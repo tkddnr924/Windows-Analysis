@@ -1,0 +1,4 @@
+regipy
+evtx
+olefile
+LnkParse3
