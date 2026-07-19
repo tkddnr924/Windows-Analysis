@@ -25,23 +25,29 @@ const isDev = process.env.NODE_ENV === "development";
 // points anywhere near the actual Windows-Analysis checkout. In that case
 // the user must explicitly point the app at their checkout folder (the one
 // containing main.py/venv/cases), persisted here across restarts.
-const CONFIG_PATH = path.join(app.getPath("userData"), "config.json");
-
 interface AppConfig {
   projectRoot?: string;
 }
 
+// Computed lazily (not at module load) — app.getPath() is only reliably
+// valid after the 'ready' event, and every caller here runs from an
+// ipcMain handler, which is always well after that.
+function configPath(): string {
+  return path.join(app.getPath("userData"), "config.json");
+}
+
 function readAppConfig(): AppConfig {
   try {
-    return JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
+    return JSON.parse(fs.readFileSync(configPath(), "utf-8"));
   } catch {
     return {};
   }
 }
 
 function writeAppConfig(config: AppConfig): void {
-  fs.mkdirSync(path.dirname(CONFIG_PATH), { recursive: true });
-  fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), "utf-8");
+  const file = configPath();
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify(config, null, 2), "utf-8");
 }
 
 function defaultProjectRoot(): string {

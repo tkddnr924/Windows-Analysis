@@ -10,12 +10,18 @@ interface ProjectRootSetupProps {
 
 export default function ProjectRootSetup({ status, onConfigured }: ProjectRootSetupProps) {
   const [lastAttempt, setLastAttempt] = useState<ProjectRootStatus | null>(null);
+  const [ipcError, setIpcError] = useState<string | null>(null);
 
   async function pick() {
-    const result = await window.api.pickProjectRoot();
-    if (!result) return;
-    setLastAttempt(result);
-    if (result.valid) onConfigured(result);
+    setIpcError(null);
+    try {
+      const result = await window.api.pickProjectRoot();
+      if (!result) return;
+      setLastAttempt(result);
+      if (result.valid) onConfigured(result);
+    } catch (e) {
+      setIpcError(String(e));
+    }
   }
 
   const failed = lastAttempt && !lastAttempt.valid ? lastAttempt : null;
@@ -46,6 +52,11 @@ export default function ProjectRootSetup({ status, onConfigured }: ProjectRootSe
       {failed && (
         <div style={{ fontSize: 12, color: "var(--danger)", maxWidth: 440 }}>
           선택한 폴더에서 main.py를 찾을 수 없습니다: {failed.root}
+        </div>
+      )}
+      {ipcError && (
+        <div style={{ fontSize: 12, color: "var(--danger)", maxWidth: 440 }}>
+          폴더 선택 중 오류가 발생했습니다: {ipcError}
         </div>
       )}
       <button

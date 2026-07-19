@@ -50,7 +50,13 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
-    window.api.getProjectRoot().then(setProjectRootStatus);
+    // Never let a rejected/hung IPC call leave the app stuck on the loading
+    // screen forever — worst case, fall through to the setup screen so the
+    // user can still pick a folder.
+    window.api
+      .getProjectRoot()
+      .then(setProjectRootStatus)
+      .catch(() => setProjectRootStatus({ root: "", valid: false }));
   }, []);
 
   useEffect(() => {
