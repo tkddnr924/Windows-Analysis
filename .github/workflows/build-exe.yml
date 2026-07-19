@@ -1,0 +1,35 @@
+name: Build Windows exe
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: viewer
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build portable .exe
+        env:
+          # Skip electron-builder's macOS code-signing tool download — not
+          # needed for an unsigned Windows portable build, and extracting it
+          # requires a symlink privilege some runners/accounts don't have.
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: npm run dist:win
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Windows-Analysis-Viewer
+          path: viewer/release/*.exe
+          if-no-files-found: error

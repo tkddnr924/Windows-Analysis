@@ -25,10 +25,14 @@ from parsers import (
     browser_login_data_parser,
     eventlog_parser,
     jumplist_parser,
+    prefetch_parser,
+    registry_parser,
     sqlite_generic_parser,
+    terminal_server_client_parser,
+    userassist_parser,
 )
 
-from common.finder import find_files_by_extension, find_files_by_name, find_sqlite_files
+from common.finder import find_files_by_extension, find_files_by_name, find_files_by_suffix, find_sqlite_files
 
 
 @dataclass
@@ -51,6 +55,10 @@ def _by_filenames(names: list[str]) -> Callable[[Path], list[Path]]:
 
 def _by_extensions(extensions: list[str]) -> Callable[[Path], list[Path]]:
     return lambda target_dir: find_files_by_extension(target_dir, extensions)
+
+
+def _by_suffixes(suffixes: list[str]) -> Callable[[Path], list[Path]]:
+    return lambda target_dir: find_files_by_suffix(target_dir, suffixes)
 
 
 ARTIFACTS: list[ArtifactDefinition] = [
@@ -92,5 +100,31 @@ ARTIFACTS: list[ArtifactDefinition] = [
         find_paths=_by_extensions(jumplist_parser.EXTENSIONS),
         parse=jumplist_parser.parse,
         field_order=jumplist_parser.FIELD_ORDER,
+    ),
+    ArtifactDefinition(
+        name=prefetch_parser.ARTIFACT_NAME,
+        find_paths=_by_extensions(prefetch_parser.EXTENSIONS),
+        parse=prefetch_parser.parse,
+        field_order=prefetch_parser.FIELD_ORDER,
+    ),
+    ArtifactDefinition(
+        name=registry_parser.ARTIFACT_NAME,
+        find_paths=_by_filenames(registry_parser.FILENAMES),
+        parse=registry_parser.parse,
+        field_order=registry_parser.FIELD_ORDER,
+    ),
+    ArtifactDefinition(
+        name=userassist_parser.ARTIFACT_NAME,
+        find_paths=_by_suffixes(userassist_parser.FILE_SUFFIXES),
+        parse=userassist_parser.parse,
+        field_order=userassist_parser.FIELD_ORDER,
+        category="Registry",
+    ),
+    ArtifactDefinition(
+        name=terminal_server_client_parser.ARTIFACT_NAME,
+        find_paths=_by_suffixes(terminal_server_client_parser.FILE_SUFFIXES),
+        parse=terminal_server_client_parser.parse,
+        field_order=terminal_server_client_parser.FIELD_ORDER,
+        category="Registry",
     ),
 ]

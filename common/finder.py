@@ -51,6 +51,19 @@ def find_files_by_extension(target_dir: Path, extensions: list[str]) -> list[Pat
     return matches
 
 
+def find_files_by_suffix(target_dir: Path, suffixes: list[str]) -> list[Path]:
+    """Recursively find files under target_dir whose filename ends with one
+    of `suffixes` (case-insensitive). Used for per-user hives the collector
+    prefixes with a username (e.g. "tkddn_NTUSER.DAT"), where the full
+    filename isn't fixed but the suffix is."""
+    wanted = tuple(s.lower() for s in suffixes)
+    matches = []
+    for path in target_dir.rglob("*"):
+        if path.is_file() and path.name.lower().endswith(wanted):
+            matches.append(path)
+    return matches
+
+
 _SQLITE_MAGIC = b"SQLite format 3\x00"
 
 

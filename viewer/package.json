@@ -1,0 +1,62 @@
+{
+  "name": "windows-analysis-viewer",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Desktop viewer for Windows-Analysis parsed CSV output (Electron + Next.js)",
+  "main": "dist-electron/main.js",
+  "scripts": {
+    "dev:next": "next dev -p 3000",
+    "dev:electron": "cross-env NODE_ENV=development tsc -p electron/tsconfig.json && cross-env NODE_ENV=development electron dist-electron/main.js",
+    "dev": "concurrently \"npm:dev:next\" \"wait-on tcp:3000 && npm run dev:electron\"",
+    "build:next": "next build",
+    "build:electron": "tsc -p electron/tsconfig.json",
+    "build": "npm run build:next && npm run build:electron",
+    "start": "cross-env NODE_ENV=production electron dist-electron/main.js",
+    "dist:win": "npm run build && electron-builder --win portable",
+    "postinstall": "electron-rebuild -f -w better-sqlite3"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.11.1"
+  },
+  "devDependencies": {
+    "@electron/rebuild": "^4.2.0",
+    "@tanstack/react-table": "^8.20.5",
+    "@tanstack/react-virtual": "^3.10.9",
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^20.14.9",
+    "@types/react": "^18.3.3",
+    "@types/react-dom": "^18.3.0",
+    "concurrently": "^8.2.2",
+    "cross-env": "^7.0.3",
+    "electron": "^31.2.1",
+    "electron-builder": "^24.13.3",
+    "next": "14.2.35",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "typescript": "^5.5.3",
+    "wait-on": "^7.2.0"
+  },
+  "build": {
+    "appId": "com.tkddnr924.windows-analysis-viewer",
+    "productName": "Windows-Analysis-Viewer",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist-electron/**/*",
+      "out/**/*",
+      "package.json"
+    ],
+    "asarUnpack": [
+      "**/*.node"
+    ],
+    "win": {
+      "target": [
+        "portable"
+      ]
+    },
+    "portable": {
+      "artifactName": "${productName}.exe"
+    }
+  }
+}

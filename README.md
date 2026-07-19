@@ -75,11 +75,15 @@ python main.py --target target --output result
 | Browser - Login Data | `parsers/browser_login_data_parser.py` | `result/BROWSER/` | `Login Data`/`Login Data For Account`의 `logins` 테이블. 암호화된 비밀번호 원문은 절대 읽지 않고 존재 여부만 기록 |
 | Browser - SQLite 전체 | `parsers/sqlite_generic_parser.py` | `result/BROWSER/` | `BROWSER` 폴더 하위의 모든 Chromium SQLite DB(Cookies, Web Data, Favicons, Top Sites 등)를 테이블 단위로 전부 덤프. 전용 파서가 이미 다루는 테이블은 중복을 피하기 위해 제외 |
 | JumpList | `parsers/jumplist_parser.py` | `result/JUMPLIST/` | `AutomaticDestinations-ms`(OLE + LNK) / `CustomDestinations-ms`(LNK 시그니처 스캔) 둘 다 지원. **DestList 자체(핀 고정/접근 횟수/MRU 순서)는 아직 파싱하지 않음** — LNK 헤더의 생성/접근/수정 시각과 타겟 경로까지만 |
+| Prefetch | `parsers/prefetch_parser.py` | `result/PREFETCH/` | `libscca-python`으로 Win10/11 MAM 압축 `.pf` 자동 처리. 실행 정보(최근 8회 실행 시각, 볼륨)와 로드된 파일 목록 두 개 CSV로 분리 |
+| Registry (SYSTEM/SOFTWARE) | `parsers/registry_parser.py` | `result/REGISTRY/` | RegRipper/RECmd 방식으로 잘 알려진 주요 키만 선별 추출: Run/RunOnce(자동실행), Uninstall(설치 프로그램), ProfileList(사용자 프로필 로드/언로드 시각), 컴퓨터명/OS버전/시간대/종료시각, USB 연결 이력. 여러 `ControlSetNNN`이 있으면 전부 순회 |
 
 ### 알려진 범위 밖 항목
 
 - IE `WebCacheV01.dat` (ESE/Jet Blue 포맷 — SQLite가 아니라 별도 파서 필요)
 - Amcache의 삭제된 레지스트리 셀 카빙은 완전 복구된 레코드만 채택 (값 목록이 일부 덮어써진 경우는 조작해서 채우지 않고 버림)
+- SAM/SECURITY/DEFAULT 하이브, `\Services`/`\Enum`(USB 제외) 전체 트리는 아직 파싱하지 않음 — 특히 SAM은 자격 증명과 맞닿아 있어 별도로 신중하게 다룰 항목
+- JumpList의 DestList(핀 고정/접근 횟수/MRU 순서)는 파싱하지 않음
 
 ## 새 아티팩트 파서 추가하기
 
@@ -112,4 +116,22 @@ parsers/
   browser_login_data_parser.py
   sqlite_generic_parser.py
   jumplist_parser.py
+  prefetch_parser.py
+  registry_parser.py
+viewer/                        result/ CSV를 훑어보는 Electron + Next.js 데스크톱 뷰어 (별도 앱, viewer/README 참고)
 ```
+
+## 뷰어 앱 (viewer/)
+
+`result/` 아래 CSV들을 폴더 트리로 훑어보는 Electron + Next.js 데스크톱 앱입니다. 파이썬 파이프라인과는 완전히 분리된 별도 Node.js 프로젝트입니다.
+
+```powershell
+cd viewer
+npm install
+npm run dev
+```
+
+- 카테고리 → CSV 파일 트리, 가상 스크롤 테이블(대용량 CSV도 부드럽게)
+- 컬럼 정렬, 컬럼 크기 조절, 컬럼별 필터(포함/제외/완전일치), 전체 텍스트 검색
+- 셀 클릭 시 해당 행 전체를 상세보기 패널로 표시 (JSON처럼 보이는 값은 자동 pretty-print)
+- CSV 조회 전용이며, 파이썬 파이프라인 실행 기능은 없음 (`python main.py`는 별도로 실행)

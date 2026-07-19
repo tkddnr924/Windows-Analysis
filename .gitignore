@@ -3,3 +3,14 @@ __pycache__/
 result/
 target/
 .claude/
+
+# Parsed case output — real extracted forensic data (browser data, credentials-
+# adjacent fields, etc.), never belongs in version control.
+cases/
+
+# Electron/Next.js viewer build output and deps — see viewer/.gitignore for
+# the rest; these two are here so `git status` at the repo root stays clean.
+viewer/node_modules/
+viewer/out/
+viewer/dist-electron/
+viewer/release/

@@ -24,7 +24,7 @@ FIELD_ORDER = {
     "EventLog_Events": [
         "timestamp", "Channel", "EventID", "LevelName", "Level", "Provider",
         "Computer", "EventRecordID", "ProcessID", "ThreadID", "UserID",
-        "EventData", "_status", "_error", "_source_file",
+        "EventData", "_record_key", "_status", "_error", "_source_file",
     ],
 }
 
@@ -140,6 +140,12 @@ def parse_one(evtx_path: Path) -> list[dict]:
         row["_status"] = "ok"
         row["_error"] = ""
         row["_source_file"] = str(evtx_path)
+        # EventRecordID only counts up within a single .evtx file — two
+        # different logs both have a "record 50". Pair it with the source
+        # filename for a value that's actually unique across the merged
+        # table, so cross-artifact links (e.g. RemoteAccessHistory) can
+        # jump to exactly one record instead of matching dozens.
+        row["_record_key"] = f"{evtx_path.name}::{row.get('EventRecordID', '')}"
         rows.append(row)
 
     return rows
