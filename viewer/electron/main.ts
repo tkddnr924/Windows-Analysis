@@ -41,12 +41,16 @@ function pipelineCommand(): { file: string; baseArgs: string[] } {
   };
 }
 
-// Case data has to live somewhere writable that doesn't depend on install
-// location — the dev checkout's cases/ folder in dev, the per-user app data
-// directory in a packaged build.
+// Case data lives right next to wherever the user put the program, so
+// results are visible and predictable — not hidden in AppData. In dev
+// that's the repo's cases/ folder. For the portable exe,
+// PORTABLE_EXECUTABLE_DIR is the folder the user's .exe actually sits in
+// (process.execPath points at the temporary self-extraction dir, not the
+// real location), so a `cases` folder appears right beside the exe.
 function casesDir(): string {
   if (isDev) return path.join(devProjectRoot(), "cases");
-  return path.join(app.getPath("userData"), "cases");
+  const base = process.env.PORTABLE_EXECUTABLE_DIR ?? path.dirname(process.execPath);
+  return path.join(base, "cases");
 }
 
 function createWindow(): void {
