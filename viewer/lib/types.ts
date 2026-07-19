@@ -61,6 +61,15 @@ export interface TimelineEntry {
   columns: string[];
 }
 
+/** Resolves a detail-view link (e.g. "이 exe가 로드한 파일") to the actual
+ * matching rows in the target table, so they can be shown inline instead of
+ * navigating away. Returns null if the target table isn't found. */
+export type FetchLinkedRows = (
+  targetFile: string,
+  targetColumn: string,
+  value: string
+) => Promise<{ rows: Record<string, string>[] } | null>;
+
 export type FilterMode = "contains" | "exclude" | "exact";
 
 export interface ColumnFilterValue {

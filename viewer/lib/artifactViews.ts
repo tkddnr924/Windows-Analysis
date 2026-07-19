@@ -1,7 +1,7 @@
 import { tagsForBoolean, tagsForDangerType, tagsForEventLevel, tagsForNameMismatch, tagsForPath, type Tag } from "./tagging";
 import { lookupEventCatalog, parseEventData, extractEventField, tagsForSecurityEvent, EVENT_QUICK_FIELDS, LOGON_TYPE_LABELS } from "./eventCatalog";
 
-export type FieldKind = "text" | "path" | "code" | "hash" | "bytes" | "json" | "badge";
+export type FieldKind = "text" | "path" | "code" | "hash" | "bytes" | "json" | "badge" | "privileges";
 
 export interface FieldSpec {
   key: string;
@@ -70,6 +70,23 @@ export interface ArtifactViewSpec {
    * the first thing scanned instead of being buried behind raw fields.
    */
   computedColumns?: ComputedColumnSpec[];
+}
+
+// Shows both the raw number and its meaning, e.g. "캐시된 자격 증명 (타입 11)" —
+// the number matters to analysts (it's what other tools/docs reference).
+function formatLogonType(lt: string): string {
+  const label = LOGON_TYPE_LABELS[lt];
+  return label ? `${label} (타입 ${lt})` : `타입 ${lt}`;
+}
+
+// Logon events (4624 success / 4625 failure / 4648 explicit-cred) carry a
+// LogonType inside EventData that decides what the logon actually WAS —
+// network(3), RDP(10), console(2), etc. Returns "" for non-logon events or
+// when the type is absent, so callers can treat it as "no qualifier".
+function logonTypeLabel(r: Record<string, string>): string {
+  if (!["4624", "4625", "4648"].includes(r.EventID)) return "";
+  const lt = extractEventField(r, "LogonType");
+  return lt ? formatLogonType(lt) : "";
 }
 
 function edField(jsonKey: string, label: string, opts: Partial<FieldSpec> = {}): FieldSpec {
@@ -248,7 +265,7 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     ],
     // HiddenArp=1 means the program was deliberately hidden from Add/Remove
     // Programs — a real self-concealment technique, not just noise.
-    tags: (r) => tagsForBoolean(r.HiddenArp, { label: "제어판에서 숨김(HiddenArp)", severity: "danger" }),
+    tags: (r) => tagsForBoolean(r.HiddenArp, { label: "제어판에서 숨김(HiddenArp)", severity: "danger", description: "제어판 '프로그램 추가/제거' 목록에서 의도적으로 숨겨진 프로그램입니다. 사용자 눈에 띄지 않게 하려는 자기은폐(self-concealment) 기법으로, 정상 소프트웨어에서는 드뭅니다." }),
     links: [
       { key: "ProgramId", label: "이 프로그램이 설치한 파일 보기", targetFile: "Amcache_Files", targetColumn: "program_id" },
       { key: "UserSid", label: "설치한 계정의 프로필 정보 보기", targetFile: "Registry_UserProfiles", targetColumn: "sid" },
@@ -268,12 +285,12 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
         { key: "UninstallString", kind: "code" },
         { key: "RegistryKeyPath", kind: "path" },
       ]},
+      // ProgramInstanceId / MsiPackageCode are low-value GUIDs — dropped from
+      // the curated view (still in "전체 필드 보기").
       { heading: "식별자", fields: [
         { key: "ProgramId", kind: "hash" },
-        { key: "ProgramInstanceId", kind: "hash" },
         { key: "PackageFullName" },
         { key: "MsiProductCode", kind: "hash" },
-        { key: "MsiPackageCode", kind: "hash" },
       ]},
     ],
   },
@@ -305,10 +322,11 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
         { key: "product_name" },
         { key: "size", kind: "bytes" },
       ]},
+      // SHA1 is high value (malware lookup); program_id is just the link key
+      // (already offered as a link above), so it's dropped from the fields.
       { heading: "해시 / 식별자", fields: [
         { key: "SHA1", kind: "hash" },
         { key: "file_id", kind: "hash" },
-        { key: "program_id", kind: "hash" },
       ]},
     ],
   },
@@ -316,7 +334,11 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
   EventLog_Events: {
     title: (r) => {
       const catalog = lookupEventCatalog(r.Provider, r.EventID);
-      return catalog ? `Event ${r.EventID} · ${catalog.label}` : `Event ${r.EventID}`;
+      const base = catalog ? `Event ${r.EventID} · ${catalog.label}` : `Event ${r.EventID}`;
+      // On logon events the LogonType is the single most important qualifier
+      // (network vs RDP vs console), so fold it straight into the title.
+      const logonType = logonTypeLabel(r);
+      return logonType ? `${base} · ${logonType}` : base;
     },
     subtitle: (r) => r.Provider || "",
     badges: [
@@ -327,6 +349,12 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
         label: "구분",
         kind: "badge",
         compute: (r) => lookupEventCatalog(r.Provider, r.EventID)?.category,
+      },
+      {
+        key: "_logon_type",
+        label: "로그온 유형",
+        kind: "badge",
+        compute: (r) => logonTypeLabel(r) || undefined,
       },
     ],
     // Level (Critical/Error) is a generic OS signal; tagsForSecurityEvent
@@ -352,16 +380,24 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     ],
     priorityColumns: ["timestamp", "Provider", "EventID", "LevelName", "Channel", "Computer"],
     sections: [
+      // EventRecordID / ProcessID / ThreadID are low-value at a glance, so
+      // they're left out of this curated view — "전체 필드 보기" still shows
+      // them. LogonType leads because it's the headline fact for logon events.
       { heading: "기본 정보", fields: [
+        {
+          key: "EventData.LogonType",
+          label: "로그온 유형",
+          kind: "badge",
+          compute: (r) => {
+            const lt = extractEventField(r, "LogonType");
+            return lt ? formatLogonType(lt) : undefined;
+          },
+        },
         { key: "Channel" },
         { key: "Computer" },
-        { key: "EventRecordID" },
-        { key: "ProcessID" },
-        { key: "ThreadID" },
         { key: "UserID" },
       ]},
       { heading: "보안 이벤트 상세 (로그온/원격 접속/SMB/영속성)", fields: [
-        edField("LogonType", "로그온 유형", { kind: "badge", valueLabels: LOGON_TYPE_LABELS }),
         edField("TargetUserName", "대상 계정"),
         edField("TargetDomainName", "대상 도메인"),
         edField("SubjectUserName", "수행 계정"),
@@ -373,7 +409,7 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
         edField("ServiceName", "서비스 이름"),
         edField("ImagePath", "서비스 실행 파일", { kind: "path" }),
         edField("TaskName", "예약 작업 이름"),
-        edField("PrivilegeList", "부여된 권한", { kind: "code" }),
+        edField("PrivilegeList", "부여된 권한", { kind: "privileges" }),
         edField("FailureReason", "실패 사유"),
         edField("Status", "상태 코드"),
         edField("ScriptBlockText", "PowerShell 스크립트 원문", { kind: "code" }),
@@ -394,10 +430,10 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     timelineField: "timestamp",
     priorityColumns: ["timestamp", "title", "url", "transition_type", "browser"],
     sections: [
+      // from_visit / visit_id are internal Chromium row IDs — low value, so
+      // only the dwell time stays in the curated view.
       { heading: "방문 정보", fields: [
         { key: "visit_duration_sec", label: "체류 시간(초)" },
-        { key: "from_visit" },
-        { key: "visit_id" },
       ]},
       { heading: "URL", fields: [{ key: "url", kind: "path" }] },
     ],
@@ -414,7 +450,6 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
       { heading: "통계", fields: [
         { key: "visit_count" },
         { key: "typed_count" },
-        { key: "hidden" },
       ]},
       { heading: "URL", fields: [{ key: "url", kind: "path" }] },
     ],
@@ -486,7 +521,6 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
       { heading: "상세", fields: [
         { key: "signon_realm", kind: "path" },
         { key: "times_used" },
-        { key: "blacklisted_by_user" },
         { key: "password_type" },
       ]},
     ],
@@ -518,10 +552,10 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
         { key: "arguments", kind: "code" },
         { key: "working_directory", kind: "path" },
       ]},
+      // machine_id / stream_id are internal jumplist bookkeeping — dropped;
+      // app_id stays (it identifies the source application).
       { heading: "식별자", fields: [
         { key: "app_id", kind: "hash" },
-        { key: "machine_id" },
-        { key: "stream_id" },
       ]},
       { heading: "오류", fields: [{ key: "_error", kind: "code" }] },
     ],
@@ -560,9 +594,9 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
         { key: "volume_serial_number", kind: "hash" },
         { key: "volume_creation_time" },
       ]},
+      // format_version is a parser detail, not investigative — dropped.
       { heading: "식별자", fields: [
         { key: "prefetch_hash", kind: "hash" },
-        { key: "format_version" },
       ]},
       { heading: "오류", fields: [{ key: "_error", kind: "code" }] },
     ],
@@ -576,7 +610,6 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     sections: [{ heading: "상세", fields: [
       { key: "loaded_filename", kind: "path" },
       { key: "file_reference" },
-      { key: "prefetch_hash", kind: "hash" },
     ]}],
   },
 
@@ -635,7 +668,6 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
       ]},
       { heading: "상세", fields: [
         { key: "profile_image_path", kind: "path" },
-        { key: "flags" },
         { key: "state" },
       ]},
     ],

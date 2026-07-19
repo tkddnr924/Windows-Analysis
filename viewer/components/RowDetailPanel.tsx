@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { getArtifactView } from "@/lib/artifactViews";
+import type { FetchLinkedRows } from "@/lib/types";
 import ArtifactDetailView from "./ArtifactDetailView";
 
 interface RowDetailPanelProps {
@@ -11,6 +12,11 @@ interface RowDetailPanelProps {
   fileBaseName: string;
   onClose: () => void;
   onNavigate: (targetFile: string, targetColumn: string, value: string) => void;
+  onFetchLinkedRows?: FetchLinkedRows;
+  /** Bookmark state + toggle for this row, bound by the parent. Omitted when
+   * the host view has no bookmarking (then no bookmark control is shown). */
+  isBookmarked?: boolean;
+  onToggleBookmark?: () => void;
 }
 
 function tryPrettyJson(value: string): string | null {
@@ -77,7 +83,7 @@ function RawFieldValue({ column, value, focused }: { column: string; value: stri
   );
 }
 
-export default function RowDetailPanel({ row, columns, focusedColumn, fileBaseName, onClose, onNavigate }: RowDetailPanelProps) {
+export default function RowDetailPanel({ row, columns, focusedColumn, fileBaseName, onClose, onNavigate, onFetchLinkedRows, isBookmarked, onToggleBookmark }: RowDetailPanelProps) {
   const spec = getArtifactView(fileBaseName);
   const [showRaw, setShowRaw] = useState(!spec);
 
@@ -148,10 +154,32 @@ export default function RowDetailPanel({ row, columns, focusedColumn, fileBaseNa
               {showRaw ? "주요 필드 보기" : "전체 필드 보기"}
             </button>
           )}
+          {onToggleBookmark && (
+            <button
+              onClick={onToggleBookmark}
+              title={isBookmarked ? "북마크 해제" : "북마크에 추가"}
+              style={{
+                marginLeft: "auto",
+                display: "inline-flex",
+                alignItems: "center",
+                gap: 5,
+                fontSize: 11.5,
+                padding: "4px 10px",
+                background: isBookmarked ? "var(--warning-subtle)" : "transparent",
+                color: isBookmarked ? "var(--warning)" : "var(--text-dim)",
+                border: `1px solid ${isBookmarked ? "var(--warning)" : "var(--border)"}`,
+                borderRadius: "var(--radius-lg)",
+                cursor: "pointer",
+                fontWeight: 600,
+              }}
+            >
+              {isBookmarked ? "★ 북마크됨" : "☆ 북마크"}
+            </button>
+          )}
           <button
             onClick={onClose}
             style={{
-              marginLeft: "auto",
+              marginLeft: onToggleBookmark ? 8 : "auto",
               background: "transparent",
               border: "none",
               color: "var(--text-dim)",
@@ -169,7 +197,7 @@ export default function RowDetailPanel({ row, columns, focusedColumn, fileBaseNa
         </div>
         <div style={{ overflowY: "auto", flex: 1 }}>
           {spec && !showRaw ? (
-            <ArtifactDetailView spec={spec} row={row} onNavigate={onNavigate} />
+            <ArtifactDetailView spec={spec} row={row} onNavigate={onNavigate} onFetchLinkedRows={onFetchLinkedRows} />
           ) : (
             columns.map((col) => (
               <RawFieldValue key={col} column={col} value={row[col] ?? ""} focused={col === focusedColumn} />

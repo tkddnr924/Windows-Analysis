@@ -101,6 +101,25 @@ export default function Home() {
     }
   }
 
+  // Same target-table lookup as handleNavigate, but returns the matching rows
+  // so the detail view can show linked records inline (accordion) rather than
+  // switching tabs.
+  const fetchLinkedRows = useCallback(
+    async (targetFile: string, targetColumn: string, value: string) => {
+      const targetBaseName = targetFile.toLowerCase();
+      for (const cat of categories) {
+        const files = await window.api.listResultFiles(cat.fullPath);
+        const match = files.find((f) => f.name.toLowerCase() === targetBaseName);
+        if (match) {
+          const data = await window.api.readResultFile(match.fullPath);
+          return { rows: data.rows.filter((r) => (r[targetColumn] ?? "") === value) };
+        }
+      }
+      return null;
+    },
+    [categories]
+  );
+
   async function handleSelectTimeline() {
     setActiveVirtualTab("timeline");
     if (!selectedCase || masterTimeline?.caseId === selectedCase.id) return;
@@ -117,13 +136,11 @@ export default function Home() {
     setActiveVirtualTab("bookmarks");
   }
 
-  async function handleToggleBookmark(file: ResultFileEntry, rowid: number) {
+  // Keyed by (fullPath, tableName, rowid) so any view holding those three —
+  // the data table or the master timeline — can toggle a bookmark the same way.
+  async function handleToggleBookmark(fullPath: string, tableName: string, rowid: number) {
     if (!selectedCase) return;
-    const result = await window.api.toggleBookmark(selectedCase.dir, {
-      fullPath: file.fullPath,
-      tableName: file.name,
-      rowid,
-    });
+    const result = await window.api.toggleBookmark(selectedCase.dir, { fullPath, tableName, rowid });
     setBookmarks(result);
   }
 
@@ -148,6 +165,9 @@ export default function Home() {
   const activeBookmarkedRowids = activeTab
     ? new Set(bookmarks.filter((b) => b.fullPath === activeTab.file.fullPath).map((b) => b.rowid))
     : undefined;
+  // Timeline rows span many files, so a per-file rowid set isn't enough —
+  // key on fullPath+rowid to tell which timeline entries are bookmarked.
+  const bookmarkedKeys = new Set(bookmarks.map((b) => `${b.fullPath}#${b.rowid}`));
 
   return (
     <main style={{ display: "flex", flexDirection: "column", height: "100%" }}>
@@ -227,7 +247,14 @@ export default function Home() {
             />
 
             {activeVirtualTab === "timeline" && (
-              <MasterTimeline entries={activeTimeline} loading={masterTimelineLoading} onNavigate={handleNavigate} />
+              <MasterTimeline
+                entries={activeTimeline}
+                loading={masterTimelineLoading}
+                onNavigate={handleNavigate}
+                onFetchLinkedRows={fetchLinkedRows}
+                bookmarkedKeys={bookmarkedKeys}
+                onToggleBookmark={(entry) => handleToggleBookmark(entry.fullPath, entry.table, entry.rowid)}
+              />
             )}
 
             {activeVirtualTab === "bookmarks" && (
@@ -262,8 +289,9 @@ export default function Home() {
                 initialFilter={pendingFilter}
                 onInitialFilterConsumed={() => setPendingFilter(null)}
                 onNavigate={handleNavigate}
+                onFetchLinkedRows={fetchLinkedRows}
                 bookmarkedRowids={activeBookmarkedRowids}
-                onToggleBookmark={(rowid) => handleToggleBookmark(activeTab.file, rowid)}
+                onToggleBookmark={(rowid) => handleToggleBookmark(activeTab.file.fullPath, activeTab.file.name, rowid)}
               />
             )}
           </div>

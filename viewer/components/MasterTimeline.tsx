@@ -2,7 +2,7 @@
 
 import { useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import type { TimelineEntry } from "@/lib/types";
+import type { FetchLinkedRows, TimelineEntry } from "@/lib/types";
 import { CATEGORY_ICONS } from "./Sidebar";
 import RowDetailPanel from "./RowDetailPanel";
 
@@ -12,6 +12,10 @@ interface MasterTimelineProps {
   entries: TimelineEntry[] | null;
   loading: boolean;
   onNavigate: (targetFile: string, targetColumn: string, value: string) => void;
+  onFetchLinkedRows: FetchLinkedRows;
+  /** Keys of bookmarked rows, formatted `${fullPath}#${rowid}`. */
+  bookmarkedKeys: Set<string>;
+  onToggleBookmark: (entry: TimelineEntry) => void;
 }
 
 // <input type="datetime-local"> yields "YYYY-MM-DDThh:mm" (no seconds) — pad
@@ -23,10 +27,13 @@ function toRangeBound(datetimeLocal: string, edge: "start" | "end"): string {
   return edge === "start" ? `${date} ${time}:00.000` : `${date} ${time}:59.999`;
 }
 
-export default function MasterTimeline({ entries, loading, onNavigate }: MasterTimelineProps) {
+export default function MasterTimeline({ entries, loading, onNavigate, onFetchLinkedRows, bookmarkedKeys, onToggleBookmark }: MasterTimelineProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const [rangeStart, setRangeStart] = useState("");
   const [rangeEnd, setRangeEnd] = useState("");
+  const [sortDir, setSortDir] = useState<"asc" | "desc">("asc");
+  const [hiddenTables, setHiddenTables] = useState<Set<string>>(new Set());
+  const [showArtifactMenu, setShowArtifactMenu] = useState(false);
   const [selectedEntry, setSelectedEntry] = useState<TimelineEntry | null>(null);
   const allRows = entries ?? [];
 
@@ -34,16 +41,46 @@ export default function MasterTimeline({ entries, loading, onNavigate }: MasterT
   const endBound = toRangeBound(rangeEnd, "end");
   const rangeActive = Boolean(startBound || endBound);
 
+  // Distinct artifact tables present, with total counts — drives the filter
+  // popup. Counts come from the full set (not range-filtered) so the list is
+  // stable as the user narrows the time range.
+  const tableCounts = useMemo(() => {
+    const m = new Map<string, number>();
+    for (const e of allRows) m.set(e.table, (m.get(e.table) ?? 0) + 1);
+    return [...m.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+  }, [allRows]);
+
+  function toggleTable(table: string) {
+    setHiddenTables((prev) => {
+      const next = new Set(prev);
+      if (next.has(table)) next.delete(table);
+      else next.add(table);
+      return next;
+    });
+  }
+
   const rows = useMemo(() => {
-    if (!rangeActive) return allRows;
-    return allRows.filter((e) => {
-      if (!e.timestamp) return false;
-      if (startBound && e.timestamp < startBound) return false;
-      if (endBound && e.timestamp > endBound) return false;
+    const filtered = allRows.filter((e) => {
+      if (hiddenTables.has(e.table)) return false;
+      if (rangeActive) {
+        if (!e.timestamp) return false;
+        if (startBound && e.timestamp < startBound) return false;
+        if (endBound && e.timestamp > endBound) return false;
+      }
       return true;
     });
+    // Timestamps are pre-formatted YYYY-MM-DD hh:mm:ss.fff, so string compare
+    // is chronological. Rows with no timestamp always sink to the bottom
+    // regardless of direction (they can't be placed on the timeline).
+    return [...filtered].sort((a, b) => {
+      if (!a.timestamp && !b.timestamp) return 0;
+      if (!a.timestamp) return 1;
+      if (!b.timestamp) return -1;
+      const cmp = a.timestamp < b.timestamp ? -1 : a.timestamp > b.timestamp ? 1 : 0;
+      return sortDir === "asc" ? cmp : -cmp;
+    });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [allRows, startBound, endBound]);
+  }, [allRows, startBound, endBound, sortDir, hiddenTables, rangeActive]);
 
   const virtualizer = useVirtualizer({
     count: rows.length,
@@ -93,12 +130,110 @@ export default function MasterTimeline({ entries, loading, onNavigate }: MasterT
       >
         <strong style={{ fontSize: 13 }}>🕐 통합 타임라인</strong>
         <span style={{ color: "var(--text-faint)", fontSize: 11.5 }}>
-          {rangeActive
+          {rangeActive || hiddenTables.size > 0
             ? `${rows.length.toLocaleString()} / ${allRows.length.toLocaleString()}건`
             : `${allRows.length.toLocaleString()}건 · 모든 아티팩트를 시간순으로 병합`}
         </span>
 
+        <button
+          onClick={() => setSortDir((d) => (d === "asc" ? "desc" : "asc"))}
+          title="정렬 순서 변경"
+          style={{
+            fontSize: 11.5,
+            padding: "4px 10px",
+            background: "var(--bg-elevated)",
+            color: "var(--text-dim)",
+            border: "1px solid var(--border)",
+            borderRadius: "var(--radius-lg)",
+            cursor: "pointer",
+            fontWeight: 600,
+            whiteSpace: "nowrap",
+          }}
+        >
+          {sortDir === "asc" ? "▲ 과거→최근" : "▼ 최근→과거"}
+        </button>
+
         <div style={{ display: "flex", alignItems: "center", gap: 6, marginLeft: "auto" }}>
+          <div style={{ position: "relative" }}>
+            <button
+              onClick={() => setShowArtifactMenu((v) => !v)}
+              title="통합 타임라인에 표시할 아티팩트 선택"
+              style={{
+                fontSize: 11.5,
+                padding: "4px 10px",
+                background: hiddenTables.size > 0 ? "var(--accent-subtle)" : "var(--bg-elevated)",
+                color: hiddenTables.size > 0 ? "var(--accent)" : "var(--text-dim)",
+                border: `1px solid ${hiddenTables.size > 0 ? "var(--accent)" : "var(--border)"}`,
+                borderRadius: "var(--radius-lg)",
+                cursor: "pointer",
+                fontWeight: 600,
+                whiteSpace: "nowrap",
+              }}
+            >
+              ▤ 아티팩트{hiddenTables.size > 0 ? ` (${tableCounts.length - hiddenTables.size}/${tableCounts.length})` : ""}
+            </button>
+            {showArtifactMenu && (
+              <>
+                <div onClick={() => setShowArtifactMenu(false)} style={{ position: "fixed", inset: 0, zIndex: 40 }} />
+                <div
+                  style={{
+                    position: "absolute",
+                    top: "calc(100% + 4px)",
+                    right: 0,
+                    zIndex: 41,
+                    width: 300,
+                    maxHeight: 380,
+                    overflowY: "auto",
+                    background: "var(--bg-elevated)",
+                    border: "1px solid var(--border)",
+                    borderRadius: "var(--radius-md)",
+                    boxShadow: "var(--shadow-panel)",
+                  }}
+                >
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 8,
+                      padding: "8px 12px",
+                      borderBottom: "1px solid var(--border)",
+                      position: "sticky",
+                      top: 0,
+                      background: "var(--bg-elevated)",
+                    }}
+                  >
+                    <span style={{ fontSize: 11.5, fontWeight: 700, color: "var(--text-dim)" }}>표시할 아티팩트</span>
+                    <button onClick={() => setHiddenTables(new Set())} style={{ marginLeft: "auto", fontSize: 11, background: "transparent", border: "none", color: "var(--accent)", cursor: "pointer", fontWeight: 600 }}>
+                      전체
+                    </button>
+                    <button onClick={() => setHiddenTables(new Set(tableCounts.map(([t]) => t)))} style={{ fontSize: 11, background: "transparent", border: "none", color: "var(--text-faint)", cursor: "pointer", fontWeight: 600 }}>
+                      해제
+                    </button>
+                  </div>
+                  {tableCounts.map(([table, count]) => {
+                    const checked = !hiddenTables.has(table);
+                    return (
+                      <label
+                        key={table}
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          gap: 8,
+                          padding: "6px 12px",
+                          cursor: "pointer",
+                          fontSize: 12,
+                        }}
+                      >
+                        <input type="checkbox" checked={checked} onChange={() => toggleTable(table)} />
+                        <span style={{ flex: 1, color: checked ? "var(--text)" : "var(--text-faint)", wordBreak: "break-all" }}>{table}</span>
+                        <span style={{ color: "var(--text-faint)", fontSize: 11 }}>{count.toLocaleString()}</span>
+                      </label>
+                    );
+                  })}
+                </div>
+              </>
+            )}
+          </div>
           <span style={{ fontSize: 11, color: "var(--text-faint)" }}>기간</span>
           <input
             type="datetime-local"
@@ -148,6 +283,7 @@ export default function MasterTimeline({ entries, loading, onNavigate }: MasterT
           const entry = rows[virtualRow.index];
           const dangerTag = entry.tags.find((t) => t.severity === "danger");
           const warningTag = entry.tags.find((t) => t.severity === "warning");
+          const bookmarked = bookmarkedKeys.has(`${entry.fullPath}#${entry.rowid}`);
           return (
             <div
               key={virtualRow.key}
@@ -214,11 +350,21 @@ export default function MasterTimeline({ entries, loading, onNavigate }: MasterT
               {(dangerTag || warningTag) && (
                 <span
                   style={{ flexShrink: 0, color: dangerTag ? "var(--danger)" : "var(--warning)" }}
-                  title={entry.tags.map((t) => t.label).join(", ")}
+                  title={entry.tags.map((t) => (t.description ? `${t.label} — ${t.description}` : t.label)).join("\n\n")}
                 >
                   {dangerTag ? "⛔" : "⚠"}
                 </span>
               )}
+              <span
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onToggleBookmark(entry);
+                }}
+                title={bookmarked ? "북마크 해제" : "북마크에 추가"}
+                style={{ flexShrink: 0, cursor: "pointer", fontSize: 14, color: bookmarked ? "var(--warning)" : "var(--text-faint)" }}
+              >
+                {bookmarked ? "★" : "☆"}
+              </span>
             </div>
           );
         })}
@@ -237,6 +383,9 @@ export default function MasterTimeline({ entries, loading, onNavigate }: MasterT
             setSelectedEntry(null);
             onNavigate(targetFile, targetColumn, value);
           }}
+          onFetchLinkedRows={onFetchLinkedRows}
+          isBookmarked={bookmarkedKeys.has(`${selectedEntry.fullPath}#${selectedEntry.rowid}`)}
+          onToggleBookmark={() => onToggleBookmark(selectedEntry)}
         />
       )}
     </div>

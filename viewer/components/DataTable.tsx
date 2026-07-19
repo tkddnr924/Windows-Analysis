@@ -13,7 +13,7 @@ import {
   type SortingState,
 } from "@tanstack/react-table";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import type { ColumnFilterValue, CsvData } from "@/lib/types";
+import type { ColumnFilterValue, CsvData, FetchLinkedRows } from "@/lib/types";
 import { getArtifactView } from "@/lib/artifactViews";
 import RowDetailPanel from "./RowDetailPanel";
 import ColumnFilterControl from "./ColumnFilterControl";
@@ -52,6 +52,7 @@ interface DataTableProps {
   initialFilter?: { column: string; value: string } | null;
   onInitialFilterConsumed?: () => void;
   onNavigate: (targetFile: string, targetColumn: string, value: string) => void;
+  onFetchLinkedRows?: FetchLinkedRows;
   /** rowids (this file's __rowid) currently bookmarked — undefined/omitted hides the star entirely. */
   bookmarkedRowids?: Set<number>;
   onToggleBookmark?: (rowid: number) => void;
@@ -63,6 +64,7 @@ export default function DataTable({
   initialFilter,
   onInitialFilterConsumed,
   onNavigate,
+  onFetchLinkedRows,
   bookmarkedRowids,
   onToggleBookmark,
 }: DataTableProps) {
@@ -124,7 +126,7 @@ export default function DataTable({
               )}
               {tags.length > 0 && (
                 <span
-                  title={tags.map((t) => t.label).join(", ")}
+                  title={tags.map((t) => (t.description ? `${t.label} — ${t.description}` : t.label)).join("\n\n")}
                   style={{ color: tags.some((t) => t.severity === "danger") ? "var(--danger)" : "var(--warning)" }}
                 >
                   {tags.some((t) => t.severity === "danger") ? "⛔" : "⚠"}
@@ -396,19 +398,26 @@ export default function DataTable({
         </table>
       </div>
 
-      {selectedCell && (
-        <RowDetailPanel
-          row={selectedCell.row}
-          columns={displayColumns}
-          focusedColumn={selectedCell.column}
-          fileBaseName={fileBaseName}
-          onClose={() => setSelectedCell(null)}
-          onNavigate={(targetFile, targetColumn, value) => {
-            setSelectedCell(null);
-            onNavigate(targetFile, targetColumn, value);
-          }}
-        />
-      )}
+      {selectedCell && (() => {
+        const selRowid = Number((selectedCell.row as Record<string, unknown>).__rowid);
+        const canBookmark = onToggleBookmark && Number.isFinite(selRowid);
+        return (
+          <RowDetailPanel
+            row={selectedCell.row}
+            columns={displayColumns}
+            focusedColumn={selectedCell.column}
+            fileBaseName={fileBaseName}
+            onClose={() => setSelectedCell(null)}
+            onNavigate={(targetFile, targetColumn, value) => {
+              setSelectedCell(null);
+              onNavigate(targetFile, targetColumn, value);
+            }}
+            onFetchLinkedRows={onFetchLinkedRows}
+            isBookmarked={canBookmark ? bookmarkedRowids?.has(selRowid) ?? false : undefined}
+            onToggleBookmark={canBookmark ? () => onToggleBookmark!(selRowid) : undefined}
+          />
+        );
+      })()}
     </div>
   );
 }

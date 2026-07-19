@@ -21,7 +21,7 @@ export default function TagList({ tags }: { tags: Tag[] }) {
         return (
           <span
             key={tag.label}
-            title={tag.severity === "danger" ? "위험 신호 — 확인 필요" : "이상 신호 — 확인 권장"}
+            title={tag.description ?? (tag.severity === "danger" ? "위험 신호 — 확인 필요" : "이상 신호 — 확인 권장")}
             style={{
               display: "inline-flex",
               alignItems: "center",
