@@ -12,7 +12,7 @@
     "build:electron": "tsc -p electron/tsconfig.json",
     "build": "npm run build:next && npm run build:electron",
     "start": "cross-env NODE_ENV=production electron dist-electron/main.js",
-    "dist:win": "npm run build && electron-builder --win portable",
+    "dist:win": "npm run build && electron-builder --win nsis",
     "postinstall": "electron-rebuild -f -w better-sqlite3"
   },
   "dependencies": {
@@ -58,11 +58,14 @@
     ],
     "win": {
       "target": [
-        "portable"
+        "nsis"
       ]
     },
-    "portable": {
-      "artifactName": "${productName}.exe"
+    "nsis": {
+      "artifactName": "${productName}-Setup.exe",
+      "oneClick": true,
+      "perMachine": false,
+      "deleteAppDataOnUninstall": false
     }
   }
 }

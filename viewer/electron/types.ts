@@ -53,6 +53,13 @@ export interface PipelineLogEntry {
   stream: "stdout" | "stderr";
 }
 
+/** error is set when the pipeline itself failed to run — kept separate from
+ * "cases is legitimately empty" so the GUI never conflates the two. */
+export interface ListCasesResult {
+  cases: CaseSummary[];
+  error: string | null;
+}
+
 export interface RunCaseOptions {
   caseId: string;
   /** Artifact names to run — omit to run all. */

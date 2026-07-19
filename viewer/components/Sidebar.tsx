@@ -246,6 +246,7 @@ function PinnedNavRow({ icon, label, count, selected, onClick }: PinnedNavRowPro
 
 interface SidebarProps {
   cases: CaseSummary[];
+  casesError: string | null;
   selectedCase: CaseSummary | null;
   onSelectCase: (c: CaseSummary) => void;
   categories: CategoryEntry[];
@@ -259,6 +260,7 @@ interface SidebarProps {
 
 export default function Sidebar({
   cases,
+  casesError,
   selectedCase,
   onSelectCase,
   categories,
@@ -333,7 +335,14 @@ export default function Sidebar({
         )}
       </div>
       <div style={{ overflowY: "auto", flex: 1 }}>
-        {cases.length === 0 && (
+        {casesError && (
+          <div style={{ padding: 16, color: "var(--danger)", fontSize: 12.5, lineHeight: 1.6, whiteSpace: "pre-wrap", wordBreak: "break-all" }}>
+            케이스 목록을 불러오지 못했습니다.
+            <br />
+            {casesError}
+          </div>
+        )}
+        {!casesError && cases.length === 0 && (
           <div style={{ padding: 16, color: "var(--text-faint)", fontSize: 12.5, lineHeight: 1.6 }}>
             등록된 케이스가 없습니다.
             <br />

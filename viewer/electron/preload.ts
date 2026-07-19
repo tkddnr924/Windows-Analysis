@@ -5,6 +5,7 @@ import type {
   CaseSummary,
   CategoryEntry,
   CsvData,
+  ListCasesResult,
   PipelineLogEntry,
   PipelineResult,
   ResultFileEntry,
@@ -13,7 +14,7 @@ import type {
 
 contextBridge.exposeInMainWorld("api", {
   pickFolder: (): Promise<string | null> => ipcRenderer.invoke("pick-folder"),
-  listCases: (): Promise<CaseSummary[]> => ipcRenderer.invoke("list-cases"),
+  listCases: (): Promise<ListCasesResult> => ipcRenderer.invoke("list-cases"),
   createCase: (name: string, targetDir: string): Promise<CaseSummary> =>
     ipcRenderer.invoke("create-case", name, targetDir),
   listArtifacts: (): Promise<string[]> => ipcRenderer.invoke("list-artifacts"),

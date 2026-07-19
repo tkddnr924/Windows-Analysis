@@ -9,6 +9,7 @@ import type {
   CaseSummary,
   CategoryEntry,
   CsvData,
+  ListCasesResult,
   PipelineLogEntry,
   PipelineResult,
   ResultFileEntry,
@@ -129,13 +130,17 @@ function caseFromPython(raw: Record<string, unknown>): CaseSummary {
   };
 }
 
-ipcMain.handle("list-cases", async (): Promise<CaseSummary[]> => {
+ipcMain.handle("list-cases", async (): Promise<ListCasesResult> => {
   try {
     const { stdout } = await runPython(["--list-cases"]);
     const raw = JSON.parse(stdout.trim());
-    return Array.isArray(raw) ? raw.map(caseFromPython) : [];
-  } catch {
-    return [];
+    return { cases: Array.isArray(raw) ? raw.map(caseFromPython) : [], error: null };
+  } catch (e) {
+    // An empty case list and a broken pipeline both used to render as the
+    // same "등록된 케이스가 없습니다" — surfacing the real error instead of
+    // swallowing it is what made a packaged-build pipeline path bug
+    // diagnosable at all.
+    return { cases: [], error: e instanceof Error ? e.message : String(e) };
   }
 });
 

@@ -23,6 +23,7 @@ type VirtualTab = "timeline" | "bookmarks" | null;
 export default function Home() {
   const [mode, setMode] = useState<Mode>("browse");
   const [cases, setCases] = useState<CaseSummary[]>([]);
+  const [casesError, setCasesError] = useState<string | null>(null);
   const [selectedCase, setSelectedCase] = useState<CaseSummary | null>(null);
   const [categories, setCategories] = useState<CategoryEntry[]>([]);
   const [tabs, setTabs] = useState<TabState[]>([]);
@@ -34,9 +35,10 @@ export default function Home() {
   const [masterTimelineLoading, setMasterTimelineLoading] = useState(false);
 
   const refreshCases = useCallback(async (): Promise<CaseSummary[]> => {
-    const list = await window.api.listCases();
-    setCases(list);
-    return list;
+    const result = await window.api.listCases();
+    setCases(result.cases);
+    setCasesError(result.error);
+    return result.cases;
   }, []);
 
   useEffect(() => {
@@ -202,6 +204,7 @@ export default function Home() {
         <div style={{ flex: 1, minHeight: 0, display: "flex" }}>
           <Sidebar
             cases={cases}
+            casesError={casesError}
             selectedCase={selectedCase}
             onSelectCase={selectCase}
             categories={categories}
