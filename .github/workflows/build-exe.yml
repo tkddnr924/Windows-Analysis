@@ -52,14 +52,26 @@ jobs:
           path: viewer/release/*.exe
           if-no-files-found: error
 
-      # Every push to main updates this same "latest" release in place —
-      # rolling build, not one release per commit — so there's always a
-      # single, stable download link on the repo's Releases page.
-      - name: Publish to "latest" release
+      # One-time cleanup: the old rolling "latest" release accumulated stale
+      # assets (a build only ever ADDED files, never removed the previous
+      # one), so users kept downloading an outdated exe sitting next to the
+      # new one. Delete it so only the clean versioned releases below remain.
+      # Harmless once it's already gone.
+      - name: Remove stale "latest" release
+        continue-on-error: true
+        run: gh release delete latest --repo "$env:GITHUB_REPOSITORY" --cleanup-tag --yes
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Each push to main publishes its own versioned release (v0.1.<run>),
+      # so every build is a distinct release holding exactly one exe — no
+      # more old-and-new files piling up under a single tag. The newest is
+      # flagged as "Latest" on the Releases page.
+      - name: Publish versioned release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: latest
-          name: Latest build
+          tag_name: v0.1.${{ github.run_number }}
+          name: v0.1.${{ github.run_number }}
           make_latest: true
           files: viewer/release/*.exe
         env:

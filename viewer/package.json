@@ -12,7 +12,7 @@
     "build:electron": "tsc -p electron/tsconfig.json",
     "build": "npm run build:next && npm run build:electron",
     "start": "cross-env NODE_ENV=production electron dist-electron/main.js",
-    "dist:win": "npm run build && electron-builder --win nsis",
+    "dist:win": "npm run build && electron-builder --win portable",
     "postinstall": "electron-rebuild -f -w better-sqlite3"
   },
   "dependencies": {
@@ -58,14 +58,13 @@
     ],
     "win": {
       "target": [
-        "nsis"
+        "portable"
       ]
     },
-    "nsis": {
-      "artifactName": "${productName}-Setup.exe",
-      "oneClick": true,
-      "perMachine": false,
-      "deleteAppDataOnUninstall": false
+    "portable": {
+      "artifactName": "${productName}.exe",
+      "requestExecutionLevel": "user",
+      "unpackDirName": "WindowsAnalysisViewer"
     }
   }
 }
