@@ -53,6 +53,12 @@ export interface PipelineLogEntry {
   stream: "stdout" | "stderr";
 }
 
+/** Where the app looks for main.py/venv/cases — auto-derived in dev, user-configured in a packaged build. */
+export interface ProjectRootStatus {
+  root: string;
+  valid: boolean;
+}
+
 export interface RunCaseOptions {
   caseId: string;
   /** Artifact names to run — omit to run all. */

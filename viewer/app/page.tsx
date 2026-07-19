@@ -7,8 +7,17 @@ import TabBar from "@/components/TabBar";
 import RunPipeline from "@/components/RunPipeline";
 import MasterTimeline from "@/components/MasterTimeline";
 import BookmarksView from "@/components/BookmarksView";
+import ProjectRootSetup from "@/components/ProjectRootSetup";
 import { buildMasterTimeline } from "@/lib/masterTimeline";
-import type { Bookmark, CaseSummary, CategoryEntry, CsvData, ResultFileEntry, TimelineEntry } from "@/lib/types";
+import type {
+  Bookmark,
+  CaseSummary,
+  CategoryEntry,
+  CsvData,
+  ProjectRootStatus,
+  ResultFileEntry,
+  TimelineEntry,
+} from "@/lib/types";
 
 interface TabState {
   file: ResultFileEntry;
@@ -21,6 +30,7 @@ type Mode = "run" | "browse";
 type VirtualTab = "timeline" | "bookmarks" | null;
 
 export default function Home() {
+  const [projectRootStatus, setProjectRootStatus] = useState<ProjectRootStatus | null>(null);
   const [mode, setMode] = useState<Mode>("browse");
   const [cases, setCases] = useState<CaseSummary[]>([]);
   const [selectedCase, setSelectedCase] = useState<CaseSummary | null>(null);
@@ -40,10 +50,15 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
+    window.api.getProjectRoot().then(setProjectRootStatus);
+  }, []);
+
+  useEffect(() => {
+    if (!projectRootStatus?.valid) return;
     refreshCases().then((list) => {
       if (list.length === 0) setMode("run");
     });
-  }, [refreshCases]);
+  }, [projectRootStatus, refreshCases]);
 
   const selectCase = useCallback(async (c: CaseSummary) => {
     setSelectedCase(c);
@@ -146,6 +161,18 @@ export default function Home() {
   const activeBookmarkedRowids = activeTab
     ? new Set(bookmarks.filter((b) => b.fullPath === activeTab.file.fullPath).map((b) => b.rowid))
     : undefined;
+
+  if (!projectRootStatus) {
+    return (
+      <main style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100%", color: "var(--text-faint)" }}>
+        불러오는 중...
+      </main>
+    );
+  }
+
+  if (!projectRootStatus.valid) {
+    return <ProjectRootSetup status={projectRootStatus} onConfigured={setProjectRootStatus} />;
+  }
 
   return (
     <main style={{ display: "flex", flexDirection: "column", height: "100%" }}>

@@ -11,19 +11,63 @@ import type {
   CsvData,
   PipelineLogEntry,
   PipelineResult,
+  ProjectRootStatus,
   ResultFileEntry,
   RunCaseOptions,
 } from "./types";
 
 const isDev = process.env.NODE_ENV === "development";
 
-// viewer/electron/main.ts -> project root is two levels up. The pipeline
-// (main.py), its venv, and cases/ all live at the project root, not inside
-// viewer/.
-const PROJECT_ROOT = path.resolve(__dirname, "..", "..");
-const PYTHON_EXE = path.join(PROJECT_ROOT, "venv", "Scripts", "python.exe");
-const MAIN_PY = path.join(PROJECT_ROOT, "main.py");
-const CASES_DIR = path.join(PROJECT_ROOT, "cases");
+// In dev, viewer/electron/main.ts -> project root is two levels up, and the
+// pipeline (main.py), its venv, and cases/ all live there. A packaged build
+// has no such fixed relationship — electron-builder's portable target
+// self-extracts to a temp directory at runtime, so __dirname no longer
+// points anywhere near the actual Windows-Analysis checkout. In that case
+// the user must explicitly point the app at their checkout folder (the one
+// containing main.py/venv/cases), persisted here across restarts.
+const CONFIG_PATH = path.join(app.getPath("userData"), "config.json");
+
+interface AppConfig {
+  projectRoot?: string;
+}
+
+function readAppConfig(): AppConfig {
+  try {
+    return JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
+  } catch {
+    return {};
+  }
+}
+
+function writeAppConfig(config: AppConfig): void {
+  fs.mkdirSync(path.dirname(CONFIG_PATH), { recursive: true });
+  fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), "utf-8");
+}
+
+function defaultProjectRoot(): string {
+  return path.resolve(__dirname, "..", "..");
+}
+
+function isValidProjectRoot(root: string): boolean {
+  return fs.existsSync(path.join(root, "main.py"));
+}
+
+function projectRoot(): string {
+  if (isDev) return defaultProjectRoot();
+  return readAppConfig().projectRoot ?? defaultProjectRoot();
+}
+
+function pythonExe(): string {
+  return path.join(projectRoot(), "venv", "Scripts", "python.exe");
+}
+
+function mainPy(): string {
+  return path.join(projectRoot(), "main.py");
+}
+
+function casesDir(): string {
+  return path.join(projectRoot(), "cases");
+}
 
 function createWindow(): void {
   const win = new BrowserWindow({
@@ -62,15 +106,31 @@ ipcMain.handle("pick-folder", async (): Promise<string | null> => {
   return result.filePaths[0];
 });
 
+ipcMain.handle("get-project-root", (): ProjectRootStatus => {
+  const root = projectRoot();
+  return { root, valid: isValidProjectRoot(root) };
+});
+
+ipcMain.handle("pick-project-root", async (): Promise<ProjectRootStatus | null> => {
+  const result = await dialog.showOpenDialog({ properties: ["openDirectory"] });
+  if (result.canceled || result.filePaths.length === 0) return null;
+  const root = result.filePaths[0];
+  const valid = isValidProjectRoot(root);
+  if (valid) writeAppConfig({ projectRoot: root });
+  return { root, valid };
+});
+
 // --- main.py invocation helpers ---
 
 function runPython(args: string[]): Promise<{ stdout: string; exitCode: number | null }> {
   return new Promise((resolve, reject) => {
-    if (!fs.existsSync(PYTHON_EXE) || !fs.existsSync(MAIN_PY)) {
-      reject(new Error(`python(${PYTHON_EXE}) 또는 main.py(${MAIN_PY})를 찾을 수 없습니다.`));
+    const pythonExePath = pythonExe();
+    const mainPyPath = mainPy();
+    if (!fs.existsSync(pythonExePath) || !fs.existsSync(mainPyPath)) {
+      reject(new Error(`python(${pythonExePath}) 또는 main.py(${mainPyPath})를 찾을 수 없습니다.`));
       return;
     }
-    const proc = spawn(PYTHON_EXE, [MAIN_PY, ...args], { cwd: PROJECT_ROOT });
+    const proc = spawn(pythonExePath, [mainPyPath, ...args], { cwd: projectRoot() });
     let stdout = "";
     let stderr = "";
     proc.stdout.on("data", (chunk: Buffer) => (stdout += chunk.toString("utf-8")));
@@ -96,7 +156,7 @@ function caseFromPython(raw: Record<string, unknown>): CaseSummary {
     id,
     name: raw.name as string,
     targetDir: raw.target_dir as string,
-    dir: path.join(CASES_DIR, id),
+    dir: path.join(casesDir(), id),
     createdAt: raw.created_at as string,
     lastRunAt: (raw.last_run_at as string | null) ?? null,
     lastRunStatus: (raw.last_run_status as string | null) ?? null,
@@ -121,11 +181,13 @@ ipcMain.handle("create-case", async (_event, name: string, targetDir: string): P
 
 ipcMain.handle("list-artifacts", (): Promise<string[]> => {
   return new Promise((resolve) => {
-    if (!fs.existsSync(PYTHON_EXE) || !fs.existsSync(MAIN_PY)) {
+    const pythonExePath = pythonExe();
+    const mainPyPath = mainPy();
+    if (!fs.existsSync(pythonExePath) || !fs.existsSync(mainPyPath)) {
       resolve([]);
       return;
     }
-    const proc = spawn(PYTHON_EXE, [MAIN_PY, "--list-artifacts"], { cwd: PROJECT_ROOT });
+    const proc = spawn(pythonExePath, [mainPyPath, "--list-artifacts"], { cwd: projectRoot() });
     let out = "";
     proc.stdout.on("data", (chunk: Buffer) => (out += chunk.toString("utf-8")));
     proc.on("close", () => {
@@ -152,19 +214,21 @@ ipcMain.handle(
         resolve({ exitCode: -1 });
         return;
       }
-      if (!fs.existsSync(PYTHON_EXE) || !fs.existsSync(MAIN_PY)) {
+      const pythonExePath = pythonExe();
+      const mainPyPath = mainPy();
+      if (!fs.existsSync(pythonExePath) || !fs.existsSync(mainPyPath)) {
         event.sender.send("pipeline-log", {
-          line: `[electron] python(${PYTHON_EXE}) 또는 main.py(${MAIN_PY})를 찾을 수 없습니다.`,
+          line: `[electron] python(${pythonExePath}) 또는 main.py(${mainPyPath})를 찾을 수 없습니다.`,
           stream: "stderr",
         } satisfies PipelineLogEntry);
         resolve({ exitCode: -1 });
         return;
       }
 
-      const args = [MAIN_PY, "--run-case", options.caseId];
+      const args = [mainPyPath, "--run-case", options.caseId];
       if (options.only && options.only.length > 0) args.push("--only", options.only.join(","));
 
-      const proc = spawn(PYTHON_EXE, args, { cwd: PROJECT_ROOT });
+      const proc = spawn(pythonExePath, args, { cwd: projectRoot() });
       currentPipelineProcess = proc;
 
       const emit = (stream: "stdout" | "stderr", chunk: Buffer) => {
