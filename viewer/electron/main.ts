@@ -11,7 +11,6 @@ import type {
   CsvData,
   PipelineLogEntry,
   PipelineResult,
-  ProjectRootStatus,
   ResultFileEntry,
   RunCaseOptions,
 } from "./types";
@@ -19,60 +18,34 @@ import type {
 const isDev = process.env.NODE_ENV === "development";
 
 // In dev, viewer/electron/main.ts -> project root is two levels up, and the
-// pipeline (main.py), its venv, and cases/ all live there. A packaged build
-// has no such fixed relationship — electron-builder's portable target
-// self-extracts to a temp directory at runtime, so __dirname no longer
-// points anywhere near the actual Windows-Analysis checkout. In that case
-// the user must explicitly point the app at their checkout folder (the one
-// containing main.py/venv/cases), persisted here across restarts.
-interface AppConfig {
-  projectRoot?: string;
-}
-
-// Computed lazily (not at module load) — app.getPath() is only reliably
-// valid after the 'ready' event, and every caller here runs from an
-// ipcMain handler, which is always well after that.
-function configPath(): string {
-  return path.join(app.getPath("userData"), "config.json");
-}
-
-function readAppConfig(): AppConfig {
-  try {
-    return JSON.parse(fs.readFileSync(configPath(), "utf-8"));
-  } catch {
-    return {};
-  }
-}
-
-function writeAppConfig(config: AppConfig): void {
-  const file = configPath();
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, JSON.stringify(config, null, 2), "utf-8");
-}
-
-function defaultProjectRoot(): string {
+// pipeline runs from the live venv + main.py there — fast to iterate on. A
+// packaged build instead ships a PyInstaller-frozen copy of the whole
+// pipeline (main.py + all parser deps, no separate Python install needed)
+// as an extraResource; process.resourcesPath points at it directly, with no
+// dependency on where the app happens to be installed/extracted.
+function devProjectRoot(): string {
   return path.resolve(__dirname, "..", "..");
 }
 
-function isValidProjectRoot(root: string): boolean {
-  return fs.existsSync(path.join(root, "main.py"));
+function pipelineCommand(): { file: string; baseArgs: string[] } {
+  if (isDev) {
+    return {
+      file: path.join(devProjectRoot(), "venv", "Scripts", "python.exe"),
+      baseArgs: [path.join(devProjectRoot(), "main.py")],
+    };
+  }
+  return {
+    file: path.join(process.resourcesPath, "pipeline", "windows-analysis-pipeline.exe"),
+    baseArgs: [],
+  };
 }
 
-function projectRoot(): string {
-  if (isDev) return defaultProjectRoot();
-  return readAppConfig().projectRoot ?? defaultProjectRoot();
-}
-
-function pythonExe(): string {
-  return path.join(projectRoot(), "venv", "Scripts", "python.exe");
-}
-
-function mainPy(): string {
-  return path.join(projectRoot(), "main.py");
-}
-
+// Case data has to live somewhere writable that doesn't depend on install
+// location — the dev checkout's cases/ folder in dev, the per-user app data
+// directory in a packaged build.
 function casesDir(): string {
-  return path.join(projectRoot(), "cases");
+  if (isDev) return path.join(devProjectRoot(), "cases");
+  return path.join(app.getPath("userData"), "cases");
 }
 
 function createWindow(): void {
@@ -112,31 +85,17 @@ ipcMain.handle("pick-folder", async (): Promise<string | null> => {
   return result.filePaths[0];
 });
 
-ipcMain.handle("get-project-root", (): ProjectRootStatus => {
-  const root = projectRoot();
-  return { root, valid: isValidProjectRoot(root) };
-});
-
-ipcMain.handle("pick-project-root", async (): Promise<ProjectRootStatus | null> => {
-  const result = await dialog.showOpenDialog({ properties: ["openDirectory"] });
-  if (result.canceled || result.filePaths.length === 0) return null;
-  const root = result.filePaths[0];
-  const valid = isValidProjectRoot(root);
-  if (valid) writeAppConfig({ projectRoot: root });
-  return { root, valid };
-});
-
 // --- main.py invocation helpers ---
 
 function runPython(args: string[]): Promise<{ stdout: string; exitCode: number | null }> {
   return new Promise((resolve, reject) => {
-    const pythonExePath = pythonExe();
-    const mainPyPath = mainPy();
-    if (!fs.existsSync(pythonExePath) || !fs.existsSync(mainPyPath)) {
-      reject(new Error(`python(${pythonExePath}) 또는 main.py(${mainPyPath})를 찾을 수 없습니다.`));
+    const { file, baseArgs } = pipelineCommand();
+    if (!fs.existsSync(file)) {
+      reject(new Error(`파싱 파이프라인 실행 파일을 찾을 수 없습니다: ${file}`));
       return;
     }
-    const proc = spawn(pythonExePath, [mainPyPath, ...args], { cwd: projectRoot() });
+    fs.mkdirSync(casesDir(), { recursive: true });
+    const proc = spawn(file, [...baseArgs, ...args, "--cases-dir", casesDir()]);
     let stdout = "";
     let stderr = "";
     proc.stdout.on("data", (chunk: Buffer) => (stdout += chunk.toString("utf-8")));
@@ -187,13 +146,12 @@ ipcMain.handle("create-case", async (_event, name: string, targetDir: string): P
 
 ipcMain.handle("list-artifacts", (): Promise<string[]> => {
   return new Promise((resolve) => {
-    const pythonExePath = pythonExe();
-    const mainPyPath = mainPy();
-    if (!fs.existsSync(pythonExePath) || !fs.existsSync(mainPyPath)) {
+    const { file, baseArgs } = pipelineCommand();
+    if (!fs.existsSync(file)) {
       resolve([]);
       return;
     }
-    const proc = spawn(pythonExePath, [mainPyPath, "--list-artifacts"], { cwd: projectRoot() });
+    const proc = spawn(file, [...baseArgs, "--list-artifacts", "--cases-dir", casesDir()]);
     let out = "";
     proc.stdout.on("data", (chunk: Buffer) => (out += chunk.toString("utf-8")));
     proc.on("close", () => {
@@ -220,21 +178,21 @@ ipcMain.handle(
         resolve({ exitCode: -1 });
         return;
       }
-      const pythonExePath = pythonExe();
-      const mainPyPath = mainPy();
-      if (!fs.existsSync(pythonExePath) || !fs.existsSync(mainPyPath)) {
+      const { file, baseArgs } = pipelineCommand();
+      if (!fs.existsSync(file)) {
         event.sender.send("pipeline-log", {
-          line: `[electron] python(${pythonExePath}) 또는 main.py(${mainPyPath})를 찾을 수 없습니다.`,
+          line: `[electron] 파싱 파이프라인 실행 파일을 찾을 수 없습니다: ${file}`,
           stream: "stderr",
         } satisfies PipelineLogEntry);
         resolve({ exitCode: -1 });
         return;
       }
+      fs.mkdirSync(casesDir(), { recursive: true });
 
-      const args = [mainPyPath, "--run-case", options.caseId];
+      const args = [...baseArgs, "--run-case", options.caseId, "--cases-dir", casesDir()];
       if (options.only && options.only.length > 0) args.push("--only", options.only.join(","));
 
-      const proc = spawn(pythonExePath, args, { cwd: projectRoot() });
+      const proc = spawn(file, args);
       currentPipelineProcess = proc;
 
       const emit = (stream: "stdout" | "stderr", chunk: Buffer) => {

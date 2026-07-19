@@ -14,3 +14,9 @@ viewer/node_modules/
 viewer/out/
 viewer/dist-electron/
 viewer/release/
+
+# PyInstaller build output for the standalone-exe pipeline bundle — built
+# fresh by CI (and locally, on demand), never committed.
+pyinstaller-dist/
+pyinstaller-build/
+*.spec

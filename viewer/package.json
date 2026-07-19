@@ -50,6 +50,12 @@
     "asarUnpack": [
       "**/*.node"
     ],
+    "extraResources": [
+      {
+        "from": "../pyinstaller-dist/windows-analysis-pipeline",
+        "to": "pipeline"
+      }
+    ],
     "win": {
       "target": [
         "portable"

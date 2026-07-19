@@ -73,12 +73,6 @@ export interface PipelineLogEntry {
   stream: "stdout" | "stderr";
 }
 
-/** Where the app looks for main.py/venv/cases — auto-derived in dev, user-configured in a packaged build. */
-export interface ProjectRootStatus {
-  root: string;
-  valid: boolean;
-}
-
 export interface RunCaseOptions {
   caseId: string;
   /** Artifact names to run — omit to run all. */
@@ -103,8 +97,6 @@ export interface ElectronApi {
   listBookmarks(caseDir: string): Promise<Bookmark[]>;
   toggleBookmark(caseDir: string, entry: BookmarkInput): Promise<Bookmark[]>;
   updateBookmarkNote(caseDir: string, id: string, note: string): Promise<Bookmark[]>;
-  getProjectRoot(): Promise<ProjectRootStatus>;
-  pickProjectRoot(): Promise<ProjectRootStatus | null>;
 }
 
 declare global {

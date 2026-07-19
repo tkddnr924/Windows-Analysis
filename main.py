@@ -21,11 +21,9 @@ from common.finder import dedupe_by_content
 from common.registry import ARTIFACTS
 from common.sqlite_writer import write_rows_to_sqlite
 
-PROJECT_ROOT = Path(__file__).resolve().parent
-
-
-def run_case(case_id: str, only: set[str] | None = None) -> None:
-    case = case_store.load_case(case_id)
+def run_case(case_id: str, cases_dir: Path, only: set[str] | None = None) -> None:
+    case = case_store.load_case(case_id, cases_dir)
+    case_output_dir = case_store.case_dir(cases_dir, case)
     target_dir = Path(case.target_dir)
 
     artifacts_run = []
@@ -57,7 +55,7 @@ def run_case(case_id: str, only: set[str] | None = None) -> None:
 
         all_results[artifact.name] = results
 
-        artifact_dir = case.dir / artifact.category.upper() / artifact.subfolder
+        artifact_dir = case_output_dir / artifact.category.upper() / artifact.subfolder
         for output_name, rows in results.items():
             sqlite_path = artifact_dir / f"{output_name}.sqlite"
             write_rows_to_sqlite(rows, sqlite_path, output_name, artifact.field_order.get(output_name, []))
@@ -66,7 +64,7 @@ def run_case(case_id: str, only: set[str] | None = None) -> None:
         artifacts_run.append(artifact.name)
 
     print("=== _OVERVIEW ===")
-    overview_dir = case.dir / "_OVERVIEW"
+    overview_dir = case_output_dir / "_OVERVIEW"
     overview_builders = {
         "TargetInfo": correlate.build_target_info,
         "ExecutionHistory": correlate.build_execution_history,
@@ -81,6 +79,7 @@ def run_case(case_id: str, only: set[str] | None = None) -> None:
 
     case_store.update_case_status(
         case_id,
+        cases_dir,
         run_at=dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         status="error" if had_error else "ok",
         artifacts_run=artifacts_run,
@@ -99,14 +98,21 @@ def main():
         action="store_true",
         help="Print known artifact names as a JSON array and exit (used by the viewer GUI to build the run screen)",
     )
+    parser.add_argument(
+        "--cases-dir",
+        required=True,
+        help="Folder holding one subfolder per case — chosen by the caller (the viewer GUI), since a "
+        "frozen/packaged build has no meaningful project-relative default.",
+    )
     args = parser.parse_args()
+    cases_dir = Path(args.cases_dir).resolve()
 
     if args.list_artifacts:
         print(json.dumps([artifact.name for artifact in ARTIFACTS]))
         return
 
     if args.list_cases:
-        cases = case_store.list_cases()
+        cases = case_store.list_cases(cases_dir)
         print(json.dumps([asdict(c) for c in cases], ensure_ascii=False))
         return
 
@@ -114,13 +120,13 @@ def main():
         if not args.target:
             parser.error("--create-case requires --target")
         created_at = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        case = case_store.create_case(args.create_case, str(Path(args.target).resolve()), created_at)
+        case = case_store.create_case(args.create_case, str(Path(args.target).resolve()), created_at, cases_dir)
         print(json.dumps(asdict(case), ensure_ascii=False))
         return
 
     if args.run_case:
         only = set(args.only.split(",")) if args.only else None
-        run_case(args.run_case, only=only)
+        run_case(args.run_case, cases_dir, only=only)
         return
 
     parser.error("one of --create-case, --run-case, --list-cases, --list-artifacts is required")

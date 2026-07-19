@@ -7,7 +7,6 @@ import type {
   CsvData,
   PipelineLogEntry,
   PipelineResult,
-  ProjectRootStatus,
   ResultFileEntry,
   RunCaseOptions,
 } from "./types";
@@ -34,6 +33,4 @@ contextBridge.exposeInMainWorld("api", {
     ipcRenderer.invoke("toggle-bookmark", caseDir, entry),
   updateBookmarkNote: (caseDir: string, id: string, note: string): Promise<Bookmark[]> =>
     ipcRenderer.invoke("update-bookmark-note", caseDir, id, note),
-  getProjectRoot: (): Promise<ProjectRootStatus> => ipcRenderer.invoke("get-project-root"),
-  pickProjectRoot: (): Promise<ProjectRootStatus | null> => ipcRenderer.invoke("pick-project-root"),
 });

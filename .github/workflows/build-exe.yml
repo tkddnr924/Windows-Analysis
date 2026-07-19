@@ -10,20 +10,35 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
-    defaults:
-      run:
-        working-directory: viewer
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Freezes main.py + all parser dependencies (regipy, evtx, olefile,
+      # LnkParse3, libscca-python) into a standalone pipeline the packaged
+      # app can run with no separate Python install — verified locally to
+      # produce byte-for-byte identical parsing output to the venv+python.exe
+      # dev path. --collect-data regipy is required: PyInstaller's static
+      # import analysis doesn't see regipy/plugins/validated_plugins.json
+      # since it's a data file, not a module, and misses it without this.
+      - name: Build standalone pipeline (PyInstaller)
+        run: |
+          pip install -r requirements.txt pyinstaller
+          pyinstaller --onedir --name windows-analysis-pipeline --collect-data regipy --distpath pyinstaller-dist --workpath pyinstaller-build --specpath pyinstaller-build main.py
 
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
 
       - name: Install dependencies
+        working-directory: viewer
         run: npm ci
 
       - name: Build portable .exe
+        working-directory: viewer
         env:
           # Skip electron-builder's macOS code-signing tool download — not
           # needed for an unsigned Windows portable build, and extracting it
