@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: windows-latest
@@ -15,7 +18,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
 
       - name: Install dependencies
         run: npm ci
@@ -33,3 +36,16 @@ jobs:
           name: Windows-Analysis-Viewer
           path: viewer/release/*.exe
           if-no-files-found: error
+
+      # Every push to main updates this same "latest" release in place —
+      # rolling build, not one release per commit — so there's always a
+      # single, stable download link on the repo's Releases page.
+      - name: Publish to "latest" release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: Latest build
+          make_latest: true
+          files: viewer/release/*.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
