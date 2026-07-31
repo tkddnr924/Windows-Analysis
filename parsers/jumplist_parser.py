@@ -34,6 +34,15 @@ from common.utils import UTC, format_timestamp
 ARTIFACT_NAME = "JumpList"
 EXTENSIONS = [".automaticDestinations-ms", ".customDestinations-ms"]
 
+# Codepage LnkParse3 uses to decode a LNK's ANSI (non-Unicode) strings —
+# target paths, working dirs, etc. These carry the ANSI code page of the
+# machine that created the shortcut, NOT UTF-8: on a Korean Windows that's
+# cp949 (EUC-KR). Decoding those bytes as UTF-8 (the old default) failed on
+# every Hangul path (0xbe/0xc0/... "invalid start byte") and produced
+# mojibake. cp949 is a superset of ASCII, so plain-ASCII paths still decode
+# correctly. Change this if analyzing evidence from a different locale.
+_LNK_ANSI_CODEPAGE = "cp949"
+
 FIELD_ORDER = {
     "JumpList_Entries": [
         "timestamp", "created_time", "modified_time", "app_id",
@@ -123,7 +132,7 @@ def _parse_automatic(path: Path) -> list[dict]:
         for stream_id in stream_names:
             try:
                 data = ole.openstream(stream_id).read()
-                parsed = LnkFile(indata=data, cp="utf-8").get_json()
+                parsed = LnkFile(indata=data, cp=_LNK_ANSI_CODEPAGE).get_json()
                 rows.append(_row_from_lnk(parsed, app_id, "Automatic", stream_id, source_file))
             except Exception as exc:
                 rows.append(_error_row(app_id, "Automatic", stream_id, source_file, exc))
@@ -151,7 +160,7 @@ def _parse_custom(path: Path) -> list[dict]:
     for i, offset in enumerate(offsets):
         stream_id = str(i)
         try:
-            parsed = LnkFile(indata=data[offset:], cp="utf-8").get_json()
+            parsed = LnkFile(indata=data[offset:], cp=_LNK_ANSI_CODEPAGE).get_json()
             rows.append(_row_from_lnk(parsed, app_id, "Custom", stream_id, source_file))
         except Exception as exc:
             rows.append(_error_row(app_id, "Custom", stream_id, source_file, exc))
