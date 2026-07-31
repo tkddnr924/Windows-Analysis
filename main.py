@@ -12,9 +12,21 @@
 import argparse
 import datetime as dt
 import json
+import sys
 import traceback
 from dataclasses import asdict
 from pathlib import Path
+
+# On a Korean (or any non-UTF-8) Windows, Python's stdout/stderr default to the
+# locale ANSI code page (e.g. cp949) — especially when the streams are pipes,
+# as they are when the Electron viewer spawns this process. The viewer always
+# decodes that output as UTF-8, so Korean case names and file paths printed
+# here come out as mojibake ("이상한 글씨"). Force UTF-8 on both streams so the
+# bytes on the wire match what the viewer expects. Guard with hasattr because a
+# windowed/frozen build can have stdout/stderr set to None.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8")
 
 from common import case_store, correlate
 from common.finder import dedupe_by_content

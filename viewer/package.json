@@ -1,6 +1,6 @@
 {
   "name": "windows-analysis-viewer",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "description": "Desktop viewer for Windows-Analysis parsed CSV output (Electron + Next.js)",
   "main": "dist-electron/main.js",
@@ -62,7 +62,7 @@
       ]
     },
     "portable": {
-      "artifactName": "${productName}.exe",
+      "artifactName": "Windows_Analysis_asvv924.exe",
       "requestExecutionLevel": "user",
       "unpackDirName": "WindowsAnalysisViewer"
     }

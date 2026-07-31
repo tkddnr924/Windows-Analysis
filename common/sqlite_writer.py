@@ -7,8 +7,23 @@ stay visible as ordinary rows instead of being dropped.
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
+
+
+def _to_cell(value):
+    """Coerce a parser value into something sqlite3 can bind to a TEXT column.
+
+    Registry values such as REG_MULTI_SZ come back as Python lists (and some
+    parsers emit dict/tuple/set values), which sqlite3 refuses to bind
+    ("type 'list' is not supported"). Serialize any non-scalar to a JSON
+    string — lossless and readable — while leaving the scalar types sqlite3
+    already handles (str/int/float/bytes/None) untouched.
+    """
+    if value is None or isinstance(value, (str, int, float, bytes)):
+        return value
+    return json.dumps(value, ensure_ascii=False, default=str)
 
 
 def write_rows_to_sqlite(
@@ -40,6 +55,6 @@ def write_rows_to_sqlite(
         insert_sql = f'INSERT INTO "{table_name}" ({quoted_fields}) VALUES ({placeholders})'
         conn.executemany(
             insert_sql,
-            [[row.get(f, "") for f in ordered_fields] for row in rows],
+            [[_to_cell(row.get(f, "")) for f in ordered_fields] for row in rows],
         )
         conn.commit()
