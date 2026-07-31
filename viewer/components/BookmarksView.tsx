@@ -12,6 +12,21 @@ interface BookmarksViewProps {
   onUpdateNote: (id: string, note: string) => void;
 }
 
+// `taggedAt` is stored as a UTC ISO string (`new Date().toISOString()`),
+// but every other time in this app is KST (the parser converts to UTC+9
+// and writes a plain "YYYY-MM-DD HH:MM:SS.fff" string). Rendering the raw
+// ISO/UTC value here made it look 9 hours off from everything else. Convert
+// to KST wall-clock in the same format — computed explicitly as UTC+9 (not
+// via the viewer machine's locale) so it matches the app's fixed KST
+// convention regardless of where the viewer runs.
+function formatTaggedAt(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  const kst = new Date(d.getTime() + 9 * 60 * 60 * 1000);
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${kst.getUTCFullYear()}-${p(kst.getUTCMonth() + 1)}-${p(kst.getUTCDate())} ${p(kst.getUTCHours())}:${p(kst.getUTCMinutes())}:${p(kst.getUTCSeconds())}`;
+}
+
 export default function BookmarksView({ bookmarks, onNavigate, onRemove, onUpdateNote }: BookmarksViewProps) {
   const [rowCache, setRowCache] = useState<Record<string, CsvData>>({});
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -68,6 +83,11 @@ export default function BookmarksView({ bookmarks, onNavigate, onRemove, onUpdat
           const row = data?.rows.find((r) => Number((r as unknown as Record<string, unknown>).__rowid) === bookmark.rowid);
           const spec = getArtifactView(bookmark.tableName);
           const notFound = data !== undefined && !row;
+          // The event's own timestamp (already KST from the parser) — prefer
+          // the spec's designated timeline field, falling back to a plain
+          // `timestamp` column. This is the "when did it happen" time, kept
+          // distinct from taggedAt ("when I bookmarked it").
+          const eventTime = row ? row[spec?.timelineField ?? "timestamp"] || row.timestamp || "" : "";
 
           return (
             <div key={bookmark.id} style={{ padding: "12px 14px", borderBottom: "1px solid var(--border-subtle)" }}>
@@ -76,7 +96,7 @@ export default function BookmarksView({ bookmarks, onNavigate, onRemove, onUpdat
                   style={{ flex: 1, minWidth: 0, cursor: row ? "pointer" : "default" }}
                   onClick={() => row && onNavigate(bookmark.tableName, "__rowid", String(bookmark.rowid))}
                 >
-                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
                     <span
                       style={{
                         fontSize: 10.5,
@@ -89,7 +109,14 @@ export default function BookmarksView({ bookmarks, onNavigate, onRemove, onUpdat
                     >
                       {bookmark.tableName}
                     </span>
-                    <span style={{ fontSize: 11, color: "var(--text-faint)" }}>{bookmark.taggedAt}</span>
+                    {eventTime && (
+                      <span style={{ fontSize: 11.5, color: "var(--text-dim)", fontFamily: "var(--mono)" }}>
+                        🕐 {eventTime}
+                      </span>
+                    )}
+                    <span style={{ fontSize: 11, color: "var(--text-faint)", marginLeft: "auto", fontFamily: "var(--mono)" }} title="북마크한 시각 (KST)">
+                      북마크 {formatTaggedAt(bookmark.taggedAt)}
+                    </span>
                   </div>
                   <div style={{ marginTop: 4, fontSize: 13, fontWeight: 600 }}>
                     {!data
