@@ -62,6 +62,57 @@ function prettyJsonOrNull(value: string): string | null {
   }
 }
 
+// Renders a code/JSON blob. When the value parses as JSON it defaults to a
+// beautified (indented) view with a toggle back to the original one-line
+// form; otherwise it just shows the raw text. Used for `json`/`code` fields
+// and for any plain field whose value turns out to be JSON.
+function CodeOrJsonBlock({ raw }: { raw: string }) {
+  const pretty = prettyJsonOrNull(raw);
+  const [beautified, setBeautified] = useState(true);
+  const isJson = pretty !== null;
+
+  return (
+    <div>
+      {isJson && (
+        <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 4 }}>
+          <button
+            onClick={() => setBeautified((b) => !b)}
+            title={beautified ? "원본(압축) 보기" : "보기 좋게 정렬"}
+            style={{
+              fontSize: 10,
+              padding: "1px 8px",
+              background: "var(--bg-elevated)",
+              color: "var(--accent)",
+              border: "1px solid var(--border)",
+              borderRadius: "var(--radius-sm)",
+              cursor: "pointer",
+            }}
+          >
+            {beautified ? "{ } 원본" : "{ } 정렬"}
+          </button>
+        </div>
+      )}
+      <pre
+        style={{
+          margin: 0,
+          padding: 8,
+          background: "var(--bg-input)",
+          border: "1px solid var(--border)",
+          borderRadius: "var(--radius-md)",
+          fontFamily: "var(--mono)",
+          fontSize: 12,
+          whiteSpace: "pre-wrap",
+          wordBreak: "break-all",
+          maxHeight: 260,
+          overflow: "auto",
+        }}
+      >
+        {isJson && beautified ? pretty : raw}
+      </pre>
+    </div>
+  );
+}
+
 function Badge({ text, color }: { text: string; color?: string }) {
   if (!text) return null;
   return (
@@ -140,34 +191,17 @@ function FieldRow({ field, row }: { field: FieldSpec; row: Record<string, string
       );
       break;
     case "code":
-    case "json": {
-      const pretty = kind === "json" ? prettyJsonOrNull(raw) : null;
-      content = (
-        <pre
-          style={{
-            margin: 0,
-            padding: 8,
-            background: "var(--bg-input)",
-            border: "1px solid var(--border)",
-            borderRadius: "var(--radius-md)",
-            fontFamily: "var(--mono)",
-            fontSize: 12,
-            whiteSpace: "pre-wrap",
-            wordBreak: "break-all",
-            maxHeight: 260,
-            overflow: "auto",
-          }}
-        >
-          {pretty ?? raw}
-        </pre>
-      );
+    case "json":
+      content = <CodeOrJsonBlock raw={raw} />;
       break;
-    }
     case "privileges":
       content = <PrivilegeList raw={raw} />;
       break;
     default:
-      content = <span style={{ fontSize: 12.5 }}>{displayValue}</span>;
+      // A plain text/path field can still hold a JSON blob (e.g. a registry
+      // value, a serialized argument) — offer the same beautify toggle when
+      // the value actually parses as JSON, otherwise render it inline.
+      content = prettyJsonOrNull(raw) ? <CodeOrJsonBlock raw={raw} /> : <span style={{ fontSize: 12.5 }}>{displayValue}</span>;
   }
 
   return (

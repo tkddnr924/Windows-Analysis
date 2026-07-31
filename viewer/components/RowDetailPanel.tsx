@@ -31,7 +31,9 @@ function tryPrettyJson(value: string): string | null {
 
 function RawFieldValue({ column, value, focused }: { column: string; value: string; focused: boolean }) {
   const [copied, setCopied] = useState(false);
+  const [beautified, setBeautified] = useState(true);
   const pretty = tryPrettyJson(value);
+  const isJson = pretty !== null;
 
   function copy() {
     navigator.clipboard.writeText(value).then(() => {
@@ -51,10 +53,28 @@ function RawFieldValue({ column, value, focused }: { column: string; value: stri
     >
       <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
         <span style={{ color: "var(--accent)", fontWeight: 600, fontFamily: "var(--mono)", fontSize: 12 }}>{column}</span>
+        {isJson && (
+          <button
+            onClick={() => setBeautified((b) => !b)}
+            title={beautified ? "원본(압축) 보기" : "보기 좋게 정렬"}
+            style={{
+              marginLeft: "auto",
+              fontSize: 11,
+              padding: "2px 8px",
+              background: "var(--bg-elevated)",
+              color: "var(--accent)",
+              border: "1px solid var(--border)",
+              borderRadius: "var(--radius-sm)",
+              cursor: "pointer",
+            }}
+          >
+            {beautified ? "{ } 원본" : "{ } 정렬"}
+          </button>
+        )}
         <button
           onClick={copy}
           style={{
-            marginLeft: "auto",
+            marginLeft: isJson ? 0 : "auto",
             fontSize: 11,
             padding: "2px 8px",
             background: "var(--bg-elevated)",
@@ -77,7 +97,7 @@ function RawFieldValue({ column, value, focused }: { column: string; value: stri
           color: value ? "var(--text)" : "var(--text-faint)",
         }}
       >
-        {pretty ?? value ?? "(empty)"}
+        {isJson && beautified ? pretty : value || "(empty)"}
       </pre>
     </div>
   );
