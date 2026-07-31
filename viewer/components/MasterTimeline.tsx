@@ -82,6 +82,23 @@ export default function MasterTimeline({ entries, loading, onNavigate, onFetchLi
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [allRows, startBound, endBound, sortDir, hiddenTables, rangeActive]);
 
+  // Earliest/latest timestamp among the rows actually shown — drives the
+  // status bar's range readout. Rows without a timestamp are ignored here.
+  const timeSpan = useMemo(() => {
+    let min = "";
+    let max = "";
+    let missing = 0;
+    for (const e of rows) {
+      if (!e.timestamp) {
+        missing += 1;
+        continue;
+      }
+      if (!min || e.timestamp < min) min = e.timestamp;
+      if (!max || e.timestamp > max) max = e.timestamp;
+    }
+    return { min, max, missing };
+  }, [rows]);
+
   const virtualizer = useVirtualizer({
     count: rows.length,
     getScrollElement: () => scrollRef.current,
@@ -272,12 +289,12 @@ export default function MasterTimeline({ entries, loading, onNavigate, onFetchLi
       </div>
 
       {rows.length === 0 ? (
-        <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "100%", color: "var(--text-faint)", gap: 8 }}>
+        <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", color: "var(--text-faint)", gap: 8 }}>
           <span style={{ fontSize: 32 }}>🕐</span>
           <span>{rangeActive ? "선택한 기간에 해당하는 기록이 없습니다." : "표시할 시간 기록이 없습니다."}</span>
         </div>
       ) : (
-      <div ref={scrollRef} style={{ flex: 1, overflow: "auto" }}>
+      <div ref={scrollRef} style={{ flex: 1, minHeight: 0, overflow: "auto" }}>
         <div style={{ height: paddingTop }} />
         {virtualRows.map((virtualRow) => {
           const entry = rows[virtualRow.index];
@@ -371,6 +388,41 @@ export default function MasterTimeline({ entries, loading, onNavigate, onFetchLi
         <div style={{ height: paddingBottom }} />
       </div>
       )}
+
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 16,
+          padding: "5px 14px",
+          borderTop: "1px solid var(--border)",
+          background: "var(--bg-panel)",
+          flexShrink: 0,
+          fontSize: 11.5,
+          fontFamily: "var(--mono)",
+          color: "var(--text-faint)",
+          whiteSpace: "nowrap",
+          overflow: "hidden",
+        }}
+      >
+        <span>
+          총 <strong style={{ color: "var(--text-dim)" }}>{allRows.length.toLocaleString()}</strong>건
+        </span>
+        <span>
+          표시 <strong style={{ color: "var(--text-dim)" }}>{rows.length.toLocaleString()}</strong>건
+          {rangeActive || hiddenTables.size > 0 ? " (필터 적용됨)" : ""}
+        </span>
+        <span>
+          아티팩트 <strong style={{ color: "var(--text-dim)" }}>{tableCounts.length - hiddenTables.size}</strong>/{tableCounts.length}종
+        </span>
+        {timeSpan.missing > 0 && <span>시간 정보 없음 {timeSpan.missing.toLocaleString()}건</span>}
+        {timeSpan.min && (
+          <span style={{ marginLeft: "auto", color: "var(--text-dim)", overflow: "hidden", textOverflow: "ellipsis" }}>
+            {timeSpan.min} ~ {timeSpan.max}
+          </span>
+        )}
+        <span style={{ marginLeft: timeSpan.min ? 0 : "auto" }}>{sortDir === "asc" ? "▲ 과거→최근" : "▼ 최근→과거"}</span>
+      </div>
 
       {selectedEntry && (
         <RowDetailPanel
