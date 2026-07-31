@@ -24,6 +24,7 @@ distinct, fiddlier binary format that can be added as a follow-up.
 A stream/entry that fails to parse is recorded as its own row with
 _status="corrupted" rather than silently skipped.
 """
+import warnings
 from pathlib import Path
 
 import olefile
@@ -42,6 +43,23 @@ EXTENSIONS = [".automaticDestinations-ms", ".customDestinations-ms"]
 # mojibake. cp949 is a superset of ASCII, so plain-ASCII paths still decode
 # correctly. Change this if analyzing evidence from a different locale.
 _LNK_ANSI_CODEPAGE = "cp949"
+
+
+def _parse_lnk(data: bytes) -> dict:
+    """Parse one LNK structure with LnkParse3, silencing its UserWarnings.
+
+    LnkParse3 warns (to stderr) for shell-item types/fields it doesn't
+    implement and for the occasional raw-bytes field that decodes as neither
+    cp949 nor UTF-8 (e.g. an unimplemented item_type 0x07's payload printed
+    as a bogus string). These are harmless noise — the values we actually
+    read (target path, header timestamps) come from link_info/header, which
+    parse fine — but they flood the viewer's streamed pipeline log. A real
+    parse failure still raises and is recorded as a corrupted row by callers.
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        return LnkFile(indata=data, cp=_LNK_ANSI_CODEPAGE).get_json()
+
 
 FIELD_ORDER = {
     "JumpList_Entries": [
@@ -132,7 +150,7 @@ def _parse_automatic(path: Path) -> list[dict]:
         for stream_id in stream_names:
             try:
                 data = ole.openstream(stream_id).read()
-                parsed = LnkFile(indata=data, cp=_LNK_ANSI_CODEPAGE).get_json()
+                parsed = _parse_lnk(data)
                 rows.append(_row_from_lnk(parsed, app_id, "Automatic", stream_id, source_file))
             except Exception as exc:
                 rows.append(_error_row(app_id, "Automatic", stream_id, source_file, exc))
@@ -160,7 +178,7 @@ def _parse_custom(path: Path) -> list[dict]:
     for i, offset in enumerate(offsets):
         stream_id = str(i)
         try:
-            parsed = LnkFile(indata=data[offset:], cp=_LNK_ANSI_CODEPAGE).get_json()
+            parsed = _parse_lnk(data[offset:])
             rows.append(_row_from_lnk(parsed, app_id, "Custom", stream_id, source_file))
         except Exception as exc:
             rows.append(_error_row(app_id, "Custom", stream_id, source_file, exc))
