@@ -64,6 +64,27 @@ def find_files_by_suffix(target_dir: Path, suffixes: list[str]) -> list[Path]:
     return matches
 
 
+def find_files_by_content(target_dir: Path, marker: str, max_bytes: int = 4096) -> list[Path]:
+    """Recursively find files whose first `max_bytes` contain `marker`, tested
+    as both UTF-8 and UTF-16LE byte sequences. For content-typed artifacts
+    that have no fixed filename or extension — e.g. Task Scheduler task
+    definitions, which are XML files with arbitrary names (often no
+    extension) identified only by their task-schema namespace."""
+    needles = [marker.encode("utf-8"), marker.encode("utf-16-le")]
+    matches = []
+    for path in target_dir.rglob("*"):
+        if not path.is_file():
+            continue
+        try:
+            with open(path, "rb") as f:
+                head = f.read(max_bytes)
+        except OSError:
+            continue
+        if any(n in head for n in needles):
+            matches.append(path)
+    return matches
+
+
 _SQLITE_MAGIC = b"SQLite format 3\x00"
 
 

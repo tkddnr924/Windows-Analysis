@@ -12,6 +12,7 @@
 import argparse
 import datetime as dt
 import json
+import shutil
 import sys
 import traceback
 from dataclasses import asdict
@@ -37,6 +38,17 @@ def run_case(case_id: str, cases_dir: Path, only: set[str] | None = None) -> Non
     case = case_store.load_case(case_id, cases_dir)
     case_output_dir = case_store.case_dir(cases_dir, case)
     target_dir = Path(case.target_dir)
+
+    # On a full re-parse, wipe previous output first so renamed or removed
+    # artifacts (e.g. an overview table that changed name, or an artifact no
+    # longer in the registry) don't leave stale .sqlite files behind. Only the
+    # per-CATEGORY output folders and _OVERVIEW are removed — case.json and
+    # bookmarks.json live in the case root and are preserved. A partial
+    # (--only) run leaves the untouched artifacts' output in place.
+    if only is None:
+        for child in case_output_dir.iterdir():
+            if child.is_dir():
+                shutil.rmtree(child, ignore_errors=True)
 
     artifacts_run = []
     had_error = False
@@ -80,7 +92,7 @@ def run_case(case_id: str, cases_dir: Path, only: set[str] | None = None) -> Non
     overview_builders = {
         "TargetInfo": correlate.build_target_info,
         "ExecutionHistory": correlate.build_execution_history,
-        "RemoteAccessHistory": correlate.build_remote_access_history,
+        "RemoteDesktopHistory": correlate.build_remote_desktop_history,
         "BrowserTimeline": correlate.build_browser_timeline,
     }
     for output_name, builder in overview_builders.items():

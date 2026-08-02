@@ -64,6 +64,48 @@ export interface ArtifactViewSpec {
    */
   priorityColumns?: string[];
   /**
+   * Restrict the TABLE view to ONLY these columns (in this order). Other
+   * columns stay in each row's data — so links, filter tabs, and the detail
+   * panel still work — but aren't shown as table columns. Use when a curated
+   * overview should surface just a few fields; leave unset to show all.
+   */
+  visibleColumns?: string[];
+  /**
+   * Quick success/failure-style tabs above the table that filter one column
+   * to a fixed value. `value` omitted = the "전체"(all) tab. Great for an
+   * overview table with a `result` column (성공/실패/정보).
+   */
+  filterTabs?: { column: string; tabs: { label: string; value?: string }[] };
+  /**
+   * Render this table as a session-grouped FLOW view (SessionFlowView)
+   * instead of a flat data table — rows are clustered into sessions by
+   * peer + account + time proximity so the connect→logon→disconnect
+   * sequence reads as a flow. Used for RemoteDesktopHistory.
+   */
+  flowView?: boolean;
+  /**
+   * Render this overview table with a bespoke, non-tabular component instead
+   * of a DataTable — the string names which one (see CUSTOM_VIEWS in page.tsx).
+   * Overview correlations (TargetInfo, ...) read as summaries/dashboards, not
+   * spreadsheets, so each gets a purpose-built view.
+   */
+  customView?: "targetInfo" | "executionHistory";
+  /**
+   * In the sidebar, present this table split by this column: instead of one
+   * row for the whole table, the category lists one entry per distinct value
+   * (e.g. EventLog_Events by "_source_file" → Security.evtx, Application.evtx,
+   * ...) plus a "전체" entry for the merged table. Clicking a split entry opens
+   * the table filtered to that value. Purely a browsing convenience; the
+   * underlying table is unchanged.
+   */
+  sidebarGroupColumn?: string;
+  /**
+   * Display transform for the raw sidebarGroupColumn values (which may be full
+   * paths or opaque keys) — e.g. a full .evtx path → its "Security.evtx"
+   * basename. The raw value is still what the click filters on.
+   */
+  sidebarGroupLabel?: (value: string) => string;
+  /**
    * Synthetic table columns computed from the full row rather than read
    * directly off a CSV column — inserted right after the detail column,
    * ahead of every real column, so a derived "what happened" summary is
@@ -143,8 +185,14 @@ const DOWNLOAD_STATE_COLORS: Record<string, string> = {
 };
 
 const DIRECTION_COLORS: Record<string, string> = {
-  "outbound(RDP client)": "#4fc1ff",
   inbound: "#d29922",
+  outbound: "#4fc1ff",
+};
+
+const RDP_RESULT_COLORS: Record<string, string> = {
+  "성공": "#3fb950",
+  "실패": "#f85149",
+  "정보": "#8a8a8a",
 };
 
 const ACTIVITY_TYPE_COLORS: Record<string, string> = {
@@ -166,6 +214,7 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
   // `links`/`event_record_id` send you back to the full raw record for
   // detail (e.g. RemoteAccessHistory -> EventLog_Events).
   TargetInfo: {
+    customView: "targetInfo",
     title: (r) => r.name || "(no name)",
     subtitle: (r) => r.category || "",
     badges: [{ key: "category", kind: "badge" }],
@@ -178,6 +227,7 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
   },
 
   ExecutionHistory: {
+    customView: "executionHistory",
     title: (r) => r.program_name || basename(r.program_path) || "(no name)",
     subtitle: (r) => r.program_path || "",
     badges: [{ key: "source_artifact", label: "출처", kind: "badge" }],
@@ -196,18 +246,34 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     ],
   },
 
-  RemoteAccessHistory: {
-    title: (r) => r.remote_address || "(no address)",
-    subtitle: (r) => r.detail || "",
+  RemoteDesktopHistory: {
+    title: (r) => r.remote_address || "(주소 없음)",
+    subtitle: (r) => r.description || "",
     badges: [
       { key: "direction", kind: "badge", badgeColors: DIRECTION_COLORS },
-      { key: "source_artifact", label: "출처", kind: "badge" },
+      { key: "result", label: "결과", kind: "badge", badgeColors: RDP_RESULT_COLORS },
     ],
     links: [{ key: "record_key", label: "이벤트 로그 원본 보기", targetFile: "EventLog_Events", targetColumn: "_record_key" }],
-    priorityColumns: ["timestamp", "direction", "remote_address", "account", "detail"],
+    // Shown as a session-grouped flow instead of a flat table.
+    flowView: true,
+    // (kept for when the raw table is viewed directly) Only these five are
+    // worth scanning; provider/event_id/result/record_key stay in the data.
+    visibleColumns: ["timestamp", "direction", "remote_address", "account", "description"],
+    filterTabs: {
+      column: "result",
+      tabs: [
+        { label: "전체" },
+        { label: "성공", value: "성공" },
+        { label: "실패", value: "실패" },
+      ],
+    },
+    priorityColumns: ["timestamp", "direction", "remote_address", "account", "description"],
     sections: [{ heading: "상세", fields: [
       { key: "account", label: "계정" },
-      { key: "detail" },
+      { key: "description", label: "설명" },
+      { key: "result", label: "결과" },
+      { key: "event_id", label: "이벤트 ID" },
+      { key: "provider", label: "공급자" },
     ]}],
   },
 
@@ -332,6 +398,7 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
   },
 
   EventLog_Events: {
+    sidebarGroupColumn: "Channel",
     title: (r) => {
       const catalog = lookupEventCatalog(r.Provider, r.EventID);
       const base = catalog ? `Event ${r.EventID} · ${catalog.label}` : `Event ${r.EventID}`;

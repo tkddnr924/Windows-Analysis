@@ -15,6 +15,7 @@ import {
 import { useVirtualizer } from "@tanstack/react-virtual";
 import type { ColumnFilterValue, CsvData, FetchLinkedRows } from "@/lib/types";
 import { getArtifactView } from "@/lib/artifactViews";
+import { inRange, rangeActive, timeColumnFor, EMPTY_TIME_RANGE, type TimeRange } from "@/lib/timeRange";
 import RowDetailPanel from "./RowDetailPanel";
 import ColumnFilterControl from "./ColumnFilterControl";
 
@@ -56,6 +57,8 @@ interface DataTableProps {
   /** rowids (this file's __rowid) currently bookmarked — undefined/omitted hides the star entirely. */
   bookmarkedRowids?: Set<number>;
   onToggleBookmark?: (rowid: number) => void;
+  /** Global incident-window filter from the sidebar; applied to this table's time column if it has one. */
+  timeRange?: TimeRange;
 }
 
 export default function DataTable({
@@ -67,14 +70,17 @@ export default function DataTable({
   onFetchLinkedRows,
   bookmarkedRowids,
   onToggleBookmark,
+  timeRange = EMPTY_TIME_RANGE,
 }: DataTableProps) {
   const [sorting, setSorting] = useState<SortingState>([]);
   const [columnFilters, setColumnFilters] = useState<ColumnFiltersState>([]);
   const [search, setSearch] = useState("");
+  const [activeTab, setActiveTab] = useState<string | undefined>(undefined);
   const [selectedCell, setSelectedCell] = useState<{ row: Record<string, string>; column: string } | null>(null);
 
   const fileBaseName = fileName.split(/[\\/]/).pop()?.replace(/\.csv$/i, "") ?? fileName;
   const artifactSpec = getArtifactView(fileBaseName);
+  const filterTabs = artifactSpec?.filterTabs;
 
   useEffect(() => {
     if (!initialFilter) return;
@@ -83,10 +89,14 @@ export default function DataTable({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [initialFilter]);
 
-  const displayColumns = useMemo(
-    () => orderColumns(data.columns, artifactSpec?.priorityColumns),
-    [data.columns, artifactSpec]
-  );
+  const displayColumns = useMemo(() => {
+    // A curated view can restrict the table to a fixed set of columns; the
+    // rest stay in each row's data (for links, filter tabs, detail panel).
+    if (artifactSpec?.visibleColumns) {
+      return artifactSpec.visibleColumns.filter((c) => data.columns.includes(c));
+    }
+    return orderColumns(data.columns, artifactSpec?.priorityColumns);
+  }, [data.columns, artifactSpec]);
 
   const columnHelper = createColumnHelper<Record<string, string>>();
   const columns = useMemo(
@@ -159,11 +169,25 @@ export default function DataTable({
     [displayColumns, artifactSpec, bookmarkedRowids, onToggleBookmark] // eslint-disable-line react-hooks/exhaustive-deps
   );
 
+  // The column the global incident-window filter applies to (null = this table
+  // has no time column, so the filter leaves it alone).
+  const timeColumn = useMemo(
+    () => timeColumnFor(artifactSpec, data.columns, data.rows[0]),
+    [artifactSpec, data.columns, data.rows]
+  );
+
   const searchedRows = useMemo(() => {
-    if (!search.trim()) return data.rows;
+    let rows = data.rows;
+    if (timeColumn && rangeActive(timeRange)) {
+      rows = rows.filter((row) => inRange(row[timeColumn] ?? "", timeRange));
+    }
+    if (filterTabs && activeTab !== undefined) {
+      rows = rows.filter((row) => (row[filterTabs.column] ?? "") === activeTab);
+    }
+    if (!search.trim()) return rows;
     const needle = search.toLowerCase();
-    return data.rows.filter((row) => data.columns.some((col) => (row[col] ?? "").toLowerCase().includes(needle)));
-  }, [data.rows, data.columns, search]);
+    return rows.filter((row) => data.columns.some((col) => (row[col] ?? "").toLowerCase().includes(needle)));
+  }, [data.rows, data.columns, search, filterTabs, activeTab, timeColumn, timeRange]);
 
   const table = useReactTable({
     data: searchedRows,
@@ -196,7 +220,7 @@ export default function DataTable({
   const activeFilterCount = columnFilters.length;
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", height: "100%", minWidth: 0 }}>
+    <div style={{ display: "flex", flexDirection: "column", flex: 1, minHeight: 0, minWidth: 0 }}>
       <div
         style={{
           display: "flex",
@@ -250,7 +274,41 @@ export default function DataTable({
         </div>
       </div>
 
-      <div ref={scrollRef} style={{ flex: 1, overflow: "auto", position: "relative" }}>
+      {filterTabs && (
+        <div style={{ display: "flex", gap: 6, padding: "6px 14px", borderBottom: "1px solid var(--border)", background: "var(--bg-panel)", flexShrink: 0 }}>
+          {filterTabs.tabs.map((tab) => {
+            const count =
+              tab.value === undefined
+                ? data.rows.length
+                : data.rows.filter((r) => (r[filterTabs.column] ?? "") === tab.value).length;
+            const active = activeTab === tab.value;
+            return (
+              <button
+                key={tab.label}
+                onClick={() => setActiveTab(tab.value)}
+                style={{
+                  fontSize: 12,
+                  padding: "4px 12px",
+                  background: active ? "var(--accent-subtle)" : "transparent",
+                  color: active ? "var(--accent)" : "var(--text-dim)",
+                  border: `1px solid ${active ? "var(--accent)" : "var(--border)"}`,
+                  borderRadius: "var(--radius-lg)",
+                  cursor: "pointer",
+                  fontWeight: active ? 700 : 500,
+                }}
+              >
+                {tab.label} <span style={{ color: "var(--text-faint)", fontWeight: 400 }}>{count.toLocaleString()}</span>
+              </button>
+            );
+          })}
+        </div>
+      )}
+
+      {/* minHeight:0 is required: without it a flex:1 child's min-height
+          defaults to its content height, so the container grows to the full
+          virtualized table height and overflow:auto never engages — clipping
+          the last rows off-screen (same fix as the master timeline, 16e52ce). */}
+      <div ref={scrollRef} style={{ flex: 1, minHeight: 0, overflow: "auto", position: "relative" }}>
         <table style={{ borderCollapse: "collapse", tableLayout: "fixed", fontFamily: "var(--mono)", width: table.getTotalSize() }}>
           <thead style={{ position: "sticky", top: 0, zIndex: 1, background: "var(--bg-panel)" }}>
             {table.getHeaderGroups().map((headerGroup) => (
@@ -396,6 +454,40 @@ export default function DataTable({
             )}
           </tbody>
         </table>
+      </div>
+
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 16,
+          padding: "5px 14px",
+          borderTop: "1px solid var(--border)",
+          background: "var(--bg-panel)",
+          flexShrink: 0,
+          fontSize: 11.5,
+          fontFamily: "var(--mono)",
+          color: "var(--text-faint)",
+          whiteSpace: "nowrap",
+          overflow: "hidden",
+        }}
+      >
+        <span>
+          총 <strong style={{ color: "var(--text-dim)" }}>{data.rowCount.toLocaleString()}</strong>건
+        </span>
+        <span>
+          표시 <strong style={{ color: "var(--text-dim)" }}>{rows.length.toLocaleString()}</strong>건
+          {columnFilters.length > 0 || search.trim() || activeTab !== undefined ? " (필터 적용됨)" : ""}
+        </span>
+        <span>
+          컬럼 <strong style={{ color: "var(--text-dim)" }}>{displayColumns.length}</strong>개
+        </span>
+        {columnFilters.length > 0 && <span>열 필터 {columnFilters.length}개</span>}
+        {sorting.length > 0 && (
+          <span style={{ marginLeft: "auto" }}>
+            정렬: {sorting[0].id} {sorting[0].desc ? "▼" : "▲"}
+          </span>
+        )}
       </div>
 
       {selectedCell && (() => {

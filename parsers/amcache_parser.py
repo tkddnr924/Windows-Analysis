@@ -4,6 +4,7 @@ Supports both the Windows 10+ format (Root\\InventoryApplication /
 Root\\InventoryApplicationFile) and the legacy format
 (Root\\Programs / Root\\File).
 """
+import logging
 from pathlib import Path
 
 from regipy.exceptions import RegistryKeyNotFoundException
@@ -106,8 +107,26 @@ def _parse_deleted_programs(hive: RegistryHive, live_program_ids: set) -> list[d
 
 def _parse_files(hive: RegistryHive) -> list[dict]:
     """Root\\File (older format) and/or Root\\InventoryApplicationFile (Win10+)."""
-    plugin = AmCachePlugin(hive, as_json=True)
-    plugin.run()
+    # regipy's Amcache plugin logs an ERROR ("Could not find \\Root\\File
+    # subkey") whenever the legacy \\Root\\File subkey is absent — which is the
+    # NORMAL case on Windows 10 1607+ (it uses \\Root\\InventoryApplicationFile
+    # instead). That's not a failure, just an old-vs-new format probe, so we
+    # detect the format ourselves, print a clear "신형 Amcache" status, and
+    # silence regipy's misleading error for the plugin run.
+    try:
+        hive.get_key(r"\Root\File")
+        print(r"[Amcache] 구형 Amcache 포맷 (\Root\File)")
+    except RegistryKeyNotFoundException:
+        print(r"[Amcache] 신형 Amcache 포맷 (\Root\InventoryApplicationFile)")
+
+    regipy_logger = logging.getLogger("regipy.plugins.amcache.amcache")
+    prev_level = regipy_logger.level
+    regipy_logger.setLevel(logging.CRITICAL)
+    try:
+        plugin = AmCachePlugin(hive, as_json=True)
+        plugin.run()
+    finally:
+        regipy_logger.setLevel(prev_level)
 
     entries = []
     for entry in plugin.entries:

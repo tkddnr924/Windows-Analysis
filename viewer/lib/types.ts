@@ -110,6 +110,7 @@ export interface ElectronApi {
   listCategories(caseDir: string): Promise<CategoryEntry[]>;
   listResultFiles(categoryDir: string): Promise<ResultFileEntry[]>;
   readResultFile(fullPath: string): Promise<CsvData>;
+  listColumnValues(fullPath: string, column: string): Promise<{ value: string; count: number }[]>;
   listBookmarks(caseDir: string): Promise<Bookmark[]>;
   toggleBookmark(caseDir: string, entry: BookmarkInput): Promise<Bookmark[]>;
   updateBookmarkNote(caseDir: string, id: string, note: string): Promise<Bookmark[]>;

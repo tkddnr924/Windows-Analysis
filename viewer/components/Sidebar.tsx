@@ -3,6 +3,21 @@
 import { useEffect, useMemo, useState } from "react";
 import type { CaseSummary, CategoryEntry, ResultFileEntry } from "@/lib/types";
 import { groupKeyFor } from "@/lib/fileGrouping";
+import { getArtifactView } from "@/lib/artifactViews";
+import { EMPTY_TIME_RANGE, rangeActive, type TimeRange } from "@/lib/timeRange";
+import DateTimeInput from "./DateTimeInput";
+
+const timeInputStyle: React.CSSProperties = {
+  width: "100%",
+  padding: "5px 8px",
+  background: "var(--bg-input)",
+  border: "1px solid var(--border)",
+  borderRadius: "var(--radius-sm)",
+  color: "var(--text)",
+  fontSize: 11.5,
+  fontFamily: "var(--mono)",
+  colorScheme: "dark",
+};
 
 export const CATEGORY_ICONS: Record<string, string> = {
   AMCACHE: "📦",
@@ -11,12 +26,54 @@ export const CATEGORY_ICONS: Record<string, string> = {
   JUMPLIST: "🔗",
   PREFETCH: "⚡",
   REGISTRY: "🗂️",
+  SRUM: "📊",
+  WER: "💥",
+  TASKSCHEDULER: "⏰",
+  POWERSHELL: "💻",
+  FILESYSTEM: "🗄️",
 };
+
+// Maps a run-list artifact name to its output CATEGORY folder (upper-cased),
+// so the sidebar can show every artifact that ran — including ones that found
+// no source files (no folder on disk) — as a "데이터 없음" placeholder.
+// Category defaults to the artifact name; only UsnJrnl files under FileSystem.
+const ARTIFACT_CATEGORY: Record<string, string> = {
+  UsnJrnl: "FILESYSTEM",
+};
+
+function categoryForArtifact(name: string): string {
+  return ARTIFACT_CATEGORY[name] ?? name.toUpperCase();
+}
+
+function EmptyCategoryRow({ name }: { name: string }) {
+  return (
+    <div
+      title="이 아티팩트는 실행됐지만 대상에서 원본 파일을 찾지 못했습니다"
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: 6,
+        padding: "8px 10px",
+        fontSize: 12.5,
+        fontWeight: 600,
+        color: "var(--text-faint)",
+        opacity: 0.5,
+        userSelect: "none",
+        cursor: "default",
+      }}
+    >
+      <span style={{ width: 10, display: "inline-block" }} />
+      {CATEGORY_ICONS[name] && <span>{CATEGORY_ICONS[name]}</span>}
+      <span>{name}</span>
+      <span style={{ marginLeft: "auto", fontSize: 10.5, fontWeight: 400 }}>데이터 없음</span>
+    </div>
+  );
+}
 
 const OVERVIEW_TABLE_ICONS: Record<string, string> = {
   TargetInfo: "🖥️",
   ExecutionHistory: "⚡",
-  RemoteAccessHistory: "🔒",
+  RemoteDesktopHistory: "🖥️",
   BrowserTimeline: "🌐",
 };
 
@@ -37,7 +94,7 @@ function FileRow({ file, selected, indent, icon, onSelectFile }: FileRowProps) {
         display: "flex",
         alignItems: "center",
         justifyContent: "space-between",
-        gap: 8,
+        gap: 6,
         padding: `5px 10px 5px ${indent}px`,
         cursor: "pointer",
         background: selected ? "var(--bg-selected)" : "transparent",
@@ -53,11 +110,102 @@ function FileRow({ file, selected, indent, icon, onSelectFile }: FileRowProps) {
         if (!selected) e.currentTarget.style.background = "transparent";
       }}
     >
-      <span style={{ display: "flex", alignItems: "center", gap: 6, overflow: "hidden", textOverflow: "ellipsis", color: selected ? "var(--text)" : "var(--text-dim)" }}>
+      <span style={{ display: "flex", alignItems: "center", gap: 5, overflow: "hidden", textOverflow: "ellipsis", color: selected ? "var(--text)" : "var(--text-dim)" }}>
         {icon && <span style={{ flexShrink: 0, fontSize: 12 }}>{icon}</span>}
         <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>{file.name}</span>
       </span>
       <span style={{ color: "var(--text-faint)", fontSize: 11, flexShrink: 0 }}>{file.rowCount.toLocaleString()}</span>
+    </div>
+  );
+}
+
+interface GroupedFileRowsProps {
+  file: ResultFileEntry;
+  groupColumn: string;
+  label: (value: string) => string;
+  indent: number;
+  selectedFile: ResultFileEntry | null;
+  onSelectFile: (file: ResultFileEntry) => void;
+  onNavigate: (targetFile: string, targetColumn: string, value: string) => void;
+}
+
+// Renders a groupable table (e.g. EventLog_Events) not as a single row but as
+// its per-value entries directly under the category — one row per distinct
+// value of groupColumn (Security.evtx, Application.evtx, ...), preceded by a
+// "전체" row that opens the merged table. Clicking a value row opens the table
+// filtered to it. The values load lazily once the category is expanded.
+function GroupedFileRows({ file, groupColumn, label, indent, selectedFile, onSelectFile, onNavigate }: GroupedFileRowsProps) {
+  const [values, setValues] = useState<{ value: string; count: number }[] | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    window.api.listColumnValues(file.fullPath, groupColumn).then((v) => {
+      if (alive) setValues(v);
+    });
+    return () => {
+      alive = false;
+    };
+  }, [file.fullPath, groupColumn]);
+
+  const selected = selectedFile?.fullPath === file.fullPath;
+
+  return (
+    <div>
+      <div
+        onClick={() => onSelectFile(file)}
+        title="모든 로그 통합"
+        style={{
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          gap: 6,
+          padding: `5px 10px 5px ${indent}px`,
+          cursor: "pointer",
+          background: selected ? "var(--bg-selected)" : "transparent",
+          borderLeft: `2px solid ${selected ? "var(--accent)" : "transparent"}`,
+          whiteSpace: "nowrap",
+          overflow: "hidden",
+        }}
+        onMouseEnter={(e) => {
+          if (!selected) e.currentTarget.style.background = "var(--bg-hover)";
+        }}
+        onMouseLeave={(e) => {
+          if (!selected) e.currentTarget.style.background = "transparent";
+        }}
+      >
+        <span style={{ display: "flex", alignItems: "center", gap: 5, overflow: "hidden", textOverflow: "ellipsis", color: selected ? "var(--text)" : "var(--text-dim)" }}>
+          <span style={{ flexShrink: 0, fontSize: 12 }}>📚</span>
+          <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>전체</span>
+        </span>
+        <span style={{ color: "var(--text-faint)", fontSize: 11, flexShrink: 0 }}>{file.rowCount.toLocaleString()}</span>
+      </div>
+      {values === null && (
+        <div style={{ padding: `4px 10px 4px ${indent + 6}px`, fontSize: 11.5, color: "var(--text-faint)" }}>불러오는 중...</div>
+      )}
+      {values?.map((v) => (
+        <div
+          key={v.value}
+          onClick={() => onNavigate(file.name, groupColumn, v.value)}
+          title={label(v.value)}
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: 8,
+            padding: `4px 10px 4px ${indent + 6}px`,
+            cursor: "pointer",
+            color: "var(--text-dim)",
+            fontSize: 12,
+            whiteSpace: "nowrap",
+            overflow: "hidden",
+          }}
+          onMouseEnter={(e) => (e.currentTarget.style.background = "var(--bg-hover)")}
+          onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+        >
+          <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>{label(v.value) || "(빈 값)"}</span>
+          <span style={{ color: "var(--text-faint)", fontSize: 11, flexShrink: 0 }}>{v.count.toLocaleString()}</span>
+        </div>
+      ))}
     </div>
   );
 }
@@ -115,10 +263,11 @@ interface CategoryNodeProps {
   /** Pinned sections (the curated cross-artifact overview) are always
    * expanded and visually distinguished from the raw per-artifact tree. */
   pinned?: boolean;
+  onNavigate?: (targetFile: string, targetColumn: string, value: string) => void;
 }
 
-function CategoryNode({ category, selectedFile, onSelectFile, displayName, pinned }: CategoryNodeProps) {
-  const [expanded, setExpanded] = useState(true);
+function CategoryNode({ category, selectedFile, onSelectFile, displayName, pinned, onNavigate }: CategoryNodeProps) {
+  const [expanded, setExpanded] = useState(false);
   const [files, setFiles] = useState<ResultFileEntry[] | null>(null);
 
   useEffect(() => {
@@ -190,16 +339,36 @@ function CategoryNode({ category, selectedFile, onSelectFile, displayName, pinne
                   onSelectFile={onSelectFile}
                 />
               ))
-            : files.map((file) => (
-                <FileRow
-                  key={file.fullPath}
-                  file={file}
-                  selected={selectedFile?.fullPath === file.fullPath}
-                  indent={pinned ? 20 : 26}
-                  icon={pinned ? OVERVIEW_TABLE_ICONS[file.name] : undefined}
-                  onSelectFile={onSelectFile}
-                />
-              ))}
+            : files.map((file) => {
+                const spec = getArtifactView(file.name);
+                // A groupable table (e.g. EventLog_Events) is shown split into
+                // its per-value entries directly under the category, rather than
+                // as one row.
+                if (spec?.sidebarGroupColumn && onNavigate) {
+                  return (
+                    <GroupedFileRows
+                      key={file.fullPath}
+                      file={file}
+                      groupColumn={spec.sidebarGroupColumn}
+                      label={spec.sidebarGroupLabel ?? ((v) => v)}
+                      indent={pinned ? 20 : 26}
+                      selectedFile={selectedFile}
+                      onSelectFile={onSelectFile}
+                      onNavigate={onNavigate}
+                    />
+                  );
+                }
+                return (
+                  <FileRow
+                    key={file.fullPath}
+                    file={file}
+                    selected={selectedFile?.fullPath === file.fullPath}
+                    indent={pinned ? 20 : 26}
+                    icon={pinned ? OVERVIEW_TABLE_ICONS[file.name] : undefined}
+                    onSelectFile={onSelectFile}
+                  />
+                );
+              })}
         </div>
       )}
     </div>
@@ -256,6 +425,9 @@ interface SidebarProps {
   onSelectTimeline: () => void;
   onSelectBookmarks: () => void;
   bookmarkCount: number;
+  timeRange: TimeRange;
+  onTimeRangeChange: (range: TimeRange) => void;
+  onNavigate: (targetFile: string, targetColumn: string, value: string) => void;
 }
 
 export default function Sidebar({
@@ -270,9 +442,29 @@ export default function Sidebar({
   onSelectTimeline,
   onSelectBookmarks,
   bookmarkCount,
+  timeRange,
+  onTimeRangeChange,
+  onNavigate,
 }: SidebarProps) {
   const overviewCategory = categories.find((c) => c.name === "_OVERVIEW");
   const rawCategories = categories.filter((c) => c.name !== "_OVERVIEW");
+
+  // Every artifact that ran, mapped to its category, in run order — so the
+  // "원본 데이터" list is 1:1 with the run list. Categories with real output
+  // render as normal nodes; ones that ran but produced no data (no folder)
+  // render as a greyed "데이터 없음" placeholder. Any present category not in
+  // the run list (e.g. from an older parse) is appended after.
+  const presentByName = new Map(rawCategories.map((c) => [c.name, c]));
+  const orderedNames: string[] = [];
+  const seenNames = new Set<string>();
+  for (const artifact of selectedCase?.artifactsRun ?? []) {
+    const cat = categoryForArtifact(artifact);
+    if (cat === "_OVERVIEW" || seenNames.has(cat)) continue;
+    seenNames.add(cat);
+    orderedNames.push(cat);
+  }
+  const leftoverCategories = rawCategories.filter((c) => !seenNames.has(c.name));
+  const hasRawSection = orderedNames.length > 0 || leftoverCategories.length > 0;
 
   return (
     <div
@@ -333,6 +525,43 @@ export default function Sidebar({
             {selectedCase.lastRunAt ? `마지막 실행: ${selectedCase.lastRunAt}` : "아직 파싱되지 않음"}
           </div>
         )}
+        {selectedCase && (
+          <div style={{ marginTop: 10 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 5 }}>
+              <span style={{ fontSize: 10.5, fontWeight: 700, color: "var(--text-faint)", textTransform: "uppercase", letterSpacing: 0.6 }}>
+                기간 필터 (사고 시점)
+              </span>
+              {rangeActive(timeRange) && (
+                <button
+                  onClick={() => onTimeRangeChange(EMPTY_TIME_RANGE)}
+                  title="기간 초기화"
+                  style={{ marginLeft: "auto", fontSize: 10.5, background: "transparent", border: "none", color: "var(--accent)", cursor: "pointer", fontWeight: 600 }}
+                >
+                  초기화 ×
+                </button>
+              )}
+            </div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+              <DateTimeInput
+                value={timeRange.start}
+                onChange={(v) => onTimeRangeChange({ ...timeRange, start: v })}
+                style={timeInputStyle}
+                ariaLabel="시작 시각"
+                placeholder="시작 (YYYY-MM-DD HH:mm:ss)"
+              />
+              <DateTimeInput
+                value={timeRange.end}
+                onChange={(v) => onTimeRangeChange({ ...timeRange, end: v })}
+                style={timeInputStyle}
+                ariaLabel="종료 시각"
+                placeholder="종료 (YYYY-MM-DD HH:mm:ss)"
+              />
+            </div>
+            {rangeActive(timeRange) && (
+              <div style={{ marginTop: 5, fontSize: 10.5, color: "var(--accent)" }}>이 기간으로 모든 데이터를 거릅니다</div>
+            )}
+          </div>
+        )}
       </div>
       <div style={{ overflowY: "auto", flex: 1 }}>
         {casesError && (
@@ -385,13 +614,21 @@ export default function Sidebar({
             onSelectFile={onSelectFile}
           />
         )}
-        {rawCategories.length > 0 && (
+        {hasRawSection && (
           <div style={{ padding: "10px 10px 4px", fontSize: 10.5, fontWeight: 700, color: "var(--text-faint)", textTransform: "uppercase", letterSpacing: 0.8 }}>
             원본 데이터
           </div>
         )}
-        {rawCategories.map((category) => (
-          <CategoryNode key={category.fullPath} category={category} selectedFile={selectedFile} onSelectFile={onSelectFile} />
+        {orderedNames.map((name) => {
+          const category = presentByName.get(name);
+          return category ? (
+            <CategoryNode key={category.fullPath} category={category} selectedFile={selectedFile} onSelectFile={onSelectFile} onNavigate={onNavigate} />
+          ) : (
+            <EmptyCategoryRow key={name} name={name} />
+          );
+        })}
+        {leftoverCategories.map((category) => (
+          <CategoryNode key={category.fullPath} category={category} selectedFile={selectedFile} onSelectFile={onSelectFile} onNavigate={onNavigate} />
         ))}
       </div>
     </div>

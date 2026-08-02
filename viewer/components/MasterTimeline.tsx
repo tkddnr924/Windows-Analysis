@@ -3,8 +3,10 @@
 import { useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import type { FetchLinkedRows, TimelineEntry } from "@/lib/types";
+import { inRange, rangeActive as globalRangeActive, toBound, type TimeRange } from "@/lib/timeRange";
 import { CATEGORY_ICONS } from "./Sidebar";
 import RowDetailPanel from "./RowDetailPanel";
+import DateTimeInput from "./DateTimeInput";
 
 const ROW_HEIGHT = 52;
 
@@ -16,18 +18,11 @@ interface MasterTimelineProps {
   /** Keys of bookmarked rows, formatted `${fullPath}#${rowid}`. */
   bookmarkedKeys: Set<string>;
   onToggleBookmark: (entry: TimelineEntry) => void;
+  /** Global incident-window filter from the sidebar. */
+  globalTimeRange: TimeRange;
 }
 
-// <input type="datetime-local"> yields "YYYY-MM-DDThh:mm" (no seconds) — pad
-// it out to the parser's "YYYY-MM-DD hh:mm:ss.fff" format so a plain string
-// compare against entry.timestamp is a correct chronological comparison.
-function toRangeBound(datetimeLocal: string, edge: "start" | "end"): string {
-  if (!datetimeLocal) return "";
-  const [date, time = "00:00"] = datetimeLocal.split("T");
-  return edge === "start" ? `${date} ${time}:00.000` : `${date} ${time}:59.999`;
-}
-
-export default function MasterTimeline({ entries, loading, onNavigate, onFetchLinkedRows, bookmarkedKeys, onToggleBookmark }: MasterTimelineProps) {
+export default function MasterTimeline({ entries, loading, onNavigate, onFetchLinkedRows, bookmarkedKeys, onToggleBookmark, globalTimeRange }: MasterTimelineProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const [rangeStart, setRangeStart] = useState("");
   const [rangeEnd, setRangeEnd] = useState("");
@@ -37,8 +32,8 @@ export default function MasterTimeline({ entries, loading, onNavigate, onFetchLi
   const [selectedEntry, setSelectedEntry] = useState<TimelineEntry | null>(null);
   const allRows = entries ?? [];
 
-  const startBound = toRangeBound(rangeStart, "start");
-  const endBound = toRangeBound(rangeEnd, "end");
+  const startBound = toBound(rangeStart, "start");
+  const endBound = toBound(rangeEnd, "end");
   const rangeActive = Boolean(startBound || endBound);
 
   // Distinct artifact tables present, with total counts — drives the filter
@@ -59,9 +54,11 @@ export default function MasterTimeline({ entries, loading, onNavigate, onFetchLi
     });
   }
 
+  const globalActive = globalRangeActive(globalTimeRange);
   const rows = useMemo(() => {
     const filtered = allRows.filter((e) => {
       if (hiddenTables.has(e.table)) return false;
+      if (globalActive && !inRange(e.timestamp, globalTimeRange)) return false;
       if (rangeActive) {
         if (!e.timestamp) return false;
         if (startBound && e.timestamp < startBound) return false;
@@ -80,7 +77,7 @@ export default function MasterTimeline({ entries, loading, onNavigate, onFetchLi
       return sortDir === "asc" ? cmp : -cmp;
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [allRows, startBound, endBound, sortDir, hiddenTables, rangeActive]);
+  }, [allRows, startBound, endBound, sortDir, hiddenTables, rangeActive, globalActive, globalTimeRange]);
 
   // Earliest/latest timestamp among the rows actually shown — drives the
   // status bar's range readout. Rows without a timestamp are ignored here.
@@ -120,6 +117,7 @@ export default function MasterTimeline({ entries, loading, onNavigate, onFetchLi
   const paddingBottom = virtualRows.length > 0 ? totalHeight - virtualRows[virtualRows.length - 1].end : 0;
 
   const inputStyle: React.CSSProperties = {
+    width: 168,
     padding: "5px 8px",
     background: "var(--bg-input)",
     border: "1px solid var(--border)",
@@ -131,7 +129,7 @@ export default function MasterTimeline({ entries, loading, onNavigate, onFetchLi
   };
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", height: "100%", minWidth: 0 }}>
+    <div style={{ display: "flex", flexDirection: "column", flex: 1, minHeight: 0, minWidth: 0 }}>
       <div
         style={{
           display: "flex",
@@ -252,18 +250,20 @@ export default function MasterTimeline({ entries, loading, onNavigate, onFetchLi
             )}
           </div>
           <span style={{ fontSize: 11, color: "var(--text-faint)" }}>기간</span>
-          <input
-            type="datetime-local"
+          <DateTimeInput
             value={rangeStart}
-            onChange={(e) => setRangeStart(e.target.value)}
+            onChange={setRangeStart}
             style={inputStyle}
+            ariaLabel="시작 시각"
+            placeholder="YYYY-MM-DD HH:mm:ss"
           />
           <span style={{ color: "var(--text-faint)", fontSize: 11 }}>~</span>
-          <input
-            type="datetime-local"
+          <DateTimeInput
             value={rangeEnd}
-            onChange={(e) => setRangeEnd(e.target.value)}
+            onChange={setRangeEnd}
             style={inputStyle}
+            ariaLabel="종료 시각"
+            placeholder="YYYY-MM-DD HH:mm:ss"
           />
           {rangeActive && (
             <button

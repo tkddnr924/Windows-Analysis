@@ -134,30 +134,6 @@ def build_execution_history(all_results: dict) -> list[dict]:
     return rows
 
 
-# (Provider, EventID) combinations that are remote-access evidence — the
-# inbound/server-side half. RemoteAccess_RDPClientHistory covers the
-# outbound/client-side half. Kept narrow to this table's purpose; the full
-# IR event catalog (persistence, account changes, etc.) lives in the
-# viewer's lib/eventCatalog.ts for the raw EventLog_Events table.
-_REMOTE_EVENT_IDS = {
-    ("Microsoft-Windows-Security-Auditing", "4624"): "로그온 성공",
-    ("Microsoft-Windows-Security-Auditing", "4625"): "로그온 실패",
-    ("Microsoft-Windows-Security-Auditing", "5140"): "네트워크 공유 접근(SMB)",
-    ("Microsoft-Windows-Security-Auditing", "5145"): "공유 파일 상세 접근(SMB)",
-    ("Microsoft-Windows-TerminalServices-RemoteConnectionManager", "1149"): "RDP 클라이언트 인증 성공",
-    ("Microsoft-Windows-TerminalServices-LocalSessionManager", "21"): "RDP 세션 로그온",
-    ("Microsoft-Windows-TerminalServices-LocalSessionManager", "24"): "RDP 세션 연결 끊김",
-    ("Microsoft-Windows-TerminalServices-LocalSessionManager", "25"): "RDP 세션 재연결",
-}
-
-_LOGON_TYPE_LABELS = {
-    "3": "네트워크",
-    "8": "네트워크(평문)",
-    "9": "새 자격 증명",
-    "10": "원격 데스크톱(RDP)",
-}
-
-
 def _parse_event_data(raw: str) -> dict:
     try:
         data = json.loads(raw) if raw else {}
@@ -166,46 +142,120 @@ def _parse_event_data(raw: str) -> dict:
         return {}
 
 
-def build_remote_access_history(all_results: dict) -> list[dict]:
+def _ed_field(event_data: dict, *names: str) -> str:
+    """Read a field from an event's data. Security-Auditing events expose
+    named fields at the top level (IpAddress, TargetUserName, ...), while the
+    TerminalServices providers store theirs one level down under 'EventXML'
+    (User/Address/SessionID or Param1/Param2/Param3) — check both."""
+    xml = event_data.get("EventXML")
+    sources = [xml] if isinstance(xml, dict) else []
+    sources.append(event_data)
+    for src in sources:
+        for name in names:
+            value = src.get(name)
+            if value not in (None, ""):
+                return str(value)
+    return ""
+
+
+# RDP evidence across the providers that actually carry it, verified against
+# this project's real EventData field names (Security uses top-level
+# IpAddress/TargetUserName; TerminalServices events nest fields under
+# EventXML). direction = inbound (someone connected TO this host) vs outbound
+# (this host connected out via the RDP client). result feeds the viewer's
+# success/failure tabs. addr/acct list the EventData field names to read.
+#
+# Only 4624/4625 are LogonType-gated (type 10 = RDP); the TerminalServices
+# providers are RDP-specific already.
+_RDP_EVENTS: dict[tuple[str, str], dict] = {
+    ("Microsoft-Windows-Security-Auditing", "4624"): {
+        "direction": "inbound", "result": "성공", "description": "RDP 로그온 성공",
+        "addr": ["IpAddress"], "acct": ["TargetUserName"], "logon_type_10": True,
+    },
+    ("Microsoft-Windows-Security-Auditing", "4625"): {
+        "direction": "inbound", "result": "실패", "description": "RDP 로그온 실패",
+        "addr": ["IpAddress"], "acct": ["TargetUserName"], "logon_type_10": True,
+    },
+    ("Microsoft-Windows-TerminalServices-RemoteConnectionManager", "1149"): {
+        "direction": "inbound", "result": "성공", "description": "RDP 네트워크 인증 성공(로그인 화면 도달)",
+        "addr": ["Param3"], "acct": ["Param1"],
+    },
+    ("Microsoft-Windows-TerminalServices-LocalSessionManager", "21"): {
+        "direction": "inbound", "result": "성공", "description": "RDP 세션 로그온",
+        "addr": ["Address"], "acct": ["User"],
+    },
+    ("Microsoft-Windows-TerminalServices-LocalSessionManager", "25"): {
+        "direction": "inbound", "result": "성공", "description": "RDP 세션 재연결",
+        "addr": ["Address"], "acct": ["User"],
+    },
+    ("Microsoft-Windows-TerminalServices-LocalSessionManager", "22"): {
+        "direction": "inbound", "result": "정보", "description": "RDP 셸 시작",
+        "addr": ["Address"], "acct": ["User"],
+    },
+    ("Microsoft-Windows-TerminalServices-LocalSessionManager", "23"): {
+        "direction": "inbound", "result": "정보", "description": "RDP 세션 로그오프",
+        "addr": ["Address"], "acct": ["User"],
+    },
+    ("Microsoft-Windows-TerminalServices-LocalSessionManager", "24"): {
+        "direction": "inbound", "result": "정보", "description": "RDP 세션 연결 끊김",
+        "addr": ["Address"], "acct": ["User"],
+    },
+    ("Microsoft-Windows-TerminalServices-LocalSessionManager", "39"): {
+        "direction": "inbound", "result": "정보", "description": "RDP 세션 연결 끊김(다른 세션에 의해)",
+        "addr": ["Address"], "acct": ["User"],
+    },
+    ("Microsoft-Windows-TerminalServices-LocalSessionManager", "40"): {
+        "direction": "inbound", "result": "정보", "description": "RDP 세션 연결 끊김",
+        "addr": ["Address"], "acct": ["User"],
+    },
+    ("Microsoft-Windows-TerminalServices-ClientActiveXCore", "1024"): {
+        "direction": "outbound", "result": "정보", "description": "RDP 아웃바운드 연결 시도",
+        "addr": ["Value"], "acct": [],
+    },
+    ("Microsoft-Windows-TerminalServices-ClientActiveXCore", "1102"): {
+        "direction": "outbound", "result": "정보", "description": "RDP 아웃바운드 서버 주소",
+        "addr": ["Value"], "acct": [],
+    },
+    # 1025/1026 are connect/disconnect signals whose "Value" is a session/reason
+    # code, not a server address — no remote_address for these.
+    ("Microsoft-Windows-TerminalServices-ClientActiveXCore", "1025"): {
+        "direction": "outbound", "result": "성공", "description": "RDP 아웃바운드 연결됨",
+        "addr": [], "acct": [],
+    },
+    ("Microsoft-Windows-TerminalServices-ClientActiveXCore", "1026"): {
+        "direction": "outbound", "result": "정보", "description": "RDP 아웃바운드 연결 끊김",
+        "addr": [], "acct": [],
+    },
+}
+
+
+def build_remote_desktop_history(all_results: dict) -> list[dict]:
+    """Inbound (someone connected to this host) and outbound (this host's RDP
+    client connected out) Remote Desktop activity, pulled from the Security
+    and TerminalServices event logs. Direction and success/failure are
+    classified per event so the viewer can split them."""
     rows = []
 
-    for r in _rows(all_results, "TerminalServerClient", "RemoteAccess_RDPClientHistory"):
-        rows.append(
-            {
-                "timestamp": r.get("timestamp", ""),
-                "direction": "outbound(RDP client)",
-                "remote_address": r.get("server", ""),
-                "account": r.get("username_hint", ""),
-                "detail": "RDP 클라이언트 접속 기록",
-                "record_key": "",
-                "source_artifact": "RemoteAccess_RDPClientHistory",
-            }
-        )
-
     for r in _rows(all_results, "EventLog", "EventLog_Events"):
-        key = (r.get("Provider", ""), str(r.get("EventID", "")))
-        label = _REMOTE_EVENT_IDS.get(key)
-        if not label:
+        spec = _RDP_EVENTS.get((r.get("Provider", ""), str(r.get("EventID", ""))))
+        if not spec:
             continue
 
         event_data = _parse_event_data(r.get("EventData", ""))
-        logon_type = str(event_data.get("LogonType", ""))
-        # 4624/4625 without a remote-ish logon type (local console, service,
-        # unlock, etc.) aren't remote-access evidence — skip those.
-        if key[1] in ("4624", "4625") and logon_type not in _LOGON_TYPE_LABELS:
+        if spec.get("logon_type_10") and str(event_data.get("LogonType", "")) != "10":
             continue
-
-        detail = f"{label} ({_LOGON_TYPE_LABELS[logon_type]})" if logon_type in _LOGON_TYPE_LABELS else label
 
         rows.append(
             {
                 "timestamp": r.get("timestamp", ""),
-                "direction": "inbound",
-                "remote_address": event_data.get("IpAddress") or event_data.get("WorkstationName") or "",
-                "account": event_data.get("TargetUserName", ""),
-                "detail": detail,
+                "direction": spec["direction"],
+                "remote_address": _ed_field(event_data, *spec["addr"]),
+                "account": _ed_field(event_data, *spec["acct"]),
+                "description": spec["description"],
+                "result": spec["result"],
+                "event_id": str(r.get("EventID", "")),
+                "provider": r.get("Provider", ""),
                 "record_key": r.get("_record_key", ""),
-                "source_artifact": "EventLog_Events",
             }
         )
 

@@ -7,7 +7,12 @@ import TabBar from "@/components/TabBar";
 import RunPipeline from "@/components/RunPipeline";
 import MasterTimeline from "@/components/MasterTimeline";
 import BookmarksView from "@/components/BookmarksView";
+import SessionFlowView from "@/components/SessionFlowView";
+import TargetInfoView from "@/components/TargetInfoView";
+import ExecutionHistoryView from "@/components/ExecutionHistoryView";
 import { buildMasterTimeline } from "@/lib/masterTimeline";
+import { getArtifactView } from "@/lib/artifactViews";
+import { EMPTY_TIME_RANGE, type TimeRange } from "@/lib/timeRange";
 import type { Bookmark, CaseSummary, CategoryEntry, CsvData, ResultFileEntry, TimelineEntry } from "@/lib/types";
 
 interface TabState {
@@ -33,6 +38,7 @@ export default function Home() {
   const [bookmarks, setBookmarks] = useState<Bookmark[]>([]);
   const [masterTimeline, setMasterTimeline] = useState<{ caseId: string; entries: TimelineEntry[] } | null>(null);
   const [masterTimelineLoading, setMasterTimelineLoading] = useState(false);
+  const [timeRange, setTimeRange] = useState<TimeRange>(EMPTY_TIME_RANGE);
 
   const refreshCases = useCallback(async (): Promise<CaseSummary[]> => {
     const result = await window.api.listCases();
@@ -234,8 +240,11 @@ export default function Home() {
             onSelectTimeline={handleSelectTimeline}
             onSelectBookmarks={handleSelectBookmarks}
             bookmarkCount={bookmarks.length}
+            timeRange={timeRange}
+            onTimeRangeChange={setTimeRange}
+            onNavigate={handleNavigate}
           />
-          <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column" }}>
+          <div style={{ flex: 1, minWidth: 0, minHeight: 0, display: "flex", flexDirection: "column" }}>
             <TabBar
               tabs={tabs.map((t) => ({ key: t.file.fullPath, label: t.file.name }))}
               activeKey={activeVirtualTab ? null : activePath}
@@ -254,6 +263,7 @@ export default function Home() {
                 onFetchLinkedRows={fetchLinkedRows}
                 bookmarkedKeys={bookmarkedKeys}
                 onToggleBookmark={(entry) => handleToggleBookmark(entry.fullPath, entry.table, entry.rowid)}
+                globalTimeRange={timeRange}
               />
             )}
 
@@ -282,18 +292,41 @@ export default function Home() {
                 {activeTab.error}
               </div>
             )}
-            {!activeVirtualTab && activeTab && !activeTab.loading && !activeTab.error && activeTab.data && (
-              <DataTable
-                fileName={activeTab.file.name}
-                data={activeTab.data}
-                initialFilter={pendingFilter}
-                onInitialFilterConsumed={() => setPendingFilter(null)}
-                onNavigate={handleNavigate}
-                onFetchLinkedRows={fetchLinkedRows}
-                bookmarkedRowids={activeBookmarkedRowids}
-                onToggleBookmark={(rowid) => handleToggleBookmark(activeTab.file.fullPath, activeTab.file.name, rowid)}
-              />
-            )}
+            {!activeVirtualTab && activeTab && !activeTab.loading && !activeTab.error && activeTab.data &&
+              (getArtifactView(activeTab.file.name)?.customView === "targetInfo" ? (
+                <TargetInfoView data={activeTab.data} />
+              ) : getArtifactView(activeTab.file.name)?.customView === "executionHistory" ? (
+                <ExecutionHistoryView
+                  data={activeTab.data}
+                  onNavigate={handleNavigate}
+                  onFetchLinkedRows={fetchLinkedRows}
+                  bookmarkedRowids={activeBookmarkedRowids}
+                  onToggleBookmark={(rowid) => handleToggleBookmark(activeTab.file.fullPath, activeTab.file.name, rowid)}
+                  timeRange={timeRange}
+                />
+              ) : getArtifactView(activeTab.file.name)?.flowView ? (
+                <SessionFlowView
+                  fileName={activeTab.file.name}
+                  data={activeTab.data}
+                  onNavigate={handleNavigate}
+                  onFetchLinkedRows={fetchLinkedRows}
+                  bookmarkedRowids={activeBookmarkedRowids}
+                  onToggleBookmark={(rowid) => handleToggleBookmark(activeTab.file.fullPath, activeTab.file.name, rowid)}
+                  timeRange={timeRange}
+                />
+              ) : (
+                <DataTable
+                  fileName={activeTab.file.name}
+                  data={activeTab.data}
+                  initialFilter={pendingFilter}
+                  onInitialFilterConsumed={() => setPendingFilter(null)}
+                  onNavigate={handleNavigate}
+                  onFetchLinkedRows={fetchLinkedRows}
+                  bookmarkedRowids={activeBookmarkedRowids}
+                  onToggleBookmark={(rowid) => handleToggleBookmark(activeTab.file.fullPath, activeTab.file.name, rowid)}
+                  timeRange={timeRange}
+                />
+              ))}
           </div>
         </div>
       )}

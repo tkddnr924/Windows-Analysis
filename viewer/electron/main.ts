@@ -297,6 +297,24 @@ ipcMain.handle("list-result-files", (_event, categoryDir: string): ResultFileEnt
   return findResultFiles(categoryDir, categoryDir).sort((a, b) => a.relativePath.localeCompare(b.relativePath));
 });
 
+// Distinct values of one column with row counts — used to expand a table into
+// per-value sub-entries in the sidebar (e.g. EventLog_Events by Channel).
+ipcMain.handle("list-column-values", (_event, fullPath: string, column: string): { value: string; count: number }[] => {
+  const db = new Database(fullPath, { readonly: true, fileMustExist: true });
+  try {
+    const tableName = firstTableName(db);
+    if (!tableName) return [];
+    const cols = (db.prepare(`PRAGMA table_info("${tableName}")`).all() as { name: string }[]).map((c) => c.name);
+    if (!cols.includes(column)) return [];
+    const rows = db
+      .prepare(`SELECT "${column}" AS value, COUNT(*) AS count FROM "${tableName}" GROUP BY "${column}" ORDER BY count DESC`)
+      .all() as { value: string | null; count: number }[];
+    return rows.map((r) => ({ value: r.value ?? "", count: r.count }));
+  } finally {
+    db.close();
+  }
+});
+
 ipcMain.handle("read-result-file", (_event, fullPath: string): CsvData => {
   const db = new Database(fullPath, { readonly: true, fileMustExist: true });
   try {

@@ -27,10 +27,35 @@ function formatTaggedAt(iso: string): string {
   return `${kst.getUTCFullYear()}-${p(kst.getUTCMonth() + 1)}-${p(kst.getUTCDate())} ${p(kst.getUTCHours())}:${p(kst.getUTCMinutes())}:${p(kst.getUTCSeconds())}`;
 }
 
+function SortChip({ active, onClick, children }: { active: boolean; onClick: () => void; children: React.ReactNode }) {
+  return (
+    <button
+      onClick={onClick}
+      style={{
+        padding: "2px 9px",
+        borderRadius: 999,
+        border: `1px solid ${active ? "var(--accent)" : "var(--border)"}`,
+        background: active ? "var(--accent-subtle)" : "transparent",
+        color: active ? "var(--accent)" : "var(--text-dim)",
+        fontSize: 11,
+        cursor: "pointer",
+        whiteSpace: "nowrap",
+      }}
+    >
+      {children}
+    </button>
+  );
+}
+
 export default function BookmarksView({ bookmarks, onNavigate, onRemove, onUpdateNote }: BookmarksViewProps) {
   const [rowCache, setRowCache] = useState<Record<string, CsvData>>({});
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draftNote, setDraftNote] = useState("");
+  // Bookmarks are the analyst's shortlist of key events; reading them oldest →
+  // newest by when each event happened reconstructs the incident timeline. That
+  // "event time" needs the source row, so it's resolved here (against rowCache)
+  // rather than sorting on the bookmark's own taggedAt.
+  const [sortDir, setSortDir] = useState<"asc" | "desc">("asc");
 
   useEffect(() => {
     const missing = [...new Set(bookmarks.map((b) => b.fullPath))].filter((p) => !rowCache[p]);
@@ -55,10 +80,26 @@ export default function BookmarksView({ bookmarks, onNavigate, onRemove, onUpdat
     );
   }
 
-  const sorted = [...bookmarks].sort((a, b) => (a.taggedAt < b.taggedAt ? 1 : a.taggedAt > b.taggedAt ? -1 : 0));
+  // Resolve each bookmark to its source row + event time, then order by that
+  // time. Rows still loading (or missing) have no event time and sink to the
+  // bottom so the loaded, placeable events read as a clean chronology.
+  const entries = bookmarks.map((bookmark) => {
+    const data = rowCache[bookmark.fullPath];
+    const row = data?.rows.find((r) => Number((r as unknown as Record<string, unknown>).__rowid) === bookmark.rowid);
+    const spec = getArtifactView(bookmark.tableName);
+    const eventTime = row ? row[spec?.timelineField ?? "timestamp"] || row.timestamp || "" : "";
+    return { bookmark, data, row, spec, eventTime };
+  });
+  const sorted = [...entries].sort((a, b) => {
+    if (!a.eventTime && !b.eventTime) return a.bookmark.taggedAt < b.bookmark.taggedAt ? -1 : 1;
+    if (!a.eventTime) return 1;
+    if (!b.eventTime) return -1;
+    const cmp = a.eventTime.localeCompare(b.eventTime);
+    return sortDir === "asc" ? cmp : -cmp;
+  });
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", height: "100%", minWidth: 0 }}>
+    <div style={{ display: "flex", flexDirection: "column", flex: 1, minHeight: 0, minWidth: 0 }}>
       <div
         style={{
           display: "flex",
@@ -72,22 +113,18 @@ export default function BookmarksView({ bookmarks, onNavigate, onRemove, onUpdat
       >
         <strong style={{ fontSize: 13 }}>🔖 북마크</strong>
         <span style={{ color: "var(--text-faint)", fontSize: 11.5 }}>{bookmarks.length.toLocaleString()}건</span>
+        <div style={{ display: "flex", gap: 4, marginLeft: 8 }}>
+          <SortChip active={sortDir === "asc"} onClick={() => setSortDir("asc")}>오래된순</SortChip>
+          <SortChip active={sortDir === "desc"} onClick={() => setSortDir("desc")}>최근순</SortChip>
+        </div>
         <span style={{ color: "var(--text-faint)", fontSize: 11, marginLeft: "auto", textAlign: "right" }}>
           케이스를 다시 파싱하면 행 번호가 바뀌어 원본 위치가 어긋날 수 있습니다.
         </span>
       </div>
 
-      <div style={{ flex: 1, overflow: "auto" }}>
-        {sorted.map((bookmark) => {
-          const data = rowCache[bookmark.fullPath];
-          const row = data?.rows.find((r) => Number((r as unknown as Record<string, unknown>).__rowid) === bookmark.rowid);
-          const spec = getArtifactView(bookmark.tableName);
+      <div style={{ flex: 1, minHeight: 0, overflow: "auto" }}>
+        {sorted.map(({ bookmark, data, row, spec, eventTime }) => {
           const notFound = data !== undefined && !row;
-          // The event's own timestamp (already KST from the parser) — prefer
-          // the spec's designated timeline field, falling back to a plain
-          // `timestamp` column. This is the "when did it happen" time, kept
-          // distinct from taggedAt ("when I bookmarked it").
-          const eventTime = row ? row[spec?.timelineField ?? "timestamp"] || row.timestamp || "" : "";
 
           return (
             <div key={bookmark.id} style={{ padding: "12px 14px", borderBottom: "1px solid var(--border-subtle)" }}>
@@ -203,6 +240,26 @@ export default function BookmarksView({ bookmarks, onNavigate, onRemove, onUpdat
             </div>
           );
         })}
+      </div>
+
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 16,
+          padding: "5px 14px",
+          borderTop: "1px solid var(--border)",
+          background: "var(--bg-panel)",
+          flexShrink: 0,
+          fontSize: 11.5,
+          fontFamily: "var(--mono)",
+          color: "var(--text-faint)",
+          whiteSpace: "nowrap",
+        }}
+      >
+        <span>
+          총 <strong style={{ color: "var(--text-dim)" }}>{bookmarks.length.toLocaleString()}</strong>건 북마크
+        </span>
       </div>
     </div>
   );

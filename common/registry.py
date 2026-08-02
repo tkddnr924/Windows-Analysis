@@ -19,20 +19,29 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
+# The parse stage produces the base artifacts below. Browser history/login,
+# the generic browser-SQLite dump, UserAssist, and RDP client history are
+# deliberately NOT parse-stage artifacts — they are "선별"(curated selections)
+# derived from parsed results in a later step, so their parser modules stay
+# in parsers/ but aren't registered here.
 from parsers import (
     amcache_parser,
-    browser_history_parser,
-    browser_login_data_parser,
     eventlog_parser,
     jumplist_parser,
+    powershell_history_parser,
     prefetch_parser,
     registry_parser,
-    sqlite_generic_parser,
-    terminal_server_client_parser,
-    userassist_parser,
+    srum_parser,
+    taskscheduler_parser,
+    usnjrnl_parser,
+    wer_parser,
 )
 
-from common.finder import find_files_by_extension, find_files_by_name, find_files_by_suffix, find_sqlite_files
+from common.finder import (
+    find_files_by_content,
+    find_files_by_extension,
+    find_files_by_name,
+)
 
 
 @dataclass
@@ -57,10 +66,8 @@ def _by_extensions(extensions: list[str]) -> Callable[[Path], list[Path]]:
     return lambda target_dir: find_files_by_extension(target_dir, extensions)
 
 
-def _by_suffixes(suffixes: list[str]) -> Callable[[Path], list[Path]]:
-    return lambda target_dir: find_files_by_suffix(target_dir, suffixes)
-
-
+# Base parse-stage artifacts, in the order the user specified. $MFT / $LogFile
+# and Windows Defender are planned but not yet implemented.
 ARTIFACTS: list[ArtifactDefinition] = [
     ArtifactDefinition(
         name=amcache_parser.ARTIFACT_NAME,
@@ -69,43 +76,16 @@ ARTIFACTS: list[ArtifactDefinition] = [
         field_order=amcache_parser.FIELD_ORDER,
     ),
     ArtifactDefinition(
-        name=eventlog_parser.ARTIFACT_NAME,
-        find_paths=_by_extensions(eventlog_parser.EXTENSIONS),
-        parse=eventlog_parser.parse,
-        field_order=eventlog_parser.FIELD_ORDER,
-    ),
-    ArtifactDefinition(
-        name=browser_history_parser.ARTIFACT_NAME,
-        find_paths=_by_filenames(browser_history_parser.FILENAMES),
-        parse=browser_history_parser.parse,
-        field_order=browser_history_parser.FIELD_ORDER,
-        category="Browser",
-    ),
-    ArtifactDefinition(
-        name=browser_login_data_parser.ARTIFACT_NAME,
-        find_paths=_by_filenames(browser_login_data_parser.FILENAMES),
-        parse=browser_login_data_parser.parse,
-        field_order=browser_login_data_parser.FIELD_ORDER,
-        category="Browser",
-    ),
-    ArtifactDefinition(
-        name="SQLite (browser)",
-        find_paths=lambda target_dir: find_sqlite_files(target_dir, under_folder="BROWSER"),
-        parse=sqlite_generic_parser.parse,
-        field_order=sqlite_generic_parser.FIELD_ORDER,
-        category="Browser",
-    ),
-    ArtifactDefinition(
-        name=jumplist_parser.ARTIFACT_NAME,
-        find_paths=_by_extensions(jumplist_parser.EXTENSIONS),
-        parse=jumplist_parser.parse,
-        field_order=jumplist_parser.FIELD_ORDER,
-    ),
-    ArtifactDefinition(
         name=prefetch_parser.ARTIFACT_NAME,
         find_paths=_by_extensions(prefetch_parser.EXTENSIONS),
         parse=prefetch_parser.parse,
         field_order=prefetch_parser.FIELD_ORDER,
+    ),
+    ArtifactDefinition(
+        name=eventlog_parser.ARTIFACT_NAME,
+        find_paths=_by_extensions(eventlog_parser.EXTENSIONS),
+        parse=eventlog_parser.parse,
+        field_order=eventlog_parser.FIELD_ORDER,
     ),
     ArtifactDefinition(
         name=registry_parser.ARTIFACT_NAME,
@@ -114,17 +94,40 @@ ARTIFACTS: list[ArtifactDefinition] = [
         field_order=registry_parser.FIELD_ORDER,
     ),
     ArtifactDefinition(
-        name=userassist_parser.ARTIFACT_NAME,
-        find_paths=_by_suffixes(userassist_parser.FILE_SUFFIXES),
-        parse=userassist_parser.parse,
-        field_order=userassist_parser.FIELD_ORDER,
-        category="Registry",
+        name=usnjrnl_parser.ARTIFACT_NAME,
+        find_paths=_by_filenames(usnjrnl_parser.FILENAMES),
+        parse=usnjrnl_parser.parse,
+        field_order=usnjrnl_parser.FIELD_ORDER,
+        category="FileSystem",
     ),
     ArtifactDefinition(
-        name=terminal_server_client_parser.ARTIFACT_NAME,
-        find_paths=_by_suffixes(terminal_server_client_parser.FILE_SUFFIXES),
-        parse=terminal_server_client_parser.parse,
-        field_order=terminal_server_client_parser.FIELD_ORDER,
-        category="Registry",
+        name=jumplist_parser.ARTIFACT_NAME,
+        find_paths=_by_extensions(jumplist_parser.EXTENSIONS),
+        parse=jumplist_parser.parse,
+        field_order=jumplist_parser.FIELD_ORDER,
+    ),
+    ArtifactDefinition(
+        name=srum_parser.ARTIFACT_NAME,
+        find_paths=_by_filenames(srum_parser.FILENAMES),
+        parse=srum_parser.parse,
+        field_order=srum_parser.FIELD_ORDER,
+    ),
+    ArtifactDefinition(
+        name=wer_parser.ARTIFACT_NAME,
+        find_paths=_by_extensions(wer_parser.EXTENSIONS),
+        parse=wer_parser.parse,
+        field_order=wer_parser.FIELD_ORDER,
+    ),
+    ArtifactDefinition(
+        name=taskscheduler_parser.ARTIFACT_NAME,
+        find_paths=lambda target_dir: find_files_by_content(target_dir, taskscheduler_parser.TASK_NAMESPACE),
+        parse=taskscheduler_parser.parse,
+        field_order=taskscheduler_parser.FIELD_ORDER,
+    ),
+    ArtifactDefinition(
+        name=powershell_history_parser.ARTIFACT_NAME,
+        find_paths=_by_filenames(powershell_history_parser.FILENAMES),
+        parse=powershell_history_parser.parse,
+        field_order=powershell_history_parser.FIELD_ORDER,
     ),
 ]
