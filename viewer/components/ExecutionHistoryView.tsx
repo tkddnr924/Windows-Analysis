@@ -328,8 +328,8 @@ export default function ExecutionHistoryView({
                   </span>
                 )}
 
-                {/* name + path */}
-                <div style={{ flex: 1, minWidth: 0 }}>
+                {/* left: name + time (read together, no ping-pong to the right) */}
+                <div style={{ flex: "1 1 42%", minWidth: 0 }}>
                   <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
                     <span style={{ fontSize: 13, fontWeight: 500, color: "var(--text)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{e.name}</span>
                     {e.tags.map((t) => (
@@ -354,19 +354,21 @@ export default function ExecutionHistoryView({
                       </span>
                     )}
                   </div>
-                  <div style={{ fontSize: 11.5, color: "var(--text-dim)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontFamily: "var(--mono)", marginTop: 2 }}>
-                    {e.path || "경로 없음"}
-                    {e.publisher && <span style={{ color: "var(--text-faint)", fontFamily: "var(--sans)" }}> · {e.publisher}</span>}
-                    {e.runCount && <span style={{ color: "var(--text-faint)", fontFamily: "var(--sans)" }}> · {e.runCount}회 실행</span>}
+                  <div style={{ fontSize: 11.5, color: "var(--text-dim)", fontFamily: "var(--mono)", marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {e.timestamp || "—"}
                   </div>
                 </div>
 
-                {/* right: source + time */}
-                <div style={{ flexShrink: 0, textAlign: "right" }}>
-                  <div style={{ fontSize: 11, color: "var(--text-faint)" }}>
-                    {meta.icon} {meta.label}
+                {/* right: full path + source/publisher/run-count */}
+                <div style={{ flex: "1 1 58%", minWidth: 0 }}>
+                  <div style={{ fontSize: 12, color: "var(--text-dim)", fontFamily: "var(--mono)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {e.path || "경로 없음"}
                   </div>
-                  <div style={{ fontSize: 11.5, color: "var(--text-dim)", fontFamily: "var(--mono)", marginTop: 2 }}>{e.timestamp || "—"}</div>
+                  <div style={{ fontSize: 11, color: "var(--text-faint)", marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {meta.icon} {meta.label}
+                    {e.publisher && ` · ${e.publisher}`}
+                    {e.runCount && ` · ${e.runCount}회 실행`}
+                  </div>
                 </div>
               </div>
             );
