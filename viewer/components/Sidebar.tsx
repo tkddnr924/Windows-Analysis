@@ -74,6 +74,7 @@ const OVERVIEW_TABLE_ICONS: Record<string, string> = {
   TargetInfo: "🖥️",
   ExecutionHistory: "⚡",
   RemoteDesktopHistory: "🖥️",
+  PowerShellHistory: "💻",
   BrowserTimeline: "🌐",
 };
 

@@ -17,6 +17,7 @@ an older run's numbers.
 from __future__ import annotations
 
 import json
+import re
 
 
 def _rows(all_results: dict, artifact_name: str, output_name: str) -> list[dict]:
@@ -258,6 +259,209 @@ def build_remote_desktop_history(all_results: dict) -> list[dict]:
                 "record_key": r.get("_record_key", ""),
             }
         )
+
+    return rows
+
+
+# --- PowerShell command history (from the event logs) -----------------------
+#
+# Built ONLY from EventLog_Events, per the DFIR question "what did PowerShell
+# actually run": the raw PSReadLine ConsoleHost_history.txt (parsed separately
+# as PowerShell_ConsoleHistory) is deliberately NOT merged in here — it carries
+# no time/account/process, so it belongs in its own raw table, not this
+# correlated view.
+#
+# Three event shapes carry a command, across the two PowerShell logs:
+#   - Microsoft-Windows-PowerShell/Operational 4104 — script block logging:
+#     the ScriptBlockText IS the code that ran (the richest source). Long
+#     scripts are split across several 4104 records sharing one ScriptBlockId
+#     (MessageNumber/MessageTotal), reassembled back into one row below. These
+#     manifest fields are NOT localized, so they parse reliably on any locale.
+#   - Microsoft-Windows-PowerShell/Operational 4103 — pipeline/module logging:
+#     ContextInfo (host application + user) and Payload (the invocation).
+#     ContextInfo's field *labels* are localized, so values are read
+#     best-effort with a value-shape fallback.
+#   - Windows PowerShell (classic) 800 — pipeline execution details: the
+#     HostApplication= / CommandLine= tokens in its detail text are literal
+#     (not localized), pulled out by regex.
+
+
+def _basename(path: str) -> str:
+    return path.replace("/", "\\").split("\\")[-1] if path else ""
+
+
+def _user_map(all_results: dict) -> dict:
+    """SID -> readable account name, from Registry_UserProfiles, so a bare
+    logon SID on a PowerShell event can be shown as e.g. 'administrator'."""
+    umap = {}
+    for r in _rows(all_results, "Registry", "Registry_UserProfiles"):
+        sid = r.get("sid", "")
+        name = _basename(r.get("profile_image_path", ""))
+        if sid and name:
+            umap[sid] = name
+    return umap
+
+
+def _all_strings(obj) -> list[str]:
+    """Every string value anywhere inside a parsed EventData structure —
+    flattens dict/list/str uniformly so a token can be found regardless of how
+    the (legacy) event serialized its data."""
+    if isinstance(obj, str):
+        return [obj]
+    if isinstance(obj, dict):
+        out = []
+        for v in obj.values():
+            out += _all_strings(v)
+        return out
+    if isinstance(obj, list):
+        out = []
+        for v in obj:
+            out += _all_strings(v)
+        return out
+    return []
+
+
+def _ctx_value(context_info: str, *label_tokens: str) -> str:
+    """Read a 'Label = Value' line out of a 4103 ContextInfo block. Labels are
+    localized (English 'Host Application' becomes '호스트 응용 프로그램' on a
+    Korean host), so match if the line's label contains ANY of the given
+    tokens (pass both the English and localized forms)."""
+    for line in context_info.splitlines():
+        if "=" not in line:
+            continue
+        label, _, value = line.partition("=")
+        label = label.strip()
+        if any(tok and tok in label for tok in label_tokens):
+            return value.strip()
+    return ""
+
+
+def _exe_from_host(host_application: str) -> str:
+    """Executable name out of a host-application command line, e.g.
+    '"C:\\...\\powershell.exe" -File x.ps1' -> 'powershell.exe'. Kept as a
+    stable per-process label (the full command line varies per invocation, so
+    it can't group a session)."""
+    h = host_application.strip()
+    if not h:
+        return ""
+    if h.startswith('"'):
+        end = h.find('"', 1)
+        path = h[1:end] if end != -1 else h[1:]
+    else:
+        path = h.split(" ", 1)[0]
+    return _basename(path) or path
+
+
+def _first_line(text: str, limit: int = 400) -> str:
+    for line in (text or "").splitlines():
+        stripped = line.strip()
+        if stripped:
+            return stripped[:limit]
+    return (text or "").strip()[:limit]
+
+
+def _find(blob: str, pattern: str) -> str:
+    m = re.search(pattern, blob)
+    return m.group(1).strip() if m else ""
+
+
+def _to_int(value, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _ps_row(*, timestamp, account, process, process_id, command, script_block, kind, event_id, provider, script_path, record_key) -> dict:
+    return {
+        "timestamp": timestamp,
+        "account": account,
+        "process": process,
+        "process_id": process_id,
+        "command": command,
+        "script_block": script_block,
+        "kind": kind,
+        "event_id": event_id,
+        "provider": provider,
+        "script_path": script_path,
+        "record_key": record_key,
+    }
+
+
+def build_powershell_history(all_results: dict) -> list[dict]:
+    umap = _user_map(all_results)
+
+    def account_for(sid: str) -> str:
+        return umap.get(sid, "") or sid
+
+    rows: list[dict] = []
+    # ScriptBlockId -> reassembly slot, for multi-part 4104 script blocks.
+    blocks: dict[str, dict] = {}
+
+    for r in _rows(all_results, "EventLog", "EventLog_Events"):
+        provider = r.get("Provider", "") or ""
+        event_id = str(r.get("EventID", ""))
+        ed = _parse_event_data(r.get("EventData", ""))
+        sid = r.get("UserID", "") or ""
+        pid = str(r.get("ProcessID", "") or "")
+        ts = r.get("timestamp", "") or ""
+        rk = r.get("_record_key", "") or ""
+
+        if provider == "Microsoft-Windows-PowerShell" and event_id == "4104":
+            text = str(ed.get("ScriptBlockText", "") or "")
+            path = str(ed.get("Path", "") or "")
+            sbid = str(ed.get("ScriptBlockId", "") or "")
+            total = _to_int(ed.get("MessageTotal"), 1)
+            num = _to_int(ed.get("MessageNumber"), 1)
+
+            if sbid and total > 1:
+                slot = blocks.setdefault(
+                    sbid,
+                    {"parts": {}, "timestamp": ts, "sid": sid, "pid": pid, "rk": rk, "path": path},
+                )
+                slot["parts"][num] = text
+                if ts and (not slot["timestamp"] or ts < slot["timestamp"]):
+                    slot["timestamp"] = ts
+                    slot["rk"] = rk  # link to the first record of the block
+                continue
+
+            rows.append(_ps_row(
+                timestamp=ts, account=account_for(sid), process="powershell.exe", process_id=pid,
+                command=_first_line(text), script_block=text, kind="스크립트 블록",
+                event_id=event_id, provider=provider, script_path=path, record_key=rk,
+            ))
+
+        elif provider == "Microsoft-Windows-PowerShell" and event_id == "4103":
+            ctx = str(ed.get("ContextInfo", "") or "")
+            host = _ctx_value(ctx, "Host Application", "호스트 응용")
+            user = _ctx_value(ctx, "User", "사용자")
+            payload = str(ed.get("Payload", "") or "").strip()
+            command = payload or _ctx_value(ctx, "Command Name", "명령 이름")
+            rows.append(_ps_row(
+                timestamp=ts, account=user or account_for(sid), process=_exe_from_host(host) or "powershell.exe",
+                process_id=pid, command=_first_line(command), script_block="", kind="파이프라인",
+                event_id=event_id, provider=provider, script_path="", record_key=rk,
+            ))
+
+        elif provider == "PowerShell" and event_id == "800":
+            blob = "\n".join(_all_strings(ed))
+            host = _find(blob, r"HostApplication=(.+)")
+            command = _find(blob, r"CommandLine=(.+)")
+            if not command:
+                continue  # a 800 with no command line carries nothing useful here
+            rows.append(_ps_row(
+                timestamp=ts, account=account_for(sid), process=_exe_from_host(host) or "powershell.exe",
+                process_id=pid, command=_first_line(command), script_block="", kind="명령 실행",
+                event_id=event_id, provider=provider, script_path="", record_key=rk,
+            ))
+
+    for slot in blocks.values():
+        text = "".join(slot["parts"][k] for k in sorted(slot["parts"]))
+        rows.append(_ps_row(
+            timestamp=slot["timestamp"], account=account_for(slot["sid"]), process="powershell.exe",
+            process_id=slot["pid"], command=_first_line(text), script_block=text, kind="스크립트 블록",
+            event_id="4104", provider="Microsoft-Windows-PowerShell", script_path=slot["path"], record_key=slot["rk"],
+        ))
 
     return rows
 

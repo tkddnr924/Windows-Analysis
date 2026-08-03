@@ -93,6 +93,7 @@ def run_case(case_id: str, cases_dir: Path, only: set[str] | None = None) -> Non
         "TargetInfo": correlate.build_target_info,
         "ExecutionHistory": correlate.build_execution_history,
         "RemoteDesktopHistory": correlate.build_remote_desktop_history,
+        "PowerShellHistory": correlate.build_powershell_history,
         "BrowserTimeline": correlate.build_browser_timeline,
     }
     for output_name, builder in overview_builders.items():

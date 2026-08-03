@@ -89,7 +89,7 @@ export interface ArtifactViewSpec {
    * Overview correlations (TargetInfo, ...) read as summaries/dashboards, not
    * spreadsheets, so each gets a purpose-built view.
    */
-  customView?: "targetInfo" | "executionHistory";
+  customView?: "targetInfo" | "executionHistory" | "powershellFlow";
   /**
    * In the sidebar, present this table split by this column: instead of one
    * row for the whole table, the category lists one entry per distinct value
@@ -275,6 +275,36 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
       { key: "event_id", label: "이벤트 ID" },
       { key: "provider", label: "공급자" },
     ]}],
+  },
+
+  PowerShellHistory: {
+    customView: "powershellFlow",
+    title: (r) => r.command || r.kind || "(명령 없음)",
+    subtitle: (r) => [r.account, r.process].filter(Boolean).join(" · "),
+    badges: [
+      { key: "kind", kind: "badge" },
+      { key: "event_id", label: "이벤트 ID", kind: "badge" },
+    ],
+    tags: (r) => tagsForPath(r.script_path),
+    links: [{ key: "record_key", label: "이벤트 로그 원본 보기", targetFile: "EventLog_Events", targetColumn: "_record_key" }],
+    // (kept for when the raw table is viewed directly, but the flow view is
+    // the default) — the five fields the analyst actually scans.
+    visibleColumns: ["timestamp", "kind", "account", "process", "command"],
+    priorityColumns: ["timestamp", "kind", "account", "process", "command"],
+    sections: [
+      { heading: "실행 정보", fields: [
+        { key: "account", label: "수행 계정" },
+        { key: "process", label: "수행 프로세스" },
+        { key: "process_id", label: "프로세스 ID" },
+        { key: "script_path", label: "스크립트 경로", kind: "path" },
+      ]},
+      { heading: "명령어", fields: [{ key: "command", kind: "code" }] },
+      { heading: "코드 블록 (ScriptBlock)", fields: [{ key: "script_block", kind: "code" }] },
+      { heading: "이벤트", fields: [
+        { key: "event_id", label: "이벤트 ID" },
+        { key: "provider", label: "공급자" },
+      ]},
+    ],
   },
 
   BrowserTimeline: {

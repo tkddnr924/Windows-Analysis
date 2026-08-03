@@ -8,6 +8,7 @@ import RunPipeline from "@/components/RunPipeline";
 import MasterTimeline from "@/components/MasterTimeline";
 import BookmarksView from "@/components/BookmarksView";
 import SessionFlowView from "@/components/SessionFlowView";
+import PowerShellFlowView from "@/components/PowerShellFlowView";
 import TargetInfoView from "@/components/TargetInfoView";
 import ExecutionHistoryView from "@/components/ExecutionHistoryView";
 import { buildMasterTimeline } from "@/lib/masterTimeline";
@@ -297,6 +298,15 @@ export default function Home() {
                 <TargetInfoView data={activeTab.data} />
               ) : getArtifactView(activeTab.file.name)?.customView === "executionHistory" ? (
                 <ExecutionHistoryView
+                  data={activeTab.data}
+                  onNavigate={handleNavigate}
+                  onFetchLinkedRows={fetchLinkedRows}
+                  bookmarkedRowids={activeBookmarkedRowids}
+                  onToggleBookmark={(rowid) => handleToggleBookmark(activeTab.file.fullPath, activeTab.file.name, rowid)}
+                  timeRange={timeRange}
+                />
+              ) : getArtifactView(activeTab.file.name)?.customView === "powershellFlow" ? (
+                <PowerShellFlowView
                   data={activeTab.data}
                   onNavigate={handleNavigate}
                   onFetchLinkedRows={fetchLinkedRows}
