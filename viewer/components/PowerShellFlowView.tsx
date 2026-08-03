@@ -244,8 +244,18 @@ export default function PowerShellFlowView({
                         title={ev.kind}
                         style={{ width: 8, height: 8, borderRadius: "50%", flexShrink: 0, background: KIND_COLOR[ev.kind] ?? "var(--text-faint)" }}
                       />
-                      <span style={{ flex: 1, minWidth: 0, fontFamily: "var(--mono)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                        {ev.command || "(명령 없음)"}
+                      <span
+                        style={{
+                          flex: 1,
+                          minWidth: 0,
+                          fontFamily: "var(--mono)",
+                          overflow: "hidden",
+                          textOverflow: "ellipsis",
+                          whiteSpace: "nowrap",
+                          color: ev.command ? undefined : "var(--text-faint)",
+                        }}
+                      >
+                        {ev.command || (ev.scriptBlock ? "코드 블록 (상세에서 확인)" : "-")}
                       </span>
                       {ev.scriptBlock && (
                         <span title="코드 블록 있음" style={{ flexShrink: 0, fontSize: 10.5, color: "var(--accent)", fontFamily: "var(--mono)" }}>

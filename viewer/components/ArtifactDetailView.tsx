@@ -7,6 +7,7 @@ import type { FetchLinkedRows } from "@/lib/types";
 import { parsePrivileges, lookupPrivilege } from "@/lib/privileges";
 import TagList from "./TagList";
 import MiniTimeline from "./MiniTimeline";
+import CodeModal from "./CodeModal";
 
 // Renders a raw Windows PrivilegeList (event 4672/4673) as a simple readable
 // list: each Se*Privilege with a plain "what it is" description. No risk
@@ -64,34 +65,44 @@ function prettyJsonOrNull(value: string): string | null {
 
 // Renders a code/JSON blob. When the value parses as JSON it defaults to a
 // beautified (indented) view with a toggle back to the original one-line
-// form; otherwise it just shows the raw text. Used for `json`/`code` fields
-// and for any plain field whose value turns out to be JSON.
-function CodeOrJsonBlock({ raw }: { raw: string }) {
+// form; otherwise it just shows the raw text. An expand button opens the
+// content full-screen (CodeModal) — the detail panel's box is small, and a
+// PowerShell ScriptBlock can be hundreds of lines. Used for `json`/`code`
+// fields and for any plain field whose value turns out to be JSON.
+function CodeOrJsonBlock({ raw, expandTitle }: { raw: string; expandTitle?: string }) {
   const pretty = prettyJsonOrNull(raw);
   const [beautified, setBeautified] = useState(true);
+  const [expanded, setExpanded] = useState(false);
   const isJson = pretty !== null;
+  const shown = isJson && beautified ? (pretty as string) : raw;
+
+  const btnStyle: React.CSSProperties = {
+    fontSize: 10,
+    padding: "1px 8px",
+    background: "var(--bg-elevated)",
+    color: "var(--accent)",
+    border: "1px solid var(--border)",
+    borderRadius: "var(--radius-sm)",
+    cursor: "pointer",
+  };
 
   return (
     <div>
-      {isJson && (
-        <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 4 }}>
+      <div style={{ display: "flex", justifyContent: "flex-end", gap: 6, marginBottom: 4 }}>
+        {isJson && (
           <button
             onClick={() => setBeautified((b) => !b)}
             title={beautified ? "원본(압축) 보기" : "보기 좋게 정렬"}
-            style={{
-              fontSize: 10,
-              padding: "1px 8px",
-              background: "var(--bg-elevated)",
-              color: "var(--accent)",
-              border: "1px solid var(--border)",
-              borderRadius: "var(--radius-sm)",
-              cursor: "pointer",
-            }}
+            style={btnStyle}
           >
             {beautified ? "{ } 원본" : "{ } 정렬"}
           </button>
-        </div>
-      )}
+        )}
+        <button onClick={() => setExpanded(true)} title="크게 보기" style={btnStyle}>
+          ⛶ 확장
+        </button>
+      </div>
+      {expanded && <CodeModal code={shown} title={expandTitle ?? "코드 보기"} onClose={() => setExpanded(false)} />}
       <pre
         style={{
           margin: 0,
@@ -107,7 +118,7 @@ function CodeOrJsonBlock({ raw }: { raw: string }) {
           overflow: "auto",
         }}
       >
-        {isJson && beautified ? pretty : raw}
+        {shown}
       </pre>
     </div>
   );
@@ -192,7 +203,7 @@ function FieldRow({ field, row }: { field: FieldSpec; row: Record<string, string
       break;
     case "code":
     case "json":
-      content = <CodeOrJsonBlock raw={raw} />;
+      content = <CodeOrJsonBlock raw={raw} expandTitle={label} />;
       break;
     case "privileges":
       content = <PrivilegeList raw={raw} />;
@@ -201,7 +212,7 @@ function FieldRow({ field, row }: { field: FieldSpec; row: Record<string, string
       // A plain text/path field can still hold a JSON blob (e.g. a registry
       // value, a serialized argument) — offer the same beautify toggle when
       // the value actually parses as JSON, otherwise render it inline.
-      content = prettyJsonOrNull(raw) ? <CodeOrJsonBlock raw={raw} /> : <span style={{ fontSize: 12.5 }}>{displayValue}</span>;
+      content = prettyJsonOrNull(raw) ? <CodeOrJsonBlock raw={raw} expandTitle={label} /> : <span style={{ fontSize: 12.5 }}>{displayValue}</span>;
   }
 
   return (

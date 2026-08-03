@@ -1,0 +1,120 @@
+"use client";
+
+import { useEffect, useState } from "react";
+
+// A full-screen overlay that shows one code/text blob on its own — for when a
+// ScriptBlock (or any long code field) is too big to read inside the detail
+// panel's small scroll box. Copy + wrap toggle + Escape/click-outside close.
+export default function CodeModal({
+  code,
+  title = "코드 보기",
+  onClose,
+}: {
+  code: string;
+  title?: string;
+  onClose: () => void;
+}) {
+  const [copied, setCopied] = useState(false);
+  const [wrap, setWrap] = useState(true);
+
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") onClose();
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  const btnStyle: React.CSSProperties = {
+    fontSize: 11,
+    padding: "3px 9px",
+    background: "var(--bg-elevated)",
+    color: "var(--text-dim)",
+    border: "1px solid var(--border)",
+    borderRadius: "var(--radius-sm)",
+    cursor: "pointer",
+  };
+
+  return (
+    <div
+      onClick={onClose}
+      style={{
+        position: "fixed",
+        inset: 0,
+        background: "rgba(1,4,9,0.75)",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        zIndex: 200,
+        padding: 24,
+      }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          width: "min(1000px, 92vw)",
+          height: "min(820px, 86vh)",
+          display: "flex",
+          flexDirection: "column",
+          background: "var(--bg-panel)",
+          border: "1px solid var(--border)",
+          borderRadius: "var(--radius-md)",
+          boxShadow: "var(--shadow-panel)",
+          overflow: "hidden",
+        }}
+      >
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+            padding: "10px 14px",
+            borderBottom: "1px solid var(--border)",
+            background: "var(--bg-elevated)",
+            flexShrink: 0,
+          }}
+        >
+          <strong style={{ fontSize: 13 }}>{title}</strong>
+          <span style={{ fontSize: 11, color: "var(--text-faint)" }}>{code.length.toLocaleString()}자</span>
+          <button onClick={() => setWrap((w) => !w)} style={{ ...btnStyle, marginLeft: "auto" }}>
+            {wrap ? "줄바꿈 끄기" : "줄바꿈 켜기"}
+          </button>
+          <button
+            onClick={() => {
+              navigator.clipboard.writeText(code).then(() => {
+                setCopied(true);
+                setTimeout(() => setCopied(false), 1200);
+              });
+            }}
+            style={btnStyle}
+          >
+            {copied ? "복사됨" : "복사"}
+          </button>
+          <button
+            onClick={onClose}
+            title="닫기 (Esc)"
+            style={{ ...btnStyle, fontSize: 16, lineHeight: 1, padding: "2px 8px" }}
+          >
+            ×
+          </button>
+        </div>
+        <pre
+          style={{
+            margin: 0,
+            flex: 1,
+            overflow: "auto",
+            padding: 16,
+            fontFamily: "var(--mono)",
+            fontSize: 13,
+            lineHeight: 1.55,
+            whiteSpace: wrap ? "pre-wrap" : "pre",
+            wordBreak: wrap ? "break-word" : "normal",
+            color: "var(--text)",
+          }}
+        >
+          {code}
+        </pre>
+      </div>
+    </div>
+  );
+}

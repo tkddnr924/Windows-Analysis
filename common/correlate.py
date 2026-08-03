@@ -425,9 +425,12 @@ def build_powershell_history(all_results: dict) -> list[dict]:
                     slot["rk"] = rk  # link to the first record of the block
                 continue
 
+            # A 4104 script block has no distinct "command line" — the code IS
+            # the record. Leave `command` empty (the viewer shows "-") and keep
+            # the full code in `script_block`, shown in the detail view.
             rows.append(_ps_row(
                 timestamp=ts, account=account_for(sid), process="powershell.exe", process_id=pid,
-                command=_first_line(text), script_block=text, kind="스크립트 블록",
+                command="", script_block=text, kind="스크립트 블록",
                 event_id=event_id, provider=provider, script_path=path, record_key=rk,
             ))
 
@@ -459,7 +462,7 @@ def build_powershell_history(all_results: dict) -> list[dict]:
         text = "".join(slot["parts"][k] for k in sorted(slot["parts"]))
         rows.append(_ps_row(
             timestamp=slot["timestamp"], account=account_for(slot["sid"]), process="powershell.exe",
-            process_id=slot["pid"], command=_first_line(text), script_block=text, kind="스크립트 블록",
+            process_id=slot["pid"], command="", script_block=text, kind="스크립트 블록",
             event_id="4104", provider="Microsoft-Windows-PowerShell", script_path=slot["path"], record_key=slot["rk"],
         ))
 
