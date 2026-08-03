@@ -48,6 +48,12 @@ def _text(elem, name) -> str:
     return (node.text or "").strip() if node is not None else ""
 
 
+def _leaf(uri: str) -> str:
+    r"""Last path segment of a task URI, e.g. '\Microsoft\Windows\Defrag\
+    ScheduledDefrag' -> 'ScheduledDefrag'. The full path stays in `uri`."""
+    return uri.rstrip("\\").split("\\")[-1] if uri else ""
+
+
 def _parse_task(path: Path) -> dict:
     root = ET.fromstring(path.read_bytes())
 
@@ -100,7 +106,9 @@ def _parse_task(path: Path) -> dict:
 
     return {
         "timestamp": format_timestamp(date, source_tz=KST) if date else "",
-        "task_name": uri or path.name,
+        # Just the task's leaf name for scanning; the full \folder\path stays
+        # in `uri` (shown in the detail view).
+        "task_name": _leaf(uri) or path.name,
         "enabled": enabled,
         "hidden": hidden,
         "run_as": run_as,

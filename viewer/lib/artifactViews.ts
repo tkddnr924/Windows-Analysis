@@ -770,6 +770,47 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     ],
   },
 
+  TaskScheduler_Tasks: {
+    title: (r) => r.task_name || r.uri || "(작업)",
+    subtitle: (r) => r.uri || r.actions || "",
+    badges: [
+      { key: "enabled", label: "사용", kind: "badge", badgeColors: BOOL_COLORS },
+      { key: "hidden", label: "숨김", kind: "badge", badgeColors: { true: "#d29922", false: "#8a8a8a" } },
+      { key: "run_level", kind: "badge" },
+    ],
+    // A hidden task, and a task whose action runs from a suspicious path, are
+    // both classic persistence signals.
+    tags: (r) =>
+      tagsForBoolean(r.hidden, {
+        label: "숨겨진 작업(Hidden)",
+        severity: "warning",
+        description: "이 예약 작업은 Task Scheduler UI에 숨겨지도록 설정되어 있습니다. 정상 작업도 일부 숨김을 쓰지만, 공격자가 지속성 확보용 작업을 감추는 수법이기도 하니 실행 명령을 확인하세요.",
+      }).concat(tagsForPath(r.actions)),
+    // Only these 7 in the table; everything else lives in the detail panel.
+    visibleColumns: ["timestamp", "task_name", "actions", "enabled", "hidden", "run_as", "run_level"],
+    priorityColumns: ["timestamp", "task_name", "actions", "enabled", "hidden", "run_as", "run_level"],
+    sections: [
+      { heading: "실행 동작", fields: [{ key: "actions", kind: "code" }] },
+      { heading: "실행 주체", fields: [
+        { key: "run_as", label: "실행 계정" },
+        { key: "run_level", label: "권한 수준" },
+        { key: "logon_type", label: "로그온 유형" },
+      ]},
+      { heading: "트리거", fields: [
+        { key: "trigger_types", label: "트리거 종류" },
+        { key: "trigger_start", label: "시작 경계" },
+      ]},
+      { heading: "등록 정보", fields: [
+        { key: "timestamp", label: "등록 시각" },
+        { key: "enabled", label: "사용 여부" },
+        { key: "hidden", label: "숨김" },
+        { key: "author", label: "작성자" },
+        { key: "description", label: "설명" },
+        { key: "uri", label: "전체 경로(URI)", kind: "path" },
+      ]},
+    ],
+  },
+
   Registry_Accounts: {
     title: (r) => r.username || (r.rid ? `RID ${r.rid}` : "(계정)"),
     subtitle: (r) => [r.rid && `RID ${r.rid}`, r.disabled === "예" ? "비활성" : ""].filter(Boolean).join(" · "),
