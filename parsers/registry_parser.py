@@ -73,9 +73,16 @@ FIELD_ORDER = {
     "Registry_NetworkProfiles": [
         "timestamp", "profile_name", "_source_file",
     ],
+    "Registry_NetworkInterfaces": [
+        "ip_address", "subnet_mask", "default_gateway", "dhcp_server",
+        "dns_server", "domain", "dhcp_enabled", "lease_obtained",
+        "lease_terminates", "interface_guid", "control_set", "_source_file",
+    ],
     "Registry_Accounts": [
-        "account_created", "username", "rid", "last_login", "password_last_set",
-        "login_count", "disabled", "account_flags", "_source_file",
+        "account_created", "username", "full_name", "rid", "home_directory",
+        "last_login", "password_last_set", "last_failed_login",
+        "login_count", "failed_login_count", "disabled", "special_account",
+        "groups", "account_flags", "_source_file",
     ],
 }
 
@@ -366,14 +373,211 @@ def _control_sets(hive: RegistryHive) -> list[str]:
     return [s.name for s in hive.root.iter_subkeys() if s.name.upper().startswith("CONTROLSET")]
 
 
+def _ip_value(vals: dict, dhcp_key: str, static_key: str) -> str:
+    """An interface's address (or gateway/mask): DHCP value if leased, else the
+    static (REG_MULTI_SZ) value. Drops the 0.0.0.0 placeholder DHCP writes when
+    no lease is held."""
+    dhcp = vals.get(dhcp_key)
+    if isinstance(dhcp, str) and dhcp.strip() and dhcp.strip() != "0.0.0.0":
+        return dhcp.strip()
+    static = vals.get(static_key)
+    if isinstance(static, list):
+        joined = ", ".join(x for x in static if x and x != "0.0.0.0")
+        if joined:
+            return joined
+    if isinstance(static, str) and static.strip() and static.strip() != "0.0.0.0":
+        return static.strip()
+    return ""
+
+
+def _dns_servers(vals: dict) -> str:
+    dhcp = vals.get("DhcpNameServer")
+    if isinstance(dhcp, str) and dhcp.strip():
+        return dhcp.strip().replace(" ", ", ")
+    static = vals.get("NameServer")
+    if isinstance(static, str) and static.strip():
+        return static.strip()
+    return ""
+
+
+def _parse_network_interfaces(hive: RegistryHive, source_file: str) -> list[dict]:
+    r"""TCP/IP configuration per network adapter, from SYSTEM
+    \<ControlSet>\Services\Tcpip\Parameters\Interfaces\<GUID> — the actual IP
+    addresses, gateway, DNS and DHCP lease. This is where a machine's IPs
+    live; the NetworkList\Profiles key only has the network's *name* and
+    last-connected time, no address. Adapters with no address are skipped, and
+    a GUID seen in one ControlSet isn't repeated from the backup set."""
+    seen = set()
+    rows = []
+    for control_set in _control_sets(hive):
+        try:
+            key = hive.get_key(f"\\{control_set}\\Services\\Tcpip\\Parameters\\Interfaces")
+        except RegistryKeyNotFoundException:
+            continue
+        for sub in key.iter_subkeys():
+            guid = sub.name
+            if guid in seen:
+                continue
+            vals = _key_values(sub)
+            ip = _ip_value(vals, "DhcpIPAddress", "IPAddress")
+            if not ip:
+                continue
+            seen.add(guid)
+            lease_o = vals.get("LeaseObtainedTime")
+            lease_t = vals.get("LeaseTerminatesTime")
+            enable_dhcp = vals.get("EnableDHCP")
+            domain = vals.get("Domain") or vals.get("DhcpDomain") or ""
+            dhcp_server = vals.get("DhcpServer")
+            rows.append(
+                {
+                    "ip_address": ip,
+                    "subnet_mask": _ip_value(vals, "DhcpSubnetMask", "SubnetMask"),
+                    "default_gateway": _ip_value(vals, "DhcpDefaultGateway", "DefaultGateway"),
+                    "dhcp_server": dhcp_server.strip() if isinstance(dhcp_server, str) else "",
+                    "dns_server": _dns_servers(vals),
+                    "domain": domain if isinstance(domain, str) else "",
+                    "dhcp_enabled": "예" if enable_dhcp == 1 else ("아니오" if enable_dhcp is not None else ""),
+                    # LeaseObtainedTime/LeaseTerminatesTime are Unix epoch (UTC).
+                    "lease_obtained": format_timestamp(lease_o, source_tz=UTC) if isinstance(lease_o, int) and lease_o else "",
+                    "lease_terminates": format_timestamp(lease_t, source_tz=UTC) if isinstance(lease_t, int) and lease_t else "",
+                    "interface_guid": guid,
+                    "control_set": control_set,
+                    "_source_file": source_file,
+                }
+            )
+    return rows
+
+
+# Well-known local group (alias) RIDs -> readable name, used when the group's
+# own name string can't be read from its C value.
+_WELLKNOWN_ALIASES = {
+    544: "Administrators(관리자)", 545: "Users(사용자)", 546: "Guests(게스트)",
+    547: "Power Users", 548: "Account Operators", 549: "Server Operators",
+    550: "Print Operators", 551: "Backup Operators(백업 운영자)", 552: "Replicators",
+    555: "Remote Desktop Users(원격 데스크톱)", 556: "Network Configuration Operators",
+    559: "Performance Log Users", 562: "Distributed COM Users", 568: "IIS_IUSRS",
+    569: "Cryptographic Operators", 573: "Event Log Readers",
+    574: "Certificate Service DCOM Access", 578: "Hyper-V Administrators",
+    579: "Access Control Assistance Operators", 580: "Remote Management Users(WinRM)",
+}
+
+
+def _as_bytes(value) -> bytes:
+    if isinstance(value, bytes):
+        return value
+    if isinstance(value, str):
+        try:
+            return bytes.fromhex(value)
+        except ValueError:
+            return value.encode("latin-1", "ignore")
+    return b""
+
+
+def _read_sid(data: bytes, off: int):
+    """Parse one binary SID at `off`; return (sid_string, bytes_consumed) or
+    (None, 0) if it doesn't look like a SID."""
+    if off + 8 > len(data):
+        return None, 0
+    revision = data[off]
+    sub_count = data[off + 1]
+    if revision != 1 or sub_count > 15:
+        return None, 0
+    length = 8 + 4 * sub_count
+    if off + length > len(data):
+        return None, 0
+    authority = int.from_bytes(data[off + 2 : off + 8], "big")
+    subs = [int.from_bytes(data[off + 8 + 4 * i : off + 12 + 4 * i], "little") for i in range(sub_count)]
+    sid = f"S-{revision}-{authority}" + "".join(f"-{s}" for s in subs)
+    return sid, length
+
+
+def _parse_alias_c(data: bytes):
+    """Group name + member SIDs from an Aliases\\<RID>\\C binary value.
+    Offsets are relative to a 0x34-byte header. Best-effort: any mismatch
+    yields an empty member list rather than wrong data."""
+    if len(data) < 0x34:
+        return "", []
+    try:
+        name_off = int.from_bytes(data[0x0C:0x10], "little") + 0x34
+        name_len = int.from_bytes(data[0x10:0x14], "little")
+        name = data[name_off : name_off + name_len].decode("utf-16-le", "replace") if 0 < name_len and name_off + name_len <= len(data) else ""
+
+        members_off = int.from_bytes(data[0x24:0x28], "little") + 0x34
+        members_len = int.from_bytes(data[0x28:0x2C], "little")
+        end = min(len(data), members_off + members_len) if members_len else len(data)
+        members = []
+        off = members_off
+        while off < end:
+            sid, consumed = _read_sid(data, off)
+            if not sid or consumed == 0:
+                break
+            members.append(sid)
+            off += consumed
+        return name, members
+    except (struct.error, IndexError, ValueError):
+        return "", []
+
+
+def _parse_sam_groups(hive: RegistryHive) -> dict:
+    """Map a local RID -> the local groups it belongs to, from the Aliases
+    membership under SAM (Builtin + Account domains). Members are stored as
+    full SIDs; we key by the trailing RID so a user (keyed by RID elsewhere)
+    can be matched without needing the machine SID prefix."""
+    by_rid: dict[str, list[str]] = {}
+    for alias_path in (r"\SAM\Domains\Builtin\Aliases", r"\SAM\Domains\Account\Aliases"):
+        try:
+            aliases = hive.get_key(alias_path)
+        except RegistryKeyNotFoundException:
+            continue
+        for sub in aliases.iter_subkeys():
+            if sub.name in ("Members", "Names"):
+                continue
+            try:
+                alias_rid = int(sub.name, 16)
+            except ValueError:
+                continue
+            c_value = None
+            for v in sub.iter_values():
+                if v.name == "C":
+                    c_value = v.value
+                    break
+            if c_value is None:
+                continue
+            name, members = _parse_alias_c(_as_bytes(c_value))
+            group_name = name or _WELLKNOWN_ALIASES.get(alias_rid, f"RID {alias_rid}")
+            for sid in members:
+                member_rid = sid.rsplit("-", 1)[-1]
+                by_rid.setdefault(member_rid, [])
+                if group_name not in by_rid[member_rid]:
+                    by_rid[member_rid].append(group_name)
+    return by_rid
+
+
+def _parse_special_accounts(hive: RegistryHive) -> dict:
+    """Winlogon SpecialAccounts\\UserList (SOFTWARE): username -> value.
+    Value 0 = the account is HIDDEN from the logon screen — a common
+    account-hiding / persistence technique. Keyed lowercase for joining."""
+    try:
+        key = hive.get_key(r"\Microsoft\Windows NT\CurrentVersion\Winlogon\SpecialAccounts\UserList")
+    except RegistryKeyNotFoundException:
+        return {}
+    result = {}
+    for v in key.iter_values(as_json=True):
+        if v.name:
+            result[v.name.lower()] = v.value
+    return result
+
+
 def _parse_sam_accounts(hive: RegistryHive, source_file: str) -> list[dict]:
-    """Local user accounts from the SAM hive: creation date, login times and
-    account flags — NOT password hashes or any other credential material.
+    """Local user accounts from the SAM hive: creation date, login/password
+    times, counts, flags and local group membership — NOT password hashes or
+    any other credential material.
 
     The account CREATION date is the last-write time of each account's
     SAM\\...\\Users\\Names\\<username> subkey (the standard forensic proxy for
     when the account was created), surfaced by the plugin as
-    `name_key_last_write`. Login/password times come from the F value.
+    `name_key_last_write`. Login/password times and counts come from the F
+    value; name/home directory from the V value; groups from the Aliases.
     """
     if SAMParsePlugin is None:
         return []
@@ -385,19 +589,28 @@ def _parse_sam_accounts(hive: RegistryHive, source_file: str) -> list[dict]:
     except Exception:
         return []
 
+    groups_by_rid = _parse_sam_groups(hive)
+
     rows = []
     for e in entries:
         flags = e.get("account_flags_parsed") or []
         rid = e.get("rid")
+        rid_str = str(rid) if rid is not None else ""
         rows.append(
             {
                 "account_created": _fmt(e.get("name_key_last_write")),
                 "username": e.get("username", "") or "",
-                "rid": str(rid) if rid is not None else "",
+                "full_name": e.get("full_name", "") or "",
+                "rid": rid_str,
+                "home_directory": e.get("home_directory", "") or "",
                 "last_login": _fmt(e.get("last_login")),
                 "password_last_set": _fmt(e.get("password_last_set")),
+                "last_failed_login": _fmt(e.get("last_failed_login")),
                 "login_count": str(e.get("login_count", "") or ""),
+                "failed_login_count": str(e.get("failed_login_count", "") or ""),
                 "disabled": "예" if "Account Disabled" in flags else "아니오",
+                "special_account": "",  # filled in from SOFTWARE after all hives parse
+                "groups": ", ".join(groups_by_rid.get(rid_str, [])),
                 "account_flags": ", ".join(flags),
                 "_source_file": source_file,
             }
@@ -408,6 +621,8 @@ def _parse_sam_accounts(hive: RegistryHive, source_file: str) -> list[dict]:
 def parse(paths: list[Path]) -> dict[str, list[dict]]:
     run_rows, program_rows, profile_rows, system_info_rows, usb_rows, network_rows = [], [], [], [], [], []
     account_rows = []
+    network_iface_rows = []
+    special_accounts: dict = {}  # from SOFTWARE; joined onto SAM accounts below
 
     for path in paths:
         source_file = str(path)
@@ -421,10 +636,12 @@ def parse(paths: list[Path]) -> dict[str, list[dict]]:
                     profile_rows.extend(_parse_user_profiles(hive, source_file))
                     system_info_rows.extend(_parse_system_info_from_software(hive, source_file))
                     network_rows.extend(_parse_network_profiles(hive, source_file))
+                    special_accounts.update(_parse_special_accounts(hive))
                 elif hive_name == "SYSTEM":
                     for control_set in _control_sets(hive):
                         system_info_rows.extend(_parse_system_info_from_system(hive, f"\\{control_set}", source_file))
                         usb_rows.extend(_parse_usb_devices(hive, f"\\{control_set}", source_file))
+                    network_iface_rows.extend(_parse_network_interfaces(hive, source_file))
                 elif hive_name == "SAM":
                     account_rows.extend(_parse_sam_accounts(hive, source_file))
         except Exception as exc:
@@ -439,6 +656,15 @@ def parse(paths: list[Path]) -> dict[str, list[dict]]:
                 }
             )
 
+    # SpecialAccounts lives in SOFTWARE but describes SAM accounts, so join it
+    # in after every hive is parsed (order of `paths` isn't guaranteed).
+    for row in account_rows:
+        val = special_accounts.get((row.get("username") or "").lower())
+        if val is None:
+            row["special_account"] = "아니오"
+        else:
+            row["special_account"] = "예(로그온 화면 숨김)" if str(val) in ("0", "0x0") else f"예(값 {val})"
+
     return {
         "Registry_Run": run_rows,
         "Registry_InstalledPrograms": program_rows,
@@ -446,5 +672,6 @@ def parse(paths: list[Path]) -> dict[str, list[dict]]:
         "Registry_SystemInfo": system_info_rows,
         "Registry_USBDevices": usb_rows,
         "Registry_NetworkProfiles": network_rows,
+        "Registry_NetworkInterfaces": network_iface_rows,
         "Registry_Accounts": account_rows,
     }

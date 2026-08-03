@@ -352,6 +352,34 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     sections: [{ heading: "상세", fields: [{ key: "profile_name", label: "네트워크 이름" }] }],
   },
 
+  Registry_NetworkInterfaces: {
+    title: (r) => r.ip_address || "(no ip)",
+    subtitle: (r) => [r.default_gateway && `GW ${r.default_gateway}`, r.domain].filter(Boolean).join(" · "),
+    badges: [{ key: "dhcp_enabled", label: "DHCP", kind: "badge" }],
+    priorityColumns: ["ip_address", "subnet_mask", "default_gateway", "dns_server", "dhcp_server", "domain", "lease_obtained"],
+    sections: [
+      { heading: "주소", fields: [
+        { key: "ip_address", label: "IP 주소" },
+        { key: "subnet_mask", label: "서브넷 마스크" },
+        { key: "default_gateway", label: "기본 게이트웨이" },
+      ]},
+      { heading: "DNS / 도메인", fields: [
+        { key: "dns_server", label: "DNS 서버" },
+        { key: "dhcp_server", label: "DHCP 서버" },
+        { key: "domain", label: "도메인" },
+        { key: "dhcp_enabled", label: "DHCP 사용" },
+      ]},
+      { heading: "DHCP 임대", fields: [
+        { key: "lease_obtained", label: "임대 시작" },
+        { key: "lease_terminates", label: "임대 만료" },
+      ]},
+      { heading: "식별자", fields: [
+        { key: "interface_guid", label: "인터페이스 GUID", kind: "hash" },
+        { key: "control_set", label: "ControlSet" },
+      ]},
+    ],
+  },
+
   Amcache_Programs: {
     title: (r) => r.Name || "(no name)",
     subtitle: (r) => [r.Version, r.Publisher].filter(Boolean).join(" · "),
@@ -818,20 +846,26 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     // Account creation lands on the master timeline (a created backdoor account
     // is a common persistence step).
     timelineField: "account_created",
-    priorityColumns: ["account_created", "username", "rid", "last_login", "login_count", "disabled"],
+    priorityColumns: ["account_created", "username", "rid", "last_login", "login_count", "disabled", "special_account", "groups"],
     sections: [
       { heading: "계정", fields: [
         { key: "username", label: "사용자 이름" },
+        { key: "full_name", label: "전체 이름" },
         { key: "rid", label: "RID" },
+        { key: "home_directory", label: "홈 디렉토리", kind: "path" },
         { key: "disabled", label: "비활성 여부" },
+        { key: "special_account", label: "SpecialAccount" },
       ]},
       { heading: "시간", fields: [
         { key: "account_created", label: "계정 생성" },
         { key: "last_login", label: "마지막 로그온" },
         { key: "password_last_set", label: "암호 마지막 설정" },
+        { key: "last_failed_login", label: "비밀번호 오류 일시" },
       ]},
-      { heading: "통계", fields: [
+      { heading: "통계 / 권한", fields: [
         { key: "login_count", label: "로그온 횟수" },
+        { key: "failed_login_count", label: "비밀번호 오류 횟수" },
+        { key: "groups", label: "그룹" },
         { key: "account_flags", label: "계정 플래그" },
       ]},
     ],

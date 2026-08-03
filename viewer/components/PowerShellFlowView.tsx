@@ -5,6 +5,7 @@ import type { CsvData, FetchLinkedRows } from "@/lib/types";
 import { getArtifactView } from "@/lib/artifactViews";
 import { inRange, EMPTY_TIME_RANGE, type TimeRange } from "@/lib/timeRange";
 import RowDetailPanel from "./RowDetailPanel";
+import PowerShellSourceView from "./PowerShellSourceView";
 
 const TABLE_NAME = "PowerShellHistory";
 // Commands run inside one powershell.exe instance cluster together; a gap
@@ -127,6 +128,7 @@ export default function PowerShellFlowView({
   const [kindFilter, setKindFilter] = useState<string | undefined>(undefined);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [selected, setSelected] = useState<Record<string, string> | null>(null);
+  const [sourceView, setSourceView] = useState<{ code: string; title: string } | null>(null);
 
   const spec = getArtifactView(TABLE_NAME);
   const sessions = useMemo(() => clusterSessions(data, timeRange, kindFilter), [data, timeRange, kindFilter]);
@@ -258,9 +260,26 @@ export default function PowerShellFlowView({
                         {ev.command || (ev.scriptBlock ? "코드 블록 (상세에서 확인)" : "-")}
                       </span>
                       {ev.scriptBlock && (
-                        <span title="코드 블록 있음" style={{ flexShrink: 0, fontSize: 10.5, color: "var(--accent)", fontFamily: "var(--mono)" }}>
-                          {"</>"}
-                        </span>
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setSourceView({ code: ev.scriptBlock, title: `PowerShell 스크립트 블록${ev.account ? ` · ${ev.account}` : ""}` });
+                          }}
+                          title="소스코드 보기 (분석 뷰)"
+                          style={{
+                            flexShrink: 0,
+                            fontSize: 10.5,
+                            fontFamily: "var(--mono)",
+                            padding: "1px 7px",
+                            color: "var(--accent)",
+                            background: "var(--accent-subtle)",
+                            border: "1px solid var(--accent)",
+                            borderRadius: "var(--radius-sm)",
+                            cursor: "pointer",
+                          }}
+                        >
+                          {"</> 소스코드"}
+                        </button>
                       )}
                       {onToggleBookmark && Number.isFinite(ev.rowid) && (
                         <span
@@ -300,6 +319,10 @@ export default function PowerShellFlowView({
             onToggleBookmark ? () => onToggleBookmark(Number((selected as Record<string, unknown>).__rowid)) : undefined
           }
         />
+      )}
+
+      {sourceView && (
+        <PowerShellSourceView code={sourceView.code} title={sourceView.title} onClose={() => setSourceView(null)} />
       )}
     </div>
   );

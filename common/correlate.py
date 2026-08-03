@@ -44,6 +44,25 @@ def build_target_info(all_results: dict) -> list[dict]:
     # created-but-never-logged-in account) are added afterward so they aren't
     # missed. `created`/`last_login`/`username` ride along as extra columns the
     # TargetInfo view reads; other categories simply leave them blank.
+    def _sam_fields(sam: dict) -> dict:
+        # Every SAM-derived account detail the TargetInfo view shows in its
+        # account detail panel. Kept as extra columns on the Account row.
+        return {
+            "created": sam.get("account_created", ""),
+            "username": sam.get("username", ""),
+            "full_name": sam.get("full_name", ""),
+            "rid": sam.get("rid", ""),
+            "last_login": sam.get("last_login", ""),
+            "password_last_set": sam.get("password_last_set", ""),
+            "last_failed_login": sam.get("last_failed_login", ""),
+            "login_count": sam.get("login_count", ""),
+            "failed_login_count": sam.get("failed_login_count", ""),
+            "disabled": sam.get("disabled", ""),
+            "special_account": sam.get("special_account", ""),
+            "groups": sam.get("groups", ""),
+            "account_flags": sam.get("account_flags", ""),
+        }
+
     sam_by_rid = {}
     for a in _rows(all_results, "Registry", "Registry_Accounts"):
         rid = a.get("rid", "")
@@ -66,10 +85,11 @@ def build_target_info(all_results: dict) -> list[dict]:
                 "category": "Account",
                 "name": sid,
                 "value": r.get("profile_image_path", ""),
-                "created": sam.get("account_created", ""),
-                "last_login": sam.get("last_login", ""),
-                "username": sam.get("username", ""),
+                "home_directory": r.get("profile_image_path", "") or sam.get("home_directory", ""),
                 "source_artifact": "Registry_UserProfiles",
+                **_sam_fields(sam),
+                # rid from the SID is authoritative even when there's no SAM row.
+                "rid": sam.get("rid", "") or rid,
             }
         )
 
@@ -86,16 +106,14 @@ def build_target_info(all_results: dict) -> list[dict]:
                 "category": "Account",
                 "name": sid,
                 "value": "",
-                "created": a.get("account_created", ""),
-                "last_login": a.get("last_login", ""),
-                "username": a.get("username", ""),
+                "home_directory": a.get("home_directory", ""),
                 "source_artifact": "SAM_Accounts",
+                **_sam_fields(a),
             }
         )
 
-    # Not an IP address — NetworkList only records which named network
-    # profile this machine connected to and when, verified against this
-    # project's real data (common/../registry_parser.py has the details).
+    # Named networks this machine joined + when (NetworkList\Profiles). This
+    # key has NO IP address, only the profile name and last-connected time.
     for r in _rows(all_results, "Registry", "Registry_NetworkProfiles"):
         rows.append(
             {
@@ -104,6 +122,27 @@ def build_target_info(all_results: dict) -> list[dict]:
                 "name": "연결한 네트워크",
                 "value": r.get("profile_name", ""),
                 "source_artifact": "Registry_NetworkProfiles",
+            }
+        )
+
+    # Actual IP configuration per adapter (SYSTEM Tcpip\...\Interfaces) — the
+    # addresses the "연결한 네트워크" list can't provide.
+    for r in _rows(all_results, "Registry", "Registry_NetworkInterfaces"):
+        rows.append(
+            {
+                "timestamp": r.get("lease_obtained", ""),
+                "category": "NetworkInterface",
+                "name": r.get("interface_guid", ""),
+                "value": r.get("ip_address", ""),
+                "subnet_mask": r.get("subnet_mask", ""),
+                "gateway": r.get("default_gateway", ""),
+                "dns_server": r.get("dns_server", ""),
+                "dhcp_server": r.get("dhcp_server", ""),
+                "domain": r.get("domain", ""),
+                "dhcp_enabled": r.get("dhcp_enabled", ""),
+                "lease_obtained": r.get("lease_obtained", ""),
+                "lease_terminates": r.get("lease_terminates", ""),
+                "source_artifact": "Registry_NetworkInterfaces",
             }
         )
 
