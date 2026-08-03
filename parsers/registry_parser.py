@@ -32,11 +32,22 @@ from regipy.exceptions import RegistryKeyNotFoundException
 from regipy.registry import RegistryHive
 from regipy.utils import convert_wintime
 
+# SAM account metadata (creation/login times, flags) comes from regipy's SAM
+# plugin. Imported defensively: it was added in newer regipy releases, and a
+# missing/renamed plugin must degrade to "no accounts table", never break the
+# whole registry parser's import.
+try:
+    from regipy.plugins.sam.samparse import SAMParsePlugin
+except Exception:  # pragma: no cover - depends on installed regipy version
+    SAMParsePlugin = None
+
 from common.hive_recovery import open_hive
 from common.utils import KST, UTC, format_timestamp
 
 ARTIFACT_NAME = "Registry"
-FILENAMES = ["SYSTEM", "SOFTWARE"]
+# SAM is included ONLY for account metadata (creation/login times) — no
+# credential/hash material is read (see _parse_sam_accounts).
+FILENAMES = ["SYSTEM", "SOFTWARE", "SAM"]
 
 FIELD_ORDER = {
     "Registry_Run": [
@@ -61,6 +72,10 @@ FIELD_ORDER = {
     ],
     "Registry_NetworkProfiles": [
         "timestamp", "profile_name", "_source_file",
+    ],
+    "Registry_Accounts": [
+        "account_created", "username", "rid", "last_login", "password_last_set",
+        "login_count", "disabled", "account_flags", "_source_file",
     ],
 }
 
@@ -351,8 +366,48 @@ def _control_sets(hive: RegistryHive) -> list[str]:
     return [s.name for s in hive.root.iter_subkeys() if s.name.upper().startswith("CONTROLSET")]
 
 
+def _parse_sam_accounts(hive: RegistryHive, source_file: str) -> list[dict]:
+    """Local user accounts from the SAM hive: creation date, login times and
+    account flags — NOT password hashes or any other credential material.
+
+    The account CREATION date is the last-write time of each account's
+    SAM\\...\\Users\\Names\\<username> subkey (the standard forensic proxy for
+    when the account was created), surfaced by the plugin as
+    `name_key_last_write`. Login/password times come from the F value.
+    """
+    if SAMParsePlugin is None:
+        return []
+
+    try:
+        plugin = SAMParsePlugin(hive, as_json=True)
+        plugin.run()
+        entries = plugin.entries or []
+    except Exception:
+        return []
+
+    rows = []
+    for e in entries:
+        flags = e.get("account_flags_parsed") or []
+        rid = e.get("rid")
+        rows.append(
+            {
+                "account_created": _fmt(e.get("name_key_last_write")),
+                "username": e.get("username", "") or "",
+                "rid": str(rid) if rid is not None else "",
+                "last_login": _fmt(e.get("last_login")),
+                "password_last_set": _fmt(e.get("password_last_set")),
+                "login_count": str(e.get("login_count", "") or ""),
+                "disabled": "예" if "Account Disabled" in flags else "아니오",
+                "account_flags": ", ".join(flags),
+                "_source_file": source_file,
+            }
+        )
+    return rows
+
+
 def parse(paths: list[Path]) -> dict[str, list[dict]]:
     run_rows, program_rows, profile_rows, system_info_rows, usb_rows, network_rows = [], [], [], [], [], []
+    account_rows = []
 
     for path in paths:
         source_file = str(path)
@@ -370,6 +425,8 @@ def parse(paths: list[Path]) -> dict[str, list[dict]]:
                     for control_set in _control_sets(hive):
                         system_info_rows.extend(_parse_system_info_from_system(hive, f"\\{control_set}", source_file))
                         usb_rows.extend(_parse_usb_devices(hive, f"\\{control_set}", source_file))
+                elif hive_name == "SAM":
+                    account_rows.extend(_parse_sam_accounts(hive, source_file))
         except Exception as exc:
             system_info_rows.append(
                 {
@@ -389,4 +446,5 @@ def parse(paths: list[Path]) -> dict[str, list[dict]]:
         "Registry_SystemInfo": system_info_rows,
         "Registry_USBDevices": usb_rows,
         "Registry_NetworkProfiles": network_rows,
+        "Registry_Accounts": account_rows,
     }

@@ -770,6 +770,32 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     ],
   },
 
+  Registry_Accounts: {
+    title: (r) => r.username || (r.rid ? `RID ${r.rid}` : "(계정)"),
+    subtitle: (r) => [r.rid && `RID ${r.rid}`, r.disabled === "예" ? "비활성" : ""].filter(Boolean).join(" · "),
+    badges: [{ key: "disabled", label: "비활성", kind: "badge", badgeColors: { 예: "#f85149", 아니오: "#3fb950" } }],
+    // Account creation lands on the master timeline (a created backdoor account
+    // is a common persistence step).
+    timelineField: "account_created",
+    priorityColumns: ["account_created", "username", "rid", "last_login", "login_count", "disabled"],
+    sections: [
+      { heading: "계정", fields: [
+        { key: "username", label: "사용자 이름" },
+        { key: "rid", label: "RID" },
+        { key: "disabled", label: "비활성 여부" },
+      ]},
+      { heading: "시간", fields: [
+        { key: "account_created", label: "계정 생성" },
+        { key: "last_login", label: "마지막 로그온" },
+        { key: "password_last_set", label: "암호 마지막 설정" },
+      ]},
+      { heading: "통계", fields: [
+        { key: "login_count", label: "로그온 횟수" },
+        { key: "account_flags", label: "계정 플래그" },
+      ]},
+    ],
+  },
+
   Registry_SystemInfo: {
     title: (r) => r.name || "(no name)",
     subtitle: (r) => r.category || "",

@@ -47,6 +47,10 @@ interface Account {
   /** Interactive human account (built-in Administrator or RID ≥ 1000) vs a
    * machine/service identity (LocalSystem, LocalService, ...). */
   isUser: boolean;
+  /** Account creation date + last login, from the SAM hive (blank when SAM
+   * wasn't collected or the account has no SAM entry). */
+  created: string;
+  lastLogin: string;
 }
 
 function basename(p: string): string {
@@ -55,14 +59,14 @@ function basename(p: string): string {
   return parts[parts.length - 1] || p;
 }
 
-function classifyAccount(sid: string, path: string): Account {
+function classifyAccount(sid: string, path: string, username: string, created: string, lastLogin: string): Account {
   const ridMatch = sid.match(/-(\d+)$/);
   const rid = ridMatch ? Number(ridMatch[1]) : NaN;
   // S-1-5-21-… is a machine/domain-issued account; RID 500 is the built-in
   // Administrator, RID ≥ 1000 are created users. Everything else (S-1-5-18/19/20)
   // is a service identity.
   const isUser = /^S-1-5-21-/.test(sid) && (rid === 500 || rid >= 1000);
-  return { sid, path, username: basename(path), isUser };
+  return { sid, path, username: username || basename(path), isUser, created, lastLogin };
 }
 
 function KeyVal({ label, children }: { label: string; children: React.ReactNode }) {
@@ -133,7 +137,7 @@ export default function TargetInfoView({ data }: TargetInfoViewProps) {
         const prev = system.get(r.name);
         if (!prev || (!prev.value && value)) system.set(r.name, { value, timestamp: r.timestamp });
       } else if (cat === "Account") {
-        accounts.push(classifyAccount(r.name, r.value));
+        accounts.push(classifyAccount(r.name, r.value, r.username ?? "", r.created ?? "", r.last_login ?? ""));
       } else if (cat === "Network") {
         const name = r.value;
         const existing = netMap.get(name);
@@ -224,7 +228,15 @@ function AccountRow({ account, highlight }: { account: Account; highlight?: bool
           {highlight ? "👤" : "⚙️"} {account.username}
         </span>
       </div>
-      <div style={{ fontSize: 11.5, color: "var(--text-dim)", marginTop: 2, wordBreak: "break-all" }}>{account.path}</div>
+      {account.path && (
+        <div style={{ fontSize: 11.5, color: "var(--text-dim)", marginTop: 2, wordBreak: "break-all" }}>{account.path}</div>
+      )}
+      {(account.created || account.lastLogin) && (
+        <div style={{ fontSize: 11, color: "var(--text-faint)", marginTop: 2, display: "flex", gap: 10, flexWrap: "wrap" }}>
+          {account.created && <span>🗓️ 생성 {account.created}</span>}
+          {account.lastLogin && <span>마지막 로그온 {account.lastLogin}</span>}
+        </div>
+      )}
       <div style={{ fontSize: 11, color: "var(--text-faint)", marginTop: 1, fontFamily: "var(--mono)", wordBreak: "break-all" }}>{account.sid}</div>
     </div>
   );

@@ -38,14 +38,58 @@ def build_target_info(all_results: dict) -> list[dict]:
             }
         )
 
+    # Account rows = user profiles (SID + profile path) enriched with SAM
+    # account metadata (creation date, last login) joined on RID — a SID's
+    # trailing number IS its RID. SAM accounts with no profile (e.g. a
+    # created-but-never-logged-in account) are added afterward so they aren't
+    # missed. `created`/`last_login`/`username` ride along as extra columns the
+    # TargetInfo view reads; other categories simply leave them blank.
+    sam_by_rid = {}
+    for a in _rows(all_results, "Registry", "Registry_Accounts"):
+        rid = a.get("rid", "")
+        if rid:
+            sam_by_rid[rid] = a
+
+    machine_sid_prefix = ""  # S-1-5-21-A-B-C, shared by every local account
+    seen_rids = set()
     for r in _rows(all_results, "Registry", "Registry_UserProfiles"):
+        sid = r.get("sid", "")
+        rid = sid.rsplit("-", 1)[-1] if "-" in sid else ""
+        if rid:
+            seen_rids.add(rid)
+        if not machine_sid_prefix and sid.startswith("S-1-5-21-"):
+            machine_sid_prefix = sid.rsplit("-", 1)[0]
+        sam = sam_by_rid.get(rid, {})
         rows.append(
             {
                 "timestamp": r.get("load_time", ""),
                 "category": "Account",
-                "name": r.get("sid", ""),
+                "name": sid,
                 "value": r.get("profile_image_path", ""),
+                "created": sam.get("account_created", ""),
+                "last_login": sam.get("last_login", ""),
+                "username": sam.get("username", ""),
                 "source_artifact": "Registry_UserProfiles",
+            }
+        )
+
+    for rid, a in sam_by_rid.items():
+        if rid in seen_rids:
+            continue
+        # No profile for this account — synthesize its SID from the machine
+        # prefix so the view can still classify/display it (username kept
+        # explicitly since there's no profile path to derive it from).
+        sid = f"{machine_sid_prefix}-{rid}" if machine_sid_prefix else ""
+        rows.append(
+            {
+                "timestamp": a.get("account_created", ""),
+                "category": "Account",
+                "name": sid,
+                "value": "",
+                "created": a.get("account_created", ""),
+                "last_login": a.get("last_login", ""),
+                "username": a.get("username", ""),
+                "source_artifact": "SAM_Accounts",
             }
         )
 
