@@ -7,10 +7,26 @@ around damaged chunks instead of failing the whole file — this matters
 because Microsoft Message Analyzer refuses to show anything from a
 corrupted evtx, while EZ's tools still surface what they can. A corrupted
 chunk is emitted here as its own row (_status="corrupted_chunk") rather
-than silently dropped, so a broken log is still visible in the CSV instead
-of just vanishing.
+than silently dropped, so a broken log is still visible instead of vanishing.
+
+Output is ONE table per source .evtx (Security.evtx -> Security.sqlite),
+keyed by the log's filename, rather than one merged EventLog table. This
+keeps the parsed output 1:1 with the collected logs — a Security log and an
+Application log stay distinct artifacts, the way an analyst reasons about
+them — instead of flattening 300+ logs into a single blob.
 """
+import contextlib
 import json
+import logging
+import os
+
+# The evtx (pyevtx-rs) native parser logs a warning for every EventData field
+# whose bytes aren't valid UTF-8 ("could not parse data as string, formating to
+# hex: ..."). It recovers by hex-encoding the value — the parsed data is fine —
+# but on a real system this floods the viewer's streamed pipeline log. Quiet
+# the native logger's env_logger path here, before it initializes on import.
+os.environ.setdefault("RUST_LOG", "off")
+
 from pathlib import Path
 
 from evtx import PyEvtxParser
@@ -20,13 +36,24 @@ from common.utils import UTC, format_timestamp
 ARTIFACT_NAME = "EventLog"
 EXTENSIONS = [".evtx"]
 
-FIELD_ORDER = {
-    "EventLog_Events": [
-        "timestamp", "Channel", "EventID", "LevelName", "Level", "Provider",
-        "Computer", "EventRecordID", "ProcessID", "ThreadID", "UserID",
-        "EventData", "_record_key", "_status", "_error", "_source_file",
-    ],
-}
+# Every per-file EventLog table shares this column order.
+_EVENT_COLUMNS = [
+    "timestamp", "Channel", "EventID", "LevelName", "Level", "Provider",
+    "Computer", "EventRecordID", "ProcessID", "ThreadID", "UserID",
+    "EventData", "_record_key", "_status", "_error", "_source_file",
+]
+
+
+class _SharedFieldOrder(dict):
+    """Output table names here are dynamic (one per .evtx file), so there's no
+    fixed key to look up. Return the shared EventLog column order whatever
+    output name main.py asks about."""
+
+    def get(self, key, default=None):
+        return _EVENT_COLUMNS
+
+
+FIELD_ORDER = _SharedFieldOrder()
 
 # EVTX System.TimeCreated is always stored in UTC — Event Viewer only
 # converts to local time for display, the underlying value is untouched.
@@ -151,19 +178,56 @@ def parse_one(evtx_path: Path) -> list[dict]:
     return rows
 
 
-def parse(paths: list[Path]) -> dict[str, list[dict]]:
-    all_events = []
-    for evtx_path in paths:
-        try:
-            all_events.extend(parse_one(evtx_path))
-        except Exception as exc:
-            all_events.append(
-                {
-                    "timestamp": "",
-                    "_status": "unreadable_file",
-                    "_error": str(exc),
-                    "_source_file": str(evtx_path),
-                }
-            )
+@contextlib.contextmanager
+def _quiet_native_logs():
+    """Raise the root logging threshold to ERROR for the duration of parsing,
+    covering the pyo3-log routing some pyevtx-rs wheels use (the RUST_LOG env
+    var above covers the env_logger routing). The evtx "formating to hex"
+    warnings are recoverable-value notices, not errors, so this hides them
+    without hiding genuine errors."""
+    root = logging.getLogger()
+    previous = root.level
+    root.setLevel(logging.ERROR)
+    try:
+        yield
+    finally:
+        root.setLevel(previous)
 
-    return {"EventLog_Events": all_events}
+
+def _output_name(evtx_path: Path, taken: set[str]) -> str:
+    """Table name for one log = its filename without the .evtx extension
+    (Security.evtx -> "Security"). Disambiguate the rare case of two collected
+    logs sharing a name (e.g. a RegBack copy) by suffixing a counter."""
+    base = evtx_path.stem or evtx_path.name
+    name = base
+    i = 2
+    while name in taken:
+        name = f"{base}_{i}"
+        i += 1
+    taken.add(name)
+    return name
+
+
+def parse(paths: list[Path]) -> dict[str, list[dict]]:
+    outputs: dict[str, list[dict]] = {}
+    taken: set[str] = set()
+    with _quiet_native_logs():
+        for evtx_path in paths:
+            try:
+                rows = parse_one(evtx_path)
+            except Exception as exc:
+                rows = [
+                    {
+                        "timestamp": "",
+                        "_status": "unreadable_file",
+                        "_error": str(exc),
+                        "_source_file": str(evtx_path),
+                    }
+                ]
+            # A log with no records at all produces no table (would just be an
+            # empty 0-byte file). Unreadable/corrupt logs still emit a status
+            # row, so real problems stay visible.
+            if rows:
+                outputs[_output_name(evtx_path, taken)] = rows
+
+    return outputs

@@ -167,17 +167,22 @@ def _dump_table(table, id_map: dict[int, str], source_file: str) -> list[dict]:
     return rows
 
 
-def parse(paths: list[Path]) -> dict[str, list[dict]]:
-    results: dict[str, list[dict]] = {}
+def parse(paths: list[Path]) -> dict[str, dict[str, list[dict]]]:
+    """One sqlite per source SRUDB.dat, with a table per ESE table inside it
+    (network usage, app resource usage, ...) — 1:1 with the source database."""
+    outputs: dict[str, dict[str, list[dict]]] = {}
+    taken: set[str] = set()
     for path in paths:
         source_file = str(path)
+        tables: dict[str, list[dict]] = {}
         db = pyesedb.file()
         try:
             db.open(source_file)
         except Exception as exc:
-            results.setdefault("SRUM_Errors", []).append(
+            tables["SRUM_Errors"] = [
                 {"timestamp": "", "_source_file": source_file, "_status": "unreadable_file", "_error": str(exc)}
-            )
+            ]
+            outputs[_unique(path.stem or path.name, taken)] = tables
             continue
         try:
             id_map = _build_id_map(db)
@@ -188,11 +193,21 @@ def parse(paths: list[Path]) -> dict[str, list[dict]]:
                     continue
                 output_name = _SRUM_TABLES.get(gname, "SRUM_" + gname.strip("{}").replace("-", ""))
                 try:
-                    results[output_name] = _dump_table(table, id_map, source_file)
+                    tables[output_name] = _dump_table(table, id_map, source_file)
                 except Exception as exc:
-                    results.setdefault(output_name, []).append(
+                    tables.setdefault(output_name, []).append(
                         {"timestamp": "", "_source_file": source_file, "_status": "corrupted", "_error": str(exc)}
                     )
         finally:
             db.close()
-    return results
+        outputs[_unique(path.stem or path.name, taken)] = tables
+    return outputs
+
+
+def _unique(base: str, taken: set) -> str:
+    name, i = base, 2
+    while name in taken:
+        name = f"{base}_{i}"
+        i += 1
+    taken.add(name)
+    return name

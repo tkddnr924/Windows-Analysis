@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { getArtifactView } from "@/lib/artifactViews";
+import { resolveArtifactView } from "@/lib/artifactViews";
 import type { FetchLinkedRows } from "@/lib/types";
 import ArtifactDetailView from "./ArtifactDetailView";
 
@@ -104,7 +104,7 @@ function RawFieldValue({ column, value, focused }: { column: string; value: stri
 }
 
 export default function RowDetailPanel({ row, columns, focusedColumn, fileBaseName, onClose, onNavigate, onFetchLinkedRows, isBookmarked, onToggleBookmark }: RowDetailPanelProps) {
-  const spec = getArtifactView(fileBaseName);
+  const spec = resolveArtifactView(fileBaseName, columns);
   const [showRaw, setShowRaw] = useState(!spec);
 
   useEffect(() => {

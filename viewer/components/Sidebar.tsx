@@ -2,8 +2,6 @@
 
 import { useEffect, useMemo, useState } from "react";
 import type { CaseSummary, CategoryEntry, ResultFileEntry } from "@/lib/types";
-import { groupKeyFor } from "@/lib/fileGrouping";
-import { getArtifactView } from "@/lib/artifactViews";
 import { EMPTY_TIME_RANGE, rangeActive, type TimeRange } from "@/lib/timeRange";
 import DateTimeInput from "./DateTimeInput";
 
@@ -21,7 +19,6 @@ const timeInputStyle: React.CSSProperties = {
 
 export const CATEGORY_ICONS: Record<string, string> = {
   AMCACHE: "📦",
-  BROWSER: "🌐",
   EVENTLOG: "📋",
   JUMPLIST: "🔗",
   PREFETCH: "⚡",
@@ -30,6 +27,8 @@ export const CATEGORY_ICONS: Record<string, string> = {
   WER: "💥",
   TASKSCHEDULER: "⏰",
   POWERSHELL: "💻",
+  USERASSIST: "🖱️",
+  REMOTEACCESS: "🖥️",
   FILESYSTEM: "🗄️",
 };
 
@@ -75,22 +74,33 @@ const OVERVIEW_TABLE_ICONS: Record<string, string> = {
   ExecutionHistory: "⚡",
   RemoteDesktopHistory: "🖥️",
   PowerShellHistory: "💻",
-  BrowserTimeline: "🌐",
 };
 
-interface FileRowProps {
-  file: ResultFileEntry;
+function sameEntry(a: ResultFileEntry | null, b: ResultFileEntry): boolean {
+  return !!a && a.fullPath === b.fullPath && a.tableName === b.tableName;
+}
+
+function FileRow({
+  entry,
+  label,
+  selected,
+  indent,
+  icon,
+  count,
+  onSelectFile,
+}: {
+  entry: ResultFileEntry;
+  label: string;
   selected: boolean;
   indent: number;
   icon?: string;
+  count?: number;
   onSelectFile: (file: ResultFileEntry) => void;
-}
-
-function FileRow({ file, selected, indent, icon, onSelectFile }: FileRowProps) {
+}) {
   return (
     <div
-      onClick={() => onSelectFile(file)}
-      title={file.relativePath}
+      onClick={() => onSelectFile(entry)}
+      title={`${entry.relativePath} · ${entry.tableName}`}
       style={{
         display: "flex",
         alignItems: "center",
@@ -113,48 +123,45 @@ function FileRow({ file, selected, indent, icon, onSelectFile }: FileRowProps) {
     >
       <span style={{ display: "flex", alignItems: "center", gap: 5, overflow: "hidden", textOverflow: "ellipsis", color: selected ? "var(--text)" : "var(--text-dim)" }}>
         {icon && <span style={{ flexShrink: 0, fontSize: 12 }}>{icon}</span>}
-        <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>{file.name}</span>
+        <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>{label}</span>
       </span>
-      <span style={{ color: "var(--text-faint)", fontSize: 11, flexShrink: 0 }}>{file.rowCount.toLocaleString()}</span>
+      <span style={{ color: "var(--text-faint)", fontSize: 11, flexShrink: 0 }}>{(count ?? entry.rowCount).toLocaleString()}</span>
     </div>
   );
 }
 
-interface GroupedFileRowsProps {
-  file: ResultFileEntry;
-  groupColumn: string;
-  label: (value: string) => string;
-  indent: number;
+// One source .sqlite. A single-table file is a plain clickable row; a
+// multi-table file (registry dump, browser History, Amcache, SRUM) is an
+// expandable node listing its tables.
+function FileNode({
+  fileName,
+  tables,
+  selectedFile,
+  indent,
+  icon,
+  onSelectFile,
+}: {
+  fileName: string;
+  tables: ResultFileEntry[];
   selectedFile: ResultFileEntry | null;
+  indent: number;
+  icon?: string;
   onSelectFile: (file: ResultFileEntry) => void;
-  onNavigate: (targetFile: string, targetColumn: string, value: string) => void;
-}
+}) {
+  const [open, setOpen] = useState(false);
 
-// Renders a groupable table (e.g. EventLog_Events) not as a single row but as
-// its per-value entries directly under the category — one row per distinct
-// value of groupColumn (Security.evtx, Application.evtx, ...), preceded by a
-// "전체" row that opens the merged table. Clicking a value row opens the table
-// filtered to it. The values load lazily once the category is expanded.
-function GroupedFileRows({ file, groupColumn, label, indent, selectedFile, onSelectFile, onNavigate }: GroupedFileRowsProps) {
-  const [values, setValues] = useState<{ value: string; count: number }[] | null>(null);
+  if (tables.length === 1) {
+    return (
+      <FileRow entry={tables[0]} label={fileName} selected={sameEntry(selectedFile, tables[0])} indent={indent} icon={icon} onSelectFile={onSelectFile} />
+    );
+  }
 
-  useEffect(() => {
-    let alive = true;
-    window.api.listColumnValues(file.fullPath, groupColumn).then((v) => {
-      if (alive) setValues(v);
-    });
-    return () => {
-      alive = false;
-    };
-  }, [file.fullPath, groupColumn]);
-
-  const selected = selectedFile?.fullPath === file.fullPath;
-
+  const total = tables.reduce((n, t) => n + t.rowCount, 0);
+  const anySelected = tables.some((t) => sameEntry(selectedFile, t));
   return (
     <div>
       <div
-        onClick={() => onSelectFile(file)}
-        title="모든 로그 통합"
+        onClick={() => setOpen((v) => !v)}
         style={{
           display: "flex",
           alignItems: "center",
@@ -162,94 +169,25 @@ function GroupedFileRows({ file, groupColumn, label, indent, selectedFile, onSel
           gap: 6,
           padding: `5px 10px 5px ${indent}px`,
           cursor: "pointer",
-          background: selected ? "var(--bg-selected)" : "transparent",
-          borderLeft: `2px solid ${selected ? "var(--accent)" : "transparent"}`,
+          userSelect: "none",
+          color: anySelected ? "var(--text)" : "var(--text-dim)",
           whiteSpace: "nowrap",
           overflow: "hidden",
         }}
-        onMouseEnter={(e) => {
-          if (!selected) e.currentTarget.style.background = "var(--bg-hover)";
-        }}
-        onMouseLeave={(e) => {
-          if (!selected) e.currentTarget.style.background = "transparent";
-        }}
+        onMouseEnter={(e) => (e.currentTarget.style.background = "var(--bg-hover)")}
+        onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
       >
-        <span style={{ display: "flex", alignItems: "center", gap: 5, overflow: "hidden", textOverflow: "ellipsis", color: selected ? "var(--text)" : "var(--text-dim)" }}>
-          <span style={{ flexShrink: 0, fontSize: 12 }}>📚</span>
-          <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>전체</span>
+        <span style={{ display: "flex", alignItems: "center", gap: 5, overflow: "hidden", textOverflow: "ellipsis" }}>
+          <span style={{ width: 10, display: "inline-block", fontSize: 9, color: "var(--text-faint)" }}>{open ? "▾" : "▸"}</span>
+          {icon && <span style={{ flexShrink: 0, fontSize: 12 }}>{icon}</span>}
+          <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>{fileName}</span>
+          <span style={{ color: "var(--text-faint)", fontSize: 11 }}>{tables.length}</span>
         </span>
-        <span style={{ color: "var(--text-faint)", fontSize: 11, flexShrink: 0 }}>{file.rowCount.toLocaleString()}</span>
+        <span style={{ color: "var(--text-faint)", fontSize: 11, flexShrink: 0 }}>{total.toLocaleString()}</span>
       </div>
-      {values === null && (
-        <div style={{ padding: `4px 10px 4px ${indent + 6}px`, fontSize: 11.5, color: "var(--text-faint)" }}>불러오는 중...</div>
-      )}
-      {values?.map((v) => (
-        <div
-          key={v.value}
-          onClick={() => onNavigate(file.name, groupColumn, v.value)}
-          title={label(v.value)}
-          style={{
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "space-between",
-            gap: 8,
-            padding: `4px 10px 4px ${indent + 6}px`,
-            cursor: "pointer",
-            color: "var(--text-dim)",
-            fontSize: 12,
-            whiteSpace: "nowrap",
-            overflow: "hidden",
-          }}
-          onMouseEnter={(e) => (e.currentTarget.style.background = "var(--bg-hover)")}
-          onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
-        >
-          <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>{label(v.value) || "(빈 값)"}</span>
-          <span style={{ color: "var(--text-faint)", fontSize: 11, flexShrink: 0 }}>{v.count.toLocaleString()}</span>
-        </div>
-      ))}
-    </div>
-  );
-}
-
-interface GroupNodeProps {
-  groupName: string;
-  files: ResultFileEntry[];
-  selectedFile: ResultFileEntry | null;
-  onSelectFile: (file: ResultFileEntry) => void;
-}
-
-function GroupNode({ groupName, files, selectedFile, onSelectFile }: GroupNodeProps) {
-  const [expanded, setExpanded] = useState(false);
-  return (
-    <div>
-      <div
-        onClick={() => setExpanded((e) => !e)}
-        style={{
-          display: "flex",
-          alignItems: "center",
-          gap: 6,
-          padding: "5px 10px 5px 24px",
-          cursor: "pointer",
-          userSelect: "none",
-          color: "var(--text-dim)",
-          fontSize: 12.5,
-        }}
-        onMouseEnter={(e) => (e.currentTarget.style.color = "var(--text)")}
-        onMouseLeave={(e) => (e.currentTarget.style.color = "var(--text-dim)")}
-      >
-        <span style={{ width: 10, display: "inline-block", fontSize: 9, color: "var(--text-faint)" }}>{expanded ? "▾" : "▸"}</span>
-        <span>{groupName}</span>
-        <span style={{ color: "var(--text-faint)" }}>{files.length}</span>
-      </div>
-      {expanded &&
-        files.map((file) => (
-          <FileRow
-            key={file.fullPath}
-            file={file}
-            selected={selectedFile?.fullPath === file.fullPath}
-            indent={44}
-            onSelectFile={onSelectFile}
-          />
+      {open &&
+        tables.map((t) => (
+          <FileRow key={t.tableName} entry={t} label={t.tableName} selected={sameEntry(selectedFile, t)} indent={indent + 16} onSelectFile={onSelectFile} />
         ))}
     </div>
   );
@@ -275,23 +213,18 @@ function CategoryNode({ category, selectedFile, onSelectFile, displayName, pinne
     window.api.listResultFiles(category.fullPath).then(setFiles);
   }, [category.fullPath]);
 
-  const groups = useMemo(() => {
+  // Group the per-table entries back by their source file, so one .sqlite is
+  // one node (expandable when it holds several tables).
+  const byFile = useMemo(() => {
     if (!files) return null;
     const map = new Map<string, ResultFileEntry[]>();
     for (const file of files) {
-      const key = groupKeyFor(file.relativePath);
-      if (!map.has(key)) map.set(key, []);
-      map.get(key)!.push(file);
+      if (!map.has(file.fileName)) map.set(file.fileName, []);
+      map.get(file.fileName)!.push(file);
     }
     return [...map.entries()].sort((a, b) => a[0].localeCompare(b[0]));
   }, [files]);
 
-  // A second tree level is only worth it when it actually splits the
-  // list into more than one group — otherwise it's just an extra click.
-  // The pinned overview section is a small, fixed set of primary nav
-  // items (TargetInfo/ExecutionHistory/...) — always shown flat, never
-  // folded into single-item groups.
-  const shouldGroup = !pinned && (groups?.length ?? 0) > 1;
   const isExpanded = pinned || expanded;
   const icon = pinned ? undefined : CATEGORY_ICONS[category.name];
 
@@ -323,53 +256,24 @@ function CategoryNode({ category, selectedFile, onSelectFile, displayName, pinne
         {icon && <span>{icon}</span>}
         {pinned && <span style={{ fontSize: 12 }}>✦</span>}
         <span>{displayName ?? category.name}</span>
-        <span style={{ color: "var(--text-faint)", fontWeight: 400, fontSize: 11.5 }}>{files ? files.length : ""}</span>
+        <span style={{ color: "var(--text-faint)", fontWeight: 400, fontSize: 11.5 }}>{byFile ? byFile.length : ""}</span>
       </div>
-      {isExpanded && files && (
+      {isExpanded && byFile && (
         <div style={{ paddingBottom: pinned ? 4 : 0 }}>
-          {files.length === 0 && (
+          {byFile.length === 0 && (
             <div style={{ padding: "4px 10px 8px 28px", color: "var(--text-faint)", fontSize: 12 }}>결과 없음</div>
           )}
-          {shouldGroup
-            ? groups!.map(([groupName, groupFiles]) => (
-                <GroupNode
-                  key={groupName}
-                  groupName={groupName}
-                  files={groupFiles}
-                  selectedFile={selectedFile}
-                  onSelectFile={onSelectFile}
-                />
-              ))
-            : files.map((file) => {
-                const spec = getArtifactView(file.name);
-                // A groupable table (e.g. EventLog_Events) is shown split into
-                // its per-value entries directly under the category, rather than
-                // as one row.
-                if (spec?.sidebarGroupColumn && onNavigate) {
-                  return (
-                    <GroupedFileRows
-                      key={file.fullPath}
-                      file={file}
-                      groupColumn={spec.sidebarGroupColumn}
-                      label={spec.sidebarGroupLabel ?? ((v) => v)}
-                      indent={pinned ? 20 : 26}
-                      selectedFile={selectedFile}
-                      onSelectFile={onSelectFile}
-                      onNavigate={onNavigate}
-                    />
-                  );
-                }
-                return (
-                  <FileRow
-                    key={file.fullPath}
-                    file={file}
-                    selected={selectedFile?.fullPath === file.fullPath}
-                    indent={pinned ? 20 : 26}
-                    icon={pinned ? OVERVIEW_TABLE_ICONS[file.name] : undefined}
-                    onSelectFile={onSelectFile}
-                  />
-                );
-              })}
+          {byFile.map(([fileName, tables]) => (
+            <FileNode
+              key={fileName}
+              fileName={fileName}
+              tables={tables}
+              selectedFile={selectedFile}
+              indent={pinned ? 20 : 26}
+              icon={pinned ? OVERVIEW_TABLE_ICONS[fileName] : undefined}
+              onSelectFile={onSelectFile}
+            />
+          ))}
         </div>
       )}
     </div>

@@ -15,15 +15,32 @@ from regipy.recovery import apply_transaction_logs
 from regipy.registry import RegistryHive
 
 
+def _sibling_log(hive_path: Path, ext: str) -> Path | None:
+    r"""Locate the hive's `<name>.LOG1`/`.LOG2` sibling, matched
+    case-insensitively. Collectors are inconsistent about case — a hive saved
+    as "Administrator_NTUSER.DAT" can have its log as
+    "Administrator_ntuser.dat.LOG1" — so an exact-name lookup misses it on a
+    case-sensitive filesystem. Returns the real path (correct on-disk case) or
+    None."""
+    want = (hive_path.name + ext).lower()
+    try:
+        for child in hive_path.parent.iterdir():
+            if child.name.lower() == want:
+                return child
+    except OSError:
+        return None
+    return None
+
+
 @contextmanager
 def open_hive(hive_path: Path):
     """Yield a RegistryHive for `hive_path`, replaying .LOG1/.LOG2
     transaction logs first if they exist next to it. Falls back to the
     unmodified hive if no logs are present or recovery fails."""
-    log1 = hive_path.with_name(hive_path.name + ".LOG1")
-    log2 = hive_path.with_name(hive_path.name + ".LOG2")
+    log1 = _sibling_log(hive_path, ".LOG1")
+    log2 = _sibling_log(hive_path, ".LOG2")
 
-    if not log1.exists():
+    if log1 is None:
         yield RegistryHive(str(hive_path))
         return
 
@@ -38,7 +55,7 @@ def open_hive(hive_path: Path):
             _, recovered_pages = apply_transaction_logs(
                 str(hive_path),
                 str(log1),
-                str(log2) if log2.exists() else None,
+                str(log2) if log2 else None,
                 restored_hive_path=str(restored_path),
             )
             hive = RegistryHive(str(restored_path))

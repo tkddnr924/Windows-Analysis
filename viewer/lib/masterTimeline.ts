@@ -1,20 +1,25 @@
-import { getArtifactView } from "./artifactViews";
+import { resolveArtifactView } from "./artifactViews";
 import type { CategoryEntry, TimelineEntry } from "./types";
 
 // Only files whose artifactViews.ts spec declares timelineField are
 // included — that's the project's own curated "this artifact matters for
-// analysis" list, so the ~90+ raw BROWSER SQLite dumps and the _OVERVIEW
-// correlation tables (already-derived, would double-count) are excluded.
+// analysis" list, so the _OVERVIEW correlation tables (already-derived, would
+// double-count) are excluded. EventLog is now one table per source .evtx with
+// an arbitrary name, so those are resolved by their columns after a read.
 export async function buildMasterTimeline(categories: CategoryEntry[]): Promise<TimelineEntry[]> {
   const entries: TimelineEntry[] = [];
 
   for (const category of categories) {
     const files = await window.api.listResultFiles(category.fullPath);
     for (const file of files) {
-      const spec = getArtifactView(file.name);
+      // A named spec is known up-front; an unnamed table (per-file EventLog)
+      // needs its columns, so read it and resolve by column shape.
+      let spec = resolveArtifactView(file.name);
+      let data = spec ? null : await window.api.readResultFile(file.fullPath, file.tableName);
+      if (!spec) spec = resolveArtifactView(file.name, data!.columns);
       if (!spec?.timelineField) continue;
 
-      const data = await window.api.readResultFile(file.fullPath);
+      if (!data) data = await window.api.readResultFile(file.fullPath, file.tableName);
       const timelineField = spec.timelineField;
       for (const row of data.rows) {
         entries.push({

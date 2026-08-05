@@ -28,9 +28,10 @@ contextBridge.exposeInMainWorld("api", {
   listCategories: (caseDir: string): Promise<CategoryEntry[]> => ipcRenderer.invoke("list-categories", caseDir),
   listResultFiles: (categoryDir: string): Promise<ResultFileEntry[]> =>
     ipcRenderer.invoke("list-result-files", categoryDir),
-  readResultFile: (fullPath: string): Promise<CsvData> => ipcRenderer.invoke("read-result-file", fullPath),
-  listColumnValues: (fullPath: string, column: string): Promise<{ value: string; count: number }[]> =>
-    ipcRenderer.invoke("list-column-values", fullPath, column),
+  readResultFile: (fullPath: string, tableName?: string): Promise<CsvData> =>
+    ipcRenderer.invoke("read-result-file", fullPath, tableName),
+  listColumnValues: (fullPath: string, column: string, tableName?: string): Promise<{ value: string; count: number }[]> =>
+    ipcRenderer.invoke("list-column-values", fullPath, column, tableName),
   listBookmarks: (caseDir: string): Promise<Bookmark[]> => ipcRenderer.invoke("list-bookmarks", caseDir),
   toggleBookmark: (caseDir: string, entry: BookmarkInput): Promise<Bookmark[]> =>
     ipcRenderer.invoke("toggle-bookmark", caseDir, entry),

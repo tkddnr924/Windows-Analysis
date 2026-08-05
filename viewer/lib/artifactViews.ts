@@ -1,4 +1,4 @@
-import { tagsForBoolean, tagsForDangerType, tagsForEventLevel, tagsForNameMismatch, tagsForPath, type Tag } from "./tagging";
+import { tagsForBoolean, tagsForEventLevel, tagsForNameMismatch, tagsForPath, type Tag } from "./tagging";
 import { lookupEventCatalog, parseEventData, extractEventField, tagsForSecurityEvent, EVENT_QUICK_FIELDS, LOGON_TYPE_LABELS } from "./eventCatalog";
 
 export type FieldKind = "text" | "path" | "code" | "hash" | "bytes" | "json" | "badge" | "privileges";
@@ -169,21 +169,6 @@ const BOOL_COLORS: Record<string, string> = {
   False: "#8a8a8a",
 };
 
-// Chromium DownloadItem::DownloadState.
-const DOWNLOAD_STATE_LABELS: Record<string, string> = {
-  "0": "진행 중",
-  "1": "완료",
-  "2": "취소됨",
-  "3": "중단됨",
-};
-
-const DOWNLOAD_STATE_COLORS: Record<string, string> = {
-  "완료": "#3fb950",
-  "취소됨": "#8a8a8a",
-  "중단됨": "#d29922",
-  "진행 중": "#4fc1ff",
-};
-
 const DIRECTION_COLORS: Record<string, string> = {
   inbound: "#d29922",
   outbound: "#4fc1ff",
@@ -193,12 +178,6 @@ const RDP_RESULT_COLORS: Record<string, string> = {
   "성공": "#3fb950",
   "실패": "#f85149",
   "정보": "#8a8a8a",
-};
-
-const ACTIVITY_TYPE_COLORS: Record<string, string> = {
-  "방문": "#4fc1ff",
-  "다운로드": "#3fb950",
-  "로그인 저장": "#d29922",
 };
 
 function basename(path: string | undefined): string {
@@ -305,17 +284,6 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
         { key: "provider", label: "공급자" },
       ]},
     ],
-  },
-
-  BrowserTimeline: {
-    title: (r) => r.title_or_target || "(no title)",
-    subtitle: (r) => r.url || "",
-    badges: [
-      { key: "activity_type", label: "구분", kind: "badge", badgeColors: ACTIVITY_TYPE_COLORS },
-      { key: "browser", kind: "badge" },
-    ],
-    priorityColumns: ["timestamp", "activity_type", "title_or_target", "url", "browser"],
-    sections: [{ heading: "URL", fields: [{ key: "url", kind: "path" }] }],
   },
 
   UserAssist_Execution: {
@@ -455,8 +423,10 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     ],
   },
 
+  // EventLog is now one table per source .evtx (Security, System, ...), each
+  // resolved to this shared spec by resolveArtifactView() via its columns —
+  // so the per-file logs still get the full catalog/tags/detail view.
   EventLog_Events: {
-    sidebarGroupColumn: "Channel",
     title: (r) => {
       const catalog = lookupEventCatalog(r.Provider, r.EventID);
       const base = catalog ? `Event ${r.EventID} · ${catalog.label}` : `Event ${r.EventID}`;
@@ -541,113 +511,6 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
       ]},
       { heading: "이벤트 데이터 (원본)", fields: [{ key: "EventData", kind: "json" }] },
       { heading: "오류", fields: [{ key: "_error", kind: "code" }] },
-    ],
-  },
-
-  History_Visits: {
-    title: (r) => r.title || r.url || "(no title)",
-    subtitle: (r) => r.url || "",
-    badges: [
-      { key: "browser", kind: "badge" },
-      { key: "transition_type", kind: "badge" },
-    ],
-    links: [{ key: "url", label: "이 URL의 방문 요약 보기", targetFile: "History_Urls", targetColumn: "url" }],
-    timelineField: "timestamp",
-    priorityColumns: ["timestamp", "title", "url", "transition_type", "browser"],
-    sections: [
-      // from_visit / visit_id are internal Chromium row IDs — low value, so
-      // only the dwell time stays in the curated view.
-      { heading: "방문 정보", fields: [
-        { key: "visit_duration_sec", label: "체류 시간(초)" },
-      ]},
-      { heading: "URL", fields: [{ key: "url", kind: "path" }] },
-    ],
-  },
-
-  History_Urls: {
-    title: (r) => r.title || r.url || "(no title)",
-    subtitle: (r) => r.url || "",
-    badges: [{ key: "browser", kind: "badge" }],
-    links: [{ key: "url", label: "이 URL의 방문 기록 전부 보기", targetFile: "History_Visits", targetColumn: "url" }],
-    timelineField: "last_visit_time",
-    priorityColumns: ["last_visit_time", "title", "url", "visit_count", "browser"],
-    sections: [
-      { heading: "통계", fields: [
-        { key: "visit_count" },
-        { key: "typed_count" },
-      ]},
-      { heading: "URL", fields: [{ key: "url", kind: "path" }] },
-    ],
-  },
-
-  History_Downloads: {
-    title: (r) => basename(r.target_path) || "(no file)",
-    subtitle: (r) => r.tab_url || "",
-    badges: [
-      { key: "browser", kind: "badge" },
-      { key: "state", kind: "badge", valueLabels: DOWNLOAD_STATE_LABELS, badgeColors: DOWNLOAD_STATE_COLORS },
-    ],
-    // Chromium's own Safe Browsing verdict (danger_type) is a direct
-    // signal, not a heuristic — surface it the same way as a path check.
-    tags: (r) => tagsForPath(r.target_path).concat(tagsForDangerType(r.danger_type)),
-    timelineFields: [
-      { key: "start_time", label: "시작" },
-      { key: "end_time", label: "종료" },
-      { key: "last_access_time", label: "마지막 접근" },
-    ],
-    timelineField: "start_time",
-    priorityColumns: ["end_time", "target_path", "tab_url", "total_bytes", "browser"],
-    sections: [
-      { heading: "시간", fields: [{ key: "start_time" }, { key: "end_time" }, { key: "last_access_time" }] },
-      { heading: "파일", fields: [
-        { key: "target_path", kind: "path" },
-        { key: "current_path", kind: "path" },
-        { key: "received_bytes", kind: "bytes" },
-        { key: "total_bytes", kind: "bytes" },
-        { key: "mime_type" },
-        { key: "danger_type", label: "브라우저 위험 판정 코드" },
-      ]},
-      { heading: "출처", fields: [
-        { key: "tab_url", kind: "path" },
-        { key: "referrer", kind: "path" },
-      ]},
-    ],
-  },
-
-  History_KeywordSearchTerms: {
-    title: (r) => r.term || "(no term)",
-    subtitle: (r) => r.browser || "",
-    sections: [{ heading: "검색", fields: [
-      { key: "url", kind: "path" },
-      { key: "normalized_term" },
-    ]}],
-  },
-
-  LoginData_Logins: {
-    title: (r) => r.origin_url || "(no origin)",
-    subtitle: (r) => r.username_value || "",
-    badges: [
-      { key: "browser", kind: "badge" },
-      { key: "has_password", kind: "badge", badgeColors: BOOL_COLORS },
-    ],
-    timelineFields: [
-      { key: "date_created", label: "생성" },
-      { key: "date_last_used", label: "마지막 사용" },
-      { key: "date_password_modified", label: "비밀번호 변경" },
-    ],
-    timelineField: "date_created",
-    priorityColumns: ["date_last_used", "origin_url", "username_value", "browser", "has_password"],
-    sections: [
-      { heading: "날짜", fields: [
-        { key: "date_created" },
-        { key: "date_last_used" },
-        { key: "date_password_modified" },
-      ]},
-      { heading: "상세", fields: [
-        { key: "signon_realm", kind: "path" },
-        { key: "times_used" },
-        { key: "password_type" },
-      ]},
     ],
   },
 
@@ -899,4 +762,18 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
 
 export function getArtifactView(fileBaseName: string): ArtifactViewSpec | null {
   return VIEWS[fileBaseName] ?? null;
+}
+
+// Resolve a table to its view spec. Prefer an exact name match; otherwise, if
+// the table's columns look like an EventLog record (every .evtx is now its own
+// table with an arbitrary name — Security, System, Microsoft-Windows-…), fall
+// back to the shared EventLog spec so per-file logs keep the rich catalog/tag
+// view instead of rendering as a plain column dump.
+export function resolveArtifactView(fileBaseName: string, columns?: string[]): ArtifactViewSpec | null {
+  const exact = VIEWS[fileBaseName];
+  if (exact) return exact;
+  if (columns && columns.includes("EventID") && columns.includes("Provider") && columns.includes("EventData")) {
+    return VIEWS.EventLog_Events;
+  }
+  return null;
 }

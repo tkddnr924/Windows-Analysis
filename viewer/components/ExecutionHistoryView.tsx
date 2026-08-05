@@ -32,10 +32,13 @@ interface SourceMeta {
   icon: string;
 }
 const SOURCE_META: Record<string, SourceMeta> = {
-  Amcache_Programs: { label: "설치 프로그램", icon: "📦" },
-  Amcache_Files: { label: "파일", icon: "📄" },
-  Prefetch_Execution: { label: "Prefetch 실행", icon: "▶️" },
-  UserAssist_Execution: { label: "UserAssist", icon: "🖱️" },
+  Amcache_Programs: { label: "설치 프로그램(Amcache)", icon: "📦" },
+  Amcache_Files: { label: "파일(Amcache)", icon: "📄" },
+  Prefetch: { label: "Prefetch 실행", icon: "▶️" },
+  UserAssist: { label: "UserAssist(실행)", icon: "🖱️" },
+  SRUM: { label: "SRUM(리소스 사용)", icon: "📊" },
+  BAM: { label: "BAM(백그라운드 실행)", icon: "⏱️" },
+  AppCompatCache: { label: "ShimCache(존재/실행)", icon: "🗃️" },
 };
 function sourceMeta(src: string): SourceMeta {
   return SOURCE_META[src] ?? { label: src, icon: "•" };
@@ -50,6 +53,7 @@ interface Entry {
   runCount: string;
   timestamp: string;
   source: string;
+  user: string;
   tags: Tag[];
   unsigned: boolean;
   /** 0 none · 1 warning · 2 danger — drives ordering and the risk dot. */
@@ -94,6 +98,7 @@ function buildEntry(row: Row): Entry {
     runCount: row.run_count || "",
     timestamp: row.timestamp || "",
     source: row.source_artifact || "",
+    user: row.user || "",
     tags,
     unsigned,
     risk,
@@ -198,7 +203,7 @@ export default function ExecutionHistoryView({
       if (filter === "risk" && e.risk === 0) return false;
       if (filter === "unsigned" && !e.unsigned) return false;
       if (filter !== "all" && filter !== "risk" && filter !== "unsigned" && e.source !== filter) return false;
-      if (needle && !(e.name.toLowerCase().includes(needle) || e.path.toLowerCase().includes(needle) || e.publisher.toLowerCase().includes(needle))) return false;
+      if (needle && !(e.name.toLowerCase().includes(needle) || e.path.toLowerCase().includes(needle) || e.publisher.toLowerCase().includes(needle) || e.user.toLowerCase().includes(needle))) return false;
       return true;
     });
     rows = [...rows].sort((a, b) => {
@@ -366,6 +371,7 @@ export default function ExecutionHistoryView({
                   </div>
                   <div style={{ fontSize: 11, color: "var(--text-faint)", marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                     {meta.icon} {meta.label}
+                    {e.user && ` · 👤 ${e.user}`}
                     {e.publisher && ` · ${e.publisher}`}
                     {e.runCount && ` · ${e.runCount}회 실행`}
                   </div>

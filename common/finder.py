@@ -83,35 +83,3 @@ def find_files_by_content(target_dir: Path, marker: str, max_bytes: int = 4096) 
         if any(n in head for n in needles):
             matches.append(path)
     return matches
-
-
-_SQLITE_MAGIC = b"SQLite format 3\x00"
-
-
-def find_sqlite_files(target_dir: Path, under_folder: str | None = None) -> list[Path]:
-    """Recursively find real SQLite3 database files under target_dir by
-    magic header bytes, not filename — browser/app SQLite databases show
-    up under all kinds of names and extensions (History, "Login Data",
-    Favicons, *.db, ...), and going by content is the only way to catch
-    all of them without hand-maintaining a name list.
-
-    `under_folder`, if given, restricts results to paths that have that
-    folder name as one of their path segments (case-insensitive) — e.g.
-    "BROWSER", to scope a scan to the collected browser-profile tree and
-    skip unrelated SQLite files elsewhere (Windows notification/timeline
-    databases, etc.)."""
-    wanted_folder = under_folder.lower() if under_folder else None
-    matches = []
-    for path in target_dir.rglob("*"):
-        if not path.is_file():
-            continue
-        if wanted_folder and wanted_folder not in {p.lower() for p in path.parts}:
-            continue
-        try:
-            with open(path, "rb") as f:
-                header = f.read(len(_SQLITE_MAGIC))
-        except OSError:
-            continue
-        if header == _SQLITE_MAGIC:
-            matches.append(path)
-    return matches

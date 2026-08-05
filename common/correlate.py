@@ -21,7 +21,33 @@ import re
 
 
 def _rows(all_results: dict, artifact_name: str, output_name: str) -> list[dict]:
-    return all_results.get(artifact_name, {}).get(output_name, [])
+    """All rows of a given table for an artifact. An artifact's results are
+    either flat ({table: rows}) or nested one level ({source_file: {table:
+    rows}}) now that some artifacts write one sqlite per source file with
+    several tables inside. The same table name can appear in more than one file
+    (e.g. Registry_SystemInfo in both SOFTWARE and SYSTEM), so matches are
+    concatenated."""
+    art = all_results.get(artifact_name, {})
+    out: list[dict] = []
+    for key, value in art.items():
+        if isinstance(value, dict):
+            rows = value.get(output_name)
+            if rows:
+                out.extend(rows)
+        elif key == output_name and isinstance(value, list):
+            out.extend(value)
+    return out
+
+
+def _eventlog_rows(all_results: dict) -> list[dict]:
+    """Every EventLog record across all logs. EventLog output is now one table
+    per source .evtx (Security, System, ...), so the correlations that scan
+    events (RDP, PowerShell) iterate all of them instead of one merged table.
+    Each row still carries its own _record_key (`<logname>.evtx::<id>`)."""
+    all_rows: list[dict] = []
+    for rows in all_results.get("EventLog", {}).values():
+        all_rows.extend(rows)
+    return all_rows
 
 
 def build_target_info(all_results: dict) -> list[dict]:
@@ -200,7 +226,7 @@ def build_execution_history(all_results: dict) -> list[dict]:
             }
         )
 
-    for r in _rows(all_results, "UserAssist", "UserAssist_Execution"):
+    for r in _rows(all_results, "NTUSER", "UserAssist_Execution"):
         rows.append(
             {
                 "timestamp": r.get("timestamp", ""),
@@ -320,7 +346,7 @@ def build_remote_desktop_history(all_results: dict) -> list[dict]:
     classified per event so the viewer can split them."""
     rows = []
 
-    for r in _rows(all_results, "EventLog", "EventLog_Events"):
+    for r in _eventlog_rows(all_results):
         spec = _RDP_EVENTS.get((r.get("Provider", ""), str(r.get("EventID", ""))))
         if not spec:
             continue
@@ -481,7 +507,7 @@ def build_powershell_history(all_results: dict) -> list[dict]:
     # ScriptBlockId -> reassembly slot, for multi-part 4104 script blocks.
     blocks: dict[str, dict] = {}
 
-    for r in _rows(all_results, "EventLog", "EventLog_Events"):
+    for r in _eventlog_rows(all_results):
         provider = r.get("Provider", "") or ""
         event_id = str(r.get("EventID", ""))
         ed = _parse_event_data(r.get("EventData", ""))
@@ -548,49 +574,5 @@ def build_powershell_history(all_results: dict) -> list[dict]:
             process_id=slot["pid"], command="", script_block=text, kind="스크립트 블록",
             event_id="4104", provider="Microsoft-Windows-PowerShell", script_path=slot["path"], record_key=slot["rk"],
         ))
-
-    return rows
-
-
-def build_browser_timeline(all_results: dict) -> list[dict]:
-    rows = []
-
-    for r in _rows(all_results, "BrowserHistory", "History_Visits"):
-        rows.append(
-            {
-                "timestamp": r.get("timestamp", ""),
-                "browser": r.get("browser", ""),
-                "activity_type": "방문",
-                "title_or_target": r.get("title", ""),
-                "url": r.get("url", ""),
-                "source_artifact": "History_Visits",
-            }
-        )
-
-    for r in _rows(all_results, "BrowserHistory", "History_Downloads"):
-        target = r.get("target_path", "")
-        filename = target.replace("/", "\\").split("\\")[-1] if target else ""
-        rows.append(
-            {
-                "timestamp": r.get("end_time", ""),
-                "browser": r.get("browser", ""),
-                "activity_type": "다운로드",
-                "title_or_target": filename,
-                "url": r.get("tab_url", ""),
-                "source_artifact": "History_Downloads",
-            }
-        )
-
-    for r in _rows(all_results, "BrowserLoginData", "LoginData_Logins"):
-        rows.append(
-            {
-                "timestamp": r.get("date_last_used", ""),
-                "browser": r.get("browser", ""),
-                "activity_type": "로그인 저장",
-                "title_or_target": r.get("origin_url", ""),
-                "url": r.get("origin_url", ""),
-                "source_artifact": "LoginData_Logins",
-            }
-        )
 
     return rows

@@ -21,8 +21,17 @@ export interface CategoryEntry {
   fullPath: string;
 }
 
+// One browsable table. A single .sqlite now holds several tables (e.g. a
+// registry hive dump, or a Chrome History DB's urls/visits/downloads), so the
+// browsable unit is a (file, table) pair rather than a whole file.
 export interface ResultFileEntry {
+  /** Display name = the table name. */
   name: string;
+  /** Source .sqlite basename without extension (e.g. "SOFTWARE"), used to
+   * group a file's tables together in the sidebar. */
+  fileName: string;
+  /** The table within the file this entry refers to. */
+  tableName: string;
   relativePath: string;
   fullPath: string;
   rowCount: number;

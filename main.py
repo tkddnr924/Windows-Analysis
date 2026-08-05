@@ -29,7 +29,7 @@ for _stream in (sys.stdout, sys.stderr):
     if hasattr(_stream, "reconfigure"):
         _stream.reconfigure(encoding="utf-8")
 
-from common import case_store, correlate
+from common import case_store, correlate, processing
 from common.finder import dedupe_by_content
 from common.registry import ARTIFACTS
 from common.sqlite_writer import write_rows_to_sqlite
@@ -80,10 +80,18 @@ def run_case(case_id: str, cases_dir: Path, only: set[str] | None = None) -> Non
         all_results[artifact.name] = results
 
         artifact_dir = case_output_dir / artifact.category.upper() / artifact.subfolder
-        for output_name, rows in results.items():
+        for output_name, content in results.items():
             sqlite_path = artifact_dir / f"{output_name}.sqlite"
-            write_rows_to_sqlite(rows, sqlite_path, output_name, artifact.field_order.get(output_name, []))
-            print(f"[+] {len(rows)} rows -> {sqlite_path}")
+            if isinstance(content, dict):
+                # One sqlite per source file, one TABLE per structure inside it
+                # (e.g. SOFTWARE.sqlite -> Registry_Run, Registry_InstalledPrograms,
+                # ...) — keeps the parsed output 1:1 with the source hive/file.
+                for table_name, rows in content.items():
+                    write_rows_to_sqlite(rows, sqlite_path, table_name, artifact.field_order.get(table_name, []))
+                    print(f"[+] {len(rows)} rows -> {sqlite_path} [{table_name}]")
+            else:
+                write_rows_to_sqlite(content, sqlite_path, output_name, artifact.field_order.get(output_name, []))
+                print(f"[+] {len(content)} rows -> {sqlite_path}")
 
         artifacts_run.append(artifact.name)
 
@@ -91,10 +99,9 @@ def run_case(case_id: str, cases_dir: Path, only: set[str] | None = None) -> Non
     overview_dir = case_output_dir / "_OVERVIEW"
     overview_builders = {
         "TargetInfo": correlate.build_target_info,
-        "ExecutionHistory": correlate.build_execution_history,
+        "ExecutionHistory": processing.build_execution_history,
         "RemoteDesktopHistory": correlate.build_remote_desktop_history,
         "PowerShellHistory": correlate.build_powershell_history,
-        "BrowserTimeline": correlate.build_browser_timeline,
     }
     for output_name, builder in overview_builders.items():
         rows = builder(all_results)

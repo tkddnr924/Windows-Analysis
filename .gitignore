@@ -20,3 +20,8 @@ viewer/release/
 pyinstaller-dist/
 pyinstaller-build/
 *.spec
+
+# macOS + local test artifacts
+.DS_Store
+/Defender%4Operational.sqlite
+.venv_test/

@@ -19,13 +19,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-# The parse stage produces the base artifacts below. Browser history/login,
-# the generic browser-SQLite dump, UserAssist, and RDP client history are
-# deliberately NOT parse-stage artifacts — they are "선별"(curated selections)
-# derived from parsed results in a later step, so their parser modules stay
-# in parsers/ but aren't registered here.
 from parsers import (
     amcache_parser,
+    browser_history_parser,
     eventlog_parser,
     jumplist_parser,
     powershell_history_parser,
@@ -41,6 +37,7 @@ from common.finder import (
     find_files_by_content,
     find_files_by_extension,
     find_files_by_name,
+    find_files_by_suffix,
 )
 
 
@@ -87,9 +84,15 @@ ARTIFACTS: list[ArtifactDefinition] = [
         parse=eventlog_parser.parse,
         field_order=eventlog_parser.FIELD_ORDER,
     ),
+    # Every registry hive — system hives by name (SYSTEM/SOFTWARE/SAM/...) and
+    # per-user hives by suffix (NTUSER.DAT / UsrClass.dat, with or without a
+    # username prefix) — is dumped to one uniform-schema sqlite per hive.
     ArtifactDefinition(
         name=registry_parser.ARTIFACT_NAME,
-        find_paths=_by_filenames(registry_parser.FILENAMES),
+        find_paths=lambda target_dir: (
+            find_files_by_name(target_dir, registry_parser.FILENAMES)
+            + find_files_by_suffix(target_dir, registry_parser.FILE_SUFFIXES)
+        ),
         parse=registry_parser.parse,
         field_order=registry_parser.FIELD_ORDER,
     ),
@@ -129,5 +132,14 @@ ARTIFACTS: list[ArtifactDefinition] = [
         find_paths=_by_filenames(powershell_history_parser.FILENAMES),
         parse=powershell_history_parser.parse,
         field_order=powershell_history_parser.FIELD_ORDER,
+    ),
+    # Chrome "History" SQLite DB, one sqlite per account (its tables copied
+    # as-is). Only the History database for now.
+    ArtifactDefinition(
+        name=browser_history_parser.ARTIFACT_NAME,
+        find_paths=_by_filenames(browser_history_parser.FILENAMES),
+        parse=browser_history_parser.parse,
+        field_order=browser_history_parser.FIELD_ORDER,
+        category="Browser",
     ),
 ]

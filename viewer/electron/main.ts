@@ -263,6 +263,12 @@ function firstTableName(db: InstanceType<typeof Database>): string | null {
   return row?.name ?? null;
 }
 
+function tableNames(db: InstanceType<typeof Database>): string[] {
+  return (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY rowid").all() as { name: string }[]).map(
+    (r) => r.name
+  );
+}
+
 function findResultFiles(dir: string, baseDir: string): ResultFileEntry[] {
   const results: ResultFileEntry[] = [];
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -276,15 +282,14 @@ function findResultFiles(dir: string, baseDir: string): ResultFileEntry[] {
 
     const db = new Database(fullPath, { readonly: true, fileMustExist: true });
     try {
-      const tableName = firstTableName(db);
-      if (!tableName) continue;
-      const { count } = db.prepare(`SELECT COUNT(*) as count FROM "${tableName}"`).get() as { count: number };
-      results.push({
-        name: entry.name.replace(/\.sqlite$/i, ""),
-        relativePath: path.relative(baseDir, fullPath),
-        fullPath,
-        rowCount: count,
-      });
+      const fileName = entry.name.replace(/\.sqlite$/i, "");
+      const relativePath = path.relative(baseDir, fullPath);
+      // One entry PER TABLE — a file can hold several (a registry dump, a
+      // browser History DB, ...).
+      for (const tableName of tableNames(db)) {
+        const { count } = db.prepare(`SELECT COUNT(*) as count FROM "${tableName}"`).get() as { count: number };
+        results.push({ name: tableName, fileName, tableName, relativePath, fullPath, rowCount: count });
+      }
     } finally {
       db.close();
     }
@@ -294,31 +299,36 @@ function findResultFiles(dir: string, baseDir: string): ResultFileEntry[] {
 
 ipcMain.handle("list-result-files", (_event, categoryDir: string): ResultFileEntry[] => {
   if (!fs.existsSync(categoryDir)) return [];
-  return findResultFiles(categoryDir, categoryDir).sort((a, b) => a.relativePath.localeCompare(b.relativePath));
+  return findResultFiles(categoryDir, categoryDir).sort(
+    (a, b) => a.relativePath.localeCompare(b.relativePath) || a.tableName.localeCompare(b.tableName)
+  );
 });
 
 // Distinct values of one column with row counts — used to expand a table into
-// per-value sub-entries in the sidebar (e.g. EventLog_Events by Channel).
-ipcMain.handle("list-column-values", (_event, fullPath: string, column: string): { value: string; count: number }[] => {
-  const db = new Database(fullPath, { readonly: true, fileMustExist: true });
-  try {
-    const tableName = firstTableName(db);
-    if (!tableName) return [];
-    const cols = (db.prepare(`PRAGMA table_info("${tableName}")`).all() as { name: string }[]).map((c) => c.name);
-    if (!cols.includes(column)) return [];
-    const rows = db
-      .prepare(`SELECT "${column}" AS value, COUNT(*) AS count FROM "${tableName}" GROUP BY "${column}" ORDER BY count DESC`)
-      .all() as { value: string | null; count: number }[];
-    return rows.map((r) => ({ value: r.value ?? "", count: r.count }));
-  } finally {
-    db.close();
+// per-value sub-entries in the sidebar (e.g. EventLog by Channel).
+ipcMain.handle(
+  "list-column-values",
+  (_event, fullPath: string, column: string, tableName?: string): { value: string; count: number }[] => {
+    const db = new Database(fullPath, { readonly: true, fileMustExist: true });
+    try {
+      const table = tableName ?? firstTableName(db);
+      if (!table) return [];
+      const cols = (db.prepare(`PRAGMA table_info("${table}")`).all() as { name: string }[]).map((c) => c.name);
+      if (!cols.includes(column)) return [];
+      const rows = db
+        .prepare(`SELECT "${column}" AS value, COUNT(*) AS count FROM "${table}" GROUP BY "${column}" ORDER BY count DESC`)
+        .all() as { value: string | null; count: number }[];
+      return rows.map((r) => ({ value: r.value ?? "", count: r.count }));
+    } finally {
+      db.close();
+    }
   }
-});
+);
 
-ipcMain.handle("read-result-file", (_event, fullPath: string): CsvData => {
+ipcMain.handle("read-result-file", (_event, fullPath: string, tableNameArg?: string): CsvData => {
   const db = new Database(fullPath, { readonly: true, fileMustExist: true });
   try {
-    const tableName = firstTableName(db);
+    const tableName = tableNameArg ?? firstTableName(db);
     if (!tableName) return { columns: [], rows: [], rowCount: 0 };
     // rowid is SQLite's built-in per-table row identifier (stable within one
     // parse; these tables have no explicit PK). Aliased as __rowid and kept

@@ -14,7 +14,7 @@ import {
 } from "@tanstack/react-table";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import type { ColumnFilterValue, CsvData, FetchLinkedRows } from "@/lib/types";
-import { getArtifactView } from "@/lib/artifactViews";
+import { resolveArtifactView } from "@/lib/artifactViews";
 import { inRange, rangeActive, timeColumnFor, EMPTY_TIME_RANGE, type TimeRange } from "@/lib/timeRange";
 import RowDetailPanel from "./RowDetailPanel";
 import ColumnFilterControl from "./ColumnFilterControl";
@@ -79,7 +79,7 @@ export default function DataTable({
   const [selectedCell, setSelectedCell] = useState<{ row: Record<string, string>; column: string } | null>(null);
 
   const fileBaseName = fileName.split(/[\\/]/).pop()?.replace(/\.csv$/i, "") ?? fileName;
-  const artifactSpec = getArtifactView(fileBaseName);
+  const artifactSpec = resolveArtifactView(fileBaseName, data.columns);
   const filterTabs = artifactSpec?.filterTabs;
 
   useEffect(() => {

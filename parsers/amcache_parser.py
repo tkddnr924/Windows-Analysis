@@ -144,8 +144,11 @@ def _parse_files(hive: RegistryHive) -> list[dict]:
     return entries
 
 
-def parse(paths: list[Path]) -> dict[str, list[dict]]:
-    all_programs, all_files = [], []
+def parse(paths: list[Path]) -> dict[str, dict[str, list[dict]]]:
+    """One sqlite per source Amcache hive, with a table per structure it holds
+    (Programs / Files) — 1:1 with the collected hive."""
+    outputs: dict[str, dict[str, list[dict]]] = {}
+    taken: set[str] = set()
     for hive_path in paths:
         with open_hive(hive_path) as hive:
             programs = _parse_programs(hive)
@@ -160,10 +163,14 @@ def parse(paths: list[Path]) -> dict[str, list[dict]]:
         for row in files:
             row["_source_file"] = str(hive_path)
 
-        all_programs.extend(programs)
-        all_files.extend(files)
+        # Name the sqlite after the source hive (Amcache.hve -> Amcache.sqlite).
+        base = hive_path.stem or hive_path.name
+        name = base
+        i = 2
+        while name in taken:
+            name = f"{base}_{i}"
+            i += 1
+        taken.add(name)
+        outputs[name] = {"Amcache_Programs": programs, "Amcache_Files": files}
 
-    return {
-        "Amcache_Programs": all_programs,
-        "Amcache_Files": all_files,
-    }
+    return outputs

@@ -23,8 +23,16 @@ export interface CategoryEntry {
   fullPath: string;
 }
 
+// One browsable table. A single .sqlite may hold several tables (a registry
+// hive dump, a Chrome History DB, ...), so the browsable unit is a (file,
+// table) pair.
 export interface ResultFileEntry {
+  /** Display name = the table name. */
   name: string;
+  /** Source .sqlite basename (no extension), used to group a file's tables. */
+  fileName: string;
+  /** The table within the file. */
+  tableName: string;
   relativePath: string;
   fullPath: string;
   rowCount: number;
@@ -109,8 +117,8 @@ export interface ElectronApi {
   onPipelineLog(callback: (entry: PipelineLogEntry) => void): () => void;
   listCategories(caseDir: string): Promise<CategoryEntry[]>;
   listResultFiles(categoryDir: string): Promise<ResultFileEntry[]>;
-  readResultFile(fullPath: string): Promise<CsvData>;
-  listColumnValues(fullPath: string, column: string): Promise<{ value: string; count: number }[]>;
+  readResultFile(fullPath: string, tableName?: string): Promise<CsvData>;
+  listColumnValues(fullPath: string, column: string, tableName?: string): Promise<{ value: string; count: number }[]>;
   listBookmarks(caseDir: string): Promise<Bookmark[]>;
   toggleBookmark(caseDir: string, entry: BookmarkInput): Promise<Bookmark[]>;
   updateBookmarkNote(caseDir: string, id: string, note: string): Promise<Bookmark[]>;

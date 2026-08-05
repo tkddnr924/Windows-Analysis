@@ -9,10 +9,12 @@ handler), who it runs as and at what privilege, whether it's enabled/hidden,
 and its triggers. "Parsing" is just turning the XML into that flat row;
 judging which tasks are suspicious is a later step.
 
-Timestamps in task XML (RegistrationInfo/Date, trigger StartBoundary) are
-written in the machine's LOCAL time with no offset. This dataset was
-collected from a KST machine, so they're interpreted as KST — passed
-explicitly as source_tz rather than defaulted.
+Timestamps in task XML (RegistrationInfo/Date, trigger StartBoundary) come in
+three shapes: UTC ("...Z"), an explicit offset ("...+09:00"), or naive local
+time (no offset). format_timestamp honours an embedded offset when present and
+only falls back to source_tz for the naive case — so KST is passed as the
+source_tz for those naive-local values. (.NET also emits 7-digit fractional
+seconds like "...55.5851926"; common.utils normalizes that before parsing.)
 """
 import xml.etree.ElementTree as ET
 from pathlib import Path

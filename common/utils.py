@@ -24,10 +24,19 @@ timestamp leads each CSV.
 from __future__ import annotations
 
 import datetime as dt
+import re
 
 UTC = dt.timezone.utc
 KST = dt.timezone(dt.timedelta(hours=9))
 TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+# .NET / Task Scheduler serialize datetimes with up to 7 fractional-second
+# digits (100-ns "ticks"), e.g. "2006-11-10T14:29:55.5851926". Python's
+# datetime.fromisoformat only accepts 3 or 6 digits, so those values fail to
+# parse and leak through as raw strings. Truncate the fraction to 6 digits
+# (microseconds) before parsing — the sub-microsecond part is noise for a
+# timeline.
+_OVERLONG_FRACTION = re.compile(r"(\.\d{6})\d+")
 
 # Common non-ISO formats artifact hives store timestamps as
 _STRING_FORMATS = (
@@ -74,8 +83,9 @@ def _parse(value, source_tz: dt.tzinfo):
         s = value.strip()
         if not s:
             return None
+        iso = _OVERLONG_FRACTION.sub(r"\1", s.replace("Z", "+00:00"))
         try:
-            parsed = dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
+            parsed = dt.datetime.fromisoformat(iso)
             return parsed if parsed.tzinfo else parsed.replace(tzinfo=source_tz)
         except ValueError:
             pass
