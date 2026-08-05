@@ -79,8 +79,10 @@ ARTIFACTS: list[ArtifactDefinition] = [
         field_order=prefetch_parser.FIELD_ORDER,
     ),
     ArtifactDefinition(
+        # Only the IR-relevant logs (eventlog_parser.ALLOWLIST), not all 300+
+        # collected .evtx — matched by exact filename, case-insensitive.
         name=eventlog_parser.ARTIFACT_NAME,
-        find_paths=_by_extensions(eventlog_parser.EXTENSIONS),
+        find_paths=_by_filenames(eventlog_parser.ALLOWLIST),
         parse=eventlog_parser.parse,
         field_order=eventlog_parser.FIELD_ORDER,
     ),

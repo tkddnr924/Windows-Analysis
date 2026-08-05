@@ -36,6 +36,31 @@ from common.utils import UTC, format_timestamp
 ARTIFACT_NAME = "EventLog"
 EXTENSIONS = [".evtx"]
 
+# A collected machine ships 300+ .evtx, almost all irrelevant to an intrusion.
+# Parsing every one buries the analyst and bloats the case, so only the logs
+# that actually carry incident evidence are parsed — matched by exact filename
+# (case-insensitive) via the registry's find_files_by_name. Names use the
+# on-disk "%4" escaping for "/". To widen coverage, add filenames here.
+ALLOWLIST = [
+    # --- Tier 1: core + primary IR ---
+    "Security.evtx",                # logon/logoff, account mgmt, 4688, 1102 log-clear
+    "System.evtx",                  # 7045 service install, service start/stop, boot/shutdown
+    "Application.evtx",             # app crashes, some AV/install traces
+    "Microsoft-Windows-PowerShell%4Operational.evtx",   # 4104 script-block logging
+    "Windows PowerShell.evtx",      # engine start 400/403/600, downgrade attacks
+    "Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx",     # RDP session logon/logoff 21-25/39/40
+    "Microsoft-Windows-TerminalServices-RemoteConnectionManager%4Operational.evtx", # RDP auth (inbound) 1149
+    "Microsoft-Windows-TerminalServices-RDPClient%4Operational.evtx",               # outbound RDP 1024/1102
+    "Microsoft-Windows-Windows Defender%4Operational.evtx",     # malware detection 1116/1117, config change 5001/5007
+    "Microsoft-Windows-TaskScheduler%4Operational.evtx",        # task register/run (persistence) 106/140/141/200/201
+    # --- Tier 2 (selected: SMB / BITS / Firewall) ---
+    "Microsoft-Windows-SMBServer%4Security.evtx",   # inbound share access (lateral movement)
+    "Microsoft-Windows-SMBServer%4Audit.evtx",
+    "Microsoft-Windows-SmbClient%4Security.evtx",   # outbound SMB
+    "Microsoft-Windows-Bits-Client%4Operational.evtx",  # BITS payload download
+    "Microsoft-Windows-Windows Firewall With Advanced Security%4Firewall.evtx",  # firewall rule changes
+]
+
 # Every per-file EventLog table shares this column order.
 _EVENT_COLUMNS = [
     "timestamp", "Channel", "EventID", "LevelName", "Level", "Provider",
