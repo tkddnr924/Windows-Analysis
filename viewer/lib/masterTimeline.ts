@@ -1,11 +1,16 @@
 import { resolveArtifactView } from "./artifactViews";
 import type { CategoryEntry, TimelineEntry } from "./types";
 
-// Only files whose artifactViews.ts spec declares timelineField are
-// included — that's the project's own curated "this artifact matters for
-// analysis" list, so the _OVERVIEW correlation tables (already-derived, would
-// double-count) are excluded. EventLog is now one table per source .evtx with
-// an arbitrary name, so those are resolved by their columns after a read.
+// Only files whose artifactViews.ts spec declares timelineField are included —
+// the project's curated "this artifact matters for analysis" list. Most
+// _OVERVIEW correlations are excluded (no timelineField) because they'd
+// double-count the raw artifacts they derive from. The one exception is
+// ExecutionHistory: it's the ONLY source of a timestamp for SRUM (first
+// sighting), AppCompatCache/ShimCache, BAM and UserAssist — none of which have
+// a raw table of their own — so it opts in, and the raw Amcache/Prefetch specs
+// drop their timelineField so they don't appear twice. EventLog is now one
+// table per source .evtx with an arbitrary name, resolved by columns after a
+// read.
 export async function buildMasterTimeline(categories: CategoryEntry[]): Promise<TimelineEntry[]> {
   const entries: TimelineEntry[] = [];
 
