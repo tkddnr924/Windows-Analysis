@@ -83,6 +83,21 @@ export default function RunPipeline({ activeCase, onBack, onChanged, onOpenHost 
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
   const [deleting, setDeleting] = useState(false);
   const logEndRef = useRef<HTMLDivElement>(null);
+  // Latest section header seen ("=== X ==="). A section is only counted as
+  // done once the NEXT section starts — so the ref lets us also flush the very
+  // last section on completion, which otherwise never gets a following header
+  // (e.g. an Amcache-only run ends on "_OVERVIEW", or the last artifact of a
+  // full run), leaving its ✓ and the step counter permanently one short.
+  const currentRef = useRef<string | null>(null);
+
+  function flushCurrentSection() {
+    const prev = currentRef.current;
+    if (prev) {
+      setDoneArtifacts((done) => new Set(done).add(prev));
+      setCompletedSteps((c) => c + 1);
+    }
+    currentRef.current = null;
+  }
 
   useEffect(() => {
     window.api.listArtifacts().then((names) => {
@@ -96,14 +111,9 @@ export default function RunPipeline({ activeCase, onBack, onChanged, onOpenHost 
       setLogs((prev) => [...prev, entry]);
       const match = entry.line.match(/^=== (.+) ===$/);
       if (match) {
-        const name = match[1];
-        setCurrentArtifact((prevCurrent) => {
-          if (prevCurrent) {
-            setDoneArtifacts((done) => new Set(done).add(prevCurrent));
-            setCompletedSteps((c) => c + 1);
-          }
-          return name;
-        });
+        flushCurrentSection();
+        currentRef.current = match[1];
+        setCurrentArtifact(match[1]);
       }
     });
     return unsubscribe;
@@ -144,6 +154,7 @@ export default function RunPipeline({ activeCase, onBack, onChanged, onOpenHost 
     const only = selectedArtifacts.size === artifacts.length ? undefined : Array.from(selectedArtifacts);
     setRunningHostId(hostId);
     setLogs([]);
+    currentRef.current = null;
     setCurrentArtifact(null);
     setDoneArtifacts(new Set());
     setCompletedSteps(0);
@@ -152,6 +163,7 @@ export default function RunPipeline({ activeCase, onBack, onChanged, onOpenHost 
 
     await window.api.runHost({ caseId: activeCase.id, hostId, only });
 
+    flushCurrentSection(); // count the final section (last artifact / _OVERVIEW)
     setRunningHostId(null);
     setCurrentArtifact(null);
     setRunComplete(true);
