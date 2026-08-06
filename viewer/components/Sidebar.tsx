@@ -72,6 +72,7 @@ function EmptyCategoryRow({ name }: { name: string }) {
 const OVERVIEW_TABLE_ICONS: Record<string, string> = {
   TargetInfo: "🖥️",
   ExecutionHistory: "⚡",
+  Defender: "🛡️",
   RemoteDesktopHistory: "🖥️",
   PowerShellHistory: "💻",
 };
