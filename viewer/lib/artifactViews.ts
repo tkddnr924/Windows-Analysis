@@ -89,7 +89,7 @@ export interface ArtifactViewSpec {
    * Overview correlations (TargetInfo, ...) read as summaries/dashboards, not
    * spreadsheets, so each gets a purpose-built view.
    */
-  customView?: "targetInfo" | "executionHistory" | "powershellFlow";
+  customView?: "targetInfo" | "executionHistory" | "powershellFlow" | "defender";
   /**
    * In the sidebar, present this table split by this column: instead of one
    * row for the whole table, the category lists one entry per distinct value
@@ -223,6 +223,24 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
         { key: "sha1", kind: "hash" },
       ]},
     ],
+  },
+
+  Defender: {
+    customView: "defender",
+    title: (r) => r.title || "(no name)",
+    subtitle: (r) => r.detail || "",
+    badges: [{ key: "section", kind: "badge" }],
+    priorityColumns: ["section", "timestamp", "title", "detail", "severity", "action", "user"],
+    sections: [{ heading: "상세", fields: [
+      { key: "severity", label: "심각도" },
+      { key: "category", label: "분류" },
+      { key: "action", label: "조치" },
+      { key: "action_time", label: "조치 시각" },
+      { key: "process", label: "프로세스" },
+      { key: "user", label: "사용자" },
+      { key: "source", label: "탐지원" },
+      { key: "detail", label: "경로/내용" },
+    ]}],
   },
 
   RemoteDesktopHistory: {

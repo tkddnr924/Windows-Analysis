@@ -544,3 +544,136 @@ def build_target_info(all_results: dict) -> list[dict]:
     rows += _networks(software)
     rows += _network_interfaces(system)
     return rows
+
+
+# --- Defender ("Windows Defender 요약") ---------------------------------------
+# Distil the Defender Operational log (thousands of hourly health rows) into the
+# handful of facts an investigator actually wants: what malware was found and
+# what was done about it, whether protection was tampered with / history wiped,
+# recent scans, and the current signature version. Not a table dump — a
+# per-section summary the DefenderView renders as cards.
+
+_DEF_KEYS = (
+    "section", "timestamp", "event_id", "title", "detail", "severity", "category",
+    "action", "action_time", "process", "user", "source", "remediation", "record_key",
+)
+
+
+def _def_row(**kw) -> dict:
+    r = {k: "" for k in _DEF_KEYS}
+    r.update(kw)
+    return r
+
+
+def _json(raw: str) -> dict:
+    try:
+        d = json.loads(raw) if raw else {}
+        return d if isinstance(d, dict) else {}
+    except (ValueError, TypeError):
+        return {}
+
+
+def _defender_events(all_results: dict):
+    for stem, rows in all_results.get("EventLog", {}).items():
+        if "defender" in stem.lower():
+            yield from rows
+
+
+# 5007 config-change events are mostly signature/hash churn; only surface the
+# ones that touch protection policy (an attacker weakening Defender).
+_TAMPER_KEYS = (
+    "disableantispyware", "disableantivirus", "disablerealtimemonitoring",
+    "disablebehaviormonitoring", "disableioavprotection", "disableonaccessprotection",
+    "disablescanonrealtimeenable", "tamperprotection", "exclusions",
+    "disableblockatfirstseen", "puaprotection", "disablescriptscanning",
+)
+
+
+def build_defender(all_results: dict) -> list[dict]:
+    detections: dict[str, dict] = {}
+    tampering: list[tuple] = []
+    scans: dict[str, tuple] = {}
+    history_cleared: list[tuple] = []
+    sig_latest = None  # (ts, version, record_key)
+
+    for r in _defender_events(all_results):
+        eid = str(r.get("EventID", ""))
+        ts = r.get("timestamp", "")
+        rk = r.get("_record_key", "")
+        d = _json(r.get("EventData", ""))
+
+        if eid in ("1116", "1117"):
+            did = d.get("Detection ID") or f"{ts}|{d.get('Threat Name', '')}"
+            rec = detections.setdefault(did, _def_row(section="threat", event_id="1116/1117"))
+            for dst, src in (
+                ("title", "Threat Name"), ("severity", "Severity Name"),
+                ("category", "Category Name"), ("process", "Process Name"),
+                ("user", "Detection User"), ("source", "Source Name"),
+            ):
+                if d.get(src):
+                    rec[dst] = d[src]
+            if d.get("Path"):
+                rec["detail"] = d["Path"]
+            elif d.get("Process Name"):
+                rec["detail"] = d["Process Name"]
+            if eid == "1116":  # detected
+                if _earlier(ts, rec["timestamp"]):
+                    rec["timestamp"] = ts
+                    rec["record_key"] = rk
+            else:  # 1117 = action taken
+                rec["action_time"] = ts
+                act = d.get("Action Name", "")
+                if act and act != "해당 없음":
+                    rec["action"] = act
+                if d.get("Remediation User"):
+                    rec["remediation"] = d["Remediation User"]
+                if not rec["timestamp"]:
+                    rec["timestamp"] = ts
+                if not rec["record_key"]:
+                    rec["record_key"] = rk
+
+        elif eid == "5001":
+            tampering.append((ts, "실시간 보호 사용 안 함", "Defender 실시간 보호가 해제됨", "", rk, eid))
+        elif eid == "5010":
+            tampering.append((ts, "바이러스 검사 사용 안 함", "", "", rk, eid))
+        elif eid == "5012":
+            tampering.append((ts, "스파이웨어 검사 사용 안 함", "", "", rk, eid))
+        elif eid == "1013":
+            history_cleared.append((ts, f"{d.get('Domain', '')}\\{d.get('User', '')}".strip("\\"), rk))
+        elif eid == "1001":
+            stype = d.get("Scan Parameters") or d.get("Scan Type") or "검사"
+            cur = scans.get(stype)
+            if cur is None or ts > cur[0]:
+                scans[stype] = (ts, d.get("Scan Type", ""), f"{d.get('Domain', '')}\\{d.get('User', '')}".strip("\\"), rk)
+        elif eid == "2000":
+            if sig_latest is None or ts > sig_latest[0]:
+                sig_latest = (ts, d.get("Current security intelligence Version", ""), rk)
+        elif eid == "5007":
+            blob = (d.get("New Value", "") + d.get("Old Value", "")).lower()
+            if any(k in blob for k in _TAMPER_KEYS):
+                tampering.append((ts, "보호 구성 변경", f"{d.get('Old Value', '')} → {d.get('New Value', '')}", "", rk, eid))
+
+    out: list[dict] = []
+    for rec in sorted(detections.values(), key=lambda x: x["timestamp"]):
+        if not rec["action"]:
+            rec["action"] = "탐지만 됨"
+        out.append(rec)
+
+    if history_cleared:
+        history_cleared.sort()
+        ts, user, rk = history_cleared[-1]
+        out.append(_def_row(
+            section="tampering", timestamp=ts, event_id="1013", title="검사/위협 기록 삭제",
+            detail=f"Defender 기록이 삭제됨 (총 {len(history_cleared)}회, 최근 시각 표시)",
+            user=user, record_key=rk,
+        ))
+    for ts, title, detail, user, rk, eid in sorted(tampering):
+        out.append(_def_row(section="tampering", timestamp=ts, event_id=eid, title=title, detail=detail, user=user, record_key=rk))
+
+    for stype, (ts, scan_type, user, rk) in sorted(scans.items()):
+        out.append(_def_row(section="scan", timestamp=ts, event_id="1001", title=stype, detail=scan_type, user=user, record_key=rk))
+
+    if sig_latest:
+        out.append(_def_row(section="signature", timestamp=sig_latest[0], event_id="2000", title="보안 인텔리전스 버전", detail=sig_latest[1], record_key=sig_latest[2]))
+
+    return out
