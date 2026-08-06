@@ -98,7 +98,7 @@ def run_host(case_id: str, host_id: str, cases_dir: Path, only: set[str] | None 
     print("=== _OVERVIEW ===")
     overview_dir = case_output_dir / "_OVERVIEW"
     overview_builders = {
-        "TargetInfo": correlate.build_target_info,
+        "TargetInfo": processing.build_target_info,
         "ExecutionHistory": processing.build_execution_history,
         "RemoteDesktopHistory": correlate.build_remote_desktop_history,
         "PowerShellHistory": correlate.build_powershell_history,

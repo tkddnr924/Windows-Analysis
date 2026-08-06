@@ -105,11 +105,16 @@ def _key_rows(key, path: str, source_file: str) -> list[dict]:
         last_write = format_timestamp(convert_wintime(key.header.last_modified, as_json=True), source_tz=UTC)
     except Exception:
         last_write = "-"
-    # as_json=False, NOT True: regipy's as_json path caps a binary value at 128
-    # bytes, which silently truncated large REG_BINARY values (AppCompatCache/
-    # ShimCache, SAM group membership, ...). as_json=False returns the full raw
-    # bytes; _clean() hex-encodes them.
-    values, truncated = _collect(key.iter_values(as_json=False))
+    # as_json=False AND trim_values=False, both deliberate:
+    #   * as_json=True renders binary as a (capped) hex string;
+    #   * trim_values=True (regipy's DEFAULT) hex-encodes an ordinary REG_BINARY
+    #     and then truncates that hex to MAX_LEN (256) chars = 128 bytes.
+    # Either one silently cut REG_BINARY off at 128 bytes — which is exactly the
+    # size of a truncated SAM V/F record, so account parsing looked "genuinely"
+    # capped when it was really regipy trimming. With both False regipy returns
+    # the full raw bytes (e.g. a real SAM V is ~684 B, not 128) and _clean()
+    # hex-encodes them, keeping the dump 1:1 with the hive.
+    values, truncated = _collect(key.iter_values(as_json=False, trim_values=False))
     rows = []
     for v in values:
         try:

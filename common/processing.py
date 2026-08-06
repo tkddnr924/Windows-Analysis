@@ -18,6 +18,8 @@ raw-hive read (a follow-up).
 from __future__ import annotations
 
 import codecs
+import datetime as _dt
+import json
 import struct
 
 from common.utils import UTC, format_timestamp
@@ -239,4 +241,284 @@ def build_execution_history(all_results: dict) -> list[dict]:
     rows += _from_bam(all_results)
     rows += _from_appcompatcache(all_results)
     rows += _from_prefetch(all_results)
+    return rows
+
+
+# --- TargetInfo ("분석 대상") --------------------------------------------------
+# System identity + local accounts + network config, all extracted from the raw
+# registry dumps (SOFTWARE/SYSTEM/SAM). The TargetInfoView reads a small fixed
+# column set per `category`; every row carries the full set so the schema stays
+# uniform. Accounts come from the SAM V/F binary structures (see _parse_sam_*).
+
+_TI_KEYS = (
+    "timestamp", "category", "name", "value", "source_artifact",
+    "username", "full_name", "rid", "home_directory", "created", "last_login",
+    "password_last_set", "last_failed_login", "login_count", "failed_login_count",
+    "disabled", "special_account", "groups", "account_flags",
+    "subnet_mask", "gateway", "dns_server", "dhcp_server", "dhcp_enabled",
+    "domain", "lease_obtained", "lease_terminates",
+)
+
+
+def _ti_row(**kw) -> dict:
+    r = {k: "" for k in _TI_KEYS}
+    r.update(kw)
+    return r
+
+
+def _hives_by_name(all_results: dict) -> dict:
+    hives: dict[str, list] = {}
+    for fname, rows in _registry_hives(all_results):
+        hives.setdefault(fname.upper(), []).extend(rows)
+    return hives
+
+
+def _unixdate(value: str) -> str:
+    try:
+        ts = int(value)
+    except (ValueError, TypeError):
+        return ""
+    if ts <= 0:
+        return ""
+    try:
+        return format_timestamp(_dt.datetime.fromtimestamp(ts, _dt.timezone.utc).isoformat(), source_tz=UTC)
+    except (OverflowError, OSError, ValueError):
+        return ""
+
+
+def _filetime_hex(hexstr: str) -> str:
+    b = _unhex(hexstr)
+    return _filetime(struct.unpack_from("<Q", b, 0)[0]) if len(b) >= 8 else ""
+
+
+def _systemtime_hex(hexstr: str) -> str:
+    b = _unhex(hexstr)
+    if len(b) < 16:
+        return ""
+    y, mo, _dow, d, h, mi, s, _ms = struct.unpack_from("<8H", b, 0)
+    return f"{y:04d}-{mo:02d}-{d:02d} {h:02d}:{mi:02d}:{s:02d}" if y else ""
+
+
+def _pick(rows: list, key_suffix: str, value_name: str) -> str:
+    """First non-empty value for a key ending in `key_suffix`, preferring the
+    live control set (ControlSet001) over its ...002 backup copy."""
+    ks = key_suffix.lower()
+    hits = [
+        r for r in rows
+        if r.get("key_path", "").lower().endswith(ks)
+        and r.get("value_name") == value_name and r.get("value_data", "") != ""
+    ]
+    for r in hits:
+        if "controlset001" in r["key_path"].lower():
+            return r["value_data"]
+    return hits[0]["value_data"] if hits else ""
+
+
+_OS_VALUES = ("ProductName", "EditionID", "DisplayVersion", "CurrentBuild", "RegisteredOwner", "InstallDate")
+
+
+def _system_info(software: list, system: list) -> list[dict]:
+    rows = []
+    cv = "\\microsoft\\windows nt\\currentversion"
+    seen = set()
+    for r in software:
+        if r.get("key_path", "").lower().endswith(cv) and r.get("value_name") in _OS_VALUES:
+            name = r["value_name"]
+            if name in seen:
+                continue
+            seen.add(name)
+            val = _unixdate(r.get("value_data", "")) if name == "InstallDate" else r.get("value_data", "")
+            rows.append(_ti_row(category="SystemInfo", name=name, value=val, source_artifact="SOFTWARE"))
+    cn = _pick(system, "\\control\\computername\\computername", "ComputerName")
+    if cn:
+        rows.append(_ti_row(category="SystemInfo", name="ComputerName", value=cn, source_artifact="SYSTEM"))
+    tz = _pick(system, "\\control\\timezoneinformation", "TimeZoneKeyName")
+    if tz:
+        rows.append(_ti_row(category="SystemInfo", name="TimeZone", value=tz, source_artifact="SYSTEM"))
+    sd = _pick(system, "\\control\\windows", "ShutdownTime")
+    if sd:
+        rows.append(_ti_row(category="SystemInfo", name="LastShutdownTime", value=_filetime_hex(sd), source_artifact="SYSTEM"))
+    return rows
+
+
+# SAM account-control bits (ACB) — the human-readable flag names.
+_ACB = [
+    (0x0001, "Disabled"), (0x0002, "HomeDirRequired"), (0x0004, "PwNotRequired"),
+    (0x0008, "TempDuplicate"), (0x0010, "Normal"), (0x0020, "MNSLogon"),
+    (0x0040, "DomainTrust"), (0x0080, "WorkstationTrust"), (0x0100, "ServerTrust"),
+    (0x0200, "PwNoExpire"), (0x0400, "AutoLocked"),
+]
+
+
+def _parse_sam_f(b: bytes) -> dict:
+    """The SAM F value (fixed-length) — account timestamps, RID, ACB flags and
+    the logon/failed-logon counters, at their well-known offsets."""
+    if len(b) < 0x44:
+        return {}
+    acb = struct.unpack_from("<H", b, 0x38)[0]
+    return {
+        "last_login": _filetime(struct.unpack_from("<Q", b, 0x08)[0]),
+        "password_last_set": _filetime(struct.unpack_from("<Q", b, 0x18)[0]),
+        "last_failed_login": _filetime(struct.unpack_from("<Q", b, 0x28)[0]),
+        "login_count": str(struct.unpack_from("<H", b, 0x42)[0]),
+        "failed_login_count": str(struct.unpack_from("<H", b, 0x40)[0]),
+        "disabled": "예" if acb & 0x0001 else "아니오",
+        "account_flags": ", ".join(n for bit, n in _ACB if acb & bit),
+    }
+
+
+def _parse_sam_v(b: bytes) -> dict:
+    """The SAM V value — a table of (offset, length) pairs (relative to 0xCC)
+    followed by the strings. Entry 1 is the username, entry 2 the full name."""
+    if len(b) < 0xCC:
+        return {}
+
+    def field(idx: int) -> str:
+        base = idx * 12
+        try:
+            off = struct.unpack_from("<I", b, base)[0]
+            length = struct.unpack_from("<I", b, base + 4)[0]
+        except struct.error:
+            return ""
+        raw = b[0xCC + off: 0xCC + off + length]
+        return raw.decode("utf-16-le", "replace")
+
+    return {"username": field(1), "full_name": field(2)}
+
+
+_HEX = set("0123456789abcdefABCDEF")
+
+
+def _accounts(sam: list, software: list) -> list[dict]:
+    # Machine SID prefix + per-SID profile path, from SOFTWARE ProfileList.
+    prefix = ""
+    profiles: dict[str, str] = {}
+    for r in software:
+        kp = r.get("key_path", "")
+        if "\\profilelist\\s-" in kp.lower() and r.get("value_name") == "ProfileImagePath":
+            sid = kp.rsplit("\\", 1)[-1]
+            profiles[sid] = r.get("value_data", "")
+            if sid.startswith("S-1-5-21-") and not prefix:
+                prefix = sid.rsplit("-", 1)[0]
+
+    # SAM: per-RID V/F blobs, plus each account's creation time (the last-write
+    # of its Users\Names\<username> key).
+    users: dict[str, dict] = {}
+    names_created: dict[str, str] = {}
+    for r in sam:
+        kp = r.get("key_path", "")
+        low = kp.lower()
+        nmark = "\\sam\\domains\\account\\users\\names\\"
+        if nmark in low:
+            tail = kp[low.index(nmark) + len(nmark):]
+            if tail and "\\" not in tail:
+                names_created[tail.lower()] = r.get("last_write", "")
+            continue
+        i = low.rfind("\\users\\")
+        if i == -1:
+            continue
+        tail = kp[i + len("\\users\\"):]
+        if len(tail) == 8 and all(c in _HEX for c in tail):
+            u = users.setdefault(tail, {})
+            if r.get("value_name") == "F":
+                u["F"] = _unhex(r.get("value_data", ""))
+            elif r.get("value_name") == "V":
+                u["V"] = _unhex(r.get("value_data", ""))
+
+    rows = []
+    for rid_hex, fv in users.items():
+        rid = int(rid_hex, 16)
+        f = _parse_sam_f(fv.get("F", b""))
+        v = _parse_sam_v(fv.get("V", b""))
+        username = v.get("username", "")
+        sid = f"{prefix}-{rid}" if prefix else ""
+        path = profiles.get(sid, "")
+        created = names_created.get(username.lower(), "")
+        rows.append(_ti_row(
+            category="Account", name=sid, value=path, source_artifact="SAM",
+            username=username, full_name=v.get("full_name", ""), rid=str(rid),
+            home_directory=path, created=created,
+            last_login=f.get("last_login", ""), password_last_set=f.get("password_last_set", ""),
+            last_failed_login=f.get("last_failed_login", ""), login_count=f.get("login_count", ""),
+            failed_login_count=f.get("failed_login_count", ""), disabled=f.get("disabled", ""),
+            account_flags=f.get("account_flags", ""),
+            timestamp=f.get("last_login", "") or created,
+        ))
+    return rows
+
+
+def _networks(software: list) -> list[dict]:
+    prof: dict[str, dict] = {}
+    for r in software:
+        kp = r.get("key_path", "")
+        if "\\networklist\\profiles\\{" in kp.lower():
+            d = prof.setdefault(kp, {})
+            if r.get("value_name") == "ProfileName":
+                d["name"] = r.get("value_data", "")
+            elif r.get("value_name") == "DateLastConnected":
+                d["when"] = _systemtime_hex(r.get("value_data", ""))
+    return [
+        _ti_row(category="Network", name="연결한 네트워크", value=d["name"], timestamp=d.get("when", ""), source_artifact="NetworkList")
+        for d in prof.values() if d.get("name")
+    ]
+
+
+def _iplist(value: str) -> str:
+    """A REG_MULTI_SZ IP list is stored as a JSON array string ('["1.2.3.4"]')
+    by the parser; flatten it to a comma list and drop empty/0.0.0.0."""
+    if not value:
+        return ""
+    s = value.strip()
+    if s.startswith("["):
+        try:
+            return ", ".join(x for x in json.loads(s) if x and x != "0.0.0.0")
+        except (ValueError, TypeError):
+            return s
+    return "" if s == "0.0.0.0" else s
+
+
+def _network_interfaces(system: list) -> list[dict]:
+    mark = "\\services\\tcpip\\parameters\\interfaces\\"
+    ifaces: dict[str, dict] = {}
+    for r in system:
+        low = r.get("key_path", "").lower()
+        i = low.find(mark)
+        if i == -1:
+            continue
+        rest = r["key_path"][i + len(mark):]
+        guid = rest.split("\\", 1)[0]
+        if not guid.startswith("{"):
+            continue
+        ifaces.setdefault(guid, {})[r.get("value_name", "")] = r.get("value_data", "")
+
+    rows = []
+    for guid, d in ifaces.items():
+        ip = _iplist(d.get("IPAddress", "")) or d.get("DhcpIPAddress", "")
+        if not ip or ip == "0.0.0.0":
+            continue
+        dhcp = d.get("EnableDHCP", "")
+        rows.append(_ti_row(
+            category="NetworkInterface", name=guid, value=ip, source_artifact="Tcpip",
+            subnet_mask=_iplist(d.get("SubnetMask", "")) or d.get("DhcpSubnetMask", ""),
+            gateway=_iplist(d.get("DefaultGateway", "")) or d.get("DhcpDefaultGateway", ""),
+            dns_server=d.get("NameServer", "") or d.get("DhcpNameServer", ""),
+            dhcp_server=d.get("DhcpServer", ""),
+            dhcp_enabled="예" if dhcp in ("1", 1) else "아니오" if dhcp in ("0", 0) else "",
+            domain=d.get("Domain", "") or d.get("DhcpDomain", ""),
+            lease_obtained=_unixdate(d.get("LeaseObtainedTime", "")),
+            lease_terminates=_unixdate(d.get("LeaseTerminatesTime", "")),
+        ))
+    return rows
+
+
+def build_target_info(all_results: dict) -> list[dict]:
+    hives = _hives_by_name(all_results)
+    software = hives.get("SOFTWARE", [])
+    system = hives.get("SYSTEM", [])
+    sam = hives.get("SAM", [])
+    rows: list[dict] = []
+    rows += _system_info(software, system)
+    rows += _accounts(sam, software)
+    rows += _networks(software)
+    rows += _network_interfaces(system)
     return rows
