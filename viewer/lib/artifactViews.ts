@@ -207,8 +207,16 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
 
   ExecutionHistory: {
     customView: "executionHistory",
+    // Feed the master timeline from this curated stream, not the raw execution
+    // artifacts: it's the only place SRUM (first sighting), AppCompatCache/
+    // ShimCache, BAM and UserAssist get a normalized timestamp, and it already
+    // merges + dedups Amcache/Prefetch. The raw Amcache/Prefetch specs drop
+    // their own timelineField so those don't double-count here.
+    timelineField: "timestamp",
     title: (r) => r.program_name || basename(r.program_path) || "(no name)",
-    subtitle: (r) => r.program_path || "",
+    // Lead with the source (SRUM / AppCompatCache / Amcache / BAM / UserAssist)
+    // so the merged execution entries stay distinguishable in the timeline.
+    subtitle: (r) => [r.source_artifact, r.program_path].filter(Boolean).join(" · "),
     badges: [{ key: "source_artifact", label: "출처", kind: "badge" }],
     tags: (r) => tagsForPath(r.program_path),
     priorityColumns: ["timestamp", "program_name", "program_path", "run_count", "source_artifact"],
@@ -380,7 +388,8 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
       { key: "ProgramId", label: "이 프로그램이 설치한 파일 보기", targetFile: "Amcache_Files", targetColumn: "program_id" },
       { key: "UserSid", label: "설치한 계정의 프로필 정보 보기", targetFile: "Registry_UserProfiles", targetColumn: "sid" },
     ],
-    timelineField: "timestamp",
+    // No timelineField: Amcache reaches the master timeline via ExecutionHistory
+    // (avoids double-counting the same entries there and here).
     priorityColumns: ["timestamp", "Name", "Version", "Publisher", "InstallDate"],
     sections: [
       { heading: "설치 정보", fields: [
@@ -416,7 +425,7 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     // on top of the general suspicious-path check.
     tags: (r) => tagsForPath(r.lower_case_long_path).concat(tagsForNameMismatch(r.name, r.original_file_name)),
     links: [{ key: "program_id", label: "이 파일을 설치한 프로그램 보기", targetFile: "Amcache_Programs", targetColumn: "ProgramId" }],
-    timelineField: "timestamp",
+    // No timelineField: reaches the master timeline via ExecutionHistory.
     priorityColumns: ["timestamp", "name", "lower_case_long_path", "product_name", "publisher", "size"],
     sections: [
       { heading: "시간", fields: [
@@ -582,7 +591,7 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
       { key: "run_time_2", label: "2회 전" },
       { key: "last_run_time", label: "최근 실행" },
     ],
-    timelineField: "last_run_time",
+    // No timelineField: Prefetch reaches the master timeline via ExecutionHistory.
     priorityColumns: ["last_run_time", "executable_filename", "run_count"],
     sections: [
       { heading: "최근 실행 시각 (최신순)", fields: [
