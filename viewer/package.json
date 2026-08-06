@@ -1,6 +1,6 @@
 {
   "name": "windows-analysis-viewer",
-  "version": "0.6.3",
+  "version": "0.6.4",
   "private": true,
   "description": "Desktop viewer for Windows-Analysis parsed CSV output (Electron + Next.js)",
   "main": "dist-electron/main.js",

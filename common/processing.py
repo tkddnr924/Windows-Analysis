@@ -161,13 +161,35 @@ def _from_bam(all_results: dict) -> list[dict]:
     return rows
 
 
+def _earlier(candidate: str, current: str) -> bool:
+    """True if `candidate` timestamp should replace `current` as the earliest.
+    A real time beats an empty one; timestamps are 'YYYY-MM-DD HH:MM:SS…' so a
+    plain string compare is chronological."""
+    if not candidate:
+        return False
+    if not current:
+        return True
+    return candidate < current
+
+
 def _from_srum(all_results: dict) -> list[dict]:
-    rows = []
+    # SRUM's ApplicationResourceUsage samples every running app about once an
+    # hour, so one program shows up dozens of times. For ExecutionHistory we
+    # only want the FIRST sighting (earliest timestamp) per app+user — that's
+    # the "it ran" evidence; the repeated hourly rows are noise here.
+    earliest: dict[tuple, dict] = {}
     for r in _srum_rows(all_results, "SRUM_ApplicationResourceUsage"):
-        app = r.get("app", "")
+        key = (r.get("app", ""), r.get("user", ""))
+        ts = r.get("timestamp", "")
+        cur = earliest.get(key)
+        if cur is None or _earlier(ts, cur["timestamp"]):
+            earliest[key] = {"app": key[0], "user": key[1], "timestamp": ts}
+    rows = []
+    for e in earliest.values():
+        app = e["app"]
         rows.append(_row(
-            timestamp=r.get("timestamp", ""), program_name=_basename(app) or app,
-            program_path=app, user=r.get("user", ""), source_artifact="SRUM",
+            timestamp=e["timestamp"], program_name=_basename(app) or app,
+            program_path=app, user=e["user"], source_artifact="SRUM",
         ))
     return rows
 
