@@ -4,16 +4,25 @@ export interface CsvData {
   rowCount: number;
 }
 
-export interface CaseSummary {
+export interface Host {
   id: string;
   name: string;
   targetDir: string;
-  /** cases/<id>/ — root folder holding one .sqlite file per artifact output. */
+  /** cases/<caseId>/<hostId>/ — holds one .sqlite per artifact output + bookmarks.json. */
   dir: string;
   createdAt: string;
   lastRunAt: string | null;
   lastRunStatus: string | null;
   artifactsRun: string[];
+}
+
+export interface Case {
+  id: string;
+  name: string;
+  createdAt: string;
+  /** cases/<caseId>/ */
+  dir: string;
+  hosts: Host[];
 }
 
 export interface CategoryEntry {
@@ -65,12 +74,13 @@ export interface PipelineLogEntry {
 /** error is set when the pipeline itself failed to run — kept separate from
  * "cases is legitimately empty" so the GUI never conflates the two. */
 export interface ListCasesResult {
-  cases: CaseSummary[];
+  cases: Case[];
   error: string | null;
 }
 
-export interface RunCaseOptions {
+export interface RunHostOptions {
   caseId: string;
+  hostId: string;
   /** Artifact names to run — omit to run all. */
   only?: string[];
 }

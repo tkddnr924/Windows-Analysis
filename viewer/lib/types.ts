@@ -6,16 +6,30 @@ export interface CsvData {
   rowCount: number;
 }
 
-export interface CaseSummary {
+/** One collected machine within a case: a target folder + its parsed output.
+ * This is the browsable unit — artifacts, timeline, and bookmarks all live at
+ * the host level. */
+export interface Host {
   id: string;
   name: string;
   targetDir: string;
-  /** cases/<id>/ — root folder holding one .sqlite file per artifact output. */
+  /** cases/<caseId>/<hostId>/ — holds one .sqlite per artifact output + bookmarks.json. */
   dir: string;
   createdAt: string;
   lastRunAt: string | null;
   lastRunStatus: string | null;
   artifactsRun: string[];
+}
+
+/** An incident. Groups the hosts (machines) involved so an analyst can pivot
+ * between them within one investigation. */
+export interface Case {
+  id: string;
+  name: string;
+  createdAt: string;
+  /** cases/<caseId>/ */
+  dir: string;
+  hosts: Host[];
 }
 
 export interface CategoryEntry {
@@ -93,12 +107,13 @@ export interface PipelineLogEntry {
 /** error is set when the pipeline itself failed to run — kept separate from
  * "cases is legitimately empty" so the GUI never conflates the two. */
 export interface ListCasesResult {
-  cases: CaseSummary[];
+  cases: Case[];
   error: string | null;
 }
 
-export interface RunCaseOptions {
+export interface RunHostOptions {
   caseId: string;
+  hostId: string;
   /** Artifact names to run — omit to run all. */
   only?: string[];
 }
@@ -110,18 +125,22 @@ export interface PipelineResult {
 export interface ElectronApi {
   pickFolder(): Promise<string | null>;
   listCases(): Promise<ListCasesResult>;
-  createCase(name: string, targetDir: string): Promise<CaseSummary>;
+  createCase(name: string): Promise<Case>;
+  createHost(caseId: string, name: string, targetDir: string): Promise<Host>;
+  deleteCase(caseId: string): Promise<boolean>;
+  deleteHost(caseId: string, hostId: string): Promise<boolean>;
   listArtifacts(): Promise<string[]>;
-  runCase(options: RunCaseOptions): Promise<PipelineResult>;
+  runHost(options: RunHostOptions): Promise<PipelineResult>;
   cancelPipeline(): Promise<boolean>;
   onPipelineLog(callback: (entry: PipelineLogEntry) => void): () => void;
-  listCategories(caseDir: string): Promise<CategoryEntry[]>;
+  /** hostDir = a host's cases/<caseId>/<hostId>/ folder. */
+  listCategories(hostDir: string): Promise<CategoryEntry[]>;
   listResultFiles(categoryDir: string): Promise<ResultFileEntry[]>;
   readResultFile(fullPath: string, tableName?: string): Promise<CsvData>;
   listColumnValues(fullPath: string, column: string, tableName?: string): Promise<{ value: string; count: number }[]>;
-  listBookmarks(caseDir: string): Promise<Bookmark[]>;
-  toggleBookmark(caseDir: string, entry: BookmarkInput): Promise<Bookmark[]>;
-  updateBookmarkNote(caseDir: string, id: string, note: string): Promise<Bookmark[]>;
+  listBookmarks(hostDir: string): Promise<Bookmark[]>;
+  toggleBookmark(hostDir: string, entry: BookmarkInput): Promise<Bookmark[]>;
+  updateBookmarkNote(hostDir: string, id: string, note: string): Promise<Bookmark[]>;
 }
 
 declare global {

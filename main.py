@@ -34,10 +34,10 @@ from common.finder import dedupe_by_content
 from common.registry import ARTIFACTS
 from common.sqlite_writer import write_rows_to_sqlite
 
-def run_case(case_id: str, cases_dir: Path, only: set[str] | None = None) -> None:
-    case = case_store.load_case(case_id, cases_dir)
-    case_output_dir = case_store.case_dir(cases_dir, case)
-    target_dir = Path(case.target_dir)
+def run_host(case_id: str, host_id: str, cases_dir: Path, only: set[str] | None = None) -> None:
+    host = case_store.load_host(case_id, host_id, cases_dir)
+    case_output_dir = case_store.host_dir(cases_dir, case_id, host_id)
+    target_dir = Path(host.target_dir)
 
     # On a full re-parse, wipe previous output first so renamed or removed
     # artifacts (e.g. an overview table that changed name, or an artifact no
@@ -109,8 +109,9 @@ def run_case(case_id: str, cases_dir: Path, only: set[str] | None = None) -> Non
         write_rows_to_sqlite(rows, sqlite_path, output_name, [])
         print(f"[+] {len(rows)} rows -> {sqlite_path}")
 
-    case_store.update_case_status(
+    case_store.update_host_status(
         case_id,
+        host_id,
         cases_dir,
         run_at=dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         status="error" if had_error else "ok",
@@ -120,11 +121,14 @@ def run_case(case_id: str, cases_dir: Path, only: set[str] | None = None) -> Non
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--create-case", metavar="NAME", help="Register a new case (does not parse)")
-    parser.add_argument("--target", help="Target folder for --create-case")
-    parser.add_argument("--run-case", metavar="CASE_ID", help="Parse a previously registered case")
+    parser.add_argument("--create-case", metavar="NAME", help="Register a new (empty) case; holds hosts")
+    parser.add_argument("--create-host", metavar="CASE_ID", help="Register a new host under a case (needs --name, --target)")
+    parser.add_argument("--name", help="Host name for --create-host")
+    parser.add_argument("--target", help="Target folder for --create-host")
+    parser.add_argument("--run-host", metavar="CASE_ID", help="Parse a host (needs --host); use with --only to re-run part")
+    parser.add_argument("--host", help="Host id for --run-host")
     parser.add_argument("--only", default=None, help="Comma-separated artifact names to run (default: all)")
-    parser.add_argument("--list-cases", action="store_true", help="Print registered cases as JSON and exit")
+    parser.add_argument("--list-cases", action="store_true", help="Print registered cases (with their hosts) as JSON and exit")
     parser.add_argument(
         "--list-artifacts",
         action="store_true",
@@ -149,19 +153,29 @@ def main():
         return
 
     if args.create_case:
-        if not args.target:
-            parser.error("--create-case requires --target")
         created_at = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        case = case_store.create_case(args.create_case, str(Path(args.target).resolve()), created_at, cases_dir)
+        case = case_store.create_case(args.create_case, created_at, cases_dir)
         print(json.dumps(asdict(case), ensure_ascii=False))
         return
 
-    if args.run_case:
-        only = set(args.only.split(",")) if args.only else None
-        run_case(args.run_case, cases_dir, only=only)
+    if args.create_host:
+        if not args.name or not args.target:
+            parser.error("--create-host requires --name and --target")
+        created_at = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        host = case_store.create_host(
+            args.create_host, args.name, str(Path(args.target).resolve()), created_at, cases_dir
+        )
+        print(json.dumps(asdict(host), ensure_ascii=False))
         return
 
-    parser.error("one of --create-case, --run-case, --list-cases, --list-artifacts is required")
+    if args.run_host:
+        if not args.host:
+            parser.error("--run-host requires --host")
+        only = set(args.only.split(",")) if args.only else None
+        run_host(args.run_host, args.host, cases_dir, only=only)
+        return
+
+    parser.error("one of --create-case, --create-host, --run-host, --list-cases, --list-artifacts is required")
 
 
 if __name__ == "__main__":

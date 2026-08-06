@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import type { CaseSummary, CategoryEntry, ResultFileEntry } from "@/lib/types";
+import type { Case, Host, CategoryEntry, ResultFileEntry } from "@/lib/types";
 import { EMPTY_TIME_RANGE, rangeActive, type TimeRange } from "@/lib/timeRange";
 import DateTimeInput from "./DateTimeInput";
 
@@ -319,10 +319,11 @@ function PinnedNavRow({ icon, label, count, selected, onClick }: PinnedNavRowPro
 }
 
 interface SidebarProps {
-  cases: CaseSummary[];
-  casesError: string | null;
-  selectedCase: CaseSummary | null;
-  onSelectCase: (c: CaseSummary) => void;
+  activeCase: Case;
+  activeHost: Host;
+  onSelectHost: (h: Host) => void;
+  onBackToCases: () => void;
+  onBackToHosts: () => void;
   categories: CategoryEntry[];
   selectedFile: ResultFileEntry | null;
   onSelectFile: (file: ResultFileEntry) => void;
@@ -336,10 +337,11 @@ interface SidebarProps {
 }
 
 export default function Sidebar({
-  cases,
-  casesError,
-  selectedCase,
-  onSelectCase,
+  activeCase,
+  activeHost,
+  onSelectHost,
+  onBackToCases,
+  onBackToHosts,
   categories,
   selectedFile,
   onSelectFile,
@@ -362,7 +364,7 @@ export default function Sidebar({
   const presentByName = new Map(rawCategories.map((c) => [c.name, c]));
   const orderedNames: string[] = [];
   const seenNames = new Set<string>();
-  for (const artifact of selectedCase?.artifactsRun ?? []) {
+  for (const artifact of activeHost.artifactsRun ?? []) {
     const cat = categoryForArtifact(artifact);
     if (cat === "_OVERVIEW" || seenNames.has(cat)) continue;
     seenNames.add(cat);
@@ -384,15 +386,26 @@ export default function Sidebar({
       }}
     >
       <div style={{ padding: 12, borderBottom: "1px solid var(--border)" }}>
+        {/* breadcrumb: case name (click → back to host list / case list) */}
+        <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 8, fontSize: 11.5 }}>
+          <button onClick={onBackToCases} title="케이스 목록" style={{ background: "transparent", border: "none", color: "var(--accent)", cursor: "pointer", fontWeight: 600, padding: 0 }}>
+            🗂️ {activeCase.name}
+          </button>
+          <span style={{ color: "var(--text-faint)" }}>/</span>
+          <button onClick={onBackToHosts} title="호스트 목록" style={{ background: "transparent", border: "none", color: "var(--accent)", cursor: "pointer", fontWeight: 600, padding: 0 }}>
+            호스트 목록
+          </button>
+        </div>
+        {/* host selector — switch between machines in this case */}
         <div style={{ position: "relative" }}>
           <span style={{ position: "absolute", left: 10, top: "50%", transform: "translateY(-50%)", fontSize: 13, pointerEvents: "none" }}>
-            🗃️
+            🖥️
           </span>
           <select
-            value={selectedCase?.id ?? ""}
+            value={activeHost.id}
             onChange={(e) => {
-              const found = cases.find((c) => c.id === e.target.value);
-              if (found) onSelectCase(found);
+              const found = activeCase.hosts.find((h) => h.id === e.target.value);
+              if (found) onSelectHost(found);
             }}
             style={{
               width: "100%",
@@ -406,31 +419,26 @@ export default function Sidebar({
               fontWeight: 600,
             }}
           >
-            <option value="" disabled>
-              케이스 선택...
-            </option>
-            {cases.map((c) => (
-              <option key={c.id} value={c.id}>
-                {c.name}
+            {activeCase.hosts.map((h) => (
+              <option key={h.id} value={h.id}>
+                {h.name}
               </option>
             ))}
           </select>
         </div>
-        {selectedCase && (
-          <div style={{ marginTop: 8, fontSize: 11, color: "var(--text-faint)", display: "flex", alignItems: "center", gap: 5 }}>
-            <span
-              style={{
-                width: 6,
-                height: 6,
-                borderRadius: "50%",
-                flexShrink: 0,
-                background: selectedCase.lastRunStatus === "ok" ? "var(--success)" : selectedCase.lastRunStatus === "error" ? "var(--danger)" : "var(--text-faint)",
-              }}
-            />
-            {selectedCase.lastRunAt ? `마지막 실행: ${selectedCase.lastRunAt}` : "아직 파싱되지 않음"}
-          </div>
-        )}
-        {selectedCase && (
+        <div style={{ marginTop: 8, fontSize: 11, color: "var(--text-faint)", display: "flex", alignItems: "center", gap: 5 }}>
+          <span
+            style={{
+              width: 6,
+              height: 6,
+              borderRadius: "50%",
+              flexShrink: 0,
+              background: activeHost.lastRunStatus === "ok" ? "var(--success)" : activeHost.lastRunStatus === "error" ? "var(--danger)" : "var(--text-faint)",
+            }}
+          />
+          {activeHost.lastRunAt ? `마지막 실행: ${activeHost.lastRunAt}` : "아직 파싱되지 않음"}
+        </div>
+        {(
           <div style={{ marginTop: 10 }}>
             <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 5 }}>
               <span style={{ fontSize: 10.5, fontWeight: 700, color: "var(--text-faint)", textTransform: "uppercase", letterSpacing: 0.6 }}>
@@ -469,31 +477,14 @@ export default function Sidebar({
         )}
       </div>
       <div style={{ overflowY: "auto", flex: 1 }}>
-        {casesError && (
-          <div style={{ padding: 16, color: "var(--danger)", fontSize: 12.5, lineHeight: 1.6, whiteSpace: "pre-wrap", wordBreak: "break-all" }}>
-            케이스 목록을 불러오지 못했습니다.
-            <br />
-            {casesError}
-          </div>
-        )}
-        {!casesError && cases.length === 0 && (
-          <div style={{ padding: 16, color: "var(--text-faint)", fontSize: 12.5, lineHeight: 1.6 }}>
-            등록된 케이스가 없습니다.
-            <br />
-            &quot;파싱 실행&quot; 탭에서 만드세요.
-          </div>
-        )}
-        {cases.length > 0 && !selectedCase && (
-          <div style={{ padding: 16, color: "var(--text-faint)", fontSize: 12.5 }}>케이스를 선택하세요.</div>
-        )}
-        {selectedCase && categories.length === 0 && (
+        {categories.length === 0 && (
           <div style={{ padding: 16, color: "var(--text-faint)", fontSize: 12.5, lineHeight: 1.6 }}>
             결과가 없습니다.
             <br />
             아직 파싱하지 않았을 수 있습니다.
           </div>
         )}
-        {selectedCase && (
+        {(
           <div style={{ borderBottom: "1px solid var(--border-subtle)" }}>
             <PinnedNavRow
               icon="🕐"

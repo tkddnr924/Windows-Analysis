@@ -2,23 +2,27 @@ import { contextBridge, ipcRenderer } from "electron";
 import type {
   Bookmark,
   BookmarkInput,
-  CaseSummary,
+  Case,
+  Host,
   CategoryEntry,
   CsvData,
   ListCasesResult,
   PipelineLogEntry,
   PipelineResult,
   ResultFileEntry,
-  RunCaseOptions,
+  RunHostOptions,
 } from "./types";
 
 contextBridge.exposeInMainWorld("api", {
   pickFolder: (): Promise<string | null> => ipcRenderer.invoke("pick-folder"),
   listCases: (): Promise<ListCasesResult> => ipcRenderer.invoke("list-cases"),
-  createCase: (name: string, targetDir: string): Promise<CaseSummary> =>
-    ipcRenderer.invoke("create-case", name, targetDir),
+  createCase: (name: string): Promise<Case> => ipcRenderer.invoke("create-case", name),
+  createHost: (caseId: string, name: string, targetDir: string): Promise<Host> =>
+    ipcRenderer.invoke("create-host", caseId, name, targetDir),
+  deleteCase: (caseId: string): Promise<boolean> => ipcRenderer.invoke("delete-case", caseId),
+  deleteHost: (caseId: string, hostId: string): Promise<boolean> => ipcRenderer.invoke("delete-host", caseId, hostId),
   listArtifacts: (): Promise<string[]> => ipcRenderer.invoke("list-artifacts"),
-  runCase: (options: RunCaseOptions): Promise<PipelineResult> => ipcRenderer.invoke("run-case", options),
+  runHost: (options: RunHostOptions): Promise<PipelineResult> => ipcRenderer.invoke("run-host", options),
   cancelPipeline: (): Promise<boolean> => ipcRenderer.invoke("cancel-pipeline"),
   onPipelineLog: (callback: (entry: PipelineLogEntry) => void): (() => void) => {
     const listener = (_event: unknown, entry: PipelineLogEntry) => callback(entry);

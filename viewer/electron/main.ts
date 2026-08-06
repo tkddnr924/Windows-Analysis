@@ -6,14 +6,15 @@ import * as path from "path";
 import type {
   Bookmark,
   BookmarkInput,
-  CaseSummary,
+  Case,
+  Host,
   CategoryEntry,
   CsvData,
   ListCasesResult,
   PipelineLogEntry,
   PipelineResult,
   ResultFileEntry,
-  RunCaseOptions,
+  RunHostOptions,
 } from "./types";
 
 const isDev = process.env.NODE_ENV === "development";
@@ -117,21 +118,42 @@ function runPython(args: string[]): Promise<{ stdout: string; exitCode: number |
 }
 
 // main.py's Case dataclass is snake_case; the renderer side uses camelCase.
-// `dir` isn't a real dataclass field on the Python side (it's a computed
-// @property, so it doesn't survive asdict()) — reconstructed here from the
-// same cases/<id>/ layout common/case_store.py uses.
-function caseFromPython(raw: Record<string, unknown>): CaseSummary {
+// `dir` isn't a real dataclass field on the Python side — reconstructed here
+// from the cases/<caseId>/<hostId>/ layout common/case_store.py uses.
+function hostFromPython(caseId: string, raw: Record<string, unknown>): Host {
   const id = raw.id as string;
   return {
     id,
     name: raw.name as string,
     targetDir: raw.target_dir as string,
-    dir: path.join(casesDir(), id),
+    dir: path.join(casesDir(), caseId, id),
     createdAt: raw.created_at as string,
     lastRunAt: (raw.last_run_at as string | null) ?? null,
     lastRunStatus: (raw.last_run_status as string | null) ?? null,
     artifactsRun: (raw.artifacts_run as string[] | undefined) ?? [],
   };
+}
+
+function caseFromPython(raw: Record<string, unknown>): Case {
+  const id = raw.id as string;
+  const rawHosts = (raw.hosts as Record<string, unknown>[] | undefined) ?? [];
+  return {
+    id,
+    name: raw.name as string,
+    createdAt: raw.created_at as string,
+    dir: path.join(casesDir(), id),
+    hosts: rawHosts.map((h) => hostFromPython(id, h)),
+  };
+}
+
+// Guards a case/host id so it resolves to an immediate child of `base` —
+// rejects "..", absolute paths, and nested separators that escape the folder.
+function safeChild(base: string, id: string): string {
+  const target = path.resolve(base, id);
+  if (path.dirname(target) !== path.resolve(base) || target === path.resolve(base)) {
+    throw new Error(`잘못된 경로: ${id}`);
+  }
+  return target;
 }
 
 ipcMain.handle("list-cases", async (): Promise<ListCasesResult> => {
@@ -148,9 +170,34 @@ ipcMain.handle("list-cases", async (): Promise<ListCasesResult> => {
   }
 });
 
-ipcMain.handle("create-case", async (_event, name: string, targetDir: string): Promise<CaseSummary> => {
-  const { stdout } = await runPython(["--create-case", name, "--target", targetDir]);
+ipcMain.handle("create-case", async (_event, name: string): Promise<Case> => {
+  const { stdout } = await runPython(["--create-case", name]);
   return caseFromPython(JSON.parse(stdout.trim()));
+});
+
+ipcMain.handle("create-host", async (_event, caseId: string, name: string, targetDir: string): Promise<Host> => {
+  const { stdout } = await runPython(["--create-host", caseId, "--name", name, "--target", targetDir]);
+  return hostFromPython(caseId, JSON.parse(stdout.trim()));
+});
+
+// Permanently removes a case folder (cases/<caseId>/ — every host's parsed
+// .sqlite, bookmarks, metadata). The ORIGINAL collected data is untouched;
+// this deletes analysis output only.
+ipcMain.handle("delete-case", (_event, caseId: string): boolean => {
+  const target = safeChild(casesDir(), caseId);
+  if (!fs.existsSync(target)) return false;
+  fs.rmSync(target, { recursive: true, force: true });
+  return true;
+});
+
+// Removes a single host folder (cases/<caseId>/<hostId>/), leaving the case and
+// its other hosts intact.
+ipcMain.handle("delete-host", (_event, caseId: string, hostId: string): boolean => {
+  const caseFolder = safeChild(casesDir(), caseId);
+  const target = safeChild(caseFolder, hostId);
+  if (!fs.existsSync(target)) return false;
+  fs.rmSync(target, { recursive: true, force: true });
+  return true;
 });
 
 ipcMain.handle("list-artifacts", (): Promise<string[]> => {
@@ -180,8 +227,8 @@ ipcMain.handle("list-artifacts", (): Promise<string[]> => {
 let currentPipelineProcess: ChildProcessWithoutNullStreams | null = null;
 
 ipcMain.handle(
-  "run-case",
-  (event: IpcMainInvokeEvent, options: RunCaseOptions): Promise<PipelineResult> => {
+  "run-host",
+  (event: IpcMainInvokeEvent, options: RunHostOptions): Promise<PipelineResult> => {
     return new Promise((resolve) => {
       if (currentPipelineProcess) {
         resolve({ exitCode: -1 });
@@ -198,7 +245,7 @@ ipcMain.handle(
       }
       fs.mkdirSync(casesDir(), { recursive: true });
 
-      const args = [...baseArgs, "--run-case", options.caseId, "--cases-dir", casesDir()];
+      const args = [...baseArgs, "--run-host", options.caseId, "--host", options.hostId, "--cases-dir", casesDir()];
       if (options.only && options.only.length > 0) args.push("--only", options.only.join(","));
 
       const proc = spawn(file, args);
