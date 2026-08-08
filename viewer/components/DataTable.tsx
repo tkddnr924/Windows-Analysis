@@ -77,10 +77,18 @@ export default function DataTable({
   const [search, setSearch] = useState("");
   const [activeTab, setActiveTab] = useState<string | undefined>(undefined);
   const [selectedCell, setSelectedCell] = useState<{ row: Record<string, string>; column: string } | null>(null);
+  const [dense, setDense] = useState(false);
+  const [onlySuspicious, setOnlySuspicious] = useState(false);
 
   const fileBaseName = fileName.split(/[\\/]/).pop()?.replace(/\.csv$/i, "") ?? fileName;
   const artifactSpec = resolveArtifactView(fileBaseName, data.columns);
   const filterTabs = artifactSpec?.filterTabs;
+  const rowHeight = dense ? 20 : ROW_HEIGHT;
+  // A row is "의심" when the artifact's own tag rules trip on it (suspicious
+  // path, mismatched name, error-level event, …) — the same signal that drives
+  // the ⛔/⚠ marker column.
+  const tagsFn = artifactSpec?.tags;
+  const rowTagCount = (row: Record<string, string>): number => (tagsFn ? tagsFn(row).length : 0);
 
   useEffect(() => {
     if (!initialFilter) return;
@@ -184,10 +192,13 @@ export default function DataTable({
     if (filterTabs && activeTab !== undefined) {
       rows = rows.filter((row) => (row[filterTabs.column] ?? "") === activeTab);
     }
+    if (onlySuspicious && tagsFn) {
+      rows = rows.filter((row) => tagsFn(row).length > 0);
+    }
     if (!search.trim()) return rows;
     const needle = search.toLowerCase();
     return rows.filter((row) => data.columns.some((col) => (row[col] ?? "").toLowerCase().includes(needle)));
-  }, [data.rows, data.columns, search, filterTabs, activeTab, timeColumn, timeRange]);
+  }, [data.rows, data.columns, search, filterTabs, activeTab, timeColumn, timeRange, onlySuspicious, tagsFn]);
 
   const table = useReactTable({
     data: searchedRows,
@@ -208,9 +219,15 @@ export default function DataTable({
   const virtualizer = useVirtualizer({
     count: rows.length,
     getScrollElement: () => scrollRef.current,
-    estimateSize: () => ROW_HEIGHT,
+    estimateSize: () => rowHeight,
     overscan: 20,
   });
+
+  // Re-measure when row density changes so the virtualizer picks up the new height.
+  useEffect(() => {
+    virtualizer.measure();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rowHeight]);
 
   const virtualRows = virtualizer.getVirtualItems();
   const totalHeight = virtualizer.getTotalSize();
@@ -254,7 +271,37 @@ export default function DataTable({
             필터 {activeFilterCount}개 초기화 ×
           </button>
         )}
-        <div style={{ position: "relative", marginLeft: "auto", width: 260 }}>
+        <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 6 }}>
+          {tagsFn && (
+            <button
+              onClick={() => setOnlySuspicious((v) => !v)}
+              title="의심 태그가 붙은 행만 표시"
+              style={{
+                flexShrink: 0, fontSize: 11, padding: "5px 10px", cursor: "pointer", fontWeight: 600,
+                background: onlySuspicious ? "var(--danger-subtle)" : "transparent",
+                color: onlySuspicious ? "var(--danger)" : "var(--text-dim)",
+                border: `1px solid ${onlySuspicious ? "var(--danger)" : "var(--border)"}`,
+                borderRadius: "var(--radius-lg)",
+              }}
+            >
+              ⚠ 의심만
+            </button>
+          )}
+          <button
+            onClick={() => setDense((v) => !v)}
+            title="행 높이 전환 (촘촘/보통)"
+            style={{
+              flexShrink: 0, fontSize: 11, padding: "5px 10px", cursor: "pointer", fontWeight: 600,
+              background: dense ? "var(--accent-subtle)" : "transparent",
+              color: dense ? "var(--accent)" : "var(--text-dim)",
+              border: `1px solid ${dense ? "var(--accent)" : "var(--border)"}`,
+              borderRadius: "var(--radius-lg)",
+            }}
+          >
+            {dense ? "촘촘" : "보통"}
+          </button>
+        </div>
+        <div style={{ position: "relative", width: 260 }}>
           <span style={{ position: "absolute", left: 9, top: "50%", transform: "translateY(-50%)", fontSize: 12, color: "var(--text-faint)", pointerEvents: "none" }}>
             🔍
           </span>
@@ -408,15 +455,22 @@ export default function DataTable({
             )}
             {virtualRows.map((virtualRow) => {
               const row = rows[virtualRow.index];
+              const tags = tagsFn ? tagsFn(row.original) : [];
+              const danger = tags.some((t) => t.severity === "danger");
+              const baseBg =
+                tags.length > 0
+                  ? danger ? "var(--danger-subtle)" : "var(--warning-subtle)"
+                  : virtualRow.index % 2 === 0 ? "transparent" : "rgba(255,255,255,0.02)";
               return (
                 <tr
                   key={row.id}
                   style={{
-                    height: ROW_HEIGHT,
-                    background: virtualRow.index % 2 === 0 ? "transparent" : "rgba(255,255,255,0.02)",
+                    height: rowHeight,
+                    background: baseBg,
+                    boxShadow: tags.length > 0 ? `inset 3px 0 0 ${danger ? "var(--danger)" : "var(--warning)"}` : undefined,
                   }}
                   onMouseEnter={(e) => (e.currentTarget.style.background = "var(--bg-hover)")}
-                  onMouseLeave={(e) => (e.currentTarget.style.background = virtualRow.index % 2 === 0 ? "transparent" : "rgba(255,255,255,0.02)")}
+                  onMouseLeave={(e) => (e.currentTarget.style.background = baseBg)}
                 >
                   {row.getVisibleCells().map((cell) => {
                     const isDetailColumn = cell.column.id === DETAIL_COLUMN_ID;
