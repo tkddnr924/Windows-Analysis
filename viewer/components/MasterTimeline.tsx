@@ -30,6 +30,7 @@ export default function MasterTimeline({ entries, loading, onNavigate, onFetchLi
   const [hiddenTables, setHiddenTables] = useState<Set<string>>(new Set());
   const [showArtifactMenu, setShowArtifactMenu] = useState(false);
   const [selectedEntry, setSelectedEntry] = useState<TimelineEntry | null>(null);
+  const [onlySuspicious, setOnlySuspicious] = useState(false);
   const allRows = entries ?? [];
 
   const startBound = toBound(rangeStart, "start");
@@ -58,6 +59,7 @@ export default function MasterTimeline({ entries, loading, onNavigate, onFetchLi
   const rows = useMemo(() => {
     const filtered = allRows.filter((e) => {
       if (hiddenTables.has(e.table)) return false;
+      if (onlySuspicious && e.tags.length === 0) return false;
       if (globalActive && !inRange(e.timestamp, globalTimeRange)) return false;
       if (rangeActive) {
         if (!e.timestamp) return false;
@@ -77,7 +79,7 @@ export default function MasterTimeline({ entries, loading, onNavigate, onFetchLi
       return sortDir === "asc" ? cmp : -cmp;
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [allRows, startBound, endBound, sortDir, hiddenTables, rangeActive, globalActive, globalTimeRange]);
+  }, [allRows, startBound, endBound, sortDir, hiddenTables, rangeActive, globalActive, globalTimeRange, onlySuspicious]);
 
   // Earliest/latest timestamp among the rows actually shown — drives the
   // status bar's range readout. Rows without a timestamp are ignored here.
@@ -95,6 +97,47 @@ export default function MasterTimeline({ entries, loading, onNavigate, onFetchLi
     }
     return { min, max, missing };
   }, [rows]);
+
+  // Activity histogram — bucket the table/range-filtered rows over their span
+  // so activity spikes (and where suspicious events cluster) are visible at a
+  // glance. Independent of the "의심만"/sort state so the shape stays stable.
+  const HISTO_BUCKETS = 72;
+  const histogram = useMemo(() => {
+    const base = allRows.filter((e) => {
+      if (hiddenTables.has(e.table)) return false;
+      if (globalActive && !inRange(e.timestamp, globalTimeRange)) return false;
+      if (rangeActive) {
+        if (startBound && e.timestamp < startBound) return false;
+        if (endBound && e.timestamp > endBound) return false;
+      }
+      return !!e.timestamp;
+    });
+    if (base.length === 0) return null;
+    const ms = (t: string) => Date.parse(t.replace(" ", "T"));
+    let tmin = Infinity;
+    let tmax = -Infinity;
+    for (const e of base) {
+      const t = ms(e.timestamp);
+      if (!Number.isNaN(t)) {
+        if (t < tmin) tmin = t;
+        if (t > tmax) tmax = t;
+      }
+    }
+    if (!Number.isFinite(tmin) || !Number.isFinite(tmax)) return null;
+    const span = Math.max(1, tmax - tmin);
+    const buckets = Array.from({ length: HISTO_BUCKETS }, () => ({ total: 0, sus: 0 }));
+    for (const e of base) {
+      const t = ms(e.timestamp);
+      if (Number.isNaN(t)) continue;
+      let idx = Math.floor(((t - tmin) / span) * HISTO_BUCKETS);
+      if (idx >= HISTO_BUCKETS) idx = HISTO_BUCKETS - 1;
+      if (idx < 0) idx = 0;
+      buckets[idx].total += 1;
+      if (e.tags.length > 0) buckets[idx].sus += 1;
+    }
+    const peak = Math.max(1, ...buckets.map((b) => b.total));
+    return { buckets, peak };
+  }, [allRows, hiddenTables, startBound, endBound, rangeActive, globalActive, globalTimeRange]);
 
   const virtualizer = useVirtualizer({
     count: rows.length,
@@ -166,6 +209,24 @@ export default function MasterTimeline({ entries, loading, onNavigate, onFetchLi
           }}
         >
           {sortDir === "asc" ? "▲ 과거→최근" : "▼ 최근→과거"}
+        </button>
+
+        <button
+          onClick={() => setOnlySuspicious((v) => !v)}
+          title="의심 태그가 붙은 항목만 표시"
+          style={{
+            fontSize: 11.5,
+            padding: "4px 10px",
+            background: onlySuspicious ? "var(--danger-subtle)" : "var(--bg-elevated)",
+            color: onlySuspicious ? "var(--danger)" : "var(--text-dim)",
+            border: `1px solid ${onlySuspicious ? "var(--danger)" : "var(--border)"}`,
+            borderRadius: "var(--radius-lg)",
+            cursor: "pointer",
+            fontWeight: 600,
+            whiteSpace: "nowrap",
+          }}
+        >
+          ⚠ 의심만
         </button>
 
         <div style={{ display: "flex", alignItems: "center", gap: 6, marginLeft: "auto" }}>
@@ -287,6 +348,23 @@ export default function MasterTimeline({ entries, loading, onNavigate, onFetchLi
           )}
         </div>
       </div>
+
+      {histogram && (
+        <div
+          title="시간대별 활동량 (빨강: 의심 항목 포함)"
+          style={{ display: "flex", alignItems: "flex-end", gap: 1, height: 42, padding: "8px 14px 4px", borderBottom: "1px solid var(--border)", background: "var(--bg-panel)", flexShrink: 0 }}
+        >
+          {histogram.buckets.map((b, i) => {
+            const h = b.total === 0 ? 0 : Math.max(2, Math.round((b.total / histogram.peak) * 28));
+            const hasSus = b.sus > 0;
+            return (
+              <div key={i} title={`${b.total.toLocaleString()}건${b.sus ? ` · 의심 ${b.sus}` : ""}`} style={{ flex: 1, height: 28, display: "flex", alignItems: "flex-end" }}>
+                <div style={{ width: "100%", height: h, background: hasSus ? "var(--danger)" : "var(--accent)", opacity: hasSus ? 0.9 : 0.5, borderRadius: 1 }} />
+              </div>
+            );
+          })}
+        </div>
+      )}
 
       {rows.length === 0 ? (
         <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", color: "var(--text-faint)", gap: 8 }}>
