@@ -89,7 +89,7 @@ export interface ArtifactViewSpec {
    * Overview correlations (TargetInfo, ...) read as summaries/dashboards, not
    * spreadsheets, so each gets a purpose-built view.
    */
-  customView?: "targetInfo" | "executionHistory" | "powershellFlow" | "defender" | "registryFindings";
+  customView?: "targetInfo" | "executionHistory" | "powershellFlow" | "defender" | "registryFindings" | "rdpCache";
   /**
    * In the sidebar, present this table split by this column: instead of one
    * row for the whole table, the category lists one entry per distinct value
@@ -266,6 +266,20 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
       { key: "user", label: "사용자" },
       { key: "source", label: "탐지원" },
       { key: "detail", label: "경로/내용" },
+    ]}],
+  },
+
+  RdpBitmapCache: {
+    customView: "rdpCache",
+    title: (r) => (r.kind === "mosaic" ? `${r.source_file} (모자이크)` : `${r.source_file} 타일 ${r.tile_index}`),
+    subtitle: (r) => (r.width && r.height ? `${r.width}×${r.height}` : ""),
+    sections: [{ heading: "타일", fields: [
+      { key: "kind", label: "종류" },
+      { key: "source_file", label: "캐시 파일" },
+      { key: "tile_index", label: "타일 번호" },
+      { key: "width", label: "너비" },
+      { key: "height", label: "높이" },
+      { key: "key", label: "키" },
     ]}],
   },
 

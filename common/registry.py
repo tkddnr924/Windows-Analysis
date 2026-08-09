@@ -26,6 +26,7 @@ from parsers import (
     jumplist_parser,
     powershell_history_parser,
     prefetch_parser,
+    rdpcache_parser,
     registry_parser,
     srum_parser,
     taskscheduler_parser,
@@ -128,6 +129,15 @@ ARTIFACTS: list[ArtifactDefinition] = [
         find_paths=lambda target_dir: find_files_by_content(target_dir, taskscheduler_parser.TASK_NAMESPACE),
         parse=taskscheduler_parser.parse,
         field_order=taskscheduler_parser.FIELD_ORDER,
+    ),
+    ArtifactDefinition(
+        # RDP bitmap cache (Cache####.bin) located by its RDP8bmp magic, so an
+        # arbitrary filename/extension still matches and empty bcache files
+        # are skipped.
+        name=rdpcache_parser.ARTIFACT_NAME,
+        find_paths=lambda target_dir: find_files_by_content(target_dir, rdpcache_parser.CONTENT_MARKER),
+        parse=rdpcache_parser.parse,
+        field_order=rdpcache_parser.FIELD_ORDER,
     ),
     ArtifactDefinition(
         name=powershell_history_parser.ARTIFACT_NAME,
