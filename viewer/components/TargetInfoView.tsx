@@ -240,7 +240,7 @@ export default function TargetInfoView({ data }: TargetInfoViewProps) {
       </div>
       <div style={{ fontSize: 12, color: "var(--text-faint)", marginBottom: 20 }}>분석 대상 시스템 정보</div>
 
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))", gap: 16, alignItems: "start" }}>
+      <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
         {/* 시스템 */}
         <Card title="시스템">
           {orderedSystem.length === 0 && <div style={{ color: "var(--text-faint)", fontSize: 12.5 }}>정보 없음</div>}
