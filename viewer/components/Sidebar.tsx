@@ -73,6 +73,7 @@ const OVERVIEW_TABLE_ICONS: Record<string, string> = {
   TargetInfo: "🖥️",
   ExecutionHistory: "⚡",
   Defender: "🛡️",
+  RegistryFindings: "🔎",
   RemoteDesktopHistory: "🖥️",
   PowerShellHistory: "💻",
 };
