@@ -730,13 +730,16 @@ def _rf_shares(system: list) -> list[dict]:
             detail="파일/프린터 공유 서비스" + ("가 실행됩니다 (공유 가능 상태)." if enabled else "가 비활성화되어 있습니다."),
             key_path="…\\Services\\LanmanServer", source="SYSTEM",
         ))
-    auto = _pick(system, "\\lanmanserver\\parameters", "AutoShareServer")
-    if auto == "0":
-        rows.append(_rf_row(
-            category="공유 폴더", name="관리 공유(AutoShareServer)", value="0 (사용 안 함)", status="정보",
-            detail="기본 관리 공유(C$, ADMIN$)가 비활성화되어 있습니다.",
-            key_path="…\\LanmanServer\\Parameters", source="SYSTEM",
-        ))
+    # Admin-share master switch — AutoShareServer on servers, AutoShareWks on
+    # client OSes; a machine may carry either, so check both.
+    for vname, role in (("AutoShareServer", "서버"), ("AutoShareWks", "워크스테이션")):
+        auto = _pick(system, "\\lanmanserver\\parameters", vname)
+        if auto == "0":
+            rows.append(_rf_row(
+                category="공유 폴더", name=f"관리 공유({vname})", value="0 (사용 안 함)", status="정보",
+                detail=f"기본 관리 공유(C$, ADMIN$)가 비활성화되어 있습니다. ({role})",
+                key_path="…\\LanmanServer\\Parameters", source="SYSTEM",
+            ))
     seen = set()
     for r in system:
         if not r.get("key_path", "").lower().endswith("\\lanmanserver\\shares"):
@@ -754,19 +757,43 @@ def _rf_shares(system: list) -> list[dict]:
     return rows
 
 
+# SQL Server internal version → release year. Any instance (MSSQL11.. onward,
+# default or named) is handled generically; the map is only for a nicer label.
+_MSSQL_VERSIONS = {
+    "10": "2008", "11": "2012", "12": "2014", "13": "2016",
+    "14": "2017", "15": "2019", "16": "2022", "17": "2025",
+}
+
+
+def _sql_instance_label(inst: str) -> str:
+    """'MSSQL15.SQLEXPRESS' -> 'SQLEXPRESS · SQL Server 2019'. Works for every
+    version and for named instances; unknown versions still return the raw id."""
+    if not inst:
+        return ""
+    ver_part, _, name = inst.partition(".")
+    year = _MSSQL_VERSIONS.get(ver_part.upper().replace("MSSQL", ""))
+    label = name or inst
+    return f"{label} · SQL Server {year}" if year else label
+
+
 def _rf_sql_auth(software: list) -> list[dict]:
+    # Every SQL Server instance stores its own LoginMode under
+    # …\Microsoft SQL Server\<MSSQL##.INSTANCE>\MSSQLServer\LoginMode (also
+    # under Wow6432Node on some installs). Scan them all — don't assume a single
+    # instance or a particular version.
     rows = []
     for r in software:
         if r.get("value_name") != "LoginMode" or "microsoft sql server" not in r.get("key_path", "").lower():
             continue
         val = r.get("value_data", "")
         inst = next((p for p in r.get("key_path", "").split("\\") if p.upper().startswith("MSSQL") and "." in p), "")
+        label = _sql_instance_label(inst)
         mixed = val == "2"
         rows.append(_rf_row(
-            category="SQL 인증", name=f"LoginMode ({inst})" if inst else "LoginMode",
-            value={"1": "Windows 인증 전용", "2": "혼합 모드 (SQL+Windows)"}.get(val, val),
-            status="주의" if mixed else "정상",
-            detail="혼합 모드 — sa 등 SQL 계정 로그인 사용 가능 (무차별 대입 표적)" if mixed else "Windows 인증만 허용",
+            category="SQL 인증", name=f"LoginMode — {label}" if label else "LoginMode",
+            value={"1": "Windows 인증 전용", "2": "혼합 모드 (SQL+Windows)"}.get(val, f"알 수 없음({val})"),
+            status="주의" if mixed else "정상" if val == "1" else "정보",
+            detail="혼합 모드 — sa 등 SQL 계정 로그인 사용 가능 (무차별 대입 표적)" if mixed else "Windows 인증만 허용" if val == "1" else "LoginMode 값 확인 필요",
             key_path=r.get("key_path", ""), source="SOFTWARE",
         ))
     return rows
