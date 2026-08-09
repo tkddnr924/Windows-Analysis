@@ -90,12 +90,14 @@ export default function RunPipeline({ activeCase, onBack, onChanged, onOpenHost 
   // full run), leaving its ✓ and the step counter permanently one short.
   const currentRef = useRef<string | null>(null);
 
+  // Mark the current section as done (✓) — an artifact is finished once the
+  // NEXT section starts (or the run ends). This does NOT advance the step
+  // counter; that happens when a section STARTS (see onPipelineLog) so the bar
+  // moves at the start of every step, the first one included, instead of
+  // lagging a step behind.
   function flushCurrentSection() {
     const prev = currentRef.current;
-    if (prev) {
-      setDoneArtifacts((done) => new Set(done).add(prev));
-      setCompletedSteps((c) => c + 1);
-    }
+    if (prev) setDoneArtifacts((done) => new Set(done).add(prev));
     currentRef.current = null;
   }
 
@@ -114,6 +116,10 @@ export default function RunPipeline({ activeCase, onBack, onChanged, onOpenHost 
         flushCurrentSection();
         currentRef.current = match[1];
         setCurrentArtifact(match[1]);
+        // Count the section as it starts. Exactly totalSteps (artifacts + the
+        // _OVERVIEW section) headers are emitted, so this reaches 100% on the
+        // final section — capped at 99% until runComplete flips it to 100.
+        setCompletedSteps((c) => c + 1);
       }
     });
     return unsubscribe;
@@ -163,7 +169,7 @@ export default function RunPipeline({ activeCase, onBack, onChanged, onOpenHost 
 
     await window.api.runHost({ caseId: activeCase.id, hostId, only });
 
-    flushCurrentSection(); // count the final section (last artifact / _OVERVIEW)
+    flushCurrentSection(); // ✓ the final section (last artifact / _OVERVIEW)
     setRunningHostId(null);
     setCurrentArtifact(null);
     setRunComplete(true);
