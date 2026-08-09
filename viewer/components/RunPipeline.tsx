@@ -221,7 +221,7 @@ export default function RunPipeline({ activeCase, onBack, onChanged, onOpenHost 
         <h3 style={{ margin: "0 0 12px", fontSize: 13.5 }}>🖥️ 새 호스트 추가</h3>
         <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
           <input
-            placeholder="호스트 이름 (예: BKMASTER)"
+            placeholder="호스트 이름 (예: WEB-01)"
             value={newHostName}
             onChange={(e) => setNewHostName(e.target.value)}
             style={{ padding: "7px 10px", background: "var(--bg-input)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", color: "var(--text)", minWidth: 180 }}
