@@ -677,3 +677,130 @@ def build_defender(all_results: dict) -> list[dict]:
         out.append(_def_row(section="signature", timestamp=sig_latest[0], event_id="2000", title="보안 인텔리전스 버전", detail=sig_latest[1], record_key=sig_latest[2]))
 
     return out
+
+
+# --- RegistryFindings ("레지스트리 특이사항") ----------------------------------
+# Curated "things worth a second look" pulled out of the raw hive dumps. Meant
+# to grow over time (add a _rf_* extractor + call it in build_registry_findings);
+# each finding carries a category + status so the view can group and flag them.
+#   status: "의심"(danger) | "주의"(warning) | "정보"(info) | "정상"(ok)
+
+_RF_KEYS = ("category", "name", "value", "status", "detail", "key_path", "source", "command", "user")
+
+
+def _rf_row(**kw) -> dict:
+    r = {k: "" for k in _RF_KEYS}
+    r.update(kw)
+    return r
+
+
+def _hive_user(fname: str) -> str:
+    up = fname.upper()
+    if up == "SOFTWARE":
+        return "(시스템)"
+    if up == "DEFAULT":
+        return ".DEFAULT"
+    if up.endswith("NTUSER.DAT"):
+        return fname[: -len("_NTUSER.DAT")] if up.endswith("_NTUSER.DAT") else fname
+    return fname
+
+
+def _share_path(value: str) -> str:
+    """A LanmanServer\\Shares value is a REG_MULTI_SZ (stored as a JSON list by
+    the parser) of 'Key=Value' lines; pull out the Path=."""
+    try:
+        items = json.loads(value) if value.startswith("[") else [value]
+    except (ValueError, TypeError):
+        items = [value]
+    for it in items:
+        if isinstance(it, str) and it.lower().startswith("path="):
+            return it[5:]
+    return ""
+
+
+def _rf_shares(system: list) -> list[dict]:
+    rows = []
+    start = _pick(system, "\\services\\lanmanserver", "Start")
+    if start:
+        enabled = start in ("2", "3")
+        rows.append(_rf_row(
+            category="공유 폴더", name="Server 서비스(LanmanServer)",
+            value={"2": "자동", "3": "수동", "4": "사용 안 함"}.get(start, start),
+            status="정보" if enabled else "정상",
+            detail="파일/프린터 공유 서비스" + ("가 실행됩니다 (공유 가능 상태)." if enabled else "가 비활성화되어 있습니다."),
+            key_path="…\\Services\\LanmanServer", source="SYSTEM",
+        ))
+    auto = _pick(system, "\\lanmanserver\\parameters", "AutoShareServer")
+    if auto == "0":
+        rows.append(_rf_row(
+            category="공유 폴더", name="관리 공유(AutoShareServer)", value="0 (사용 안 함)", status="정보",
+            detail="기본 관리 공유(C$, ADMIN$)가 비활성화되어 있습니다.",
+            key_path="…\\LanmanServer\\Parameters", source="SYSTEM",
+        ))
+    seen = set()
+    for r in system:
+        if not r.get("key_path", "").lower().endswith("\\lanmanserver\\shares"):
+            continue
+        name = r.get("value_name", "")
+        if name in ("", "(default)") or name in seen:
+            continue
+        seen.add(name)
+        path = _share_path(r.get("value_data", ""))
+        rows.append(_rf_row(
+            category="공유 폴더", name=name, value=path or r.get("value_data", "")[:80], status="주의",
+            detail="사용자 정의 공유 폴더 — 외부 노출/권한 점검 필요",
+            key_path=r.get("key_path", ""), source="SYSTEM",
+        ))
+    return rows
+
+
+def _rf_sql_auth(software: list) -> list[dict]:
+    rows = []
+    for r in software:
+        if r.get("value_name") != "LoginMode" or "microsoft sql server" not in r.get("key_path", "").lower():
+            continue
+        val = r.get("value_data", "")
+        inst = next((p for p in r.get("key_path", "").split("\\") if p.upper().startswith("MSSQL") and "." in p), "")
+        mixed = val == "2"
+        rows.append(_rf_row(
+            category="SQL 인증", name=f"LoginMode ({inst})" if inst else "LoginMode",
+            value={"1": "Windows 인증 전용", "2": "혼합 모드 (SQL+Windows)"}.get(val, val),
+            status="주의" if mixed else "정상",
+            detail="혼합 모드 — sa 등 SQL 계정 로그인 사용 가능 (무차별 대입 표적)" if mixed else "Windows 인증만 허용",
+            key_path=r.get("key_path", ""), source="SOFTWARE",
+        ))
+    return rows
+
+
+_AUTORUN_SUFFIXES = ("\\currentversion\\run", "\\currentversion\\runonce", "\\policies\\explorer\\run")
+
+
+def _rf_autoruns(all_results: dict) -> list[dict]:
+    rows = []
+    for fname, reg in _registry_hives(all_results):
+        user = _hive_user(fname)
+        for r in reg:
+            low = r.get("key_path", "").lower()
+            if not any(low.endswith(s) for s in _AUTORUN_SUFFIXES):
+                continue
+            name = r.get("value_name", "")
+            if name in ("", "(default)"):
+                continue
+            cmd = r.get("value_data", "")
+            kind = "RunOnce" if low.endswith("runonce") else "Policy Run" if "policies" in low else "Run"
+            rows.append(_rf_row(
+                category="자동 실행", name=name, value=cmd, status="정보", detail=kind,
+                command=cmd, user=user, key_path=r.get("key_path", ""), source=fname,
+            ))
+    return rows
+
+
+def build_registry_findings(all_results: dict) -> list[dict]:
+    hives = _hives_by_name(all_results)
+    software = hives.get("SOFTWARE", [])
+    system = hives.get("SYSTEM", [])
+    rows: list[dict] = []
+    rows += _rf_shares(system)
+    rows += _rf_sql_auth(software)
+    rows += _rf_autoruns(all_results)
+    return rows

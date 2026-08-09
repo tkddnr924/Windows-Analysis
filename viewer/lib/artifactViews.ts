@@ -89,7 +89,7 @@ export interface ArtifactViewSpec {
    * Overview correlations (TargetInfo, ...) read as summaries/dashboards, not
    * spreadsheets, so each gets a purpose-built view.
    */
-  customView?: "targetInfo" | "executionHistory" | "powershellFlow" | "defender";
+  customView?: "targetInfo" | "executionHistory" | "powershellFlow" | "defender" | "registryFindings";
   /**
    * In the sidebar, present this table split by this column: instead of one
    * row for the whole table, the category lists one entry per distinct value
@@ -231,6 +231,24 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
         { key: "sha1", kind: "hash" },
       ]},
     ],
+  },
+
+  RegistryFindings: {
+    customView: "registryFindings",
+    title: (r) => r.name || "(no name)",
+    subtitle: (r) => r.value || "",
+    badges: [{ key: "status", kind: "badge" }],
+    priorityColumns: ["category", "status", "name", "value", "detail", "user", "source"],
+    sections: [{ heading: "상세", fields: [
+      { key: "category", label: "분류" },
+      { key: "status", label: "상태" },
+      { key: "value", label: "값" },
+      { key: "detail", label: "설명" },
+      { key: "command", label: "명령" },
+      { key: "user", label: "사용자" },
+      { key: "key_path", label: "키 경로" },
+      { key: "source", label: "하이브" },
+    ]}],
   },
 
   Defender: {

@@ -101,6 +101,7 @@ def run_host(case_id: str, host_id: str, cases_dir: Path, only: set[str] | None 
         "TargetInfo": processing.build_target_info,
         "ExecutionHistory": processing.build_execution_history,
         "Defender": processing.build_defender,
+        "RegistryFindings": processing.build_registry_findings,
         "RemoteDesktopHistory": correlate.build_remote_desktop_history,
         "PowerShellHistory": correlate.build_powershell_history,
     }
