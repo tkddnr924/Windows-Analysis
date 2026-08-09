@@ -72,7 +72,7 @@ export default function RegistryFindingsView({ data }: Props) {
 
       {data.rows.length === 0 && <div style={{ color: "var(--text-faint)", fontSize: 13 }}>레지스트리 특이사항이 없습니다.</div>}
 
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(420px, 1fr))", gap: 16, alignItems: "start" }}>
+      <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
         {groups.map(({ cat, icon, rows }) => {
           const worst = rows.some((r) => r.status === "의심") ? "var(--danger)" : rows.some((r) => r.status === "주의") ? "var(--warning)" : "var(--border)";
           return (
