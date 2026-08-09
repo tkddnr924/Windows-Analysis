@@ -822,11 +822,51 @@ def _rf_autoruns(all_results: dict) -> list[dict]:
     return rows
 
 
+def _rf_credential_protection(system: list) -> list[dict]:
+    """Settings that decide how exposed cached credentials are to tools like
+    mimikatz. Always reported (present or not) so the answer is explicit."""
+    rows = []
+    wd = _pick(system, "\\securityproviders\\wdigest", "UseLogonCredential")
+    if wd == "1":
+        rows.append(_rf_row(
+            category="자격 증명 보호", name="WDigest UseLogonCredential", value="1 (사용)", status="의심",
+            detail="WDigest 평문 자격증명 캐시가 켜져 있음 — mimikatz(sekurlsa/wdigest) 등으로 LSASS에서 평문 암호 추출 가능 (공격자 사전작업 흔적)",
+            key_path="…\\Control\\SecurityProviders\\WDigest", source="SYSTEM",
+        ))
+    elif wd == "0":
+        rows.append(_rf_row(
+            category="자격 증명 보호", name="WDigest UseLogonCredential", value="0 (사용 안 함)", status="정상",
+            detail="WDigest 평문 자격증명 캐시 비활성",
+            key_path="…\\Control\\SecurityProviders\\WDigest", source="SYSTEM",
+        ))
+    else:
+        rows.append(_rf_row(
+            category="자격 증명 보호", name="WDigest UseLogonCredential", value="미설정 (기본값)", status="정보",
+            detail="미설정 — 최신 Windows(8.1/2012 R2+)는 기본 비활성이나, 구버전이거나 값이 추가되면 평문 캐시가 켜질 수 있음",
+            key_path="…\\Control\\SecurityProviders\\WDigest", source="SYSTEM",
+        ))
+    ppl = _pick(system, "\\control\\lsa", "RunAsPPL")
+    if ppl in ("1", "2"):
+        rows.append(_rf_row(
+            category="자격 증명 보호", name="LSASS 보호(RunAsPPL)", value=f"{ppl} (사용)", status="정상",
+            detail="LSASS가 PPL(보호 프로세스)로 실행됨 — 자격증명 덤프 난이도 상승",
+            key_path="…\\Control\\Lsa", source="SYSTEM",
+        ))
+    else:
+        rows.append(_rf_row(
+            category="자격 증명 보호", name="LSASS 보호(RunAsPPL)", value="미설정", status="주의",
+            detail="RunAsPPL 미설정 — LSASS가 보호 프로세스로 실행되지 않아 자격증명 덤프에 노출",
+            key_path="…\\Control\\Lsa", source="SYSTEM",
+        ))
+    return rows
+
+
 def build_registry_findings(all_results: dict) -> list[dict]:
     hives = _hives_by_name(all_results)
     software = hives.get("SOFTWARE", [])
     system = hives.get("SYSTEM", [])
     rows: list[dict] = []
+    rows += _rf_credential_protection(system)
     rows += _rf_shares(system)
     rows += _rf_sql_auth(software)
     rows += _rf_autoruns(all_results)

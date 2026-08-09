@@ -20,6 +20,7 @@ function statusColor(status: string): string {
 
 // Category display order + icon (unknown categories fall through, appended).
 const CATEGORY_META: { key: string; icon: string }[] = [
+  { key: "자격 증명 보호", icon: "🔑" },
   { key: "공유 폴더", icon: "📁" },
   { key: "SQL 인증", icon: "🗄️" },
   { key: "자동 실행", icon: "🚀" },
