@@ -406,6 +406,7 @@ function eventSummary(row: Row): string {
 function AccountDetailPage({ account, onBack, loadEvents }: { account: Account; onBack: () => void; loadEvents?: (sid: string, username: string) => Promise<Row[]> }) {
   const [events, setEvents] = useState<Row[] | null>(null);
   const [loading, setLoading] = useState(false);
+  const [selectedEvent, setSelectedEvent] = useState<Row | null>(null);
 
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
@@ -474,22 +475,82 @@ function AccountDetailPage({ account, onBack, loadEvents }: { account: Account; 
           {!loadEvents && <div style={{ fontSize: 12.5, color: "var(--text-faint)" }}>이벤트 로그 연동을 사용할 수 없습니다.</div>}
           {loadEvents && loading && <div style={{ fontSize: 12.5, color: "var(--text-dim)" }}>이벤트 로그에서 이 계정 활동을 찾는 중…</div>}
           {loadEvents && !loading && events && events.length === 0 && <div style={{ fontSize: 12.5, color: "var(--text-faint)" }}>이 계정(SID)과 관련된 이벤트가 없습니다.</div>}
+          {loadEvents && !loading && events && events.length > 0 && (
+            <div style={{ fontSize: 10.5, color: "var(--text-faint)", marginBottom: 4 }}>행을 클릭하면 이벤트 전체 내용을 봅니다.</div>
+          )}
           {loadEvents && !loading && events && events.map((r, i) => {
             const eid = r.EventID || "";
             const isCreate = CREATE_LIKE.has(eid);
             const label = EVENT_LABELS[eid] || `Event ${eid}`;
+            const summary = eventSummary(r);
             return (
-              <div key={i} style={{ padding: "7px 0", borderBottom: i < events.length - 1 ? "1px solid var(--border-subtle)" : "none", borderLeft: isCreate ? "3px solid var(--warning)" : undefined, paddingLeft: isCreate ? 8 : 0, marginLeft: isCreate ? -8 : 0 }}>
+              <div
+                key={i}
+                onClick={() => setSelectedEvent(r)}
+                onMouseEnter={(e) => (e.currentTarget.style.background = "var(--bg-hover)")}
+                onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+                style={{ padding: "7px 8px", margin: "0 -8px", borderRadius: "var(--radius-sm)", borderBottom: i < events.length - 1 ? "1px solid var(--border-subtle)" : "none", borderLeft: isCreate ? "3px solid var(--warning)" : undefined, cursor: "pointer" }}
+              >
                 <div style={{ display: "flex", gap: 8, alignItems: "baseline", flexWrap: "wrap" }}>
+                  <span style={{ flexShrink: 0, fontSize: 10.5, color: "var(--text-faint)", fontFamily: "var(--mono)" }}>{r.timestamp}</span>
                   <span style={{ fontSize: 12.5, fontWeight: 700, color: isCreate ? "var(--warning)" : "var(--text)" }}>{label}</span>
-                  <span style={{ fontSize: 10, color: "var(--text-faint)" }}>{eid} · {r._log || ""}</span>
-                  <span style={{ marginLeft: "auto", fontSize: 10.5, color: "var(--text-faint)", fontFamily: "var(--mono)" }}>{r.timestamp}</span>
+                  <span style={{ fontSize: 10, color: "var(--text-faint)" }}>{eid} · {r._log || r.Provider || ""}</span>
                 </div>
-                {eventSummary(r) && <div style={{ fontSize: 11, color: "var(--text-dim)", marginTop: 2 }}>{eventSummary(r)}</div>}
+                {summary && <div style={{ fontSize: 11, color: "var(--text-dim)", marginTop: 2, wordBreak: "break-all" }}>{summary}</div>}
               </div>
             );
           })}
         </Card>
+      </div>
+
+      {selectedEvent && <EventDetailModal row={selectedEvent} onClose={() => setSelectedEvent(null)} />}
+    </div>
+  );
+}
+
+function EventDetailModal({ row, onClose }: { row: Row; onClose: () => void }) {
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") onClose();
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  const eid = row.EventID || "";
+  const label = EVENT_LABELS[eid] || `Event ${eid}`;
+  let ed: Record<string, unknown> = {};
+  try {
+    ed = row.EventData ? JSON.parse(row.EventData) : {};
+  } catch {
+    ed = {};
+  }
+  // System/meta columns to show (skip internal + the raw EventData blob, which
+  // is expanded field-by-field below).
+  const META_ORDER = ["timestamp", "EventID", "LevelName", "Provider", "Channel", "Computer", "EventRecordID", "ProcessID", "ThreadID", "UserID", "_log", "_record_key"];
+  const meta = META_ORDER.filter((k) => row[k]).map((k) => [k, row[k]] as [string, string]);
+  const edEntries = Object.entries(ed).filter(([, v]) => v !== "" && v !== null && v !== undefined);
+
+  return (
+    <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(1,4,9,0.7)", zIndex: 300, display: "flex", alignItems: "center", justifyContent: "center", padding: 24 }}>
+      <div onClick={(e) => e.stopPropagation()} style={{ width: "min(720px, 96vw)", maxHeight: "88vh", display: "flex", flexDirection: "column", background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", boxShadow: "var(--shadow-panel)", overflow: "hidden" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "12px 16px", borderBottom: "1px solid var(--border)", background: "var(--bg-elevated)", flexShrink: 0 }}>
+          <span style={{ fontSize: 14.5, fontWeight: 700 }}>{label}</span>
+          <span style={{ fontSize: 11, color: "var(--text-faint)" }}>EventID {eid} · {row._log || row.Channel || ""}</span>
+          <span style={{ marginLeft: "auto", fontSize: 11, color: "var(--text-faint)", fontFamily: "var(--mono)" }}>{row.timestamp}</span>
+          <button onClick={onClose} title="닫기 (Esc)" style={{ background: "transparent", border: "none", color: "var(--text-dim)", fontSize: 20, cursor: "pointer", lineHeight: 1, padding: "0 4px" }}>×</button>
+        </div>
+        <div style={{ padding: "6px 16px 16px", overflow: "auto" }}>
+          <div style={{ fontSize: 11, fontWeight: 700, color: "var(--text-faint)", margin: "8px 0 2px" }}>이벤트</div>
+          {meta.map(([k, v]) => (
+            <DetailRow key={k} label={k} value={v} mono={k === "_record_key" || k === "UserID"} />
+          ))}
+          <div style={{ fontSize: 11, fontWeight: 700, color: "var(--text-faint)", margin: "12px 0 2px" }}>EventData ({edEntries.length})</div>
+          {edEntries.length === 0 && <div style={{ fontSize: 12, color: "var(--text-faint)", padding: "6px 0" }}>추가 데이터 없음</div>}
+          {edEntries.map(([k, v]) => (
+            <DetailRow key={k} label={k} value={String(v)} mono />
+          ))}
+        </div>
       </div>
     </div>
   );
