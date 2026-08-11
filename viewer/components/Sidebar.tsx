@@ -333,6 +333,7 @@ interface SidebarProps {
   selectedFile: ResultFileEntry | null;
   onSelectFile: (file: ResultFileEntry) => void;
   activeVirtualTab: "timeline" | "bookmarks" | null;
+  onSelectDashboard: () => void;
   onSelectTimeline: () => void;
   onSelectBookmarks: () => void;
   bookmarkCount: number;
@@ -351,6 +352,7 @@ export default function Sidebar({
   selectedFile,
   onSelectFile,
   activeVirtualTab,
+  onSelectDashboard,
   onSelectTimeline,
   onSelectBookmarks,
   bookmarkCount,
@@ -491,6 +493,12 @@ export default function Sidebar({
         )}
         {(
           <div style={{ borderBottom: "1px solid var(--border-subtle)" }}>
+            <PinnedNavRow
+              icon="🏠"
+              label="대시보드"
+              selected={!activeVirtualTab && !selectedFile}
+              onClick={onSelectDashboard}
+            />
             <PinnedNavRow
               icon="🕐"
               label="통합 타임라인"
