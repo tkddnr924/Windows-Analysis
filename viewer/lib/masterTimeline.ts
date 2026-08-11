@@ -1,6 +1,28 @@
 import { resolveArtifactView } from "./artifactViews";
 import type { CategoryEntry, TimelineEntry } from "./types";
 
+// Hand control back to the event loop so pending clicks/renders are processed
+// mid-build. MessageChannel isn't subject to setTimeout's 4ms nested clamp, so
+// it yields cheaply; fall back to setTimeout where it's unavailable.
+function yieldToEventLoop(): Promise<void> {
+  return new Promise((resolve) => {
+    if (typeof MessageChannel === "undefined") {
+      setTimeout(resolve, 0);
+      return;
+    }
+    const ch = new MessageChannel();
+    ch.port1.onmessage = () => {
+      ch.port1.close();
+      resolve();
+    };
+    ch.port2.postMessage(0);
+  });
+}
+
+// Rows processed between yields. Big enough that the per-yield overhead stays
+// negligible, small enough that the UI never freezes for more than a frame.
+const YIELD_EVERY = 8000;
+
 // Only files whose artifactViews.ts spec declares timelineField are included —
 // the project's curated "this artifact matters for analysis" list. Most
 // _OVERVIEW correlations are excluded (no timelineField) because they'd
@@ -26,6 +48,7 @@ export async function buildMasterTimeline(categories: CategoryEntry[]): Promise<
 
       if (!data) data = await window.api.readResultFile(file.fullPath, file.tableName);
       const timelineField = spec.timelineField;
+      let sinceYield = 0;
       for (const row of data.rows) {
         entries.push({
           timestamp: row[timelineField] ?? "",
@@ -39,6 +62,12 @@ export async function buildMasterTimeline(categories: CategoryEntry[]): Promise<
           row,
           columns: data.columns,
         });
+        // Big tables (EventLog can be ~700k rows) would otherwise block the
+        // renderer's single thread for seconds; yield so the UI stays live.
+        if (++sinceYield >= YIELD_EVERY) {
+          sinceYield = 0;
+          await yieldToEventLoop();
+        }
       }
     }
   }
@@ -47,6 +76,7 @@ export async function buildMasterTimeline(categories: CategoryEntry[]): Promise<
   // formatted YYYY-MM-DD hh:mm:ss.fff by the parser — lexicographic order
   // is chronological order. Rows with no timestamp value (empty string)
   // sort last rather than being dropped from the merged view.
+  await yieldToEventLoop(); // let queued UI events through before the big sort
   entries.sort((a, b) => (a.timestamp < b.timestamp ? 1 : a.timestamp > b.timestamp ? -1 : 0));
   return entries;
 }
