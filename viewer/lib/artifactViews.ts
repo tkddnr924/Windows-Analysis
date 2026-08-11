@@ -252,6 +252,39 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     ]}],
   },
 
+  // Chrome disk-cache entries (browser_cache_parser) — a normal table, but with
+  // the decoded HTTP response surfaced: status/type up front, full response
+  // headers as a code block in the detail panel.
+  CacheEntries: {
+    title: (r) => basename(r.url) || r.url || "(no url)",
+    subtitle: (r) => r.url || "",
+    badges: [{ key: "status", kind: "badge" }],
+    priorityColumns: ["response_time", "url", "status", "content_type", "content_length", "server", "account"],
+    sections: [
+      { heading: "HTTP 응답", fields: [
+        { key: "status", label: "상태" },
+        { key: "content_type", label: "Content-Type" },
+        { key: "content_length", label: "Content-Length" },
+        { key: "content_encoding", label: "Content-Encoding" },
+        { key: "server", label: "Server" },
+        { key: "date", label: "Date" },
+        { key: "last_modified", label: "Last-Modified" },
+        { key: "etag", label: "ETag" },
+        { key: "cache_control", label: "Cache-Control" },
+        { key: "location", label: "Location" },
+      ]},
+      { heading: "원본 응답 헤더", fields: [{ key: "all_headers", label: "헤더", kind: "code" }] },
+      { heading: "시간 · 본문", fields: [
+        { key: "request_time", label: "요청 시각" },
+        { key: "response_time", label: "응답 시각" },
+        { key: "creation_time", label: "캐시 생성" },
+        { key: "body_size", label: "본문 크기(bytes)" },
+        { key: "body_file", label: "본문 파일" },
+        { key: "cache_key", label: "캐시 키" },
+      ]},
+    ],
+  },
+
   RegistryFindings: {
     customView: "registryFindings",
     title: (r) => r.name || "(no name)",

@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import type { CsvData } from "@/lib/types";
 
 type Row = Record<string, string>;
@@ -9,120 +9,174 @@ interface Props {
   data: CsvData;
 }
 
+const DOW = ["일", "월", "화", "수", "목", "금", "토"];
+
+// "YYYY-MM-DD HH:MM:SS.fff" -> "YYYY-MM-DD"
+const dayOf = (ts: string) => (ts ? ts.slice(0, 10) : "");
+
 export default function BrowserHistoryView({ data }: Props) {
-  const { accounts, visitTotal, downloadTotal } = useMemo(() => {
-    const byAcct = new Map<string, { visits: Row[]; downloads: Row[] }>();
-    for (const r of data.rows) {
-      const a = r.account || "(알 수 없음)";
-      if (!byAcct.has(a)) byAcct.set(a, { visits: [], downloads: [] });
-      const g = byAcct.get(a)!;
-      if (r.kind === "download") g.downloads.push(r);
-      else g.visits.push(r);
-    }
-    const byTime = (a: Row, b: Row) => (b.timestamp || "").localeCompare(a.timestamp || "");
-    const accounts = [...byAcct.entries()]
-      .map(([account, g]) => ({
-        account,
-        visits: g.visits.sort(byTime),
-        downloads: g.downloads.sort(byTime),
-      }))
-      .sort((a, b) => b.downloads.length - a.downloads.length || b.visits.length - a.visits.length);
-    return {
-      accounts,
-      visitTotal: data.rows.filter((r) => r.kind !== "download").length,
-      downloadTotal: data.rows.filter((r) => r.kind === "download").length,
-    };
+  const [account, setAccount] = useState<string>("(전체)");
+  const [selectedDay, setSelectedDay] = useState<string>("");
+  const [month, setMonth] = useState<{ y: number; m: number } | null>(null);
+
+  const accounts = useMemo(() => {
+    const s = new Set<string>();
+    for (const r of data.rows) if (r.account) s.add(r.account);
+    return ["(전체)", ...[...s].sort()];
   }, [data.rows]);
 
+  // Rows for the chosen account, with a parsed day; downloads + visits together.
+  const scoped = useMemo(
+    () => data.rows.filter((r) => (account === "(전체)" || r.account === account) && r.timestamp),
+    [data.rows, account]
+  );
+
+  // day -> count, for the calendar dots.
+  const dayCounts = useMemo(() => {
+    const m = new Map<string, number>();
+    for (const r of scoped) {
+      const d = dayOf(r.timestamp);
+      if (d) m.set(d, (m.get(d) ?? 0) + 1);
+    }
+    return m;
+  }, [scoped]);
+
+  // Default the calendar + selection to the most recent day with activity.
+  const latestDay = useMemo(() => {
+    let max = "";
+    for (const d of dayCounts.keys()) if (d > max) max = d;
+    return max;
+  }, [dayCounts]);
+
+  const activeDay = selectedDay || latestDay;
+  const view = month ?? (activeDay ? { y: +activeDay.slice(0, 4), m: +activeDay.slice(5, 7) } : monthNow());
+
+  const dayRows = useMemo(
+    () => scoped.filter((r) => dayOf(r.timestamp) === activeDay).sort((a, b) => (a.timestamp || "").localeCompare(b.timestamp || "")),
+    [scoped, activeDay]
+  );
+
+  const grid = useMemo(() => calendarGrid(view.y, view.m), [view]);
+
   return (
-    <div style={{ flex: 1, minHeight: 0, overflow: "auto", padding: "20px 24px" }}>
+    <div style={{ flex: 1, minHeight: 0, overflow: "auto", padding: "18px 22px" }}>
       <div style={{ display: "flex", alignItems: "baseline", gap: 12, marginBottom: 2 }}>
-        <span style={{ fontSize: 22, fontWeight: 700, color: "var(--text)" }}>🌐 브라우저 활동</span>
-        <span style={{ fontSize: 13, color: "var(--text-dim)" }}>Chrome 방문 기록 · 다운로드 (계정별)</span>
+        <span style={{ fontSize: 22, fontWeight: 700 }}>🌐 브라우저 활동</span>
+        <span style={{ fontSize: 13, color: "var(--text-dim)" }}>일자를 선택하면 그날의 기록을 시간순으로 봅니다</span>
       </div>
-      <div style={{ fontSize: 12, color: "var(--text-faint)", marginBottom: 18 }}>URL은 평문으로 디코딩해 표시합니다.</div>
+      <div style={{ fontSize: 12, color: "var(--text-faint)", marginBottom: 14 }}>URL은 평문으로 디코딩해 표시합니다.</div>
 
-      <div style={{ display: "flex", flexWrap: "wrap", gap: 10, marginBottom: 20 }}>
-        <Tile label="계정" value={accounts.length} tone="neutral" />
-        <Tile label="방문 URL" value={visitTotal} tone="neutral" />
-        <Tile label="다운로드" value={downloadTotal} tone={downloadTotal ? "warning" : "ok"} />
-      </div>
-
-      {accounts.length === 0 && <div style={{ color: "var(--text-faint)", fontSize: 13 }}>브라우저 기록이 없습니다.</div>}
-
-      <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-        {accounts.map(({ account, visits, downloads }) => (
-          <section key={account} style={{ background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "var(--radius-lg)", boxShadow: "var(--shadow-card)", overflow: "hidden" }}>
-            <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "11px 14px", borderBottom: "1px solid var(--border-subtle)", borderLeft: `3px solid ${downloads.length ? "var(--warning)" : "var(--accent)"}` }}>
-              <span style={{ fontSize: 14, fontWeight: 700, color: "var(--text)" }}>👤 {account}</span>
-              <span style={{ fontSize: 11.5, color: "var(--text-faint)" }}>방문 {visits.length} · 다운로드 {downloads.length}</span>
-            </div>
-            <div style={{ padding: "6px 14px 12px" }}>
-              {downloads.length > 0 && (
-                <>
-                  <SubHead>⬇ 다운로드</SubHead>
-                  {downloads.map((d, i) => (
-                    <div key={`d${i}`} style={{ padding: "8px 0", borderBottom: "1px solid var(--border-subtle)" }}>
-                      <div style={{ display: "flex", alignItems: "baseline", gap: 8, flexWrap: "wrap" }}>
-                        <span style={{ fontSize: 13, fontWeight: 600, color: "var(--text)", wordBreak: "break-all" }}>{d.title || "(파일명 없음)"}</span>
-                        {d.size && <span style={{ fontSize: 11, color: "var(--text-faint)" }}>{d.size}</span>}
-                        {d.danger && <Pill text={`위험: ${d.danger}`} color="var(--danger)" />}
-                        <span style={{ marginLeft: "auto", fontSize: 10.5, color: "var(--text-faint)", fontFamily: "var(--mono)" }}>{d.timestamp}</span>
-                      </div>
-                      {d.detail && <KV k="저장 경로" v={d.detail} mono />}
-                      {d.source_url && <KV k="출처" v={d.source_url} mono link />}
-                      {d.mime && <KV k="유형" v={d.mime} />}
-                    </div>
-                  ))}
-                </>
-              )}
-
-              {visits.length > 0 && (
-                <>
-                  <SubHead>🔗 방문 URL</SubHead>
-                  {visits.map((v, i) => (
-                    <div key={`v${i}`} style={{ display: "flex", gap: 10, padding: "6px 0", borderBottom: i < visits.length - 1 ? "1px solid var(--border-subtle)" : "none", alignItems: "baseline" }}>
-                      <div style={{ flex: 1, minWidth: 0 }}>
-                        {v.title && <div style={{ fontSize: 12.5, fontWeight: 600, color: "var(--text)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{v.title}</div>}
-                        <div title={v.url_raw} style={{ fontSize: 11.5, color: "var(--accent)", fontFamily: "var(--mono)", wordBreak: "break-all" }}>{v.url}</div>
-                      </div>
-                      <span style={{ flexShrink: 0, fontSize: 10.5, color: "var(--text-faint)" }}>{v.visit_count && `${v.visit_count}회`}</span>
-                      <span style={{ flexShrink: 0, fontSize: 10.5, color: "var(--text-faint)", fontFamily: "var(--mono)" }}>{v.timestamp}</span>
-                    </div>
-                  ))}
-                </>
-              )}
-            </div>
-          </section>
+      {/* account chips */}
+      <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 16 }}>
+        {accounts.map((a) => (
+          <button
+            key={a}
+            onClick={() => { setAccount(a); setSelectedDay(""); setMonth(null); }}
+            style={{
+              fontSize: 12, padding: "4px 12px", borderRadius: "var(--radius-lg)", cursor: "pointer", fontWeight: account === a ? 700 : 500,
+              background: account === a ? "var(--accent-subtle)" : "transparent",
+              color: account === a ? "var(--accent)" : "var(--text-dim)",
+              border: `1px solid ${account === a ? "var(--accent)" : "var(--border)"}`,
+            }}
+          >
+            {a === "(전체)" ? a : `👤 ${a}`}
+          </button>
         ))}
       </div>
+
+      <div style={{ display: "flex", gap: 18, alignItems: "flex-start", flexWrap: "wrap" }}>
+        {/* calendar */}
+        <div style={{ flex: "0 0 300px", background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "var(--radius-lg)", padding: 14, boxShadow: "var(--shadow-card)" }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
+            <button onClick={() => setMonth(shift(view, -1))} style={navBtn}>‹</button>
+            <span style={{ fontSize: 13.5, fontWeight: 700 }}>{view.y}년 {view.m}월</span>
+            <button onClick={() => setMonth(shift(view, +1))} style={navBtn}>›</button>
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 2, textAlign: "center" }}>
+            {DOW.map((d, i) => (
+              <div key={d} style={{ fontSize: 10.5, color: i === 0 ? "var(--danger)" : i === 6 ? "var(--accent)" : "var(--text-faint)", padding: "2px 0" }}>{d}</div>
+            ))}
+            {grid.map((cell, i) => {
+              if (!cell) return <div key={i} />;
+              const ds = `${view.y}-${pad(view.m)}-${pad(cell)}`;
+              const count = dayCounts.get(ds) ?? 0;
+              const isSel = ds === activeDay;
+              return (
+                <button
+                  key={i}
+                  onClick={() => count > 0 && setSelectedDay(ds)}
+                  disabled={count === 0}
+                  title={count ? `${count}건` : ""}
+                  style={{
+                    aspectRatio: "1", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
+                    fontSize: 12, borderRadius: "var(--radius-sm)", border: "1px solid transparent",
+                    cursor: count ? "pointer" : "default",
+                    background: isSel ? "var(--accent)" : count ? "var(--accent-subtle)" : "transparent",
+                    color: isSel ? "#fff" : count ? "var(--accent)" : "var(--text-faint)",
+                    fontWeight: count ? 700 : 400,
+                  }}
+                >
+                  {cell}
+                  {count > 0 && <span style={{ fontSize: 8, opacity: 0.8 }}>{count}</span>}
+                </button>
+              );
+            })}
+          </div>
+          <div style={{ fontSize: 10.5, color: "var(--text-faint)", marginTop: 10 }}>
+            활동 있는 날 {dayCounts.size}일 · 파란 날짜 클릭
+          </div>
+        </div>
+
+        {/* day timeline */}
+        <div style={{ flex: 1, minWidth: 320 }}>
+          <div style={{ fontSize: 13.5, fontWeight: 700, marginBottom: 8 }}>
+            {activeDay ? `🗓️ ${activeDay} · ${dayRows.length}건` : "활동 기록 없음"}
+          </div>
+          <div style={{ background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "var(--radius-lg)", boxShadow: "var(--shadow-card)", overflow: "hidden" }}>
+            {dayRows.length === 0 && <div style={{ padding: 20, color: "var(--text-faint)", fontSize: 12.5 }}>선택한 날짜의 기록이 없습니다.</div>}
+            {dayRows.map((r, i) => {
+              const isDl = r.kind === "download";
+              return (
+                <div key={i} style={{ display: "flex", gap: 10, padding: "8px 14px", borderBottom: i < dayRows.length - 1 ? "1px solid var(--border-subtle)" : "none", borderLeft: `3px solid ${isDl ? "var(--warning)" : "transparent"}` }}>
+                  <span style={{ flexShrink: 0, fontSize: 11, color: "var(--text-faint)", fontFamily: "var(--mono)", width: 60 }}>{(r.timestamp || "").slice(11, 19)}</span>
+                  <span style={{ flexShrink: 0, fontSize: 13 }}>{isDl ? "⬇" : "🔗"}</span>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ display: "flex", gap: 6, alignItems: "baseline", flexWrap: "wrap" }}>
+                      <span style={{ fontSize: 12.5, fontWeight: 600, color: "var(--text)", wordBreak: "break-all" }}>{r.title || (isDl ? "(파일)" : r.url)}</span>
+                      {account === "(전체)" && r.account && <span style={{ fontSize: 10, color: "var(--text-faint)" }}>👤 {r.account}</span>}
+                      {isDl && r.size && <span style={{ fontSize: 10.5, color: "var(--warning)" }}>{r.size}</span>}
+                      {r.visit_count && !isDl && <span style={{ fontSize: 10, color: "var(--text-faint)" }}>{r.visit_count}회</span>}
+                    </div>
+                    <div title={r.url_raw} style={{ fontSize: 11, color: "var(--accent)", fontFamily: "var(--mono)", wordBreak: "break-all" }}>{isDl ? r.source_url || r.url : r.url}</div>
+                    {isDl && r.detail && <div style={{ fontSize: 10.5, color: "var(--text-faint)", fontFamily: "var(--mono)", wordBreak: "break-all" }}>💾 {r.detail}</div>}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      </div>
     </div>
   );
 }
 
-function SubHead({ children }: { children: React.ReactNode }) {
-  return <div style={{ fontSize: 11, fontWeight: 700, color: "var(--text-dim)", margin: "8px 0 4px", textTransform: "uppercase", letterSpacing: 0.4 }}>{children}</div>;
-}
+const navBtn: React.CSSProperties = { fontSize: 16, width: 26, height: 26, background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", color: "var(--text)", cursor: "pointer" };
 
-function KV({ k, v, mono, link }: { k: string; v: string; mono?: boolean; link?: boolean }) {
-  return (
-    <div style={{ display: "flex", gap: 8, marginTop: 2, fontSize: 11.5 }}>
-      <span style={{ flex: "0 0 60px", color: "var(--text-faint)" }}>{k}</span>
-      <span style={{ flex: 1, color: link ? "var(--accent)" : "var(--text-dim)", fontFamily: mono ? "var(--mono)" : undefined, wordBreak: "break-all" }}>{v}</span>
-    </div>
-  );
+function pad(n: number): string { return String(n).padStart(2, "0"); }
+function monthNow(): { y: number; m: number } { return { y: 2000, m: 1 }; } // no activity → arbitrary; grid still renders
+function shift(v: { y: number; m: number }, d: number): { y: number; m: number } {
+  let m = v.m + d, y = v.y;
+  if (m < 1) { m = 12; y -= 1; }
+  if (m > 12) { m = 1; y += 1; }
+  return { y, m };
 }
-
-function Tile({ label, value, tone }: { label: string; value: number; tone: "ok" | "warning" | "neutral" }) {
-  const color = tone === "warning" ? "var(--warning)" : tone === "ok" ? "var(--success)" : "var(--accent)";
-  return (
-    <div style={{ minWidth: 110, padding: "10px 14px", background: "var(--bg-panel)", border: "1px solid var(--border)", borderLeft: `3px solid ${color}`, borderRadius: "var(--radius-md)" }}>
-      <div style={{ fontSize: 11, color: "var(--text-faint)" }}>{label}</div>
-      <div style={{ fontSize: 18, fontWeight: 800, color }}>{value.toLocaleString()}</div>
-    </div>
-  );
-}
-
-function Pill({ text, color }: { text: string; color: string }) {
-  return <span style={{ fontSize: 10, fontWeight: 700, color, border: `1px solid ${color}`, borderRadius: 4, padding: "0 5px" }}>{text}</span>;
+// Grid of 42 cells (6 weeks); null for leading/trailing blanks, day-number otherwise.
+function calendarGrid(y: number, m: number): (number | null)[] {
+  const first = new Date(y, m - 1, 1).getDay(); // 0=Sun
+  const days = new Date(y, m, 0).getDate();
+  const cells: (number | null)[] = [];
+  for (let i = 0; i < first; i++) cells.push(null);
+  for (let d = 1; d <= days; d++) cells.push(d);
+  while (cells.length % 7 !== 0) cells.push(null);
+  return cells;
 }

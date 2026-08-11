@@ -21,6 +21,7 @@ from typing import Callable
 
 from parsers import (
     amcache_parser,
+    browser_cache_parser,
     browser_history_parser,
     eventlog_parser,
     jumplist_parser,
@@ -152,6 +153,13 @@ ARTIFACTS: list[ArtifactDefinition] = [
         find_paths=_by_filenames(browser_history_parser.FILENAMES),
         parse=browser_history_parser.parse,
         field_order=browser_history_parser.FIELD_ORDER,
+        category="Browser",
+    ),
+    ArtifactDefinition(
+        name=browser_cache_parser.ARTIFACT_NAME,
+        find_paths=_by_filenames(browser_cache_parser.FILENAMES),
+        parse=browser_cache_parser.parse,
+        field_order=browser_cache_parser.FIELD_ORDER,
         category="Browser",
     ),
 ]
