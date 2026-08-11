@@ -145,6 +145,71 @@ _RDP_EVENTS: dict[tuple[str, str], dict] = {
 }
 
 
+def _smb_client_ip(client_name: str) -> str:
+    """SMBServer events carry the peer as a UNC-style '\\\\10.10.10.217' (or
+    '\\\\[fe80::...]'). Strip the leading backslashes to a plain address."""
+    return (client_name or "").lstrip("\\").strip()
+
+
+# SMB / network-logon evidence, kept separate from RDP. Two providers cover
+# two host configurations: Security-Auditing 4624/4625 (LogonType 3) when
+# logon auditing is on, and SMBServer/Security (551 auth failure, 1009 session
+# auth failure) which record the client address even when Security auditing is
+# off. All are inbound (a client authenticating TO this host).
+def build_smb_history(all_results: dict) -> list[dict]:
+    """Inbound network logons and SMB session authentications, with source
+    address and account. Fed to the connection view's SMB tab so SMB and RDP
+    stay visually distinct."""
+    rows = []
+    for r in _eventlog_rows(all_results):
+        provider = r.get("Provider", "")
+        eid = str(r.get("EventID", ""))
+        ed = _parse_event_data(r.get("EventData", ""))
+
+        remote = ""
+        account = ""
+        result = ""
+        description = ""
+
+        if provider == "Microsoft-Windows-Security-Auditing" and eid in ("4624", "4625"):
+            if str(_ed_field(ed, "LogonType")) != "3":
+                continue  # only network logons; RDP (type 10) belongs to the RDP tab
+            remote = _ed_field(ed, "IpAddress", "SourceNetworkAddress")
+            account = _ed_field(ed, "TargetUserName")
+            result = "성공" if eid == "4624" else "실패"
+            description = "네트워크 로그온 성공 (SMB 등)" if eid == "4624" else "네트워크 로그온 실패 (SMB 등)"
+        elif provider == "Microsoft-Windows-SMBServer" and eid in ("551", "1009"):
+            # SMBServer nests its fields one level down under "EventData".
+            inner = ed.get("EventData") if isinstance(ed.get("EventData"), dict) else ed
+            remote = _smb_client_ip(inner.get("ClientName", ""))
+            account = inner.get("UserName") or ""
+            if eid == "551":
+                result = "실패"  # session setup / authentication failure
+                description = "SMB 인증 실패"
+            else:
+                result = ""  # 1009: session auth failure, no status/account recorded
+                description = "SMB 세션 인증 실패"
+        else:
+            continue
+
+        if not remote or remote == "-":
+            continue  # local/anonymous — no peer to place on the graph
+        rows.append(
+            {
+                "timestamp": r.get("timestamp", ""),
+                "direction": "inbound",  # a network/SMB logon is always TO this host
+                "remote_address": remote,
+                "account": account,
+                "description": description,
+                "result": result,
+                "event_id": eid,
+                "provider": provider,
+                "record_key": r.get("_record_key", ""),
+            }
+        )
+    return rows
+
+
 def build_remote_desktop_history(all_results: dict) -> list[dict]:
     """Inbound (someone connected to this host) and outbound (this host's RDP
     client connected out) Remote Desktop activity, pulled from the Security

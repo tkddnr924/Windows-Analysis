@@ -104,6 +104,7 @@ def run_host(case_id: str, host_id: str, cases_dir: Path, only: set[str] | None 
         "RegistryFindings": processing.build_registry_findings,
         "BrowserActivity": processing.build_browser_history,
         "RemoteDesktopHistory": correlate.build_remote_desktop_history,
+        # "SmbHistory": correlate.build_smb_history,  # deferred — needs a sample with SMB logon data
         "PowerShellHistory": correlate.build_powershell_history,
     }
     for output_name, builder in overview_builders.items():
