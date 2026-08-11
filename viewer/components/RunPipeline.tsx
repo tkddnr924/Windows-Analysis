@@ -134,6 +134,15 @@ export default function RunPipeline({ activeCase, onBack, onChanged, onOpenHost,
     run.cancel();
   }
 
+  // Parse every host in the case, one after another (run.start resolves when a
+  // host finishes). The global progress bar tracks whichever host is running.
+  async function handleRunAll() {
+    const only = selectedArtifacts.size === artifacts.length ? undefined : Array.from(selectedArtifacts);
+    for (const h of hosts) {
+      await run.start({ caseId: activeCase.id, hostId: h.id, hostName: h.name, only, totalArtifacts: artifacts.length });
+    }
+  }
+
   async function handleDelete(hostId: string) {
     setDeleting(true);
     try {
@@ -148,7 +157,7 @@ export default function RunPipeline({ activeCase, onBack, onChanged, onOpenHost,
   const barColor = hadError ? "var(--danger)" : run.runComplete ? "var(--success)" : "var(--accent)";
 
   return (
-    <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", padding: 24, gap: 22, overflow: "auto", maxWidth: 980, margin: "0 auto", width: "100%" }}>
+    <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", padding: 24, gap: 22, overflow: "hidden", maxWidth: 980, margin: "0 auto", width: "100%" }}>
       {/* breadcrumb */}
       <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
         <button onClick={onBack} style={{ background: "transparent", border: "none", color: "var(--accent)", cursor: "pointer", fontSize: 12.5, fontWeight: 600 }}>
@@ -213,9 +222,21 @@ export default function RunPipeline({ activeCase, onBack, onChanged, onOpenHost,
       )}
 
       {/* host list */}
-      <section style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 120 }}>
-        <h3 style={{ margin: "0 0 10px", fontSize: 13.5 }}>🖥️ 호스트 목록</h3>
-        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+      <section style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, margin: "0 0 10px" }}>
+          <h3 style={{ margin: 0, fontSize: 13.5 }}>🖥️ 호스트 목록</h3>
+          {hosts.length > 1 && (
+            <button
+              onClick={handleRunAll}
+              disabled={!!runningHostId || selectedArtifacts.size === 0}
+              title="이 케이스의 모든 호스트를 순서대로 파싱"
+              style={{ ...primaryButtonStyle, padding: "5px 12px", fontSize: 12, opacity: !!runningHostId || selectedArtifacts.size === 0 ? 0.5 : 1 }}
+            >
+              ▶ 전체 파싱 ({hosts.length})
+            </button>
+          )}
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 10, overflow: "auto", flex: 1, minHeight: 0, paddingRight: 4 }}>
           {hosts.length === 0 && (
             <div style={{ padding: 24, textAlign: "center", color: "var(--text-faint)", border: "1px dashed var(--border)", borderRadius: "var(--radius-lg)" }}>
               이 케이스에 호스트가 없습니다. 위에서 호스트를 추가하세요.
