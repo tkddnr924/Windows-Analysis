@@ -25,10 +25,14 @@ from regipy.utils import convert_wintime
 from common.hive_recovery import open_hive
 from common.utils import UTC, format_timestamp
 
-# regipy logs a warning for every binary value it can't render as text and for
-# damaged cells; on a full hive dump that's constant noise, and the value is
-# still returned (as hex), so silence it.
-logging.getLogger("regipy").setLevel(logging.ERROR)
+# regipy is chatty on a full-hive dump: a warning for every binary value it
+# can't render as text, and an ERROR ("Could not parse VK at …, registry hive
+# is probably corrupted.") for every damaged/slack cell it hits near a hive's
+# tail. Neither is fatal — _collect() keeps everything read before the bad cell
+# and _dump_hive() records the damage in-band as a `_status=corrupted` row — so
+# it's pure console noise. Silence regipy entirely (CRITICAL) and rely on the
+# in-data damage markers instead.
+logging.getLogger("regipy").setLevel(logging.CRITICAL)
 
 ARTIFACT_NAME = "Registry"
 # System hives by exact name; per-user hives by suffix (the collector prefixes
