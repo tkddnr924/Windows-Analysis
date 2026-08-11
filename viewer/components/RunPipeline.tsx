@@ -1,13 +1,16 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import type { Case, Host, PipelineLogEntry } from "@/lib/types";
+import type { Case, Host } from "@/lib/types";
+import type { PipelineRun } from "@/lib/usePipelineRun";
 
 interface RunPipelineProps {
   activeCase: Case;
   onBack: () => void;
   onChanged: () => void;
   onOpenHost: (h: Host) => void;
+  /** Shared parse state, hoisted to Home so it survives screen changes. */
+  run: PipelineRun;
 }
 
 const primaryButtonStyle: React.CSSProperties = {
@@ -63,7 +66,7 @@ function StatusPill({ status }: { status: string | null }) {
   return <span style={{ fontSize: 11, color: "var(--text-faint)", background: "var(--bg-elevated)", padding: "2px 8px", borderRadius: "var(--radius-lg)" }}>미실행</span>;
 }
 
-export default function RunPipeline({ activeCase, onBack, onChanged, onOpenHost }: RunPipelineProps) {
+export default function RunPipeline({ activeCase, onBack, onChanged, onOpenHost, run }: RunPipelineProps) {
   const hosts = activeCase.hosts;
 
   const [newHostName, setNewHostName] = useState("");
@@ -72,57 +75,20 @@ export default function RunPipeline({ activeCase, onBack, onChanged, onOpenHost 
 
   const [artifacts, setArtifacts] = useState<string[]>([]);
   const [selectedArtifacts, setSelectedArtifacts] = useState<Set<string>>(new Set());
-  const [runningHostId, setRunningHostId] = useState<string | null>(null);
-  const [logs, setLogs] = useState<PipelineLogEntry[]>([]);
-  const [currentArtifact, setCurrentArtifact] = useState<string | null>(null);
-  const [doneArtifacts, setDoneArtifacts] = useState<Set<string>>(new Set());
-  const [totalSteps, setTotalSteps] = useState(0);
-  const [completedSteps, setCompletedSteps] = useState(0);
-  const [runComplete, setRunComplete] = useState(false);
   const [showLog, setShowLog] = useState(false);
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
   const [deleting, setDeleting] = useState(false);
   const logEndRef = useRef<HTMLDivElement>(null);
-  // Latest section header seen ("=== X ==="). A section is only counted as
-  // done once the NEXT section starts — so the ref lets us also flush the very
-  // last section on completion, which otherwise never gets a following header
-  // (e.g. an Amcache-only run ends on "_OVERVIEW", or the last artifact of a
-  // full run), leaving its ✓ and the step counter permanently one short.
-  const currentRef = useRef<string | null>(null);
 
-  // Mark the current section as done (✓) — an artifact is finished once the
-  // NEXT section starts (or the run ends). This does NOT advance the step
-  // counter; that happens when a section STARTS (see onPipelineLog) so the bar
-  // moves at the start of every step, the first one included, instead of
-  // lagging a step behind.
-  function flushCurrentSection() {
-    const prev = currentRef.current;
-    if (prev) setDoneArtifacts((done) => new Set(done).add(prev));
-    currentRef.current = null;
-  }
+  // The parse state (runningHostId, logs, progress, …) lives in the `run` hook
+  // hoisted to Home so it survives navigating away mid-parse.
+  const { runningHostId, logs, currentArtifact, doneArtifacts, totalSteps, completedSteps, percent, stepLabel, hadError } = run;
 
   useEffect(() => {
     window.api.listArtifacts().then((names) => {
       setArtifacts(names);
       setSelectedArtifacts(new Set(names));
     });
-  }, []);
-
-  useEffect(() => {
-    const unsubscribe = window.api.onPipelineLog((entry) => {
-      setLogs((prev) => [...prev, entry]);
-      const match = entry.line.match(/^=== (.+) ===$/);
-      if (match) {
-        flushCurrentSection();
-        currentRef.current = match[1];
-        setCurrentArtifact(match[1]);
-        // Count the section as it starts. Exactly totalSteps (artifacts + the
-        // _OVERVIEW section) headers are emitted, so this reaches 100% on the
-        // final section — capped at 99% until runComplete flips it to 100.
-        setCompletedSteps((c) => c + 1);
-      }
-    });
-    return unsubscribe;
   }, []);
 
   useEffect(() => {
@@ -156,28 +122,16 @@ export default function RunPipeline({ activeCase, onBack, onChanged, onOpenHost 
     });
   }
 
-  async function handleRun(hostId: string) {
+  function handleRun(hostId: string) {
+    const host = hosts.find((h) => h.id === hostId);
     const only = selectedArtifacts.size === artifacts.length ? undefined : Array.from(selectedArtifacts);
-    setRunningHostId(hostId);
-    setLogs([]);
-    currentRef.current = null;
-    setCurrentArtifact(null);
-    setDoneArtifacts(new Set());
-    setCompletedSteps(0);
-    setRunComplete(false);
-    setTotalSteps((only ? only.length : artifacts.length) + 1);
-
-    await window.api.runHost({ caseId: activeCase.id, hostId, only });
-
-    flushCurrentSection(); // ✓ the final section (last artifact / _OVERVIEW)
-    setRunningHostId(null);
-    setCurrentArtifact(null);
-    setRunComplete(true);
-    onChanged();
+    // run.start awaits the child process and refreshes the case list (Home's
+    // onDone) on completion — so the host list here updates without onChanged.
+    run.start({ caseId: activeCase.id, hostId, hostName: host?.name ?? "", only, totalArtifacts: artifacts.length });
   }
 
-  async function handleCancel() {
-    await window.api.cancelPipeline();
+  function handleCancel() {
+    run.cancel();
   }
 
   async function handleDelete(hostId: string) {
@@ -191,18 +145,7 @@ export default function RunPipeline({ activeCase, onBack, onChanged, onOpenHost 
     }
   }
 
-  const hadError = logs.some((l) => l.line.includes("failed:") || l.line.includes("Traceback"));
-  const percent = runComplete
-    ? 100
-    : runningHostId && totalSteps > 0
-      ? Math.min(99, Math.round((completedSteps / totalSteps) * 100))
-      : 0;
-  const stepLabel = runComplete
-    ? hadError ? "완료 (일부 오류)" : "완료"
-    : currentArtifact === "_OVERVIEW"
-      ? "종합 분석 생성 중…"
-      : currentArtifact ? `${currentArtifact} 파싱 중…` : runningHostId ? "준비 중…" : "대기 중";
-  const barColor = hadError ? "var(--danger)" : runComplete ? "var(--success)" : "var(--accent)";
+  const barColor = hadError ? "var(--danger)" : run.runComplete ? "var(--success)" : "var(--accent)";
 
   return (
     <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", padding: 24, gap: 22, overflow: "auto", maxWidth: 980, margin: "0 auto", width: "100%" }}>
