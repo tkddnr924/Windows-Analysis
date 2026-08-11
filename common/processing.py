@@ -21,6 +21,7 @@ import codecs
 import datetime as _dt
 import json
 import struct
+import urllib.parse
 
 from common.utils import UTC, format_timestamp
 
@@ -870,4 +871,97 @@ def build_registry_findings(all_results: dict) -> list[dict]:
     rows += _rf_shares(system)
     rows += _rf_sql_auth(software)
     rows += _rf_autoruns(all_results)
+    return rows
+
+
+# --- BrowserActivity ("브라우저 활동") -----------------------------------------
+# Per-account view of the parsed Chrome History: visited URLs and downloaded
+# files, with Chrome's WebKit timestamps converted and percent-encoded URLs
+# decoded to readable text (so "%EC%B0%A8%EB%9F%89" reads as "차량"). Downloads
+# carry the page they came from (tab_url) so a visit ↔ download links up.
+
+_BH_KEYS = (
+    "account", "kind", "timestamp", "title", "url", "url_raw",
+    "visit_count", "typed_count", "detail", "size", "mime", "danger", "source_url",
+)
+
+
+def _bh_row(**kw) -> dict:
+    r = {k: "" for k in _BH_KEYS}
+    r.update(kw)
+    return r
+
+
+def _chrome_time(value) -> str:
+    """Chrome/WebKit time = microseconds since 1601-01-01 UTC."""
+    try:
+        v = int(value)
+    except (ValueError, TypeError):
+        return ""
+    if v <= 0:
+        return ""
+    try:
+        dt = _dt.datetime(1601, 1, 1) + _dt.timedelta(microseconds=v)
+        return format_timestamp(dt.isoformat(), source_tz=UTC)
+    except (OverflowError, ValueError):
+        return ""
+
+
+def _url_decode(url: str) -> str:
+    if not url:
+        return ""
+    try:
+        return urllib.parse.unquote(url)
+    except (ValueError, TypeError):
+        return url
+
+
+def _human_bytes(value) -> str:
+    try:
+        n = int(value)
+    except (ValueError, TypeError):
+        return ""
+    if n < 0:
+        return ""
+    units = ["B", "KB", "MB", "GB", "TB"]
+    f = float(n)
+    for u in units:
+        if f < 1024 or u == units[-1]:
+            return f"{int(f)} {u}" if u == "B" else f"{f:.1f} {u}"
+        f /= 1024
+    return f"{n} B"
+
+
+def _browser_histories(all_results: dict):
+    for fname, tables in all_results.get("BrowserHistory", {}).items():
+        account = fname[: -len("_Chrome_History")] if fname.endswith("_Chrome_History") else fname
+        if isinstance(tables, dict):
+            yield account, tables
+
+
+def build_browser_history(all_results: dict) -> list[dict]:
+    rows: list[dict] = []
+    for account, tables in _browser_histories(all_results):
+        for u in tables.get("urls", []):
+            raw = u.get("url", "")
+            rows.append(_bh_row(
+                account=account, kind="visit",
+                timestamp=_chrome_time(u.get("last_visit_time", "")),
+                title=u.get("title", ""), url=_url_decode(raw), url_raw=raw,
+                visit_count=str(u.get("visit_count", "") or ""),
+                typed_count=str(u.get("typed_count", "") or ""),
+            ))
+        for d in tables.get("downloads", []):
+            tgt = d.get("target_path", "") or d.get("current_path", "")
+            src = d.get("tab_url", "") or d.get("referrer", "") or d.get("site_url", "")
+            danger = d.get("danger_type", "")
+            rows.append(_bh_row(
+                account=account, kind="download",
+                timestamp=_chrome_time(d.get("start_time", "")),
+                title=_basename(_url_decode(tgt)), detail=_url_decode(tgt),
+                url=_url_decode(src), url_raw=src, source_url=_url_decode(src),
+                size=_human_bytes(d.get("total_bytes", "") or d.get("received_bytes", "")),
+                mime=d.get("mime_type", ""),
+                danger=danger if danger not in ("", "0") else "",
+            ))
     return rows
