@@ -377,29 +377,56 @@ const EVENT_LABELS: Record<string, string> = {
   "4672": "특수 권한 부여", "4776": "자격증명 검증",
 };
 const CREATE_LIKE = new Set(["4720", "4726", "4738", "4781", "4728", "4732", "4756"]);
+const evPgBtn = (disabled: boolean): React.CSSProperties => ({ fontSize: 11.5, padding: "3px 10px", background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", color: "var(--text-dim)", cursor: disabled ? "default" : "pointer", opacity: disabled ? 0.4 : 1 });
 
-function eventSummary(row: Row): string {
-  let ed: Record<string, unknown> = {};
+function parseEd(row: Row): Record<string, unknown> {
   try {
-    ed = row.EventData ? JSON.parse(row.EventData) : {};
+    return row.EventData ? JSON.parse(row.EventData) : {};
   } catch {
-    ed = {};
+    return {};
   }
-  const get = (...keys: string[]) => {
-    for (const k of keys) if (ed[k] !== undefined && ed[k] !== "" && ed[k] !== "-") return String(ed[k]);
+}
+
+// Flatten nested EventData (e.g. 1149's EventXML.{Param1,Param2,…}) into
+// "Key" / "Parent.Child" string pairs, so nested objects show their real values
+// instead of "[object Object]".
+function flattenEd(obj: unknown, prefix = ""): [string, string][] {
+  if (!obj || typeof obj !== "object") return [];
+  const out: [string, string][] = [];
+  for (const [k, v] of Object.entries(obj as Record<string, unknown>)) {
+    const key = prefix ? `${prefix}.${k}` : k;
+    if (v && typeof v === "object" && !Array.isArray(v)) out.push(...flattenEd(v, key));
+    else out.push([key, Array.isArray(v) ? v.join(", ") : String(v ?? "")]);
+  }
+  return out;
+}
+
+// One-line summary of an event from its (flattened) data — labeled fields first,
+// falling back to the first few short values for events (like 1149) that stash
+// everything in unlabeled EventXML params.
+function eventSummary(row: Row): string {
+  const flat = flattenEd(parseEd(row));
+  const val = (...pats: RegExp[]) => {
+    for (const [k, v] of flat) if (v && v !== "-" && pats.some((p) => p.test(k))) return v;
     return "";
   };
   const parts: string[] = [];
-  const target = get("TargetUserName", "MemberName");
-  const actor = get("SubjectUserName");
-  const group = get("TargetGroupName", "GroupName");
-  const logonType = get("LogonType");
-  const ip = get("IpAddress", "ClientAddress");
+  const target = val(/target.*user|membername/i);
+  const group = val(/group.*name/i);
+  const actor = val(/subject.*user/i);
+  const logon = val(/logontype/i);
+  const ip = val(/ipaddress|clientaddress|\baddress\b/i);
   if (target) parts.push(`대상: ${target}`);
   if (group) parts.push(`그룹: ${group}`);
   if (actor && actor !== target) parts.push(`수행: ${actor}`);
-  if (logonType) parts.push(`로그온타입 ${logonType}`);
-  if (ip && ip !== "-" && ip !== "::1" && ip !== "127.0.0.1") parts.push(`IP ${ip}`);
+  if (logon) parts.push(`로그온타입 ${logon}`);
+  if (ip && !["::1", "127.0.0.1", "-"].includes(ip)) parts.push(`IP ${ip}`);
+  if (parts.length === 0) {
+    for (const [, v] of flat) {
+      if (v && v.length <= 48 && v !== "-" && !/^\d+$/.test(v)) parts.push(v);
+      if (parts.length >= 3) break;
+    }
+  }
   return parts.join(" · ");
 }
 
@@ -407,6 +434,8 @@ function AccountDetailPage({ account, onBack, loadEvents }: { account: Account; 
   const [events, setEvents] = useState<Row[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [selectedEvent, setSelectedEvent] = useState<Row | null>(null);
+  const [evPage, setEvPage] = useState(0);
+  const EV_PAGE_SIZE = 100;
 
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
@@ -428,7 +457,13 @@ function AccountDetailPage({ account, onBack, loadEvents }: { account: Account; 
     return () => { cancelled = true; };
   }, [account.sid, account.username, loadEvents]);
 
+  useEffect(() => setEvPage(0), [events]);
+
   const hijack = account.rid && account.ridSam && account.rid !== account.ridSam;
+  const evCount = events?.length ?? 0;
+  const evPageCount = Math.max(1, Math.ceil(evCount / EV_PAGE_SIZE));
+  const evSafePage = Math.min(evPage, evPageCount - 1);
+  const pagedEvents = (events ?? []).slice(evSafePage * EV_PAGE_SIZE, (evSafePage + 1) * EV_PAGE_SIZE);
 
   return (
     <div style={{ flex: 1, minHeight: 0, overflow: "auto", padding: "18px 24px" }}>
@@ -478,7 +513,7 @@ function AccountDetailPage({ account, onBack, loadEvents }: { account: Account; 
           {loadEvents && !loading && events && events.length > 0 && (
             <div style={{ fontSize: 10.5, color: "var(--text-faint)", marginBottom: 4 }}>행을 클릭하면 이벤트 전체 내용을 봅니다.</div>
           )}
-          {loadEvents && !loading && events && events.map((r, i) => {
+          {loadEvents && !loading && events && pagedEvents.map((r, i) => {
             const eid = r.EventID || "";
             const isCreate = CREATE_LIKE.has(eid);
             const label = EVENT_LABELS[eid] || `Event ${eid}`;
@@ -489,7 +524,7 @@ function AccountDetailPage({ account, onBack, loadEvents }: { account: Account; 
                 onClick={() => setSelectedEvent(r)}
                 onMouseEnter={(e) => (e.currentTarget.style.background = "var(--bg-hover)")}
                 onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
-                style={{ padding: "7px 8px", margin: "0 -8px", borderRadius: "var(--radius-sm)", borderBottom: i < events.length - 1 ? "1px solid var(--border-subtle)" : "none", borderLeft: isCreate ? "3px solid var(--warning)" : undefined, cursor: "pointer" }}
+                style={{ padding: "7px 8px", margin: "0 -8px", borderRadius: "var(--radius-sm)", borderBottom: i < pagedEvents.length - 1 ? "1px solid var(--border-subtle)" : "none", borderLeft: isCreate ? "3px solid var(--warning)" : undefined, cursor: "pointer" }}
               >
                 <div style={{ display: "flex", gap: 8, alignItems: "baseline", flexWrap: "wrap" }}>
                   <span style={{ flexShrink: 0, fontSize: 10.5, color: "var(--text-faint)", fontFamily: "var(--mono)" }}>{r.timestamp}</span>
@@ -500,6 +535,13 @@ function AccountDetailPage({ account, onBack, loadEvents }: { account: Account; 
               </div>
             );
           })}
+          {loadEvents && !loading && evPageCount > 1 && (
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 6, marginTop: 10 }}>
+              <button onClick={() => setEvPage(evSafePage - 1)} disabled={evSafePage === 0} style={evPgBtn(evSafePage === 0)}>‹ 이전</button>
+              <span style={{ fontSize: 11.5, color: "var(--text-dim)" }}>{evSafePage + 1} / {evPageCount} 쪽 <span style={{ color: "var(--text-faint)" }}>({evCount.toLocaleString()}건)</span></span>
+              <button onClick={() => setEvPage(evSafePage + 1)} disabled={evSafePage >= evPageCount - 1} style={evPgBtn(evSafePage >= evPageCount - 1)}>다음 ›</button>
+            </div>
+          )}
         </Card>
       </div>
 
@@ -519,17 +561,14 @@ function EventDetailModal({ row, onClose }: { row: Row; onClose: () => void }) {
 
   const eid = row.EventID || "";
   const label = EVENT_LABELS[eid] || `Event ${eid}`;
-  let ed: Record<string, unknown> = {};
-  try {
-    ed = row.EventData ? JSON.parse(row.EventData) : {};
-  } catch {
-    ed = {};
-  }
+  const summary = eventSummary(row);
   // System/meta columns to show (skip internal + the raw EventData blob, which
   // is expanded field-by-field below).
   const META_ORDER = ["timestamp", "EventID", "LevelName", "Provider", "Channel", "Computer", "EventRecordID", "ProcessID", "ThreadID", "UserID", "_log", "_record_key"];
   const meta = META_ORDER.filter((k) => row[k]).map((k) => [k, row[k]] as [string, string]);
-  const edEntries = Object.entries(ed).filter(([, v]) => v !== "" && v !== null && v !== undefined);
+  // Flatten so nested objects (e.g. 1149 EventXML) expand into readable rows
+  // rather than "[object Object]".
+  const edEntries = flattenEd(parseEd(row)).filter(([, v]) => v !== "");
 
   return (
     <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(1,4,9,0.7)", zIndex: 300, display: "flex", alignItems: "center", justifyContent: "center", padding: 24 }}>
@@ -541,6 +580,7 @@ function EventDetailModal({ row, onClose }: { row: Row; onClose: () => void }) {
           <button onClick={onClose} title="닫기 (Esc)" style={{ background: "transparent", border: "none", color: "var(--text-dim)", fontSize: 20, cursor: "pointer", lineHeight: 1, padding: "0 4px" }}>×</button>
         </div>
         <div style={{ padding: "6px 16px 16px", overflow: "auto" }}>
+          {summary && <div style={{ fontSize: 12.5, color: "var(--text-dim)", padding: "4px 0 8px" }}>{summary}</div>}
           <div style={{ fontSize: 11, fontWeight: 700, color: "var(--text-faint)", margin: "8px 0 2px" }}>이벤트</div>
           {meta.map(([k, v]) => (
             <DetailRow key={k} label={k} value={v} mono={k === "_record_key" || k === "UserID"} />

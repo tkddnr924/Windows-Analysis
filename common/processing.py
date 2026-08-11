@@ -472,7 +472,26 @@ def _accounts(sam: list, software: list) -> list[dict]:
             account_flags=f.get("account_flags", ""),
             timestamp=f.get("last_login", "") or created,
         ))
+
+    # Accounts that have a profile but no SAM entry — virtual service accounts
+    # (S-1-5-80-…, e.g. NT SERVICE\MSSQLSERVER), well-known identities, and
+    # domain users. They're real accounts on this host; without this they'd be
+    # missing entirely (SAM only holds local security-principal accounts).
+    emitted = {r["name"] for r in rows if r["name"]}
+    for sid, path in profiles.items():
+        if sid in emitted:
+            continue
+        rows.append(_ti_row(
+            category="Account", name=sid, value=path, source_artifact="ProfileList",
+            username=_WELL_KNOWN_SIDS.get(sid) or _basename(path.rstrip("\\")) or sid,
+            home_directory=path,
+        ))
     return rows
+
+
+_WELL_KNOWN_SIDS = {
+    "S-1-5-18": "LocalSystem", "S-1-5-19": "LocalService", "S-1-5-20": "NetworkService",
+}
 
 
 def _networks(software: list) -> list[dict]:
