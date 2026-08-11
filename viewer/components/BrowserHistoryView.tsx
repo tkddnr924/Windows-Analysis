@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { CsvData } from "@/lib/types";
 
 type Row = Record<string, string>;
@@ -20,13 +20,14 @@ export default function BrowserHistoryView({ data }: Props) {
   const [month, setMonth] = useState<{ y: number; m: number } | null>(null);
   const [kinds, setKinds] = useState<Set<string>>(new Set(["visit", "download", "cache"]));
   const [detail, setDetail] = useState<Row | null>(null);
+  const [page, setPage] = useState(0);
 
   const KINDS = [
     { k: "visit", label: "🔗 방문" },
     { k: "download", label: "⬇ 다운로드" },
     { k: "cache", label: "📦 리소스(캐시)" },
   ];
-  const DAY_CAP = 1000; // rendered rows per day (cache can be huge)
+  const PAGE_SIZE = 300; // rows per page (a busy day can hold thousands of cache hits)
 
   const accounts = useMemo(() => {
     const s = new Set<string>();
@@ -67,6 +68,12 @@ export default function BrowserHistoryView({ data }: Props) {
     () => scoped.filter((r) => dayOf(r.timestamp) === activeDay).sort((a, b) => (a.timestamp || "").localeCompare(b.timestamp || "")),
     [scoped, activeDay]
   );
+
+  // Reset to the first page whenever the day / account / kind filter changes.
+  useEffect(() => setPage(0), [activeDay, account, kinds]);
+  const pageCount = Math.max(1, Math.ceil(dayRows.length / PAGE_SIZE));
+  const safePage = Math.min(page, pageCount - 1);
+  const pagedRows = dayRows.slice(safePage * PAGE_SIZE, (safePage + 1) * PAGE_SIZE);
 
   const grid = useMemo(() => calendarGrid(view.y, view.m), [view]);
 
@@ -179,7 +186,7 @@ export default function BrowserHistoryView({ data }: Props) {
           </div>
           <div style={{ background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "var(--radius-lg)", boxShadow: "var(--shadow-card)", overflow: "hidden" }}>
             {dayRows.length === 0 && <div style={{ padding: 20, color: "var(--text-faint)", fontSize: 12.5 }}>선택한 날짜의 기록이 없습니다.</div>}
-            {dayRows.slice(0, DAY_CAP).map((r, i, arr) => {
+            {pagedRows.map((r, i, arr) => {
               const isDl = r.kind === "download";
               const isCache = r.kind === "cache";
               const icon = isDl ? "⬇" : isCache ? "📦" : "🔗";
@@ -208,12 +215,18 @@ export default function BrowserHistoryView({ data }: Props) {
                 </div>
               );
             })}
-            {dayRows.length > DAY_CAP && (
-              <div style={{ padding: "8px 14px", fontSize: 11.5, color: "var(--text-faint)" }}>
-                …외 {(dayRows.length - DAY_CAP).toLocaleString()}건 더 (전체는 원본 캐시 테이블에서 확인)
-              </div>
-            )}
           </div>
+          {pageCount > 1 && (
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8, marginTop: 10 }}>
+              <button onClick={() => setPage(0)} disabled={safePage === 0} style={pgBtn(safePage === 0)}>«</button>
+              <button onClick={() => setPage(safePage - 1)} disabled={safePage === 0} style={pgBtn(safePage === 0)}>‹ 이전</button>
+              <span style={{ fontSize: 12, color: "var(--text-dim)", minWidth: 120, textAlign: "center" }}>
+                {safePage + 1} / {pageCount} 쪽 <span style={{ color: "var(--text-faint)" }}>({(safePage * PAGE_SIZE + 1).toLocaleString()}–{Math.min((safePage + 1) * PAGE_SIZE, dayRows.length).toLocaleString()} / {dayRows.length.toLocaleString()})</span>
+              </span>
+              <button onClick={() => setPage(safePage + 1)} disabled={safePage >= pageCount - 1} style={pgBtn(safePage >= pageCount - 1)}>다음 ›</button>
+              <button onClick={() => setPage(pageCount - 1)} disabled={safePage >= pageCount - 1} style={pgBtn(safePage >= pageCount - 1)}>»</button>
+            </div>
+          )}
         </div>
       </div>
 
@@ -224,6 +237,7 @@ export default function BrowserHistoryView({ data }: Props) {
 
 const navBtn: React.CSSProperties = { fontSize: 15, minWidth: 24, height: 24, padding: 0, background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", color: "var(--text)", cursor: "pointer" };
 const jumpBtn: React.CSSProperties = { flex: 1, fontSize: 11, padding: "3px 6px", background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", color: "var(--text-dim)", cursor: "pointer", whiteSpace: "nowrap" };
+const pgBtn = (disabled: boolean): React.CSSProperties => ({ fontSize: 12, padding: "4px 10px", background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", color: "var(--text-dim)", cursor: disabled ? "default" : "pointer", opacity: disabled ? 0.4 : 1, whiteSpace: "nowrap" });
 
 const KIND_LABEL: Record<string, string> = { visit: "🔗 방문", download: "⬇ 다운로드", cache: "📦 리소스(캐시)" };
 
