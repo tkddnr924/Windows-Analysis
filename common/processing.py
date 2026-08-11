@@ -953,6 +953,8 @@ def build_browser_history(all_results: dict) -> list[dict]:
     # already formats its timestamps, so reuse them as-is.
     for account, tables in _browser_caches(all_results):
         for c in tables.get("CacheEntries", []):
+            # When the response was received (revalidations included); fall back
+            # to the entry's creation time, which is always present.
             ts = c.get("response_time") or c.get("creation_time") or ""
             url = c.get("url", "")
             if not ts or not url:

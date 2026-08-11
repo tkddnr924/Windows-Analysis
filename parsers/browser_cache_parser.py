@@ -105,22 +105,36 @@ class _Cache:
         return data[off: off + length]
 
 
+# A cached response time is a base::Time (µs since 1601) — the request/response
+# times sit in the pickle header right before the "HTTP/1." status line, but
+# their exact offset drifts between Chrome versions (an extra int or two creeps
+# in). Rather than hard-code an offset, scan that leading region for int64s that
+# fall in a sane calendar window (~1990–2110) — robust across versions.
+_TIME_LO = 12_000_000_000_000_000  # ~1981
+_TIME_HI = 16_000_000_000_000_000  # ~2108
+
+
+def _scan_times(blob: bytes) -> list[int]:
+    times = []
+    for off in range(0, max(0, len(blob) - 8), 4):
+        v = struct.unpack_from("<q", blob, off)[0]
+        if _TIME_LO < v < _TIME_HI:
+            times.append(v)
+    return times
+
+
 def _parse_headers(stream0: bytes) -> dict:
-    """Pull request/response times and the HTTP response headers out of a
-    serialized HttpResponseInfo. Robust to version drift: times are read at
-    their fixed pickle offsets, headers by locating the 'HTTP/1.' status line
-    and reading the following NUL-separated header list."""
+    """Decode a serialized HttpResponseInfo: request/response times (scanned
+    from the pickle header) and the HTTP response headers (located by the
+    'HTTP/1.' status line, then read as a NUL-separated list)."""
     out = {"request_time": "", "response_time": "", "status": "", "all_headers": "", "headers": {}}
-    if len(stream0) >= 24:
-        # Pickle: [payload_size u32][flags i32][request_time i64][response_time i64]…
-        try:
-            out["request_time"] = _chrome_time(struct.unpack_from("<q", stream0, 8)[0])
-            out["response_time"] = _chrome_time(struct.unpack_from("<q", stream0, 16)[0])
-        except struct.error:
-            pass
     i = stream0.find(b"HTTP/1.")
     if i == -1:
         i = stream0.find(b"HTTP/2")
+    times = _scan_times(stream0[: i if i != -1 else 64])
+    if times:
+        out["request_time"] = _chrome_time(min(times))
+        out["response_time"] = _chrome_time(max(times))
     if i != -1:
         end = stream0.find(b"\x00\x00", i)
         blob = stream0[i: end if end != -1 else len(stream0)]
