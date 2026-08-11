@@ -89,7 +89,7 @@ export interface ArtifactViewSpec {
    * Overview correlations (TargetInfo, ...) read as summaries/dashboards, not
    * spreadsheets, so each gets a purpose-built view.
    */
-  customView?: "targetInfo" | "executionHistory" | "powershellFlow" | "defender" | "registryFindings" | "rdpCache";
+  customView?: "targetInfo" | "executionHistory" | "powershellFlow" | "defender" | "registryFindings" | "rdpCache" | "browserHistory";
   /**
    * In the sidebar, present this table split by this column: instead of one
    * row for the whole table, the category lists one entry per distinct value
@@ -231,6 +231,25 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
         { key: "sha1", kind: "hash" },
       ]},
     ],
+  },
+
+  BrowserActivity: {
+    customView: "browserHistory",
+    title: (r) => r.title || r.url || "(no url)",
+    subtitle: (r) => r.url || "",
+    badges: [{ key: "kind", kind: "badge" }],
+    priorityColumns: ["account", "kind", "timestamp", "title", "url", "size", "source_url"],
+    sections: [{ heading: "상세", fields: [
+      { key: "account", label: "계정" },
+      { key: "kind", label: "종류" },
+      { key: "url", label: "URL(디코딩)" },
+      { key: "url_raw", label: "URL(원본)" },
+      { key: "visit_count", label: "방문 횟수" },
+      { key: "detail", label: "저장 경로" },
+      { key: "source_url", label: "출처" },
+      { key: "size", label: "크기" },
+      { key: "mime", label: "유형" },
+    ]}],
   },
 
   RegistryFindings: {
