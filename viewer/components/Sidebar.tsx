@@ -291,26 +291,30 @@ interface PinnedNavRowProps {
   count?: number;
   selected: boolean;
   onClick: () => void;
+  /** When true the row shows a spinner and is not clickable (background work
+   * — e.g. the master timeline — is still building). */
+  busy?: boolean;
 }
 
-function PinnedNavRow({ icon, label, count, selected, onClick }: PinnedNavRowProps) {
+function PinnedNavRow({ icon, label, count, selected, onClick, busy }: PinnedNavRowProps) {
   return (
     <div
-      onClick={onClick}
+      onClick={busy ? undefined : onClick}
+      title={busy ? "백그라운드에서 준비 중…" : undefined}
       style={{
         display: "flex",
         alignItems: "center",
         gap: 8,
         padding: "9px 12px",
-        cursor: "pointer",
+        cursor: busy ? "progress" : "pointer",
         fontSize: 12.5,
         fontWeight: 600,
         background: selected ? "var(--bg-selected)" : "transparent",
         borderLeft: `2px solid ${selected ? "var(--accent)" : "transparent"}`,
-        color: selected ? "var(--text)" : "var(--text-dim)",
+        color: busy ? "var(--text-faint)" : selected ? "var(--text)" : "var(--text-dim)",
       }}
       onMouseEnter={(e) => {
-        if (!selected) e.currentTarget.style.background = "var(--bg-hover)";
+        if (!selected && !busy) e.currentTarget.style.background = "var(--bg-hover)";
       }}
       onMouseLeave={(e) => {
         if (!selected) e.currentTarget.style.background = "transparent";
@@ -318,7 +322,11 @@ function PinnedNavRow({ icon, label, count, selected, onClick }: PinnedNavRowPro
     >
       <span>{icon}</span>
       <span>{label}</span>
-      {count !== undefined && <span style={{ color: "var(--text-faint)", fontWeight: 400, fontSize: 11.5 }}>{count}</span>}
+      {busy ? (
+        <span className="wa-spin" style={{ marginLeft: "auto" }} />
+      ) : (
+        count !== undefined && <span style={{ color: "var(--text-faint)", fontWeight: 400, fontSize: 11.5 }}>{count}</span>
+      )}
     </div>
   );
 }
@@ -335,6 +343,9 @@ interface SidebarProps {
   activeVirtualTab: "timeline" | "bookmarks" | "connections" | null;
   onSelectDashboard: () => void;
   onSelectTimeline: () => void;
+  /** Master timeline is still building in the background — show a spinner and
+   * block the click until it's ready. */
+  timelineBusy: boolean;
   onSelectBookmarks: () => void;
   onSelectConnections: () => void;
   bookmarkCount: number;
@@ -355,6 +366,7 @@ export default function Sidebar({
   activeVirtualTab,
   onSelectDashboard,
   onSelectTimeline,
+  timelineBusy,
   onSelectBookmarks,
   onSelectConnections,
   bookmarkCount,
@@ -525,6 +537,7 @@ export default function Sidebar({
               label="통합 타임라인"
               selected={activeVirtualTab === "timeline"}
               onClick={onSelectTimeline}
+              busy={timelineBusy}
             />
           </div>
         </>

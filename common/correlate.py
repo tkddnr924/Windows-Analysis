@@ -145,6 +145,17 @@ _RDP_EVENTS: dict[tuple[str, str], dict] = {
 }
 
 
+def _bare_account(name: str) -> str:
+    """Normalize an account to just the username. Different providers report it
+    differently — bare "Administrator" from TerminalServices, "MAINDB1\\Admin"
+    from Security-Auditing — so strip any DOMAIN\\ or HOST\\ prefix so the same
+    user reads consistently across sources. Also drops a UPN "@domain" suffix."""
+    if not name:
+        return ""
+    tail = name.replace("/", "\\").split("\\")[-1]
+    return tail.split("@")[0].strip()
+
+
 def _smb_client_ip(client_name: str) -> str:
     """SMBServer events carry the peer as a UNC-style '\\\\10.10.10.217' (or
     '\\\\[fe80::...]'). Strip the leading backslashes to a plain address."""
@@ -199,7 +210,7 @@ def build_smb_history(all_results: dict) -> list[dict]:
                 "timestamp": r.get("timestamp", ""),
                 "direction": "inbound",  # a network/SMB logon is always TO this host
                 "remote_address": remote,
-                "account": account,
+                "account": _bare_account(account),
                 "description": description,
                 "result": result,
                 "event_id": eid,
@@ -231,7 +242,7 @@ def build_remote_desktop_history(all_results: dict) -> list[dict]:
                 "timestamp": r.get("timestamp", ""),
                 "direction": spec["direction"],
                 "remote_address": _ed_field(event_data, *spec["addr"]),
-                "account": _ed_field(event_data, *spec["acct"]),
+                "account": _bare_account(_ed_field(event_data, *spec["acct"])),
                 "description": spec["description"],
                 "result": spec["result"],
                 "event_id": str(r.get("EventID", "")),

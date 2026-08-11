@@ -94,3 +94,16 @@ button {
   background: #484f58;
   background-clip: padding-box;
 }
+
+/* Small inline loading spinner (used by pinned nav rows while a background
+   build — e.g. the master timeline — is still running). */
+@keyframes wa-spin { to { transform: rotate(360deg); } }
+.wa-spin {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: wa-spin 0.7s linear infinite;
+}
