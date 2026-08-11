@@ -109,7 +109,6 @@ function buildEntry(row: Row): Entry {
 
 const RISK_DOT: Record<number, string> = { 0: "transparent", 1: "var(--warning)", 2: "var(--danger)" };
 
-type FilterKey = "all" | "risk" | "unsigned" | string; // string = a source_artifact
 type SortKey = "risk" | "recent" | "oldest";
 
 const SORT_LABEL: Record<SortKey, string> = { risk: "위험순", recent: "최근순", oldest: "오래된순" };
@@ -162,7 +161,9 @@ export default function ExecutionHistoryView({
   onToggleBookmark,
   timeRange,
 }: ExecutionHistoryViewProps) {
-  const [filter, setFilter] = useState<FilterKey>("all");
+  const [disabledSources, setDisabledSources] = useState<Set<string>>(new Set());
+  const [onlyRisk, setOnlyRisk] = useState(false);
+  const [onlyUnsigned, setOnlyUnsigned] = useState(false);
   const [sort, setSort] = useState<SortKey>("risk");
   const [excludeWindows, setExcludeWindows] = useState(false);
   const [search, setSearch] = useState("");
@@ -200,9 +201,9 @@ export default function ExecutionHistoryView({
     let rows = all.filter((e) => {
       if (rangeActive(timeRange) && !inRange(e.timestamp, timeRange)) return false;
       if (excludeWindows && e.winPath) return false;
-      if (filter === "risk" && e.risk === 0) return false;
-      if (filter === "unsigned" && !e.unsigned) return false;
-      if (filter !== "all" && filter !== "risk" && filter !== "unsigned" && e.source !== filter) return false;
+      if (disabledSources.has(e.source)) return false;
+      if (onlyRisk && e.risk === 0) return false;
+      if (onlyUnsigned && !e.unsigned) return false;
       if (needle && !(e.name.toLowerCase().includes(needle) || e.path.toLowerCase().includes(needle) || e.publisher.toLowerCase().includes(needle) || e.user.toLowerCase().includes(needle))) return false;
       return true;
     });
@@ -213,7 +214,7 @@ export default function ExecutionHistoryView({
       return sort === "oldest" ? cmp : -cmp;
     });
     return rows;
-  }, [all, filter, sort, search, timeRange, excludeWindows]);
+  }, [all, disabledSources, onlyRisk, onlyUnsigned, sort, search, timeRange, excludeWindows]);
 
   const virtualizer = useVirtualizer({
     count: filtered.length,
@@ -246,16 +247,29 @@ export default function ExecutionHistoryView({
 
       {/* Filters */}
       <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "14px 20px", flexWrap: "wrap" }}>
-        <Chip active={filter === "all"} onClick={() => setFilter("all")}>전체</Chip>
-        <Chip active={filter === "risk"} onClick={() => setFilter("risk")}>⚠ 의심 {stats.risk > 0 && `(${stats.risk})`}</Chip>
-        <Chip active={filter === "unsigned"} onClick={() => setFilter("unsigned")}>미서명 {stats.unsigned > 0 && `(${stats.unsigned})`}</Chip>
+        <Chip active={onlyRisk} onClick={() => setOnlyRisk((v) => !v)}>⚠ 의심만 {stats.risk > 0 && `(${stats.risk})`}</Chip>
+        <Chip active={onlyUnsigned} onClick={() => setOnlyUnsigned((v) => !v)}>미서명만 {stats.unsigned > 0 && `(${stats.unsigned})`}</Chip>
         {sources.length > 1 && <span style={{ width: 1, height: 18, background: "var(--border)", margin: "0 2px" }} />}
         {sources.length > 1 &&
-          sources.map(([src, n]) => (
-            <Chip key={src} active={filter === src} onClick={() => setFilter(src)}>
-              {sourceMeta(src).icon} {sourceMeta(src).label} ({n})
-            </Chip>
-          ))}
+          sources.map(([src, n]) => {
+            const on = !disabledSources.has(src);
+            return (
+              <Chip
+                key={src}
+                active={on}
+                onClick={() =>
+                  setDisabledSources((prev) => {
+                    const s = new Set(prev);
+                    if (s.has(src)) s.delete(src);
+                    else s.add(src);
+                    return s;
+                  })
+                }
+              >
+                {sourceMeta(src).icon} {sourceMeta(src).label} ({n})
+              </Chip>
+            );
+          })}
         <Chip active={excludeWindows} onClick={() => setExcludeWindows((v) => !v)}>
           🚫 Windows 경로 제외 {stats.winPath > 0 && `(${stats.winPath})`}
         </Chip>
@@ -386,7 +400,7 @@ export default function ExecutionHistoryView({
       <div style={{ display: "flex", gap: 16, padding: "6px 20px", borderTop: "1px solid var(--border-subtle)", fontSize: 11.5, color: "var(--text-faint)", flexShrink: 0 }}>
         <span>
           표시 <strong style={{ color: "var(--text-dim)" }}>{filtered.length.toLocaleString()}</strong> / {stats.total.toLocaleString()}건
-          {(filter !== "all" || search.trim() || rangeActive(timeRange) || excludeWindows) && " (필터 적용됨)"}
+          {(disabledSources.size > 0 || onlyRisk || onlyUnsigned || search.trim() || rangeActive(timeRange) || excludeWindows) && " (필터 적용됨)"}
         </span>
         <span>정렬 {SORT_LABEL[sort]}</span>
       </div>

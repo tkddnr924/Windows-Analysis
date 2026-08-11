@@ -19,6 +19,7 @@ export default function BrowserHistoryView({ data }: Props) {
   const [selectedDay, setSelectedDay] = useState<string>("");
   const [month, setMonth] = useState<{ y: number; m: number } | null>(null);
   const [kinds, setKinds] = useState<Set<string>>(new Set(["visit", "download", "cache"]));
+  const [detail, setDetail] = useState<Row | null>(null);
 
   const KINDS = [
     { k: "visit", label: "🔗 방문" },
@@ -49,15 +50,18 @@ export default function BrowserHistoryView({ data }: Props) {
     return m;
   }, [scoped]);
 
-  // Default the calendar + selection to the most recent day with activity.
-  const latestDay = useMemo(() => {
-    let max = "";
-    for (const d of dayCounts.keys()) if (d > max) max = d;
-    return max;
-  }, [dayCounts]);
+  // Sorted list of days that have activity — drives latest-day default and the
+  // "이전/다음 활동일" jump buttons (skip straight to a day with records).
+  const activeDays = useMemo(() => [...dayCounts.keys()].sort(), [dayCounts]);
+  const latestDay = activeDays.length ? activeDays[activeDays.length - 1] : "";
 
   const activeDay = selectedDay || latestDay;
   const view = month ?? (activeDay ? { y: +activeDay.slice(0, 4), m: +activeDay.slice(5, 7) } : monthNow());
+
+  const dayIdx = activeDays.indexOf(activeDay);
+  const gotoDay = (d: string) => { setSelectedDay(d); setMonth(null); };
+  const prevDay = dayIdx > 0 ? activeDays[dayIdx - 1] : "";
+  const nextDay = dayIdx >= 0 && dayIdx < activeDays.length - 1 ? activeDays[dayIdx + 1] : "";
 
   const dayRows = useMemo(
     () => scoped.filter((r) => dayOf(r.timestamp) === activeDay).sort((a, b) => (a.timestamp || "").localeCompare(b.timestamp || "")),
@@ -114,10 +118,24 @@ export default function BrowserHistoryView({ data }: Props) {
       <div style={{ display: "flex", gap: 18, alignItems: "flex-start", flexWrap: "wrap" }}>
         {/* calendar */}
         <div style={{ flex: "0 0 300px", background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "var(--radius-lg)", padding: 14, boxShadow: "var(--shadow-card)" }}>
-          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
-            <button onClick={() => setMonth(shift(view, -1))} style={navBtn}>‹</button>
-            <span style={{ fontSize: 13.5, fontWeight: 700 }}>{view.y}년 {view.m}월</span>
-            <button onClick={() => setMonth(shift(view, +1))} style={navBtn}>›</button>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+            <div style={{ display: "flex", gap: 3 }}>
+              <button onClick={() => setMonth({ y: view.y - 1, m: view.m })} title="이전 해" style={navBtn}>«</button>
+              <button onClick={() => setMonth(shift(view, -1))} title="이전 달" style={navBtn}>‹</button>
+            </div>
+            <button onClick={() => latestDay && gotoDay(latestDay)} title="최근 활동일로" style={{ fontSize: 13.5, fontWeight: 700, background: "transparent", border: "none", color: "var(--text)", cursor: "pointer" }}>
+              {view.y}년 {view.m}월
+            </button>
+            <div style={{ display: "flex", gap: 3 }}>
+              <button onClick={() => setMonth(shift(view, +1))} title="다음 달" style={navBtn}>›</button>
+              <button onClick={() => setMonth({ y: view.y + 1, m: view.m })} title="다음 해" style={navBtn}>»</button>
+            </div>
+          </div>
+          {/* jump between days that actually have activity */}
+          <div style={{ display: "flex", alignItems: "center", gap: 4, marginBottom: 10 }}>
+            <button onClick={() => prevDay && gotoDay(prevDay)} disabled={!prevDay} style={{ ...jumpBtn, opacity: prevDay ? 1 : 0.4 }}>◀ 이전 활동일</button>
+            <button onClick={() => latestDay && gotoDay(latestDay)} title="최근" style={{ ...jumpBtn, flex: "0 0 auto", padding: "3px 8px" }}>최근</button>
+            <button onClick={() => nextDay && gotoDay(nextDay)} disabled={!nextDay} style={{ ...jumpBtn, opacity: nextDay ? 1 : 0.4 }}>다음 활동일 ▶</button>
           </div>
           <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 2, textAlign: "center" }}>
             {DOW.map((d, i) => (
@@ -167,7 +185,13 @@ export default function BrowserHistoryView({ data }: Props) {
               const icon = isDl ? "⬇" : isCache ? "📦" : "🔗";
               const accent = isDl ? "var(--warning)" : isCache ? "var(--border)" : "transparent";
               return (
-                <div key={i} style={{ display: "flex", gap: 10, padding: isCache ? "5px 14px" : "8px 14px", borderBottom: i < arr.length - 1 ? "1px solid var(--border-subtle)" : "none", borderLeft: `3px solid ${accent}`, opacity: isCache ? 0.82 : 1 }}>
+                <div
+                  key={i}
+                  onClick={() => setDetail(r)}
+                  onMouseEnter={(e) => (e.currentTarget.style.background = "var(--bg-hover)")}
+                  onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+                  style={{ display: "flex", gap: 10, padding: isCache ? "5px 14px" : "8px 14px", borderBottom: i < arr.length - 1 ? "1px solid var(--border-subtle)" : "none", borderLeft: `3px solid ${accent}`, opacity: isCache ? 0.82 : 1, cursor: "pointer" }}
+                >
                   <span style={{ flexShrink: 0, fontSize: 11, color: "var(--text-faint)", fontFamily: "var(--mono)", width: 60 }}>{(r.timestamp || "").slice(11, 19)}</span>
                   <span style={{ flexShrink: 0, fontSize: isCache ? 11 : 13 }}>{icon}</span>
                   <div style={{ flex: 1, minWidth: 0 }}>
@@ -192,11 +216,50 @@ export default function BrowserHistoryView({ data }: Props) {
           </div>
         </div>
       </div>
+
+      {detail && <DetailModal row={detail} onClose={() => setDetail(null)} />}
     </div>
   );
 }
 
-const navBtn: React.CSSProperties = { fontSize: 16, width: 26, height: 26, background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", color: "var(--text)", cursor: "pointer" };
+const navBtn: React.CSSProperties = { fontSize: 15, minWidth: 24, height: 24, padding: 0, background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", color: "var(--text)", cursor: "pointer" };
+const jumpBtn: React.CSSProperties = { flex: 1, fontSize: 11, padding: "3px 6px", background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", color: "var(--text-dim)", cursor: "pointer", whiteSpace: "nowrap" };
+
+const KIND_LABEL: Record<string, string> = { visit: "🔗 방문", download: "⬇ 다운로드", cache: "📦 리소스(캐시)" };
+
+function DetailModal({ row, onClose }: { row: Row; onClose: () => void }) {
+  const isDl = row.kind === "download";
+  const isCache = row.kind === "cache";
+  const fields: [string, string][] = [
+    ["종류", KIND_LABEL[row.kind] || row.kind],
+    ["계정", row.account],
+    ["시각", row.timestamp],
+    ["제목", row.title],
+    ["URL", row.url],
+    ["URL(원본)", row.url_raw && row.url_raw !== row.url ? row.url_raw : ""],
+    ...(!isDl && !isCache ? ([["방문 횟수", row.visit_count], ["입력 횟수", row.typed_count]] as [string, string][]) : []),
+    ...(isDl ? ([["출처 페이지", row.source_url], ["저장 경로", row.detail], ["크기", row.size], ["유형", row.mime]] as [string, string][]) : []),
+    ...(isCache ? ([["상태", row.status], ["Content-Type", row.mime], ["크기", row.size]] as [string, string][]) : []),
+  ];
+  return (
+    <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(1,4,9,0.6)", zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
+      <div onClick={(e) => e.stopPropagation()} style={{ width: 620, maxWidth: "100%", maxHeight: "82vh", overflow: "auto", background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "var(--radius-lg)", boxShadow: "var(--shadow-panel)" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "14px 18px", borderBottom: "1px solid var(--border)" }}>
+          <span style={{ fontSize: 15, fontWeight: 700, wordBreak: "break-all" }}>{row.title || row.url || "(기록)"}</span>
+          <button onClick={onClose} style={{ marginLeft: "auto", background: "transparent", border: "none", color: "var(--text-faint)", fontSize: 18, cursor: "pointer" }}>×</button>
+        </div>
+        <div style={{ padding: "10px 18px 18px" }}>
+          {fields.filter(([, v]) => v).map(([k, v]) => (
+            <div key={k} style={{ display: "flex", gap: 12, padding: "7px 0", borderBottom: "1px solid var(--border-subtle)" }}>
+              <span style={{ flex: "0 0 108px", color: "var(--text-faint)", fontSize: 12 }}>{k}</span>
+              <span style={{ flex: 1, color: "var(--text)", fontSize: 12.5, fontFamily: k.startsWith("URL") || k.includes("경로") ? "var(--mono)" : undefined, wordBreak: "break-all" }}>{v}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
 
 function pad(n: number): string { return String(n).padStart(2, "0"); }
 function monthNow(): { y: number; m: number } { return { y: 2000, m: 1 }; } // no activity → arbitrary; grid still renders
