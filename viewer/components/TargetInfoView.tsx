@@ -5,6 +5,9 @@ import type { CsvData } from "@/lib/types";
 
 interface TargetInfoViewProps {
   data: CsvData;
+  /** Fetch EventLog rows involving an account (by SID or username) — account
+   * management (creation/group/pw) + logons. Enables the account detail page. */
+  loadAccountEvents?: (sid: string, username: string) => Promise<Row[]>;
 }
 
 // TargetInfo is a correlation of registry-derived system facts (OS build,
@@ -51,6 +54,9 @@ interface Account {
   // account has no SAM entry) — shown in the account detail panel.
   fullName: string;
   rid: string;
+  /** RID embedded in the SAM F record — differs from `rid` (the key/folder RID)
+   * under RID hijacking. */
+  ridSam: string;
   homeDir: string;
   created: string;
   lastLogin: string;
@@ -85,6 +91,7 @@ function buildAccount(r: Row): Account {
     isUser,
     fullName: r.full_name || "",
     rid: r.rid || (Number.isFinite(ridNum) ? String(ridNum) : ""),
+    ridSam: r.rid_sam || "",
     homeDir: r.home_directory || r.value || "",
     created: r.created || "",
     lastLogin: r.last_login || "",
@@ -152,7 +159,7 @@ interface NetInterface {
   leaseTerminates: string;
 }
 
-export default function TargetInfoView({ data }: TargetInfoViewProps) {
+export default function TargetInfoView({ data, loadAccountEvents }: TargetInfoViewProps) {
   const [selectedAccount, setSelectedAccount] = useState<Account | null>(null);
   const { system, users, services, networks, interfaces, computerName, osSummary } = useMemo(() => {
     const rows = data.rows as Row[];
@@ -231,6 +238,12 @@ export default function TargetInfoView({ data }: TargetInfoViewProps) {
     return keys;
   }, [system]);
 
+  // Clicking an account opens a full page (not a modal) — account detail plus
+  // the EventLog activity for its SID.
+  if (selectedAccount) {
+    return <AccountDetailPage account={selectedAccount} onBack={() => setSelectedAccount(null)} loadEvents={loadAccountEvents} />;
+  }
+
   return (
     <div style={{ flex: 1, minHeight: 0, overflow: "auto", padding: "20px 24px" }}>
       {/* Hero */}
@@ -305,7 +318,6 @@ export default function TargetInfoView({ data }: TargetInfoViewProps) {
         </Card>
       </div>
 
-      {selectedAccount && <AccountDetailModal account={selectedAccount} onClose={() => setSelectedAccount(null)} />}
     </div>
   );
 }
@@ -356,54 +368,96 @@ function DetailRow({ label, value, mono }: { label: string; value: string; mono?
   );
 }
 
-function AccountDetailModal({ account, onClose }: { account: Account; onClose: () => void }) {
+const EVENT_LABELS: Record<string, string> = {
+  "4720": "계정 생성", "4722": "계정 활성화", "4723": "비밀번호 변경 시도", "4724": "비밀번호 재설정",
+  "4725": "계정 비활성화", "4726": "계정 삭제", "4738": "계정 변경", "4740": "계정 잠김",
+  "4767": "계정 잠금 해제", "4781": "계정 이름 변경", "4728": "전역 그룹에 추가", "4729": "전역 그룹에서 제거",
+  "4732": "로컬 그룹에 추가", "4733": "로컬 그룹에서 제거", "4756": "유니버설 그룹에 추가", "4757": "유니버설 그룹에서 제거",
+  "4624": "로그온", "4625": "로그온 실패", "4634": "로그오프", "4647": "로그오프", "4648": "명시적 자격증명 로그온",
+  "4672": "특수 권한 부여", "4776": "자격증명 검증",
+};
+const CREATE_LIKE = new Set(["4720", "4726", "4738", "4781", "4728", "4732", "4756"]);
+
+function eventSummary(row: Row): string {
+  let ed: Record<string, unknown> = {};
+  try {
+    ed = row.EventData ? JSON.parse(row.EventData) : {};
+  } catch {
+    ed = {};
+  }
+  const get = (...keys: string[]) => {
+    for (const k of keys) if (ed[k] !== undefined && ed[k] !== "" && ed[k] !== "-") return String(ed[k]);
+    return "";
+  };
+  const parts: string[] = [];
+  const target = get("TargetUserName", "MemberName");
+  const actor = get("SubjectUserName");
+  const group = get("TargetGroupName", "GroupName");
+  const logonType = get("LogonType");
+  const ip = get("IpAddress", "ClientAddress");
+  if (target) parts.push(`대상: ${target}`);
+  if (group) parts.push(`그룹: ${group}`);
+  if (actor && actor !== target) parts.push(`수행: ${actor}`);
+  if (logonType) parts.push(`로그온타입 ${logonType}`);
+  if (ip && ip !== "-" && ip !== "::1" && ip !== "127.0.0.1") parts.push(`IP ${ip}`);
+  return parts.join(" · ");
+}
+
+function AccountDetailPage({ account, onBack, loadEvents }: { account: Account; onBack: () => void; loadEvents?: (sid: string, username: string) => Promise<Row[]> }) {
+  const [events, setEvents] = useState<Row[] | null>(null);
+  const [loading, setLoading] = useState(false);
+
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
-      if (e.key === "Escape") onClose();
+      if (e.key === "Escape") onBack();
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
+  }, [onBack]);
+
+  useEffect(() => {
+    if (!loadEvents) return;
+    let cancelled = false;
+    setLoading(true);
+    setEvents(null);
+    loadEvents(account.sid, account.username)
+      .then((rows) => { if (!cancelled) setEvents(rows); })
+      .catch(() => { if (!cancelled) setEvents([]); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [account.sid, account.username, loadEvents]);
+
+  const hijack = account.rid && account.ridSam && account.rid !== account.ridSam;
 
   return (
-    <div
-      onClick={onClose}
-      style={{ position: "fixed", inset: 0, background: "rgba(1,4,9,0.7)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 200, padding: 24 }}
-    >
-      <div
-        onClick={(e) => e.stopPropagation()}
-        style={{
-          width: "min(640px, 94vw)",
-          maxHeight: "88vh",
-          display: "flex",
-          flexDirection: "column",
-          background: "var(--bg-panel)",
-          border: "1px solid var(--border)",
-          borderRadius: "var(--radius-md)",
-          boxShadow: "var(--shadow-panel)",
-          overflow: "hidden",
-        }}
-      >
-        <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "12px 16px", borderBottom: "1px solid var(--border)", background: "var(--bg-elevated)", flexShrink: 0 }}>
-          <span style={{ fontSize: 15, fontWeight: 700 }}>{account.isUser ? "👤" : "⚙️"} {account.username || "(이름 없음)"}</span>
-          {account.fullName && account.fullName !== account.username && (
-            <span style={{ fontSize: 12, color: "var(--text-dim)" }}>{account.fullName}</span>
-          )}
-          {account.disabled === "예" && (
-            <span style={{ fontSize: 11, color: "var(--text-faint)", border: "1px solid var(--border)", borderRadius: 4, padding: "1px 6px" }}>비활성</span>
-          )}
-          <button
-            onClick={onClose}
-            title="닫기 (Esc)"
-            style={{ marginLeft: "auto", background: "transparent", border: "none", color: "var(--text-dim)", fontSize: 20, cursor: "pointer", lineHeight: 1, padding: 4 }}
-          >
-            ×
-          </button>
+    <div style={{ flex: 1, minHeight: 0, overflow: "auto", padding: "18px 24px" }}>
+      <button onClick={onBack} style={{ background: "transparent", border: "none", color: "var(--accent)", cursor: "pointer", fontSize: 12.5, fontWeight: 600, padding: 0, marginBottom: 12 }}>
+        ‹ 분석 대상으로
+      </button>
+
+      <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 4 }}>
+        <span style={{ fontSize: 22, fontWeight: 800 }}>{account.isUser ? "👤" : "⚙️"} {account.username || "(이름 없음)"}</span>
+        {account.fullName && account.fullName !== account.username && <span style={{ fontSize: 13, color: "var(--text-dim)" }}>{account.fullName}</span>}
+        {account.disabled === "예" && <span style={{ fontSize: 11, color: "var(--text-faint)", border: "1px solid var(--border)", borderRadius: 4, padding: "1px 6px" }}>비활성</span>}
+      </div>
+      <div style={{ fontSize: 11.5, color: "var(--text-faint)", fontFamily: "var(--mono)", marginBottom: 14 }}>{account.sid}</div>
+
+      {hijack && (
+        <div style={{ background: "var(--danger-subtle)", border: "1px solid var(--danger)", borderRadius: "var(--radius-md)", padding: "10px 14px", marginBottom: 16 }}>
+          <div style={{ fontSize: 13, fontWeight: 700, color: "var(--danger)" }}>⛔ RID Hijacking 의심</div>
+          <div style={{ fontSize: 12, color: "var(--text)", marginTop: 3 }}>
+            SAM 키(폴더) RID <b>{account.rid}</b> 와 F 레코드 RID <b>{account.ridSam}</b> 가 다릅니다.
+            이 계정은 로그온 시 RID {account.ridSam}{account.ridSam === "500" ? "(Administrator)" : ""} 권한으로 동작할 수 있습니다.
+          </div>
         </div>
-        <div style={{ padding: "6px 16px 16px", overflow: "auto" }}>
+      )}
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(340px, 1fr))", gap: 16, alignItems: "start" }}>
+        <Card title="계정 정보">
           <DetailRow label="계정명" value={account.username} />
           <DetailRow label="계정 SID" value={account.sid} mono />
-          <DetailRow label="RID" value={account.rid} mono />
+          <DetailRow label="RID (SAM 키/폴더)" value={account.rid} mono />
+          <DetailRow label="RID (SAM F 레코드)" value={account.ridSam || account.rid} mono />
           <DetailRow label="홈 디렉토리" value={account.homeDir} mono />
           <DetailRow label="생성 일시" value={account.created} mono />
           <DetailRow label="최근 로그인 일시" value={account.lastLogin} mono />
@@ -414,7 +468,28 @@ function AccountDetailModal({ account, onClose }: { account: Account; onClose: (
           <DetailRow label="SpecialAccount" value={account.specialAccount} />
           <DetailRow label="그룹" value={account.groups} />
           <DetailRow label="권한 / 속성" value={account.accountFlags} />
-        </div>
+        </Card>
+
+        <Card title="🗒️ 이벤트 로그 활동" count={events?.length}>
+          {!loadEvents && <div style={{ fontSize: 12.5, color: "var(--text-faint)" }}>이벤트 로그 연동을 사용할 수 없습니다.</div>}
+          {loadEvents && loading && <div style={{ fontSize: 12.5, color: "var(--text-dim)" }}>이벤트 로그에서 이 계정 활동을 찾는 중…</div>}
+          {loadEvents && !loading && events && events.length === 0 && <div style={{ fontSize: 12.5, color: "var(--text-faint)" }}>이 계정(SID)과 관련된 이벤트가 없습니다.</div>}
+          {loadEvents && !loading && events && events.map((r, i) => {
+            const eid = r.EventID || "";
+            const isCreate = CREATE_LIKE.has(eid);
+            const label = EVENT_LABELS[eid] || `Event ${eid}`;
+            return (
+              <div key={i} style={{ padding: "7px 0", borderBottom: i < events.length - 1 ? "1px solid var(--border-subtle)" : "none", borderLeft: isCreate ? "3px solid var(--warning)" : undefined, paddingLeft: isCreate ? 8 : 0, marginLeft: isCreate ? -8 : 0 }}>
+                <div style={{ display: "flex", gap: 8, alignItems: "baseline", flexWrap: "wrap" }}>
+                  <span style={{ fontSize: 12.5, fontWeight: 700, color: isCreate ? "var(--warning)" : "var(--text)" }}>{label}</span>
+                  <span style={{ fontSize: 10, color: "var(--text-faint)" }}>{eid} · {r._log || ""}</span>
+                  <span style={{ marginLeft: "auto", fontSize: 10.5, color: "var(--text-faint)", fontFamily: "var(--mono)" }}>{r.timestamp}</span>
+                </div>
+                {eventSummary(r) && <div style={{ fontSize: 11, color: "var(--text-dim)", marginTop: 2 }}>{eventSummary(r)}</div>}
+              </div>
+            );
+          })}
+        </Card>
       </div>
     </div>
   );

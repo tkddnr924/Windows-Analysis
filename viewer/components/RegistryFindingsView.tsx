@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import { tagsForPath } from "@/lib/tagging";
 import type { CsvData } from "@/lib/types";
 
@@ -27,6 +27,7 @@ const CATEGORY_META: { key: string; icon: string }[] = [
 ];
 
 export default function RegistryFindingsView({ data }: Props) {
+  const [detail, setDetail] = useState<Row | null>(null);
   const { groups, warnCount, dangerCount } = useMemo(() => {
     const rows = data.rows;
     // autoruns get a suspicious re-classification from the command path so the
@@ -83,7 +84,14 @@ export default function RegistryFindingsView({ data }: Props) {
               </div>
               <div style={{ padding: "6px 14px 12px" }}>
                 {rows.map((r, i) => (
-                  <div key={i} style={{ padding: "8px 0", borderBottom: i < rows.length - 1 ? "1px solid var(--border-subtle)" : "none" }}>
+                  <div
+                    key={i}
+                    onClick={() => setDetail(r)}
+                    onMouseEnter={(e) => (e.currentTarget.style.background = "var(--bg-hover)")}
+                    onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+                    style={{ padding: "8px 8px", margin: "0 -8px", borderRadius: "var(--radius-sm)", borderBottom: i < rows.length - 1 ? "1px solid var(--border-subtle)" : "none", cursor: "pointer" }}
+                    title="클릭하면 근거(레지스트리 키·값) 상세 보기"
+                  >
                     <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
                       <span style={{ fontSize: 12.5, fontWeight: 600, color: "var(--text)", wordBreak: "break-all" }}>{r.name}</span>
                       <Pill text={r.status} color={statusColor(r.status)} />
@@ -109,6 +117,44 @@ export default function RegistryFindingsView({ data }: Props) {
             </section>
           );
         })}
+      </div>
+
+      {detail && <RfDetailModal row={detail} onClose={() => setDetail(null)} />}
+    </div>
+  );
+}
+
+function RfDetailModal({ row, onClose }: { row: Row; onClose: () => void }) {
+  const kind = row.detail === "Run" || row.detail === "RunOnce" || row.detail === "Policy Run" ? row.detail : "";
+  const fields: [string, string, boolean][] = [
+    ["분류", row.category, false],
+    ["항목", row.name, false],
+    ["판정", row.status, false],
+    ["값", row.value, true],
+    ["명령", row.command, true],
+    ["자동실행 위치", kind, false],
+    ["사용자", row.user, false],
+    ["근거 설명", row.detail && !kind ? row.detail : "", false],
+    ["하이브", row.source, false],
+    ["레지스트리 키", row.key_path, true],
+  ];
+  return (
+    <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(1,4,9,0.6)", zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
+      <div onClick={(e) => e.stopPropagation()} style={{ width: 640, maxWidth: "100%", maxHeight: "82vh", overflow: "auto", background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "var(--radius-lg)", boxShadow: "var(--shadow-panel)" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "14px 18px", borderBottom: "1px solid var(--border)", borderLeft: `3px solid ${statusColor(row.status)}` }}>
+          <span style={{ fontSize: 15, fontWeight: 700, wordBreak: "break-all" }}>{row.name}</span>
+          <Pill text={row.status} color={statusColor(row.status)} />
+          <button onClick={onClose} style={{ marginLeft: "auto", background: "transparent", border: "none", color: "var(--text-faint)", fontSize: 18, cursor: "pointer" }}>×</button>
+        </div>
+        <div style={{ padding: "6px 18px 12px", fontSize: 11.5, color: "var(--text-faint)" }}>이 판정의 근거가 된 레지스트리 원본 키·값입니다.</div>
+        <div style={{ padding: "0 18px 18px" }}>
+          {fields.filter(([, v]) => v).map(([k, v, mono]) => (
+            <div key={k} style={{ display: "flex", gap: 12, padding: "8px 0", borderBottom: "1px solid var(--border-subtle)" }}>
+              <span style={{ flex: "0 0 108px", color: "var(--text-faint)", fontSize: 12 }}>{k}</span>
+              <span style={{ flex: 1, color: "var(--text)", fontSize: 12.5, fontFamily: mono ? "var(--mono)" : undefined, wordBreak: "break-all", whiteSpace: k === "값" || k === "명령" ? "pre-wrap" : undefined }}>{v}</span>
+            </div>
+          ))}
+        </div>
       </div>
     </div>
   );

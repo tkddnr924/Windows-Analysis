@@ -275,7 +275,7 @@ def build_execution_history(all_results: dict) -> list[dict]:
 
 _TI_KEYS = (
     "timestamp", "category", "name", "value", "source_artifact",
-    "username", "full_name", "rid", "home_directory", "created", "last_login",
+    "username", "full_name", "rid", "rid_sam", "home_directory", "created", "last_login",
     "password_last_set", "last_failed_login", "login_count", "failed_login_count",
     "disabled", "special_account", "groups", "account_flags",
     "subnet_mask", "gateway", "dns_server", "dhcp_server", "dhcp_enabled",
@@ -380,6 +380,10 @@ def _parse_sam_f(b: bytes) -> dict:
         return {}
     acb = struct.unpack_from("<H", b, 0x38)[0]
     return {
+        # RID embedded in the F record (offset 0x30). This is what LSASS uses at
+        # logon; when it disagrees with the account's key/folder RID it's the
+        # tell-tale of RID hijacking (a low-priv account given RID 500).
+        "rid": str(struct.unpack_from("<I", b, 0x30)[0]),
         "last_login": _filetime(struct.unpack_from("<Q", b, 0x08)[0]),
         "password_last_set": _filetime(struct.unpack_from("<Q", b, 0x18)[0]),
         "last_failed_login": _filetime(struct.unpack_from("<Q", b, 0x28)[0]),
@@ -459,7 +463,8 @@ def _accounts(sam: list, software: list) -> list[dict]:
         created = names_created.get(username.lower(), "")
         rows.append(_ti_row(
             category="Account", name=sid, value=path, source_artifact="SAM",
-            username=username, full_name=v.get("full_name", ""), rid=str(rid),
+            username=username, full_name=v.get("full_name", ""),
+            rid=str(rid), rid_sam=f.get("rid", ""),
             home_directory=path, created=created,
             last_login=f.get("last_login", ""), password_last_set=f.get("password_last_set", ""),
             last_failed_login=f.get("last_failed_login", ""), login_count=f.get("login_count", ""),
