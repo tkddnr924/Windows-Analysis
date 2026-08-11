@@ -882,7 +882,7 @@ def build_registry_findings(all_results: dict) -> list[dict]:
 
 _BH_KEYS = (
     "account", "kind", "timestamp", "title", "url", "url_raw",
-    "visit_count", "typed_count", "detail", "size", "mime", "danger", "source_url",
+    "visit_count", "typed_count", "detail", "size", "mime", "danger", "source_url", "status",
 )
 
 
@@ -939,8 +939,31 @@ def _browser_histories(all_results: dict):
             yield account, tables
 
 
+def _browser_caches(all_results: dict):
+    for fname, tables in all_results.get("BrowserCache", {}).items():
+        account = fname[: -len("_Chrome_Cache")] if fname.endswith("_Chrome_Cache") else fname
+        if isinstance(tables, dict):
+            yield account, tables
+
+
 def build_browser_history(all_results: dict) -> list[dict]:
     rows: list[dict] = []
+    # Cached HTTP responses — "what resource was fetched, and when" — so the
+    # calendar timeline shows them alongside visits/downloads. The cache parser
+    # already formats its timestamps, so reuse them as-is.
+    for account, tables in _browser_caches(all_results):
+        for c in tables.get("CacheEntries", []):
+            ts = c.get("response_time") or c.get("creation_time") or ""
+            url = c.get("url", "")
+            if not ts or not url:
+                continue
+            rows.append(_bh_row(
+                account=c.get("account") or account, kind="cache", timestamp=ts,
+                title=_basename(url) or url, url=url,
+                mime=c.get("content_type", ""),
+                size=c.get("content_length", "") or c.get("body_size", ""),
+                status=c.get("status", ""),
+            ))
     for account, tables in _browser_histories(all_results):
         for u in tables.get("urls", []):
             raw = u.get("url", "")

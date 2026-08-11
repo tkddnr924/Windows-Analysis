@@ -18,6 +18,14 @@ export default function BrowserHistoryView({ data }: Props) {
   const [account, setAccount] = useState<string>("(전체)");
   const [selectedDay, setSelectedDay] = useState<string>("");
   const [month, setMonth] = useState<{ y: number; m: number } | null>(null);
+  const [kinds, setKinds] = useState<Set<string>>(new Set(["visit", "download", "cache"]));
+
+  const KINDS = [
+    { k: "visit", label: "🔗 방문" },
+    { k: "download", label: "⬇ 다운로드" },
+    { k: "cache", label: "📦 리소스(캐시)" },
+  ];
+  const DAY_CAP = 1000; // rendered rows per day (cache can be huge)
 
   const accounts = useMemo(() => {
     const s = new Set<string>();
@@ -27,8 +35,8 @@ export default function BrowserHistoryView({ data }: Props) {
 
   // Rows for the chosen account, with a parsed day; downloads + visits together.
   const scoped = useMemo(
-    () => data.rows.filter((r) => (account === "(전체)" || r.account === account) && r.timestamp),
-    [data.rows, account]
+    () => data.rows.filter((r) => (account === "(전체)" || r.account === account) && r.timestamp && kinds.has(r.kind || "visit")),
+    [data.rows, account, kinds]
   );
 
   // day -> count, for the calendar dots.
@@ -82,6 +90,25 @@ export default function BrowserHistoryView({ data }: Props) {
             {a === "(전체)" ? a : `👤 ${a}`}
           </button>
         ))}
+        <span style={{ width: 1, alignSelf: "stretch", background: "var(--border)", margin: "0 4px" }} />
+        {KINDS.map(({ k, label }) => {
+          const on = kinds.has(k);
+          return (
+            <button
+              key={k}
+              onClick={() => setKinds((prev) => { const n = new Set(prev); if (n.has(k)) n.delete(k); else n.add(k); return n.size ? n : prev; })}
+              style={{
+                fontSize: 12, padding: "4px 10px", borderRadius: "var(--radius-lg)", cursor: "pointer", fontWeight: on ? 700 : 500,
+                background: on ? "var(--bg-elevated)" : "transparent",
+                color: on ? "var(--text)" : "var(--text-faint)",
+                border: `1px solid ${on ? "var(--border)" : "var(--border-subtle)"}`,
+                opacity: on ? 1 : 0.6,
+              }}
+            >
+              {label}
+            </button>
+          );
+        })}
       </div>
 
       <div style={{ display: "flex", gap: 18, alignItems: "flex-start", flexWrap: "wrap" }}>
@@ -134,25 +161,34 @@ export default function BrowserHistoryView({ data }: Props) {
           </div>
           <div style={{ background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "var(--radius-lg)", boxShadow: "var(--shadow-card)", overflow: "hidden" }}>
             {dayRows.length === 0 && <div style={{ padding: 20, color: "var(--text-faint)", fontSize: 12.5 }}>선택한 날짜의 기록이 없습니다.</div>}
-            {dayRows.map((r, i) => {
+            {dayRows.slice(0, DAY_CAP).map((r, i, arr) => {
               const isDl = r.kind === "download";
+              const isCache = r.kind === "cache";
+              const icon = isDl ? "⬇" : isCache ? "📦" : "🔗";
+              const accent = isDl ? "var(--warning)" : isCache ? "var(--border)" : "transparent";
               return (
-                <div key={i} style={{ display: "flex", gap: 10, padding: "8px 14px", borderBottom: i < dayRows.length - 1 ? "1px solid var(--border-subtle)" : "none", borderLeft: `3px solid ${isDl ? "var(--warning)" : "transparent"}` }}>
+                <div key={i} style={{ display: "flex", gap: 10, padding: isCache ? "5px 14px" : "8px 14px", borderBottom: i < arr.length - 1 ? "1px solid var(--border-subtle)" : "none", borderLeft: `3px solid ${accent}`, opacity: isCache ? 0.82 : 1 }}>
                   <span style={{ flexShrink: 0, fontSize: 11, color: "var(--text-faint)", fontFamily: "var(--mono)", width: 60 }}>{(r.timestamp || "").slice(11, 19)}</span>
-                  <span style={{ flexShrink: 0, fontSize: 13 }}>{isDl ? "⬇" : "🔗"}</span>
+                  <span style={{ flexShrink: 0, fontSize: isCache ? 11 : 13 }}>{icon}</span>
                   <div style={{ flex: 1, minWidth: 0 }}>
                     <div style={{ display: "flex", gap: 6, alignItems: "baseline", flexWrap: "wrap" }}>
-                      <span style={{ fontSize: 12.5, fontWeight: 600, color: "var(--text)", wordBreak: "break-all" }}>{r.title || (isDl ? "(파일)" : r.url)}</span>
+                      <span style={{ fontSize: isCache ? 12 : 12.5, fontWeight: isCache ? 500 : 600, color: isCache ? "var(--text-dim)" : "var(--text)", wordBreak: "break-all" }}>{r.title || (isDl ? "(파일)" : r.url)}</span>
                       {account === "(전체)" && r.account && <span style={{ fontSize: 10, color: "var(--text-faint)" }}>👤 {r.account}</span>}
                       {isDl && r.size && <span style={{ fontSize: 10.5, color: "var(--warning)" }}>{r.size}</span>}
-                      {r.visit_count && !isDl && <span style={{ fontSize: 10, color: "var(--text-faint)" }}>{r.visit_count}회</span>}
+                      {isCache && (r.status || r.mime) && <span style={{ fontSize: 10, color: "var(--text-faint)" }}>{[r.status, r.mime, r.size].filter(Boolean).join(" · ")}</span>}
+                      {r.visit_count && !isDl && !isCache && <span style={{ fontSize: 10, color: "var(--text-faint)" }}>{r.visit_count}회</span>}
                     </div>
-                    <div title={r.url_raw} style={{ fontSize: 11, color: "var(--accent)", fontFamily: "var(--mono)", wordBreak: "break-all" }}>{isDl ? r.source_url || r.url : r.url}</div>
+                    <div title={r.url_raw} style={{ fontSize: isCache ? 10.5 : 11, color: isCache ? "var(--text-faint)" : "var(--accent)", fontFamily: "var(--mono)", wordBreak: "break-all" }}>{isDl ? r.source_url || r.url : r.url}</div>
                     {isDl && r.detail && <div style={{ fontSize: 10.5, color: "var(--text-faint)", fontFamily: "var(--mono)", wordBreak: "break-all" }}>💾 {r.detail}</div>}
                   </div>
                 </div>
               );
             })}
+            {dayRows.length > DAY_CAP && (
+              <div style={{ padding: "8px 14px", fontSize: 11.5, color: "var(--text-faint)" }}>
+                …외 {(dayRows.length - DAY_CAP).toLocaleString()}건 더 (전체는 원본 캐시 테이블에서 확인)
+              </div>
+            )}
           </div>
         </div>
       </div>
