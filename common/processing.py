@@ -581,6 +581,7 @@ def build_target_info(all_results: dict) -> list[dict]:
 _DEF_KEYS = (
     "section", "timestamp", "event_id", "title", "detail", "severity", "category",
     "action", "action_time", "process", "user", "source", "remediation", "record_key",
+    "additional_actions", "origin", "detection_user",
 )
 
 
@@ -627,13 +628,18 @@ def build_defender(all_results: dict) -> list[dict]:
         rk = r.get("_record_key", "")
         d = _json(r.get("EventData", ""))
 
-        if eid in ("1116", "1117"):
+        # Threat detected / action-taken — 1116/1117 (current) and 1006/1007
+        # (legacy) both come in a detected+action pair; 1015 is a suspicious-
+        # behavior detection. Merge the pair into one record by Detection ID.
+        if eid in ("1116", "1117", "1006", "1007", "1015"):
+            detected = eid in ("1116", "1006", "1015")
             did = d.get("Detection ID") or f"{ts}|{d.get('Threat Name', '')}"
-            rec = detections.setdefault(did, _def_row(section="threat", event_id="1116/1117"))
+            rec = detections.setdefault(did, _def_row(section="threat", event_id=eid))
             for dst, src in (
                 ("title", "Threat Name"), ("severity", "Severity Name"),
                 ("category", "Category Name"), ("process", "Process Name"),
-                ("user", "Detection User"), ("source", "Source Name"),
+                ("user", "Detection User"), ("detection_user", "Detection User"),
+                ("source", "Source Name"), ("origin", "Origin Name"),
             ):
                 if d.get(src):
                     rec[dst] = d[src]
@@ -641,17 +647,19 @@ def build_defender(all_results: dict) -> list[dict]:
                 rec["detail"] = d["Path"]
             elif d.get("Process Name"):
                 rec["detail"] = d["Process Name"]
-            if eid == "1116":  # detected
+            if detected:
                 if _earlier(ts, rec["timestamp"]):
                     rec["timestamp"] = ts
                     rec["record_key"] = rk
-            else:  # 1117 = action taken
+            else:  # action taken (1117 / 1007)
                 rec["action_time"] = ts
                 act = d.get("Action Name", "")
                 if act and act != "해당 없음":
                     rec["action"] = act
                 if d.get("Remediation User"):
                     rec["remediation"] = d["Remediation User"]
+                if d.get("Additional Actions String") and d["Additional Actions String"] != "No additional actions required":
+                    rec["additional_actions"] = d["Additional Actions String"]
                 if not rec["timestamp"]:
                     rec["timestamp"] = ts
                 if not rec["record_key"]:
@@ -659,10 +667,14 @@ def build_defender(all_results: dict) -> list[dict]:
 
         elif eid == "5001":
             tampering.append((ts, "실시간 보호 사용 안 함", "Defender 실시간 보호가 해제됨", "", rk, eid))
+        elif eid == "5004":
+            tampering.append((ts, "실시간 보호 구성 변경", "실시간 보호 설정이 변경됨", "", rk, eid))
         elif eid == "5010":
             tampering.append((ts, "바이러스 검사 사용 안 함", "", "", rk, eid))
         elif eid == "5012":
             tampering.append((ts, "스파이웨어 검사 사용 안 함", "", "", rk, eid))
+        elif eid == "1119":
+            tampering.append((ts, "위협 제거 실패", f"{d.get('Threat Name', '')} 제거/치료 실패", "", rk, eid))
         elif eid == "1013":
             history_cleared.append((ts, f"{d.get('Domain', '')}\\{d.get('User', '')}".strip("\\"), rk))
         elif eid == "1001":

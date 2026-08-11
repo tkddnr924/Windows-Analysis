@@ -97,6 +97,9 @@ export default function DefenderView({ data }: Props) {
                     {t.process && t.process !== "Unknown" && <KV label="프로세스" v={t.process} mono />}
                     {t.user && <KV label="사용자" v={t.user} />}
                     {t.source && <KV label="탐지원" v={t.source} />}
+                    {t.origin && t.origin !== "알 수 없음" && <KV label="원본" v={t.origin} />}
+                    {t.remediation && <KV label="치료 수행" v={t.remediation} />}
+                    {t.additional_actions && <KV label="추가 조치" v={t.additional_actions} />}
                     {t.detail && <KV label="경로/내용" v={t.detail} mono />}
                   </div>
                 </div>

@@ -126,36 +126,48 @@ export default function RegistryFindingsView({ data }: Props) {
 
 function RfDetailModal({ row, onClose }: { row: Row; onClose: () => void }) {
   const kind = row.detail === "Run" || row.detail === "RunOnce" || row.detail === "Policy Run" ? row.detail : "";
-  const fields: [string, string, boolean][] = [
-    ["분류", row.category, false],
-    ["항목", row.name, false],
-    ["판정", row.status, false],
-    ["값", row.value, true],
-    ["명령", row.command, true],
-    ["자동실행 위치", kind, false],
-    ["사용자", row.user, false],
-    ["근거 설명", row.detail && !kind ? row.detail : "", false],
-    ["하이브", row.source, false],
-    ["레지스트리 키", row.key_path, true],
+  // Secondary fields (the evidence — key path + value — is shown up top).
+  const meta: [string, string][] = [
+    ["분류", row.category],
+    ["항목(값 이름)", row.name],
+    ["자동실행 위치", kind],
+    ["사용자", row.user && row.user !== "(시스템)" ? row.user : ""],
+    ["설명", !kind ? row.detail : ""],
   ];
   return (
     <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(1,4,9,0.6)", zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
-      <div onClick={(e) => e.stopPropagation()} style={{ width: 640, maxWidth: "100%", maxHeight: "82vh", overflow: "auto", background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "var(--radius-lg)", boxShadow: "var(--shadow-panel)" }}>
+      <div onClick={(e) => e.stopPropagation()} style={{ width: 660, maxWidth: "100%", maxHeight: "82vh", overflow: "auto", background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "var(--radius-lg)", boxShadow: "var(--shadow-panel)" }}>
         <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "14px 18px", borderBottom: "1px solid var(--border)", borderLeft: `3px solid ${statusColor(row.status)}` }}>
           <span style={{ fontSize: 15, fontWeight: 700, wordBreak: "break-all" }}>{row.name}</span>
           <Pill text={row.status} color={statusColor(row.status)} />
           <button onClick={onClose} style={{ marginLeft: "auto", background: "transparent", border: "none", color: "var(--text-faint)", fontSize: 18, cursor: "pointer" }}>×</button>
         </div>
-        <div style={{ padding: "6px 18px 12px", fontSize: 11.5, color: "var(--text-faint)" }}>이 판정의 근거가 된 레지스트리 원본 키·값입니다.</div>
-        <div style={{ padding: "0 18px 18px" }}>
-          {fields.filter(([, v]) => v).map(([k, v, mono]) => (
-            <div key={k} style={{ display: "flex", gap: 12, padding: "8px 0", borderBottom: "1px solid var(--border-subtle)" }}>
+        <div style={{ padding: "14px 18px 18px" }}>
+          {/* Evidence — the raw registry key + value this verdict is based on. */}
+          <div style={{ fontSize: 11, fontWeight: 700, color: "var(--text-faint)", marginBottom: 6 }}>🔑 근거 — 레지스트리 원본</div>
+          <div style={{ background: "var(--bg)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", padding: "12px 14px", marginBottom: 16, fontFamily: "var(--mono)" }}>
+            <EvRow label="키 경로" value={row.key_path} />
+            <EvRow label="값" value={row.value} highlight />
+            {row.command && <EvRow label="명령" value={row.command} highlight />}
+            <EvRow label="하이브" value={row.source} last />
+          </div>
+          {meta.filter(([, v]) => v).map(([k, v]) => (
+            <div key={k} style={{ display: "flex", gap: 12, padding: "7px 0", borderBottom: "1px solid var(--border-subtle)" }}>
               <span style={{ flex: "0 0 108px", color: "var(--text-faint)", fontSize: 12 }}>{k}</span>
-              <span style={{ flex: 1, color: "var(--text)", fontSize: 12.5, fontFamily: mono ? "var(--mono)" : undefined, wordBreak: "break-all", whiteSpace: k === "값" || k === "명령" ? "pre-wrap" : undefined }}>{v}</span>
+              <span style={{ flex: 1, color: "var(--text)", fontSize: 12.5, wordBreak: "break-all" }}>{v}</span>
             </div>
           ))}
         </div>
       </div>
+    </div>
+  );
+}
+
+function EvRow({ label, value, highlight, last }: { label: string; value: string; highlight?: boolean; last?: boolean }) {
+  return (
+    <div style={{ display: "flex", gap: 12, padding: "6px 0", borderBottom: last ? "none" : "1px solid var(--border-subtle)", alignItems: "baseline" }}>
+      <span style={{ flex: "0 0 70px", color: "var(--text-faint)", fontSize: 11, fontFamily: "var(--sans)" }}>{label}</span>
+      <span style={{ flex: 1, color: highlight ? "var(--accent)" : "var(--text)", fontSize: 13, fontWeight: highlight ? 700 : 500, wordBreak: "break-all", whiteSpace: "pre-wrap" }}>{value || "—"}</span>
     </div>
   );
 }

@@ -2,11 +2,14 @@
 
 import { useEffect, useMemo, useState } from "react";
 import type { CsvData } from "@/lib/types";
+import { inRange, rangeActive, EMPTY_TIME_RANGE, type TimeRange } from "@/lib/timeRange";
 
 type Row = Record<string, string>;
 
 interface Props {
   data: CsvData;
+  /** Global incident-window filter from the sidebar; applied to every row. */
+  timeRange?: TimeRange;
 }
 
 const DOW = ["일", "월", "화", "수", "목", "금", "토"];
@@ -14,7 +17,7 @@ const DOW = ["일", "월", "화", "수", "목", "금", "토"];
 // "YYYY-MM-DD HH:MM:SS.fff" -> "YYYY-MM-DD"
 const dayOf = (ts: string) => (ts ? ts.slice(0, 10) : "");
 
-export default function BrowserHistoryView({ data }: Props) {
+export default function BrowserHistoryView({ data, timeRange = EMPTY_TIME_RANGE }: Props) {
   const [account, setAccount] = useState<string>("(전체)");
   const [selectedDay, setSelectedDay] = useState<string>("");
   const [month, setMonth] = useState<{ y: number; m: number } | null>(null);
@@ -36,9 +39,17 @@ export default function BrowserHistoryView({ data }: Props) {
   }, [data.rows]);
 
   // Rows for the chosen account, with a parsed day; downloads + visits together.
+  const rangeOn = rangeActive(timeRange);
   const scoped = useMemo(
-    () => data.rows.filter((r) => (account === "(전체)" || r.account === account) && r.timestamp && kinds.has(r.kind || "visit")),
-    [data.rows, account, kinds]
+    () =>
+      data.rows.filter(
+        (r) =>
+          (account === "(전체)" || r.account === account) &&
+          r.timestamp &&
+          kinds.has(r.kind || "visit") &&
+          (!rangeOn || inRange(r.timestamp, timeRange))
+      ),
+    [data.rows, account, kinds, rangeOn, timeRange]
   );
 
   // day -> count, for the calendar dots.
