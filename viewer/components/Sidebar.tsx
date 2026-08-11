@@ -332,10 +332,11 @@ interface SidebarProps {
   categories: CategoryEntry[];
   selectedFile: ResultFileEntry | null;
   onSelectFile: (file: ResultFileEntry) => void;
-  activeVirtualTab: "timeline" | "bookmarks" | null;
+  activeVirtualTab: "timeline" | "bookmarks" | "connections" | null;
   onSelectDashboard: () => void;
   onSelectTimeline: () => void;
   onSelectBookmarks: () => void;
+  onSelectConnections: () => void;
   bookmarkCount: number;
   timeRange: TimeRange;
   onTimeRangeChange: (range: TimeRange) => void;
@@ -355,6 +356,7 @@ export default function Sidebar({
   onSelectDashboard,
   onSelectTimeline,
   onSelectBookmarks,
+  onSelectConnections,
   bookmarkCount,
   timeRange,
   onTimeRangeChange,
@@ -491,8 +493,27 @@ export default function Sidebar({
             아직 파싱하지 않았을 수 있습니다.
           </div>
         )}
-        {(
+        <>
+          {/* 케이스 분석 — spans every host in the case */}
           <div style={{ borderBottom: "1px solid var(--border-subtle)" }}>
+            <div style={{ padding: "8px 14px 4px", fontSize: 10.5, fontWeight: 700, letterSpacing: 0.5, color: "var(--text-faint)", textTransform: "uppercase" }}>케이스 분석</div>
+            <PinnedNavRow
+              icon="🔗"
+              label="호스트 연결"
+              selected={activeVirtualTab === "connections"}
+              onClick={onSelectConnections}
+            />
+            <PinnedNavRow
+              icon="🔖"
+              label="북마크"
+              count={bookmarkCount}
+              selected={activeVirtualTab === "bookmarks"}
+              onClick={onSelectBookmarks}
+            />
+          </div>
+          {/* 호스트 분석 — the currently open host */}
+          <div style={{ borderBottom: "1px solid var(--border-subtle)" }}>
+            <div style={{ padding: "8px 14px 4px", fontSize: 10.5, fontWeight: 700, letterSpacing: 0.5, color: "var(--text-faint)", textTransform: "uppercase" }}>호스트 분석</div>
             <PinnedNavRow
               icon="🏠"
               label="대시보드"
@@ -505,15 +526,8 @@ export default function Sidebar({
               selected={activeVirtualTab === "timeline"}
               onClick={onSelectTimeline}
             />
-            <PinnedNavRow
-              icon="🔖"
-              label="북마크"
-              count={bookmarkCount}
-              selected={activeVirtualTab === "bookmarks"}
-              onClick={onSelectBookmarks}
-            />
           </div>
-        )}
+        </>
         {overviewCategory && (
           <CategoryNode
             category={overviewCategory}
