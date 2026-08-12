@@ -435,7 +435,7 @@ function AccountDetailPage({ account, onBack, loadEvents }: { account: Account; 
   const [loading, setLoading] = useState(false);
   const [selectedEvent, setSelectedEvent] = useState<Row | null>(null);
   const [evPage, setEvPage] = useState(0);
-  const EV_PAGE_SIZE = 100;
+  const EV_PAGE_SIZE = 40;
 
   useEffect(() => {
     function onKey(e: KeyboardEvent) {

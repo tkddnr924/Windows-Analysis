@@ -164,7 +164,7 @@ export default function ExecutionHistoryView({
   const [disabledSources, setDisabledSources] = useState<Set<string>>(new Set());
   const [onlyRisk, setOnlyRisk] = useState(false);
   const [onlyUnsigned, setOnlyUnsigned] = useState(false);
-  const [sort, setSort] = useState<SortKey>("risk");
+  const [sort, setSort] = useState<SortKey>("oldest");
   const [excludeWindows, setExcludeWindows] = useState(false);
   const [search, setSearch] = useState("");
   const [selected, setSelected] = useState<Entry | null>(null);

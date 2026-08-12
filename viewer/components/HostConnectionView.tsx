@@ -195,6 +195,8 @@ export default function HostConnectionView({ graph, loading, timeRange = EMPTY_T
   const [mouse, setMouse] = useState<XY>({ x: 0, y: 0 });
   // view controls
   const [hostsOnly, setHostsOnly] = useState(false); // show only registered hosts (hide external IPs)
+  const [excludeLocal, setExcludeLocal] = useState(false); // hide the LOCAL node
+  const [excludeLoopback, setExcludeLoopback] = useState(false); // hide loopback (HOST/127.0.0.1) nodes
   const [dirFilter, setDirFilter] = useState<DirFilter>("all");
   const [search, setSearch] = useState("");
   const [showSettings, setShowSettings] = useState(false);
@@ -269,16 +271,18 @@ export default function HostConnectionView({ graph, loading, timeRange = EMPTY_T
     return { edges, totalRecords: graph.records.length, shownRecords: recs.length };
   }, [graph, rangeOn, timeRange]);
 
-  // Apply the view filters (direction + registered-hosts-only) to get the
-  // edges actually drawn; the time filter already shaped `edges`.
+  // Apply the view filters (direction + node-kind exclusions) to get the edges
+  // actually drawn; the time filter already shaped `edges`.
   const visibleEdges = useMemo(
     () =>
       edges.filter((e) => {
         if (dirFilter !== "all" && e.direction !== dirFilter) return false;
         if (hostsOnly && !e.peerIsHost) return false;
+        if (excludeLocal && e.peerKind === "local") return false;
+        if (excludeLoopback && e.peerKind === "loopback") return false;
         return true;
       }),
-    [edges, dirFilter, hostsOnly]
+    [edges, dirFilter, hostsOnly, excludeLocal, excludeLoopback]
   );
 
   // Nodes to render: registered hosts always; external nodes only when they
@@ -407,6 +411,8 @@ export default function HostConnectionView({ graph, loading, timeRange = EMPTY_T
   const selEdges = selected ? visibleEdges.filter((e) => e.host === selected || e.peer === selected) : [];
   const hostCount = graph.hosts.length;
   const externalCount = topo.ids.length - hostCount;
+  const hasLocalNode = topo.ids.some((id) => topo.meta[id]?.kind === "local");
+  const hasLoopbackNode = topo.ids.some((id) => topo.meta[id]?.kind === "loopback");
 
   return (
     <div style={{ flex: 1, minHeight: 0, overflow: "auto", padding: "18px 22px" }}>
@@ -439,15 +445,21 @@ export default function HostConnectionView({ graph, loading, timeRange = EMPTY_T
         {topo.meta["LOCAL"]?.kind === "local" && <span style={chip("var(--warning)")}>🏢 LOCAL 세션 존재 — 콘솔/AD 서버(도메인 컨트롤러) 경유 가능성</span>}
       </div>
 
-      {/* controls: registered-only toggle, direction filter, search, counts */}
+      {/* controls: node-kind toggles, direction filter, search, counts */}
       <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center", marginBottom: 12 }}>
-        <button
-          onClick={() => setHostsOnly((v) => !v)}
-          title="외부 IP를 숨기고 등록된 호스트만 표시"
-          style={{ ...btn, borderColor: hostsOnly ? "var(--accent)" : "var(--border)", background: hostsOnly ? "var(--accent-subtle)" : "var(--bg-elevated)", color: hostsOnly ? "var(--accent)" : "var(--text-dim)" }}
-        >
-          {hostsOnly ? "☑" : "☐"} 등록 호스트만
-        </button>
+        <ToggleBtn active={hostsOnly} onClick={() => setHostsOnly((v) => !v)} title="외부 IP를 숨기고 등록된 호스트만 표시">
+          등록 호스트
+        </ToggleBtn>
+        {!hostsOnly && hasLocalNode && (
+          <ToggleBtn active={excludeLocal} onClick={() => setExcludeLocal((v) => !v)} title="LOCAL 노드를 숨김">
+            Local 제외
+          </ToggleBtn>
+        )}
+        {!hostsOnly && hasLoopbackNode && (
+          <ToggleBtn active={excludeLoopback} onClick={() => setExcludeLoopback((v) => !v)} title="로컬호스트(HOST/127.0.0.1) 노드를 숨김">
+            로컬호스트 제외
+          </ToggleBtn>
+        )}
 
         <div style={{ display: "inline-flex", background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", padding: 2, gap: 2 }}>
           {([["all", "전체"], ["inbound", "인바운드"], ["outbound", "아웃바운드"]] as [DirFilter, string][]).map(([v, label]) => {
@@ -611,7 +623,7 @@ export default function HostConnectionView({ graph, loading, timeRange = EMPTY_T
 
         {visibleEdges.length === 0 && (
           <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", color: "var(--text-faint)", fontSize: 12.5, pointerEvents: "none" }}>
-            {totalRecords > 0 && (rangeOn || dirFilter !== "all" || hostsOnly) ? "조건에 맞는 RDP 연결이 없습니다." : "RDP 접속 기록이 없습니다."}
+            {totalRecords > 0 && (rangeOn || dirFilter !== "all" || hostsOnly || excludeLocal || excludeLoopback) ? "조건에 맞는 RDP 연결이 없습니다." : "RDP 접속 기록이 없습니다."}
           </div>
         )}
 
@@ -799,6 +811,18 @@ function Slider({ label, hint, value, min, max, step, onChange, format }: { labe
       />
       {hint && <div style={{ fontSize: 9.5, color: "var(--text-faint)", marginTop: 1 }}>{hint}</div>}
     </div>
+  );
+}
+
+function ToggleBtn({ active, onClick, title, children }: { active: boolean; onClick: () => void; title?: string; children: React.ReactNode }) {
+  return (
+    <button
+      onClick={onClick}
+      title={title}
+      style={{ ...btn, borderColor: active ? "var(--accent)" : "var(--border)", background: active ? "var(--accent-subtle)" : "var(--bg-elevated)", color: active ? "var(--accent)" : "var(--text-dim)" }}
+    >
+      {active ? "☑" : "☐"} {children}
+    </button>
   );
 }
 

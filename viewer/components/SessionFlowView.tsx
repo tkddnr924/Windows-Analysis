@@ -271,7 +271,7 @@ export default function SessionFlowView({
                 </span>
                 <span style={{ fontFamily: "var(--mono)", fontSize: 13.5, fontWeight: 600, minWidth: 120 }}>{s.remote_address || "(주소 없음)"}</span>
                 {s.account && (
-                  <span style={{ fontSize: 11.5, color: "var(--text-dim)", padding: "1px 8px", borderRadius: 999, background: "var(--bg-elevated)", border: "1px solid var(--border-subtle)" }}>
+                  <span style={{ fontSize: 11.5, fontWeight: 600, color: "var(--text)", padding: "1px 8px", borderRadius: 999, background: "var(--bg-elevated)", border: "1px solid var(--border-subtle)" }}>
                     👤 {s.account}
                   </span>
                 )}
@@ -297,7 +297,7 @@ export default function SessionFlowView({
                       <span style={{ fontFamily: "var(--mono)", fontSize: 11.5, color: "var(--text-dim)", width: 168, flexShrink: 0 }}>{ev.timestamp}</span>
                       <span style={{ width: 8, height: 8, borderRadius: "50%", flexShrink: 0, background: RESULT_COLOR[ev.result] ?? "var(--text-faint)" }} />
                       <span style={{ flex: 1 }}>{ev.description}</span>
-                      {ev.account && ev.account !== s.account && <span style={{ color: "var(--text-faint)", fontSize: 11 }}>👤 {ev.account}</span>}
+                      {ev.account && ev.account !== s.account && <span style={{ color: "var(--text-dim)", fontSize: 11 }}>👤 {ev.account}</span>}
                       {onToggleBookmark && Number.isFinite(ev.rowid) && (
                         <span
                           onClick={(e) => {
