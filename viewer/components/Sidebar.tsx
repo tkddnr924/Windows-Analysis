@@ -343,9 +343,6 @@ interface SidebarProps {
   activeVirtualTab: "timeline" | "bookmarks" | "connections" | null;
   onSelectDashboard: () => void;
   onSelectTimeline: () => void;
-  /** Master timeline is still building in the background — show a spinner and
-   * block the click until it's ready. */
-  timelineBusy: boolean;
   onSelectBookmarks: () => void;
   onSelectConnections: () => void;
   bookmarkCount: number;
@@ -366,7 +363,6 @@ export default function Sidebar({
   activeVirtualTab,
   onSelectDashboard,
   onSelectTimeline,
-  timelineBusy,
   onSelectBookmarks,
   onSelectConnections,
   bookmarkCount,
@@ -537,7 +533,6 @@ export default function Sidebar({
               label="통합 타임라인"
               selected={activeVirtualTab === "timeline"}
               onClick={onSelectTimeline}
-              busy={timelineBusy}
             />
           </div>
         </>
