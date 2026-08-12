@@ -16,8 +16,23 @@ an older run's numbers.
 """
 from __future__ import annotations
 
+import datetime as _dt
 import json
 import re
+
+
+def _ts_epoch(ts: str):
+    """Parse the parser's fixed 'YYYY-MM-DD hh:mm:ss.fff' string to epoch
+    seconds for relative time-delta comparisons (timezone is irrelevant to a
+    delta). Returns None on anything unparseable."""
+    if not ts:
+        return None
+    for fmt, cut in (("%Y-%m-%d %H:%M:%S.%f", 23), ("%Y-%m-%d %H:%M:%S", 19)):
+        try:
+            return _dt.datetime.strptime(ts[:cut], fmt).timestamp()
+        except (ValueError, TypeError):
+            continue
+    return None
 
 
 def _rows(all_results: dict, artifact_name: str, output_name: str) -> list[dict]:
@@ -227,9 +242,16 @@ def build_remote_desktop_history(all_results: dict) -> list[dict]:
     and TerminalServices event logs. Direction and success/failure are
     classified per event so the viewer can split them."""
     rows = []
+    lsm = "Microsoft-Windows-TerminalServices-LocalSessionManager"
+    # session number -> [address, account] learned from LSM events that carry
+    # them (21/22/24/25). Logoff/disconnect (23/39/40) omit the address, so we
+    # backfill by session so they don't render as "(주소 없음)".
+    sess_info: dict[str, list] = {}
+    lsm_pending: list[tuple] = []  # (row_index, session_key)
 
     for r in _eventlog_rows(all_results):
-        spec = _RDP_EVENTS.get((r.get("Provider", ""), str(r.get("EventID", ""))))
+        provider = r.get("Provider", "")
+        spec = _RDP_EVENTS.get((provider, str(r.get("EventID", ""))))
         if not spec:
             continue
 
@@ -237,19 +259,60 @@ def build_remote_desktop_history(all_results: dict) -> list[dict]:
         if spec.get("logon_type_10") and str(event_data.get("LogonType", "")) != "10":
             continue
 
+        addr = _ed_field(event_data, *spec["addr"]) if spec["addr"] else ""
+        acct = _bare_account(_ed_field(event_data, *spec["acct"])) if spec["acct"] else ""
         rows.append(
             {
                 "timestamp": r.get("timestamp", ""),
                 "direction": spec["direction"],
-                "remote_address": _ed_field(event_data, *spec["addr"]),
-                "account": _bare_account(_ed_field(event_data, *spec["acct"])),
+                "remote_address": addr,
+                "account": acct,
                 "description": spec["description"],
                 "result": spec["result"],
                 "event_id": str(r.get("EventID", "")),
-                "provider": r.get("Provider", ""),
+                "provider": provider,
                 "record_key": r.get("_record_key", ""),
             }
         )
+
+        if provider == lsm:
+            xml = event_data.get("EventXML")
+            src = xml if isinstance(xml, dict) else event_data
+            skey = src.get("SessionID") or src.get("Session") or src.get("TargetSession")
+            if skey is not None:
+                skey = str(skey)
+                info = sess_info.setdefault(skey, [None, None])
+                if addr:
+                    info[0] = addr
+                if acct:
+                    info[1] = acct
+                lsm_pending.append((len(rows) - 1, skey))
+
+    # Backfill address/account onto the LSM lifecycle events from their session.
+    for idx, skey in lsm_pending:
+        info = sess_info.get(skey)
+        if not info:
+            continue
+        row = rows[idx]
+        if not row["remote_address"] and info[0]:
+            row["remote_address"] = info[0]
+        if not row["account"] and info[1]:
+            row["account"] = info[1]
+
+    # Outbound (RDP client) connect/disconnect signals (1025/1026) carry no
+    # server address; carry forward the most recent outbound server address
+    # (1024/1102, field "Value") seen within a short window so the outbound
+    # session reads with a target instead of "(주소 없음)".
+    _OUTBOUND_WINDOW = 5 * 60  # seconds
+    last_out = None  # (epoch, address)
+    for row in sorted(rows, key=lambda x: x["timestamp"]):
+        if row["direction"] != "outbound":
+            continue
+        t = _ts_epoch(row["timestamp"])
+        if row["remote_address"]:
+            last_out = (t, row["remote_address"])
+        elif last_out and t is not None and last_out[0] is not None and 0 <= t - last_out[0] <= _OUTBOUND_WINDOW:
+            row["remote_address"] = last_out[1]
 
     return rows
 
