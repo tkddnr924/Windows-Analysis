@@ -349,8 +349,12 @@ def _system_info(software: list, system: list) -> list[dict]:
             name = r["value_name"]
             if name in seen:
                 continue
-            seen.add(name)
             val = _unixdate(r.get("value_data", "")) if name == "InstallDate" else r.get("value_data", "")
+            # The Wow6432Node CurrentVersion mirror often carries InstallDate=0;
+            # skip an empty/invalid InstallDate so the real one still wins.
+            if name == "InstallDate" and not val:
+                continue
+            seen.add(name)
             rows.append(_ti_row(category="SystemInfo", name=name, value=val, source_artifact="SOFTWARE"))
     cn = _pick(system, "\\control\\computername\\computername", "ComputerName")
     if cn:

@@ -182,7 +182,7 @@ export default function TargetInfoView({ data, loadAccountEvents }: TargetInfoVi
 
     for (const r of dedup) {
       const cat = r.category;
-      if (cat === "OS" || cat === "System") {
+      if (cat === "SystemInfo" || cat === "OS" || cat === "System") {
         // Prefer a non-empty value; some rows carry only a timestamp
         // (e.g. LastShutdownTime), which we surface as the value.
         const value = r.value || r.timestamp || "";
