@@ -58,6 +58,7 @@ _MOSAIC_COLS = 48     # tiles per row in the see-all mosaic
 _MAX_DIM = 256        # sanity bound; a larger declared tile means corruption
 _BG = (16, 20, 26)    # dark background behind stitched cells
 _MIN_FRAGMENT = 2     # a "fragment" is 2+ tiles joined; singles fall to "tile"
+_MAX_EDGE_SHARE = 8   # an edge matched by more tiles than this is a generic border, not a real seam — don't guess a join from it
 
 
 def _png(width: int, height: int, rgb: bytes) -> str:
@@ -153,7 +154,15 @@ def _uniform(edge: bytes) -> bool:
 def _stitch(tiles: list[dict]):
     """Join tiles by exact matching edges into connected components, each with a
     grid position. Returns (components, pos) where components is a list of member
-    id-lists (largest first) and pos maps tile id -> (col, row)."""
+    id-lists (largest first) and pos maps tile id -> (col, row).
+
+    Two guards keep the reconstructions honest:
+      - an edge shared by more than _MAX_EDGE_SHARE tiles is a generic border
+        (blank frame, repeated UI chrome), so we don't guess a seam from it;
+      - during layout, a tile is never placed on a cell another tile already
+        occupies — when the match graph is geometrically inconsistent (a seam
+        that folds back on itself), the conflicting join is dropped instead of
+        overwriting a neighbour and garbling the image."""
     left_idx, top_idx = defaultdict(list), defaultdict(list)
     edge = {}
     for t in tiles:
@@ -170,12 +179,14 @@ def _stitch(tiles: list[dict]):
     for t in tiles:
         L, R, T, B = edge[t["i"]]
         if not _uniform(R):
-            cand = [b for b in left_idx[(t["h"], R)] if b != t["i"]]
-            if cand:
+            grp = left_idx[(t["h"], R)]
+            cand = [b for b in grp if b != t["i"]]
+            if cand and len(grp) <= _MAX_EDGE_SHARE:
                 right_of[t["i"]] = cand[0]
         if not _uniform(B):
-            cand = [b for b in top_idx[(t["w"], B)] if b != t["i"]]
-            if cand:
+            grp = top_idx[(t["w"], B)]
+            cand = [b for b in grp if b != t["i"]]
+            if cand and len(grp) <= _MAX_EDGE_SHARE:
                 down_of[t["i"]] = cand[0]
     left_of = {v: k for k, v in right_of.items()}
     up_of = {v: k for k, v in down_of.items()}
@@ -189,17 +200,23 @@ def _stitch(tiles: list[dict]):
         pos[t["i"]] = (0, 0)
         seen.add(t["i"])
         members = [t["i"]]
+        occupied = {(0, 0): t["i"]}  # cell -> tile, so two tiles never share a cell
         q = deque([t["i"]])
         while q:
             cur = q.popleft()
             cx, cy = pos[cur]
             for nid, (dx, dy) in ((right_of.get(cur), (1, 0)), (down_of.get(cur), (0, 1)),
                                    (left_of.get(cur), (-1, 0)), (up_of.get(cur), (0, -1))):
-                if nid is not None and nid not in seen:
-                    seen.add(nid)
-                    pos[nid] = (cx + dx, cy + dy)
-                    members.append(nid)
-                    q.append(nid)
+                if nid is None or nid in seen:
+                    continue
+                cell = (cx + dx, cy + dy)
+                if cell in occupied:  # inconsistent geometry — drop this join
+                    continue
+                seen.add(nid)
+                pos[nid] = cell
+                occupied[cell] = nid
+                members.append(nid)
+                q.append(nid)
         comps.append(members)
     comps.sort(key=len, reverse=True)
     return comps, pos
