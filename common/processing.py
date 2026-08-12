@@ -624,6 +624,7 @@ def build_defender(all_results: dict) -> list[dict]:
     tampering: list[tuple] = []
     scans: dict[str, tuple] = {}
     history_cleared: list[tuple] = []
+    rt_events: list[tuple] = []  # (ts, is_on, record_key) — 5000 on / 5001 off
     sig_latest = None  # (ts, version, record_key)
 
     for r in _defender_events(all_results):
@@ -670,7 +671,9 @@ def build_defender(all_results: dict) -> list[dict]:
                     rec["record_key"] = rk
 
         elif eid == "5001":
-            tampering.append((ts, "실시간 보호 사용 안 함", "Defender 실시간 보호가 해제됨", "", rk, eid))
+            rt_events.append((ts, False, rk))
+        elif eid == "5000":
+            rt_events.append((ts, True, rk))
         elif eid == "5004":
             tampering.append((ts, "실시간 보호 구성 변경", "실시간 보호 설정이 변경됨", "", rk, eid))
         elif eid == "5010":
@@ -699,6 +702,26 @@ def build_defender(all_results: dict) -> list[dict]:
         if not rec["action"]:
             rec["action"] = "탐지만 됨"
         out.append(rec)
+
+    # Real-time protection: collapse the raw 5000/5001 stream to state changes
+    # only — routine boot-time "enabled" events would otherwise flood the list.
+    # A leading "enabled" (the normal baseline) is not surfaced; a disable and
+    # any later re-enable ("복원") are.
+    rt_events.sort()
+    prev = None
+    for ts, is_on, rk in rt_events:
+        if prev is None:
+            prev = is_on
+            if not is_on:
+                tampering.append((ts, "실시간 보호 사용 안 함", "Defender 실시간 보호가 해제됨", "", rk, "5001"))
+            continue
+        if is_on == prev:
+            continue
+        prev = is_on
+        if is_on:
+            tampering.append((ts, "실시간 보호 복원", "Defender 실시간 보호가 다시 켜짐", "", rk, "5000"))
+        else:
+            tampering.append((ts, "실시간 보호 사용 안 함", "Defender 실시간 보호가 해제됨", "", rk, "5001"))
 
     if history_cleared:
         history_cleared.sort()
