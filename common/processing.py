@@ -420,7 +420,20 @@ def _parse_sam_v(b: bytes) -> dict:
 _HEX = set("0123456789abcdefABCDEF")
 
 
+def _special_accounts(software: list) -> dict:
+    r"""Winlogon SpecialAccounts\UserList: username(lower) -> raw value. A user
+    listed with 0 is hidden from the Windows logon screen — a well-known way to
+    stash a persistence account so it doesn't show up on the welcome screen."""
+    mark = "\\microsoft\\windows nt\\currentversion\\winlogon\\specialaccounts\\userlist"
+    out: dict[str, str] = {}
+    for r in software:
+        if r.get("key_path", "").lower().endswith(mark) and r.get("value_name"):
+            out[r["value_name"].lower()] = str(r.get("value_data", "")).strip()
+    return out
+
+
 def _accounts(sam: list, software: list) -> list[dict]:
+    hidden = _special_accounts(software)
     # Machine SID prefix + per-SID profile path, from SOFTWARE ProfileList.
     prefix = ""
     profiles: dict[str, str] = {}
@@ -465,6 +478,8 @@ def _accounts(sam: list, software: list) -> list[dict]:
         sid = f"{prefix}-{rid}" if prefix else ""
         path = profiles.get(sid, "")
         created = names_created.get(username.lower(), "")
+        sp = hidden.get(username.lower())
+        special = "" if sp is None else ("예 (로그온 화면 숨김)" if sp in ("0", "0x0") else f"UserList 값 {sp}")
         rows.append(_ti_row(
             category="Account", name=sid, value=path, source_artifact="SAM",
             username=username, full_name=v.get("full_name", ""),
@@ -473,7 +488,7 @@ def _accounts(sam: list, software: list) -> list[dict]:
             last_login=f.get("last_login", ""), password_last_set=f.get("password_last_set", ""),
             last_failed_login=f.get("last_failed_login", ""), login_count=f.get("login_count", ""),
             failed_login_count=f.get("failed_login_count", ""), disabled=f.get("disabled", ""),
-            account_flags=f.get("account_flags", ""),
+            account_flags=f.get("account_flags", ""), special_account=special,
             timestamp=f.get("last_login", "") or created,
         ))
 
