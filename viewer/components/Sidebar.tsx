@@ -79,6 +79,12 @@ const OVERVIEW_TABLE_ICONS: Record<string, string> = {
   BrowserActivity: "🌐",
   RemoteDesktopHistory: "🖥️",
   PowerShellHistory: "💻",
+  RdpCache: "🖼️",
+};
+
+// Friendlier labels for overview tables whose raw name reads awkwardly.
+const OVERVIEW_TABLE_NAMES: Record<string, string> = {
+  RdpCache: "RDP 캐시",
 };
 
 function sameEntry(a: ResultFileEntry | null, b: ResultFileEntry): boolean {
@@ -140,6 +146,7 @@ function FileRow({
 // expandable node listing its tables.
 function FileNode({
   fileName,
+  label,
   tables,
   selectedFile,
   indent,
@@ -147,6 +154,7 @@ function FileNode({
   onSelectFile,
 }: {
   fileName: string;
+  label?: string;
   tables: ResultFileEntry[];
   selectedFile: ResultFileEntry | null;
   indent: number;
@@ -157,7 +165,7 @@ function FileNode({
 
   if (tables.length === 1) {
     return (
-      <FileRow entry={tables[0]} label={fileName} selected={sameEntry(selectedFile, tables[0])} indent={indent} icon={icon} onSelectFile={onSelectFile} />
+      <FileRow entry={tables[0]} label={label ?? fileName} selected={sameEntry(selectedFile, tables[0])} indent={indent} icon={icon} onSelectFile={onSelectFile} />
     );
   }
 
@@ -272,6 +280,7 @@ function CategoryNode({ category, selectedFile, onSelectFile, displayName, pinne
             <FileNode
               key={fileName}
               fileName={fileName}
+              label={pinned ? OVERVIEW_TABLE_NAMES[fileName] : undefined}
               tables={tables}
               selectedFile={selectedFile}
               indent={pinned ? 20 : 26}

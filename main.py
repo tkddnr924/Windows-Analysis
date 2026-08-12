@@ -106,9 +106,15 @@ def run_host(case_id: str, host_id: str, cases_dir: Path, only: set[str] | None 
         "RemoteDesktopHistory": correlate.build_remote_desktop_history,
         # "SmbHistory": correlate.build_smb_history,  # deferred — needs a sample with SMB logon data
         "PowerShellHistory": correlate.build_powershell_history,
+        "RdpCache": processing.build_rdp_cache,
     }
+    # Overviews that only make sense when the source artifact exists — skip
+    # writing an empty table so no blank tab shows up in 종합 분석.
+    skip_if_empty = {"RdpCache"}
     for output_name, builder in overview_builders.items():
         rows = builder(all_results)
+        if not rows and output_name in skip_if_empty:
+            continue
         sqlite_path = overview_dir / f"{output_name}.sqlite"
         write_rows_to_sqlite(rows, sqlite_path, output_name, [])
         print(f"[+] {len(rows)} rows -> {sqlite_path}")

@@ -335,6 +335,22 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     ]}],
   },
 
+  // Processed overview: the stitched/reconstructed RDP cache images (fragments
+  // + mosaic), split out of the raw RdpBitmapCache table into 종합 분석.
+  RdpCache: {
+    customView: "rdpCache",
+    title: (r) => (r.kind === "mosaic" ? `${r.source_file} (모자이크)` : `${r.source_file} 복원 조각 ${r.fragment_index}`),
+    subtitle: (r) => (r.cols && r.rows ? `${r.cols}×${r.rows} 타일` : ""),
+    sections: [{ heading: "복원 조각", fields: [
+      { key: "kind", label: "종류" },
+      { key: "source_file", label: "캐시 파일" },
+      { key: "fragment_index", label: "조각 번호" },
+      { key: "tile_count", label: "타일 수" },
+      { key: "cols", label: "가로 타일" },
+      { key: "rows", label: "세로 타일" },
+    ]}],
+  },
+
   RemoteDesktopHistory: {
     title: (r) => r.remote_address || "(주소 없음)",
     subtitle: (r) => r.description || "",
