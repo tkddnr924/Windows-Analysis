@@ -145,6 +145,7 @@ export interface ElectronApi {
   listResultFiles(categoryDir: string): Promise<ResultFileEntry[]>;
   readResultFile(fullPath: string, tableName?: string): Promise<CsvData>;
   listColumnValues(fullPath: string, column: string, tableName?: string): Promise<{ value: string; count: number }[]>;
+  searchCase(query: string, hosts: { id: string; name: string; dir: string }[]): Promise<SearchHit[]>;
   listBookmarks(hostDir: string): Promise<Bookmark[]>;
   toggleBookmark(hostDir: string, entry: BookmarkInput): Promise<Bookmark[]>;
   updateBookmarkNote(hostDir: string, id: string, note: string): Promise<Bookmark[]>;
@@ -154,4 +155,17 @@ declare global {
   interface Window {
     api: ElectronApi;
   }
+}
+
+export interface SearchHit {
+  hostId: string;
+  hostName: string;
+  fileName: string;
+  tableName: string;
+  fullPath: string;
+  rowid: number;
+  /** The first column whose value contained the query (for a labelled preview). */
+  matchColumn: string;
+  columns: string[];
+  row: Record<string, string>;
 }

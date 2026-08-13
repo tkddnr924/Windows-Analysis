@@ -2,6 +2,7 @@ import { contextBridge, ipcRenderer } from "electron";
 import type {
   Bookmark,
   BookmarkInput,
+  SearchHit,
   Case,
   Host,
   CategoryEntry,
@@ -36,6 +37,8 @@ contextBridge.exposeInMainWorld("api", {
     ipcRenderer.invoke("read-result-file", fullPath, tableName),
   listColumnValues: (fullPath: string, column: string, tableName?: string): Promise<{ value: string; count: number }[]> =>
     ipcRenderer.invoke("list-column-values", fullPath, column, tableName),
+  searchCase: (query: string, hosts: { id: string; name: string; dir: string }[]): Promise<SearchHit[]> =>
+    ipcRenderer.invoke("search-case", query, hosts),
   listBookmarks: (caseDir: string): Promise<Bookmark[]> => ipcRenderer.invoke("list-bookmarks", caseDir),
   toggleBookmark: (caseDir: string, entry: BookmarkInput): Promise<Bookmark[]> =>
     ipcRenderer.invoke("toggle-bookmark", caseDir, entry),

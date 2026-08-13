@@ -95,3 +95,16 @@ export interface RunHostOptions {
 export interface PipelineResult {
   exitCode: number | null;
 }
+
+export interface SearchHit {
+  hostId: string;
+  hostName: string;
+  fileName: string;
+  tableName: string;
+  fullPath: string;
+  rowid: number;
+  /** The first column whose value contained the query (for a labelled preview). */
+  matchColumn: string;
+  columns: string[];
+  row: Record<string, string>;
+}

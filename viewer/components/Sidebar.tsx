@@ -349,11 +349,12 @@ interface SidebarProps {
   categories: CategoryEntry[];
   selectedFile: ResultFileEntry | null;
   onSelectFile: (file: ResultFileEntry) => void;
-  activeVirtualTab: "timeline" | "bookmarks" | "connections" | null;
+  activeVirtualTab: "timeline" | "bookmarks" | "connections" | "search" | null;
   onSelectDashboard: () => void;
   onSelectTimeline: () => void;
   onSelectBookmarks: () => void;
   onSelectConnections: () => void;
+  onSelectSearch: () => void;
   bookmarkCount: number;
   timeRange: TimeRange;
   onTimeRangeChange: (range: TimeRange) => void;
@@ -374,6 +375,7 @@ export default function Sidebar({
   onSelectTimeline,
   onSelectBookmarks,
   onSelectConnections,
+  onSelectSearch,
   bookmarkCount,
   timeRange,
   onTimeRangeChange,
@@ -514,6 +516,12 @@ export default function Sidebar({
           {/* 케이스 분석 — spans every host in the case */}
           <div style={{ borderBottom: "1px solid var(--border-subtle)" }}>
             <div style={{ padding: "8px 14px 4px", fontSize: 10.5, fontWeight: 700, letterSpacing: 0.5, color: "var(--text-faint)", textTransform: "uppercase" }}>케이스 분석</div>
+            <PinnedNavRow
+              icon="🔍"
+              label="전체 검색"
+              selected={activeVirtualTab === "search"}
+              onClick={onSelectSearch}
+            />
             <PinnedNavRow
               icon="🔗"
               label="호스트 연결"

@@ -344,6 +344,79 @@ function findResultFiles(dir: string, baseDir: string): ResultFileEntry[] {
   return results;
 }
 
+// Collect every non-empty .sqlite path under a host dir (recursive).
+function collectSqlite(dir: string): string[] {
+  const out: string[] = [];
+  if (!fs.existsSync(dir)) return out;
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) out.push(...collectSqlite(full));
+    else if (entry.isFile() && entry.name.toLowerCase().endsWith(".sqlite") && fs.statSync(full).size > EMPTY_SQLITE_MAX_BYTES) out.push(full);
+  }
+  return out;
+}
+
+interface SearchHit {
+  hostId: string;
+  hostName: string;
+  fileName: string;
+  tableName: string;
+  fullPath: string;
+  rowid: number;
+  matchColumn: string;
+  columns: string[];
+  row: Record<string, string>;
+}
+
+// Case-wide substring search: scan every host's every table for rows where any
+// column contains the query. Bounded per-table and overall so a broad term on
+// a huge case stays responsive. Runs in the main process (better-sqlite3 is
+// sync) so the renderer stays live behind a spinner.
+ipcMain.handle("search-case", (_event, query: string, hosts: { id: string; name: string; dir: string }[]): SearchHit[] => {
+  const q = (query ?? "").trim();
+  if (q.length < 2) return [];
+  const like = `%${q.replace(/[%_\\]/g, (m) => "\\" + m)}%`;
+  const PER_TABLE = 50;
+  const TOTAL = 600;
+  const hits: SearchHit[] = [];
+  for (const host of hosts ?? []) {
+    for (const fullPath of collectSqlite(host.dir)) {
+      let db: InstanceType<typeof Database>;
+      try {
+        db = new Database(fullPath, { readonly: true, fileMustExist: true });
+      } catch {
+        continue;
+      }
+      try {
+        const fileName = path.basename(fullPath).replace(/\.sqlite$/i, "");
+        for (const tableName of tableNames(db)) {
+          const cols = (db.prepare(`PRAGMA table_info("${tableName}")`).all() as { name: string }[]).map((c) => c.name);
+          if (cols.length === 0) continue;
+          const where = cols.map((c) => `"${c}" LIKE @q ESCAPE '\\'`).join(" OR ");
+          let rows: Record<string, string>[];
+          try {
+            rows = db.prepare(`SELECT rowid AS __rowid, * FROM "${tableName}" WHERE ${where} LIMIT ${PER_TABLE}`).all({ q: like }) as Record<string, string>[];
+          } catch {
+            continue;
+          }
+          const ql = q.toLowerCase();
+          for (const row of rows) {
+            const matchColumn = cols.find((c) => String(row[c] ?? "").toLowerCase().includes(ql)) ?? "";
+            hits.push({ hostId: host.id, hostName: host.name, fileName, tableName, fullPath, rowid: Number((row as Record<string, unknown>).__rowid), matchColumn, columns: cols, row });
+            if (hits.length >= TOTAL) {
+              db.close();
+              return hits;
+            }
+          }
+        }
+      } finally {
+        db.close();
+      }
+    }
+  }
+  return hits;
+});
+
 ipcMain.handle("list-result-files", (_event, categoryDir: string): ResultFileEntry[] => {
   if (!fs.existsSync(categoryDir)) return [];
   return findResultFiles(categoryDir, categoryDir).sort(
