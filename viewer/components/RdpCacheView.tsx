@@ -51,9 +51,10 @@ export default function RdpCacheView({ data, mode = "fragments" }: RdpCacheViewP
     for (const g of byFile.values()) {
       g.fragments.sort((a, b) => Number(b.tile_count) - Number(a.tile_count));
     }
-    // Only keep files that have something to show in this mode.
+    // Only keep files that have something to show in this mode. The mosaic
+    // (all tiles laid out) belongs with the raw tiles, not the reconstruction.
     return [...byFile.values()]
-      .filter((g) => (isTiles ? g.tiles.length > 0 : g.fragments.length > 0 || g.mosaic))
+      .filter((g) => (isTiles ? g.tiles.length > 0 || g.mosaic : g.fragments.length > 0))
       .sort((a, b) => a.source.localeCompare(b.source));
   }, [data.rows, isTiles]);
 
@@ -90,7 +91,20 @@ export default function RdpCacheView({ data, mode = "fragments" }: RdpCacheViewP
           </div>
 
           {isTiles ? (
-            /* raw single tiles — the main content in 원본 데이터 */
+            /* raw single tiles + the see-all mosaic — the content in 원본 데이터 */
+            <>
+            {g.mosaic?.image && (
+              <div style={{ marginBottom: 14 }}>
+                <div style={{ fontSize: 11.5, color: "var(--text-faint)", marginBottom: 4 }}>전체 모자이크 (캐시 순서)</div>
+                <div
+                  onClick={() => setZoom({ img: src(g.mosaic!.image), label: `${g.source} · 전체 모자이크` })}
+                  title="클릭하면 원본 크기로 확대"
+                  style={{ border: "1px solid var(--border)", borderRadius: "var(--radius-md)", overflow: "hidden", cursor: "zoom-in", background: "var(--bg)", lineHeight: 0 }}
+                >
+                  <img src={src(g.mosaic.image)} alt="모자이크" style={{ width: "100%", display: "block", imageRendering: "pixelated" }} />
+                </div>
+              </div>
+            )}
             <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
               {g.tiles.map((t) => (
                 <div key={t.tile_index} style={{ position: "relative", lineHeight: 0 }}>
@@ -107,40 +121,21 @@ export default function RdpCacheView({ data, mode = "fragments" }: RdpCacheViewP
                 </div>
               ))}
             </div>
-          ) : (
-            <>
-              {/* reconstructed fragments — the main content */}
-              {g.fragments.length > 0 ? (
-                <div style={{ display: "flex", flexWrap: "wrap", gap: 10, alignItems: "flex-start" }}>
-                  {g.fragments.map((f) => (
-                    <div
-                      key={f.fragment_index}
-                      onClick={() => setZoom({ img: src(f.image), label: `${g.source} · 복원 조각 ${f.fragment_index} (${f.tile_count} 타일)` })}
-                      title={`${f.tile_count} 타일 · ${f.cols}×${f.rows}`}
-                      style={{ border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", padding: 4, background: "var(--bg)", cursor: "zoom-in" }}
-                    >
-                      <img src={src(f.image)} alt={`복원 조각 ${f.fragment_index}`} style={{ display: "block", imageRendering: "pixelated", maxWidth: 360 }} />
-                    </div>
-                  ))}
-                </div>
-              ) : (
-                <div style={{ color: "var(--text-faint)", fontSize: 12 }}>이어붙은 조각이 없습니다 (아래 모자이크 참고).</div>
-              )}
-
-              {/* mosaic — see everything at once */}
-              {g.mosaic?.image && (
-                <div style={{ marginTop: 14 }}>
-                  <div style={{ fontSize: 11.5, color: "var(--text-faint)", marginBottom: 4 }}>전체 모자이크 (캐시 순서)</div>
-                  <div
-                    onClick={() => setZoom({ img: src(g.mosaic!.image), label: `${g.source} · 전체 모자이크` })}
-                    title="클릭하면 원본 크기로 확대"
-                    style={{ border: "1px solid var(--border)", borderRadius: "var(--radius-md)", overflow: "hidden", cursor: "zoom-in", background: "var(--bg)", lineHeight: 0 }}
-                  >
-                    <img src={src(g.mosaic.image)} alt="모자이크" style={{ width: "100%", display: "block", imageRendering: "pixelated" }} />
-                  </div>
-                </div>
-              )}
             </>
+          ) : (
+            /* reconstructed fragments only — no raw tiles/mosaic here */
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 10, alignItems: "flex-start" }}>
+              {g.fragments.map((f) => (
+                <div
+                  key={f.fragment_index}
+                  onClick={() => setZoom({ img: src(f.image), label: `${g.source} · 복원 조각 ${f.fragment_index} (${f.tile_count} 타일)` })}
+                  title={`${f.tile_count} 타일 · ${f.cols}×${f.rows}`}
+                  style={{ border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", padding: 4, background: "var(--bg)", cursor: "zoom-in" }}
+                >
+                  <img src={src(f.image)} alt={`복원 조각 ${f.fragment_index}`} style={{ display: "block", imageRendering: "pixelated", maxWidth: 360 }} />
+                </div>
+              ))}
+            </div>
           )}
         </section>
       ))}

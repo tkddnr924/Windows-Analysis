@@ -1108,12 +1108,13 @@ def build_browser_history(all_results: dict) -> list[dict]:
 
 def build_rdp_cache(all_results: dict) -> list[dict]:
     """The stitched/reconstructed RDP bitmap-cache images — the reassembled
-    "fragment"s and the per-file "mosaic" — pulled out of the raw
-    RdpBitmapCache table so they live under the processed overview ("RDP
-    캐시"). The raw single tiles stay in the raw view; nothing is recomputed,
-    the derived rows are just surfaced where they belong."""
+    "fragment"s only — pulled out of the raw RdpBitmapCache table so they live
+    under the processed overview ("RDP 캐시"). The single tiles AND the per-file
+    "mosaic" (every tile laid out in cache order, essentially the raw tiles) stay
+    in the raw view; nothing is recomputed, the derived rows are just surfaced
+    where they belong."""
     rows = []
     for r in all_results.get("RdpCache", {}).get("RdpBitmapCache", []):
-        if r.get("kind") in ("fragment", "mosaic"):
+        if r.get("kind") == "fragment":
             rows.append(r)
     return rows
