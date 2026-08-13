@@ -76,6 +76,7 @@ const OVERVIEW_TABLE_ICONS: Record<string, string> = {
   RegistryFindings: "🔎",
   BrowserActivity: "🌐",
   RemoteDesktopHistory: "🖥️",
+  SmbHistory: "📁",
   PowerShellHistory: "💻",
   RdpCache: "🖼️",
 };
@@ -83,6 +84,7 @@ const OVERVIEW_TABLE_ICONS: Record<string, string> = {
 // Friendlier labels for overview tables whose raw name reads awkwardly.
 const OVERVIEW_TABLE_NAMES: Record<string, string> = {
   RdpCache: "RDP 캐시",
+  SmbHistory: "SMB 연결",
 };
 
 function sameEntry(a: ResultFileEntry | null, b: ResultFileEntry): boolean {

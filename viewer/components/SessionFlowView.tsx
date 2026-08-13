@@ -6,7 +6,6 @@ import { getArtifactView } from "@/lib/artifactViews";
 import { inRange, EMPTY_TIME_RANGE, type TimeRange } from "@/lib/timeRange";
 import RowDetailPanel from "./RowDetailPanel";
 
-const TABLE_NAME = "RemoteDesktopHistory";
 // A gap longer than this between consecutive events of the same peer starts a
 // new session. RDP sessions cluster their connect/logon/reconnect/disconnect
 // events within a short window; 10 minutes keeps a burst together without
@@ -134,7 +133,8 @@ export default function SessionFlowView({
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [selected, setSelected] = useState<Record<string, string> | null>(null);
 
-  const spec = getArtifactView(TABLE_NAME);
+  const isSmb = fileName === "SmbHistory";
+  const spec = getArtifactView(fileName);
   const allSessions = useMemo(() => clusterSessions(data, timeRange), [data, timeRange]);
 
   const sessions = useMemo(() => {
@@ -184,7 +184,7 @@ export default function SessionFlowView({
       {/* toolbar */}
       <div style={{ padding: "10px 14px", borderBottom: "1px solid var(--border)", background: "var(--bg-panel)", flexShrink: 0, display: "flex", flexDirection: "column", gap: 9 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
-          <strong style={{ fontSize: 13.5 }}>🖥️ 원격 데스크톱 세션 흐름</strong>
+          <strong style={{ fontSize: 13.5 }}>{isSmb ? "📁 SMB 연결 (네트워크 인증)" : "🖥️ 원격 데스크톱 세션 흐름"}</strong>
           <span style={{ color: "var(--text-faint)", fontSize: 11.5 }}>
             {sessions.length.toLocaleString()} / {allSessions.length.toLocaleString()}개 세션
           </span>
@@ -324,7 +324,7 @@ export default function SessionFlowView({
           row={selected}
           columns={data.columns}
           focusedColumn={null}
-          fileBaseName={TABLE_NAME}
+          fileBaseName={fileName}
           onClose={() => setSelected(null)}
           onNavigate={(targetFile, targetColumn, value) => {
             setSelected(null);

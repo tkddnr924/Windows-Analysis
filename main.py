@@ -104,13 +104,13 @@ def run_host(case_id: str, host_id: str, cases_dir: Path, only: set[str] | None 
         "RegistryFindings": processing.build_registry_findings,
         "BrowserActivity": processing.build_browser_history,
         "RemoteDesktopHistory": correlate.build_remote_desktop_history,
-        # "SmbHistory": correlate.build_smb_history,  # deferred — needs a sample with SMB logon data
+        "SmbHistory": correlate.build_smb_history,
         "PowerShellHistory": correlate.build_powershell_history,
         "RdpCache": processing.build_rdp_cache,
     }
     # Overviews that only make sense when the source artifact exists — skip
     # writing an empty table so no blank tab shows up in 종합 분석.
-    skip_if_empty = {"RdpCache"}
+    skip_if_empty = {"RdpCache", "SmbHistory"}
     for output_name, builder in overview_builders.items():
         rows = builder(all_results)
         if not rows and output_name in skip_if_empty:

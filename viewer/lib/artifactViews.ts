@@ -382,6 +382,39 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     ]}],
   },
 
+  // Inbound SMB / network-logon activity (SMBServer/Security 551·1009 and, when
+  // Security auditing is on, 4624/4625 LogonType 3). Same session-flow view as
+  // RDP — repeated failures from one IP collapse into a burst, which reads as a
+  // brute-force / lateral-movement attempt.
+  SmbHistory: {
+    title: (r) => r.remote_address || "(주소 없음)",
+    subtitle: (r) => r.description || "",
+    badges: [
+      { key: "direction", kind: "badge", badgeColors: DIRECTION_COLORS },
+      { key: "result", label: "결과", kind: "badge", badgeColors: RDP_RESULT_COLORS },
+    ],
+    links: [{ key: "record_key", label: "이벤트 로그 원본 보기", targetFile: "EventLog_Events", targetColumn: "_record_key" }],
+    flowView: true,
+    visibleColumns: ["timestamp", "remote_address", "account", "result", "description"],
+    filterTabs: {
+      column: "result",
+      tabs: [
+        { label: "전체" },
+        { label: "실패", value: "실패" },
+        { label: "성공", value: "성공" },
+      ],
+    },
+    priorityColumns: ["timestamp", "remote_address", "account", "result", "description"],
+    sections: [{ heading: "상세", fields: [
+      { key: "remote_address", label: "클라이언트 주소" },
+      { key: "account", label: "계정" },
+      { key: "description", label: "설명" },
+      { key: "result", label: "결과" },
+      { key: "event_id", label: "이벤트 ID" },
+      { key: "provider", label: "공급자" },
+    ]}],
+  },
+
   PowerShellHistory: {
     customView: "powershellFlow",
     title: (r) => r.command || r.kind || "(명령 없음)",
