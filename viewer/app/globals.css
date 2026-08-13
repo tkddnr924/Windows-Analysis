@@ -14,6 +14,8 @@
   --text: #e6edf3;
   --text-dim: #8b949e;
   --text-faint: #6e7681;
+  /* Timestamps must stay readable — brighter than the faint/dim greys. */
+  --text-time: #b9c2cc;
 
   --accent: #58a6ff;
   --accent-emphasis: #388bfd;

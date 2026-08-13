@@ -345,10 +345,19 @@ export default function ArtifactDetailView({ spec, row, onNavigate, onFetchLinke
 
   const activeLinks = (spec.links ?? []).filter((link) => row[link.key]);
 
+  // The record's time. Always surfaced when present — the primary timeline
+  // field if the spec declares one, else a plain "timestamp"/"last_write".
+  const timeValue = (spec.timelineField ? row[spec.timelineField] : "") || row.timestamp || row.last_write || "";
+
   return (
     <div>
       <div style={{ padding: "18px 16px 14px", borderBottom: "1px solid var(--border-subtle)" }}>
         <div style={{ fontSize: 16, fontWeight: 700, wordBreak: "break-word" }}>{title}</div>
+        {timeValue && (
+          <div style={{ fontSize: 13, color: "var(--text)", fontFamily: "var(--mono)", fontWeight: 600, marginTop: 5 }}>
+            🕑 {timeValue}
+          </div>
+        )}
         {subtitle && (
           <div style={{ fontSize: 12.5, color: "var(--text-dim)", marginTop: 3, wordBreak: "break-word" }}>
             {subtitle}

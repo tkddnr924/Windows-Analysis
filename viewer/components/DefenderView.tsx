@@ -158,7 +158,7 @@ export default function DefenderView({ data, onNavigate }: Props) {
                     {/* rail + dot */}
                     <span style={{ position: "absolute", left: 4, top: 13, width: 9, height: 9, borderRadius: "50%", background: color, border: "2px solid var(--bg-panel)", zIndex: 1 }} />
                     {!last && <span style={{ position: "absolute", left: 8, top: 20, bottom: -8, width: 1, background: "var(--border)" }} />}
-                    <span style={{ fontFamily: "var(--mono)", fontSize: 11.5, color: "var(--text-faint)", flex: "0 0 150px" }}>{t.timestamp || "-"}</span>
+                    <span style={{ fontFamily: "var(--mono)", fontSize: 11.5, color: "var(--text-time)", flex: "0 0 150px" }}>{t.timestamp || "-"}</span>
                     <div style={{ flex: 1 }}>
                       <span style={{ fontSize: 12.5, fontWeight: 600, color }}>{t.title}</span>
                       {t.detail && <div style={{ fontSize: 11.5, color: "var(--text-dim)", marginTop: 2, wordBreak: "break-all" }}>{t.detail}</div>}
@@ -185,7 +185,7 @@ export default function DefenderView({ data, onNavigate }: Props) {
                   onMouseEnter={(e) => s.record_key && (e.currentTarget.style.background = "var(--bg-hover)")}
                   onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
                 >
-                  <span style={{ fontFamily: "var(--mono)", fontSize: 11.5, color: "var(--text-faint)", flex: "0 0 150px" }}>{s.timestamp || "-"}</span>
+                  <span style={{ fontFamily: "var(--mono)", fontSize: 11.5, color: "var(--text-time)", flex: "0 0 150px" }}>{s.timestamp || "-"}</span>
                   <span style={{ color: "var(--text)", fontWeight: 600 }}>{s.title}</span>
                   {s.user && <span style={{ marginLeft: "auto", color: "var(--text-faint)", fontSize: 11 }}>{s.user}</span>}
                 </div>

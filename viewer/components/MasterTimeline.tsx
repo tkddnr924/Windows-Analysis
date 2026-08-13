@@ -402,7 +402,7 @@ export default function MasterTimeline({ entries, loading, onNavigate, onFetchLi
                   width: 168,
                   fontFamily: "var(--mono)",
                   fontSize: 12,
-                  color: entry.timestamp ? "var(--text-dim)" : "var(--text-faint)",
+                  color: entry.timestamp ? "var(--text-time)" : "var(--text-faint)",
                 }}
               >
                 {entry.timestamp || "(시간 정보 없음)"}

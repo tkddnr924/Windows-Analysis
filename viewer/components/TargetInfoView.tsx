@@ -2,12 +2,18 @@
 
 import { useEffect, useMemo, useState } from "react";
 import type { CsvData } from "@/lib/types";
+import type { FetchLinkedRows } from "@/lib/types";
+import RowDetailPanel from "./RowDetailPanel";
 
 interface TargetInfoViewProps {
   data: CsvData;
   /** Fetch EventLog rows involving an account (by SID or username) — account
    * management (creation/group/pw) + logons. Enables the account detail page. */
   loadAccountEvents?: (sid: string, username: string) => Promise<Row[]>;
+  /** Threaded so the account-event detail uses the same shared EventLog detail
+   * panel (RowDetailPanel) as every other view. */
+  onNavigate?: (targetFile: string, targetColumn: string, value: string) => void;
+  onFetchLinkedRows?: FetchLinkedRows;
 }
 
 // TargetInfo is a correlation of registry-derived system facts (OS build,
@@ -159,7 +165,7 @@ interface NetInterface {
   leaseTerminates: string;
 }
 
-export default function TargetInfoView({ data, loadAccountEvents }: TargetInfoViewProps) {
+export default function TargetInfoView({ data, loadAccountEvents, onNavigate, onFetchLinkedRows }: TargetInfoViewProps) {
   const [selectedAccount, setSelectedAccount] = useState<Account | null>(null);
   const { system, users, services, networks, interfaces, computerName, osSummary } = useMemo(() => {
     const rows = data.rows as Row[];
@@ -241,7 +247,7 @@ export default function TargetInfoView({ data, loadAccountEvents }: TargetInfoVi
   // Clicking an account opens a full page (not a modal) — account detail plus
   // the EventLog activity for its SID.
   if (selectedAccount) {
-    return <AccountDetailPage account={selectedAccount} onBack={() => setSelectedAccount(null)} loadEvents={loadAccountEvents} />;
+    return <AccountDetailPage account={selectedAccount} onBack={() => setSelectedAccount(null)} loadEvents={loadAccountEvents} onNavigate={onNavigate} onFetchLinkedRows={onFetchLinkedRows} />;
   }
 
   return (
@@ -430,7 +436,7 @@ function eventSummary(row: Row): string {
   return parts.join(" · ");
 }
 
-function AccountDetailPage({ account, onBack, loadEvents }: { account: Account; onBack: () => void; loadEvents?: (sid: string, username: string) => Promise<Row[]> }) {
+function AccountDetailPage({ account, onBack, loadEvents, onNavigate, onFetchLinkedRows }: { account: Account; onBack: () => void; loadEvents?: (sid: string, username: string) => Promise<Row[]>; onNavigate?: (targetFile: string, targetColumn: string, value: string) => void; onFetchLinkedRows?: FetchLinkedRows }) {
   const [events, setEvents] = useState<Row[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [selectedEvent, setSelectedEvent] = useState<Row | null>(null);
@@ -545,7 +551,17 @@ function AccountDetailPage({ account, onBack, loadEvents }: { account: Account; 
         </Card>
       </div>
 
-      {selectedEvent && <EventDetailModal row={selectedEvent} onClose={() => setSelectedEvent(null)} />}
+      {selectedEvent && (
+        <RowDetailPanel
+          row={selectedEvent}
+          columns={Object.keys(selectedEvent)}
+          focusedColumn={null}
+          fileBaseName="EventLog_Events"
+          onClose={() => setSelectedEvent(null)}
+          onNavigate={onNavigate ?? (() => {})}
+          onFetchLinkedRows={onFetchLinkedRows}
+        />
+      )}
     </div>
   );
 }

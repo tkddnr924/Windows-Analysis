@@ -151,7 +151,7 @@ export default function SmbHistoryView({ data, onNavigate, onFetchLinkedRows, bo
                   {p.fail > 0 && <Pill color="var(--danger)">실패 {p.fail.toLocaleString()}</Pill>}
                   {p.success > 0 && <Pill color="var(--danger)">성공 {p.success.toLocaleString()}</Pill>}
                 </span>
-                <span style={{ marginLeft: "auto", fontSize: 10.5, color: "var(--text-faint)", fontFamily: "var(--mono)" }}>{p.first?.slice(0, 16)} ~ {p.last?.slice(11, 16) || p.last}</span>
+                <span style={{ marginLeft: "auto", fontSize: 10.5, color: "var(--text-time)", fontFamily: "var(--mono)" }}>{p.first?.slice(0, 16)} ~ {p.last?.slice(11, 16) || p.last}</span>
                 {p.accounts.length > 0 && (
                   <div style={{ flexBasis: "100%", fontSize: 11, color: "var(--text-faint)", marginLeft: 20 }}>
                     👤 시도 계정: {p.accounts.slice(0, 8).join(", ")}{p.accounts.length > 8 ? ` 외 ${p.accounts.length - 8}` : ""}
@@ -163,7 +163,7 @@ export default function SmbHistoryView({ data, onNavigate, onFetchLinkedRows, bo
                   {p.events.slice(0, 500).map((ev, i) => (
                     <div key={i} onClick={() => setSelected(ev as Record<string, string>)} style={{ display: "flex", alignItems: "center", gap: 10, padding: "5px 12px 5px 30px", cursor: "pointer", fontSize: 12 }}
                       onMouseEnter={(e) => (e.currentTarget.style.background = "var(--bg-hover)")} onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}>
-                      <span style={{ fontFamily: "var(--mono)", fontSize: 11.5, color: "var(--text-dim)", width: 168, flexShrink: 0 }}>{ev.timestamp}</span>
+                      <span style={{ fontFamily: "var(--mono)", fontSize: 11.5, color: "var(--text-time)", width: 168, flexShrink: 0 }}>{ev.timestamp}</span>
                       <span style={{ width: 8, height: 8, borderRadius: "50%", flexShrink: 0, background: ev.result === "실패" ? "var(--danger)" : ev.result === "성공" ? "var(--success)" : "var(--text-faint)" }} />
                       <span style={{ color: "var(--text-dim)", flex: 1 }}>{ev.description}</span>
                       {ev.account && <span style={{ fontSize: 11, color: "var(--text-faint)" }}>👤 {bareAccount(ev.account)}</span>}

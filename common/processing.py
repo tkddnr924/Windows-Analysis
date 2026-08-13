@@ -764,7 +764,7 @@ def build_defender(all_results: dict) -> list[dict]:
 # each finding carries a category + status so the view can group and flag them.
 #   status: "의심"(danger) | "주의"(warning) | "정보"(info) | "정상"(ok)
 
-_RF_KEYS = ("category", "name", "value", "status", "detail", "key_path", "source", "command", "user")
+_RF_KEYS = ("timestamp", "category", "name", "value", "status", "detail", "key_path", "source", "command", "user")
 
 
 def _rf_row(**kw) -> dict:
@@ -831,7 +831,7 @@ def _rf_shares(system: list) -> list[dict]:
         rows.append(_rf_row(
             category="공유 폴더", name=name, value=path or r.get("value_data", "")[:80], status="주의",
             detail="사용자 정의 공유 폴더 — 외부 노출/권한 점검 필요",
-            key_path=r.get("key_path", ""), source="SYSTEM",
+            key_path=r.get("key_path", ""), source="SYSTEM", timestamp=r.get("last_write", ""),
         ))
     return rows
 
@@ -897,6 +897,7 @@ def _rf_autoruns(all_results: dict) -> list[dict]:
             rows.append(_rf_row(
                 category="자동 실행", name=name, value=cmd, status="정보", detail=kind,
                 command=cmd, user=user, key_path=r.get("key_path", ""), source=fname,
+                timestamp=r.get("last_write", ""),
             ))
     return rows
 
@@ -976,11 +977,13 @@ def _rf_execution_traces(all_results: dict) -> list[dict]:
                 rows.append(_rf_row(
                     category="실행 흔적", name="Run 대화상자 입력 (RunMRU)", value=cmd, status="정보",
                     command=cmd, user=user, key_path=r.get("key_path", ""), source=fname,
+                    timestamp=r.get("last_write", ""),
                 ))
             elif low.endswith("\\explorer\\typedpaths"):
                 rows.append(_rf_row(
                     category="실행 흔적", name="탐색기 주소 입력 (TypedPaths)", value=data, status="정보",
                     user=user, key_path=r.get("key_path", ""), source=fname,
+                    timestamp=r.get("last_write", ""),
                 ))
     return rows
 

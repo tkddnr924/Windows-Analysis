@@ -116,6 +116,9 @@ export default function RegistryFindingsView({ data }: Props) {
                         🔑 {r.key_path}{r.source ? `  ·  ${r.source}` : ""}
                       </div>
                     )}
+                    {r.timestamp && (
+                      <div style={{ fontSize: 10.5, color: "var(--text-dim)", fontFamily: "var(--mono)", marginTop: 2 }}>🕑 {r.timestamp}</div>
+                    )}
                   </div>
                 ))}
               </div>
@@ -147,6 +150,11 @@ function RfDetailModal({ row, onClose }: { row: Row; onClose: () => void }) {
           <button onClick={onClose} style={{ marginLeft: "auto", background: "transparent", border: "none", color: "var(--text-faint)", fontSize: 18, cursor: "pointer" }}>×</button>
         </div>
         <div style={{ padding: "14px 18px 18px" }}>
+          {row.timestamp && (
+            <div style={{ fontSize: 13, color: "var(--text)", fontFamily: "var(--mono)", fontWeight: 600, marginBottom: 12 }}>
+              🕑 {row.timestamp} <span style={{ fontSize: 10.5, color: "var(--text-faint)", fontFamily: "var(--sans)", fontWeight: 400 }}>(키 마지막 수정)</span>
+            </div>
+          )}
           {/* The raw registry key + value. */}
           <div style={{ fontSize: 11, fontWeight: 700, color: "var(--text-faint)", marginBottom: 6 }}>🔑 레지스트리 키 · 값</div>
           <div style={{ background: "var(--bg)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", padding: "12px 14px", marginBottom: 16, fontFamily: "var(--mono)" }}>

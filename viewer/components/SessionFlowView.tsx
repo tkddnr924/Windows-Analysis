@@ -275,7 +275,7 @@ export default function SessionFlowView({
                     👤 {s.account}
                   </span>
                 )}
-                <span style={{ fontSize: 11.5, color: "var(--text-faint)", fontFamily: "var(--mono)" }}>
+                <span style={{ fontSize: 11.5, color: "var(--text-time)", fontFamily: "var(--mono)" }}>
                   {s.start.slice(0, 19)} <span style={{ opacity: 0.6 }}>~ {s.end.slice(11, 19) || s.end}</span>
                 </span>
                 <span style={{ marginLeft: "auto", display: "flex", gap: 6, alignItems: "center", fontSize: 10.5 }}>
@@ -294,7 +294,7 @@ export default function SessionFlowView({
                       onMouseEnter={(e) => (e.currentTarget.style.background = "var(--bg-hover)")}
                       onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
                     >
-                      <span style={{ fontFamily: "var(--mono)", fontSize: 11.5, color: "var(--text-dim)", width: 168, flexShrink: 0 }}>{ev.timestamp}</span>
+                      <span style={{ fontFamily: "var(--mono)", fontSize: 11.5, color: "var(--text-time)", width: 168, flexShrink: 0 }}>{ev.timestamp}</span>
                       <span style={{ width: 8, height: 8, borderRadius: "50%", flexShrink: 0, background: RESULT_COLOR[ev.result] ?? "var(--text-faint)" }} />
                       <span style={{ flex: 1 }}>{ev.description}</span>
                       {ev.account && ev.account !== s.account && <span style={{ color: "var(--text-dim)", fontSize: 11 }}>👤 {ev.account}</span>}
