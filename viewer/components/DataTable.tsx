@@ -457,17 +457,27 @@ export default function DataTable({
               const row = rows[virtualRow.index];
               const tags = tagsFn ? tagsFn(row.original) : [];
               const danger = tags.some((t) => t.severity === "danger");
-              const baseBg =
-                tags.length > 0
+              const rowid = Number((row.original as Record<string, unknown>).__rowid);
+              const bookmarked = (bookmarkedRowids?.has(rowid) ?? false) && Number.isFinite(rowid);
+              // A bookmarked row is the analyst's explicit mark — make the whole
+              // row stand out (tinted fill + a full amber ring), not just the ★.
+              const baseBg = bookmarked
+                ? "color-mix(in srgb, var(--warning) 15%, transparent)"
+                : tags.length > 0
                   ? danger ? "var(--danger-subtle)" : "var(--warning-subtle)"
                   : virtualRow.index % 2 === 0 ? "transparent" : "rgba(255,255,255,0.02)";
+              const boxShadow = bookmarked
+                ? "inset 3px 0 0 var(--warning), inset 0 0 0 1px color-mix(in srgb, var(--warning) 55%, transparent)"
+                : tags.length > 0
+                  ? `inset 3px 0 0 ${danger ? "var(--danger)" : "var(--warning)"}`
+                  : undefined;
               return (
                 <tr
                   key={row.id}
                   style={{
                     height: rowHeight,
                     background: baseBg,
-                    boxShadow: tags.length > 0 ? `inset 3px 0 0 ${danger ? "var(--danger)" : "var(--warning)"}` : undefined,
+                    boxShadow,
                   }}
                   onMouseEnter={(e) => (e.currentTarget.style.background = "var(--bg-hover)")}
                   onMouseLeave={(e) => (e.currentTarget.style.background = baseBg)}

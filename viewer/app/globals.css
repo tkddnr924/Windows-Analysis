@@ -1,15 +1,15 @@
 :root {
   /* Layered surfaces (GitHub Dark-inspired) — each level one step lighter,
      used for depth instead of hard borders everywhere. */
-  --bg: #0d1117;
-  --bg-panel: #161b22;
-  --bg-elevated: #1c2128;
-  --bg-input: #0d1117;
-  --bg-hover: rgba(177, 186, 196, 0.09);
-  --bg-selected: rgba(56, 139, 253, 0.15);
+  --bg: #161b22;
+  --bg-panel: #1c232d;
+  --bg-elevated: #262d38;
+  --bg-input: #161b22;
+  --bg-hover: rgba(177, 186, 196, 0.10);
+  --bg-selected: rgba(56, 139, 253, 0.18);
 
-  --border: #30363d;
-  --border-subtle: rgba(240, 246, 252, 0.08);
+  --border: #3a424d;
+  --border-subtle: rgba(240, 246, 252, 0.10);
 
   --text: #e6edf3;
   --text-dim: #8b949e;
