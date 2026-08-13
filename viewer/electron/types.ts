@@ -58,12 +58,19 @@ export interface Bookmark {
   rowid: number;
   note: string;
   taggedAt: string;
+  /** Which host in the case this bookmark's row belongs to (bookmarks are
+   * case-level and shared across hosts). Optional for backward compatibility
+   * with bookmarks saved before host attribution existed. */
+  hostId?: string;
+  hostName?: string;
 }
 
 export interface BookmarkInput {
   fullPath: string;
   tableName: string;
   rowid: number;
+  hostId?: string;
+  hostName?: string;
 }
 
 export interface PipelineLogEntry {

@@ -1,13 +1,15 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import type { Bookmark, CsvData } from "@/lib/types";
+import type { Bookmark, CsvData, Host } from "@/lib/types";
 import { getArtifactView } from "@/lib/artifactViews";
 import TagList from "./TagList";
 
 interface BookmarksViewProps {
   bookmarks: Bookmark[];
-  onNavigate: (targetFile: string, targetColumn: string, value: string) => void;
+  hosts: Host[];
+  currentHostId: string | null;
+  onOpen: (bookmark: Bookmark) => void;
   onRemove: (bookmark: Bookmark) => void;
   onUpdateNote: (id: string, note: string) => void;
 }
@@ -47,7 +49,14 @@ function SortChip({ active, onClick, children }: { active: boolean; onClick: () 
   );
 }
 
-export default function BookmarksView({ bookmarks, onNavigate, onRemove, onUpdateNote }: BookmarksViewProps) {
+export default function BookmarksView({ bookmarks, hosts, currentHostId, onOpen, onRemove, onUpdateNote }: BookmarksViewProps) {
+  // Bookmarks are case-shared; resolve which host each belongs to (stored, or
+  // derived from the .sqlite path for bookmarks saved before host attribution).
+  const hostOf = (b: Bookmark): { id: string; name: string } => {
+    if (b.hostId || b.hostName) return { id: b.hostId ?? "", name: b.hostName || b.hostId || "(알 수 없는 호스트)" };
+    const h = hosts.find((x) => b.fullPath.startsWith(x.dir));
+    return { id: h?.id ?? "", name: h?.name ?? "(알 수 없는 호스트)" };
+  };
   const [rowCache, setRowCache] = useState<Record<string, CsvData>>({});
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draftNote, setDraftNote] = useState("");
@@ -98,6 +107,19 @@ export default function BookmarksView({ bookmarks, onNavigate, onRemove, onUpdat
     return sortDir === "asc" ? cmp : -cmp;
   });
 
+  // Group the time-sorted bookmarks by host so it's clear which machine each
+  // came from (bookmarks are shared across the case's hosts); the open host first.
+  const groupedHosts = (() => {
+    const m = new Map<string, { id: string; name: string; items: typeof sorted }>();
+    for (const e of sorted) {
+      const h = hostOf(e.bookmark);
+      const key = h.id || h.name;
+      if (!m.has(key)) m.set(key, { id: h.id, name: h.name, items: [] });
+      m.get(key)!.items.push(e);
+    }
+    return [...m.values()].sort((a, b) => (a.id === currentHostId ? -1 : b.id === currentHostId ? 1 : a.name.localeCompare(b.name)));
+  })();
+
   return (
     <div style={{ display: "flex", flexDirection: "column", flex: 1, minHeight: 0, minWidth: 0 }}>
       <div
@@ -123,7 +145,14 @@ export default function BookmarksView({ bookmarks, onNavigate, onRemove, onUpdat
       </div>
 
       <div style={{ flex: 1, minHeight: 0, overflow: "auto" }}>
-        {sorted.map(({ bookmark, data, row, spec, eventTime }) => {
+        {groupedHosts.map((group) => (
+          <div key={group.id || group.name}>
+            <div style={{ position: "sticky", top: 0, zIndex: 1, display: "flex", alignItems: "center", gap: 8, padding: "6px 14px", background: "var(--bg-elevated)", borderBottom: "1px solid var(--border)", fontSize: 11.5, fontWeight: 700, color: "var(--text-dim)" }}>
+              🖥️ {group.name}
+              <span style={{ color: "var(--text-faint)", fontWeight: 400 }}>{group.items.length}건</span>
+              {group.id === currentHostId && <span style={{ color: "var(--accent)", fontWeight: 600 }}>· 현재 호스트</span>}
+            </div>
+        {group.items.map(({ bookmark, data, row, spec, eventTime }) => {
           const notFound = data !== undefined && !row;
 
           return (
@@ -131,7 +160,7 @@ export default function BookmarksView({ bookmarks, onNavigate, onRemove, onUpdat
               <div style={{ display: "flex", alignItems: "flex-start", gap: 10 }}>
                 <div
                   style={{ flex: 1, minWidth: 0, cursor: row ? "pointer" : "default" }}
-                  onClick={() => row && onNavigate(bookmark.tableName, "__rowid", String(bookmark.rowid))}
+                  onClick={() => row && onOpen(bookmark)}
                 >
                   <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
                     <span
@@ -240,6 +269,8 @@ export default function BookmarksView({ bookmarks, onNavigate, onRemove, onUpdat
             </div>
           );
         })}
+          </div>
+        ))}
       </div>
 
       <div

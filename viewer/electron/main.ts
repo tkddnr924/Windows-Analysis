@@ -433,6 +433,8 @@ ipcMain.handle("toggle-bookmark", (_event, caseDir: string, entry: BookmarkInput
       rowid: entry.rowid,
       note: "",
       taggedAt: new Date().toISOString(),
+      hostId: entry.hostId ?? "",
+      hostName: entry.hostName ?? "",
     });
   }
   writeBookmarks(caseDir, bookmarks);
