@@ -52,6 +52,7 @@ interface Props {
 }
 
 type DirFilter = "all" | "inbound" | "outbound";
+type ResultFilter = "success" | "all" | "fail";
 
 const VB_W = 1000;
 const VB_H = 640;
@@ -198,6 +199,9 @@ export default function HostConnectionView({ graph, loading, timeRange = EMPTY_T
   const [excludeLocal, setExcludeLocal] = useState(false); // hide the LOCAL node
   const [excludeLoopback, setExcludeLoopback] = useState(false); // hide loopback (HOST/127.0.0.1) nodes
   const [dirFilter, setDirFilter] = useState<DirFilter>("all");
+  // RDP logs many events per session (logon=성공, logoff/disconnect=정보, failed=실패);
+  // default to successful connections so the graph reflects real access, not noise.
+  const [resultFilter, setResultFilter] = useState<ResultFilter>("success");
   const [search, setSearch] = useState("");
   const [showSettings, setShowSettings] = useState(false);
   const [layout, setLayout] = useState<LayoutParams>(DEFAULT_LAYOUT);
@@ -280,10 +284,16 @@ export default function HostConnectionView({ graph, loading, timeRange = EMPTY_T
         if (hostsOnly && !e.peerIsHost) return false;
         if (excludeLocal && e.peerKind === "local") return false;
         if (excludeLoopback && e.peerKind === "loopback") return false;
+        if (resultFilter === "success" && e.success === 0) return false; // no successful connection
+        if (resultFilter === "fail" && e.fail === 0) return false; // no failed attempt
         return true;
       }),
-    [edges, dirFilter, hostsOnly, excludeLocal, excludeLoopback]
+    [edges, dirFilter, hostsOnly, excludeLocal, excludeLoopback, resultFilter]
   );
+
+  // The connection strength an edge represents under the current result filter:
+  // successful connections by default (real access), failed attempts under 실패.
+  const edgeWeight = (e: ConnEdge) => (resultFilter === "fail" ? e.fail : e.success || e.count);
 
   // Nodes to render: registered hosts always; external nodes only when they
   // still have a visible edge (and only if externals aren't hidden).
@@ -472,6 +482,18 @@ export default function HostConnectionView({ graph, loading, timeRange = EMPTY_T
           })}
         </div>
 
+        {/* result filter — the graph is success-based by default */}
+        <div style={{ display: "inline-flex", background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", padding: 2, gap: 2 }}>
+          {([["success", "성공한 접속", "var(--success)"], ["all", "전체", "var(--accent)"], ["fail", "실패 시도", "var(--danger)"]] as [ResultFilter, string, string][]).map(([v, label, c]) => {
+            const active = resultFilter === v;
+            return (
+              <button key={v} onClick={() => setResultFilter(v)} title={v === "success" ? "성공한 접속만 표시" : v === "fail" ? "실패한 접속 시도만 표시" : "성공·실패·정보 모두"} style={{ fontSize: 11.5, padding: "4px 11px", border: "none", borderRadius: "var(--radius-sm)", cursor: "pointer", fontWeight: active ? 700 : 500, background: active ? `color-mix(in srgb, ${c} 18%, transparent)` : "transparent", color: active ? c : "var(--text-dim)" }}>
+                {label}
+              </button>
+            );
+          })}
+        </div>
+
         <div style={{ position: "relative", flex: "0 1 240px", minWidth: 160 }}>
           <span style={{ position: "absolute", left: 9, top: "50%", transform: "translateY(-50%)", fontSize: 12, color: "var(--text-faint)", pointerEvents: "none" }}>🔍</span>
           <input
@@ -556,7 +578,7 @@ export default function HostConnectionView({ graph, loading, timeRange = EMPTY_T
                   d={`M ${sx} ${sy} Q ${mx} ${my} ${ex} ${ey}`}
                   fill="none"
                   stroke={active ? "var(--accent)" : inbound ? "var(--warning)" : "var(--text-faint)"}
-                  strokeWidth={(active ? 2.6 : Math.min(1 + Math.log10(e.count + 1), 3)) / view.k}
+                  strokeWidth={(active ? 2.6 : Math.min(1 + Math.log10(edgeWeight(e) + 1), 3)) / view.k}
                   strokeOpacity={dim ? 0.1 : active ? 1 : 0.5}
                   markerEnd={active ? "url(#ar-hi)" : inbound ? "url(#ar-in)" : "url(#ar-out)"}
                   style={{ cursor: "pointer" }}
@@ -623,7 +645,7 @@ export default function HostConnectionView({ graph, loading, timeRange = EMPTY_T
 
         {visibleEdges.length === 0 && (
           <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", color: "var(--text-faint)", fontSize: 12.5, pointerEvents: "none" }}>
-            {totalRecords > 0 && (rangeOn || dirFilter !== "all" || hostsOnly || excludeLocal || excludeLoopback) ? "조건에 맞는 RDP 연결이 없습니다." : "RDP 접속 기록이 없습니다."}
+            {totalRecords > 0 && (rangeOn || dirFilter !== "all" || resultFilter !== "all" || hostsOnly || excludeLocal || excludeLoopback) ? "조건에 맞는 RDP 연결이 없습니다." : "RDP 접속 기록이 없습니다."}
           </div>
         )}
 
@@ -671,7 +693,7 @@ export default function HostConnectionView({ graph, loading, timeRange = EMPTY_T
               </button>
             )}
             <div style={{ fontSize: 11.5, color: "var(--text-dim)", margin: "8px 0 4px" }}>
-              연결 {selEdges.length}건 · 인바운드 {selEdges.filter((e) => e.direction === "inbound").reduce((s, e) => s + e.count, 0).toLocaleString()} · 아웃바운드 {selEdges.filter((e) => e.direction === "outbound").reduce((s, e) => s + e.count, 0).toLocaleString()}회
+              성공 {selEdges.reduce((s, e) => s + e.success, 0).toLocaleString()} · 실패 {selEdges.reduce((s, e) => s + e.fail, 0).toLocaleString()} · 인바운드 {selEdges.filter((e) => e.direction === "inbound").length} / 아웃바운드 {selEdges.filter((e) => e.direction === "outbound").length}건
             </div>
             <div style={{ overflow: "auto", flex: 1, marginTop: 4, display: "flex", flexDirection: "column", gap: 6 }}>
               {selEdges.length === 0 && <div style={{ fontSize: 11.5, color: "var(--text-faint)" }}>이 기간에 연결이 없습니다.</div>}
@@ -686,7 +708,7 @@ export default function HostConnectionView({ graph, loading, timeRange = EMPTY_T
                       {other}
                     </div>
                     <div style={{ fontSize: 10.5, color: "var(--text-faint)", marginTop: 2 }}>
-                      {e.count.toLocaleString()}회 · 성공 {e.success}{e.fail ? ` · 실패 ${e.fail}` : ""}
+                      성공 {e.success} · 실패 {e.fail}{e.count ? ` · ${e.count.toLocaleString()} 이벤트` : ""}
                     </div>
                     <div style={{ fontSize: 10, color: "var(--text-faint)", fontFamily: "var(--mono)", marginTop: 2 }}>
                       {e.first?.slice(0, 16)} ~ {e.last?.slice(0, 16)}
@@ -701,7 +723,7 @@ export default function HostConnectionView({ graph, loading, timeRange = EMPTY_T
       </div>
 
       <div style={{ fontSize: 11, color: "var(--text-faint)", marginTop: 8 }}>
-        원 크기 = 접속량. LOCAL = 콘솔/AD 경유 가능성, 루프백(HOST/127.0.0.1) = 원격/터널링 도구 가능성. 전역 기간 필터가 이 뷰에도 적용됩니다.
+        선 굵기 = 접속 횟수(기본: 성공한 접속 기준). LOCAL = 콘솔/AD 경유 가능성, 루프백(HOST/127.0.0.1) = 원격/터널링 도구 가능성. 전역 기간 필터가 이 뷰에도 적용됩니다.
       </div>
     </div>
   );
@@ -731,7 +753,7 @@ function FloatingTip({ mouse, edge }: { mouse: XY; edge: ConnEdge }) {
         {edge.direction === "inbound" ? `${edge.peerLabel} → ${edge.host}` : `${edge.host} → ${edge.peerLabel}`}
       </div>
       <div style={{ color: "var(--text-dim)", marginTop: 3 }}>
-        {edge.direction === "inbound" ? "인바운드" : "아웃바운드"} · {edge.count.toLocaleString()}회 · 성공 {edge.success} / 실패 {edge.fail}
+        {edge.direction === "inbound" ? "인바운드" : "아웃바운드"} · 성공 {edge.success} · 실패 {edge.fail}{edge.count ? ` · ${edge.count.toLocaleString()} 이벤트` : ""}
       </div>
       <div style={{ color: "var(--text-faint)", marginTop: 3, fontFamily: "var(--mono)", fontSize: 11 }}>
         {edge.first?.slice(0, 19)} ~ {edge.last?.slice(0, 19)}
