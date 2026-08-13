@@ -89,7 +89,7 @@ export interface ArtifactViewSpec {
    * Overview correlations (TargetInfo, ...) read as summaries/dashboards, not
    * spreadsheets, so each gets a purpose-built view.
    */
-  customView?: "targetInfo" | "executionHistory" | "powershellFlow" | "defender" | "registryFindings" | "rdpCache" | "browserHistory";
+  customView?: "targetInfo" | "executionHistory" | "powershellFlow" | "defender" | "registryFindings" | "rdpCache" | "browserHistory" | "smb";
   /**
    * In the sidebar, present this table split by this column: instead of one
    * row for the whole table, the category lists one entry per distinct value
@@ -387,6 +387,7 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
   // RDP — repeated failures from one IP collapse into a burst, which reads as a
   // brute-force / lateral-movement attempt.
   SmbHistory: {
+    customView: "smb",
     title: (r) => r.remote_address || "(주소 없음)",
     subtitle: (r) => r.description || "",
     badges: [
@@ -394,7 +395,6 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
       { key: "result", label: "결과", kind: "badge", badgeColors: RDP_RESULT_COLORS },
     ],
     links: [{ key: "record_key", label: "이벤트 로그 원본 보기", targetFile: "EventLog_Events", targetColumn: "_record_key" }],
-    flowView: true,
     visibleColumns: ["timestamp", "remote_address", "account", "result", "description"],
     filterTabs: {
       column: "result",

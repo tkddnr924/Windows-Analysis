@@ -518,8 +518,8 @@ export default function HostConnectionView({ graph, loading, timeRange = EMPTY_T
         <Legend color={KIND_COLOR.external} label="외부 IP" />
         <Legend color={KIND_COLOR.local} label="LOCAL" />
         <Legend color={KIND_COLOR.loopback} label="루프백" />
-        <span style={{ color: "var(--warning)" }}>― 인바운드</span>
-        <span>― 아웃바운드</span>
+        <span style={{ color: "var(--warning)" }}>→ 인바운드 (외부 → 이 호스트, 접속당함)</span>
+        <span>→ 아웃바운드 (이 호스트 → 외부, 접속함)</span>
       </div>
 
       <div style={{ position: "relative", border: "1px solid var(--border)", borderRadius: "var(--radius-lg)", background: "var(--bg-panel)", overflow: "hidden" }}>
@@ -535,14 +535,14 @@ export default function HostConnectionView({ graph, loading, timeRange = EMPTY_T
           onWheel={onWheel}
         >
           <defs>
-            <marker id="ar-in" markerWidth="9" markerHeight="9" refX="6.5" refY="4" orient="auto">
-              <path d="M2,1.5 L6.5,4 L2,6.5" fill="none" stroke="var(--warning)" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
+            <marker id="ar-in" markerWidth="6" markerHeight="6" refX="4.6" refY="3" orient="auto" markerUnits="strokeWidth">
+              <path d="M1,0.6 L4.4,3 L1,5.4" fill="none" stroke="var(--warning)" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" />
             </marker>
-            <marker id="ar-out" markerWidth="9" markerHeight="9" refX="6.5" refY="4" orient="auto">
-              <path d="M2,1.5 L6.5,4 L2,6.5" fill="none" stroke="var(--text-faint)" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
+            <marker id="ar-out" markerWidth="6" markerHeight="6" refX="4.6" refY="3" orient="auto" markerUnits="strokeWidth">
+              <path d="M1,0.6 L4.4,3 L1,5.4" fill="none" stroke="var(--text-faint)" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" />
             </marker>
-            <marker id="ar-hi" markerWidth="9" markerHeight="9" refX="6.5" refY="4" orient="auto">
-              <path d="M2,1.5 L6.5,4 L2,6.5" fill="none" stroke="var(--accent)" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+            <marker id="ar-hi" markerWidth="6" markerHeight="6" refX="4.6" refY="3" orient="auto" markerUnits="strokeWidth">
+              <path d="M1,0.6 L4.4,3 L1,5.4" fill="none" stroke="var(--accent)" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
             </marker>
           </defs>
 

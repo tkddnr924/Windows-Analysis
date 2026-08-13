@@ -24,7 +24,13 @@ const CATEGORY_META: { key: string; icon: string }[] = [
   { key: "공유 폴더", icon: "📁" },
   { key: "SQL 인증", icon: "🗄️" },
   { key: "자동 실행", icon: "🚀" },
+  { key: "실행 흔적", icon: "⌨️" },
 ];
+
+// A value that reads as a filesystem/UNC path (share folders, typed paths).
+function looksLikePath(v: string): boolean {
+  return /^[a-zA-Z]:\\|^\\\\/.test(v);
+}
 
 export default function RegistryFindingsView({ data }: Props) {
   const [detail, setDetail] = useState<Row | null>(null);
@@ -90,25 +96,24 @@ export default function RegistryFindingsView({ data }: Props) {
                     onMouseEnter={(e) => (e.currentTarget.style.background = "var(--bg-hover)")}
                     onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
                     style={{ padding: "8px 8px", margin: "0 -8px", borderRadius: "var(--radius-sm)", borderBottom: i < rows.length - 1 ? "1px solid var(--border-subtle)" : "none", cursor: "pointer" }}
-                    title="클릭하면 근거(레지스트리 키·값) 상세 보기"
+                    title="클릭하면 레지스트리 키·값 상세 보기"
                   >
                     <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
                       <span style={{ fontSize: 12.5, fontWeight: 600, color: "var(--text)", wordBreak: "break-all" }}>{r.name}</span>
                       <Pill text={r.status} color={statusColor(r.status)} />
+                      {(r.detail === "Run" || r.detail === "RunOnce" || r.detail === "Policy Run") && (
+                        <span style={{ fontSize: 10, color: "var(--text-faint)", border: "1px solid var(--border)", borderRadius: 4, padding: "0 5px" }}>{r.detail}</span>
+                      )}
                       {r.user && r.user !== "(시스템)" && <span style={{ fontSize: 10.5, color: "var(--text-faint)" }}>👤 {r.user}</span>}
                     </div>
                     {r.value && (
-                      <div style={{ fontSize: 12, color: "var(--text-dim)", fontFamily: "var(--mono)", marginTop: 2, wordBreak: "break-all" }}>{r.value}</div>
-                    )}
-                    {r.detail && r.detail !== "Run" && r.detail !== "RunOnce" && r.detail !== "Policy Run" && (
-                      <div style={{ fontSize: 11, color: statusColor(r.status), marginTop: 2 }}>{r.detail}</div>
-                    )}
-                    {r.detail && (r.detail === "Run" || r.detail === "RunOnce" || r.detail === "Policy Run") && (
-                      <div style={{ fontSize: 10.5, color: "var(--text-faint)", marginTop: 2 }}>{r.detail}</div>
+                      <div style={{ fontSize: looksLikePath(r.value) ? 12.5 : 12, fontWeight: looksLikePath(r.value) ? 600 : 400, color: looksLikePath(r.value) ? "var(--accent)" : "var(--text-dim)", fontFamily: "var(--mono)", marginTop: 3, wordBreak: "break-all" }}>
+                        {looksLikePath(r.value) ? "📂 " : ""}{r.value}
+                      </div>
                     )}
                     {r.key_path && (
-                      <div style={{ fontSize: 10, color: "var(--text-faint)", fontFamily: "var(--mono)", marginTop: 2, wordBreak: "break-all" }} title={r.key_path}>
-                        {r.source} · {r.key_path}
+                      <div style={{ fontSize: 10.5, color: "var(--text-faint)", fontFamily: "var(--mono)", marginTop: 3, wordBreak: "break-all" }} title={r.key_path}>
+                        🔑 {r.key_path}{r.source ? `  ·  ${r.source}` : ""}
                       </div>
                     )}
                   </div>
@@ -126,13 +131,12 @@ export default function RegistryFindingsView({ data }: Props) {
 
 function RfDetailModal({ row, onClose }: { row: Row; onClose: () => void }) {
   const kind = row.detail === "Run" || row.detail === "RunOnce" || row.detail === "Policy Run" ? row.detail : "";
-  // Secondary fields (the evidence — key path + value — is shown up top).
+  // Secondary fields. No explanation line — just what the registry actually holds.
   const meta: [string, string][] = [
     ["분류", row.category],
     ["항목(값 이름)", row.name],
     ["자동실행 위치", kind],
     ["사용자", row.user && row.user !== "(시스템)" ? row.user : ""],
-    ["설명", !kind ? row.detail : ""],
   ];
   return (
     <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(1,4,9,0.6)", zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
@@ -143,10 +147,11 @@ function RfDetailModal({ row, onClose }: { row: Row; onClose: () => void }) {
           <button onClick={onClose} style={{ marginLeft: "auto", background: "transparent", border: "none", color: "var(--text-faint)", fontSize: 18, cursor: "pointer" }}>×</button>
         </div>
         <div style={{ padding: "14px 18px 18px" }}>
-          {/* Evidence — the raw registry key + value this verdict is based on. */}
-          <div style={{ fontSize: 11, fontWeight: 700, color: "var(--text-faint)", marginBottom: 6 }}>🔑 근거 — 레지스트리 원본</div>
+          {/* The raw registry key + value. */}
+          <div style={{ fontSize: 11, fontWeight: 700, color: "var(--text-faint)", marginBottom: 6 }}>🔑 레지스트리 키 · 값</div>
           <div style={{ background: "var(--bg)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", padding: "12px 14px", marginBottom: 16, fontFamily: "var(--mono)" }}>
             <EvRow label="키 경로" value={row.key_path} />
+            <EvRow label="값 이름" value={row.name} />
             <EvRow label="값" value={row.value} highlight />
             {row.command && <EvRow label="명령" value={row.command} highlight />}
             <EvRow label="하이브" value={row.source} last />

@@ -949,6 +949,39 @@ def build_registry_findings(all_results: dict) -> list[dict]:
     rows += _rf_shares(system)
     rows += _rf_sql_auth(software)
     rows += _rf_autoruns(all_results)
+    rows += _rf_execution_traces(all_results)
+    return rows
+
+
+def _rf_execution_traces(all_results: dict) -> list[dict]:
+    r"""What a user actually typed/ran, from per-user NTUSER hives:
+      - RunMRU  (\...\Explorer\RunMRU): commands typed into the Win+R Run box.
+      - TypedPaths (\...\Explorer\TypedPaths): paths typed into Explorer's
+        address bar.
+    Both are direct evidence of hands-on-keyboard activity, valuable in an
+    intrusion; surfaced so they aren't buried in the raw hive dump."""
+    rows = []
+    for fname, reg in _registry_hives(all_results):
+        user = _hive_user(fname)
+        for r in reg:
+            low = r.get("key_path", "").lower()
+            name = r.get("value_name", "")
+            if name in ("", "(default)", "MRUList", "MRUListEx"):
+                continue
+            data = r.get("value_data", "")
+            if low.endswith("\\explorer\\runmru"):
+                # RunMRU values are '<command>\1' — the trailing \1 is the
+                # ShowWindow flag, not part of the command.
+                cmd = data[:-2] if data.endswith("\\1") else data
+                rows.append(_rf_row(
+                    category="실행 흔적", name="Run 대화상자 입력 (RunMRU)", value=cmd, status="정보",
+                    command=cmd, user=user, key_path=r.get("key_path", ""), source=fname,
+                ))
+            elif low.endswith("\\explorer\\typedpaths"):
+                rows.append(_rf_row(
+                    category="실행 흔적", name="탐색기 주소 입력 (TypedPaths)", value=data, status="정보",
+                    user=user, key_path=r.get("key_path", ""), source=fname,
+                ))
     return rows
 
 
