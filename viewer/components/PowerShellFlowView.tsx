@@ -224,7 +224,10 @@ export default function PowerShellFlowView({
               </div>
               {open && (
                 <div style={{ borderTop: "1px solid var(--border)", padding: "4px 0" }}>
-                  {s.events.map((ev, i) => (
+                  {s.events.map((ev, i) => {
+                    const bm = (bookmarkedRowids?.has(ev.rowid) ?? false) && Number.isFinite(ev.rowid);
+                    const bmBg = bm ? "color-mix(in srgb, var(--warning) 14%, transparent)" : "transparent";
+                    return (
                     <div
                       key={i}
                       onClick={() => setSelected(ev.row)}
@@ -235,9 +238,11 @@ export default function PowerShellFlowView({
                         padding: "5px 12px 5px 30px",
                         cursor: "pointer",
                         fontSize: 12,
+                        background: bmBg,
+                        boxShadow: bm ? "inset 3px 0 0 var(--warning)" : undefined,
                       }}
                       onMouseEnter={(e) => (e.currentTarget.style.background = "var(--bg-hover)")}
-                      onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+                      onMouseLeave={(e) => (e.currentTarget.style.background = bmBg)}
                     >
                       <span style={{ fontFamily: "var(--mono)", fontSize: 11.5, color: "var(--text-dim)", width: 168, flexShrink: 0 }}>
                         {ev.timestamp}
@@ -294,7 +299,8 @@ export default function PowerShellFlowView({
                         </span>
                       )}
                     </div>
-                  ))}
+                    );
+                  })}
                 </div>
               )}
             </div>

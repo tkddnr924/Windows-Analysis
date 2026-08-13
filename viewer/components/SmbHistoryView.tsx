@@ -160,15 +160,23 @@ export default function SmbHistoryView({ data, onNavigate, onFetchLinkedRows, bo
               </div>
               {open && (
                 <div style={{ borderTop: "1px solid var(--border)", background: "color-mix(in srgb, var(--bg-elevated) 40%, transparent)", maxHeight: 320, overflow: "auto" }}>
-                  {p.events.slice(0, 500).map((ev, i) => (
-                    <div key={i} onClick={() => setSelected(ev as Record<string, string>)} style={{ display: "flex", alignItems: "center", gap: 10, padding: "5px 12px 5px 30px", cursor: "pointer", fontSize: 12 }}
-                      onMouseEnter={(e) => (e.currentTarget.style.background = "var(--bg-hover)")} onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}>
+                  {p.events.slice(0, 500).map((ev, i) => {
+                    const rid = Number((ev as Record<string, unknown>).__rowid);
+                    const bm = (bookmarkedRowids?.has(rid) ?? false) && Number.isFinite(rid);
+                    const bmBg = bm ? "color-mix(in srgb, var(--warning) 14%, transparent)" : "transparent";
+                    return (
+                    <div key={i} onClick={() => setSelected(ev as Record<string, string>)} style={{ display: "flex", alignItems: "center", gap: 10, padding: "5px 12px 5px 30px", cursor: "pointer", fontSize: 12, background: bmBg, boxShadow: bm ? "inset 3px 0 0 var(--warning)" : undefined }}
+                      onMouseEnter={(e) => (e.currentTarget.style.background = "var(--bg-hover)")} onMouseLeave={(e) => (e.currentTarget.style.background = bmBg)}>
                       <span style={{ fontFamily: "var(--mono)", fontSize: 11.5, color: "var(--text-time)", width: 168, flexShrink: 0 }}>{ev.timestamp}</span>
                       <span style={{ width: 8, height: 8, borderRadius: "50%", flexShrink: 0, background: ev.result === "실패" ? "var(--danger)" : ev.result === "성공" ? "var(--success)" : "var(--text-faint)" }} />
                       <span style={{ color: "var(--text-dim)", flex: 1 }}>{ev.description}</span>
                       {ev.account && <span style={{ fontSize: 11, color: "var(--text-faint)" }}>👤 {bareAccount(ev.account)}</span>}
+                      {onToggleBookmark && Number.isFinite(rid) && (
+                        <span onClick={(e) => { e.stopPropagation(); onToggleBookmark(rid); }} title={bm ? "북마크 해제" : "북마크에 추가"} style={{ cursor: "pointer", color: bm ? "var(--warning)" : "var(--text-faint)" }}>{bm ? "★" : "☆"}</span>
+                      )}
                     </div>
-                  ))}
+                    );
+                  })}
                   {p.events.length > 500 && <div style={{ padding: "6px 30px", fontSize: 11, color: "var(--text-faint)" }}>… 외 {(p.events.length - 500).toLocaleString()}건 (원본 테이블에서 전체 확인)</div>}
                 </div>
               )}

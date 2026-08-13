@@ -286,13 +286,16 @@ export default function SessionFlowView({
               </div>
               {open && (
                 <div style={{ borderTop: "1px solid var(--border)", padding: "4px 0", background: "color-mix(in srgb, var(--bg-elevated) 40%, transparent)" }}>
-                  {s.events.map((ev, i) => (
+                  {s.events.map((ev, i) => {
+                    const bm = (bookmarkedRowids?.has(ev.rowid) ?? false) && Number.isFinite(ev.rowid);
+                    const bmBg = bm ? "color-mix(in srgb, var(--warning) 14%, transparent)" : "transparent";
+                    return (
                     <div
                       key={i}
                       onClick={() => setSelected(ev.row)}
-                      style={{ display: "flex", alignItems: "center", gap: 10, padding: "5px 12px 5px 30px", cursor: "pointer", fontSize: 12 }}
+                      style={{ display: "flex", alignItems: "center", gap: 10, padding: "5px 12px 5px 30px", cursor: "pointer", fontSize: 12, background: bmBg, boxShadow: bm ? "inset 3px 0 0 var(--warning)" : undefined }}
                       onMouseEnter={(e) => (e.currentTarget.style.background = "var(--bg-hover)")}
-                      onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+                      onMouseLeave={(e) => (e.currentTarget.style.background = bmBg)}
                     >
                       <span style={{ fontFamily: "var(--mono)", fontSize: 11.5, color: "var(--text-time)", width: 168, flexShrink: 0 }}>{ev.timestamp}</span>
                       <span style={{ width: 8, height: 8, borderRadius: "50%", flexShrink: 0, background: RESULT_COLOR[ev.result] ?? "var(--text-faint)" }} />
@@ -311,7 +314,8 @@ export default function SessionFlowView({
                         </span>
                       )}
                     </div>
-                  ))}
+                    );
+                  })}
                 </div>
               )}
             </div>

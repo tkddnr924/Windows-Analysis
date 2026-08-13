@@ -391,10 +391,11 @@ export default function MasterTimeline({ entries, loading, onNavigate, onFetchLi
                 padding: "0 14px",
                 borderBottom: "1px solid var(--border-subtle)",
                 cursor: "pointer",
-                background: virtualRow.index % 2 === 0 ? "transparent" : "rgba(255,255,255,0.02)",
+                background: bookmarked ? "color-mix(in srgb, var(--warning) 14%, transparent)" : virtualRow.index % 2 === 0 ? "transparent" : "rgba(255,255,255,0.02)",
+                boxShadow: bookmarked ? "inset 3px 0 0 var(--warning)" : undefined,
               }}
               onMouseEnter={(e) => (e.currentTarget.style.background = "var(--bg-hover)")}
-              onMouseLeave={(e) => (e.currentTarget.style.background = virtualRow.index % 2 === 0 ? "transparent" : "rgba(255,255,255,0.02)")}
+              onMouseLeave={(e) => (e.currentTarget.style.background = bookmarked ? "color-mix(in srgb, var(--warning) 14%, transparent)" : virtualRow.index % 2 === 0 ? "transparent" : "rgba(255,255,255,0.02)")}
             >
               <span
                 style={{

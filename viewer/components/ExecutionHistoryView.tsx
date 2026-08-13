@@ -321,13 +321,14 @@ export default function ExecutionHistoryView({
                   padding: "0 20px",
                   borderBottom: "1px solid var(--border-subtle)",
                   cursor: "pointer",
-                  background: isSel ? "var(--bg-selected)" : "transparent",
+                  background: isSel ? "var(--bg-selected)" : bookmarked ? "color-mix(in srgb, var(--warning) 14%, transparent)" : "transparent",
+                  boxShadow: bookmarked ? "inset 3px 0 0 var(--warning)" : undefined,
                 }}
                 onMouseEnter={(el) => {
                   if (!isSel) el.currentTarget.style.background = "var(--bg-hover)";
                 }}
                 onMouseLeave={(el) => {
-                  if (!isSel) el.currentTarget.style.background = "transparent";
+                  if (!isSel) el.currentTarget.style.background = bookmarked ? "color-mix(in srgb, var(--warning) 14%, transparent)" : "transparent";
                 }}
               >
                 {/* risk dot */}
