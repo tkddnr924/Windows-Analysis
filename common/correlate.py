@@ -345,14 +345,19 @@ def _basename(path: str) -> str:
 
 
 def _user_map(all_results: dict) -> dict:
-    """SID -> readable account name, from Registry_UserProfiles, so a bare
-    logon SID on a PowerShell event can be shown as e.g. 'administrator'."""
+    r"""SID -> readable account name, from the SOFTWARE hive's ProfileList
+    (\Microsoft\Windows NT\CurrentVersion\ProfileList\<SID> -> ProfileImagePath),
+    so a bare logon SID on a PowerShell event can be shown as e.g.
+    'administrator'. Reads the raw 'Registry' dump — there is no interpreted
+    Registry_UserProfiles table (that was folded into the overview builders)."""
     umap = {}
-    for r in _rows(all_results, "Registry", "Registry_UserProfiles"):
-        sid = r.get("sid", "")
-        name = _basename(r.get("profile_image_path", ""))
-        if sid and name:
-            umap[sid] = name
+    for r in _rows(all_results, "Registry", "Registry"):
+        kp = r.get("key_path", "")
+        if "\\profilelist\\s-" in kp.lower() and r.get("value_name") == "ProfileImagePath":
+            sid = kp.rsplit("\\", 1)[-1]
+            name = _basename(r.get("value_data", ""))
+            if sid and name:
+                umap[sid] = name
     return umap
 
 

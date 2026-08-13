@@ -412,67 +412,9 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     ],
   },
 
-  UserAssist_Execution: {
-    title: (r) => basename(r.program_path) || r.program_path || "(no name)",
-    subtitle: (r) => r.user || "",
-    tags: (r) => tagsForPath(r.program_path),
-    timelineField: "timestamp",
-    priorityColumns: ["timestamp", "program_path", "run_count", "focus_count", "user"],
-    sections: [
-      { heading: "실행/사용 통계", fields: [
-        { key: "run_count", label: "실행 횟수" },
-        { key: "focus_count", label: "포커스 횟수" },
-        { key: "focus_time_ms", label: "포커스 시간(ms)" },
-      ]},
-      { heading: "경로", fields: [{ key: "program_path", kind: "path" }] },
-    ],
-  },
 
-  RemoteAccess_RDPClientHistory: {
-    title: (r) => r.server || "(no server)",
-    subtitle: (r) => r.username_hint || "",
-    timelineField: "timestamp",
-    priorityColumns: ["timestamp", "server", "username_hint", "user"],
-    sections: [{ heading: "상세", fields: [
-      { key: "username_hint", label: "사용자 힌트" },
-      { key: "cert_hash", kind: "hash" },
-    ]}],
-  },
 
-  Registry_NetworkProfiles: {
-    title: (r) => r.profile_name || "(no name)",
-    timelineField: "timestamp",
-    priorityColumns: ["timestamp", "profile_name"],
-    sections: [{ heading: "상세", fields: [{ key: "profile_name", label: "네트워크 이름" }] }],
-  },
 
-  Registry_NetworkInterfaces: {
-    title: (r) => r.ip_address || "(no ip)",
-    subtitle: (r) => [r.default_gateway && `GW ${r.default_gateway}`, r.domain].filter(Boolean).join(" · "),
-    badges: [{ key: "dhcp_enabled", label: "DHCP", kind: "badge" }],
-    priorityColumns: ["ip_address", "subnet_mask", "default_gateway", "dns_server", "dhcp_server", "domain", "lease_obtained"],
-    sections: [
-      { heading: "주소", fields: [
-        { key: "ip_address", label: "IP 주소" },
-        { key: "subnet_mask", label: "서브넷 마스크" },
-        { key: "default_gateway", label: "기본 게이트웨이" },
-      ]},
-      { heading: "DNS / 도메인", fields: [
-        { key: "dns_server", label: "DNS 서버" },
-        { key: "dhcp_server", label: "DHCP 서버" },
-        { key: "domain", label: "도메인" },
-        { key: "dhcp_enabled", label: "DHCP 사용" },
-      ]},
-      { heading: "DHCP 임대", fields: [
-        { key: "lease_obtained", label: "임대 시작" },
-        { key: "lease_terminates", label: "임대 만료" },
-      ]},
-      { heading: "식별자", fields: [
-        { key: "interface_guid", label: "인터페이스 GUID", kind: "hash" },
-        { key: "control_set", label: "ControlSet" },
-      ]},
-    ],
-  },
 
   Amcache_Programs: {
     title: (r) => r.Name || "(no name)",
@@ -486,7 +428,6 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     tags: (r) => tagsForBoolean(r.HiddenArp, { label: "제어판에서 숨김(HiddenArp)", severity: "danger", description: "제어판 '프로그램 추가/제거' 목록에서 의도적으로 숨겨진 프로그램입니다. 사용자 눈에 띄지 않게 하려는 자기은폐(self-concealment) 기법으로, 정상 소프트웨어에서는 드뭅니다." }),
     links: [
       { key: "ProgramId", label: "이 프로그램이 설치한 파일 보기", targetFile: "Amcache_Files", targetColumn: "program_id" },
-      { key: "UserSid", label: "설치한 계정의 프로필 정보 보기", targetFile: "Registry_UserProfiles", targetColumn: "sid" },
     ],
     // No timelineField: Amcache reaches the master timeline via ExecutionHistory
     // (avoids double-counting the same entries there and here).
@@ -585,7 +526,6 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     // PowerShell, group-membership changes, etc. Anything not in the
     // curated catalog simply yields no extra tag, it isn't hidden.
     tags: (r) => tagsForEventLevel(r.LevelName).concat(tagsForSecurityEvent(r.Provider, r.EventID, r.EventData)),
-    links: [{ key: "UserID", label: "이 계정(SID)의 프로필 정보 보기", targetFile: "Registry_UserProfiles", targetColumn: "sid" }],
     timelineField: "timestamp",
     computedColumns: [
       { key: "_ir_label", label: "이벤트 설명", size: 240, compute: (r) => lookupEventCatalog(r.Provider, r.EventID)?.label ?? "" },
@@ -728,65 +668,8 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     ]}],
   },
 
-  Registry_Run: {
-    title: (r) => r.value_name || "(no name)",
-    subtitle: (r) => r.key_path || "",
-    badges: [
-      { key: "hive", kind: "badge" },
-      { key: "run_type", kind: "badge" },
-    ],
-    tags: (r) => tagsForPath(r.value_data),
-    timelineField: "key_last_write",
-    priorityColumns: ["key_last_write", "value_name", "value_data", "run_type"],
-    sections: [
-      { heading: "시간", fields: [{ key: "key_last_write" }] },
-      { heading: "명령", fields: [
-        { key: "value_data", kind: "code" },
-        { key: "key_path", kind: "path" },
-      ]},
-    ],
-  },
 
-  Registry_InstalledPrograms: {
-    title: (r) => r.display_name || "(no name)",
-    subtitle: (r) => [r.display_version, r.publisher].filter(Boolean).join(" · "),
-    tags: (r) => tagsForPath(r.install_location).concat(tagsForPath(r.uninstall_string)),
-    timelineField: "install_date",
-    priorityColumns: ["install_date", "display_name", "display_version", "publisher"],
-    sections: [
-      { heading: "날짜", fields: [
-        { key: "install_date" },
-        { key: "key_last_write" },
-      ]},
-      { heading: "위치", fields: [
-        { key: "install_location", kind: "path" },
-        { key: "uninstall_string", kind: "code" },
-        { key: "estimated_size_kb", label: "예상 크기(KB)" },
-      ]},
-      { heading: "레지스트리 키", fields: [{ key: "registry_key", kind: "path" }] },
-    ],
-  },
 
-  Registry_UserProfiles: {
-    title: (r) => basename(r.profile_image_path) || r.sid || "(no profile)",
-    subtitle: (r) => r.sid || "",
-    timelineFields: [
-      { key: "load_time", label: "로드(로그온)" },
-      { key: "unload_time", label: "언로드(로그오프)" },
-    ],
-    timelineField: "load_time",
-    priorityColumns: ["load_time", "profile_image_path", "unload_time", "sid"],
-    sections: [
-      { heading: "시간", fields: [
-        { key: "load_time", label: "마지막 로드(로그온)" },
-        { key: "unload_time", label: "마지막 언로드(로그오프)" },
-      ]},
-      { heading: "상세", fields: [
-        { key: "profile_image_path", kind: "path" },
-        { key: "state" },
-      ]},
-    ],
-  },
 
   TaskScheduler_Tasks: {
     title: (r) => r.task_name || r.uri || "(작업)",
@@ -829,62 +712,8 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     ],
   },
 
-  Registry_Accounts: {
-    title: (r) => r.username || (r.rid ? `RID ${r.rid}` : "(계정)"),
-    subtitle: (r) => [r.rid && `RID ${r.rid}`, r.disabled === "예" ? "비활성" : ""].filter(Boolean).join(" · "),
-    badges: [{ key: "disabled", label: "비활성", kind: "badge", badgeColors: { 예: "#f85149", 아니오: "#3fb950" } }],
-    // Account creation lands on the master timeline (a created backdoor account
-    // is a common persistence step).
-    timelineField: "account_created",
-    priorityColumns: ["account_created", "username", "rid", "last_login", "login_count", "disabled", "special_account", "groups"],
-    sections: [
-      { heading: "계정", fields: [
-        { key: "username", label: "사용자 이름" },
-        { key: "full_name", label: "전체 이름" },
-        { key: "rid", label: "RID" },
-        { key: "home_directory", label: "홈 디렉토리", kind: "path" },
-        { key: "disabled", label: "비활성 여부" },
-        { key: "special_account", label: "SpecialAccount" },
-      ]},
-      { heading: "시간", fields: [
-        { key: "account_created", label: "계정 생성" },
-        { key: "last_login", label: "마지막 로그온" },
-        { key: "password_last_set", label: "암호 마지막 설정" },
-        { key: "last_failed_login", label: "비밀번호 오류 일시" },
-      ]},
-      { heading: "통계 / 권한", fields: [
-        { key: "login_count", label: "로그온 횟수" },
-        { key: "failed_login_count", label: "비밀번호 오류 횟수" },
-        { key: "groups", label: "그룹" },
-        { key: "account_flags", label: "계정 플래그" },
-      ]},
-    ],
-  },
 
-  Registry_SystemInfo: {
-    title: (r) => r.name || "(no name)",
-    subtitle: (r) => r.category || "",
-    timelineField: "timestamp",
-    priorityColumns: ["timestamp", "name", "value", "category"],
-    sections: [{ heading: "값", fields: [
-      { key: "value" },
-      { key: "timestamp" },
-      { key: "source_path", kind: "path" },
-    ]}],
-  },
 
-  Registry_USBDevices: {
-    title: (r) => r.friendly_name || r.device_class || "(no device)",
-    subtitle: (r) => r.device_class || "",
-    timelineField: "key_last_write",
-    priorityColumns: ["key_last_write", "friendly_name", "device_class", "service"],
-    sections: [{ heading: "상세", fields: [
-      { key: "key_last_write" },
-      { key: "control_set" },
-      { key: "instance_id", kind: "hash" },
-      { key: "service" },
-    ]}],
-  },
 };
 
 export function getArtifactView(fileBaseName: string): ArtifactViewSpec | null {

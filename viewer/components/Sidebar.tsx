@@ -27,8 +27,6 @@ export const CATEGORY_ICONS: Record<string, string> = {
   WER: "💥",
   TASKSCHEDULER: "⏰",
   POWERSHELL: "💻",
-  USERASSIST: "🖱️",
-  REMOTEACCESS: "🖥️",
   RDPCACHE: "🖼️",
   BROWSER: "🌐",
   FILESYSTEM: "🗄️",
