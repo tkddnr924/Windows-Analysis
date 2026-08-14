@@ -38,6 +38,11 @@ export const CATEGORY_ICONS: Record<string, string> = {
 // Category defaults to the artifact name; only UsnJrnl files under FileSystem.
 const ARTIFACT_CATEGORY: Record<string, string> = {
   UsnJrnl: "FILESYSTEM",
+  // Both browser artifacts write into the shared BROWSER output folder, so the
+  // run-list placeholder must resolve there too — otherwise BrowserHistory /
+  // BrowserCache show as empty "데이터 없음" rows next to the real BROWSER folder.
+  BrowserHistory: "BROWSER",
+  BrowserCache: "BROWSER",
 };
 
 function categoryForArtifact(name: string): string {
