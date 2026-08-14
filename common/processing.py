@@ -220,30 +220,6 @@ def _parse_shimcache(data: bytes) -> list[tuple]:
     return entries
 
 
-def _from_appcompatcache(all_results: dict) -> list[dict]:
-    """AppCompatCache / ShimCache from the SYSTEM hive dump — evidence a
-    program existed on / ran from a path, with the executable's last-modified
-    time. Deduped across ControlSet001/002 (both keep a copy)."""
-    rows = []
-    seen = set()
-    for fname, reg_rows in _registry_hives(all_results):
-        if fname.upper() != "SYSTEM":
-            continue
-        for r in reg_rows:
-            if r.get("value_name") != "AppCompatCache":
-                continue
-            for path, ft in _parse_shimcache(_unhex(r.get("value_data", ""))):
-                key = (path, ft)
-                if key in seen:
-                    continue
-                seen.add(key)
-                rows.append(_row(
-                    timestamp=_filetime(ft), program_name=_basename(path),
-                    program_path=path, source_artifact="AppCompatCache",
-                ))
-    return rows
-
-
 def _from_prefetch(all_results: dict) -> list[dict]:
     rows = []
     pf = all_results.get("Prefetch", {})
@@ -262,7 +238,9 @@ def build_execution_history(all_results: dict) -> list[dict]:
     rows += _from_userassist(all_results)
     rows += _from_srum(all_results)
     rows += _from_bam(all_results)
-    rows += _from_appcompatcache(all_results)
+    # AppCompatCache/ShimCache is intentionally NOT here: its timestamp is the
+    # executable's last-modified time, not an execution time, so it misleads in
+    # an execution timeline. It lives in RegistryFindings instead (_rf_shimcache).
     rows += _from_prefetch(all_results)
     return rows
 
@@ -764,7 +742,7 @@ def build_defender(all_results: dict) -> list[dict]:
 # each finding carries a category + status so the view can group and flag them.
 #   status: "의심"(danger) | "주의"(warning) | "정보"(info) | "정상"(ok)
 
-_RF_KEYS = ("timestamp", "category", "name", "value", "status", "detail", "key_path", "source", "command", "user")
+_RF_KEYS = ("timestamp", "category", "name", "value", "status", "detail", "key_path", "source", "command", "user", "subtype")
 
 
 def _rf_row(**kw) -> dict:
@@ -951,6 +929,7 @@ def build_registry_findings(all_results: dict) -> list[dict]:
     rows += _rf_sql_auth(software)
     rows += _rf_autoruns(all_results)
     rows += _rf_execution_traces(all_results)
+    rows += _rf_shimcache(all_results)
     return rows
 
 
@@ -975,15 +954,43 @@ def _rf_execution_traces(all_results: dict) -> list[dict]:
                 # ShowWindow flag, not part of the command.
                 cmd = data[:-2] if data.endswith("\\1") else data
                 rows.append(_rf_row(
-                    category="실행 흔적", name="Run 대화상자 입력 (RunMRU)", value=cmd, status="정보",
+                    category="기타 레지스트리", subtype="RunMRU", name="Run 대화상자 입력 (RunMRU)", value=cmd, status="정보",
                     command=cmd, user=user, key_path=r.get("key_path", ""), source=fname,
                     timestamp=r.get("last_write", ""),
                 ))
             elif low.endswith("\\explorer\\typedpaths"):
                 rows.append(_rf_row(
-                    category="실행 흔적", name="탐색기 주소 입력 (TypedPaths)", value=data, status="정보",
+                    category="기타 레지스트리", subtype="TypedPaths", name="탐색기 주소 입력 (TypedPaths)", value=data, status="정보",
                     user=user, key_path=r.get("key_path", ""), source=fname,
                     timestamp=r.get("last_write", ""),
+                ))
+    return rows
+
+
+def _rf_shimcache(all_results: dict) -> list[dict]:
+    """ShimCache / AppCompatCache from the SYSTEM hive — evidence a program
+    existed on / ran from a path. Its time is the executable's LAST-MODIFIED
+    time, NOT an execution time, so it's surfaced here (not in the execution
+    timeline) with that caveat spelled out; `timestamp` is left empty so it
+    isn't mistaken for an event time, and the file-mtime goes in `detail`."""
+    rows = []
+    seen = set()
+    for fname, reg_rows in _registry_hives(all_results):
+        if fname.upper() != "SYSTEM":
+            continue
+        for r in reg_rows:
+            if r.get("value_name") != "AppCompatCache":
+                continue
+            for path, ft in _parse_shimcache(_unhex(r.get("value_data", ""))):
+                if path in seen:
+                    continue
+                seen.add(path)
+                mtime = _filetime(ft)
+                rows.append(_rf_row(
+                    category="기타 레지스트리", subtype="ShimCache", name=_basename(path),
+                    value=path, status="정보",
+                    detail=(f"파일 수정 시각: {mtime} (실행 시각 아님)" if mtime else "파일 존재/실행 흔적 (시각 없음)"),
+                    key_path="…\\Control\\Session Manager\\AppCompatCache", source="SYSTEM",
                 ))
     return rows
 

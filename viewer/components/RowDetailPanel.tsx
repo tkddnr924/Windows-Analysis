@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { resolveArtifactView } from "@/lib/artifactViews";
+import { resolveArtifactView, getArtifactView } from "@/lib/artifactViews";
 import type { FetchLinkedRows } from "@/lib/types";
 import ArtifactDetailView from "./ArtifactDetailView";
 
@@ -29,11 +29,26 @@ function tryPrettyJson(value: string): string | null {
   }
 }
 
+// Turn literal escape sequences ("\r\n", "\n", "\t") — which many EventData
+// blobs store as two-character text, not real whitespace — into actual line
+// breaks/tabs so multi-line content reads normally. Display-only.
+function unescapeWhitespace(s: string): string {
+  return s
+    .replace(/\\r\\n/g, "\n")
+    .replace(/\\n/g, "\n")
+    .replace(/\\r/g, "\n")
+    .replace(/\\t/g, "\t");
+}
+
 function RawFieldValue({ column, value, focused }: { column: string; value: string; focused: boolean }) {
   const [copied, setCopied] = useState(false);
   const [beautified, setBeautified] = useState(true);
+  const [unescaped, setUnescaped] = useState(false);
   const pretty = tryPrettyJson(value);
   const isJson = pretty !== null;
+  const hasEscapes = /\\[rnt]/.test(value);
+  const baseText = isJson && beautified ? pretty! : value || "(empty)";
+  const shownText = unescaped ? unescapeWhitespace(baseText) : baseText;
 
   function copy() {
     navigator.clipboard.writeText(value).then(() => {
@@ -71,10 +86,28 @@ function RawFieldValue({ column, value, focused }: { column: string; value: stri
             {beautified ? "{ } 원본" : "{ } 정렬"}
           </button>
         )}
+        {hasEscapes && (
+          <button
+            onClick={() => setUnescaped((u) => !u)}
+            title={unescaped ? "이스케이프 원본(\\r \\n \\t) 보기" : "\\r \\n \\t 를 실제 줄바꿈·탭으로 치환"}
+            style={{
+              marginLeft: isJson ? 0 : "auto",
+              fontSize: 11,
+              padding: "2px 8px",
+              background: unescaped ? "var(--accent-subtle)" : "var(--bg-elevated)",
+              color: "var(--accent)",
+              border: `1px solid ${unescaped ? "var(--accent)" : "var(--border)"}`,
+              borderRadius: "var(--radius-sm)",
+              cursor: "pointer",
+            }}
+          >
+            ↵ \n 치환
+          </button>
+        )}
         <button
           onClick={copy}
           style={{
-            marginLeft: isJson ? 0 : "auto",
+            marginLeft: isJson || hasEscapes ? 0 : "auto",
             fontSize: 11,
             padding: "2px 8px",
             background: "var(--bg-elevated)",
@@ -97,15 +130,43 @@ function RawFieldValue({ column, value, focused }: { column: string; value: stri
           color: value ? "var(--text)" : "var(--text-faint)",
         }}
       >
-        {isJson && beautified ? pretty : value || "(empty)"}
+        {shownText}
       </pre>
     </div>
   );
 }
 
 export default function RowDetailPanel({ row, columns, focusedColumn, fileBaseName, onClose, onNavigate, onFetchLinkedRows, isBookmarked, onToggleBookmark }: RowDetailPanelProps) {
-  const spec = resolveArtifactView(fileBaseName, columns);
-  const [showRaw, setShowRaw] = useState(!spec);
+  // EventLog-derived overview rows (PowerShell/RDP/SMB correlations) carry only
+  // a `record_key` link to the raw event, not the event itself. To give ONE
+  // detail everywhere, when such a link exists we load the linked raw EventLog
+  // row and show the shared EventLog detail for it — so a PowerShell command
+  // and its source Security/PowerShell event render the exact same panel.
+  const recordKey = row.record_key || "";
+  const canLink = Boolean(recordKey && onFetchLinkedRows);
+  const [linked, setLinked] = useState<{ row: Record<string, string>; columns: string[] } | null | undefined>(undefined);
+
+  useEffect(() => {
+    if (!canLink) { setLinked(null); return; }
+    let alive = true;
+    setLinked(undefined);
+    onFetchLinkedRows!("EventLog_Events", "_record_key", recordKey)
+      .then((res) => {
+        if (!alive) return;
+        const r = res?.rows?.[0];
+        setLinked(r ? { row: r, columns: Object.keys(r).filter((c) => c !== "__rowid") } : null);
+      })
+      .catch(() => alive && setLinked(null));
+    return () => { alive = false; };
+  }, [canLink, recordKey, onFetchLinkedRows]);
+
+  const useLinked = Boolean(canLink && linked && (linked as { row: Record<string, string> }).row);
+  const effRow = useLinked ? (linked as { row: Record<string, string> }).row : row;
+  const effCols = useLinked ? (linked as { columns: string[] }).columns : columns;
+  const effSpec = useLinked ? getArtifactView("EventLog_Events") ?? resolveArtifactView(fileBaseName, columns) : resolveArtifactView(fileBaseName, columns);
+  const spec = effSpec;
+  const linkLoading = canLink && linked === undefined;
+  const [showRaw, setShowRaw] = useState(!resolveArtifactView(fileBaseName, columns));
 
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
@@ -216,11 +277,13 @@ export default function RowDetailPanel({ row, columns, focusedColumn, fileBaseNa
           </button>
         </div>
         <div style={{ overflowY: "auto", flex: 1 }}>
-          {spec && !showRaw ? (
-            <ArtifactDetailView spec={spec} row={row} onNavigate={onNavigate} onFetchLinkedRows={onFetchLinkedRows} />
+          {linkLoading ? (
+            <div style={{ padding: 20, color: "var(--text-dim)", fontSize: 12.5 }}>원본 이벤트 로그를 불러오는 중...</div>
+          ) : spec && !showRaw ? (
+            <ArtifactDetailView spec={spec} row={effRow} onNavigate={onNavigate} onFetchLinkedRows={onFetchLinkedRows} />
           ) : (
-            columns.map((col) => (
-              <RawFieldValue key={col} column={col} value={row[col] ?? ""} focused={col === focusedColumn} />
+            effCols.map((col) => (
+              <RawFieldValue key={col} column={col} value={effRow[col] ?? ""} focused={col === focusedColumn} />
             ))
           )}
         </div>

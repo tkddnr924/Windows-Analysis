@@ -10,27 +10,112 @@ interface Props {
   data: CsvData;
   /** Global incident-window filter from the sidebar; applied to every row. */
   timeRange?: TimeRange;
+  /** Rowids (of this table) currently bookmarked, + the toggle — same
+   * bookmarking every other view has, keyed on each row's __rowid. */
+  bookmarkedRowids?: Set<number>;
+  onToggleBookmark?: (rowid: number) => void;
 }
+
+const rowidOf = (r: Record<string, string>): number => Number((r as Record<string, unknown>).__rowid);
 
 const DOW = ["일", "월", "화", "수", "목", "금", "토"];
 
 // "YYYY-MM-DD HH:MM:SS.fff" -> "YYYY-MM-DD"
 const dayOf = (ts: string) => (ts ? ts.slice(0, 10) : "");
 
-export default function BrowserHistoryView({ data, timeRange = EMPTY_TIME_RANGE }: Props) {
+const miniBtn: React.CSSProperties = { marginTop: 6, fontSize: 11, padding: "2px 8px", background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", color: "var(--accent)", cursor: "pointer" };
+const sortChip = (active: boolean): React.CSSProperties => ({ fontSize: 11, padding: "3px 10px", borderRadius: 999, cursor: "pointer", background: active ? "var(--accent-subtle)" : "transparent", color: active ? "var(--accent)" : "var(--text-dim)", border: `1px solid ${active ? "var(--accent)" : "var(--border)"}`, whiteSpace: "nowrap" });
+
+// "2.2 MB" / "218166" / "1,024 KB" -> bytes, for size sorting.
+function parseBytes(s: string): number {
+  if (!s) return 0;
+  const m = s.trim().match(/^([\d.,]+)\s*(TB|GB|MB|KB|B)?/i);
+  if (!m) return 0;
+  const n = parseFloat(m[1].replace(/,/g, "")) || 0;
+  const mult: Record<string, number> = { B: 1, KB: 1024, MB: 1024 ** 2, GB: 1024 ** 3, TB: 1024 ** 4 };
+  return n * (mult[(m[2] || "B").toUpperCase()] ?? 1);
+}
+
+// Full-list modal used by the "더 보기" buttons — a scrollable list with an
+// optional sort toolbar in the header.
+function ListModal({ title, toolbar, onClose, children }: { title: string; toolbar?: React.ReactNode; onClose: () => void; children: React.ReactNode }) {
+  return (
+    <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(1,4,9,0.6)", zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
+      <div onClick={(e) => e.stopPropagation()} style={{ width: 720, maxWidth: "100%", maxHeight: "82vh", display: "flex", flexDirection: "column", background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "var(--radius-lg)", boxShadow: "var(--shadow-panel)" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "12px 18px", borderBottom: "1px solid var(--border)", flexWrap: "wrap" }}>
+          <span style={{ fontSize: 14, fontWeight: 700 }}>{title}</span>
+          {toolbar}
+          <button onClick={onClose} style={{ marginLeft: "auto", background: "transparent", border: "none", color: "var(--text-faint)", fontSize: 18, cursor: "pointer" }}>×</button>
+        </div>
+        <div style={{ padding: "10px 18px 18px", overflow: "auto" }}>{children}</div>
+      </div>
+    </div>
+  );
+}
+
+// Host of a URL — used for the domain ranking. Falls back to a regex for
+// odd/relative values; returns "" for file paths and unparseable strings.
+function domainOf(url: string): string {
+  if (!url) return "";
+  try {
+    return new URL(url).hostname || "";
+  } catch {
+    const m = url.match(/^[a-z][a-z0-9+.-]*:\/\/([^/?#]+)/i);
+    return m ? m[1] : "";
+  }
+}
+
+// Find JWTs anywhere in a string (header.payload.signature, base64url). Scans
+// both the raw and URL-decoded form since tokens often ride in query params.
+const JWT_RE = /eyJ[A-Za-z0-9_-]{5,}\.eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]*/g;
+function findJwts(...texts: string[]): string[] {
+  const out = new Set<string>();
+  for (const t of texts) {
+    if (!t) continue;
+    let dec = t;
+    try { dec = decodeURIComponent(t); } catch { /* keep raw */ }
+    for (const s of new Set([t, dec])) {
+      const mm = s.match(JWT_RE);
+      if (mm) mm.forEach((x) => out.add(x));
+    }
+  }
+  return [...out];
+}
+function b64urlDecode(s: string): string {
+  let t = s.replace(/-/g, "+").replace(/_/g, "/");
+  while (t.length % 4) t += "=";
+  try {
+    // handle UTF-8 payloads
+    return decodeURIComponent(Array.from(atob(t), (c) => "%" + c.charCodeAt(0).toString(16).padStart(2, "0")).join(""));
+  } catch {
+    try { return atob(t); } catch { return ""; }
+  }
+}
+function decodeJwt(token: string): { header: string; payload: string } | null {
+  const parts = token.split(".");
+  if (parts.length < 2) return null;
+  const pretty = (raw: string) => { try { return JSON.stringify(JSON.parse(raw), null, 2); } catch { return raw || "(디코드 실패)"; } };
+  return { header: pretty(b64urlDecode(parts[0])), payload: pretty(b64urlDecode(parts[1])) };
+}
+
+export default function BrowserHistoryView({ data, timeRange = EMPTY_TIME_RANGE, bookmarkedRowids, onToggleBookmark }: Props) {
   const [account, setAccount] = useState<string>("(전체)");
   const [selectedDay, setSelectedDay] = useState<string>("");
   const [month, setMonth] = useState<{ y: number; m: number } | null>(null);
   const [kinds, setKinds] = useState<Set<string>>(new Set(["visit", "download", "cache"]));
   const [detail, setDetail] = useState<Row | null>(null);
   const [page, setPage] = useState(0);
+  const [modal, setModal] = useState<null | "domains" | "downloads">(null);
+  const [domainSort, setDomainSort] = useState<"desc" | "asc">("desc");
+  const [dlSort, setDlSort] = useState<"date" | "size" | "name">("date");
+  const [search, setSearch] = useState("");
 
   const KINDS = [
     { k: "visit", label: "🔗 방문" },
     { k: "download", label: "⬇ 다운로드" },
     { k: "cache", label: "📦 리소스(캐시)" },
   ];
-  const PAGE_SIZE = 300; // rows per page (a busy day can hold thousands of cache hits)
+  const PAGE_SIZE = 10; // rows per page
 
   const accounts = useMemo(() => {
     const s = new Set<string>();
@@ -62,6 +147,28 @@ export default function BrowserHistoryView({ data, timeRange = EMPTY_TIME_RANGE 
     return m;
   }, [scoped]);
 
+  // Period statistics — computed over the filtered scope (account + kind +
+  // sidebar time range), independent of the selected calendar day. So the
+  // stats reflect exactly what the current filters select.
+  const stats = useMemo(() => {
+    const domainMap = new Map<string, number>();
+    const dayMap = new Map<string, number>();
+    const downloads: Row[] = [];
+    for (const r of scoped) {
+      const d = domainOf(r.url || r.url_raw || "");
+      if (d) domainMap.set(d, (domainMap.get(d) ?? 0) + 1);
+      const day = dayOf(r.timestamp);
+      if (day) dayMap.set(day, (dayMap.get(day) ?? 0) + 1);
+      if (r.kind === "download") downloads.push(r);
+    }
+    const domains = [...domainMap.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+    const days = [...dayMap.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+    downloads.sort((a, b) => (a.timestamp || "").localeCompare(b.timestamp || ""));
+    return { domains, days, downloads };
+  }, [scoped]);
+
+  useEffect(() => { setModal(null); }, [account, kinds, rangeOn]);
+
   // Sorted list of days that have activity — drives latest-day default and the
   // "이전/다음 활동일" jump buttons (skip straight to a day with records).
   const activeDays = useMemo(() => [...dayCounts.keys()].sort(), [dayCounts]);
@@ -80,11 +187,22 @@ export default function BrowserHistoryView({ data, timeRange = EMPTY_TIME_RANGE 
     [scoped, activeDay]
   );
 
-  // Reset to the first page whenever the day / account / kind filter changes.
-  useEffect(() => setPage(0), [activeDay, account, kinds]);
-  const pageCount = Math.max(1, Math.ceil(dayRows.length / PAGE_SIZE));
+  // Search runs LAST — after the period (time-range) filter and the calendar-day
+  // filter have narrowed the set — matching the domain, full URL, or title.
+  const searchedRows = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    if (!q) return dayRows;
+    return dayRows.filter((r) => {
+      const url = (r.url || r.url_raw || "").toLowerCase();
+      return url.includes(q) || domainOf(r.url || r.url_raw || "").toLowerCase().includes(q) || (r.title || "").toLowerCase().includes(q);
+    });
+  }, [dayRows, search]);
+
+  // Reset to the first page whenever the day / account / kind / search changes.
+  useEffect(() => setPage(0), [activeDay, account, kinds, search]);
+  const pageCount = Math.max(1, Math.ceil(searchedRows.length / PAGE_SIZE));
   const safePage = Math.min(page, pageCount - 1);
-  const pagedRows = dayRows.slice(safePage * PAGE_SIZE, (safePage + 1) * PAGE_SIZE);
+  const pagedRows = searchedRows.slice(safePage * PAGE_SIZE, (safePage + 1) * PAGE_SIZE);
 
   const grid = useMemo(() => calendarGrid(view.y, view.m), [view]);
 
@@ -132,6 +250,81 @@ export default function BrowserHistoryView({ data, timeRange = EMPTY_TIME_RANGE 
           );
         })}
       </div>
+
+      {/* period statistics — follows the account/kind/time-range filters */}
+      {scoped.length > 0 && (
+        <div style={{ display: "flex", gap: 14, flexWrap: "wrap", marginBottom: 16, alignItems: "flex-start" }}>
+          {/* most-accessed domains */}
+          <div style={{ flex: "1 1 300px", minWidth: 280, background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "var(--radius-lg)", padding: 14, boxShadow: "var(--shadow-card)" }}>
+            <div style={{ fontSize: 12.5, fontWeight: 700, marginBottom: 8 }}>🌐 접근 도메인 <span style={{ color: "var(--text-faint)", fontWeight: 400 }}>{stats.domains.length}개</span></div>
+            {(() => {
+              const max = stats.domains[0]?.[1] ?? 1;
+              return (
+                <>
+                  {stats.domains.slice(0, 5).map(([dom, n]) => (
+                    <div key={dom} style={{ display: "flex", alignItems: "center", gap: 8, padding: "3px 0" }}>
+                      <span style={{ flex: 1, minWidth: 0, position: "relative", fontSize: 11.5, fontFamily: "var(--mono)" }}>
+                        <span style={{ position: "absolute", inset: 0, background: "var(--accent-subtle)", width: `${Math.round((n / max) * 100)}%`, borderRadius: 3 }} />
+                        <span style={{ position: "relative", color: "var(--text)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", display: "block", padding: "2px 6px" }}>{dom}</span>
+                      </span>
+                      <span style={{ flexShrink: 0, fontSize: 11.5, color: "var(--text-dim)", fontFamily: "var(--mono)" }}>{n.toLocaleString()}</span>
+                    </div>
+                  ))}
+                  {stats.domains.length > 5 && (
+                    <button onClick={() => setModal("domains")} style={miniBtn}>
+                      +{stats.domains.length - 5}개 더 보기
+                    </button>
+                  )}
+                </>
+              );
+            })()}
+          </div>
+
+          {/* downloads */}
+          <div style={{ flex: "1 1 300px", minWidth: 280, background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "var(--radius-lg)", padding: 14, boxShadow: "var(--shadow-card)" }}>
+            <div style={{ fontSize: 12.5, fontWeight: 700, marginBottom: 8 }}>⬇ 다운로드 <span style={{ color: "var(--text-faint)", fontWeight: 400 }}>{stats.downloads.length}건</span></div>
+            {stats.downloads.length === 0 && <div style={{ fontSize: 11.5, color: "var(--text-faint)" }}>기록 없음</div>}
+            {stats.downloads.slice(0, 5).map((r, i) => (
+              <div key={i} onClick={() => setDetail(r)} title="클릭하면 상세" style={{ display: "flex", gap: 8, padding: "3px 0", cursor: "pointer", borderBottom: "1px solid var(--border-subtle)" }}>
+                <span style={{ flexShrink: 0, fontSize: 10.5, color: "var(--text-faint)", fontFamily: "var(--mono)" }}>{(r.timestamp || "").slice(5, 16)}</span>
+                <span style={{ flex: 1, minWidth: 0, fontSize: 11.5, color: "var(--warning)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{r.title || r.url}</span>
+                {r.size && <span style={{ flexShrink: 0, fontSize: 10.5, color: "var(--text-faint)" }}>{r.size}</span>}
+              </div>
+            ))}
+            {stats.downloads.length > 5 && (
+              <button onClick={() => setModal("downloads")} style={miniBtn}>
+                +{stats.downloads.length - 5}건 더 보기
+              </button>
+            )}
+          </div>
+
+          {/* per-day activity graph */}
+          <div style={{ flex: "1 1 320px", minWidth: 300, background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "var(--radius-lg)", padding: 14, boxShadow: "var(--shadow-card)" }}>
+            <div style={{ fontSize: 12.5, fontWeight: 700, marginBottom: 8 }}>📊 기간별 활동 <span style={{ color: "var(--text-faint)", fontWeight: 400 }}>{stats.days.length}일</span></div>
+            {(() => {
+              const max = Math.max(1, ...stats.days.map(([, n]) => n));
+              return (
+                <div style={{ display: "flex", alignItems: "flex-end", gap: 2, height: 84, overflowX: "auto", paddingBottom: 2 }}>
+                  {stats.days.map(([day, n]) => (
+                    <div
+                      key={day}
+                      onClick={() => gotoDay(day)}
+                      title={`${day} · ${n.toLocaleString()}건`}
+                      style={{ flex: "1 0 8px", minWidth: 6, display: "flex", flexDirection: "column", justifyContent: "flex-end", height: "100%", cursor: "pointer" }}
+                    >
+                      <div style={{ height: `${Math.round((n / max) * 100)}%`, background: day === activeDay ? "var(--accent)" : "var(--accent-subtle)", borderRadius: "2px 2px 0 0", minHeight: 2 }} />
+                    </div>
+                  ))}
+                </div>
+              );
+            })()}
+            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, color: "var(--text-faint)", fontFamily: "var(--mono)", marginTop: 4 }}>
+              <span>{stats.days[0]?.[0] ?? ""}</span>
+              <span>{stats.days[stats.days.length - 1]?.[0] ?? ""}</span>
+            </div>
+          </div>
+        </div>
+      )}
 
       <div style={{ display: "flex", gap: 18, alignItems: "flex-start", flexWrap: "wrap" }}>
         {/* calendar */}
@@ -192,11 +385,25 @@ export default function BrowserHistoryView({ data, timeRange = EMPTY_TIME_RANGE 
 
         {/* day timeline */}
         <div style={{ flex: 1, minWidth: 320 }}>
-          <div style={{ fontSize: 13.5, fontWeight: 700, marginBottom: 8 }}>
-            {activeDay ? `🗓️ ${activeDay} · ${dayRows.length}건` : "활동 기록 없음"}
+          <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8, flexWrap: "wrap" }}>
+            <span style={{ fontSize: 13.5, fontWeight: 700 }}>
+              {activeDay ? `🗓️ ${activeDay} · ${searchedRows.length.toLocaleString()}건` : "활동 기록 없음"}
+              {search.trim() && <span style={{ color: "var(--text-faint)", fontWeight: 400 }}> / {dayRows.length.toLocaleString()}건 중</span>}
+            </span>
+            <div style={{ marginLeft: "auto", position: "relative" }}>
+              <input
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                placeholder="이 날짜에서 도메인·URL·제목 검색"
+                style={{ width: 280, padding: "5px 26px 5px 10px", background: "var(--bg-input)", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", color: "var(--text)", fontSize: 12 }}
+              />
+              {search && (
+                <button onClick={() => setSearch("")} title="지우기" style={{ position: "absolute", right: 4, top: "50%", transform: "translateY(-50%)", background: "transparent", border: "none", color: "var(--text-faint)", cursor: "pointer", fontSize: 14 }}>×</button>
+              )}
+            </div>
           </div>
           <div style={{ background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "var(--radius-lg)", boxShadow: "var(--shadow-card)", overflow: "hidden" }}>
-            {dayRows.length === 0 && <div style={{ padding: 20, color: "var(--text-faint)", fontSize: 12.5 }}>선택한 날짜의 기록이 없습니다.</div>}
+            {searchedRows.length === 0 && <div style={{ padding: 20, color: "var(--text-faint)", fontSize: 12.5 }}>{search.trim() ? `"${search.trim()}" 검색 결과가 없습니다.` : "선택한 날짜의 기록이 없습니다."}</div>}
             {pagedRows.map((r, i, arr) => {
               const isDl = r.kind === "download";
               const isCache = r.kind === "cache";
@@ -223,6 +430,15 @@ export default function BrowserHistoryView({ data, timeRange = EMPTY_TIME_RANGE 
                     <div title={r.url_raw} style={{ fontSize: isCache ? 10.5 : 11, color: isCache ? "var(--text-faint)" : "var(--accent)", fontFamily: "var(--mono)", wordBreak: "break-all" }}>{isDl ? r.source_url || r.url : r.url}</div>
                     {isDl && r.detail && <div style={{ fontSize: 10.5, color: "var(--text-faint)", fontFamily: "var(--mono)", wordBreak: "break-all" }}>💾 {r.detail}</div>}
                   </div>
+                  {onToggleBookmark && Number.isFinite(rowidOf(r)) && (
+                    <span
+                      onClick={(e) => { e.stopPropagation(); onToggleBookmark(rowidOf(r)); }}
+                      title={bookmarkedRowids?.has(rowidOf(r)) ? "북마크 해제" : "북마크에 추가"}
+                      style={{ flexShrink: 0, alignSelf: "center", cursor: "pointer", fontSize: 14, color: bookmarkedRowids?.has(rowidOf(r)) ? "var(--warning)" : "var(--text-faint)" }}
+                    >
+                      {bookmarkedRowids?.has(rowidOf(r)) ? "★" : "☆"}
+                    </span>
+                  )}
                 </div>
               );
             })}
@@ -232,7 +448,7 @@ export default function BrowserHistoryView({ data, timeRange = EMPTY_TIME_RANGE 
               <button onClick={() => setPage(0)} disabled={safePage === 0} style={pgBtn(safePage === 0)}>«</button>
               <button onClick={() => setPage(safePage - 1)} disabled={safePage === 0} style={pgBtn(safePage === 0)}>‹ 이전</button>
               <span style={{ fontSize: 12, color: "var(--text-dim)", minWidth: 120, textAlign: "center" }}>
-                {safePage + 1} / {pageCount} 쪽 <span style={{ color: "var(--text-faint)" }}>({(safePage * PAGE_SIZE + 1).toLocaleString()}–{Math.min((safePage + 1) * PAGE_SIZE, dayRows.length).toLocaleString()} / {dayRows.length.toLocaleString()})</span>
+                {safePage + 1} / {pageCount} 쪽 <span style={{ color: "var(--text-faint)" }}>({(safePage * PAGE_SIZE + 1).toLocaleString()}–{Math.min((safePage + 1) * PAGE_SIZE, searchedRows.length).toLocaleString()} / {searchedRows.length.toLocaleString()})</span>
               </span>
               <button onClick={() => setPage(safePage + 1)} disabled={safePage >= pageCount - 1} style={pgBtn(safePage >= pageCount - 1)}>다음 ›</button>
               <button onClick={() => setPage(pageCount - 1)} disabled={safePage >= pageCount - 1} style={pgBtn(safePage >= pageCount - 1)}>»</button>
@@ -241,7 +457,68 @@ export default function BrowserHistoryView({ data, timeRange = EMPTY_TIME_RANGE 
         </div>
       </div>
 
-      {detail && <DetailModal row={detail} onClose={() => setDetail(null)} />}
+      {detail && (
+        <DetailModal
+          row={detail}
+          onClose={() => setDetail(null)}
+          isBookmarked={bookmarkedRowids?.has(rowidOf(detail)) ?? false}
+          onToggleBookmark={onToggleBookmark && Number.isFinite(rowidOf(detail)) ? () => onToggleBookmark(rowidOf(detail)) : undefined}
+        />
+      )}
+
+      {modal === "domains" && (
+        <ListModal title={`🌐 접근 도메인 (${stats.domains.length}개)`} onClose={() => setModal(null)}
+          toolbar={
+            <div style={{ display: "flex", gap: 4 }}>
+              <button onClick={() => setDomainSort("desc")} style={sortChip(domainSort === "desc")}>횟수 많은순 ↓</button>
+              <button onClick={() => setDomainSort("asc")} style={sortChip(domainSort === "asc")}>횟수 적은순 ↑</button>
+            </div>
+          }
+        >
+          {(() => {
+            const list = domainSort === "asc" ? [...stats.domains].reverse() : stats.domains;
+            const max = stats.domains[0]?.[1] ?? 1;
+            return list.map(([dom, n]) => (
+              <div key={dom} style={{ display: "flex", alignItems: "center", gap: 10, padding: "4px 0" }}>
+                <span style={{ flex: 1, minWidth: 0, position: "relative", fontSize: 12, fontFamily: "var(--mono)" }}>
+                  <span style={{ position: "absolute", inset: 0, background: "var(--accent-subtle)", width: `${Math.round((n / max) * 100)}%`, borderRadius: 3 }} />
+                  <span style={{ position: "relative", color: "var(--text)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", display: "block", padding: "3px 8px" }}>{dom}</span>
+                </span>
+                <span style={{ flexShrink: 0, fontSize: 12, color: "var(--text-dim)", fontFamily: "var(--mono)" }}>{n.toLocaleString()}</span>
+              </div>
+            ));
+          })()}
+        </ListModal>
+      )}
+
+      {modal === "downloads" && (
+        <ListModal title={`⬇ 다운로드 (${stats.downloads.length}건)`} onClose={() => setModal(null)}
+          toolbar={
+            <div style={{ display: "flex", gap: 4 }}>
+              <span style={{ fontSize: 11, color: "var(--text-faint)", alignSelf: "center", marginRight: 2 }}>정렬</span>
+              <button onClick={() => setDlSort("date")} style={sortChip(dlSort === "date")}>일자</button>
+              <button onClick={() => setDlSort("size")} style={sortChip(dlSort === "size")}>크기</button>
+              <button onClick={() => setDlSort("name")} style={sortChip(dlSort === "name")}>이름</button>
+            </div>
+          }
+        >
+          {[...stats.downloads].sort((a, b) => {
+            if (dlSort === "size") return parseBytes(b.size) - parseBytes(a.size);
+            if (dlSort === "name") return (a.title || a.url || "").localeCompare(b.title || b.url || "");
+            return (a.timestamp || "").localeCompare(b.timestamp || "");
+          }).map((r, i) => (
+            <div key={i} onClick={() => { setDetail(r); setModal(null); }} title="클릭하면 상세"
+              style={{ display: "flex", gap: 10, padding: "6px 0", cursor: "pointer", borderBottom: "1px solid var(--border-subtle)" }}
+              onMouseEnter={(e) => (e.currentTarget.style.background = "var(--bg-hover)")}
+              onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+            >
+              <span style={{ flexShrink: 0, fontSize: 11, color: "var(--text-faint)", fontFamily: "var(--mono)", width: 128 }}>{r.timestamp || ""}</span>
+              <span style={{ flex: 1, minWidth: 0, fontSize: 12, color: "var(--warning)", wordBreak: "break-all" }}>{r.title || r.url}</span>
+              {r.size && <span style={{ flexShrink: 0, fontSize: 11, color: "var(--text-faint)", fontFamily: "var(--mono)" }}>{r.size}</span>}
+            </div>
+          ))}
+        </ListModal>
+      )}
     </div>
   );
 }
@@ -251,10 +528,13 @@ const jumpBtn: React.CSSProperties = { flex: 1, fontSize: 11, padding: "3px 6px"
 const pgBtn = (disabled: boolean): React.CSSProperties => ({ fontSize: 12, padding: "4px 10px", background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", color: "var(--text-dim)", cursor: disabled ? "default" : "pointer", opacity: disabled ? 0.4 : 1, whiteSpace: "nowrap" });
 
 const KIND_LABEL: Record<string, string> = { visit: "🔗 방문", download: "⬇ 다운로드", cache: "📦 리소스(캐시)" };
+const jwtPre: React.CSSProperties = { margin: 0, padding: 8, background: "var(--bg-input)", border: "1px solid var(--border-subtle)", borderRadius: "var(--radius-sm)", fontFamily: "var(--mono)", fontSize: 11.5, whiteSpace: "pre-wrap", wordBreak: "break-all", color: "var(--text)" };
 
-function DetailModal({ row, onClose }: { row: Row; onClose: () => void }) {
+function DetailModal({ row, onClose, isBookmarked, onToggleBookmark }: { row: Row; onClose: () => void; isBookmarked?: boolean; onToggleBookmark?: () => void }) {
   const isDl = row.kind === "download";
   const isCache = row.kind === "cache";
+  const jwts = findJwts(row.url || "", row.url_raw || "", row.source_url || "");
+  const [showJwt, setShowJwt] = useState(false);
   const fields: [string, string][] = [
     ["종류", KIND_LABEL[row.kind] || row.kind],
     ["계정", row.account],
@@ -271,7 +551,16 @@ function DetailModal({ row, onClose }: { row: Row; onClose: () => void }) {
       <div onClick={(e) => e.stopPropagation()} style={{ width: 620, maxWidth: "100%", maxHeight: "82vh", overflow: "auto", background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "var(--radius-lg)", boxShadow: "var(--shadow-panel)" }}>
         <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "14px 18px", borderBottom: "1px solid var(--border)" }}>
           <span style={{ fontSize: 15, fontWeight: 700, wordBreak: "break-all" }}>{row.title || row.url || "(기록)"}</span>
-          <button onClick={onClose} style={{ marginLeft: "auto", background: "transparent", border: "none", color: "var(--text-faint)", fontSize: 18, cursor: "pointer" }}>×</button>
+          {onToggleBookmark && (
+            <button
+              onClick={onToggleBookmark}
+              title={isBookmarked ? "북마크 해제" : "북마크에 추가"}
+              style={{ marginLeft: "auto", background: isBookmarked ? "var(--warning-subtle)" : "var(--bg-elevated)", border: `1px solid ${isBookmarked ? "var(--warning)" : "var(--border)"}`, color: isBookmarked ? "var(--warning)" : "var(--text-dim)", fontSize: 12, fontWeight: 600, padding: "3px 10px", borderRadius: "var(--radius-sm)", cursor: "pointer", whiteSpace: "nowrap" }}
+            >
+              {isBookmarked ? "★ 북마크됨" : "☆ 북마크"}
+            </button>
+          )}
+          <button onClick={onClose} style={{ marginLeft: onToggleBookmark ? 8 : "auto", background: "transparent", border: "none", color: "var(--text-faint)", fontSize: 18, cursor: "pointer" }}>×</button>
         </div>
         <div style={{ padding: "10px 18px 18px" }}>
           {fields.filter(([, v]) => v).map(([k, v]) => (
@@ -280,6 +569,34 @@ function DetailModal({ row, onClose }: { row: Row; onClose: () => void }) {
               <span style={{ flex: 1, color: "var(--text)", fontSize: 12.5, fontFamily: k.startsWith("URL") || k.includes("경로") ? "var(--mono)" : undefined, wordBreak: "break-all" }}>{v}</span>
             </div>
           ))}
+
+          {/* JWT: URLs (esp. token=… login links) often carry a JWT. Offer to decode it. */}
+          {jwts.length > 0 && (
+            <div style={{ marginTop: 12 }}>
+              <button
+                onClick={() => setShowJwt((v) => !v)}
+                style={{ fontSize: 12, fontWeight: 600, padding: "5px 12px", background: showJwt ? "var(--accent-subtle)" : "var(--bg-elevated)", color: "var(--accent)", border: `1px solid ${showJwt ? "var(--accent)" : "var(--border)"}`, borderRadius: "var(--radius-sm)", cursor: "pointer" }}
+              >
+                🔑 JWT 디코드 {jwts.length > 1 ? `(${jwts.length}개)` : ""}
+              </button>
+              {showJwt && jwts.map((tok, i) => {
+                const dec = decodeJwt(tok);
+                return (
+                  <div key={i} style={{ marginTop: 8, border: "1px solid var(--border)", borderRadius: "var(--radius-md)", overflow: "hidden" }}>
+                    <div style={{ padding: "5px 10px", background: "var(--bg-elevated)", fontSize: 10.5, color: "var(--text-faint)", fontFamily: "var(--mono)", wordBreak: "break-all" }}>{tok}</div>
+                    {dec && (
+                      <div style={{ padding: 10 }}>
+                        <div style={{ fontSize: 11, color: "var(--text-faint)", marginBottom: 2 }}>HEADER</div>
+                        <pre style={jwtPre}>{dec.header}</pre>
+                        <div style={{ fontSize: 11, color: "var(--text-faint)", margin: "8px 0 2px" }}>PAYLOAD</div>
+                        <pre style={jwtPre}>{dec.payload}</pre>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
         </div>
       </div>
     </div>

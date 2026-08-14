@@ -186,6 +186,61 @@ function basename(path: string | undefined): string {
   return parts[parts.length - 1] || path;
 }
 
+// A SID with a human label where one is knowable from the SID alone (built-in /
+// service accounts, and the built-in Administrator RID 500). Mapping an
+// arbitrary S-1-5-21-…-<RID≥1000> user SID to its account name needs the
+// registry profile list, which isn't available to this row-only formatter.
+const WELL_KNOWN_SID: Record<string, string> = {
+  "S-1-5-18": "LocalSystem",
+  "S-1-5-19": "LocalService",
+  "S-1-5-20": "NetworkService",
+  "S-1-1-0": "Everyone",
+  "S-1-5-7": "Anonymous",
+  "S-1-5-11": "Authenticated Users",
+  "S-1-5-32-544": "Administrators",
+  "S-1-5-32-545": "Users",
+};
+function sidLabel(sid: string | undefined): string {
+  if (!sid) return "";
+  const wk = WELL_KNOWN_SID[sid];
+  if (wk) return `${sid} (${wk})`;
+  const rid = sid.match(/-(\d+)$/)?.[1];
+  if (/^S-1-5-21-/.test(sid) && rid === "500") return `${sid} (Administrator)`;
+  return sid;
+}
+
+// Windows Error Reporting (Application / Event 1001): the crash is described by
+// EventName + the P1..P10 bucket parameters, whose meaning depends on EventName
+// (APPCRASH: P1=app, P2=version, P4=faulting module, …). These helpers pull the
+// human-relevant bits so the detail view names the crashed program and reason
+// instead of a wall of P-fields.
+function isWerEvent(r: Record<string, string>): boolean {
+  return /Error Reporting/i.test(r.Provider || "") || (!!extractEventField(r, "EventName") && !!extractEventField(r, "P1"));
+}
+function werAppPath(r: Record<string, string>): string | undefined {
+  const d = parseEventData(r.EventData);
+  if (!d) return undefined;
+  // A P-field sometimes carries the faulting exe's full path; ignore the WER
+  // report temp folder (…\WER\…), which is bookkeeping, not the program.
+  for (const v of Object.values(d)) {
+    const s = String(v);
+    if (/^[a-z]:\\.+\.(exe|dll|sys)$/i.test(s) && !/\\WER\\/i.test(s)) return s;
+  }
+  return undefined;
+}
+function werReason(r: Record<string, string>): string | undefined {
+  const d = parseEventData(r.EventData);
+  if (!d) return undefined;
+  const resp = String(d.Response ?? "");
+  const p3 = String(d.P3 ?? "");
+  const p4 = String(d.P4 ?? "");
+  const parts: string[] = [];
+  if (resp && !/사용할 수 없|not ?available|^n\/?a$/i.test(resp)) parts.push(resp);
+  if (p3) parts.push(p3);
+  if (p4) parts.push(p4); // often an HRESULT like 0x80070002
+  return parts.length ? parts.join(" · ") : undefined;
+}
+
 const VIEWS: Record<string, ArtifactViewSpec> = {
   // --- 종합 분석 (_OVERVIEW/): cross-artifact correlation tables built by
   // common/correlate.py — one row here can come from several different
@@ -536,7 +591,6 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
       const logonType = logonTypeLabel(r);
       return logonType ? `${base} · ${logonType}` : base;
     },
-    subtitle: (r) => r.Provider || "",
     badges: [
       { key: "LevelName", kind: "badge", badgeColors: LEVEL_COLORS },
       { key: "_status", kind: "badge", badgeColors: STATUS_COLORS },
@@ -575,12 +629,12 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     ],
     priorityColumns: ["timestamp", "Provider", "EventID", "LevelName", "Channel", "Computer"],
     sections: [
-      // EventRecordID / ProcessID / ThreadID are low-value at a glance, so
-      // they're left out of this curated view — "전체 필드 보기" still shows
-      // them. LogonType leads because it's the headline fact for logon events.
       { heading: "기본 정보", fields: [
+        { key: "timestamp", label: "시각" },
+        { key: "Channel", label: "채널" },
+        { key: "EventID", label: "Event ID" },
         {
-          key: "EventData.LogonType",
+          key: "_logon_type_field",
           label: "로그온 유형",
           kind: "badge",
           compute: (r) => {
@@ -588,11 +642,15 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
             return lt ? formatLogonType(lt) : undefined;
           },
         },
-        { key: "Channel" },
-        { key: "Computer" },
-        { key: "UserID" },
+        // Writer SID → account: labels built-in/service SIDs (LocalSystem, …)
+        // and the built-in Administrator; a plain user SID shows as-is.
+        { key: "UserID", label: "UserID (계정)", compute: (r) => sidLabel(r.UserID) },
       ]},
-      { heading: "보안 이벤트 상세 (로그온/원격 접속/SMB/영속성)", fields: [
+      // Every field below renders only when the event actually carries it, so a
+      // single section adapts per Event ID: BITS shows its URL/파일, a logon
+      // shows accounts/IP, a service-install shows the image path, and so on.
+      { heading: "이벤트 데이터", fields: [
+        // Accounts / logon / remote access / SMB / persistence
         edField("TargetUserName", "대상 계정"),
         edField("TargetDomainName", "대상 도메인"),
         edField("SubjectUserName", "수행 계정"),
@@ -608,8 +666,25 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
         edField("FailureReason", "실패 사유"),
         edField("Status", "상태 코드"),
         edField("ScriptBlockText", "PowerShell 스크립트 원문", { kind: "code" }),
+        // Windows Error Reporting (Application 1001) — crash details
+        { key: "_wer_name", label: "이벤트 이름 (오류 유형)", compute: (r) => (isWerEvent(r) ? extractEventField(r, "EventName") || undefined : undefined) },
+        { key: "_wer_app", label: "오류 발생 프로그램", compute: (r) => (isWerEvent(r) ? extractEventField(r, "P1") || undefined : undefined) },
+        { key: "_wer_path", label: "오류 발생 프로그램 경로", kind: "path", compute: (r) => (isWerEvent(r) ? werAppPath(r) : undefined) },
+        { key: "_wer_reason", label: "오류 원인", compute: (r) => (isWerEvent(r) ? werReason(r) : undefined) },
+        // BITS transfer (Bits-Client) — download job details
+        edField("url", "URL", { kind: "path" }),
+        edField("name", "작업 이름"),
+        edField("Id", "작업 ID", { kind: "hash" }),
+        edField("fileTime", "파일 시각"),
+        edField("fileLength", "파일 크기(byte)"),
+        edField("bytesTotal", "전체 바이트"),
+        edField("bytesTransferred", "전송된 바이트"),
+        edField("peer", "피어"),
+        // Firewall rule changes
+        edField("RuleName", "방화벽 규칙"),
+        edField("ApplicationPath", "대상 프로그램", { kind: "path" }),
       ]},
-      { heading: "이벤트 데이터 (원본)", fields: [{ key: "EventData", kind: "json" }] },
+      { heading: "원본 (EventData)", fields: [{ key: "EventData", kind: "json" }] },
       { heading: "오류", fields: [{ key: "_error", kind: "code" }] },
     ],
   },

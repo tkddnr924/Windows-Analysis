@@ -69,12 +69,26 @@ function prettyJsonOrNull(value: string): string | null {
 // content full-screen (CodeModal) — the detail panel's box is small, and a
 // PowerShell ScriptBlock can be hundreds of lines. Used for `json`/`code`
 // fields and for any plain field whose value turns out to be JSON.
+// Turn literal escape sequences ("\r\n", "\n", "\t") — which many EventData
+// blobs store as two-character text, not real whitespace — into actual line
+// breaks/tabs so multi-line content reads normally. Display-only.
+function unescapeWhitespace(s: string): string {
+  return s
+    .replace(/\\r\\n/g, "\n")
+    .replace(/\\n/g, "\n")
+    .replace(/\\r/g, "\n")
+    .replace(/\\t/g, "\t");
+}
+
 function CodeOrJsonBlock({ raw, expandTitle }: { raw: string; expandTitle?: string }) {
   const pretty = prettyJsonOrNull(raw);
   const [beautified, setBeautified] = useState(true);
   const [expanded, setExpanded] = useState(false);
+  const [unescaped, setUnescaped] = useState(false);
   const isJson = pretty !== null;
-  const shown = isJson && beautified ? (pretty as string) : raw;
+  const hasEscapes = /\\[rnt]/.test(raw);
+  const base = isJson && beautified ? (pretty as string) : raw;
+  const shown = unescaped ? unescapeWhitespace(base) : base;
 
   const btnStyle: React.CSSProperties = {
     fontSize: 10,
@@ -96,6 +110,15 @@ function CodeOrJsonBlock({ raw, expandTitle }: { raw: string; expandTitle?: stri
             style={btnStyle}
           >
             {beautified ? "{ } 원본" : "{ } 정렬"}
+          </button>
+        )}
+        {hasEscapes && (
+          <button
+            onClick={() => setUnescaped((u) => !u)}
+            title={unescaped ? "이스케이프 원본(\\r \\n \\t) 보기" : "\\r \\n \\t 를 실제 줄바꿈·탭으로 치환"}
+            style={{ ...btnStyle, background: unescaped ? "var(--accent-subtle)" : "var(--bg-elevated)", borderColor: unescaped ? "var(--accent)" : "var(--border)" }}
+          >
+            ↵ \n 치환
           </button>
         )}
         <button onClick={() => setExpanded(true)} title="크게 보기" style={btnStyle}>

@@ -24,8 +24,13 @@ const CATEGORY_META: { key: string; icon: string }[] = [
   { key: "공유 폴더", icon: "📁" },
   { key: "SQL 인증", icon: "🗄️" },
   { key: "자동 실행", icon: "🚀" },
-  { key: "실행 흔적", icon: "⌨️" },
+  { key: "기타 레지스트리", icon: "🧩" },
 ];
+
+// Categories that split into sub-tabs, and the row field each tabs on:
+// autoruns by the account (user) they belong to, 기타 레지스트리 by finding
+// type (RunMRU / TypedPaths / ShimCache).
+const TAB_FIELD: Record<string, string> = { "자동 실행": "user", "기타 레지스트리": "subtype" };
 
 // A value that reads as a filesystem/UNC path (share folders, typed paths).
 function looksLikePath(v: string): boolean {
@@ -80,55 +85,100 @@ export default function RegistryFindingsView({ data }: Props) {
       {data.rows.length === 0 && <div style={{ color: "var(--text-faint)", fontSize: 13 }}>레지스트리 특이사항이 없습니다.</div>}
 
       <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-        {groups.map(({ cat, icon, rows }) => {
-          const worst = rows.some((r) => r.status === "의심") ? "var(--danger)" : rows.some((r) => r.status === "주의") ? "var(--warning)" : "var(--border)";
-          return (
-            <section key={cat} style={{ background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "var(--radius-lg)", boxShadow: "var(--shadow-card)", overflow: "hidden" }}>
-              <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "11px 14px", borderBottom: "1px solid var(--border-subtle)", borderLeft: `3px solid ${worst}` }}>
-                <span style={{ fontSize: 13, fontWeight: 700, color: "var(--text)" }}>{icon} {cat}</span>
-                <span style={{ fontSize: 12, color: "var(--text-faint)" }}>{rows.length}</span>
-              </div>
-              <div style={{ padding: "6px 14px 12px" }}>
-                {rows.map((r, i) => (
-                  <div
-                    key={i}
-                    onClick={() => setDetail(r)}
-                    onMouseEnter={(e) => (e.currentTarget.style.background = "var(--bg-hover)")}
-                    onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
-                    style={{ padding: "8px 8px", margin: "0 -8px", borderRadius: "var(--radius-sm)", borderBottom: i < rows.length - 1 ? "1px solid var(--border-subtle)" : "none", cursor: "pointer" }}
-                    title="클릭하면 레지스트리 키·값 상세 보기"
-                  >
-                    <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-                      <span style={{ fontSize: 12.5, fontWeight: 600, color: "var(--text)", wordBreak: "break-all" }}>{r.name}</span>
-                      <Pill text={r.status} color={statusColor(r.status)} />
-                      {(r.detail === "Run" || r.detail === "RunOnce" || r.detail === "Policy Run") && (
-                        <span style={{ fontSize: 10, color: "var(--text-faint)", border: "1px solid var(--border)", borderRadius: 4, padding: "0 5px" }}>{r.detail}</span>
-                      )}
-                      {r.user && r.user !== "(시스템)" && <span style={{ fontSize: 10.5, color: "var(--text-faint)" }}>👤 {r.user}</span>}
-                    </div>
-                    {r.value && (
-                      <div style={{ fontSize: looksLikePath(r.value) ? 12.5 : 12, fontWeight: looksLikePath(r.value) ? 600 : 400, color: looksLikePath(r.value) ? "var(--accent)" : "var(--text-dim)", fontFamily: "var(--mono)", marginTop: 3, wordBreak: "break-all" }}>
-                        {looksLikePath(r.value) ? "📂 " : ""}{r.value}
-                      </div>
-                    )}
-                    {r.key_path && (
-                      <div style={{ fontSize: 10.5, color: "var(--text-faint)", fontFamily: "var(--mono)", marginTop: 3, wordBreak: "break-all" }} title={r.key_path}>
-                        🔑 {r.key_path}{r.source ? `  ·  ${r.source}` : ""}
-                      </div>
-                    )}
-                    {r.timestamp && (
-                      <div style={{ fontSize: 10.5, color: "var(--text-dim)", fontFamily: "var(--mono)", marginTop: 2 }}>🕑 {r.timestamp}</div>
-                    )}
-                  </div>
-                ))}
-              </div>
-            </section>
-          );
-        })}
+        {groups.map(({ cat, icon, rows }) => (
+          <FindingSection key={cat} cat={cat} icon={icon} rows={rows} tabField={TAB_FIELD[cat]} onSelect={setDetail} />
+        ))}
       </div>
 
       {detail && <RfDetailModal row={detail} onClose={() => setDetail(null)} />}
     </div>
+  );
+}
+
+// One category card. When `tabField` is set (자동 실행 → user, 기타 레지스트리 →
+// subtype) it shows a tab bar and filters its rows to the active tab.
+function FindingSection({ cat, icon, rows, tabField, onSelect }: { cat: string; icon: string; rows: Row[]; tabField?: string; onSelect: (r: Row) => void }) {
+  const tabs = useMemo(() => {
+    if (!tabField) return [];
+    const seen: string[] = [];
+    for (const r of rows) {
+      const v = r[tabField] || "(기타)";
+      if (!seen.includes(v)) seen.push(v);
+    }
+    return seen;
+  }, [rows, tabField]);
+  const [tab, setTab] = useState<string>("전체");
+  const shown = tabField && tab !== "전체" ? rows.filter((r) => (r[tabField] || "(기타)") === tab) : rows;
+
+  const worst = rows.some((r) => r.status === "의심") ? "var(--danger)" : rows.some((r) => r.status === "주의") ? "var(--warning)" : "var(--border)";
+  return (
+    <section style={{ background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "var(--radius-lg)", boxShadow: "var(--shadow-card)", overflow: "hidden" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "11px 14px", borderBottom: "1px solid var(--border-subtle)", borderLeft: `3px solid ${worst}` }}>
+        <span style={{ fontSize: 13, fontWeight: 700, color: "var(--text)" }}>{icon} {cat}</span>
+        <span style={{ fontSize: 12, color: "var(--text-faint)" }}>{rows.length}</span>
+      </div>
+
+      {tabField && tabs.length > 1 && (
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap", padding: "8px 14px 0" }}>
+          {["전체", ...tabs].map((t) => {
+            const active = tab === t;
+            const count = t === "전체" ? rows.length : rows.filter((r) => (r[tabField] || "(기타)") === t).length;
+            const label = tabField === "user" && t !== "전체" ? (t === "(시스템)" ? t : `👤 ${t}`) : t;
+            return (
+              <button
+                key={t}
+                onClick={() => setTab(t)}
+                style={{ fontSize: 11.5, padding: "3px 10px", borderRadius: 999, cursor: "pointer", whiteSpace: "nowrap",
+                  background: active ? "var(--accent-subtle)" : "transparent",
+                  color: active ? "var(--accent)" : "var(--text-dim)",
+                  border: `1px solid ${active ? "var(--accent)" : "var(--border)"}` }}
+              >
+                {label} <span style={{ color: "var(--text-faint)" }}>{count.toLocaleString()}</span>
+              </button>
+            );
+          })}
+        </div>
+      )}
+
+      <div style={{ padding: "6px 14px 12px" }}>
+        {shown.map((r, i) => (
+          <div
+            key={i}
+            onClick={() => onSelect(r)}
+            onMouseEnter={(e) => (e.currentTarget.style.background = "var(--bg-hover)")}
+            onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+            style={{ padding: "8px 8px", margin: "0 -8px", borderRadius: "var(--radius-sm)", borderBottom: i < shown.length - 1 ? "1px solid var(--border-subtle)" : "none", cursor: "pointer" }}
+            title="클릭하면 레지스트리 키·값 상세 보기"
+          >
+            <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+              <span style={{ fontSize: 12.5, fontWeight: 600, color: "var(--text)", wordBreak: "break-all" }}>{r.name}</span>
+              <Pill text={r.status} color={statusColor(r.status)} />
+              {r.subtype && <span style={{ fontSize: 10, color: "var(--text-faint)", border: "1px solid var(--border)", borderRadius: 4, padding: "0 5px" }}>{r.subtype}</span>}
+              {(r.detail === "Run" || r.detail === "RunOnce" || r.detail === "Policy Run") && (
+                <span style={{ fontSize: 10, color: "var(--text-faint)", border: "1px solid var(--border)", borderRadius: 4, padding: "0 5px" }}>{r.detail}</span>
+              )}
+              {r.user && r.user !== "(시스템)" && <span style={{ fontSize: 10.5, color: "var(--text-faint)" }}>👤 {r.user}</span>}
+            </div>
+            {r.value && (
+              <div style={{ fontSize: looksLikePath(r.value) ? 12.5 : 12, fontWeight: looksLikePath(r.value) ? 600 : 400, color: looksLikePath(r.value) ? "var(--accent)" : "var(--text-dim)", fontFamily: "var(--mono)", marginTop: 3, wordBreak: "break-all" }}>
+                {looksLikePath(r.value) ? "📂 " : ""}{r.value}
+              </div>
+            )}
+            {r.detail && !["Run", "RunOnce", "Policy Run"].includes(r.detail) && r.subtype === "ShimCache" && (
+              <div style={{ fontSize: 10.5, color: "var(--text-faint)", marginTop: 3 }}>{r.detail}</div>
+            )}
+            {r.key_path && (
+              <div style={{ fontSize: 10.5, color: "var(--text-faint)", fontFamily: "var(--mono)", marginTop: 3, wordBreak: "break-all" }} title={r.key_path}>
+                🔑 {r.key_path}{r.source ? `  ·  ${r.source}` : ""}
+              </div>
+            )}
+            {r.timestamp && (
+              <div style={{ fontSize: 10.5, color: "var(--text-dim)", fontFamily: "var(--mono)", marginTop: 2 }}>🕑 {r.timestamp}</div>
+            )}
+          </div>
+        ))}
+      </div>
+    </section>
   );
 }
 
