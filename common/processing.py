@@ -989,7 +989,7 @@ def _rf_shimcache(all_results: dict) -> list[dict]:
                 rows.append(_rf_row(
                     category="기타 레지스트리", subtype="ShimCache", name=_basename(path),
                     value=path, status="정보",
-                    detail=(f"파일 수정 시각: {mtime} (실행 시각 아님)" if mtime else "파일 존재/실행 흔적 (시각 없음)"),
+                    detail=(f"파일 수정 시각: {mtime}" if mtime else ""),
                     key_path="…\\Control\\Session Manager\\AppCompatCache", source="SYSTEM",
                 ))
     return rows

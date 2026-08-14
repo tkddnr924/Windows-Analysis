@@ -11,24 +11,8 @@ interface BookmarksViewProps {
   hosts: Host[];
   currentHostId: string | null;
   onRemove: (bookmark: Bookmark) => void;
-  onUpdateNote: (id: string, note: string) => void;
   onNavigate: (targetFile: string, targetColumn: string, value: string) => void;
   onFetchLinkedRows: FetchLinkedRows;
-}
-
-// `taggedAt` is stored as a UTC ISO string (`new Date().toISOString()`),
-// but every other time in this app is KST (the parser converts to UTC+9
-// and writes a plain "YYYY-MM-DD HH:MM:SS.fff" string). Rendering the raw
-// ISO/UTC value here made it look 9 hours off from everything else. Convert
-// to KST wall-clock in the same format — computed explicitly as UTC+9 (not
-// via the viewer machine's locale) so it matches the app's fixed KST
-// convention regardless of where the viewer runs.
-function formatTaggedAt(iso: string): string {
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return iso;
-  const kst = new Date(d.getTime() + 9 * 60 * 60 * 1000);
-  const p = (n: number) => String(n).padStart(2, "0");
-  return `${kst.getUTCFullYear()}-${p(kst.getUTCMonth() + 1)}-${p(kst.getUTCDate())} ${p(kst.getUTCHours())}:${p(kst.getUTCMinutes())}:${p(kst.getUTCSeconds())}`;
 }
 
 function SortChip({ active, onClick, children }: { active: boolean; onClick: () => void; children: React.ReactNode }) {
@@ -51,7 +35,7 @@ function SortChip({ active, onClick, children }: { active: boolean; onClick: () 
   );
 }
 
-export default function BookmarksView({ bookmarks, hosts, currentHostId, onRemove, onUpdateNote, onNavigate, onFetchLinkedRows }: BookmarksViewProps) {
+export default function BookmarksView({ bookmarks, hosts, currentHostId, onRemove, onNavigate, onFetchLinkedRows }: BookmarksViewProps) {
   // Clicking a bookmark opens the shared detail panel (same everywhere), built
   // from the cached source row — not a jump to the source tab.
   const [detail, setDetail] = useState<{ bookmark: Bookmark; row: Record<string, string>; columns: string[] } | null>(null);
@@ -63,8 +47,6 @@ export default function BookmarksView({ bookmarks, hosts, currentHostId, onRemov
     return { id: h?.id ?? "", name: h?.name ?? "(알 수 없는 호스트)" };
   };
   const [rowCache, setRowCache] = useState<Record<string, CsvData>>({});
-  const [editingId, setEditingId] = useState<string | null>(null);
-  const [draftNote, setDraftNote] = useState("");
   // Bookmarks are the analyst's shortlist of key events; reading them oldest →
   // newest by when each event happened reconstructs the incident timeline. That
   // "event time" needs the source row, so it's resolved here (against rowCache)
@@ -112,19 +94,6 @@ export default function BookmarksView({ bookmarks, hosts, currentHostId, onRemov
     return sortDir === "asc" ? cmp : -cmp;
   });
 
-  // Group the time-sorted bookmarks by host so it's clear which machine each
-  // came from (bookmarks are shared across the case's hosts); the open host first.
-  const groupedHosts = (() => {
-    const m = new Map<string, { id: string; name: string; items: typeof sorted }>();
-    for (const e of sorted) {
-      const h = hostOf(e.bookmark);
-      const key = h.id || h.name;
-      if (!m.has(key)) m.set(key, { id: h.id, name: h.name, items: [] });
-      m.get(key)!.items.push(e);
-    }
-    return [...m.values()].sort((a, b) => (a.id === currentHostId ? -1 : b.id === currentHostId ? 1 : a.name.localeCompare(b.name)));
-  })();
-
   return (
     <div style={{ display: "flex", flexDirection: "column", flex: 1, minHeight: 0, minWidth: 0 }}>
       <div
@@ -149,16 +118,8 @@ export default function BookmarksView({ bookmarks, hosts, currentHostId, onRemov
         </span>
       </div>
 
-      <div style={{ flex: 1, minHeight: 0, overflow: "auto" }}>
-        {groupedHosts.map((group) => (
-          <div key={group.id || group.name}>
-            <div style={{ position: "sticky", top: 0, zIndex: 1, display: "flex", alignItems: "center", gap: 8, padding: "6px 14px", background: "var(--bg-elevated)", borderBottom: "1px solid var(--border)", fontSize: 11.5, fontWeight: 700, color: "var(--text-dim)" }}>
-              🖥️ {group.name}
-              <span style={{ color: "var(--text-faint)", fontWeight: 400 }}>{group.items.length}건</span>
-              {group.id === currentHostId && <span style={{ color: "var(--accent)", fontWeight: 600 }}>· 현재 호스트</span>}
-            </div>
-        <div style={{ padding: "8px 14px 14px" }}>
-        {group.items.map(({ bookmark, data, row, spec, eventTime }, idx) => {
+      <div style={{ flex: 1, minHeight: 0, overflow: "auto", padding: "8px 14px 14px" }}>
+        {sorted.map(({ bookmark, data, row, spec, eventTime }, idx) => {
           const notFound = data !== undefined && !row;
           const tags = row && spec?.tags ? spec.tags(row) : [];
           // Dot color = the flagged event's severity; plain analyst picks (no
@@ -168,7 +129,8 @@ export default function BookmarksView({ bookmarks, hosts, currentHostId, onRemov
             : tags.some((t) => t.severity === "warning")
               ? "var(--warning)"
               : "var(--accent)";
-          const last = idx === group.items.length - 1;
+          const last = idx === sorted.length - 1;
+          const host = hostOf(bookmark);
           const title = !data
             ? "불러오는 중..."
             : notFound
@@ -192,36 +154,11 @@ export default function BookmarksView({ bookmarks, hosts, currentHostId, onRemov
                   <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
                     <span style={{ fontSize: 13, fontWeight: 700, color: "var(--text)" }}>{title}</span>
                     <span style={{ fontSize: 10.5, fontWeight: 600, padding: "1px 7px", borderRadius: "var(--radius-lg)", background: "var(--bg-elevated)", color: "var(--text-faint)" }}>{bookmark.tableName}</span>
+                    <span style={{ fontSize: 10.5, fontWeight: 600, padding: "1px 7px", borderRadius: "var(--radius-lg)", background: "var(--bg-elevated)", color: host.id === currentHostId ? "var(--accent)" : "var(--text-faint)" }}>🖥️ {host.name}</span>
                     {row && <span style={{ marginLeft: "auto", fontSize: 11, color: "var(--accent)" }}>원본 →</span>}
                   </div>
                   {row && spec?.subtitle && <div style={{ fontSize: 12, color: "var(--text-dim)", marginTop: 2, wordBreak: "break-all" }}>{spec.subtitle(row)}</div>}
                   {tags.length > 0 && <div style={{ marginTop: 6 }}><TagList tags={tags} /></div>}
-                </div>
-
-                {/* analyst note — the judgment this timeline exists to capture */}
-                {editingId === bookmark.id ? (
-                  <input
-                    autoFocus
-                    value={draftNote}
-                    onChange={(e) => setDraftNote(e.target.value)}
-                    onBlur={() => { onUpdateNote(bookmark.id, draftNote); setEditingId(null); }}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") { onUpdateNote(bookmark.id, draftNote); setEditingId(null); }
-                      if (e.key === "Escape") setEditingId(null);
-                    }}
-                    placeholder="이 항목이 의심스러운 이유..."
-                    style={{ marginTop: 6, width: "100%", padding: "5px 8px", background: "var(--bg-input)", border: "1px solid var(--accent)", borderRadius: "var(--radius-sm)", color: "var(--text)", fontSize: 12 }}
-                  />
-                ) : (
-                  <div
-                    onClick={() => { setEditingId(bookmark.id); setDraftNote(bookmark.note); }}
-                    style={{ marginTop: 6, fontSize: 12, color: bookmark.note ? "var(--text)" : "var(--text-faint)", cursor: "pointer", fontStyle: bookmark.note ? "normal" : "italic" }}
-                  >
-                    {bookmark.note ? `📝 ${bookmark.note}` : "판단 메모 추가..."}
-                  </div>
-                )}
-                <div style={{ fontSize: 10.5, color: "var(--text-faint)", fontFamily: "var(--mono)", marginTop: 4 }} title="북마크한 시각 (KST)">
-                  북마크 {formatTaggedAt(bookmark.taggedAt)}
                 </div>
               </div>
 
@@ -235,9 +172,6 @@ export default function BookmarksView({ bookmarks, hosts, currentHostId, onRemov
             </div>
           );
         })}
-        </div>
-          </div>
-        ))}
       </div>
 
       <div

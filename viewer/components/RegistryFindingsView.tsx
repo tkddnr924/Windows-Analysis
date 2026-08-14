@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { tagsForPath } from "@/lib/tagging";
 import type { CsvData } from "@/lib/types";
 
@@ -108,7 +108,15 @@ function FindingSection({ cat, icon, rows, tabField, onSelect }: { cat: string; 
     return seen;
   }, [rows, tabField]);
   const [tab, setTab] = useState<string>("전체");
-  const shown = tabField && tab !== "전체" ? rows.filter((r) => (r[tabField] || "(기타)") === tab) : rows;
+  const filtered = tabField && tab !== "전체" ? rows.filter((r) => (r[tabField] || "(기타)") === tab) : rows;
+
+  // Fixed 10 rows per page; the rest paginates.
+  const PAGE = 10;
+  const [page, setPage] = useState(0);
+  useEffect(() => setPage(0), [tab]);
+  const pageCount = Math.max(1, Math.ceil(filtered.length / PAGE));
+  const safePage = Math.min(page, pageCount - 1);
+  const shown = filtered.slice(safePage * PAGE, (safePage + 1) * PAGE);
 
   const worst = rows.some((r) => r.status === "의심") ? "var(--danger)" : rows.some((r) => r.status === "주의") ? "var(--warning)" : "var(--border)";
   return (
@@ -177,10 +185,21 @@ function FindingSection({ cat, icon, rows, tabField, onSelect }: { cat: string; 
             )}
           </div>
         ))}
+        {pageCount > 1 && (
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8, marginTop: 10 }}>
+            <button onClick={() => setPage(safePage - 1)} disabled={safePage === 0} style={pgBtn(safePage === 0)}>‹ 이전</button>
+            <span style={{ fontSize: 11.5, color: "var(--text-dim)" }}>
+              {safePage + 1} / {pageCount} <span style={{ color: "var(--text-faint)" }}>({(safePage * PAGE + 1).toLocaleString()}–{Math.min((safePage + 1) * PAGE, filtered.length).toLocaleString()} / {filtered.length.toLocaleString()})</span>
+            </span>
+            <button onClick={() => setPage(safePage + 1)} disabled={safePage >= pageCount - 1} style={pgBtn(safePage >= pageCount - 1)}>다음 ›</button>
+          </div>
+        )}
       </div>
     </section>
   );
 }
+
+const pgBtn = (disabled: boolean): React.CSSProperties => ({ fontSize: 11.5, padding: "3px 10px", background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", color: "var(--text-dim)", cursor: disabled ? "default" : "pointer", opacity: disabled ? 0.4 : 1 });
 
 function RfDetailModal({ row, onClose }: { row: Row; onClose: () => void }) {
   const kind = row.detail === "Run" || row.detail === "RunOnce" || row.detail === "Policy Run" ? row.detail : "";

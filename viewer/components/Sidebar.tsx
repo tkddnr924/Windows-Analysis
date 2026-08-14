@@ -90,6 +90,7 @@ const OVERVIEW_TABLE_ICONS: Record<string, string> = {
 const OVERVIEW_TABLE_NAMES: Record<string, string> = {
   RdpCache: "RDP 캐시",
   SmbHistory: "SMB 연결",
+  RegistryFindings: "레지스트리 특이사항",
 };
 
 function sameEntry(a: ResultFileEntry | null, b: ResultFileEntry): boolean {
