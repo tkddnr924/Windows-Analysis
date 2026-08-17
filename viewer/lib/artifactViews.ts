@@ -89,7 +89,7 @@ export interface ArtifactViewSpec {
    * Overview correlations (TargetInfo, ...) read as summaries/dashboards, not
    * spreadsheets, so each gets a purpose-built view.
    */
-  customView?: "targetInfo" | "executionHistory" | "powershellFlow" | "defender" | "registryFindings" | "rdpCache" | "browserHistory" | "smb";
+  customView?: "targetInfo" | "executionHistory" | "powershellFlow" | "defender" | "registryFindings" | "rdpCache" | "browserHistory" | "smb" | "scheduledTasks";
   /**
    * In the sidebar, present this table split by this column: instead of one
    * row for the whole table, the category lists one entry per distinct value
@@ -284,6 +284,34 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
       { heading: "정보", fields: [
         { key: "publisher" },
         { key: "sha1", kind: "hash" },
+      ]},
+    ],
+  },
+
+  ScheduledTasks: {
+    customView: "scheduledTasks",
+    title: (r) => r.task_name || "(이름 없음)",
+    subtitle: (r) => r.actions || "",
+    tags: (r) => tagsForPath(r.actions),
+    timelineField: "timestamp",
+    sections: [
+      { heading: "실행", fields: [
+        { key: "actions", label: "동작(실행 명령)", kind: "code" },
+        { key: "run_as", label: "실행 계정" },
+        { key: "run_level", label: "권한 수준" },
+        { key: "logon_type", label: "로그온 유형" },
+      ]},
+      { heading: "트리거", fields: [
+        { key: "trigger_types", label: "트리거" },
+        { key: "trigger_start", label: "시작 시각" },
+      ]},
+      { heading: "정보", fields: [
+        { key: "timestamp", label: "생성 시각" },
+        { key: "enabled", label: "사용" },
+        { key: "hidden", label: "숨김" },
+        { key: "author", label: "작성자" },
+        { key: "description", label: "설명" },
+        { key: "uri", label: "경로(URI)" },
       ]},
     ],
   },

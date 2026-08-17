@@ -995,6 +995,38 @@ def _rf_shimcache(all_results: dict) -> list[dict]:
     return rows
 
 
+# --- ScheduledTasks ("작업 스케줄러") -----------------------------------------
+# The parsed task definitions, re-presented for triage: built-in Microsoft
+# tasks are flagged apart from user/third-party tasks (the ones worth reading —
+# custom backup scripts, persistence). All fields pass through; the view does
+# the risk framing (suspicious action paths, hidden, SYSTEM run level).
+
+_ST_KEYS = (
+    "timestamp", "task_name", "is_microsoft", "actions", "trigger_types",
+    "trigger_start", "run_as", "run_level", "logon_type", "enabled", "hidden",
+    "author", "description", "uri", "_source_file", "_status", "_error",
+)
+
+
+def build_scheduled_tasks(all_results: dict) -> list[dict]:
+    ts = all_results.get("TaskScheduler", {})
+    src_rows = ts.get("TaskScheduler_Tasks", []) if isinstance(ts, dict) else []
+    out: list[dict] = []
+    for r in src_rows:
+        uri = r.get("uri", "") or ""
+        author = r.get("author", "") or ""
+        # Built-in tasks live under \Microsoft\… or are authored by Microsoft;
+        # everything else is user/third-party and gets surfaced first.
+        is_ms = uri.lower().startswith("\\microsoft\\") or "microsoft" in author.lower()
+        row = {k: "" for k in _ST_KEYS}
+        for k in _ST_KEYS:
+            if k in r:
+                row[k] = r.get(k, "")
+        row["is_microsoft"] = "1" if is_ms else ""
+        out.append(row)
+    return out
+
+
 # --- BrowserActivity ("브라우저 활동") -----------------------------------------
 # Per-account view of the parsed Chrome History: visited URLs and downloaded
 # files, with Chrome's WebKit timestamps converted and percent-encoded URLs
