@@ -1,6 +1,8 @@
 "use client";
 
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
+import type { FetchLinkedRows } from "@/lib/types";
+import RowDetailPanel from "./RowDetailPanel";
 import type { CsvData } from "@/lib/types";
 
 type Row = Record<string, string>;
@@ -8,6 +10,9 @@ type Row = Record<string, string>;
 interface Props {
   data: CsvData;
   onNavigate?: (targetFile: string, targetColumn: string, value: string) => void;
+  onFetchLinkedRows?: FetchLinkedRows;
+  bookmarkedRowids?: Set<number>;
+  onToggleBookmark?: (rowid: number) => void;
 }
 
 function sevColor(sev: string): string {
@@ -37,7 +42,7 @@ function tamperTone(r: Row): "ok" | "danger" | "warning" {
 }
 const toneColor = { ok: "var(--success)", danger: "var(--danger)", warning: "var(--warning)" };
 
-export default function DefenderView({ data, onNavigate }: Props) {
+export default function DefenderView({ data, onNavigate, onFetchLinkedRows, bookmarkedRowids, onToggleBookmark }: Props) {
   const { threats, unhandled, tampering, scans, signature, rtState, lastScan, historyCleared } = useMemo(() => {
     const rows = data.rows;
     const rawThreats = rows.filter((r) => r.section === "threat");
@@ -65,9 +70,7 @@ export default function DefenderView({ data, onNavigate }: Props) {
   }, [data.rows]);
 
   const hasData = data.rows.length > 0;
-  const goSource = (r: Row) => {
-    if (onNavigate && r.record_key) onNavigate("EventLog_Events", "_record_key", r.record_key);
-  };
+  const [selected, setSelected] = useState<Row | null>(null);
 
   return (
     <div style={{ flex: 1, minHeight: 0, overflow: "auto", padding: "20px 24px" }}>
@@ -77,7 +80,7 @@ export default function DefenderView({ data, onNavigate }: Props) {
         {signature && <span style={{ fontSize: 13, color: "var(--text-dim)" }}>보안 인텔리전스 {signature.detail}</span>}
       </div>
       <div style={{ fontSize: 12, color: "var(--text-faint)", marginBottom: 18 }}>
-        이벤트 로그를 종합한 백신 활동 요약 · 항목을 클릭하면 원본 이벤트 로그로 이동합니다.
+        이벤트 로그를 종합한 백신 활동 요약 · 항목을 클릭하면 상세 보기(→ 원본 이벤트로 이동·북마크)가 열립니다.
       </div>
 
       {/* Summary tiles */}
@@ -105,10 +108,10 @@ export default function DefenderView({ data, onNavigate }: Props) {
                 return (
                   <div
                     key={i}
-                    onClick={() => goSource(t)}
-                    title={t.record_key ? "클릭하면 원본 이벤트 로그로 이동" : undefined}
-                    style={{ padding: "10px 12px", background: "var(--bg-elevated)", border: `1px solid ${neutral ? "var(--border-subtle)" : "var(--danger)"}`, borderRadius: "var(--radius-md)", cursor: t.record_key ? "pointer" : "default" }}
-                    onMouseEnter={(e) => t.record_key && (e.currentTarget.style.background = "var(--bg-hover)")}
+                    onClick={() => setSelected(t)}
+                    title="클릭하면 상세 보기"
+                    style={{ padding: "10px 12px", background: "var(--bg-elevated)", border: `1px solid ${neutral ? "var(--border-subtle)" : "var(--danger)"}`, borderRadius: "var(--radius-md)", cursor: "pointer" }}
+                    onMouseEnter={(e) => (e.currentTarget.style.background = "var(--bg-hover)")}
                     onMouseLeave={(e) => (e.currentTarget.style.background = "var(--bg-elevated)")}
                   >
                     <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
@@ -117,7 +120,7 @@ export default function DefenderView({ data, onNavigate }: Props) {
                       {t.category && <span style={{ fontSize: 11, color: "var(--text-faint)" }}>{t.category}</span>}
                       <span style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 6 }}>
                         <Pill text={neutral ? t.action : "⚠ 미조치"} color={actionColor(t.action)} filled={!neutral} />
-                        {t.record_key && <span style={{ fontSize: 11, color: "var(--text-faint)" }}>원본 →</span>}
+                        <span style={{ fontSize: 11, color: "var(--text-faint)" }}>상세 →</span>
                       </span>
                     </div>
                     <div style={{ marginTop: 6, display: "grid", gridTemplateColumns: "auto 1fr", gap: "3px 10px", fontSize: 12 }}>
@@ -149,10 +152,10 @@ export default function DefenderView({ data, onNavigate }: Props) {
                 return (
                   <div
                     key={i}
-                    onClick={() => goSource(t)}
-                    title={t.record_key ? "클릭하면 원본 이벤트 로그로 이동" : undefined}
-                    style={{ position: "relative", display: "flex", gap: 12, padding: "8px 6px 8px 20px", cursor: t.record_key ? "pointer" : "default", borderRadius: "var(--radius-sm)" }}
-                    onMouseEnter={(e) => t.record_key && (e.currentTarget.style.background = "var(--bg-hover)")}
+                    onClick={() => setSelected(t)}
+                    title="클릭하면 상세 보기"
+                    style={{ position: "relative", display: "flex", gap: 12, padding: "8px 6px 8px 20px", cursor: "pointer", borderRadius: "var(--radius-sm)" }}
+                    onMouseEnter={(e) => (e.currentTarget.style.background = "var(--bg-hover)")}
                     onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
                   >
                     {/* rail + dot */}
@@ -164,7 +167,7 @@ export default function DefenderView({ data, onNavigate }: Props) {
                       {t.detail && <div style={{ fontSize: 11.5, color: "var(--text-dim)", marginTop: 2, wordBreak: "break-all" }}>{t.detail}</div>}
                       {t.user && <div style={{ fontSize: 11, color: "var(--text-faint)", marginTop: 1 }}>👤 {t.user}</div>}
                     </div>
-                    {t.record_key && <span style={{ fontSize: 11, color: "var(--text-faint)", alignSelf: "center" }}>원본 →</span>}
+                    <span style={{ fontSize: 11, color: "var(--text-faint)", alignSelf: "center" }}>상세 →</span>
                   </div>
                 );
               })}
@@ -179,10 +182,10 @@ export default function DefenderView({ data, onNavigate }: Props) {
               {scans.map((s, i) => (
                 <div
                   key={i}
-                  onClick={() => goSource(s)}
-                  title={s.record_key ? "클릭하면 원본 이벤트 로그로 이동" : undefined}
-                  style={{ display: "flex", gap: 12, padding: "6px 6px", borderBottom: i < scans.length - 1 ? "1px solid var(--border-subtle)" : "none", fontSize: 12.5, cursor: s.record_key ? "pointer" : "default", borderRadius: "var(--radius-sm)" }}
-                  onMouseEnter={(e) => s.record_key && (e.currentTarget.style.background = "var(--bg-hover)")}
+                  onClick={() => setSelected(s)}
+                  title="클릭하면 상세 보기"
+                  style={{ display: "flex", gap: 12, padding: "6px 6px", borderBottom: i < scans.length - 1 ? "1px solid var(--border-subtle)" : "none", fontSize: 12.5, cursor: "pointer", borderRadius: "var(--radius-sm)" }}
+                  onMouseEnter={(e) => (e.currentTarget.style.background = "var(--bg-hover)")}
                   onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
                 >
                   <span style={{ fontFamily: "var(--mono)", fontSize: 11.5, color: "var(--text-time)", flex: "0 0 150px" }}>{s.timestamp || "-"}</span>
@@ -194,6 +197,20 @@ export default function DefenderView({ data, onNavigate }: Props) {
           </Card>
         )}
       </div>
+
+      {selected && (
+        <RowDetailPanel
+          row={selected}
+          columns={data.columns}
+          focusedColumn={null}
+          fileBaseName="Defender"
+          onClose={() => setSelected(null)}
+          onNavigate={(f, c, v) => { setSelected(null); onNavigate?.(f, c, v); }}
+          onFetchLinkedRows={onFetchLinkedRows}
+          isBookmarked={onToggleBookmark ? bookmarkedRowids?.has(Number((selected as Record<string, unknown>).__rowid)) ?? false : undefined}
+          onToggleBookmark={onToggleBookmark ? () => onToggleBookmark(Number((selected as Record<string, unknown>).__rowid)) : undefined}
+        />
+      )}
     </div>
   );
 }

@@ -391,6 +391,7 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     title: (r) => r.title || "(no name)",
     subtitle: (r) => r.detail || "",
     badges: [{ key: "section", kind: "badge" }],
+    links: [{ key: "record_key", label: "원본 이벤트 로그 보기", targetFile: "EventLog_Events", targetColumn: "_record_key" }],
     priorityColumns: ["section", "timestamp", "title", "detail", "severity", "action", "user"],
     sections: [{ heading: "상세", fields: [
       { key: "severity", label: "심각도" },
