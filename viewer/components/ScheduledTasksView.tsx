@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import RowDetailPanel from "./RowDetailPanel";
+import { inRange, rangeActive, EMPTY_TIME_RANGE, type TimeRange } from "@/lib/timeRange";
 import { tagsForPath, type Tag } from "@/lib/tagging";
 import type { CsvData, FetchLinkedRows } from "@/lib/types";
 
@@ -13,6 +14,7 @@ interface Props {
   onFetchLinkedRows?: FetchLinkedRows;
   bookmarkedRowids?: Set<number>;
   onToggleBookmark?: (rowid: number) => void;
+  timeRange?: TimeRange;
 }
 
 type Row = Record<string, string>;
@@ -79,7 +81,7 @@ function Badge({ text, color }: { text: string; color: string }) {
   return <span style={{ fontSize: 10, fontWeight: 700, color, border: `1px solid ${color}`, borderRadius: 4, padding: "0 5px", whiteSpace: "nowrap" }}>{text}</span>;
 }
 
-export default function ScheduledTasksView({ data, onNavigate, onFetchLinkedRows, bookmarkedRowids, onToggleBookmark }: Props) {
+export default function ScheduledTasksView({ data, onNavigate, onFetchLinkedRows, bookmarkedRowids, onToggleBookmark, timeRange = EMPTY_TIME_RANGE }: Props) {
   const [filter, setFilter] = useState<FilterKey>("user");
   const [search, setSearch] = useState("");
   const [page, setPage] = useState(0);
@@ -94,9 +96,14 @@ export default function ScheduledTasksView({ data, onNavigate, onFetchLinkedRows
     risk: all.filter((e) => e.risk > 0).length,
   }), [all]);
 
+  const rangeOn = rangeActive(timeRange);
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
     let rows = all.filter((e) => {
+      // Global incident-window filter: a task's registration date (when it was
+      // created) must fall in the window — surfaces persistence created during
+      // the incident. Tasks with no registration date drop out when active.
+      if (rangeOn && !inRange(e.row.timestamp || "", timeRange)) return false;
       if (filter === "user" && e.isMs) return false;
       if (filter === "risk" && e.risk === 0) return false;
       if (filter === "hidden" && !e.hidden) return false;
@@ -106,9 +113,9 @@ export default function ScheduledTasksView({ data, onNavigate, onFetchLinkedRows
     // Suspicious first, then user tasks, then by name.
     rows = [...rows].sort((a, b) => b.risk - a.risk || Number(a.isMs) - Number(b.isMs) || a.name.localeCompare(b.name));
     return rows;
-  }, [all, filter, search]);
+  }, [all, filter, search, rangeOn, timeRange]);
 
-  useEffect(() => setPage(0), [filter, search]);
+  useEffect(() => setPage(0), [filter, search, rangeOn, timeRange]);
   const pageCount = Math.max(1, Math.ceil(filtered.length / PAGE));
   const safePage = Math.min(page, pageCount - 1);
   const paged = filtered.slice(safePage * PAGE, (safePage + 1) * PAGE);
@@ -116,7 +123,10 @@ export default function ScheduledTasksView({ data, onNavigate, onFetchLinkedRows
   return (
     <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
       <div style={{ padding: "16px 20px 0" }}>
-        <div style={{ fontSize: 16, fontWeight: 700, marginBottom: 12 }}>⏰ 작업 스케줄러</div>
+        <div style={{ display: "flex", alignItems: "baseline", gap: 10, marginBottom: 12, flexWrap: "wrap" }}>
+          <span style={{ fontSize: 16, fontWeight: 700 }}>⏰ 작업 스케줄러</span>
+          {rangeOn && <span style={{ fontSize: 11.5, padding: "2px 9px", borderRadius: 999, border: "1px solid var(--accent)", background: "color-mix(in srgb, var(--accent) 12%, transparent)", color: "var(--text-dim)" }}>기간 필터 적용됨 · 등록일 기준 {filtered.length.toLocaleString()} / {all.length.toLocaleString()}</span>}
+        </div>
         <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
           <Tile label="전체 작업" value={stats.total.toLocaleString()} />
           <Tile label="사용자 작업" value={stats.user.toLocaleString()} accent={stats.user ? "var(--accent)" : undefined} />
