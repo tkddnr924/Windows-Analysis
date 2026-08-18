@@ -101,7 +101,7 @@ export default function BookmarksView({ bookmarks, hosts, hostIpMap, currentHost
   // become host↔peer messages.
   const seqEntries: SeqEntry[] = sorted.map((e) => {
     const h = hostOf(e.bookmark);
-    const rawPeer = e.row?.remote_address ?? "";
+    const rawPeer = (e.row?.remote_address ?? "").trim();
     const pHost = rawPeer ? hostIpMap[rawPeer] : undefined;
     return {
       ...e,
