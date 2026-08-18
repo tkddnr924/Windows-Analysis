@@ -37,6 +37,8 @@ export interface PipelineRun {
 // updating even when the user navigates to a different screen mid-parse. The
 // actual work already runs in the Electron main process; this just makes the
 // renderer-side state survive component unmounts.
+const MAX_LOG_LINES = 2000;
+
 export function usePipelineRun(onDone?: () => void): PipelineRun {
   const [runningHostId, setRunningHostId] = useState<string | null>(null);
   const [runningHostName, setRunningHostName] = useState<string | null>(null);
@@ -61,7 +63,15 @@ export function usePipelineRun(onDone?: () => void): PipelineRun {
 
   useEffect(() => {
     const unsubscribe = window.api.onPipelineLog((entry) => {
-      setLogs((prev) => [...prev, entry]);
+      // Keep only the most recent lines. A verbose run (thousands of source
+      // paths) would otherwise make `[...prev, entry]` copy an ever-growing
+      // array on every single line — O(n²) — and pile up as many DOM nodes,
+      // freezing the viewer. Bounding the buffer keeps each append O(cap).
+      setLogs((prev) =>
+        prev.length >= MAX_LOG_LINES
+          ? [...prev.slice(prev.length - MAX_LOG_LINES + 1), entry]
+          : [...prev, entry],
+      );
       const match = entry.line.match(/^=== (.+) ===$/);
       if (match) {
         flushCurrentSection();

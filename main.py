@@ -67,8 +67,16 @@ def run_host(case_id: str, host_id: str, cases_dir: Path, only: set[str] | None 
                 artifacts_run.append(artifact.name)
                 continue
 
-            for path in paths:
-                print(f"[*] found: {path}")
+            # Print each source path only when there are few of them. High-file
+            # artifacts (WER/Prefetch can be thousands) would otherwise flood the
+            # live log with one line per file — every line is a separate IPC
+            # message + React state update in the viewer, which was the real
+            # cause of the "WER takes forever" stall (not the parsing itself).
+            if len(paths) <= 20:
+                for path in paths:
+                    print(f"[*] found: {path}")
+            else:
+                print(f"[*] found: {len(paths)} files")
 
             results = artifact.parse(paths)
         except Exception:
