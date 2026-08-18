@@ -32,8 +32,7 @@ interface SourceMeta {
   icon: string;
 }
 const SOURCE_META: Record<string, SourceMeta> = {
-  Amcache_Programs: { label: "설치 프로그램(Amcache)", icon: "📦" },
-  Amcache_Files: { label: "파일(Amcache)", icon: "📄" },
+  Amcache: { label: "Amcache", icon: "📦" },
   Prefetch: { label: "Prefetch 실행", icon: "▶️" },
   UserAssist: { label: "UserAssist(실행)", icon: "🖱️" },
   SRUM: { label: "SRUM(리소스 사용)", icon: "📊" },
@@ -74,7 +73,14 @@ function basename(p: string): string {
 // "%SystemRoot%\..." form Amcache sometimes stores.
 function isWindowsSystemPath(p: string): boolean {
   const s = (p || "").toLowerCase();
-  return /^[a-z]:\\windows(\\|$)/.test(s) || s.startsWith("\\windows\\") || s.startsWith("%systemroot%");
+  // Drive-rooted (C:\Windows\...), UNC/rooted (\Windows\...), env form, and
+  // the raw \SystemRoot\ / \??\ prefixes.
+  if (/^[a-z]:\\windows(\\|$)/.test(s) || s.startsWith("\\windows\\") || s.startsWith("%systemroot%") || s.startsWith("\\systemroot\\")) return true;
+  // SRUM stores paths as \Device\HarddiskVolumeN\Windows\... — treat those as
+  // Windows paths too. And catch the system dirs wherever a \Windows\ prefix sits.
+  if (/\\device\\harddiskvolume\d+\\windows\\/.test(s)) return true;
+  if (/(^|\\)windows\\(system32|syswow64|winsxs)\\/.test(s)) return true;
+  return false;
 }
 
 function buildEntry(row: Row): Entry {
@@ -97,7 +103,7 @@ function buildEntry(row: Row): Entry {
     sha1: row.sha1 || "",
     runCount: row.run_count || "",
     timestamp: row.timestamp || "",
-    source: row.source_artifact || "",
+    source: /^Amcache/.test(row.source_artifact || "") ? "Amcache" : row.source_artifact || "",
     user: row.user || "",
     tags,
     unsigned,

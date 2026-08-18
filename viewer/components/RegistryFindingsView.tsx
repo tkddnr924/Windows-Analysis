@@ -39,6 +39,7 @@ function looksLikePath(v: string): boolean {
 
 export default function RegistryFindingsView({ data }: Props) {
   const [detail, setDetail] = useState<Row | null>(null);
+  const [search, setSearch] = useState("");
   const { groups, warnCount, dangerCount } = useMemo(() => {
     const rows = data.rows;
     // autoruns get a suspicious re-classification from the command path so the
@@ -49,8 +50,14 @@ export default function RegistryFindingsView({ data }: Props) {
       }
       return r;
     });
+    const warnCountAll = enriched.filter((r) => r.status === "주의").length;
+    const dangerCountAll = enriched.filter((r) => r.status === "의심").length;
+    const q = search.trim().toLowerCase();
+    const shownRows = q
+      ? enriched.filter((r) => [r.name, r.value, r.key_path, r.command, r.detail, r.source, r.user].some((v) => (v || "").toLowerCase().includes(q)))
+      : enriched;
     const byCat = new Map<string, Row[]>();
-    for (const r of enriched) {
+    for (const r of shownRows) {
       const c = r.category || "기타";
       if (!byCat.has(c)) byCat.set(c, []);
       byCat.get(c)!.push(r);
@@ -64,17 +71,25 @@ export default function RegistryFindingsView({ data }: Props) {
     }
     for (const [cat, rows2] of byCat) ordered.push({ cat, icon: "🔧", rows: rows2 });
 
-    const warnCount = enriched.filter((r) => r.status === "주의").length;
-    const dangerCount = enriched.filter((r) => r.status === "의심").length;
-    return { groups: ordered, warnCount, dangerCount };
-  }, [data.rows]);
+    return { groups: ordered, warnCount: warnCountAll, dangerCount: dangerCountAll };
+  }, [data.rows, search]);
 
   return (
     <div style={{ flex: 1, minHeight: 0, overflow: "auto", padding: "20px 24px" }}>
       <div style={{ display: "flex", alignItems: "baseline", gap: 12, marginBottom: 2 }}>
         <span style={{ fontSize: 22, fontWeight: 700, color: "var(--text)" }}>🔎 레지스트리 특이사항</span>
       </div>
-      <div style={{ fontSize: 12, color: "var(--text-faint)", marginBottom: 18 }}>레지스트리에서 점검 가치가 있는 설정을 추려 보여줍니다.</div>
+      <div style={{ fontSize: 12, color: "var(--text-faint)", marginBottom: 12 }}>레지스트리에서 점검 가치가 있는 설정을 추려 보여줍니다.</div>
+      <div style={{ position: "relative", maxWidth: 420, marginBottom: 18 }}>
+        <span style={{ position: "absolute", left: 10, top: "50%", transform: "translateY(-50%)", fontSize: 12, color: "var(--text-faint)", pointerEvents: "none" }}>🔍</span>
+        <input
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+          placeholder="키 경로 · 값 · 이름 검색 (기타 레지스트리 포함)"
+          style={{ width: "100%", padding: "7px 26px 7px 30px", fontSize: 12.5, fontFamily: "var(--mono)", background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", color: "var(--text)", outline: "none" }}
+        />
+        {search && <span onClick={() => setSearch("")} style={{ position: "absolute", right: 8, top: "50%", transform: "translateY(-50%)", cursor: "pointer", color: "var(--text-faint)", fontSize: 13 }}>✕</span>}
+      </div>
 
       <div style={{ display: "flex", flexWrap: "wrap", gap: 10, marginBottom: 20 }}>
         <Tile label="의심" value={dangerCount} tone={dangerCount ? "danger" : "ok"} />

@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import type { Bookmark, CsvData, FetchLinkedRows, Host } from "@/lib/types";
-import { getArtifactView } from "@/lib/artifactViews";
+import { getArtifactView, resolveArtifactView } from "@/lib/artifactViews";
 import TagList from "./TagList";
 import RowDetailPanel from "./RowDetailPanel";
 
@@ -84,7 +84,7 @@ export default function BookmarksView({ bookmarks, hosts, hostIpMap, currentHost
   const entries = bookmarks.map((bookmark) => {
     const data = rowCache[bookmark.fullPath];
     const row = data?.rows.find((r) => Number((r as unknown as Record<string, unknown>).__rowid) === bookmark.rowid);
-    const spec = getArtifactView(bookmark.tableName);
+    const spec = resolveArtifactView(bookmark.tableName, data?.columns) ?? getArtifactView(bookmark.tableName);
     const eventTime = row ? row[spec?.timelineField ?? "timestamp"] || row.timestamp || "" : "";
     return { bookmark, data, row, spec, eventTime };
   });

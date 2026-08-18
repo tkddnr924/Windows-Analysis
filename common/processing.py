@@ -180,7 +180,13 @@ def _from_srum(all_results: dict) -> list[dict]:
     # the "it ran" evidence; the repeated hourly rows are noise here.
     earliest: dict[tuple, dict] = {}
     for r in _srum_rows(all_results, "SRUM_ApplicationResourceUsage"):
-        key = (r.get("app", ""), r.get("user", ""))
+        app = r.get("app", "")
+        # SRUM stores some background/service entries as an AppId moniker like
+        # "svc.ownproc.s0...", not a real program — of no analytic value here, so
+        # drop them (only actual run evidence stays).
+        if not app or app.lower().startswith("svc."):
+            continue
+        key = (app, r.get("user", ""))
         ts = r.get("timestamp", "")
         cur = earliest.get(key)
         if cur is None or _earlier(ts, cur["timestamp"]):
