@@ -255,6 +255,22 @@ type SeqEntry = {
   direction: string;
 };
 
+// An artifact-type icon for a bookmarked event, so the sequence diagram reads
+// as icons/logos rather than dense text. Falls back to a pin.
+function iconFor(e: SeqEntry): string {
+  const t = (e.bookmark.tableName || "").toLowerCase();
+  if (t.includes("defender")) return "\u{1F6E1}\u{FE0F}";        // 🛡️
+  if (t.includes("smb")) return "\u{1F4C1}";                       // 📁
+  if (t.includes("remotedesktop") || t.includes("rdp")) return "\u{1F5A5}\u{FE0F}"; // 🖥️
+  if (t.includes("powershell")) return "\u26A1";                   // ⚡
+  if (t.includes("registry")) return "\u{1F511}";                  // 🔑
+  if (t.includes("scheduledtask") || t.includes("task")) return "\u23F0"; // ⏰
+  if (t.includes("execution") || t.includes("prefetch") || t.includes("amcache") || t.includes("srum")) return "\u25B6\u{FE0F}"; // ▶️
+  if (t.includes("browser")) return "\u{1F310}";                   // 🌐
+  if (t.includes("event") || t.includes("security") || t.includes("system")) return "\u{1F4C4}"; // 📄
+  return "\u{1F4CC}";                                              // 📌
+}
+
 // A UML-ish sequence diagram of the bookmarked events: each host (and each
 // remote peer IP referenced) is a lifeline; time flows downward; RDP/SMB rows
 // with a remote address + direction become arrows between lifelines, everything
@@ -264,6 +280,7 @@ function BookmarkSequence({ entries, currentHostId, onOpen }: { entries: SeqEntr
   const COL = 176;
   const TOP = 58;
   const ROW = 48;
+  const [hover, setHover] = useState<{ x: number; y: number; e: SeqEntry } | null>(null);
 
   const trunc = (str: string, n = 30) => (str.length > n ? str.slice(0, n) + "…" : str);
 
@@ -304,7 +321,7 @@ function BookmarkSequence({ entries, currentHostId, onOpen }: { entries: SeqEntr
   return (
     <div style={{ flex: 1, minHeight: 0, overflow: "auto", padding: 12 }}>
       <div style={{ fontSize: 11.5, color: "var(--text-faint)", marginBottom: 8 }}>
-        세로축 = 시간 순서. 🖥️ = 등록 호스트(라이프라인), 나머지 = 원격 IP. RDP/SMB는 방향 화살표, 그 외는 호스트 위의 이벤트입니다.
+        세로축 = 시간 순서. 각 아이콘이 북마크한 이벤트입니다 — 마우스를 올리면 요약, 클릭하면 상세를 봅니다.
       </div>
       <svg width={width} height={height} style={{ maxWidth: "none", display: "block" }}>
         <defs>
@@ -331,33 +348,63 @@ function BookmarkSequence({ entries, currentHostId, onOpen }: { entries: SeqEntr
           const tags = e.spec?.tags && e.row ? e.spec.tags(e.row) : [];
           const color = tags.some((t) => t.severity === "danger") ? "var(--danger)" : tags.some((t) => t.severity === "warning") ? "var(--warning)" : "var(--accent)";
           const hx = xOf(e.hostKey);
-          const label = trunc(e.spec && e.row ? e.spec.title(e.row) : e.bookmark.tableName, 30);
           const peerKey = e.peerHostKey || e.peer;
           const peerX = peerKey ? xOf(peerKey) : -1;
-          const isMsg = peerX >= 0 && hx >= 0;
+          const isMsg = peerX >= 0 && hx >= 0 && peerX !== hx;
           const inbound = e.direction !== "outbound";
           const from = isMsg ? (inbound ? peerX : hx) : 0;
           const to = isMsg ? (inbound ? hx : peerX) : 0;
+          const iconX = isMsg ? (from + to) / 2 : hx;
+          const active = hover?.e.bookmark.id === e.bookmark.id;
           return (
-            <g key={e.bookmark.id} style={{ cursor: "pointer" }} onClick={() => onOpen(e)}>
-              <rect x={0} y={y - ROW / 2} width={width} height={ROW} fill="transparent" />
+            <g
+              key={e.bookmark.id}
+              style={{ cursor: "pointer" }}
+              onClick={() => onOpen(e)}
+              onMouseEnter={(ev) => setHover({ x: ev.clientX, y: ev.clientY, e })}
+              onMouseMove={(ev) => setHover({ x: ev.clientX, y: ev.clientY, e })}
+              onMouseLeave={() => setHover(null)}
+            >
+              <rect x={0} y={y - ROW / 2} width={width} height={ROW} fill={active ? "var(--bg-hover)" : "transparent"} />
               <text x={6} y={y + 3} fontSize="9.5" fill="var(--text-time)" fontFamily="var(--mono)">{(e.eventTime || "시간없음").slice(5, 19)}</text>
-              {isMsg ? (
-                <>
-                  <line x1={from} y1={y} x2={to} y2={y} stroke={color} strokeWidth={1.8} markerEnd="url(#seqarrow)" />
-                  <text x={(from + to) / 2} y={y - 6} textAnchor="middle" fontSize="10" fill="var(--text-dim)">{label}</text>
-                </>
-              ) : (
-                <>
-                  <circle cx={hx} cy={y} r={4} fill={color} />
-                  <rect x={hx + 10} y={y - 11} width={Math.min(COL - 24, label.length * 6.6 + 16)} height={22} rx={5} fill="var(--bg-elevated)" stroke={color} strokeOpacity={0.55} />
-                  <text x={hx + 18} y={y + 4} fontSize="10.5" fill="var(--text)">{label}</text>
-                </>
-              )}
+              {isMsg && <line x1={from} y1={y} x2={to} y2={y} stroke={color} strokeWidth={1.8} markerEnd="url(#seqarrow)" />}
+              <circle cx={iconX} cy={y} r={13} fill="var(--bg-panel)" stroke={color} strokeWidth={active ? 2.2 : 1.5} />
+              <text x={iconX} y={y + 1} textAnchor="middle" dominantBaseline="central" fontSize="14">{iconFor(e)}</text>
             </g>
           );
         })}
       </svg>
+      {hover && (() => {
+        const e = hover.e;
+        const title = e.spec && e.row ? e.spec.title(e.row) : e.bookmark.tableName;
+        const tags = e.spec?.tags && e.row ? e.spec.tags(e.row) : [];
+        const peerKey = e.peerHostKey || e.peer;
+        const inbound = e.direction !== "outbound";
+        const peerLabel = e.peerHostName || e.peer;
+        return (
+          <div
+            style={{
+              position: "fixed", left: hover.x + 16, top: hover.y + 16, zIndex: 60, pointerEvents: "none", maxWidth: 340,
+              background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", boxShadow: "var(--shadow-panel)", padding: "8px 11px",
+            }}
+          >
+            <div style={{ fontSize: 12.5, fontWeight: 700, color: "var(--text)", marginBottom: 4, wordBreak: "break-all" }}>{iconFor(e)} {title}</div>
+            <div style={{ fontSize: 10.5, color: "var(--text-time)", fontFamily: "var(--mono)", marginBottom: 4 }}>🕑 {e.eventTime || "시간 정보 없음"}</div>
+            <div style={{ fontSize: 11, color: "var(--text-dim)" }}>
+              🖥️ {e.hostName}{peerKey && peerLabel ? `  ${inbound ? "←" : "→"}  ${peerLabel}` : ""}
+            </div>
+            {tags.length > 0 && (
+              <div style={{ display: "flex", gap: 4, flexWrap: "wrap", marginTop: 6 }}>
+                {tags.slice(0, 4).map((t, i) => {
+                  const c = t.severity === "danger" ? "var(--danger)" : "var(--warning)";
+                  return <span key={i} style={{ fontSize: 9.5, fontWeight: 700, padding: "0 5px", borderRadius: 4, color: c, border: `1px solid ${c}` }}>{t.label}</span>;
+                })}
+              </div>
+            )}
+            <div style={{ fontSize: 9.5, color: "var(--text-faint)", marginTop: 6 }}>클릭 → 상세 보기</div>
+          </div>
+        );
+      })()}
     </div>
   );
 }
