@@ -7,14 +7,16 @@ Each report file becomes one row. Well-known scalar keys are pulled into
 named leading columns; every other real `Key=Value` pair is kept so nothing
 is dropped.
 
-Indexed key families (LoadedModule[0..N], File[N].Path, Sig[N].Name/Value,
-DynamicSig[N], OsInfo[N], UI[N], ...) are collapsed into a single JSON column
-per family instead of one column per index. A busy host's reports each list
-hundreds of loaded modules, so exploding those into per-index columns made
-the sqlite table balloon to thousands of sparse columns — the union is taken
-across every report — which made writing the table extremely slow (and could
-exceed SQLite's column limit). Collapsing keeps the schema bounded (~35
-columns) no matter how many/large the reports are, while preserving all data.
+Every parsed key=value pair (scalars plus indexed families like
+LoadedModule[0..N], File[N].Path, Sig[N].Name/Value, DynamicSig[N], ...) is
+stored in a SINGLE json "report" column, not one column per key. A few stable,
+useful fields (EventType, AppName, AppPath, TargetAppId, ReportIdentifier) are
+also promoted to their own columns so the list view stays scannable. This
+keeps the table schema fixed and small no matter how many/large the reports
+are: a column-per-key table is wide and sparse (its union is taken across
+every report), slow for the viewer to render, and on a pathological host can
+exceed SQLite's hard column limit and fail the write. The json column
+preserves every field.
 
 EventTime / UploadTime are Windows FILETIME values (100-ns ticks since
 1601-01-01 UTC) — converted and formatted; the raw values are also kept.
@@ -32,7 +34,7 @@ EXTENSIONS = [".wer"]
 FIELD_ORDER = {
     "WER_Reports": [
         "timestamp", "EventType", "AppName", "AppPath", "TargetAppId",
-        "ReportIdentifier", "_source_file",
+        "ReportIdentifier", "report", "_source_file",
     ],
 }
 
@@ -93,15 +95,30 @@ def _parse_report(path: Path) -> dict:
         else:
             scalars[key] = value
 
-    row: dict = {"_source_file": str(path)}
-    row.update(scalars)
+    # Keep the whole report as ONE json column instead of exploding every
+    # key into its own sqlite column. Reports from different apps collectively
+    # carry many different scalar keys; a column-per-key table is wide+sparse,
+    # slow for the viewer to render, and — on a pathological host — can exceed
+    # SQLite's hard column limit and fail the write outright. A single json
+    # column keeps the schema fixed and small while preserving every field.
+    full: dict = dict(scalars)
     for fam, bucket in families.items():
-        # ordered by index so the json array reads in report order
-        row[fam] = json.dumps([bucket[i] for i in sorted(bucket)], ensure_ascii=False)
+        # ordered by index so the array reads in report order
+        full[fam] = [bucket[i] for i in sorted(bucket)]
 
     event_dt = _filetime_to_dt(scalars.get("EventTime", ""))
-    row["timestamp"] = format_timestamp(event_dt, source_tz=UTC) if event_dt else ""
-    return row
+    return {
+        "timestamp": format_timestamp(event_dt, source_tz=UTC) if event_dt else "",
+        # a handful of stable, useful fields promoted to real columns so the
+        # list view is scannable and sortable without opening each report
+        "EventType": scalars.get("EventType", ""),
+        "AppName": scalars.get("AppName", ""),
+        "AppPath": scalars.get("AppPath", ""),
+        "TargetAppId": scalars.get("TargetAppId", ""),
+        "ReportIdentifier": scalars.get("ReportIdentifier", ""),
+        "report": json.dumps(full, ensure_ascii=False),
+        "_source_file": str(path),
+    }
 
 
 def parse(paths: list[Path]) -> dict[str, list[dict]]:

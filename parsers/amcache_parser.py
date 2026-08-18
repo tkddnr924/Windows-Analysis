@@ -8,7 +8,7 @@ import logging
 from pathlib import Path
 
 from regipy.exceptions import RegistryKeyNotFoundException
-from regipy.plugins.amcache.amcache import AmCachePlugin
+from regipy.plugins.amcache.amcache import AMCACHE_FIELD_NUMERIC_MAPPINGS, AmCachePlugin
 from regipy.registry import RegistryHive
 from regipy.utils import convert_wintime
 
@@ -66,6 +66,29 @@ def _key_values_to_dict(key) -> dict:
     return {v.name: v.value for v in key.iter_values(as_json=True)}
 
 
+# Legacy (Win8/8.1) \Root\Programs subkeys store their values under numeric
+# names, exactly like \Root\File does. regipy maps the File numbers but has
+# no Programs mapping, so without this a legacy Programs row comes out with
+# meaningless "0"/"1"/"2" columns. Only the fields with strong cross-reference
+# consensus are named; any other numeric value is preserved verbatim so
+# nothing is dropped or mislabeled.
+_PROGRAM_NUMERIC_MAPPINGS = {
+    "0": "Name",
+    "1": "Version",
+    "2": "Publisher",
+    "3": "Language",
+}
+
+
+def _map_legacy_program(entry: dict) -> dict:
+    if not any(k in _PROGRAM_NUMERIC_MAPPINGS for k in entry):
+        return entry  # already named (not the legacy numeric layout)
+    out = {}
+    for k, v in entry.items():
+        out[_PROGRAM_NUMERIC_MAPPINGS.get(k, k)] = v
+    return out
+
+
 def _parse_programs(hive: RegistryHive) -> list[dict]:
     """Root\\InventoryApplication (Win10+) or Root\\Programs (older format)."""
     for key_path in (r"\Root\InventoryApplication", r"\Root\Programs"):
@@ -74,9 +97,12 @@ def _parse_programs(hive: RegistryHive) -> list[dict]:
         except RegistryKeyNotFoundException:
             continue
 
+        legacy = key_path.endswith("Programs")
         entries = []
         for sub in key.iter_subkeys():
             entry = _key_values_to_dict(sub)
+            if legacy:
+                entry = _map_legacy_program(entry)
             entry["timestamp"] = convert_wintime(sub.header.last_modified, as_json=True)
             entry["_recovery"] = "live"
             entries.append(entry)
@@ -134,8 +160,13 @@ def _parse_files(hive: RegistryHive) -> list[dict]:
             entries.append(entry)
         else:
             # regipy falls back to the raw registry key object for a handful
-            # of older-format subkeys that hold values directly.
-            entries.append(_key_values_to_dict(entry))
+            # of older-format \Root\File subkeys that hold values directly —
+            # those use the same numeric value names, so map them too.
+            raw = _key_values_to_dict(entry)
+            for num, named in AMCACHE_FIELD_NUMERIC_MAPPINGS.items():
+                if num in raw:
+                    raw[named] = raw.pop(num)
+            entries.append(raw)
 
     for entry in entries:
         if "sha1" in entry:
