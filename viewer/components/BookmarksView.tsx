@@ -52,6 +52,7 @@ export default function BookmarksView({ bookmarks, hosts, currentHostId, onRemov
   // "event time" needs the source row, so it's resolved here (against rowCache)
   // rather than sorting on the bookmark's own taggedAt.
   const [sortDir, setSortDir] = useState<"asc" | "desc">("asc");
+  const [viewMode, setViewMode] = useState<"timeline" | "sequence">("timeline");
 
   useEffect(() => {
     const missing = [...new Set(bookmarks.map((b) => b.fullPath))].filter((p) => !rowCache[p]);
@@ -94,6 +95,21 @@ export default function BookmarksView({ bookmarks, hosts, currentHostId, onRemov
     return sortDir === "asc" ? cmp : -cmp;
   });
 
+  // Augment each entry with its host + any remote peer/direction, for the
+  // sequence-diagram (UML-ish) view: hosts become lifelines and RDP/SMB rows
+  // become host↔peer messages.
+  const seqEntries: SeqEntry[] = sorted.map((e) => {
+    const h = hostOf(e.bookmark);
+    return {
+      ...e,
+      hostKey: h.id || h.name,
+      hostName: h.name,
+      hostId: h.id,
+      peer: e.row?.remote_address ?? "",
+      direction: e.row?.direction ?? "",
+    };
+  });
+
   return (
     <div style={{ display: "flex", flexDirection: "column", flex: 1, minHeight: 0, minWidth: 0 }}>
       <div
@@ -113,11 +129,18 @@ export default function BookmarksView({ bookmarks, hosts, currentHostId, onRemov
           <SortChip active={sortDir === "asc"} onClick={() => setSortDir("asc")}>오래된순</SortChip>
           <SortChip active={sortDir === "desc"} onClick={() => setSortDir("desc")}>최근순</SortChip>
         </div>
+        <div style={{ display: "flex", gap: 4, marginLeft: 4 }}>
+          <SortChip active={viewMode === "timeline"} onClick={() => setViewMode("timeline")}>타임라인</SortChip>
+          <SortChip active={viewMode === "sequence"} onClick={() => setViewMode("sequence")}>시퀀스</SortChip>
+        </div>
         <span style={{ color: "var(--text-faint)", fontSize: 11, marginLeft: "auto", textAlign: "right" }}>
           케이스를 다시 파싱하면 행 번호가 바뀌어 원본 위치가 어긋날 수 있습니다.
         </span>
       </div>
 
+      {viewMode === "sequence" ? (
+        <BookmarkSequence entries={seqEntries} currentHostId={currentHostId} onOpen={(e) => e.row && e.data && setDetail({ bookmark: e.bookmark, row: e.row, columns: e.data.columns })} />
+      ) : (
       <div style={{ flex: 1, minHeight: 0, overflow: "auto", padding: "8px 14px 14px" }}>
         {sorted.map(({ bookmark, data, row, spec, eventTime }, idx) => {
           const notFound = data !== undefined && !row;
@@ -173,6 +196,7 @@ export default function BookmarksView({ bookmarks, hosts, currentHostId, onRemov
           );
         })}
       </div>
+      )}
 
       <div
         style={{
@@ -207,6 +231,121 @@ export default function BookmarksView({ bookmarks, hosts, currentHostId, onRemov
           onToggleBookmark={() => { onRemove(detail.bookmark); setDetail(null); }}
         />
       )}
+    </div>
+  );
+}
+
+type SeqEntry = {
+  bookmark: Bookmark;
+  data?: CsvData;
+  row?: Record<string, string>;
+  spec: ReturnType<typeof getArtifactView>;
+  eventTime: string;
+  hostKey: string;
+  hostName: string;
+  hostId: string;
+  peer: string;
+  direction: string;
+};
+
+// A UML-ish sequence diagram of the bookmarked events: each host (and each
+// remote peer IP referenced) is a lifeline; time flows downward; RDP/SMB rows
+// with a remote address + direction become arrows between lifelines, everything
+// else is a note on its host's lifeline. Click any event to open its detail.
+function BookmarkSequence({ entries, currentHostId, onOpen }: { entries: SeqEntry[]; currentHostId: string | null; onOpen: (e: SeqEntry) => void }) {
+  const GUTTER = 118;
+  const COL = 176;
+  const TOP = 58;
+  const ROW = 48;
+
+  const trunc = (str: string, n = 30) => (str.length > n ? str.slice(0, n) + "…" : str);
+
+  const hostParts: { key: string; label: string; kind: "host" }[] = [];
+  const seen = new Set<string>();
+  for (const e of entries) {
+    if (!seen.has(e.hostKey)) {
+      seen.add(e.hostKey);
+      hostParts.push({ key: e.hostKey, label: e.hostName, kind: "host" });
+    }
+  }
+  const peerParts: { key: string; label: string; kind: "peer" }[] = [];
+  const seenP = new Set<string>();
+  for (const e of entries) {
+    const ip = e.peer;
+    if (ip && !seen.has(ip) && !seenP.has(ip)) {
+      seenP.add(ip);
+      peerParts.push({ key: ip, label: ip, kind: "peer" });
+    }
+  }
+  const participants = [...hostParts, ...peerParts.slice(0, 10)];
+  const idxOf = new Map(participants.map((p, i) => [p.key, i] as const));
+  const xOf = (key: string) => {
+    const i = idxOf.get(key);
+    return i === undefined ? -1 : GUTTER + i * COL + COL / 2;
+  };
+  const width = Math.max(GUTTER + participants.length * COL + 16, 560);
+  const height = TOP + entries.length * ROW + 24;
+
+  if (participants.length === 0) {
+    return <div style={{ flex: 1, minHeight: 0, overflow: "auto", padding: 20, color: "var(--text-faint)" }}>표시할 항목이 없습니다.</div>;
+  }
+
+  return (
+    <div style={{ flex: 1, minHeight: 0, overflow: "auto", padding: 12 }}>
+      <div style={{ fontSize: 11.5, color: "var(--text-faint)", marginBottom: 8 }}>
+        세로축 = 시간 순서. 🖥️ = 등록 호스트(라이프라인), 나머지 = 원격 IP. RDP/SMB는 방향 화살표, 그 외는 호스트 위의 이벤트입니다.
+      </div>
+      <svg width={width} height={height} style={{ maxWidth: "none", display: "block" }}>
+        <defs>
+          <marker id="seqarrow" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+            <path d="M0,0 L7,3 L0,6 Z" fill="var(--accent)" />
+          </marker>
+        </defs>
+        {participants.map((p) => {
+          const x = xOf(p.key);
+          const isHost = p.kind === "host";
+          const cur = isHost && p.key === currentHostId;
+          return (
+            <g key={p.key}>
+              <line x1={x} y1={TOP - 14} x2={x} y2={height - 10} stroke="var(--border)" strokeDasharray="3 4" />
+              <rect x={x - COL / 2 + 8} y={8} width={COL - 16} height={32} rx={6} fill={isHost ? "var(--accent-subtle)" : "var(--bg-elevated)"} stroke={cur ? "var(--accent)" : isHost ? "var(--accent)" : "var(--border)"} strokeWidth={cur ? 1.8 : 1} />
+              <text x={x} y={28} textAnchor="middle" fontSize="11.5" fontWeight={isHost ? 700 : 500} fill={isHost ? "var(--text)" : "var(--text-dim)"} style={{ fontFamily: isHost ? undefined : "var(--mono)" }}>
+                {(isHost ? "🖥️ " : "") + trunc(p.label, isHost ? 16 : 20)}
+              </text>
+            </g>
+          );
+        })}
+        {entries.map((e, idx) => {
+          const y = TOP + idx * ROW + ROW / 2;
+          const tags = e.spec?.tags && e.row ? e.spec.tags(e.row) : [];
+          const color = tags.some((t) => t.severity === "danger") ? "var(--danger)" : tags.some((t) => t.severity === "warning") ? "var(--warning)" : "var(--accent)";
+          const hx = xOf(e.hostKey);
+          const label = trunc(e.spec && e.row ? e.spec.title(e.row) : e.bookmark.tableName, 30);
+          const peerX = e.peer ? xOf(e.peer) : -1;
+          const isMsg = peerX >= 0 && hx >= 0;
+          const inbound = e.direction !== "outbound";
+          const from = isMsg ? (inbound ? peerX : hx) : 0;
+          const to = isMsg ? (inbound ? hx : peerX) : 0;
+          return (
+            <g key={e.bookmark.id} style={{ cursor: "pointer" }} onClick={() => onOpen(e)}>
+              <rect x={0} y={y - ROW / 2} width={width} height={ROW} fill="transparent" />
+              <text x={6} y={y + 3} fontSize="9.5" fill="var(--text-time)" fontFamily="var(--mono)">{(e.eventTime || "시간없음").slice(5, 19)}</text>
+              {isMsg ? (
+                <>
+                  <line x1={from} y1={y} x2={to} y2={y} stroke={color} strokeWidth={1.8} markerEnd="url(#seqarrow)" />
+                  <text x={(from + to) / 2} y={y - 6} textAnchor="middle" fontSize="10" fill="var(--text-dim)">{label}</text>
+                </>
+              ) : (
+                <>
+                  <circle cx={hx} cy={y} r={4} fill={color} />
+                  <rect x={hx + 10} y={y - 11} width={Math.min(COL - 24, label.length * 6.6 + 16)} height={22} rx={5} fill="var(--bg-elevated)" stroke={color} strokeOpacity={0.55} />
+                  <text x={hx + 18} y={y + 4} fontSize="10.5" fill="var(--text)">{label}</text>
+                </>
+              )}
+            </g>
+          );
+        })}
+      </svg>
     </div>
   );
 }
