@@ -89,7 +89,7 @@ export interface ArtifactViewSpec {
    * Overview correlations (TargetInfo, ...) read as summaries/dashboards, not
    * spreadsheets, so each gets a purpose-built view.
    */
-  customView?: "targetInfo" | "executionHistory" | "powershellFlow" | "defender" | "registryFindings" | "rdpCache" | "browserHistory" | "smb" | "scheduledTasks";
+  customView?: "targetInfo" | "executionHistory" | "powershellFlow" | "defender" | "registryFindings" | "rdpCache" | "browserHistory" | "smb" | "scheduledTasks" | "wer";
   /**
    * In the sidebar, present this table split by this column: instead of one
    * row for the whole table, the category lists one entry per distinct value
@@ -242,6 +242,17 @@ function werReason(r: Record<string, string>): string | undefined {
 }
 
 const VIEWS: Record<string, ArtifactViewSpec> = {
+  // Windows Error Reporting — every report field lives in one `report` JSON
+  // column; WerView parses it into fault-signature / loaded-modules sections.
+  WER_Reports: {
+    customView: "wer",
+    title: (r) => r.AppName || "(WER)",
+    subtitle: (r) => r.EventType || "",
+    badges: [{ key: "EventType", kind: "badge" }],
+    priorityColumns: ["timestamp", "EventType", "AppName", "AppPath", "TargetAppId", "ReportIdentifier"],
+    sections: [{ heading: "보고서", fields: [{ key: "EventType" }, { key: "AppPath" }, { key: "ReportIdentifier" }, { key: "report", kind: "json" }] }],
+  },
+
   // --- 종합 분석 (_OVERVIEW/): cross-artifact correlation tables built by
   // common/correlate.py — one row here can come from several different
   // source artifacts, tagged via `source_artifact`. These summarize;
