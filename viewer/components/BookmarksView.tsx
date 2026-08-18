@@ -279,7 +279,6 @@ function iconFor(e: SeqEntry): string {
 function BookmarkSequence({ entries, currentHostId, onOpen }: { entries: SeqEntry[]; currentHostId: string | null; onOpen: (e: SeqEntry) => void }) {
   const GUTTER = 118;
   const COL = 176;
-  const TOP = 58;
   const ROW = 48;
   const [hover, setHover] = useState<{ x: number; y: number; e: SeqEntry } | null>(null);
 
@@ -313,7 +312,9 @@ function BookmarkSequence({ entries, currentHostId, onOpen }: { entries: SeqEntr
     return i === undefined ? -1 : GUTTER + i * COL + COL / 2;
   };
   const width = Math.max(GUTTER + participants.length * COL + 16, 560);
-  const height = TOP + entries.length * ROW + 24;
+  const HEADER_H = 46; // sticky host-header band height
+  const BODY_TOP = 8;  // top pad inside the scrolling body svg
+  const bodyHeight = BODY_TOP + entries.length * ROW + 24;
 
   if (participants.length === 0) {
     return <div style={{ flex: 1, minHeight: 0, overflow: "auto", padding: 20, color: "var(--text-faint)" }}>표시할 항목이 없습니다.</div>;
@@ -324,28 +325,38 @@ function BookmarkSequence({ entries, currentHostId, onOpen }: { entries: SeqEntr
       <div style={{ fontSize: 11.5, color: "var(--text-faint)", marginBottom: 8 }}>
         세로축 = 시간 순서. 각 아이콘이 북마크한 이벤트입니다 — 마우스를 올리면 요약, 클릭하면 상세를 봅니다.
       </div>
-      <svg width={width} height={height} style={{ maxWidth: "none", display: "block" }}>
+      {/* Host/peer header band — sticks to the top of the scroll area so the
+          lifelines stay labeled while the events scroll under it. */}
+      <div style={{ position: "sticky", top: 0, zIndex: 5, background: "var(--bg)" }}>
+        <svg width={width} height={HEADER_H} style={{ maxWidth: "none", display: "block" }}>
+          {participants.map((p) => {
+            const x = xOf(p.key);
+            const isHost = p.kind === "host";
+            const cur = isHost && p.key === currentHostId;
+            return (
+              <g key={p.key}>
+                <rect x={x - COL / 2 + 8} y={8} width={COL - 16} height={32} rx={6} fill={isHost ? "var(--accent-subtle)" : "var(--bg-elevated)"} stroke={cur ? "var(--accent)" : isHost ? "var(--accent)" : "var(--border)"} strokeWidth={cur ? 1.8 : 1} />
+                <text x={x} y={28} textAnchor="middle" fontSize="11.5" fontWeight={isHost ? 700 : 500} fill={isHost ? "var(--text)" : "var(--text-dim)"} style={{ fontFamily: isHost ? undefined : "var(--mono)" }}>
+                  {(isHost ? "🖥️ " : "") + trunc(p.label, isHost ? 16 : 20)}
+                </text>
+                <line x1={x} y1={40} x2={x} y2={HEADER_H} stroke="var(--border)" strokeDasharray="3 4" />
+              </g>
+            );
+          })}
+        </svg>
+      </div>
+
+      <svg width={width} height={bodyHeight} style={{ maxWidth: "none", display: "block" }}>
         <defs>
           <marker id="seqarrow" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
             <path d="M0,0 L7,3 L0,6 Z" fill="var(--accent)" />
           </marker>
         </defs>
-        {participants.map((p) => {
-          const x = xOf(p.key);
-          const isHost = p.kind === "host";
-          const cur = isHost && p.key === currentHostId;
-          return (
-            <g key={p.key}>
-              <line x1={x} y1={TOP - 14} x2={x} y2={height - 10} stroke="var(--border)" strokeDasharray="3 4" />
-              <rect x={x - COL / 2 + 8} y={8} width={COL - 16} height={32} rx={6} fill={isHost ? "var(--accent-subtle)" : "var(--bg-elevated)"} stroke={cur ? "var(--accent)" : isHost ? "var(--accent)" : "var(--border)"} strokeWidth={cur ? 1.8 : 1} />
-              <text x={x} y={28} textAnchor="middle" fontSize="11.5" fontWeight={isHost ? 700 : 500} fill={isHost ? "var(--text)" : "var(--text-dim)"} style={{ fontFamily: isHost ? undefined : "var(--mono)" }}>
-                {(isHost ? "🖥️ " : "") + trunc(p.label, isHost ? 16 : 20)}
-              </text>
-            </g>
-          );
-        })}
+        {participants.map((p) => (
+          <line key={p.key} x1={xOf(p.key)} y1={0} x2={xOf(p.key)} y2={bodyHeight - 10} stroke="var(--border)" strokeDasharray="3 4" />
+        ))}
         {entries.map((e, idx) => {
-          const y = TOP + idx * ROW + ROW / 2;
+          const y = BODY_TOP + idx * ROW + ROW / 2;
           const tags = e.spec?.tags && e.row ? e.spec.tags(e.row) : [];
           const color = tags.some((t) => t.severity === "danger") ? "var(--danger)" : tags.some((t) => t.severity === "warning") ? "var(--warning)" : "var(--accent)";
           const hx = xOf(e.hostKey);
