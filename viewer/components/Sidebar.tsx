@@ -88,11 +88,19 @@ const OVERVIEW_TABLE_ICONS: Record<string, string> = {
 };
 
 // Friendlier labels for overview tables whose raw name reads awkwardly.
+// 종합 분석(_OVERVIEW) items are labeled in English; the rest of the UI stays
+// Korean. Every overview table gets an explicit English name here.
 const OVERVIEW_TABLE_NAMES: Record<string, string> = {
-  RdpCache: "RDP 캐시",
-  SmbHistory: "SMB 연결",
-  RegistryFindings: "레지스트리 특이사항",
-  ScheduledTasks: "작업 스케줄러",
+  TargetInfo: "Target Info",
+  ExecutionHistory: "Execution History",
+  Defender: "Defender",
+  RegistryFindings: "Registry Findings",
+  BrowserActivity: "Browser Activity",
+  RemoteDesktopHistory: "Remote Desktop",
+  SmbHistory: "SMB History",
+  PowerShellHistory: "PowerShell History",
+  RdpCache: "RDP Cache",
+  ScheduledTasks: "Scheduled Tasks",
 };
 
 function sameEntry(a: ResultFileEntry | null, b: ResultFileEntry): boolean {

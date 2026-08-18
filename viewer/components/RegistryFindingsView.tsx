@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { tagsForPath } from "@/lib/tagging";
+import { inRange, rangeActive, EMPTY_TIME_RANGE, type TimeRange } from "@/lib/timeRange";
 import type { CsvData } from "@/lib/types";
 
 type Row = Record<string, string>;
@@ -12,6 +13,10 @@ interface Props {
   // toggle. Omitted when the view is opened outside a bookmarkable context.
   bookmarkedRowids?: Set<number>;
   onToggleBookmark?: (rowid: number) => void;
+  // Global incident-window filter. Findings that carry a time (autoruns'
+  // key-write time, ShimCache file-mtime, RunMRU/TypedPaths) are narrowed to
+  // the window; timeless config findings always stay visible.
+  timeRange?: TimeRange;
 }
 
 // status → color. 의심(danger) / 주의(warning) / 정보·정상(neutral/ok)
@@ -41,10 +46,11 @@ function looksLikePath(v: string): boolean {
   return /^[a-zA-Z]:\\|^\\\\/.test(v);
 }
 
-export default function RegistryFindingsView({ data, bookmarkedRowids, onToggleBookmark }: Props) {
+export default function RegistryFindingsView({ data, bookmarkedRowids, onToggleBookmark, timeRange = EMPTY_TIME_RANGE }: Props) {
   const [detail, setDetail] = useState<Row | null>(null);
   const [search, setSearch] = useState("");
-  const { groups, warnCount, dangerCount } = useMemo(() => {
+  const rangeOn = rangeActive(timeRange);
+  const { groups, warnCount, dangerCount, shownCount, totalCount } = useMemo(() => {
     const rows = data.rows;
     // autoruns get a suspicious re-classification from the command path so the
     // view flags them even though the parser leaves them as neutral "정보".
@@ -57,9 +63,13 @@ export default function RegistryFindingsView({ data, bookmarkedRowids, onToggleB
     const warnCountAll = enriched.filter((r) => r.status === "주의").length;
     const dangerCountAll = enriched.filter((r) => r.status === "의심").length;
     const q = search.trim().toLowerCase();
-    const shownRows = q
+    let shownRows = q
       ? enriched.filter((r) => [r.name, r.value, r.key_path, r.command, r.detail, r.source, r.user].some((v) => (v || "").toLowerCase().includes(q)))
       : enriched;
+    // Time-range filter: drop time-bearing findings outside the window, but
+    // keep findings that have no time at all (config settings can't be placed
+    // in a window, so a window filter shouldn't hide them).
+    if (rangeOn) shownRows = shownRows.filter((r) => !r.timestamp || inRange(r.timestamp, timeRange));
     const byCat = new Map<string, Row[]>();
     for (const r of shownRows) {
       const c = r.category || "기타";
@@ -75,13 +85,18 @@ export default function RegistryFindingsView({ data, bookmarkedRowids, onToggleB
     }
     for (const [cat, rows2] of byCat) ordered.push({ cat, icon: "🔧", rows: rows2 });
 
-    return { groups: ordered, warnCount: warnCountAll, dangerCount: dangerCountAll };
-  }, [data.rows, search]);
+    return { groups: ordered, warnCount: warnCountAll, dangerCount: dangerCountAll, shownCount: shownRows.length, totalCount: enriched.length };
+  }, [data.rows, search, rangeOn, timeRange]);
 
   return (
     <div style={{ flex: 1, minHeight: 0, overflow: "auto", padding: "20px 24px" }}>
-      <div style={{ display: "flex", alignItems: "baseline", gap: 12, marginBottom: 2 }}>
+      <div style={{ display: "flex", alignItems: "baseline", gap: 12, marginBottom: 2, flexWrap: "wrap" }}>
         <span style={{ fontSize: 22, fontWeight: 700, color: "var(--text)" }}>🔎 레지스트리 특이사항</span>
+        {rangeOn && (
+          <span style={{ fontSize: 11.5, padding: "2px 9px", borderRadius: 999, border: "1px solid var(--accent)", background: "color-mix(in srgb, var(--accent) 12%, transparent)", color: "var(--text-dim)" }}>
+            기간 필터 적용됨 · 시간 있는 항목 {shownCount.toLocaleString()} / {totalCount.toLocaleString()}
+          </span>
+        )}
       </div>
       <div style={{ fontSize: 12, color: "var(--text-faint)", marginBottom: 12 }}>레지스트리에서 점검 가치가 있는 설정을 추려 보여줍니다.</div>
       <div style={{ position: "relative", maxWidth: 420, marginBottom: 18 }}>
@@ -256,7 +271,7 @@ function RfDetailModal({ row, onClose, isBookmarked, onToggleBookmark }: { row: 
         <div style={{ padding: "14px 18px 18px" }}>
           {row.timestamp && (
             <div style={{ fontSize: 13, color: "var(--text)", fontFamily: "var(--mono)", fontWeight: 600, marginBottom: 12 }}>
-              🕑 {row.timestamp} <span style={{ fontSize: 10.5, color: "var(--text-faint)", fontFamily: "var(--sans)", fontWeight: 400 }}>(키 마지막 수정)</span>
+              🕑 {row.timestamp} <span style={{ fontSize: 10.5, color: "var(--text-faint)", fontFamily: "var(--sans)", fontWeight: 400 }}>({row.subtype === "ShimCache" ? "파일 수정 시각" : "키 마지막 수정"})</span>
             </div>
           )}
           {/* The raw registry key + value. */}

@@ -977,8 +977,10 @@ def _rf_shimcache(all_results: dict) -> list[dict]:
     """ShimCache / AppCompatCache from the SYSTEM hive — evidence a program
     existed on / ran from a path. Its time is the executable's LAST-MODIFIED
     time, NOT an execution time, so it's surfaced here (not in the execution
-    timeline) with that caveat spelled out; `timestamp` is left empty so it
-    isn't mistaken for an event time, and the file-mtime goes in `detail`."""
+    timeline). The file-mtime is stored in `timestamp` (the view labels it
+    "파일 수정 시각" so it isn't read as an event time); keeping it in a real
+    time field also lets a bookmarked ShimCache row land on the bookmark
+    timeline at that modified time."""
     rows = []
     seen = set()
     for fname, reg_rows in _registry_hives(all_results):
@@ -994,8 +996,7 @@ def _rf_shimcache(all_results: dict) -> list[dict]:
                 mtime = _filetime(ft)
                 rows.append(_rf_row(
                     category="기타 레지스트리", subtype="ShimCache", name=_basename(path),
-                    value=path, status="정보",
-                    detail=(f"파일 수정 시각: {mtime}" if mtime else ""),
+                    value=path, status="정보", timestamp=mtime,
                     key_path="…\\Control\\Session Manager\\AppCompatCache", source="SYSTEM",
                 ))
     return rows
