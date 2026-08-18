@@ -9,6 +9,7 @@ import RowDetailPanel from "./RowDetailPanel";
 interface BookmarksViewProps {
   bookmarks: Bookmark[];
   hosts: Host[];
+  hostIpMap: Record<string, { id: string; name: string }>;
   currentHostId: string | null;
   onRemove: (bookmark: Bookmark) => void;
   onNavigate: (targetFile: string, targetColumn: string, value: string) => void;
@@ -35,7 +36,7 @@ function SortChip({ active, onClick, children }: { active: boolean; onClick: () 
   );
 }
 
-export default function BookmarksView({ bookmarks, hosts, currentHostId, onRemove, onNavigate, onFetchLinkedRows }: BookmarksViewProps) {
+export default function BookmarksView({ bookmarks, hosts, hostIpMap, currentHostId, onRemove, onNavigate, onFetchLinkedRows }: BookmarksViewProps) {
   // Clicking a bookmark opens the shared detail panel (same everywhere), built
   // from the cached source row — not a jump to the source tab.
   const [detail, setDetail] = useState<{ bookmark: Bookmark; row: Record<string, string>; columns: string[] } | null>(null);
@@ -100,12 +101,16 @@ export default function BookmarksView({ bookmarks, hosts, currentHostId, onRemov
   // become host↔peer messages.
   const seqEntries: SeqEntry[] = sorted.map((e) => {
     const h = hostOf(e.bookmark);
+    const rawPeer = e.row?.remote_address ?? "";
+    const pHost = rawPeer ? hostIpMap[rawPeer] : undefined;
     return {
       ...e,
       hostKey: h.id || h.name,
       hostName: h.name,
       hostId: h.id,
-      peer: e.row?.remote_address ?? "",
+      peer: rawPeer,
+      peerHostKey: pHost ? pHost.id || pHost.name : "",
+      peerHostName: pHost?.name ?? "",
       direction: e.row?.direction ?? "",
     };
   });
@@ -245,6 +250,8 @@ type SeqEntry = {
   hostName: string;
   hostId: string;
   peer: string;
+  peerHostKey: string;
+  peerHostName: string;
   direction: string;
 };
 
@@ -262,17 +269,21 @@ function BookmarkSequence({ entries, currentHostId, onOpen }: { entries: SeqEntr
 
   const hostParts: { key: string; label: string; kind: "host" }[] = [];
   const seen = new Set<string>();
-  for (const e of entries) {
-    if (!seen.has(e.hostKey)) {
-      seen.add(e.hostKey);
-      hostParts.push({ key: e.hostKey, label: e.hostName, kind: "host" });
+  const addHost = (key: string, label: string) => {
+    if (key && !seen.has(key)) {
+      seen.add(key);
+      hostParts.push({ key, label, kind: "host" });
     }
+  };
+  for (const e of entries) {
+    addHost(e.hostKey, e.hostName);
+    if (e.peerHostKey) addHost(e.peerHostKey, e.peerHostName); // a peer IP that is another host
   }
   const peerParts: { key: string; label: string; kind: "peer" }[] = [];
   const seenP = new Set<string>();
   for (const e of entries) {
     const ip = e.peer;
-    if (ip && !seen.has(ip) && !seenP.has(ip)) {
+    if (ip && !e.peerHostKey && !seen.has(ip) && !seenP.has(ip)) {
       seenP.add(ip);
       peerParts.push({ key: ip, label: ip, kind: "peer" });
     }
@@ -321,7 +332,8 @@ function BookmarkSequence({ entries, currentHostId, onOpen }: { entries: SeqEntr
           const color = tags.some((t) => t.severity === "danger") ? "var(--danger)" : tags.some((t) => t.severity === "warning") ? "var(--warning)" : "var(--accent)";
           const hx = xOf(e.hostKey);
           const label = trunc(e.spec && e.row ? e.spec.title(e.row) : e.bookmark.tableName, 30);
-          const peerX = e.peer ? xOf(e.peer) : -1;
+          const peerKey = e.peerHostKey || e.peer;
+          const peerX = peerKey ? xOf(peerKey) : -1;
           const isMsg = peerX >= 0 && hx >= 0;
           const inbound = e.direction !== "outbound";
           const from = isMsg ? (inbound ? peerX : hx) : 0;
