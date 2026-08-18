@@ -8,6 +8,10 @@ type Row = Record<string, string>;
 
 interface Props {
   data: CsvData;
+  // Bookmarking: the rowids (this table's __rowid) currently bookmarked, and a
+  // toggle. Omitted when the view is opened outside a bookmarkable context.
+  bookmarkedRowids?: Set<number>;
+  onToggleBookmark?: (rowid: number) => void;
 }
 
 // status → color. 의심(danger) / 주의(warning) / 정보·정상(neutral/ok)
@@ -37,7 +41,7 @@ function looksLikePath(v: string): boolean {
   return /^[a-zA-Z]:\\|^\\\\/.test(v);
 }
 
-export default function RegistryFindingsView({ data }: Props) {
+export default function RegistryFindingsView({ data, bookmarkedRowids, onToggleBookmark }: Props) {
   const [detail, setDetail] = useState<Row | null>(null);
   const [search, setSearch] = useState("");
   const { groups, warnCount, dangerCount } = useMemo(() => {
@@ -101,18 +105,25 @@ export default function RegistryFindingsView({ data }: Props) {
 
       <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
         {groups.map(({ cat, icon, rows }) => (
-          <FindingSection key={cat} cat={cat} icon={icon} rows={rows} tabField={TAB_FIELD[cat]} onSelect={setDetail} />
+          <FindingSection key={cat} cat={cat} icon={icon} rows={rows} tabField={TAB_FIELD[cat]} onSelect={setDetail} bookmarkedRowids={bookmarkedRowids} />
         ))}
       </div>
 
-      {detail && <RfDetailModal row={detail} onClose={() => setDetail(null)} />}
+      {detail && (
+        <RfDetailModal
+          row={detail}
+          onClose={() => setDetail(null)}
+          isBookmarked={onToggleBookmark ? bookmarkedRowids?.has(Number((detail as Record<string, unknown>).__rowid)) ?? false : undefined}
+          onToggleBookmark={onToggleBookmark ? () => onToggleBookmark(Number((detail as Record<string, unknown>).__rowid)) : undefined}
+        />
+      )}
     </div>
   );
 }
 
 // One category card. When `tabField` is set (자동 실행 → user, 기타 레지스트리 →
 // subtype) it shows a tab bar and filters its rows to the active tab.
-function FindingSection({ cat, icon, rows, tabField, onSelect }: { cat: string; icon: string; rows: Row[]; tabField?: string; onSelect: (r: Row) => void }) {
+function FindingSection({ cat, icon, rows, tabField, onSelect, bookmarkedRowids }: { cat: string; icon: string; rows: Row[]; tabField?: string; onSelect: (r: Row) => void; bookmarkedRowids?: Set<number> }) {
   const tabs = useMemo(() => {
     if (!tabField) return [];
     const seen: string[] = [];
@@ -170,7 +181,7 @@ function FindingSection({ cat, icon, rows, tabField, onSelect }: { cat: string; 
             onClick={() => onSelect(r)}
             onMouseEnter={(e) => (e.currentTarget.style.background = "var(--bg-hover)")}
             onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
-            style={{ padding: "8px 8px", margin: "0 -8px", borderRadius: "var(--radius-sm)", borderBottom: i < shown.length - 1 ? "1px solid var(--border-subtle)" : "none", cursor: "pointer" }}
+            style={{ padding: "8px 8px", margin: "0 -8px", borderRadius: "var(--radius-sm)", borderBottom: i < shown.length - 1 ? "1px solid var(--border-subtle)" : "none", cursor: "pointer", boxShadow: (bookmarkedRowids?.has(Number((r as Record<string, unknown>).__rowid)) ?? false) ? "inset 3px 0 0 var(--warning)" : undefined }}
             title="클릭하면 레지스트리 키·값 상세 보기"
           >
             <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
@@ -216,7 +227,7 @@ function FindingSection({ cat, icon, rows, tabField, onSelect }: { cat: string; 
 
 const pgBtn = (disabled: boolean): React.CSSProperties => ({ fontSize: 11.5, padding: "3px 10px", background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", color: "var(--text-dim)", cursor: disabled ? "default" : "pointer", opacity: disabled ? 0.4 : 1 });
 
-function RfDetailModal({ row, onClose }: { row: Row; onClose: () => void }) {
+function RfDetailModal({ row, onClose, isBookmarked, onToggleBookmark }: { row: Row; onClose: () => void; isBookmarked?: boolean; onToggleBookmark?: () => void }) {
   const kind = row.detail === "Run" || row.detail === "RunOnce" || row.detail === "Policy Run" ? row.detail : "";
   // Secondary fields. No explanation line — just what the registry actually holds.
   const meta: [string, string][] = [
@@ -231,7 +242,16 @@ function RfDetailModal({ row, onClose }: { row: Row; onClose: () => void }) {
         <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "14px 18px", borderBottom: "1px solid var(--border)", borderLeft: `3px solid ${statusColor(row.status)}` }}>
           <span style={{ fontSize: 15, fontWeight: 700, wordBreak: "break-all" }}>{row.name}</span>
           <Pill text={row.status} color={statusColor(row.status)} />
-          <button onClick={onClose} style={{ marginLeft: "auto", background: "transparent", border: "none", color: "var(--text-faint)", fontSize: 18, cursor: "pointer" }}>×</button>
+          {onToggleBookmark && (
+            <button
+              onClick={onToggleBookmark}
+              title={isBookmarked ? "북마크 해제" : "북마크에 추가"}
+              style={{ marginLeft: "auto", display: "inline-flex", alignItems: "center", gap: 5, fontSize: 11.5, padding: "4px 10px", background: isBookmarked ? "var(--warning-subtle)" : "transparent", color: isBookmarked ? "var(--warning)" : "var(--text-dim)", border: `1px solid ${isBookmarked ? "var(--warning)" : "var(--border)"}`, borderRadius: "var(--radius-lg)", cursor: "pointer", fontWeight: 600 }}
+            >
+              {isBookmarked ? "★ 북마크됨" : "☆ 북마크"}
+            </button>
+          )}
+          <button onClick={onClose} style={{ marginLeft: onToggleBookmark ? 8 : "auto", background: "transparent", border: "none", color: "var(--text-faint)", fontSize: 18, cursor: "pointer" }}>×</button>
         </div>
         <div style={{ padding: "14px 18px 18px" }}>
           {row.timestamp && (
