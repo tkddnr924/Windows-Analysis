@@ -60,6 +60,10 @@ export interface Bookmark {
   rowid: number;
   note: string;
   taggedAt: string;
+  /** For rows that carry several timestamps (e.g. an $MFT record's SI/FN
+   * Created/Modified/...), which one this bookmark marks — so the same row can
+   * be bookmarked on each time independently. Absent for whole-row bookmarks. */
+  field?: string;
   /** Which host in the case this bookmark's row belongs to (bookmarks are
    * case-level and shared across hosts). Optional for backward compatibility
    * with bookmarks saved before host attribution existed. */
@@ -71,6 +75,7 @@ export interface BookmarkInput {
   fullPath: string;
   tableName: string;
   rowid: number;
+  field?: string;
   hostId?: string;
   hostName?: string;
 }
@@ -144,6 +149,9 @@ export interface ElectronApi {
   listCategories(hostDir: string): Promise<CategoryEntry[]>;
   listResultFiles(categoryDir: string): Promise<ResultFileEntry[]>;
   readResultFile(fullPath: string, tableName?: string): Promise<CsvData>;
+  mftChildren(fullPath: string, parentEntry: number): Promise<Record<string, string>[]>;
+  mftSearch(fullPath: string, query: string, limit: number): Promise<Record<string, string>[]>;
+  mftRow(fullPath: string, rowid: number): Promise<Record<string, string> | null>;
   listColumnValues(fullPath: string, column: string, tableName?: string): Promise<{ value: string; count: number }[]>;
   searchCase(query: string, hosts: { id: string; name: string; dir: string }[]): Promise<SearchHit[]>;
   listBookmarks(hostDir: string): Promise<Bookmark[]>;

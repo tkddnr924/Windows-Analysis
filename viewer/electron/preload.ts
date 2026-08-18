@@ -35,6 +35,12 @@ contextBridge.exposeInMainWorld("api", {
     ipcRenderer.invoke("list-result-files", categoryDir),
   readResultFile: (fullPath: string, tableName?: string): Promise<CsvData> =>
     ipcRenderer.invoke("read-result-file", fullPath, tableName),
+  mftChildren: (fullPath: string, parentEntry: number): Promise<Record<string, string>[]> =>
+    ipcRenderer.invoke("mft-children", fullPath, parentEntry),
+  mftSearch: (fullPath: string, query: string, limit: number): Promise<Record<string, string>[]> =>
+    ipcRenderer.invoke("mft-search", fullPath, query, limit),
+  mftRow: (fullPath: string, rowid: number): Promise<Record<string, string> | null> =>
+    ipcRenderer.invoke("mft-row", fullPath, rowid),
   listColumnValues: (fullPath: string, column: string, tableName?: string): Promise<{ value: string; count: number }[]> =>
     ipcRenderer.invoke("list-column-values", fullPath, column, tableName),
   searchCase: (query: string, hosts: { id: string; name: string; dir: string }[]): Promise<SearchHit[]> =>

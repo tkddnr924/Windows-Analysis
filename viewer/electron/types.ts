@@ -56,6 +56,7 @@ export interface Bookmark {
   fullPath: string;
   tableName: string;
   rowid: number;
+  field?: string;
   note: string;
   taggedAt: string;
   /** Which host in the case this bookmark's row belongs to (bookmarks are
@@ -69,6 +70,7 @@ export interface BookmarkInput {
   fullPath: string;
   tableName: string;
   rowid: number;
+  field?: string;
   hostId?: string;
   hostName?: string;
 }

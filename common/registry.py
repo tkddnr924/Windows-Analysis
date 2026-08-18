@@ -25,6 +25,7 @@ from parsers import (
     browser_history_parser,
     eventlog_parser,
     jumplist_parser,
+    mft_parser,
     powershell_history_parser,
     prefetch_parser,
     rdpcache_parser,
@@ -65,7 +66,7 @@ def _by_extensions(extensions: list[str]) -> Callable[[Path], list[Path]]:
     return lambda target_dir: find_files_by_extension(target_dir, extensions)
 
 
-# Base parse-stage artifacts, in the order the user specified. $MFT / $LogFile
+# Base parse-stage artifacts, in the order the user specified. $LogFile
 # and Windows Defender are planned but not yet implemented.
 ARTIFACTS: list[ArtifactDefinition] = [
     ArtifactDefinition(
@@ -105,6 +106,13 @@ ARTIFACTS: list[ArtifactDefinition] = [
         find_paths=_by_filenames(usnjrnl_parser.FILENAMES),
         parse=usnjrnl_parser.parse,
         field_order=usnjrnl_parser.FIELD_ORDER,
+        category="FileSystem",
+    ),
+    ArtifactDefinition(
+        name=mft_parser.ARTIFACT_NAME,
+        find_paths=_by_filenames(mft_parser.FILENAMES),
+        parse=mft_parser.parse,
+        field_order=mft_parser.FIELD_ORDER,
         category="FileSystem",
     ),
     ArtifactDefinition(

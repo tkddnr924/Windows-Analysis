@@ -89,7 +89,7 @@ export interface ArtifactViewSpec {
    * Overview correlations (TargetInfo, ...) read as summaries/dashboards, not
    * spreadsheets, so each gets a purpose-built view.
    */
-  customView?: "targetInfo" | "executionHistory" | "powershellFlow" | "defender" | "registryFindings" | "rdpCache" | "browserHistory" | "smb" | "scheduledTasks" | "wer";
+  customView?: "targetInfo" | "executionHistory" | "powershellFlow" | "defender" | "registryFindings" | "rdpCache" | "browserHistory" | "smb" | "scheduledTasks" | "wer" | "mft";
   /**
    * In the sidebar, present this table split by this column: instead of one
    * row for the whole table, the category lists one entry per distinct value
@@ -251,6 +251,25 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     badges: [{ key: "EventType", kind: "badge" }],
     priorityColumns: ["timestamp", "EventType", "AppName", "AppPath", "TargetAppId", "ReportIdentifier"],
     sections: [{ heading: "보고서", fields: [{ key: "EventType" }, { key: "AppPath" }, { key: "ReportIdentifier" }, { key: "report", kind: "json" }] }],
+  },
+  // $MFT — Explorer-style browse (MftView queries SQLite lazily, since the
+  // table can hold ~1M rows). No timelineField: each record carries eight
+  // timestamps, bookmarked individually, rather than one event time.
+  MFT_Records: {
+    customView: "mft",
+    title: (r) => r.file_name || (r.path ? r.path.split("\\").filter(Boolean).pop() ?? r.path : "") || "(MFT)",
+    subtitle: (r) => r.path || "",
+    priorityColumns: ["path", "file_name", "extension", "is_directory", "in_use", "file_size"],
+    sections: [{ heading: "$STANDARD_INFORMATION (0x10)", fields: [
+      { key: "si_created", label: "생성" }, { key: "si_modified", label: "수정" },
+      { key: "si_mft_modified", label: "MFT 수정" }, { key: "si_accessed", label: "접근" },
+    ]}, { heading: "$FILE_NAME (0x30)", fields: [
+      { key: "fn_created", label: "생성" }, { key: "fn_modified", label: "수정" },
+      { key: "fn_mft_modified", label: "MFT 수정" }, { key: "fn_accessed", label: "접근" },
+    ]}, { heading: "레코드", fields: [
+      { key: "path", label: "경로" }, { key: "entry", label: "엔트리" }, { key: "seq", label: "시퀀스" },
+      { key: "parent_entry", label: "부모" }, { key: "in_use", label: "사용중" }, { key: "file_size", label: "크기" },
+    ]}],
   },
 
   // --- 종합 분석 (_OVERVIEW/): cross-artifact correlation tables built by

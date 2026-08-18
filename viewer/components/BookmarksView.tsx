@@ -54,14 +54,31 @@ export default function BookmarksView({ bookmarks, hosts, hostIpMap, currentHost
   // rather than sorting on the bookmark's own taggedAt.
   const [sortDir, setSortDir] = useState<"asc" | "desc">("asc");
   const [viewMode, setViewMode] = useState<"timeline" | "sequence">("timeline");
+  const [mftRowCache, setMftRowCache] = useState<Record<string, Record<string, string>>>({});
 
+  // Non-$MFT tables are small — load each whole table once, index by rowid.
   useEffect(() => {
-    const missing = [...new Set(bookmarks.map((b) => b.fullPath))].filter((p) => !rowCache[p]);
+    const mftPaths = new Set(bookmarks.filter((b) => b.tableName === "MFT_Records").map((b) => b.fullPath));
+    const missing = [...new Set(bookmarks.map((b) => b.fullPath))].filter((p) => !rowCache[p] && !mftPaths.has(p));
     if (missing.length === 0) return;
     Promise.all(missing.map((p) => window.api.readResultFile(p).then((data) => [p, data] as const))).then((pairs) => {
       setRowCache((prev) => {
         const next = { ...prev };
         for (const [p, data] of pairs) next[p] = data;
+        return next;
+      });
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [bookmarks]);
+
+  // $MFT is ~1M rows — never load the whole table; fetch only bookmarked rows.
+  useEffect(() => {
+    const missing = bookmarks.filter((b) => b.tableName === "MFT_Records" && mftRowCache[`${b.fullPath}#${b.rowid}`] === undefined);
+    if (missing.length === 0) return;
+    Promise.all(missing.map((b) => window.api.mftRow(b.fullPath, b.rowid).then((r) => [`${b.fullPath}#${b.rowid}`, r] as const))).then((pairs) => {
+      setMftRowCache((prev) => {
+        const next = { ...prev };
+        for (const [k, r] of pairs) next[k] = r ?? {}; // {} marks "looked up, missing"
         return next;
       });
     });
@@ -82,11 +99,24 @@ export default function BookmarksView({ bookmarks, hosts, hostIpMap, currentHost
   // time. Rows still loading (or missing) have no event time and sink to the
   // bottom so the loaded, placeable events read as a clean chronology.
   const entries = bookmarks.map((bookmark) => {
-    const data = rowCache[bookmark.fullPath];
-    const row = data?.rows.find((r) => Number((r as unknown as Record<string, unknown>).__rowid) === bookmark.rowid);
-    const spec = resolveArtifactView(bookmark.tableName, data?.columns) ?? getArtifactView(bookmark.tableName);
-    const eventTime = row ? row[spec?.timelineField ?? "timestamp"] || row.timestamp || "" : "";
-    return { bookmark, data, row, spec, eventTime };
+    const isMft = bookmark.tableName === "MFT_Records";
+    const data = isMft ? undefined : rowCache[bookmark.fullPath];
+    let row: Record<string, string> | undefined;
+    let loaded: boolean;
+    if (isMft) {
+      const cached = mftRowCache[`${bookmark.fullPath}#${bookmark.rowid}`];
+      loaded = cached !== undefined;
+      row = cached && Object.keys(cached).length ? cached : undefined;
+    } else {
+      loaded = data !== undefined;
+      row = data?.rows.find((r) => Number((r as unknown as Record<string, unknown>).__rowid) === bookmark.rowid);
+    }
+    const columns = isMft ? (row ? Object.keys(row).filter((c) => c !== "__rowid") : []) : (data?.columns ?? []);
+    const spec = resolveArtifactView(bookmark.tableName, columns) ?? getArtifactView(bookmark.tableName);
+    // A field-scoped bookmark (e.g. $MFT SI-Created) reads its time from that
+    // field; others use the artifact's timeline/timestamp column.
+    const eventTime = row ? ((bookmark.field ? row[bookmark.field] : row[spec?.timelineField ?? "timestamp"] || row.timestamp) || "") : "";
+    return { bookmark, row, columns, spec, eventTime, loaded };
   });
   const sorted = [...entries].sort((a, b) => {
     if (!a.eventTime && !b.eventTime) return a.bookmark.taggedAt < b.bookmark.taggedAt ? -1 : 1;
@@ -144,11 +174,11 @@ export default function BookmarksView({ bookmarks, hosts, hostIpMap, currentHost
       </div>
 
       {viewMode === "sequence" ? (
-        <BookmarkSequence entries={seqEntries} currentHostId={currentHostId} onOpen={(e) => e.row && e.data && setDetail({ bookmark: e.bookmark, row: e.row, columns: e.data.columns })} />
+        <BookmarkSequence entries={seqEntries} currentHostId={currentHostId} onOpen={(e) => e.row && setDetail({ bookmark: e.bookmark, row: e.row, columns: e.columns })} />
       ) : (
       <div style={{ flex: 1, minHeight: 0, overflow: "auto", padding: "8px 14px 14px" }}>
-        {sorted.map(({ bookmark, data, row, spec, eventTime }, idx) => {
-          const notFound = data !== undefined && !row;
+        {sorted.map(({ bookmark, row, columns, spec, eventTime, loaded }, idx) => {
+          const notFound = loaded && !row;
           const tags = row && spec?.tags ? spec.tags(row) : [];
           // Dot color = the flagged event's severity; plain analyst picks (no
           // tags) get the neutral accent so the rail still reads as "my picks".
@@ -159,7 +189,7 @@ export default function BookmarksView({ bookmarks, hosts, hostIpMap, currentHost
               : "var(--accent)";
           const last = idx === sorted.length - 1;
           const host = hostOf(bookmark);
-          const title = !data
+          const title = !loaded
             ? "불러오는 중..."
             : notFound
               ? "원본 행을 찾을 수 없습니다 (케이스가 다시 파싱되었을 수 있음)"
@@ -178,10 +208,11 @@ export default function BookmarksView({ bookmarks, hosts, hostIpMap, currentHost
               </span>
 
               <div style={{ flex: 1, minWidth: 0 }}>
-                <div onClick={() => row && data && setDetail({ bookmark, row, columns: data.columns })} style={{ cursor: row ? "pointer" : "default" }}>
+                <div onClick={() => row && setDetail({ bookmark, row, columns })} style={{ cursor: row ? "pointer" : "default" }}>
                   <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
                     <span style={{ fontSize: 13, fontWeight: 700, color: "var(--text)" }}>{title}</span>
                     <span style={{ fontSize: 10.5, fontWeight: 600, padding: "1px 7px", borderRadius: "var(--radius-lg)", background: "var(--bg-elevated)", color: "var(--text-faint)" }}>{bookmark.tableName}</span>
+                    {bookmark.field && <span style={{ fontSize: 10.5, fontWeight: 700, padding: "1px 7px", borderRadius: "var(--radius-lg)", background: "var(--accent-subtle)", color: "var(--accent)" }}>🕑 {fieldLabel(bookmark.field)}</span>}
                     <span style={{ fontSize: 10.5, fontWeight: 600, padding: "1px 7px", borderRadius: "var(--radius-lg)", background: "var(--bg-elevated)", color: host.id === currentHostId ? "var(--accent)" : "var(--text-faint)" }}>🖥️ {host.name}</span>
                     {row && <span style={{ marginLeft: "auto", fontSize: 11, color: "var(--accent)" }}>원본 →</span>}
                   </div>
@@ -242,7 +273,8 @@ export default function BookmarksView({ bookmarks, hosts, hostIpMap, currentHost
 
 type SeqEntry = {
   bookmark: Bookmark;
-  data?: CsvData;
+  columns: string[];
+  loaded: boolean;
   row?: Record<string, string>;
   spec: ReturnType<typeof getArtifactView>;
   eventTime: string;
@@ -255,6 +287,15 @@ type SeqEntry = {
   direction: string;
 };
 
+// Human label for a per-timestamp bookmark's field ($MFT SI/FN times).
+const _FIELD_LABELS: Record<string, string> = {
+  si_created: "SI 생성", si_modified: "SI 수정", si_mft_modified: "SI MFT수정", si_accessed: "SI 접근",
+  fn_created: "FN 생성", fn_modified: "FN 수정", fn_mft_modified: "FN MFT수정", fn_accessed: "FN 접근",
+};
+function fieldLabel(field: string): string {
+  return _FIELD_LABELS[field] ?? field;
+}
+
 // An artifact-type icon for a bookmarked event, so the sequence diagram reads
 // as icons/logos rather than dense text. Falls back to a pin.
 function iconFor(e: SeqEntry): string {
@@ -266,6 +307,7 @@ function iconFor(e: SeqEntry): string {
   if (t.includes("registry")) return "\u{1F511}";                  // 🔑
   if (t.includes("scheduledtask") || t.includes("task")) return "\u23F0"; // ⏰
   if (t.startsWith("wer")) return "\u{1F4A5}";                     // WER crash
+  if (t.startsWith("mft")) return "\u{1F5C2}\u{FE0F}";             // 🗂️ $MFT entry
   if (t.includes("execution") || t.includes("prefetch") || t.includes("amcache") || t.includes("srum")) return "\u{1F680}"; // rocket (bright; replaced dark ▶)
   if (t.includes("browser")) return "\u{1F310}";                   // 🌐
   if (t.includes("event") || t.includes("security") || t.includes("system")) return "\u{1F4C4}"; // 📄

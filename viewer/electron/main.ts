@@ -464,6 +464,49 @@ ipcMain.handle("read-result-file", (_event, fullPath: string, tableNameArg?: str
   }
 });
 
+// --- $MFT lazy browse: the MFT table can hold ~1M rows (hundreds of MB), far
+// too much to ship to the renderer at once. The Explorer view queries on
+// demand instead — a folder's children, a name/path search, or a single row —
+// straight from SQLite (better-sqlite3 in the main process scans the table in
+// tens of ms, so no persistent index is needed). ---
+const MFT_TABLE = "MFT_Records";
+
+ipcMain.handle("mft-children", (_event, fullPath: string, parentEntry: number): Record<string, string>[] => {
+  const db = new Database(fullPath, { readonly: true, fileMustExist: true });
+  try {
+    return db
+      .prepare(
+        `SELECT rowid AS __rowid, * FROM "${MFT_TABLE}" WHERE parent_entry = ? AND entry != ? ORDER BY is_directory DESC, file_name COLLATE NOCASE`,
+      )
+      .all(String(parentEntry), String(parentEntry)) as Record<string, string>[];
+  } finally {
+    db.close();
+  }
+});
+
+ipcMain.handle("mft-search", (_event, fullPath: string, query: string, limit: number): Record<string, string>[] => {
+  const db = new Database(fullPath, { readonly: true, fileMustExist: true });
+  try {
+    const like = `%${query}%`;
+    return db
+      .prepare(
+        `SELECT rowid AS __rowid, * FROM "${MFT_TABLE}" WHERE file_name LIKE ? OR path LIKE ? ORDER BY is_directory DESC, path COLLATE NOCASE LIMIT ?`,
+      )
+      .all(like, like, limit) as Record<string, string>[];
+  } finally {
+    db.close();
+  }
+});
+
+ipcMain.handle("mft-row", (_event, fullPath: string, rowid: number): Record<string, string> | null => {
+  const db = new Database(fullPath, { readonly: true, fileMustExist: true });
+  try {
+    return (db.prepare(`SELECT rowid AS __rowid, * FROM "${MFT_TABLE}" WHERE rowid = ?`).get(rowid) as Record<string, string>) ?? null;
+  } finally {
+    db.close();
+  }
+});
+
 // --- Bookmarks: analyst annotations on individual rows, stored separately
 // from the SQLite parsing output in cases/<id>/bookmarks.json (plain JSON,
 // not part of the pipeline's own artifacts). A bookmark's `rowid` only means
@@ -495,15 +538,19 @@ ipcMain.handle("list-bookmarks", (_event, caseDir: string): Bookmark[] => readBo
 
 ipcMain.handle("toggle-bookmark", (_event, caseDir: string, entry: BookmarkInput): Bookmark[] => {
   const bookmarks = readBookmarks(caseDir);
-  const idx = bookmarks.findIndex((b) => b.fullPath === entry.fullPath && b.rowid === entry.rowid);
+  // `field` lets one row carry several independent bookmarks — e.g. an $MFT
+  // record bookmarked on its SI-Created vs FN-Modified time separately.
+  const field = entry.field ?? "";
+  const idx = bookmarks.findIndex((b) => b.fullPath === entry.fullPath && b.rowid === entry.rowid && (b.field ?? "") === field);
   if (idx >= 0) {
     bookmarks.splice(idx, 1);
   } else {
     bookmarks.push({
-      id: `${entry.fullPath}#${entry.rowid}`,
+      id: `${entry.fullPath}#${entry.rowid}${field ? "@" + field : ""}`,
       fullPath: entry.fullPath,
       tableName: entry.tableName,
       rowid: entry.rowid,
+      field: field || undefined,
       note: "",
       taggedAt: new Date().toISOString(),
       hostId: entry.hostId ?? "",
