@@ -265,7 +265,8 @@ function iconFor(e: SeqEntry): string {
   if (t.includes("powershell")) return "\u26A1";                   // ⚡
   if (t.includes("registry")) return "\u{1F511}";                  // 🔑
   if (t.includes("scheduledtask") || t.includes("task")) return "\u23F0"; // ⏰
-  if (t.includes("execution") || t.includes("prefetch") || t.includes("amcache") || t.includes("srum")) return "\u25B6\u{FE0F}"; // ▶️
+  if (t.startsWith("wer")) return "\u{1F4A5}";                     // WER crash
+  if (t.includes("execution") || t.includes("prefetch") || t.includes("amcache") || t.includes("srum")) return "\u{1F680}"; // rocket (bright; replaced dark ▶)
   if (t.includes("browser")) return "\u{1F310}";                   // 🌐
   if (t.includes("event") || t.includes("security") || t.includes("system")) return "\u{1F4C4}"; // 📄
   return "\u{1F4CC}";                                              // 📌
