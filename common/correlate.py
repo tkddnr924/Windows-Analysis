@@ -162,7 +162,7 @@ _RDP_EVENTS: dict[tuple[str, str], dict] = {
 
 def _bare_account(name: str) -> str:
     """Normalize an account to just the username. Different providers report it
-    differently — bare "Administrator" from TerminalServices, "MAINDB1\\Admin"
+    differently — bare "Administrator" from TerminalServices, "DOMAIN\\Administrator"
     from Security-Auditing — so strip any DOMAIN\\ or HOST\\ prefix so the same
     user reads consistently across sources. Also drops a UPN "@domain" suffix."""
     if not name:
@@ -172,7 +172,7 @@ def _bare_account(name: str) -> str:
 
 
 def _smb_client_ip(client_name: str) -> str:
-    """SMBServer events carry the peer as a UNC-style '\\\\10.10.10.217' (or
+    """SMBServer events carry the peer as a UNC-style '\\\\192.0.2.10' (or
     '\\\\[fe80::...]'). Strip the leading backslashes to a plain address."""
     return (client_name or "").lstrip("\\").strip()
 
