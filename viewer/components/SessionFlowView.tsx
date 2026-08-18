@@ -109,6 +109,9 @@ function clusterSessions(data: CsvData, timeRange: TimeRange): Session[] {
 interface SessionFlowViewProps {
   fileName: string;
   data: CsvData;
+  /** IP -> host for the whole case, so a remote IP that is a registered host
+   * shows the host name. Empty until the case network map is loaded. */
+  hostIpMap?: Record<string, { id: string; name: string }>;
   onNavigate: (targetFile: string, targetColumn: string, value: string) => void;
   onFetchLinkedRows?: FetchLinkedRows;
   bookmarkedRowids?: Set<number>;
@@ -121,6 +124,7 @@ type ResultFilter = "all" | "success" | "fail";
 export default function SessionFlowView({
   fileName,
   data,
+  hostIpMap = {},
   onNavigate,
   onFetchLinkedRows,
   bookmarkedRowids,
@@ -143,10 +147,10 @@ export default function SessionFlowView({
       if (dirFilter && s.direction !== dirFilter) return false;
       if (resultFilter === "success" && s.success === 0) return false;
       if (resultFilter === "fail" && s.fail === 0) return false;
-      if (q && !s.remote_address.toLowerCase().includes(q) && !s.account.toLowerCase().includes(q)) return false;
+      if (q && !s.remote_address.toLowerCase().includes(q) && !s.account.toLowerCase().includes(q) && !(hostIpMap[s.remote_address]?.name.toLowerCase().includes(q))) return false;
       return true;
     });
-  }, [allSessions, dirFilter, resultFilter, query]);
+  }, [allSessions, dirFilter, resultFilter, query, hostIpMap]);
 
   const totals = useMemo(() => {
     let inbound = 0, outbound = 0, success = 0, fail = 0;
@@ -269,7 +273,16 @@ export default function SessionFlowView({
                 >
                   {DIRECTION_LABEL[s.direction] ?? s.direction}
                 </span>
-                <span style={{ fontFamily: "var(--mono)", fontSize: 13.5, fontWeight: 600, minWidth: 120 }}>{s.remote_address || "(주소 없음)"}</span>
+                <span style={{ display: "inline-flex", alignItems: "baseline", gap: 6, minWidth: 120 }}>
+                  {hostIpMap[s.remote_address] ? (
+                    <>
+                      <span style={{ fontSize: 12.5, fontWeight: 700, color: "var(--accent)" }}>🖥️ {hostIpMap[s.remote_address].name}</span>
+                      <span style={{ fontFamily: "var(--mono)", fontSize: 11, color: "var(--text-faint)" }}>{s.remote_address}</span>
+                    </>
+                  ) : (
+                    <span style={{ fontFamily: "var(--mono)", fontSize: 13.5, fontWeight: 600 }}>{s.remote_address || "(주소 없음)"}</span>
+                  )}
+                </span>
                 {s.account && (
                   <span style={{ fontSize: 11.5, fontWeight: 600, color: "var(--text)", padding: "1px 8px", borderRadius: 999, background: "var(--bg-elevated)", border: "1px solid var(--border-subtle)" }}>
                     👤 {s.account}
