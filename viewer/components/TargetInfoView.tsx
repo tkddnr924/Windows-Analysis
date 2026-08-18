@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import type { CsvData } from "@/lib/types";
+import type { CsvData, Bookmark } from "@/lib/types";
 import type { FetchLinkedRows } from "@/lib/types";
 import RowDetailPanel from "./RowDetailPanel";
 
@@ -14,6 +14,9 @@ interface TargetInfoViewProps {
    * panel (RowDetailPanel) as every other view. */
   onNavigate?: (targetFile: string, targetColumn: string, value: string) => void;
   onFetchLinkedRows?: FetchLinkedRows;
+  /** Per-timestamp bookmarking of account rows (생성/최근 로그인/비밀번호 …). */
+  tableBookmarks?: Bookmark[];
+  onToggleBookmark?: (rowid: number, field: string) => void;
 }
 
 // TargetInfo is a correlation of registry-derived system facts (OS build,
@@ -50,6 +53,7 @@ const SYSTEM_ORDER = [
 ];
 
 interface Account {
+  rowid: number;
   sid: string;
   path: string;
   username: string;
@@ -91,6 +95,7 @@ function buildAccount(r: Row): Account {
   // is a service identity.
   const isUser = /^S-1-5-21-/.test(sid) && (ridNum === 500 || ridNum >= 1000);
   return {
+    rowid: Number((r as unknown as Record<string, unknown>).__rowid),
     sid,
     path: r.value || "",
     username: r.username || basename(r.value || ""),
@@ -165,7 +170,8 @@ interface NetInterface {
   leaseTerminates: string;
 }
 
-export default function TargetInfoView({ data, loadAccountEvents, onNavigate, onFetchLinkedRows }: TargetInfoViewProps) {
+export default function TargetInfoView({ data, loadAccountEvents, onNavigate, onFetchLinkedRows, tableBookmarks, onToggleBookmark }: TargetInfoViewProps) {
+  const bmRowids = useMemo(() => new Set((tableBookmarks ?? []).map((b) => b.rowid)), [tableBookmarks]);
   const [selectedAccount, setSelectedAccount] = useState<Account | null>(null);
   const { system, users, services, networks, interfaces, computerName, osSummary } = useMemo(() => {
     const rows = data.rows as Row[];
@@ -247,7 +253,7 @@ export default function TargetInfoView({ data, loadAccountEvents, onNavigate, on
   // Clicking an account opens a full page (not a modal) — account detail plus
   // the EventLog activity for its SID.
   if (selectedAccount) {
-    return <AccountDetailPage account={selectedAccount} onBack={() => setSelectedAccount(null)} loadEvents={loadAccountEvents} onNavigate={onNavigate} onFetchLinkedRows={onFetchLinkedRows} />;
+    return <AccountDetailPage account={selectedAccount} onBack={() => setSelectedAccount(null)} loadEvents={loadAccountEvents} onNavigate={onNavigate} onFetchLinkedRows={onFetchLinkedRows} tableBookmarks={tableBookmarks} onToggleBookmark={onToggleBookmark} />;
   }
 
   return (
@@ -311,7 +317,7 @@ export default function TargetInfoView({ data, loadAccountEvents, onNavigate, on
         <Card title="사용자 계정" count={users.length}>
           {users.length === 0 && <div style={{ color: "var(--text-faint)", fontSize: 12.5 }}>계정 없음</div>}
           {users.map((a) => (
-            <AccountRow key={a.sid} account={a} highlight onSelect={() => setSelectedAccount(a)} />
+            <AccountRow key={a.sid} account={a} highlight bookmarked={bmRowids.has(a.rowid)} onSelect={() => setSelectedAccount(a)} />
           ))}
         </Card>
 
@@ -319,7 +325,7 @@ export default function TargetInfoView({ data, loadAccountEvents, onNavigate, on
         <Card title="시스템 · 서비스 계정" count={services.length}>
           {services.length === 0 && <div style={{ color: "var(--text-faint)", fontSize: 12.5 }}>없음</div>}
           {services.map((a) => (
-            <AccountRow key={a.sid} account={a} onSelect={() => setSelectedAccount(a)} />
+            <AccountRow key={a.sid} account={a} bookmarked={bmRowids.has(a.rowid)} onSelect={() => setSelectedAccount(a)} />
           ))}
         </Card>
       </div>
@@ -328,7 +334,7 @@ export default function TargetInfoView({ data, loadAccountEvents, onNavigate, on
   );
 }
 
-function AccountRow({ account, highlight, onSelect }: { account: Account; highlight?: boolean; onSelect: () => void }) {
+function AccountRow({ account, highlight, bookmarked, onSelect }: { account: Account; highlight?: boolean; bookmarked?: boolean; onSelect: () => void }) {
   return (
     <div
       onClick={onSelect}
@@ -341,6 +347,7 @@ function AccountRow({ account, highlight, onSelect }: { account: Account; highli
         <span style={{ fontSize: 13, fontWeight: highlight ? 600 : 500, color: highlight ? "var(--text)" : "var(--text-dim)" }}>
           {highlight ? "👤" : "⚙️"} {account.username}
         </span>
+        {bookmarked && <span title="북마크된 시각이 있음" style={{ fontSize: 11, color: "var(--warning)" }}>★</span>}
         {account.disabled === "예" && (
           <span style={{ fontSize: 10, color: "var(--text-faint)", border: "1px solid var(--border)", borderRadius: 4, padding: "0 5px" }}>비활성</span>
         )}
@@ -363,13 +370,22 @@ function AccountRow({ account, highlight, onSelect }: { account: Account; highli
   );
 }
 
-function DetailRow({ label, value, mono }: { label: string; value: string; mono?: boolean }) {
+function DetailRow({ label, value, mono, bm }: { label: string; value: string; mono?: boolean; bm?: { active: boolean; onToggle: () => void } }) {
   return (
-    <div style={{ display: "flex", gap: 12, padding: "7px 0", borderBottom: "1px solid var(--border-subtle)" }}>
+    <div style={{ display: "flex", gap: 12, padding: "7px 0", borderBottom: "1px solid var(--border-subtle)", alignItems: "center" }}>
       <span style={{ flex: "0 0 150px", color: "var(--text-dim)", fontSize: 12.5 }}>{label}</span>
       <span style={{ flex: 1, color: "var(--text)", fontSize: 12.5, wordBreak: "break-all", fontFamily: mono ? "var(--mono)" : "var(--sans)" }}>
         {value || "—"}
       </span>
+      {bm && value && (
+        <button
+          onClick={bm.onToggle}
+          title={bm.active ? "이 시각 북마크 해제" : "이 시각 북마크"}
+          style={{ flexShrink: 0, fontSize: 11, padding: "2px 8px", borderRadius: "var(--radius-lg)", cursor: "pointer", background: bm.active ? "var(--warning-subtle)" : "transparent", color: bm.active ? "var(--warning)" : "var(--text-dim)", border: `1px solid ${bm.active ? "var(--warning)" : "var(--border)"}`, fontWeight: 600 }}
+        >
+          {bm.active ? "★" : "☆"}
+        </button>
+      )}
     </div>
   );
 }
@@ -436,12 +452,19 @@ function eventSummary(row: Row): string {
   return parts.join(" · ");
 }
 
-function AccountDetailPage({ account, onBack, loadEvents, onNavigate, onFetchLinkedRows }: { account: Account; onBack: () => void; loadEvents?: (sid: string, username: string) => Promise<Row[]>; onNavigate?: (targetFile: string, targetColumn: string, value: string) => void; onFetchLinkedRows?: FetchLinkedRows }) {
+function AccountDetailPage({ account, onBack, loadEvents, onNavigate, onFetchLinkedRows, tableBookmarks, onToggleBookmark }: { account: Account; onBack: () => void; loadEvents?: (sid: string, username: string) => Promise<Row[]>; onNavigate?: (targetFile: string, targetColumn: string, value: string) => void; onFetchLinkedRows?: FetchLinkedRows; tableBookmarks?: Bookmark[]; onToggleBookmark?: (rowid: number, field: string) => void }) {
   const [events, setEvents] = useState<Row[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [selectedEvent, setSelectedEvent] = useState<Row | null>(null);
   const [evPage, setEvPage] = useState(0);
   const EV_PAGE_SIZE = 40;
+
+  // Per-timestamp bookmark state for this account's SAM/profile row.
+  const bmKeys = useMemo(() => new Set((tableBookmarks ?? []).map((b) => `${b.rowid}@${b.field ?? ""}`)), [tableBookmarks]);
+  const mkBm = (field: string) =>
+    onToggleBookmark && Number.isFinite(account.rowid)
+      ? { active: bmKeys.has(`${account.rowid}@${field}`), onToggle: () => onToggleBookmark(account.rowid, field) }
+      : undefined;
 
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
@@ -501,10 +524,10 @@ function AccountDetailPage({ account, onBack, loadEvents, onNavigate, onFetchLin
           <DetailRow label="RID (SAM 키/폴더)" value={account.rid} mono />
           <DetailRow label="RID (SAM F 레코드)" value={account.ridSam || account.rid} mono />
           <DetailRow label="홈 디렉토리" value={account.homeDir} mono />
-          <DetailRow label="생성 일시" value={account.created} mono />
-          <DetailRow label="최근 로그인 일시" value={account.lastLogin} mono />
-          <DetailRow label="비밀번호 마지막 변경" value={account.passwordLastSet} mono />
-          <DetailRow label="비밀번호 오류 일시" value={account.lastFailedLogin} mono />
+          <DetailRow label="생성 일시" value={account.created} mono bm={mkBm("created")} />
+          <DetailRow label="최근 로그인 일시" value={account.lastLogin} mono bm={mkBm("last_login")} />
+          <DetailRow label="비밀번호 마지막 변경" value={account.passwordLastSet} mono bm={mkBm("password_last_set")} />
+          <DetailRow label="비밀번호 오류 일시" value={account.lastFailedLogin} mono bm={mkBm("last_failed_login")} />
           <DetailRow label="로그인 횟수" value={account.loginCount} />
           <DetailRow label="비밀번호 오류 횟수" value={account.failedLoginCount} />
           <DetailRow label="SpecialAccount" value={account.specialAccount} />

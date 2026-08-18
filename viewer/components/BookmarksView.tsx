@@ -291,6 +291,7 @@ type SeqEntry = {
 const _FIELD_LABELS: Record<string, string> = {
   si_created: "SI 생성", si_modified: "SI 수정", si_mft_modified: "SI MFT수정", si_accessed: "SI 접근",
   fn_created: "FN 생성", fn_modified: "FN 수정", fn_mft_modified: "FN MFT수정", fn_accessed: "FN 접근",
+  created: "계정 생성", last_login: "최근 로그인", password_last_set: "암호 변경", last_failed_login: "로그인 실패",
 };
 function fieldLabel(field: string): string {
   return _FIELD_LABELS[field] ?? field;
@@ -308,6 +309,7 @@ function iconFor(e: SeqEntry): string {
   if (t.includes("scheduledtask") || t.includes("task")) return "\u23F0"; // ⏰
   if (t.startsWith("wer")) return "\u{1F4A5}";                     // WER crash
   if (t.startsWith("mft")) return "\u{1F5C2}\u{FE0F}";             // 🗂️ $MFT entry
+  if (t.includes("targetinfo")) return "\u{1F464}";               // 👤 account
   if (t.includes("execution") || t.includes("prefetch") || t.includes("amcache") || t.includes("srum")) return "\u{1F680}"; // rocket (bright; replaced dark ▶)
   if (t.includes("browser")) return "\u{1F310}";                   // 🌐
   if (t.includes("event") || t.includes("security") || t.includes("system")) return "\u{1F4C4}"; // 📄
