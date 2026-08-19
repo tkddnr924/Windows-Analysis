@@ -33,7 +33,6 @@ from parsers import (
     srum_parser,
     taskscheduler_parser,
     usnjrnl_parser,
-    wer_parser,
 )
 
 from common.finder import (
@@ -113,7 +112,9 @@ ARTIFACTS: list[ArtifactDefinition] = [
         find_paths=_by_filenames(mft_parser.FILENAMES),
         parse=mft_parser.parse,
         field_order=mft_parser.FIELD_ORDER,
-        category="FileSystem",
+        # Surfaced under 종합 분석(_OVERVIEW) alongside the correlation tables,
+        # not as a raw FileSystem dump — it's a primary analysis view.
+        category="_OVERVIEW",
     ),
     ArtifactDefinition(
         name=jumplist_parser.ARTIFACT_NAME,
@@ -126,12 +127,6 @@ ARTIFACTS: list[ArtifactDefinition] = [
         find_paths=_by_filenames(srum_parser.FILENAMES),
         parse=srum_parser.parse,
         field_order=srum_parser.FIELD_ORDER,
-    ),
-    ArtifactDefinition(
-        name=wer_parser.ARTIFACT_NAME,
-        find_paths=_by_extensions(wer_parser.EXTENSIONS),
-        parse=wer_parser.parse,
-        field_order=wer_parser.FIELD_ORDER,
     ),
     ArtifactDefinition(
         name=taskscheduler_parser.ARTIFACT_NAME,

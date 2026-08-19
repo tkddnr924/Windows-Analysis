@@ -85,6 +85,7 @@ const OVERVIEW_TABLE_ICONS: Record<string, string> = {
   PowerShellHistory: "💻",
   RdpCache: "🖼️",
   ScheduledTasks: "⏰",
+  MFT_Records: "🗂️",
 };
 
 // Friendlier labels for overview tables whose raw name reads awkwardly.
@@ -101,6 +102,7 @@ const OVERVIEW_TABLE_NAMES: Record<string, string> = {
   PowerShellHistory: "PowerShell History",
   RdpCache: "RDP Cache",
   ScheduledTasks: "Scheduled Tasks",
+  MFT_Records: "MFT Explorer",
 };
 
 function sameEntry(a: ResultFileEntry | null, b: ResultFileEntry): boolean {
