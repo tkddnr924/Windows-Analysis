@@ -1,6 +1,0 @@
-regipy
-evtx
-olefile
-LnkParse3
-libscca-python
-libesedb-python
