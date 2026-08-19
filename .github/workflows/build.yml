@@ -1,9 +1,9 @@
 name: build
 
-# Builds the Rust `wina` CLI and the Tauri desktop app for macOS + Windows.
-# The GUI ships `wina` as a Tauri sidecar (externalBin), so each platform
-# builds wina first and drops it into src-tauri/binaries/wina-<target-triple>
-# before bundling.
+# Builds the Tauri desktop app for macOS + Windows. The GUI links wina-core
+# directly (no sidecar), so it's a single self-contained binary:
+#   - macOS  -> a .dmg
+#   - Windows -> the raw portable .exe (no installer; --no-bundle)
 
 on:
   push:
@@ -23,11 +23,9 @@ jobs:
       matrix:
         include:
           - os: macos-latest
-            triple: aarch64-apple-darwin
-            ext: ""
+            bundleArgs: "--bundles dmg"
           - os: windows-latest
-            triple: x86_64-pc-windows-msvc
-            ext: ".exe"
+            bundleArgs: "--no-bundle"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -38,23 +36,12 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: |
-            rust
-            viewer/src-tauri
+          workspaces: viewer/src-tauri
 
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: 20
-
-      - name: Build wina (Rust core + CLI)
-        run: cargo build --release -p wina --manifest-path rust/Cargo.toml
-
-      - name: Stage wina as the Tauri sidecar
-        shell: bash
-        run: |
-          mkdir -p viewer/src-tauri/binaries
-          cp "rust/target/release/wina${{ matrix.ext }}" "viewer/src-tauri/binaries/wina-${{ matrix.triple }}${{ matrix.ext }}"
 
       - name: Install viewer deps
         working-directory: viewer
@@ -62,26 +49,28 @@ jobs:
 
       - name: Build Tauri app
         working-directory: viewer
-        run: npm run tauri build
+        run: npm run tauri build -- ${{ matrix.bundleArgs }}
 
-      - name: Upload wina CLI
+      - name: Stage release assets
+        shell: bash
+        run: |
+          mkdir -p dist
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            cp "viewer/src-tauri/target/release/windows-analysis-gui.exe" "dist/Windows-Analysis.exe"
+          else
+            cp viewer/src-tauri/target/release/bundle/dmg/*.dmg dist/ || true
+          fi
+          ls -la dist
+
+      - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: wina-${{ matrix.triple }}
-          path: rust/target/release/wina${{ matrix.ext }}
-
-      - name: Upload Tauri bundle
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-analysis-gui-${{ matrix.triple }}
-          path: |
-            viewer/src-tauri/target/release/bundle/**
+          name: windows-analysis-${{ matrix.os }}
+          path: dist/*
           if-no-files-found: warn
 
-      # On a tag push (e.g. `beta`, `v0.1.0`), publish the built installers +
-      # the wina CLI to a GitHub Release. Each platform job appends its own
-      # assets to the same release; unmatched globs are skipped so a runner only
-      # uploads what it produced.
+      # On a tag push (e.g. `beta`, `v0.1.0`), publish the app to a GitHub
+      # Release. Each platform job appends its own asset to the same release.
       - name: Publish to GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
@@ -90,8 +79,4 @@ jobs:
           name: ${{ github.ref_name }}
           prerelease: ${{ contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') || contains(github.ref_name, 'alpha') }}
           fail_on_unmatched_patterns: false
-          files: |
-            rust/target/release/wina${{ matrix.ext }}
-            viewer/src-tauri/target/release/bundle/dmg/*.dmg
-            viewer/src-tauri/target/release/bundle/msi/*.msi
-            viewer/src-tauri/target/release/bundle/nsis/*-setup.exe
+          files: dist/*

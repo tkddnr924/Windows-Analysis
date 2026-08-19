@@ -19,11 +19,6 @@ use wina_core::parsers::usnjrnl::parse_usn_stream;
 use wina_core::parsers::wer::{parse_wer, WER_FIELD_ORDER, WER_TABLE};
 use wina_core::sqlite::{write_table, write_table_cols};
 
-const ARTIFACT_NAMES: &[&str] = &[
-    "Amcache", "EventLog", "Registry", "UsnJrnl", "MFT", "JumpList", "SRUM",
-    "TaskScheduler", "RdpCache", "BrowserHistory", "BrowserCache", "PowerShell", "Prefetch", "WER",
-];
-
 fn now() -> String { chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string() }
 
 /// Minimal --key value parser (values may follow the flag).
@@ -52,7 +47,7 @@ fn main() -> Result<()> {
 
     let f = flags(&args);
     if f.contains_key("list-artifacts") {
-        println!("{}", serde_json::to_string(&ARTIFACT_NAMES)?);
+        println!("{}", serde_json::to_string(wina_core::pipeline::ARTIFACT_NAMES)?);
         return Ok(());
     }
     let cases_dir = PathBuf::from(f.get("cases-dir").ok_or_else(|| anyhow::anyhow!("--cases-dir required"))?).canonicalize().unwrap_or_else(|_| PathBuf::from(f.get("cases-dir").unwrap()));

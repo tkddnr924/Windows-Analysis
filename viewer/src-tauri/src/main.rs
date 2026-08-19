@@ -1,20 +1,19 @@
 // Tauri backend for the Windows-Analysis viewer. Replaces the Electron main
-// process: CLI-shaped operations (list/create/run-host/list-artifacts) shell
-// out to the Rust `wina` binary (same CLI the Electron viewer drove); data
-// reads (categories, result tables, $MFT browse, search, bookmarks) run
-// in-process with rusqlite + std::fs. The React frontend is unchanged — a
-// small `window.api` shim maps its calls onto these commands.
+// process. Case/pipeline operations call `wina-core` in-process (no subprocess,
+// no sidecar — the app is a single self-contained binary); data reads
+// (categories, result tables, $MFT browse, search, bookmarks) use rusqlite +
+// std::fs. The React frontend is unchanged — a small `window.api` shim maps its
+// calls onto these commands.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
 
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter};
+use wina_core::{case_store, pipeline};
 
 // --- paths -----------------------------------------------------------------
 
@@ -39,19 +38,6 @@ fn cases_dir() -> PathBuf {
     // Packaged: a `cases` folder next to the app executable.
     std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("cases")))
         .unwrap_or_else(|| dev_repo_path("cases"))
-}
-
-fn wina_bin() -> PathBuf {
-    if let Ok(b) = std::env::var("WINA_BIN") { return PathBuf::from(b); }
-    let name = if cfg!(windows) { "wina.exe" } else { "wina" };
-    // Packaged: the sidecar sits next to the app executable (externalBin).
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let cand = dir.join(name);
-            if !is_dev_build() && cand.exists() { return cand; }
-        }
-    }
-    dev_repo_path(&format!("rust/target/release/{}", name))
 }
 
 // --- shared types (camelCase to match the frontend) ------------------------
@@ -85,47 +71,29 @@ struct ListCasesResult {
     error: Option<String>,
 }
 
-// --- wina CLI plumbing -----------------------------------------------------
+// --- wina-core mapping (add the frontend's `dir` field) --------------------
 
-fn run_wina(args: &[String]) -> Result<String, String> {
-    let bin = wina_bin();
-    let cd = cases_dir();
-    std::fs::create_dir_all(&cd).ok();
-    let mut a: Vec<String> = args.to_vec();
-    a.push("--cases-dir".into());
-    a.push(cd.to_string_lossy().to_string());
-    let out = Command::new(&bin).args(&a).output()
-        .map_err(|e| format!("failed to launch {}: {}", bin.display(), e))?;
-    if !out.status.success() {
-        return Err(String::from_utf8_lossy(&out.stderr).to_string());
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
-fn host_from_json(case_id: &str, raw: &Value, cd: &Path) -> Host {
-    let g = |k: &str| raw.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let id = g("id");
+fn gui_host(case_id: &str, h: &case_store::Host, cd: &Path) -> Host {
     Host {
-        dir: cd.join(case_id).join(&id).to_string_lossy().to_string(),
-        id: id.clone(),
-        name: g("name"),
-        target_dir: g("target_dir"),
-        created_at: g("created_at"),
-        last_run_at: raw.get("last_run_at").and_then(|v| v.as_str()).map(|s| s.to_string()),
-        last_run_status: raw.get("last_run_status").and_then(|v| v.as_str()).map(|s| s.to_string()),
-        artifacts_run: raw.get("artifacts_run").and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
-            .unwrap_or_default(),
+        dir: case_store::host_dir(cd, case_id, &h.id).to_string_lossy().to_string(),
+        id: h.id.clone(),
+        name: h.name.clone(),
+        target_dir: h.target_dir.clone(),
+        created_at: h.created_at.clone(),
+        last_run_at: h.last_run_at.clone(),
+        last_run_status: h.last_run_status.clone(),
+        artifacts_run: h.artifacts_run.clone(),
     }
 }
 
-fn case_from_json(raw: &Value, cd: &Path) -> Case {
-    let g = |k: &str| raw.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let id = g("id");
-    let hosts = raw.get("hosts").and_then(|v| v.as_array())
-        .map(|a| a.iter().map(|h| host_from_json(&id, h, cd)).collect())
-        .unwrap_or_default();
-    Case { dir: cd.join(&id).to_string_lossy().to_string(), id: id.clone(), name: g("name"), created_at: g("created_at"), hosts }
+fn gui_case(c: &case_store::Case, cd: &Path) -> Case {
+    Case {
+        dir: case_store::case_dir(cd, &c.id).to_string_lossy().to_string(),
+        id: c.id.clone(),
+        name: c.name.clone(),
+        created_at: c.created_at.clone(),
+        hosts: c.hosts.iter().map(|h| gui_host(&c.id, h, cd)).collect(),
+    }
 }
 
 // --- sqlite plumbing -------------------------------------------------------
@@ -190,34 +158,29 @@ fn collect_sqlite(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-// --- commands: cases / pipeline (via wina) ---------------------------------
+// --- commands: cases / pipeline (in-process via wina-core) -----------------
 
 #[tauri::command]
 fn list_cases() -> ListCasesResult {
     let cd = cases_dir();
-    match run_wina(&["--list-cases".into()]) {
-        Ok(stdout) => match serde_json::from_str::<Value>(stdout.trim()) {
-            Ok(Value::Array(arr)) => ListCasesResult { cases: arr.iter().map(|c| case_from_json(c, &cd)).collect(), error: None },
-            _ => ListCasesResult { cases: vec![], error: None },
-        },
-        Err(e) => ListCasesResult { cases: vec![], error: Some(e) },
+    match case_store::list_cases(&cd) {
+        Ok(cases) => ListCasesResult { cases: cases.iter().map(|c| gui_case(c, &cd)).collect(), error: None },
+        Err(e) => ListCasesResult { cases: vec![], error: Some(e.to_string()) },
     }
 }
 
 #[tauri::command]
 fn create_case(name: String) -> Result<Case, String> {
     let cd = cases_dir();
-    let stdout = run_wina(&["--create-case".into(), name])?;
-    let raw: Value = serde_json::from_str(stdout.trim()).map_err(|e| e.to_string())?;
-    Ok(case_from_json(&raw, &cd))
+    let c = case_store::create_case(&name, &case_store::now(), &cd).map_err(|e| e.to_string())?;
+    Ok(gui_case(&c, &cd))
 }
 
 #[tauri::command]
 fn create_host(case_id: String, name: String, target_dir: String) -> Result<Host, String> {
     let cd = cases_dir();
-    let stdout = run_wina(&["--create-host".into(), case_id.clone(), "--name".into(), name, "--target".into(), target_dir])?;
-    let raw: Value = serde_json::from_str(stdout.trim()).map_err(|e| e.to_string())?;
-    Ok(host_from_json(&case_id, &raw, &cd))
+    let h = case_store::create_host(&case_id, &name, &target_dir, &case_store::now(), &cd).map_err(|e| e.to_string())?;
+    Ok(gui_host(&case_id, &h, &cd))
 }
 
 #[tauri::command]
@@ -234,14 +197,8 @@ fn delete_host(case_id: String, host_id: String) -> bool {
 
 #[tauri::command]
 fn list_artifacts() -> Vec<String> {
-    match run_wina(&["--list-artifacts".into()]) {
-        Ok(s) => serde_json::from_str::<Vec<String>>(s.trim()).unwrap_or_default(),
-        Err(_) => vec![],
-    }
+    pipeline::ARTIFACT_NAMES.iter().map(|s| s.to_string()).collect()
 }
-
-#[derive(Default)]
-struct PipelineState(Mutex<Option<Child>>);
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -255,62 +212,32 @@ struct PipelineLogEntry { line: String, stream: String }
 struct PipelineResult { exit_code: Option<i32> }
 
 #[tauri::command]
-async fn run_host(app: AppHandle, state: State<'_, PipelineState>, options: RunHostOptions) -> Result<PipelineResult, String> {
-    {
-        let guard = state.0.lock().unwrap();
-        if guard.is_some() { return Ok(PipelineResult { exit_code: Some(-1) }); }
-    }
+async fn run_host(app: AppHandle, options: RunHostOptions) -> Result<PipelineResult, String> {
     let cd = cases_dir();
     std::fs::create_dir_all(&cd).ok();
-    let mut args = vec![
-        "--run-host".to_string(), options.case_id, "--host".to_string(), options.host_id,
-        "--cases-dir".to_string(), cd.to_string_lossy().to_string(),
-    ];
-    if let Some(only) = options.only { if !only.is_empty() { args.push("--only".into()); args.push(only.join(",")); } }
-
-    let mut child = Command::new(wina_bin()).args(&args)
-        .stdout(Stdio::piped()).stderr(Stdio::piped())
-        .spawn().map_err(|e| format!("failed to start pipeline: {}", e))?;
-
-    // Stream stdout + stderr line-by-line as `pipeline-log` events.
-    let emit = |app: &AppHandle, reader: Box<dyn std::io::Read + Send>, stream: &'static str| {
-        let app = app.clone();
-        std::thread::spawn(move || {
-            use std::io::BufRead;
-            let buf = std::io::BufReader::new(reader);
-            for line in buf.lines().map_while(Result::ok) {
-                if line.is_empty() { continue; }
-                let _ = app.emit("pipeline-log", PipelineLogEntry { line, stream: stream.to_string() });
-            }
-        });
-    };
-    if let Some(o) = child.stdout.take() { emit(&app, Box::new(o), "stdout"); }
-    if let Some(e) = child.stderr.take() { emit(&app, Box::new(e), "stderr"); }
-
-    *state.0.lock().unwrap() = Some(child);
-
-    // Poll for completion so `cancel_pipeline` can still reach the child.
-    loop {
-        {
-            let mut guard = state.0.lock().unwrap();
-            match guard.as_mut() {
-                None => return Ok(PipelineResult { exit_code: Some(-1) }), // cancelled/taken
-                Some(ch) => {
-                    if let Ok(Some(status)) = ch.try_wait() {
-                        *guard = None;
-                        return Ok(PipelineResult { exit_code: status.code() });
-                    }
-                }
-            }
-        }
-        std::thread::sleep(std::time::Duration::from_millis(120));
-    }
+    let only = options.only
+        .filter(|v| !v.is_empty())
+        .map(|v| v.into_iter().collect::<std::collections::HashSet<String>>());
+    let case_id = options.case_id;
+    let host_id = options.host_id;
+    let app2 = app.clone();
+    // Runs on a blocking thread; the pipeline's per-thread log sink (set here)
+    // streams progress lines out as `pipeline-log` events.
+    let code = tauri::async_runtime::spawn_blocking(move || {
+        pipeline::set_log_sink(Some(Box::new(move |line: &str| {
+            let _ = app2.emit("pipeline-log", PipelineLogEntry { line: line.to_string(), stream: "stdout".to_string() });
+        })));
+        let res = pipeline::run_host(&case_id, &host_id, &cd, only);
+        pipeline::set_log_sink(None);
+        match res { Ok(()) => 0i32, Err(_) => -1i32 }
+    }).await.map_err(|e| e.to_string())?;
+    Ok(PipelineResult { exit_code: Some(code) })
 }
 
 #[tauri::command]
-fn cancel_pipeline(state: State<'_, PipelineState>) -> bool {
-    let mut guard = state.0.lock().unwrap();
-    if let Some(mut child) = guard.take() { let _ = child.kill(); true } else { false }
+fn cancel_pipeline() -> bool {
+    pipeline::CANCEL.store(true, std::sync::atomic::Ordering::Relaxed);
+    true
 }
 
 // --- commands: result browsing (in-process sqlite) -------------------------
@@ -579,7 +506,6 @@ async fn pick_folder(app: AppHandle) -> Option<String> {
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .manage(PipelineState::default())
         .invoke_handler(tauri::generate_handler![
             list_cases, create_case, create_host, delete_case, delete_host, list_artifacts,
             run_host, cancel_pipeline, list_categories, list_result_files, read_result_file,

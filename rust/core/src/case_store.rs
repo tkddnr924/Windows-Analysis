@@ -31,6 +31,9 @@ pub struct Case {
     pub hosts: Vec<Host>,
 }
 
+/// Current local time as "YYYY-MM-DD HH:MM:SS" (case/host timestamp format).
+pub fn now() -> String { chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string() }
+
 pub fn case_dir(cases_dir: &Path, case_id: &str) -> PathBuf { cases_dir.join(case_id) }
 pub fn host_dir(cases_dir: &Path, case_id: &str, host_id: &str) -> PathBuf { case_dir(cases_dir, case_id).join(host_id) }
 fn case_meta(cases_dir: &Path, case_id: &str) -> PathBuf { case_dir(cases_dir, case_id).join("case.json") }

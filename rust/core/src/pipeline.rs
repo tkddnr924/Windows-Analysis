@@ -13,11 +13,43 @@ use crate::parsers::{amcache, browser_cache, browser_history, eventlog, powershe
 use crate::sqlite::{write_table, write_table_cols, Row};
 use crate::overview;
 
-fn announce(name: &str) { println!("=== {} ===", name); }
+use std::cell::RefCell;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+thread_local! {
+    // When set (by the GUI), progress lines route here instead of stdout so the
+    // desktop app can stream them; unset (CLI) prints to stdout as before.
+    static LOG_SINK: RefCell<Option<Box<dyn FnMut(&str)>>> = RefCell::new(None);
+}
+
+/// Install (or clear) the per-thread progress sink. Call on the SAME thread that
+/// runs `run_host`.
+pub fn set_log_sink(sink: Option<Box<dyn FnMut(&str)>>) {
+    LOG_SINK.with(|s| *s.borrow_mut() = sink);
+}
+
+fn emit(msg: &str) {
+    LOG_SINK.with(|s| {
+        let mut b = s.borrow_mut();
+        match b.as_mut() { Some(f) => f(msg), None => println!("{}", msg) }
+    });
+}
+
+/// Cooperative cancel flag: `run_host` clears it at start and checks it before
+/// each artifact; `cancel` (from the GUI) sets it to stop the remaining work.
+pub static CANCEL: AtomicBool = AtomicBool::new(false);
+
+/// Every artifact the pipeline knows how to parse, in run order.
+pub const ARTIFACT_NAMES: &[&str] = &[
+    "Amcache", "EventLog", "Registry", "UsnJrnl", "MFT", "JumpList", "SRUM",
+    "TaskScheduler", "RdpCache", "BrowserHistory", "BrowserCache", "PowerShell", "Prefetch", "WER",
+];
+
+fn announce(name: &str) { emit(&format!("=== {} ===", name)); }
 fn found(paths: &[std::path::PathBuf]) {
-    if paths.is_empty() { println!("[!] no matching files found"); }
-    else if paths.len() <= 20 { for p in paths { println!("[*] found: {}", p.display()); } }
-    else { println!("[*] found: {} files", paths.len()); }
+    if paths.is_empty() { emit(&format!("[!] no matching files found")); }
+    else if paths.len() <= 20 { for p in paths { emit(&format!("[*] found: {}", p.display())); } }
+    else { emit(&format!("[*] found: {} files", paths.len())); }
 }
 fn uniq_name(base: &str, taken: &mut HashSet<String>) -> String {
     if taken.insert(base.to_string()) { return base.to_string(); }
@@ -29,6 +61,7 @@ pub fn run_host(case_id: &str, host_id: &str, cases_dir: &Path, only: Option<Has
     let host = case_store::load_host(case_id, host_id, cases_dir)?;
     let out_dir = case_store::host_dir(cases_dir, case_id, host_id);
     let target = std::path::PathBuf::from(&host.target_dir);
+    CANCEL.store(false, Ordering::Relaxed);
 
     if only.is_none() {
         if let Ok(entries) = std::fs::read_dir(&out_dir) {
@@ -41,8 +74,10 @@ pub fn run_host(case_id: &str, host_id: &str, cases_dir: &Path, only: Option<Has
     let cat = |c: &str| out_dir.join(c);
 
     macro_rules! guard { ($name:expr, $body:block) => {{
-        let r: Result<()> = (|| { $body Ok(()) })();
-        if let Err(e) = r { println!("[!] {} failed: {}", $name, e); had_error = true; }
+        if !CANCEL.load(Ordering::Relaxed) {
+            let r: Result<()> = (|| { $body Ok(()) })();
+            if let Err(e) = r { emit(&format!("[!] {} failed: {}", $name, e)); had_error = true; }
+        }
         artifacts_run.push($name.to_string());
     }}; }
 
@@ -58,7 +93,7 @@ pub fn run_host(case_id: &str, host_id: &str, cases_dir: &Path, only: Option<Has
             let (progs, files) = amcache::parse_amcache(p)?;
             write_table(&out, amcache::PROGRAMS_TABLE, &progs, amcache::PROGRAMS_FIELD_ORDER)?;
             write_table(&out, amcache::FILES_TABLE, &files, amcache::FILES_FIELD_ORDER)?;
-            println!("[+] {} programs, {} files -> {}", progs.len(), files.len(), out.display());
+            emit(&format!("[+] {} programs, {} files -> {}", progs.len(), files.len(), out.display()));
         }
     }); }
 
@@ -72,7 +107,7 @@ pub fn run_host(case_id: &str, host_id: &str, cases_dir: &Path, only: Option<Has
             let name = uniq_name(&base, &mut taken);
             let out = cat("EVENTLOG").join(format!("{}.sqlite", name));
             let n = eventlog::parse_evtx_stream(p, &out, &name)?;
-            if n > 0 { println!("[+] {} rows -> {} [{}]", n, out.display(), name); }
+            if n > 0 { emit(&format!("[+] {} rows -> {} [{}]", n, out.display(), name)); }
         }
     }); }
 
@@ -97,7 +132,7 @@ pub fn run_host(case_id: &str, host_id: &str, cases_dir: &Path, only: Option<Has
             let name = uniq_name(&base, &mut taken);
             let out = cat("REGISTRY").join(format!("{}.sqlite", name));
             let n = registry::parse_hive_stream(p, &out)?;
-            println!("[+] {} rows -> {} [Registry]", n, out.display());
+            emit(&format!("[+] {} rows -> {} [Registry]", n, out.display()));
         }
     }); }
 
@@ -108,7 +143,7 @@ pub fn run_host(case_id: &str, host_id: &str, cases_dir: &Path, only: Option<Has
         if let Some(p) = paths.first() {
             let out = cat("FILESYSTEM").join("UsnJrnl_Records.sqlite");
             let n = usnjrnl::parse_usn_stream(p, &out)?;
-            println!("[+] {} rows -> {}", n, out.display());
+            emit(&format!("[+] {} rows -> {}", n, out.display()));
         }
     }); }
 
@@ -119,7 +154,7 @@ pub fn run_host(case_id: &str, host_id: &str, cases_dir: &Path, only: Option<Has
         if let Some(p) = paths.first() {
             let out = cat("_OVERVIEW").join("MFT_Records.sqlite");
             let n = mft::parse_mft_stream(p, &out)?;
-            println!("[+] {} rows -> {}", n, out.display());
+            emit(&format!("[+] {} rows -> {}", n, out.display()));
         }
     }); }
 
@@ -133,7 +168,7 @@ pub fn run_host(case_id: &str, host_id: &str, cases_dir: &Path, only: Option<Has
             let name = uniq_name(&base, &mut taken);
             let out = cat("SRUM").join(format!("{}.sqlite", name));
             let tables = srum::parse_srum_stream(p, &out)?;
-            for (t, n) in tables { println!("[+] {} rows -> {} [{}]", n, out.display(), t); }
+            for (t, n) in tables { emit(&format!("[+] {} rows -> {} [{}]", n, out.display(), t)); }
         }
     }); }
 
@@ -143,8 +178,8 @@ pub fn run_host(case_id: &str, host_id: &str, cases_dir: &Path, only: Option<Has
         if !rows.is_empty() {
             let out = cat("JUMPLIST").join("JumpList_Entries.sqlite");
             write_table(&out, jumplist::JUMPLIST_TABLE, &rows, jumplist::JUMPLIST_FIELD_ORDER)?;
-            println!("[+] {} rows -> {}", rows.len(), out.display());
-        } else { println!("[!] no matching files found"); }
+            emit(&format!("[+] {} rows -> {}", rows.len(), out.display()));
+        } else { emit(&format!("[!] no matching files found")); }
     }); }
 
     // --- TaskScheduler (TASKSCHEDULER/TaskScheduler_Tasks.sqlite) ---
@@ -153,8 +188,8 @@ pub fn run_host(case_id: &str, host_id: &str, cases_dir: &Path, only: Option<Has
         if !rows.is_empty() {
             let out = cat("TASKSCHEDULER").join("TaskScheduler_Tasks.sqlite");
             write_table(&out, taskscheduler::TASK_TABLE, &rows, taskscheduler::TASK_FIELD_ORDER)?;
-            println!("[+] {} rows -> {}", rows.len(), out.display());
-        } else { println!("[!] no matching files found"); }
+            emit(&format!("[+] {} rows -> {}", rows.len(), out.display()));
+        } else { emit(&format!("[!] no matching files found")); }
     }); }
 
     // --- RdpCache (RDPCACHE/RdpBitmapCache.sqlite) ---
@@ -163,8 +198,8 @@ pub fn run_host(case_id: &str, host_id: &str, cases_dir: &Path, only: Option<Has
         if !rows.is_empty() {
             let out = cat("RDPCACHE").join("RdpBitmapCache.sqlite");
             write_table(&out, rdpcache::RDP_TABLE, &rows, rdpcache::RDP_FIELD_ORDER)?;
-            println!("[+] {} rows -> {}", rows.len(), out.display());
-        } else { println!("[!] no matching files found"); }
+            emit(&format!("[+] {} rows -> {}", rows.len(), out.display()));
+        } else { emit(&format!("[!] no matching files found")); }
     }); }
 
     // --- WER (WER/WER_Reports.sqlite) ---
@@ -173,8 +208,8 @@ pub fn run_host(case_id: &str, host_id: &str, cases_dir: &Path, only: Option<Has
         if !rows.is_empty() {
             let out = cat("WER").join("WER_Reports.sqlite");
             write_table(&out, wer::WER_TABLE, &rows, wer::WER_FIELD_ORDER)?;
-            println!("[+] {} rows -> {}", rows.len(), out.display());
-        } else { println!("[!] no matching files found"); }
+            emit(&format!("[+] {} rows -> {}", rows.len(), out.display()));
+        } else { emit(&format!("[!] no matching files found")); }
     }); }
 
     // --- BrowserHistory (BROWSER/<account>.sqlite, table per source table) ---
@@ -189,7 +224,7 @@ pub fn run_host(case_id: &str, host_id: &str, cases_dir: &Path, only: Option<Has
             let tables = browser_history::parse_history(p)?;
             for (t, cols, rows) in &tables {
                 write_table_cols(&out, t, rows, cols, &[])?;
-                println!("[+] {} rows -> {} [{}]", rows.len(), out.display(), t);
+                emit(&format!("[+] {} rows -> {} [{}]", rows.len(), out.display(), t));
             }
         }
     }); }
@@ -201,7 +236,7 @@ pub fn run_host(case_id: &str, host_id: &str, cases_dir: &Path, only: Option<Has
         for (name, rows) in browser_cache::parse_caches(&paths) {
             let out = cat("BROWSER").join(format!("{}.sqlite", name));
             write_table(&out, browser_cache::CACHE_TABLE, &rows, browser_cache::CACHE_FIELD_ORDER)?;
-            println!("[+] {} rows -> {}", rows.len(), out.display());
+            emit(&format!("[+] {} rows -> {}", rows.len(), out.display()));
         }
     }); }
 
@@ -213,10 +248,10 @@ pub fn run_host(case_id: &str, host_id: &str, cases_dir: &Path, only: Option<Has
             let (exec_rows, loaded_rows) = prefetch::parse_prefetch(&paths);
             let ex = cat("PREFETCH").join(format!("{}.sqlite", prefetch::EXEC_TABLE));
             write_table(&ex, prefetch::EXEC_TABLE, &exec_rows, prefetch::EXEC_FIELD_ORDER)?;
-            println!("[+] {} rows -> {}", exec_rows.len(), ex.display());
+            emit(&format!("[+] {} rows -> {}", exec_rows.len(), ex.display()));
             let lf = cat("PREFETCH").join(format!("{}.sqlite", prefetch::LOADED_TABLE));
             write_table(&lf, prefetch::LOADED_TABLE, &loaded_rows, prefetch::LOADED_FIELD_ORDER)?;
-            println!("[+] {} rows -> {}", loaded_rows.len(), lf.display());
+            emit(&format!("[+] {} rows -> {}", loaded_rows.len(), lf.display()));
         }
     }); }
 
@@ -228,17 +263,17 @@ pub fn run_host(case_id: &str, host_id: &str, cases_dir: &Path, only: Option<Has
             let rows = powershell_history::parse_console_history(&paths)?;
             let out = cat("POWERSHELL").join(format!("{}.sqlite", powershell_history::PS_TABLE));
             write_table(&out, powershell_history::PS_TABLE, &rows, powershell_history::PS_FIELD_ORDER)?;
-            println!("[+] {} rows -> {}", rows.len(), out.display());
+            emit(&format!("[+] {} rows -> {}", rows.len(), out.display()));
         }
     }); }
 
-    println!("=== _OVERVIEW ===");
+    emit(&format!("=== _OVERVIEW ==="));
     let ov = out_dir.join("_OVERVIEW");
     let write_ov = |name: &str, rows: Vec<Row>, skip_empty: bool| -> Result<()> {
         if rows.is_empty() && skip_empty { return Ok(()); }
         let out = ov.join(format!("{}.sqlite", name));
         write_table(&out, name, &rows, &[])?;
-        println!("[+] {} rows -> {}", rows.len(), out.display());
+        emit(&format!("[+] {} rows -> {}", rows.len(), out.display()));
         Ok(())
     };
     write_ov("ScheduledTasks", overview::build_scheduled_tasks(&out_dir), true)?;
