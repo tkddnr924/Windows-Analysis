@@ -12,6 +12,10 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Needed so the release step can create/update a GitHub Release on tag pushes.
+permissions:
+  contents: write
+
 jobs:
   build:
     strategy:
@@ -73,3 +77,21 @@ jobs:
           path: |
             viewer/src-tauri/target/release/bundle/**
           if-no-files-found: warn
+
+      # On a tag push (e.g. `beta`, `v0.1.0`), publish the built installers +
+      # the wina CLI to a GitHub Release. Each platform job appends its own
+      # assets to the same release; unmatched globs are skipped so a runner only
+      # uploads what it produced.
+      - name: Publish to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          prerelease: ${{ contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') || contains(github.ref_name, 'alpha') }}
+          fail_on_unmatched_patterns: false
+          files: |
+            rust/target/release/wina${{ matrix.ext }}
+            viewer/src-tauri/target/release/bundle/dmg/*.dmg
+            viewer/src-tauri/target/release/bundle/msi/*.msi
+            viewer/src-tauri/target/release/bundle/nsis/*-setup.exe
