@@ -38,6 +38,10 @@ export const CATEGORY_ICONS: Record<string, string> = {
 // Category defaults to the artifact name; only UsnJrnl files under FileSystem.
 const ARTIFACT_CATEGORY: Record<string, string> = {
   UsnJrnl: "FILESYSTEM",
+  // MFT is a 종합 분석 item (_OVERVIEW/MFT_Records.sqlite → "MFT Explorer"),
+  // not a raw category — map it there so it never shows as an empty "MFT"
+  // placeholder in the 원본 데이터 list.
+  MFT: "_OVERVIEW",
   // Both browser artifacts write into the shared BROWSER output folder, so the
   // run-list placeholder must resolve there too — otherwise BrowserHistory /
   // BrowserCache show as empty "데이터 없음" rows next to the real BROWSER folder.
@@ -49,7 +53,14 @@ function categoryForArtifact(name: string): string {
   return ARTIFACT_CATEGORY[name] ?? name.toUpperCase();
 }
 
-function EmptyCategoryRow({ name }: { name: string }) {
+// Friendlier display labels for raw categories whose folder name reads
+// awkwardly. POWERSHELL holds only the PSReadLine console history (the
+// PowerShell *event logs* live under EVENTLOG), so label it accordingly.
+const CATEGORY_LABELS: Record<string, string> = {
+  POWERSHELL: "ConsoleHistory",
+};
+
+function EmptyCategoryRow({ name, label }: { name: string; label?: string }) {
   return (
     <div
       title="이 아티팩트는 실행됐지만 대상에서 원본 파일을 찾지 못했습니다"
@@ -68,7 +79,7 @@ function EmptyCategoryRow({ name }: { name: string }) {
     >
       <span style={{ width: 10, display: "inline-block" }} />
       {CATEGORY_ICONS[name] && <span>{CATEGORY_ICONS[name]}</span>}
-      <span>{name}</span>
+      <span>{label ?? name}</span>
       <span style={{ marginLeft: "auto", fontSize: 10.5, fontWeight: 400 }}>데이터 없음</span>
     </div>
   );
@@ -588,9 +599,9 @@ export default function Sidebar({
         {orderedNames.map((name) => {
           const category = presentByName.get(name);
           return category ? (
-            <CategoryNode key={category.fullPath} category={category} selectedFile={selectedFile} onSelectFile={onSelectFile} onNavigate={onNavigate} />
+            <CategoryNode key={category.fullPath} category={category} displayName={CATEGORY_LABELS[category.name]} selectedFile={selectedFile} onSelectFile={onSelectFile} onNavigate={onNavigate} />
           ) : (
-            <EmptyCategoryRow key={name} name={name} />
+            <EmptyCategoryRow key={name} name={name} label={CATEGORY_LABELS[name]} />
           );
         })}
         {leftoverCategories.map((category) => (

@@ -194,12 +194,12 @@ pub fn run_host(case_id: &str, host_id: &str, cases_dir: &Path, only: Option<Has
         }
     }); }
 
-    // --- BrowserCache (BROWSERCACHE/<account>_Chrome_Cache.sqlite) ---
+    // --- BrowserCache (BROWSER/<account>_Chrome_Cache.sqlite — shared with BrowserHistory) ---
     if want("BrowserCache") { announce("BrowserCache"); guard!("BrowserCache", {
         let paths = finder::dedupe_by_content(finder::by_name(&target, &["index"]));
         found(&paths);
         for (name, rows) in browser_cache::parse_caches(&paths) {
-            let out = cat("BROWSERCACHE").join(format!("{}.sqlite", name));
+            let out = cat("BROWSER").join(format!("{}.sqlite", name));
             write_table(&out, browser_cache::CACHE_TABLE, &rows, browser_cache::CACHE_FIELD_ORDER)?;
             println!("[+] {} rows -> {}", rows.len(), out.display());
         }

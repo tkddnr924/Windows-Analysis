@@ -586,11 +586,7 @@ fn main() {
             list_column_values, mft_children, mft_search, mft_row, search_case,
             list_bookmarks, toggle_bookmark, update_bookmark_note, pick_folder
         ])
-        .setup(|app| {
-            #[cfg(debug_assertions)]
-            { let _ = app.handle(); }
-            Ok(())
-        })
+        .setup(|_app| Ok(()))
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

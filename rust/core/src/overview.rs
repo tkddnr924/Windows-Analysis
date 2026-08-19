@@ -741,7 +741,7 @@ fn browser_sources(out_dir: &Path, category: &str, suffix: &str) -> Vec<(String,
 pub fn build_browser_history(out_dir: &Path) -> Vec<Row> {
     let mut rows: Vec<Row> = Vec::new();
     // Cached HTTP responses (BrowserCache) — empty when no cache artifact present.
-    for (account, db) in browser_sources(out_dir, "BROWSERCACHE", "_Chrome_Cache") {
+    for (account, db) in browser_sources(out_dir, "BROWSER", "_Chrome_Cache") {
         for c in read_table(&db, "CacheEntries") {
             let g = |k: &str| c.get(k).cloned().unwrap_or_default();
             let ts = { let r = g("response_time"); if !r.is_empty() { r } else { g("creation_time") } };
