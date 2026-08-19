@@ -2,8 +2,11 @@ name: build
 
 # Builds the Tauri desktop app for macOS + Windows. The GUI links wina-core
 # directly (no sidecar), so it's a single self-contained binary:
-#   - macOS  -> a .dmg
+#   - macOS   -> a .dmg
 #   - Windows -> the raw portable .exe (no installer; --no-bundle)
+# A separate `release` job (tag pushes only) collects both platforms' outputs
+# and publishes them to one GitHub Release — done in a single job so the two
+# build jobs don't race updating the same release.
 
 on:
   push:
@@ -12,7 +15,6 @@ on:
   pull_request:
   workflow_dispatch:
 
-# Needed so the release step can create/update a GitHub Release on tag pushes.
 permissions:
   contents: write
 
@@ -69,14 +71,23 @@ jobs:
           path: dist/*
           if-no-files-found: warn
 
-      # On a tag push (e.g. `beta`, `v0.1.0`), publish the app to a GitHub
-      # Release. Each platform job appends its own asset to the same release.
+  # Publish both platforms' assets to a single GitHub Release (tag pushes only).
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: List assets
+        run: find dist -type f
       - name: Publish to GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
           name: ${{ github.ref_name }}
           prerelease: ${{ contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') || contains(github.ref_name, 'alpha') }}
           fail_on_unmatched_patterns: false
-          files: dist/*
+          files: dist/**/*
