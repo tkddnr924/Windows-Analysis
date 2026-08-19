@@ -1,0 +1,24 @@
+[package]
+name = "wina-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rusqlite = { version = "0.31", features = ["bundled"] }
+mft = "0.6"
+notatin = "1"
+# notatin (>=6) misresolves to nom 8; its code is nom-7 API. Pin nom to 7.
+nom = "=7.1.3"
+chrono = "0.4"
+evtx = "0.8"
+png = "0.17"
+base64 = "0.22"
+libesedb = "0.2"
+roxmltree = "0.20"
+cfb = "0.10"
+lnk = "0.5"
+walkdir = "2"
+serde_json = { version = "1", features = ["preserve_order"] }
+serde = { version = "1", features = ["derive"] }
+anyhow = "1"
+prefetch-core = "0.1.1"

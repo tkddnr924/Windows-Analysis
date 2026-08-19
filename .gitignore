@@ -1,27 +1,22 @@
-venv/
-__pycache__/
-result/
+# Rust build output (rust/target + viewer/src-tauri/target)
 target/
-.claude/
 
-# Parsed case output — real extracted forensic data (browser data, credentials-
-# adjacent fields, etc.), never belongs in version control.
+# Parsed case output — real extracted forensic data (browser data, account
+# fields, etc.); never belongs in version control.
 cases/
 
-# Electron/Next.js viewer build output and deps — see viewer/.gitignore for
-# the rest; these two are here so `git status` at the repo root stays clean.
+# The collected sample under analysis — never commit.
+Target/
+
+# Node / Next / Tauri
 viewer/node_modules/
+viewer/.next/
 viewer/out/
-viewer/dist-electron/
-viewer/release/
+viewer/src-tauri/gen/
+viewer/src-tauri/binaries/
 
-# PyInstaller build output for the standalone-exe pipeline bundle — built
-# fresh by CI (and locally, on demand), never committed.
-pyinstaller-dist/
-pyinstaller-build/
-*.spec
-
-# macOS + local test artifacts
+# Editor / OS / local
+.claude/
 .DS_Store
-/Defender%4Operational.sqlite
-.venv_test/
+__pycache__/
+*.tsbuildinfo
