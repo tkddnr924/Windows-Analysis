@@ -100,6 +100,21 @@ const OVERVIEW_TABLE_ICONS: Record<string, string> = {
 };
 
 // Friendlier labels for overview tables whose raw name reads awkwardly.
+// Curated display order for the 종합 분석(_OVERVIEW) tables (by sqlite/table
+// name). Anything not listed (e.g. BrowserActivity) sorts after these.
+const OVERVIEW_ORDER: string[] = [
+  "TargetInfo",
+  "MFT_Records",
+  "RemoteDesktopHistory",
+  "ExecutionHistory",
+  "Defender",
+  "RegistryFindings",
+  "PowerShellHistory",
+  "SmbHistory",
+  "ScheduledTasks",
+  "RdpCache",
+];
+
 // 종합 분석(_OVERVIEW) items are labeled in English; the rest of the UI stays
 // Korean. Every overview table gets an explicit English name here.
 const OVERVIEW_TABLE_NAMES: Record<string, string> = {
@@ -264,8 +279,16 @@ function CategoryNode({ category, selectedFile, onSelectFile, displayName, pinne
       if (!map.has(file.fileName)) map.set(file.fileName, []);
       map.get(file.fileName)!.push(file);
     }
-    return [...map.entries()].sort((a, b) => a[0].localeCompare(b[0]));
-  }, [files]);
+    // 종합 분석(_OVERVIEW) follows a curated analyst order; everything else is
+    // alphabetical. Files not in the list fall to the end (still alphabetical).
+    const rank = (name: string) => {
+      const i = OVERVIEW_ORDER.indexOf(name);
+      return i === -1 ? OVERVIEW_ORDER.length : i;
+    };
+    return [...map.entries()].sort((a, b) =>
+      pinned ? (rank(a[0]) - rank(b[0]) || a[0].localeCompare(b[0])) : a[0].localeCompare(b[0]),
+    );
+  }, [files, pinned]);
 
   const isExpanded = pinned || expanded;
   const icon = pinned ? undefined : CATEGORY_ICONS[category.name];

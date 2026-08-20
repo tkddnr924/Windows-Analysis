@@ -98,11 +98,11 @@ export default function DefenderView({ data, onNavigate, onFetchLinkedRows, book
 
       {!hasData && <div style={{ color: "var(--text-faint)", fontSize: 13 }}>Defender 이벤트 로그가 없습니다.</div>}
 
-      <div style={{ display: "grid", gridTemplateColumns: "1fr", gap: 16, maxWidth: 1100 }}>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr", gap: 16 }}>
         {/* Threats */}
         {threats.length > 0 && (
           <Card title="🦠 탐지된 위협" count={threats.length} accent="var(--danger)" note={unhandled ? `미조치 ${unhandled}건` : undefined}>
-            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(460px, 1fr))", gap: 10, alignItems: "start" }}>
               {threats.map((t, i) => {
                 const neutral = isNeutralized(t.action);
                 return (

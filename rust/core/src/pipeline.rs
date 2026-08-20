@@ -77,10 +77,17 @@ pub fn run_host(case_id: &str, host_id: &str, cases_dir: &Path, only: Option<Has
     let mut had_error = false;
     let cat = |c: &str| out_dir.join(c);
 
+    // Each artifact is isolated: an Err is logged and skipped, and a *panic*
+    // (e.g. a malformed structure that trips an index) is caught too, so one
+    // bad artifact can never stop the ones after it or the _OVERVIEW stage.
     macro_rules! guard { ($name:expr, $body:block) => {{
         if !CANCEL.load(Ordering::Relaxed) {
-            let r: Result<()> = (|| { $body Ok(()) })();
-            if let Err(e) = r { emit(&format!("[!] {} failed: {}", $name, e)); had_error = true; }
+            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> { $body Ok(()) }));
+            match res {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => { emit(&format!("[!] {} failed: {}", $name, e)); had_error = true; }
+                Err(_) => { emit(&format!("[!] {} panicked — skipped", $name)); had_error = true; }
+            }
         }
         artifacts_run.push($name.to_string());
     }}; }
