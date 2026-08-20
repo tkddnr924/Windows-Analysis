@@ -128,6 +128,7 @@ pub fn parse_hive_stream(primary: &Path, out: &Path) -> Result<usize> {
 
     let mut writer = StreamWriter::create(out, REG_TABLE, REG_FIELD_ORDER, REG_FIELD_ORDER)?;
     for key in ParserIterator::new(&parser) {
+        if crate::pipeline::cancelled() { break; }
         let last_write = fmt_kst(key.last_key_written_date_and_time());
         let path = key.path.clone();
         let mut had_value = false;

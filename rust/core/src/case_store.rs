@@ -20,6 +20,8 @@ pub struct Host {
     pub last_run_status: Option<String>,
     #[serde(default)]
     pub artifacts_run: Vec<String>,
+    #[serde(default)]
+    pub last_run_duration_secs: Option<f64>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -76,6 +78,7 @@ pub fn create_host(case_id: &str, name: &str, target_dir: &str, created_at: &str
     let host = Host {
         id: host_id.clone(), name: name.to_string(), target_dir: target_dir.to_string(),
         created_at: created_at.to_string(), last_run_at: None, last_run_status: None, artifacts_run: vec![],
+        last_run_duration_secs: None,
     };
     std::fs::create_dir_all(host_dir(cases_dir, case_id, &host_id))?;
     write_host(&host, cases_dir, case_id)?;
@@ -117,10 +120,11 @@ pub fn list_cases(cases_dir: &Path) -> Result<Vec<Case>> {
     Ok(cases)
 }
 
-pub fn update_host_status(case_id: &str, host_id: &str, cases_dir: &Path, run_at: &str, status: &str, artifacts_run: Vec<String>) -> Result<()> {
+pub fn update_host_status(case_id: &str, host_id: &str, cases_dir: &Path, run_at: &str, status: &str, artifacts_run: Vec<String>, duration_secs: Option<f64>) -> Result<()> {
     let mut host = load_host(case_id, host_id, cases_dir)?;
     host.last_run_at = Some(run_at.to_string());
     host.last_run_status = Some(status.to_string());
     host.artifacts_run = artifacts_run;
+    host.last_run_duration_secs = duration_secs;
     write_host(&host, cases_dir, case_id)
 }

@@ -25,13 +25,33 @@ pub const MFT_FIELD_ORDER: &[&str] = &[
 
 const ROOT_ENTRY: u64 = 5;
 
-/// Best $FILE_NAME (Python namespace priority) + the $STANDARD_INFORMATION
-/// timestamps, in a single attribute pass.
-fn extract(entry: &mft::MftEntry) -> (Option<FileNameAttr>, Option<[String; 4]>) {
+/// Best $FILE_NAME (Python namespace priority), the $STANDARD_INFORMATION
+/// timestamps, and the real data size, in a single attribute pass.
+///
+/// The size comes from the unnamed $DATA (0x80) attribute — non-resident:
+/// its `file_size`; resident (small files stored inline): its `data_size`.
+/// The $FILE_NAME size fields are NOT authoritative: NTFS only refreshes them
+/// when the filename attribute itself is rewritten, so for most files they sit
+/// at 0 (or a stale value) even though the file has data. Reading them was why
+/// real files showed as 0 bytes. Named $DATA streams are alternate data streams
+/// and are skipped, so the size stays the file's own.
+fn extract(entry: &mft::MftEntry) -> (Option<FileNameAttr>, Option<[String; 4]>, Option<u64>) {
+    use mft::attribute::header::ResidentialHeader;
+    use mft::attribute::MftAttributeType;
+
     let mut si: Option<[String; 4]> = None;
     let mut best: Option<FileNameAttr> = None;
     let mut best_prio: i32 = -1;
+    let mut data_size: Option<u64> = None;
+
     for attr in entry.iter_attributes().filter_map(|a| a.ok()) {
+        if attr.header.type_code == MftAttributeType::DATA && attr.header.name.is_empty() {
+            match &attr.header.residential_header {
+                ResidentialHeader::NonResident(nr) => data_size = Some(nr.file_size),
+                ResidentialHeader::Resident(r) => data_size = Some(r.data_size as u64),
+                _ => {}
+            }
+        }
         match attr.data {
             MftAttributeContent::AttrX10(s) => {
                 si = Some([
@@ -50,7 +70,7 @@ fn extract(entry: &mft::MftEntry) -> (Option<FileNameAttr>, Option<[String; 4]>)
             _ => {}
         }
     }
-    (best, si)
+    (best, si, data_size)
 }
 
 /// Resolve a full path from parent references (memoized; identical algorithm to
@@ -73,8 +93,9 @@ pub fn parse_mft_stream(mft_path: &Path, out: &Path) -> Result<usize> {
     {
         let mut parser = MftParser::from_path(mft_path)?;
         for entry in parser.iter_entries() {
+            if crate::pipeline::cancelled() { break; }
             let entry = match entry { Ok(e) => e, Err(_) => continue };
-            if let (Some(f), _) = extract(&entry) {
+            if let (Some(f), _, _) = extract(&entry) {
                 index.insert(entry.header.record_number, (f.name.clone(), f.parent.entry));
             }
         }
@@ -88,19 +109,24 @@ pub fn parse_mft_stream(mft_path: &Path, out: &Path) -> Result<usize> {
     // pass 2: build + stream each row.
     let mut parser = MftParser::from_path(mft_path)?;
     for entry in parser.iter_entries() {
+        if crate::pipeline::cancelled() { break; }
         let entry = match entry { Ok(e) => e, Err(_) => continue };
         let hdr = &entry.header;
         let in_use = hdr.flags.bits() & 0x01 != 0;
         let is_dir = hdr.flags.bits() & 0x02 != 0;
-        let (best, si) = extract(&entry);
+        let (best, si, data_size) = extract(&entry);
         if best.is_none() && si.is_none() { continue; }
 
-        let (name, parent, size, fn_t) = match &best {
+        let (name, parent, fn_size, fn_t) = match &best {
             Some(f) => (f.name.clone(), f.parent.entry, f.physical_size, [
                 fmt_kst_ft(f.created), fmt_kst_ft(f.modified), fmt_kst_ft(f.mft_modified), fmt_kst_ft(f.accessed),
             ]),
             None => (String::new(), u64::MAX, 0, [String::new(), String::new(), String::new(), String::new()]),
         };
+        // $DATA is authoritative; fall back to $FILE_NAME only when there's no
+        // $DATA attribute at all (e.g. a directory, or a record whose data
+        // attribute lives in an extension record).
+        let size = data_size.unwrap_or(fn_size);
 
         let e = hdr.record_number;
         let path = if e == ROOT_ENTRY || name == "." {

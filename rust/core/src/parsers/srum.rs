@@ -117,6 +117,7 @@ fn dump_table_stream(table: &libesedb::Table, id_map: &HashMap<i64, String>, sou
     let uref: Vec<&str> = universe.iter().map(|s| s.as_str()).collect();
     let mut writer = StreamWriter::create(out, name, &uref, SRUM_PREFIX)?;
     for rec in table.iter_records()?.filter_map(|r| r.ok()) {
+        if crate::pipeline::cancelled() { break; }
         let mut row = Row::new();
         row.insert("_source_file".into(), source.into());
         let (mut app_id, mut user_id) = (None, None);

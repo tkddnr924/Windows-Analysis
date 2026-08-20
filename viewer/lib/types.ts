@@ -19,6 +19,8 @@ export interface Host {
   lastRunAt: string | null;
   lastRunStatus: string | null;
   artifactsRun: string[];
+  /** Wall-clock seconds the last parse took (shown as a "소요" tag). */
+  lastRunDurationSecs?: number | null;
 }
 
 /** An incident. Groups the hosts (machines) involved so an analyst can pivot
@@ -134,6 +136,17 @@ export interface PipelineResult {
   exitCode: number | null;
 }
 
+/** A sighting of a filesystem path in another artifact (JumpList today;
+ * Shellbag/LNK later) — used to tag rows in the $MFT explorer. */
+export interface PathReference {
+  /** lowercased target path, for matching against $MFT paths */
+  path: string;
+  kind: string;
+  account: string;
+  label: string;
+  fields: Record<string, string>;
+}
+
 export interface ElectronApi {
   pickFolder(): Promise<string | null>;
   listCases(): Promise<ListCasesResult>;
@@ -157,6 +170,8 @@ export interface ElectronApi {
   listBookmarks(hostDir: string): Promise<Bookmark[]>;
   toggleBookmark(hostDir: string, entry: BookmarkInput): Promise<Bookmark[]>;
   updateBookmarkNote(hostDir: string, id: string, note: string): Promise<Bookmark[]>;
+  /** Cross-artifact references to filesystem paths for a host. */
+  pathReferences(hostDir: string): Promise<PathReference[]>;
 }
 
 declare global {

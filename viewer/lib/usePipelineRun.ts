@@ -51,6 +51,9 @@ export function usePipelineRun(onDone?: () => void): PipelineRun {
   const [dismissed, setDismissed] = useState(true);
   const currentRef = useRef<string | null>(null);
   const onDoneRef = useRef(onDone);
+  /** Set when the user cancels, so the pending runHost() promise doesn't
+   * resurrect the progress UI as "완료" when it eventually resolves. */
+  const cancelledRef = useRef(false);
   onDoneRef.current = onDone;
 
   // Mark the current section done (✓) — a section is finished once the next
@@ -84,6 +87,7 @@ export function usePipelineRun(onDone?: () => void): PipelineRun {
   }, []);
 
   async function start(opts: StartOpts) {
+    cancelledRef.current = false;
     setRunningHostId(opts.hostId);
     setRunningHostName(opts.hostName);
     setLogs([]);
@@ -97,6 +101,13 @@ export function usePipelineRun(onDone?: () => void): PipelineRun {
 
     await window.api.runHost({ caseId: opts.caseId, hostId: opts.hostId, only: opts.only });
 
+    // A cancelled run already tore the UI down in cancel(); don't flip it back
+    // to "완료" when the backend finally returns.
+    if (cancelledRef.current) {
+      cancelledRef.current = false;
+      onDoneRef.current?.();
+      return;
+    }
     flushCurrentSection();
     setRunningHostId(null);
     setCurrentArtifact(null);
@@ -104,8 +115,18 @@ export function usePipelineRun(onDone?: () => void): PipelineRun {
     onDoneRef.current?.();
   }
 
+  // Parsing runs in a child process, so cancel kills it outright — the work
+  // stops immediately, not at the next poll point. The pending runHost()
+  // promise still resolves afterwards; cancelledRef keeps it from flipping the
+  // UI back to "완료".
   async function cancel() {
-    await window.api.cancelPipeline();
+    cancelledRef.current = true;
+    void window.api.cancelPipeline();
+    flushCurrentSection();
+    setRunningHostId(null);
+    setCurrentArtifact(null);
+    setRunComplete(false);
+    setDismissed(true);
   }
 
   function dismiss() {

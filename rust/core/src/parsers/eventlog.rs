@@ -109,6 +109,7 @@ pub fn parse_evtx_stream(path: &Path, out: &Path, table: &str) -> Result<usize> 
     let mut writer = StreamWriter::create(out, table, EVENT_COLUMNS, EVENT_COLUMNS)?;
 
     for rec in parser.records_json_value() {
+        if crate::pipeline::cancelled() { break; }
         match rec {
             Err(e) => {
                 let mut row = Row::new();

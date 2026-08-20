@@ -1,12 +1,21 @@
 // Tauri backend for the Windows-Analysis viewer. Replaces the Electron main
-// process. Case/pipeline operations call `wina-core` in-process (no subprocess,
-// no sidecar — the app is a single self-contained binary); data reads
-// (categories, result tables, $MFT browse, search, bookmarks) use rusqlite +
-// std::fs. The React frontend is unchanged — a small `window.api` shim maps its
-// calls onto these commands.
+// process. Everything links wina-core directly — the app is a single
+// self-contained binary with no sidecar.
+//
+// Case metadata and data reads (categories, result tables, $MFT browse, search,
+// bookmarks) run in-process via wina-core/rusqlite. PARSING, however, runs in a
+// child process: this same executable re-invoked with the hidden --__parse flag
+// (see run_as_parse_worker). That keeps the heavy work off the GUI process and,
+// crucially, makes cancel instant — a process can be killed, a thread can't.
+//
+// The React frontend is unchanged — a small `window.api` shim maps its calls
+// onto these commands.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod shellbag;
+
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OpenFlags};
@@ -53,6 +62,7 @@ struct Host {
     last_run_at: Option<String>,
     last_run_status: Option<String>,
     artifacts_run: Vec<String>,
+    last_run_duration_secs: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -83,6 +93,7 @@ fn gui_host(case_id: &str, h: &case_store::Host, cd: &Path) -> Host {
         last_run_at: h.last_run_at.clone(),
         last_run_status: h.last_run_status.clone(),
         artifacts_run: h.artifacts_run.clone(),
+        last_run_duration_secs: h.last_run_duration_secs,
     }
 }
 
@@ -211,33 +222,83 @@ struct PipelineLogEntry { line: String, stream: String }
 #[serde(rename_all = "camelCase")]
 struct PipelineResult { exit_code: Option<i32> }
 
+/// Tracks the running parse child so cancel can kill it outright.
+#[derive(Default)]
+struct PipelineState(std::sync::Mutex<Option<std::process::Child>>);
+
 #[tauri::command]
-async fn run_host(app: AppHandle, options: RunHostOptions) -> Result<PipelineResult, String> {
+async fn run_host(app: AppHandle, state: tauri::State<'_, PipelineState>, options: RunHostOptions) -> Result<PipelineResult, String> {
+    {
+        let g = state.0.lock().unwrap();
+        if g.is_some() { return Ok(PipelineResult { exit_code: Some(-1) }); } // already running
+    }
     let cd = cases_dir();
     std::fs::create_dir_all(&cd).ok();
-    let only = options.only
-        .filter(|v| !v.is_empty())
-        .map(|v| v.into_iter().collect::<std::collections::HashSet<String>>());
-    let case_id = options.case_id;
-    let host_id = options.host_id;
-    let app2 = app.clone();
-    // Runs on a blocking thread; the pipeline's per-thread log sink (set here)
-    // streams progress lines out as `pipeline-log` events.
-    let code = tauri::async_runtime::spawn_blocking(move || {
-        pipeline::set_log_sink(Some(Box::new(move |line: &str| {
-            let _ = app2.emit("pipeline-log", PipelineLogEntry { line: line.to_string(), stream: "stdout".to_string() });
-        })));
-        let res = pipeline::run_host(&case_id, &host_id, &cd, only);
-        pipeline::set_log_sink(None);
-        match res { Ok(()) => 0i32, Err(_) => -1i32 }
-    }).await.map_err(|e| e.to_string())?;
-    Ok(PipelineResult { exit_code: Some(code) })
+
+    // Parsing runs in a CHILD PROCESS (this same executable, re-invoked with the
+    // hidden --__parse flag) rather than a thread. A thread can't be killed in
+    // Rust, so a cancel could only take effect at the pipeline's next poll —
+    // and a single long library call (notatin's deleted-cell recovery on a big
+    // hive) has no poll point inside it, which made cancel look broken. A child
+    // process can simply be killed, so cancel is immediate. The app stays a
+    // single self-contained binary (no sidecar).
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let mut args: Vec<String> = vec![
+        PARSE_FLAG.to_string(), options.case_id, options.host_id,
+        cd.to_string_lossy().to_string(),
+    ];
+    if let Some(only) = options.only.filter(|v| !v.is_empty()) { args.push(only.join(",")); }
+
+    let mut child = Command::new(exe).args(&args)
+        .stdout(Stdio::piped()).stderr(Stdio::piped())
+        .spawn().map_err(|e| format!("failed to start parser process: {}", e))?;
+
+    // Stream the child's stdout/stderr as `pipeline-log` events.
+    let pump = |app: &AppHandle, reader: Option<Box<dyn std::io::Read + Send>>, stream: &'static str| {
+        if let Some(r) = reader {
+            let app = app.clone();
+            std::thread::spawn(move || {
+                use std::io::BufRead;
+                for line in std::io::BufReader::new(r).lines().map_while(Result::ok) {
+                    if line.is_empty() { continue; }
+                    let _ = app.emit("pipeline-log", PipelineLogEntry { line, stream: stream.to_string() });
+                }
+            });
+        }
+    };
+    pump(&app, child.stdout.take().map(|o| Box::new(o) as Box<dyn std::io::Read + Send>), "stdout");
+    pump(&app, child.stderr.take().map(|e| Box::new(e) as Box<dyn std::io::Read + Send>), "stderr");
+
+    *state.0.lock().unwrap() = Some(child);
+
+    // Poll for exit so cancel_pipeline can still reach the child while it runs.
+    loop {
+        {
+            let mut g = state.0.lock().unwrap();
+            match g.as_mut() {
+                None => return Ok(PipelineResult { exit_code: Some(-1) }), // cancelled
+                Some(ch) => {
+                    if let Ok(Some(status)) = ch.try_wait() {
+                        *g = None;
+                        return Ok(PipelineResult { exit_code: status.code() });
+                    }
+                }
+            }
+        }
+        tokio_sleep(120).await;
+    }
+}
+
+async fn tokio_sleep(ms: u64) {
+    // Small helper so the poll loop yields instead of blocking an async worker.
+    tauri::async_runtime::spawn_blocking(move || std::thread::sleep(std::time::Duration::from_millis(ms)))
+        .await.ok();
 }
 
 #[tauri::command]
-fn cancel_pipeline() -> bool {
-    pipeline::CANCEL.store(true, std::sync::atomic::Ordering::Relaxed);
-    true
+fn cancel_pipeline(state: tauri::State<'_, PipelineState>) -> bool {
+    let mut g = state.0.lock().unwrap();
+    if let Some(mut child) = g.take() { let _ = child.kill(); let _ = child.wait(); true } else { false }
 }
 
 // --- commands: result browsing (in-process sqlite) -------------------------
@@ -400,6 +461,141 @@ fn search_case(query: String, hosts: Vec<SearchHost>) -> Vec<SearchHit> {
     hits
 }
 
+// --- commands: cross-artifact path references ------------------------------
+
+/// One other-artifact sighting of a filesystem path — currently JumpList
+/// entries; `kind` is open so Shellbag/LNK/Prefetch can be added without a
+/// frontend change. `path` is lowercased for matching against $MFT paths.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PathReference {
+    path: String,
+    kind: String,
+    account: String,
+    label: String,
+    fields: Map<String, Value>,
+}
+
+/// Normalize a path to the volume-relative, lowercased form $MFT uses:
+/// drop a leading drive letter (`C:\Windows` -> `\windows`) and lowercase.
+/// UNC paths (`\\host\share`) and already-relative paths pass through lowered.
+fn to_volume_relative(p: &str) -> String {
+    let low = p.to_lowercase().replace('/', "\\");
+    let b = low.as_bytes();
+    if b.len() >= 2 && b[1] == b':' && b[0].is_ascii_alphabetic() {
+        let rest = &low[2..];
+        if rest.is_empty() { "\\".to_string() }
+        else if rest.starts_with('\\') { rest.to_string() }
+        else { format!("\\{}", rest) }
+    } else {
+        low
+    }
+}
+
+/// The account a per-user artifact belongs to: the path component right after
+/// a LNK/JUMPLIST collection folder (…/LNK/<account>/Recent/…).
+fn account_from_source(src: &str) -> String {
+    let parts: Vec<&str> = src.split(['/', '\\']).collect();
+    for (i, p) in parts.iter().enumerate() {
+        let up = p.to_uppercase();
+        if (up == "LNK" || up == "JUMPLIST") && i + 1 < parts.len() {
+            return parts[i + 1].to_string();
+        }
+    }
+    String::new()
+}
+
+/// Every cross-artifact reference to a filesystem path for this host, so the
+/// $MFT explorer can tag files that also appear in a JumpList (etc.) and show
+/// the details on demand. Returned as a flat list; the frontend indexes it by
+/// `path`.
+#[tauri::command]
+fn path_references(host_dir: String) -> Vec<PathReference> {
+    let mut out = Vec::new();
+    let jl = PathBuf::from(&host_dir).join("JUMPLIST").join("JumpList_Entries.sqlite");
+    if let Ok(conn) = open_ro(&jl.to_string_lossy()) {
+        let sql = "SELECT target_path, app_id, jumplist_type, arguments, working_directory, \
+                   machine_id, timestamp, created_time, modified_time, _source_file \
+                   FROM JumpList_Entries WHERE target_path IS NOT NULL AND target_path != ''";
+        if let Ok(rows) = query_rows(&conn, sql, &[]) {
+            for r in rows {
+                let get = |k: &str| r.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let target = get("target_path");
+                if target.is_empty() { continue; }
+                let src = get("_source_file");
+                let mut fields = Map::new();
+                for k in ["target_path", "app_id", "jumplist_type", "arguments", "working_directory",
+                          "machine_id", "timestamp", "created_time", "modified_time", "_source_file"] {
+                    let v = get(k);
+                    if !v.is_empty() { fields.insert(k.to_string(), Value::from(v)); }
+                }
+                out.push(PathReference {
+                    path: to_volume_relative(&target),
+                    kind: "Jumplist".to_string(),
+                    account: account_from_source(&src),
+                    label: target.clone(),
+                    fields,
+                });
+            }
+        }
+    }
+    out.extend(shellbag_references(&host_dir));
+    out
+}
+
+/// Decode shellbags from the host's registry dumps and turn them into path
+/// references (kind = "Shellbag").
+fn shellbag_references(host_dir: &str) -> Vec<PathReference> {
+    let reg_dir = PathBuf::from(host_dir).join("REGISTRY");
+    let mut rows: Vec<shellbag::BagRow> = Vec::new();
+    let files = match std::fs::read_dir(&reg_dir) {
+        Ok(rd) => rd.filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().map(|x| x == "sqlite").unwrap_or(false)).collect::<Vec<_>>(),
+        Err(_) => return vec![],
+    };
+    for f in files {
+        // Account = the hive's user prefix (Administrator_UsrClass.dat -> Administrator).
+        let stem = f.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+        let account = stem.split('_').next().unwrap_or(&stem).to_string();
+        let conn = match open_ro(&f.to_string_lossy()) { Ok(c) => c, Err(_) => continue };
+        let sql = "SELECT key_path, value_name, value_data FROM Registry \
+                   WHERE lower(key_path) LIKE '%bagmru%' AND value_name GLOB '[0-9]*' \
+                   AND value_data IS NOT NULL AND value_data != ''";
+        let mut stmt = match conn.prepare(sql) { Ok(s) => s, Err(_) => continue };
+        let it = stmt.query_map([], |r| Ok((
+            r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?,
+        )));
+        if let Ok(it) = it {
+            for row in it.filter_map(|x| x.ok()) {
+                let (key_path, value_name, hex) = row;
+                let data = unhex(&hex);
+                if data.is_empty() { continue; }
+                rows.push(shellbag::BagRow { key_path, value_name, data, account: account.clone() });
+            }
+        }
+    }
+    shellbag::reconstruct(rows).into_iter().map(|s| {
+        let mut fields = Map::new();
+        fields.insert("path".into(), Value::from(s.display.clone()));
+        if !s.account.is_empty() { fields.insert("account".into(), Value::from(s.account.clone())); }
+        PathReference { path: s.path, kind: "Shellbag".to_string(), account: s.account, label: s.display, fields }
+    }).collect()
+}
+
+/// Decode a lowercase/uppercase hex string to bytes ("" or odd length -> empty).
+fn unhex(s: &str) -> Vec<u8> {
+    let b = s.as_bytes();
+    if b.len() % 2 != 0 { return Vec::new(); }
+    let hv = |c: u8| -> Option<u8> { match c { b'0'..=b'9' => Some(c - b'0'), b'a'..=b'f' => Some(c - b'a' + 10), b'A'..=b'F' => Some(c - b'A' + 10), _ => None } };
+    let mut out = Vec::with_capacity(b.len() / 2);
+    let mut i = 0;
+    while i + 1 < b.len() {
+        match (hv(b[i]), hv(b[i + 1])) { (Some(h), Some(l)) => out.push(h << 4 | l), _ => return Vec::new() }
+        i += 2;
+    }
+    out
+}
+
 // --- commands: bookmarks (JSON file) ---------------------------------------
 
 fn bookmarks_path(case_dir: &str) -> PathBuf { PathBuf::from(case_dir).join("bookmarks.json") }
@@ -503,14 +699,48 @@ async fn pick_folder(app: AppHandle) -> Option<String> {
     rx.recv().ok().flatten().map(|p| p.to_string())
 }
 
+/// Hidden flag that turns this executable into the parse worker:
+///   <exe> --__parse <caseId> <hostId> <casesDir> [only,comma,separated]
+/// Progress goes to stdout; the parent streams it as `pipeline-log` events and
+/// kills this process on cancel.
+const PARSE_FLAG: &str = "--__parse";
+
+/// Runs the pipeline and exits — never opens a window. Returns None when the
+/// args aren't the parse-worker form (i.e. normal GUI launch).
+fn run_as_parse_worker() -> Option<i32> {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() < 5 || args[1] != PARSE_FLAG { return None; }
+    let (case_id, host_id, cases_dir) = (&args[2], &args[3], std::path::PathBuf::from(&args[4]));
+    let only = args.get(5)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.split(',').map(|x| x.to_string()).collect::<std::collections::HashSet<String>>());
+    // Sink stays unset, so pipeline prints progress to stdout for the parent.
+    match pipeline::run_host(case_id, host_id, &cases_dir, only) {
+        Ok(()) => Some(0),
+        Err(e) => { eprintln!("[!] {}", e); Some(1) }
+    }
+}
+
 fn main() {
+    if let Some(code) = run_as_parse_worker() {
+        std::process::exit(code);
+    }
+    // Debug: `--__shellbag <hostDir>` prints reconstructed shellbag refs.
+    let a: Vec<String> = std::env::args().collect();
+    if a.len() >= 3 && a[1] == "--__shellbag" {
+        for r in shellbag_references(&a[2]) {
+            println!("[{}] {}  {}", r.account, r.label, r.path);
+        }
+        std::process::exit(0);
+    }
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .manage(PipelineState::default())
         .invoke_handler(tauri::generate_handler![
             list_cases, create_case, create_host, delete_case, delete_host, list_artifacts,
             run_host, cancel_pipeline, list_categories, list_result_files, read_result_file,
             list_column_values, mft_children, mft_search, mft_row, search_case,
-            list_bookmarks, toggle_bookmark, update_bookmark_note, pick_folder
+            list_bookmarks, toggle_bookmark, update_bookmark_note, pick_folder, path_references
         ])
         .setup(|_app| Ok(()))
         .run(tauri::generate_context!())

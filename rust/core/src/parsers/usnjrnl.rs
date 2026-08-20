@@ -50,6 +50,7 @@ pub fn parse_usn_stream(path: &Path, out: &Path) -> Result<usize> {
     let mut writer = StreamWriter::create(out, USN_TABLE, USN_FIELD_ORDER, USN_FIELD_ORDER)?;
     let mut pos = 0usize;
     while pos < n {
+        if crate::pipeline::cancelled() { break; }
         if data[pos] == 0 { pos += 1; continue; }
         if pos + 4 > n { break; }
         let reclen = u32le(&data, pos) as usize;

@@ -13,31 +13,34 @@ use crate::parsers::{amcache, browser_cache, browser_history, eventlog, powershe
 use crate::sqlite::{write_table, write_table_cols, Row};
 use crate::overview;
 
-use std::cell::RefCell;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Mutex;
 
-thread_local! {
-    // When set (by the GUI), progress lines route here instead of stdout so the
-    // desktop app can stream them; unset (CLI) prints to stdout as before.
-    static LOG_SINK: RefCell<Option<Box<dyn FnMut(&str)>>> = RefCell::new(None);
-}
+// Global progress sink (Send). When set (by the GUI), progress lines route here
+// instead of stdout; unset (CLI) prints to stdout. Global + Send so worker
+// threads (parallel registry parsing) reach the same sink.
+static LOG_SINK: Mutex<Option<Box<dyn FnMut(&str) + Send>>> = Mutex::new(None);
 
-/// Install (or clear) the per-thread progress sink. Call on the SAME thread that
-/// runs `run_host`.
-pub fn set_log_sink(sink: Option<Box<dyn FnMut(&str)>>) {
-    LOG_SINK.with(|s| *s.borrow_mut() = sink);
+/// Install (or clear) the progress sink.
+pub fn set_log_sink(sink: Option<Box<dyn FnMut(&str) + Send>>) {
+    *LOG_SINK.lock().unwrap() = sink;
 }
 
 fn emit(msg: &str) {
-    LOG_SINK.with(|s| {
-        let mut b = s.borrow_mut();
-        match b.as_mut() { Some(f) => f(msg), None => println!("{}", msg) }
-    });
+    if let Ok(mut g) = LOG_SINK.lock() {
+        match g.as_mut() { Some(f) => f(msg), None => println!("{}", msg) }
+    }
 }
 
 /// Cooperative cancel flag: `run_host` clears it at start and checks it before
 /// each artifact; `cancel` (from the GUI) sets it to stop the remaining work.
+/// Parsers poll `cancelled()` inside their row loops so a long single artifact
+/// (e.g. a big registry hive) stops promptly too, not only between artifacts.
 pub static CANCEL: AtomicBool = AtomicBool::new(false);
+
+/// True once the user requested cancel. Parsers should break out of their
+/// row/entry loops when this returns true.
+pub fn cancelled() -> bool { CANCEL.load(Ordering::Relaxed) }
 
 /// Every artifact the pipeline knows how to parse, in run order.
 pub const ARTIFACT_NAMES: &[&str] = &[
@@ -62,6 +65,7 @@ pub fn run_host(case_id: &str, host_id: &str, cases_dir: &Path, only: Option<Has
     let out_dir = case_store::host_dir(cases_dir, case_id, host_id);
     let target = std::path::PathBuf::from(&host.target_dir);
     CANCEL.store(false, Ordering::Relaxed);
+    let started = std::time::Instant::now();
 
     if only.is_none() {
         if let Ok(entries) = std::fs::read_dir(&out_dir) {
@@ -126,14 +130,35 @@ pub fn run_host(case_id: &str, host_id: &str, cases_dir: &Path, only: Option<Has
         });
         let paths = finder::dedupe_by_content(all);
         found(&paths);
+        // Assign each hive a unique output name (sequential), then parse hives
+        // in parallel — each writes its own sqlite, so there's no shared state.
+        // notatin's deleted-cell/transaction-log recovery is CPU-heavy and
+        // dominates this step; spreading the hives across cores cuts wall time.
         let mut taken = HashSet::new();
+        let mut jobs: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
         for p in &paths {
             let base = p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "hive".into());
             let name = uniq_name(&base, &mut taken);
-            let out = cat("REGISTRY").join(format!("{}.sqlite", name));
-            let n = registry::parse_hive_stream(p, &out)?;
-            emit(&format!("[+] {} rows -> {} [Registry]", n, out.display()));
+            jobs.push((p.clone(), cat("REGISTRY").join(format!("{}.sqlite", name))));
         }
+        // Cap concurrency: each big hive's recovery can use hundreds of MB.
+        let workers = std::thread::available_parallelism().map(|n| n.get().min(4)).unwrap_or(2);
+        let next = AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..workers {
+                s.spawn(|| loop {
+                    if CANCEL.load(Ordering::Relaxed) { break; } // stop starting new hives
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= jobs.len() { break; }
+                    let (src, out) = &jobs[i];
+                    if CANCEL.load(Ordering::Relaxed) { break; }
+                    match registry::parse_hive_stream(src, out) {
+                        Ok(n) => emit(&format!("[+] {} rows -> {} [Registry]", n, out.display())),
+                        Err(e) => emit(&format!("[!] {} failed: {}", out.display(), e)),
+                    }
+                });
+            }
+        });
     }); }
 
     // --- UsnJrnl (FILESYSTEM/UsnJrnl_Records.sqlite) ---
@@ -267,29 +292,36 @@ pub fn run_host(case_id: &str, host_id: &str, cases_dir: &Path, only: Option<Has
         }
     }); }
 
-    emit(&format!("=== _OVERVIEW ==="));
-    let ov = out_dir.join("_OVERVIEW");
-    let write_ov = |name: &str, rows: Vec<Row>, skip_empty: bool| -> Result<()> {
-        if rows.is_empty() && skip_empty { return Ok(()); }
-        let out = ov.join(format!("{}.sqlite", name));
-        write_table(&out, name, &rows, &[])?;
-        emit(&format!("[+] {} rows -> {}", rows.len(), out.display()));
-        Ok(())
-    };
-    write_ov("ScheduledTasks", overview::build_scheduled_tasks(&out_dir), true)?;
-    write_ov("RdpCache", overview::build_rdp_cache(&out_dir), true)?;
-    write_ov("Defender", overview::build_defender(&out_dir), false)?;
-    write_ov("RemoteDesktopHistory", overview::build_remote_desktop_history(&out_dir), false)?;
-    write_ov("SmbHistory", overview::build_smb_history(&out_dir), true)?;
-    write_ov("PowerShellHistory", overview::build_powershell_history(&out_dir), false)?;
-    write_ov("BrowserActivity", overview::build_browser_history(&out_dir), false)?;
-    write_ov("TargetInfo", overview::build_target_info(&out_dir), false)?;
-    write_ov("ExecutionHistory", overview::build_execution_history(&out_dir), false)?;
-    write_ov("RegistryFindings", overview::build_registry_findings(&out_dir), false)?;
+    // Skip the correlation stage entirely if the run was cancelled.
+    if !cancelled() {
+        emit(&format!("=== _OVERVIEW ==="));
+        let ov = out_dir.join("_OVERVIEW");
+        let write_ov = |name: &str, rows: Vec<Row>, skip_empty: bool| -> Result<()> {
+            if rows.is_empty() && skip_empty { return Ok(()); }
+            let out = ov.join(format!("{}.sqlite", name));
+            write_table(&out, name, &rows, &[])?;
+            emit(&format!("[+] {} rows -> {}", rows.len(), out.display()));
+            Ok(())
+        };
+        write_ov("ScheduledTasks", overview::build_scheduled_tasks(&out_dir), true)?;
+        write_ov("RdpCache", overview::build_rdp_cache(&out_dir), true)?;
+        write_ov("Defender", overview::build_defender(&out_dir), false)?;
+        write_ov("RemoteDesktopHistory", overview::build_remote_desktop_history(&out_dir), false)?;
+        write_ov("SmbHistory", overview::build_smb_history(&out_dir), true)?;
+        write_ov("PowerShellHistory", overview::build_powershell_history(&out_dir), false)?;
+        write_ov("BrowserActivity", overview::build_browser_history(&out_dir), false)?;
+        write_ov("TargetInfo", overview::build_target_info(&out_dir), false)?;
+        write_ov("ExecutionHistory", overview::build_execution_history(&out_dir), false)?;
+        write_ov("RegistryFindings", overview::build_registry_findings(&out_dir), false)?;
+    } else {
+        emit(&format!("=== 취소됨 — 종합 분석 건너뜀 ==="));
+    }
 
     let run_at = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let status = if cancelled() { "cancelled" } else if had_error { "error" } else { "ok" };
     case_store::update_host_status(case_id, host_id, cases_dir,
-        &run_at, if had_error { "error" } else { "ok" }, artifacts_run)?;
+        &run_at, status, artifacts_run,
+        Some(started.elapsed().as_secs_f64()))?;
     Ok(())
 }
 

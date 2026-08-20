@@ -58,6 +58,15 @@ const linkButtonStyle: React.CSSProperties = {
   fontWeight: 600,
 };
 
+// "45초" / "3분 12초" / "1시간 4분" from a duration in seconds.
+function formatDuration(secs: number): string {
+  const s = Math.max(0, Math.round(secs));
+  if (s < 60) return `${s}초`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}분 ${s % 60}초`;
+  return `${Math.floor(m / 60)}시간 ${m % 60}분`;
+}
+
 function StatusPill({ status }: { status: string | null }) {
   if (status === "ok")
     return <span style={{ fontSize: 11, fontWeight: 600, color: "var(--success)", background: "var(--success-subtle)", padding: "2px 8px", borderRadius: "var(--radius-lg)" }}>✓ 완료</span>;
@@ -248,6 +257,14 @@ export default function RunPipeline({ activeCase, onBack, onChanged, onOpenHost,
                 <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                   <span style={{ fontWeight: 700, fontSize: 13.5 }}>🖥️ {h.name}</span>
                   <StatusPill status={h.lastRunStatus} />
+                  {h.lastRunStatus === "ok" && h.lastRunDurationSecs != null && (
+                    <span
+                      title="마지막 파싱 소요 시간"
+                      style={{ fontSize: 11, fontWeight: 600, color: "var(--accent)", background: "var(--accent-subtle, var(--bg-elevated))", padding: "2px 8px", borderRadius: "var(--radius-lg)" }}
+                    >
+                      ⏱ {formatDuration(h.lastRunDurationSecs)} 소요
+                    </span>
+                  )}
                 </div>
                 <div style={{ fontSize: 11.5, color: "var(--text-faint)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", marginTop: 3 }} title={h.targetDir}>
                   📁 {h.targetDir}

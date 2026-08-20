@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { Bookmark } from "@/lib/types";
+import type { Bookmark, PathReference } from "@/lib/types";
 
 // $MFT Explorer — a two-pane view: a lazily-loaded folder tree on the left,
 // a live detail panel on the right that updates as you click rows (files AND
@@ -35,6 +35,25 @@ const FN_FIELDS: { key: string; label: string }[] = [
   { key: "fn_accessed", label: "접근 (Accessed)" },
 ];
 
+/** dbPath is <hostDir>/_OVERVIEW/MFT_Records.sqlite — strip the tail to get
+ *  the host folder the other artifacts live under. */
+function hostDirOf(dbPath: string): string {
+  const parts = dbPath.split(/[\\/]/);
+  return parts.slice(0, Math.max(0, parts.length - 2)).join("/");
+}
+
+type RefMap = Map<string, PathReference[]>;
+
+/// References for a row's path, optionally limited to selected accounts
+/// (accountFilter === null means "no filtering — show all").
+function refsFor(refs: RefMap, row: Row, accountFilter: Set<string> | null): PathReference[] {
+  const p = (row.path || "").toLowerCase();
+  if (!p) return [];
+  const all = refs.get(p) ?? [];
+  if (!accountFilter) return all;
+  return all.filter((r) => accountFilter.has(r.account));
+}
+
 function isDir(r: Row): boolean {
   return r.is_directory === "Y";
 }
@@ -57,6 +76,38 @@ export default function MftView({ dbPath, tableBookmarks, onToggleBookmark }: Pr
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [loadingEntry, setLoadingEntry] = useState<Set<string>>(new Set());
   const [selected, setSelected] = useState<Row | null>(null);
+  // Cross-artifact sightings of a path (JumpList today), indexed by lowercased
+  // path so the tree can tag rows without a query per row.
+  const [pathRefs, setPathRefs] = useState<RefMap>(new Map());
+  const [refModal, setRefModal] = useState<PathReference | null>(null);
+  // Accounts seen across all references, and which are currently shown. An
+  // investigator can uncheck accounts unrelated to the attack so their
+  // JumpList/Shellbag tags stop cluttering the tree.
+  const [refAccounts, setRefAccounts] = useState<string[]>([]);
+  const [selAccounts, setSelAccounts] = useState<Set<string>>(new Set());
+
+  useEffect(() => {
+    let alive = true;
+    window.api.pathReferences(hostDirOf(dbPath)).then((list) => {
+      if (!alive) return;
+      const m: RefMap = new Map();
+      const accts = new Set<string>();
+      for (const r of list) {
+        const arr = m.get(r.path);
+        if (arr) arr.push(r); else m.set(r.path, [r]);
+        accts.add(r.account);
+      }
+      const sorted = [...accts].sort((a, b) => a.localeCompare(b));
+      setPathRefs(m);
+      setRefAccounts(sorted);
+      setSelAccounts(new Set(sorted)); // default: all accounts shown
+    }).catch(() => {});
+    return () => { alive = false; };
+  }, [dbPath]);
+
+  const toggleAccount = useCallback((acct: string) => {
+    setSelAccounts((s) => { const n = new Set(s); if (n.has(acct)) n.delete(acct); else n.add(acct); return n; });
+  }, []);
 
   const [search, setSearch] = useState("");
   const [results, setResults] = useState<Row[] | null>(null);
@@ -148,11 +199,25 @@ export default function MftView({ dbPath, tableBookmarks, onToggleBookmark }: Pr
             <span onClick={() => setSearch("")} style={{ position: "absolute", right: 8, top: "50%", transform: "translateY(-50%)", cursor: "pointer", color: "var(--text-faint)", fontSize: 13 }}>✕</span>
           )}
         </div>
+        {refAccounts.length > 0 && (
+          <div style={{ display: "flex", alignItems: "center", flexWrap: "wrap", gap: 8, marginTop: 10 }}>
+            <span style={{ fontSize: 11, color: "var(--text-faint)" }}>👤 JumpList/Shellbag 계정:</span>
+            {refAccounts.map((a) => {
+              const on = selAccounts.has(a);
+              return (
+                <label key={a || "(none)"} style={{ display: "inline-flex", alignItems: "center", gap: 4, cursor: "pointer", fontSize: 11.5, fontWeight: 600, padding: "2px 8px", borderRadius: "var(--radius-lg)", border: `1px solid ${on ? "var(--accent)" : "var(--border)"}`, color: on ? "var(--accent)" : "var(--text-faint)", background: on ? "var(--accent-subtle, transparent)" : "transparent" }}>
+                  <input type="checkbox" checked={on} onChange={() => toggleAccount(a)} style={{ accentColor: "var(--accent)", width: 12, height: 12 }} />
+                  {a || "(계정 미상)"}
+                </label>
+              );
+            })}
+          </div>
+        )}
       </div>
 
       <div style={{ flex: 1, minHeight: 0, display: "flex", borderTop: "1px solid var(--border)" }}>
-        {/* left: Explorer (≈75%) */}
-        <div style={{ flex: 3, minWidth: 0, overflow: "auto", padding: "8px 10px 16px" }}>
+        {/* left: Explorer (60%) */}
+        <div style={{ flex: 6, minWidth: 0, overflow: "auto", padding: "8px 10px 16px" }}>
           {results !== null ? (
             <SearchResults rows={results} searching={searching} bmRowids={bmRowids} selectedRowid={selectedRowid} onSelect={setSelected} />
           ) : root === null ? (
@@ -170,15 +235,17 @@ export default function MftView({ dbPath, tableBookmarks, onToggleBookmark }: Pr
                 selectedRowid={selectedRowid}
                 onToggle={toggle}
                 onSelect={setSelected}
+                refs={pathRefs}
+                accountFilter={selAccounts}
               />
             ))
           )}
         </div>
 
-        {/* right: live detail (≈25%) */}
-        <div style={{ flex: 1, minWidth: 260, maxWidth: 420, overflow: "auto", borderLeft: "1px solid var(--border)", background: "var(--bg-panel)" }}>
+        {/* right: live detail (40%) */}
+        <div style={{ flex: 4, minWidth: 320, overflow: "auto", borderLeft: "1px solid var(--border)", background: "var(--bg-panel)" }}>
           {selected ? (
-            <DetailPane row={selected} bmFieldKeys={bmFieldKeys} onToggleBookmark={onToggleBookmark} />
+            <DetailPane row={selected} bmFieldKeys={bmFieldKeys} onToggleBookmark={onToggleBookmark} refs={refsFor(pathRefs, selected, selAccounts)} onOpenRef={setRefModal} />
           ) : (
             <div style={{ padding: 20, color: "var(--text-faint)", fontSize: 12.5, textAlign: "center", marginTop: 40 }}>
               왼쪽에서 파일·폴더를 클릭하면
@@ -188,6 +255,7 @@ export default function MftView({ dbPath, tableBookmarks, onToggleBookmark }: Pr
           )}
         </div>
       </div>
+      {refModal && <RefModal ref={refModal} onClose={() => setRefModal(null)} />}
     </div>
   );
 }
@@ -202,6 +270,8 @@ function TreeNode({
   selectedRowid,
   onToggle,
   onSelect,
+  refs,
+  accountFilter,
 }: {
   row: Row;
   depth: number;
@@ -212,6 +282,8 @@ function TreeNode({
   selectedRowid: number | null;
   onToggle: (r: Row) => void;
   onSelect: (r: Row) => void;
+  refs: RefMap;
+  accountFilter: Set<string> | null;
 }) {
   const dir = isDir(row);
   const open = expanded.has(row.entry);
@@ -220,14 +292,32 @@ function TreeNode({
   const bm = bmRowids.has(Number(row.__rowid));
   const isSel = selectedRowid !== null && Number(row.__rowid) === selectedRowid;
 
+  // Clicking a folder row selects it AND toggles open/closed — click to open,
+  // click again to collapse (the little arrow does the same).
+  const handleRowClick = () => { onSelect(row); if (dir) onToggle(row); };
+
+  // (account, kind) chips for other artifacts that reference this exact path,
+  // de-duplicated (a path can appear many times in one JumpList).
+  const rowTags = (() => {
+    const seen = new Set<string>();
+    const out: { account: string; kind: string }[] = [];
+    for (const r of refsFor(refs, row, accountFilter)) {
+      const key = `${r.account}|${r.kind}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({ account: r.account, kind: r.kind });
+    }
+    return out;
+  })();
+
   return (
     <>
       <div
-        onClick={() => onSelect(row)}
+        onClick={handleRowClick}
         style={{ display: "flex", alignItems: "center", gap: 4, padding: "3px 6px", paddingLeft: 6 + depth * 16, borderRadius: "var(--radius-sm)", cursor: "pointer", opacity: deleted ? 0.55 : 1, background: isSel ? "var(--bg-selected)" : "transparent" }}
         onMouseEnter={(e) => { if (!isSel) e.currentTarget.style.background = "var(--bg-hover)"; }}
         onMouseLeave={(e) => { if (!isSel) e.currentTarget.style.background = "transparent"; }}
-        title={dir ? "클릭: 상세 · 화살표: 펼치기" : "클릭: 상세 보기"}
+        title={dir ? "클릭: 열기 + 상세 · 화살표: 접기/펼치기" : "클릭: 상세 보기"}
       >
         <span
           onClick={(e) => {
@@ -244,6 +334,11 @@ function TreeNode({
         <span style={{ fontSize: 12.5, color: "var(--text)", wordBreak: "break-all" }}>{row.file_name || "(이름 없음)"}</span>
         {deleted && <span style={{ fontSize: 9.5, fontWeight: 700, color: "var(--danger)", border: "1px solid var(--danger)", borderRadius: 3, padding: "0 4px" }}>삭제됨</span>}
         {bm && <span style={{ fontSize: 11, color: "var(--warning)" }}>★</span>}
+        {rowTags.map((t, i) => (
+          <span key={i} title={`${t.account || "?"} 계정의 ${t.kind}`} style={{ fontSize: 9.5, fontWeight: 700, color: "var(--accent)", border: "1px solid var(--accent)", borderRadius: 3, padding: "0 4px", whiteSpace: "nowrap" }}>
+            {t.account ? `${t.account}, ${t.kind}` : t.kind}
+          </span>
+        ))}
         {!dir && <span style={{ marginLeft: "auto", fontSize: 10.5, color: "var(--text-faint)", fontFamily: "var(--mono)" }}>{fmtSize(row.file_size)}</span>}
       </div>
       {dir && open && (
@@ -264,6 +359,8 @@ function TreeNode({
               selectedRowid={selectedRowid}
               onToggle={onToggle}
               onSelect={onSelect}
+              refs={refs}
+              accountFilter={accountFilter}
             />
           ))
         )
@@ -303,7 +400,7 @@ function SearchResults({ rows, searching, bmRowids, selectedRowid, onSelect }: {
   );
 }
 
-function DetailPane({ row, bmFieldKeys, onToggleBookmark }: { row: Row; bmFieldKeys: Set<string>; onToggleBookmark: (rowid: number, field: string) => void }) {
+function DetailPane({ row, bmFieldKeys, onToggleBookmark, refs, onOpenRef }: { row: Row; bmFieldKeys: Set<string>; onToggleBookmark: (rowid: number, field: string) => void; refs: PathReference[]; onOpenRef: (r: PathReference) => void }) {
   const dir = isDir(row);
   const rowid = Number(row.__rowid);
   const meta: [string, string][] = [
@@ -359,6 +456,58 @@ function DetailPane({ row, bmFieldKeys, onToggleBookmark }: { row: Row; bmFieldK
 
       <div style={{ fontSize: 10.5, fontWeight: 700, color: "var(--text-faint)", margin: "14px 0 2px" }}>$FILE_NAME (0x30)</div>
       {FN_FIELDS.map((f) => <TimeRow key={f.key} f={f} />)}
+
+      {refs.length > 0 && (
+        <>
+          <div style={{ fontSize: 10.5, fontWeight: 700, color: "var(--accent)", margin: "16px 0 2px" }}>
+            다른 아티팩트에서 발견 ({refs.length})
+          </div>
+          <div style={{ fontSize: 10, color: "var(--text-faint)", marginBottom: 4 }}>클릭하면 상세 내용을 볼 수 있습니다</div>
+          {refs.map((r, i) => (
+            <div
+              key={i}
+              onClick={() => onOpenRef(r)}
+              style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 8px", marginBottom: 4, borderRadius: "var(--radius-sm)", cursor: "pointer", border: "1px solid var(--border)", background: "var(--bg-elevated)" }}
+              onMouseEnter={(e) => (e.currentTarget.style.background = "var(--bg-hover)")}
+              onMouseLeave={(e) => (e.currentTarget.style.background = "var(--bg-elevated)")}
+            >
+              <span style={{ fontSize: 9.5, fontWeight: 700, color: "var(--accent)", border: "1px solid var(--accent)", borderRadius: 3, padding: "0 4px", whiteSpace: "nowrap" }}>{r.kind}</span>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontSize: 11.5, color: "var(--text)" }}>{r.account || "(계정 미상)"}</div>
+                {r.label && <div style={{ fontSize: 10, color: "var(--text-faint)", fontFamily: "var(--mono)", wordBreak: "break-all" }}>{r.label}</div>}
+              </div>
+              <span style={{ fontSize: 12, color: "var(--text-faint)" }}>›</span>
+            </div>
+          ))}
+        </>
+      )}
+    </div>
+  );
+}
+
+// Modal showing all raw fields of one cross-artifact reference.
+function RefModal({ ref: r, onClose }: { ref: PathReference; onClose: () => void }) {
+  return (
+    <div
+      onClick={onClose}
+      style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.5)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000 }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{ width: "min(680px, 90vw)", maxHeight: "82vh", overflow: "auto", background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "var(--radius-lg)", boxShadow: "var(--shadow-card)", padding: 20 }}
+      >
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
+          <span style={{ fontSize: 11, fontWeight: 700, color: "var(--accent)", border: "1px solid var(--accent)", borderRadius: 3, padding: "1px 6px" }}>{r.kind}</span>
+          <span style={{ fontSize: 15, fontWeight: 700 }}>{r.account || "(계정 미상)"}</span>
+          <button onClick={onClose} style={{ marginLeft: "auto", background: "transparent", border: "none", color: "var(--text-faint)", fontSize: 18, cursor: "pointer" }}>✕</button>
+        </div>
+        {Object.entries(r.fields).map(([k, v]) => (
+          <div key={k} style={{ display: "flex", gap: 12, padding: "6px 0", borderBottom: "1px solid var(--border-subtle)" }}>
+            <span style={{ flex: "0 0 150px", color: "var(--text-faint)", fontSize: 11.5, fontFamily: "var(--mono)" }}>{k}</span>
+            <span style={{ flex: 1, color: "var(--text)", fontSize: 12, wordBreak: "break-all", fontFamily: "var(--mono)" }}>{v}</span>
+          </div>
+        ))}
+      </div>
     </div>
   );
 }

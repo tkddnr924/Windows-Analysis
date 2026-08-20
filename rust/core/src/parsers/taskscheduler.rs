@@ -152,8 +152,14 @@ pub fn parse_tasks(root: &Path) -> Result<Vec<Row>> {
     for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
         if !entry.file_type().is_file() { continue; }
         let path = entry.path();
-        let raw = match std::fs::read(path) { Ok(d) => d, Err(_) => continue };
-        let head = &raw[..raw.len().min(4096)];
+        // Read only the first 4 KB to test for the task namespace — never the
+        // whole file. A target can hold huge unrelated files (images, dumps);
+        // slurping each one just to check its header made discovery crawl.
+        let mut head = Vec::new();
+        match std::fs::File::open(path) {
+            Ok(f) => { use std::io::Read; if std::io::Read::take(f, 4096).read_to_end(&mut head).is_err() { continue; } }
+            Err(_) => continue,
+        }
         let utf8 = TASK_NAMESPACE.as_bytes().to_vec();
         let utf16: Vec<u8> = TASK_NAMESPACE.bytes().flat_map(|b| [b, 0]).collect();
         let has = |needle: &[u8]| head.windows(needle.len()).any(|w| w == needle);

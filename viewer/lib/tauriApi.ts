@@ -8,7 +8,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type {
   Bookmark, BookmarkInput, Case, CategoryEntry, CsvData, ElectronApi, Host,
-  ListCasesResult, PipelineLogEntry, PipelineResult, ResultFileEntry, RunHostOptions, SearchHit,
+  ListCasesResult, PathReference, PipelineLogEntry, PipelineResult, ResultFileEntry, RunHostOptions, SearchHit,
 } from "./types";
 
 function makeApi(): ElectronApi {
@@ -43,6 +43,7 @@ function makeApi(): ElectronApi {
     listBookmarks: (caseDir) => invoke<Bookmark[]>("list_bookmarks", { caseDir }),
     toggleBookmark: (caseDir, entry: BookmarkInput) => invoke<Bookmark[]>("toggle_bookmark", { caseDir, entry }),
     updateBookmarkNote: (caseDir, id, note) => invoke<Bookmark[]>("update_bookmark_note", { caseDir, id, note }),
+    pathReferences: (hostDir) => invoke<PathReference[]>("path_references", { hostDir }),
   };
 }
 
