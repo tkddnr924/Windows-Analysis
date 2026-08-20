@@ -18,10 +18,32 @@ pub const RDP_TABLE: &str = "RdpBitmapCache";
 pub const CONTENT_MARKER: &str = "RDP8bmp";
 const MAGIC: &[u8] = b"RDP8bmp\x00";
 pub const RDP_FIELD_ORDER: &[&str] = &[
-    "kind", "source_file", "fragment_index", "tile_count", "cols", "rows",
+    "kind", "account", "source_file", "fragment_index", "tile_count", "cols", "rows",
     "tile_index", "count", "width", "height", "key", "image",
     "_source_file", "_status", "_error",
 ];
+
+/// The account an RDP cache file belongs to — the path segment right after the
+/// `RDP_CACHE` collection folder (…/RDP_CACHE/<account>/Cache/Cache0000.bin).
+/// Collected data isn't always laid out that way, so when no account can be
+/// derived from the path this returns "unknown" rather than an empty string.
+fn account_of(path: &std::path::Path) -> String {
+    let parts: Vec<String> = path.components().map(|c| c.as_os_str().to_string_lossy().to_string()).collect();
+    for (i, p) in parts.iter().enumerate() {
+        if p.eq_ignore_ascii_case("RDP_CACHE") && i + 1 < parts.len() {
+            let a = parts[i + 1].trim();
+            if !a.is_empty() && !a.eq_ignore_ascii_case("Cache") { return a.to_string(); }
+        }
+    }
+    // Fallback: the folder above a "Cache" directory.
+    for (i, p) in parts.iter().enumerate() {
+        if p.eq_ignore_ascii_case("Cache") && i >= 1 {
+            let a = parts[i - 1].trim();
+            if !a.is_empty() { return a.to_string(); }
+        }
+    }
+    "unknown".to_string()
+}
 
 const TILE: usize = 64;
 const MOSAIC_COLS: usize = 48;
@@ -300,9 +322,15 @@ pub fn parse_rdpcache(root: &Path) -> Result<Vec<Row>> {
         let (tiles, corrupt) = decode_file(entry.path());
         let src = entry.file_name().to_string_lossy().to_string();
         let full = entry.path().to_string_lossy().to_string();
-        if let Some(m) = mosaic_row(&src, &full, &tiles) { rows.push(m); }
-        rows.extend(tile_rows(&src, &full, &tiles));
-        rows.extend(corrupt);
+        let account = account_of(entry.path());
+        // Collect this file's rows, then stamp the account on every one so the
+        // viewer can group/tag RDP cache by the user it was captured under.
+        let mut file_rows: Vec<Row> = Vec::new();
+        if let Some(m) = mosaic_row(&src, &full, &tiles) { file_rows.push(m); }
+        file_rows.extend(tile_rows(&src, &full, &tiles));
+        file_rows.extend(corrupt);
+        for r in &mut file_rows { r.insert("account".into(), account.clone()); }
+        rows.extend(file_rows);
     }
     Ok(rows)
 }
