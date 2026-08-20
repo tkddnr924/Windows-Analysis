@@ -152,6 +152,20 @@ export interface PathReference {
   rowid: number;
 }
 
+/** A cached HTTP response with its (decoded) body, for the browser cache
+ * content preview and the AI-conversation section. */
+export interface CacheEntry {
+  account: string;
+  url: string;
+  contentType: string;
+  status: string;
+  responseTime: string;
+  bodySize: string;
+  /** base64 of the decoded body (image bytes or text). */
+  bodyB64: string;
+  cacheKey: string;
+}
+
 export interface ElectronApi {
   pickFolder(): Promise<string | null>;
   listCases(): Promise<ListCasesResult>;
@@ -177,6 +191,8 @@ export interface ElectronApi {
   updateBookmarkNote(hostDir: string, id: string, note: string): Promise<Bookmark[]>;
   /** Cross-artifact references to filesystem paths for a host. */
   pathReferences(hostDir: string): Promise<PathReference[]>;
+  /** Cached HTTP responses (with decoded bodies) for a host. */
+  cacheEntries(hostDir: string): Promise<CacheEntry[]>;
 }
 
 declare global {

@@ -1,13 +1,105 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import type { CsvData } from "@/lib/types";
+import type { CsvData, CacheEntry } from "@/lib/types";
 import { inRange, rangeActive, EMPTY_TIME_RANGE, type TimeRange } from "@/lib/timeRange";
 
 type Row = Record<string, string>;
 
+// --- cached-body helpers ---------------------------------------------------
+
+function b64ToText(b64: string): string {
+  try {
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return new TextDecoder("utf-8").decode(bytes);
+  } catch { return ""; }
+}
+function isImageType(ct: string): boolean { return /^image\//i.test(ct.trim()); }
+function isTextType(ct: string): boolean {
+  const c = ct.trim().toLowerCase();
+  return c.startsWith("text/") || c.includes("json") || c.includes("javascript") || c.includes("xml");
+}
+function prettyJson(s: string): string {
+  // Some APIs prefix JSON with an anti-hijack token like ")]}'".
+  const cleaned = s.replace(/^\)\]\}'?\s*/, "");
+  try { return JSON.stringify(JSON.parse(cleaned), null, 2); } catch { return s; }
+}
+
+// --- AI conversation extraction (best-effort across providers) -------------
+
+const AI_HOSTS = ["chatgpt.com", "chat.openai.com", "openai.com", "claude.ai", "anthropic.com", "gemini.google.com", "bard.google.com"];
+
+interface AiMessage { role: string; text: string; time?: string }
+interface AiConversation { provider: string; title: string; date: string; url: string; messages: AiMessage[]; raw: string }
+
+function hostOf(url: string): string { try { return new URL(url).hostname.toLowerCase(); } catch { return ""; } }
+
+/** Pull chat messages out of a provider's conversation JSON. Handles ChatGPT's
+ * `mapping` graph and Claude's `chat_messages` array; falls back to nothing
+ * (the raw JSON is still shown). */
+function parseAiJson(obj: unknown): { title: string; date: string; messages: AiMessage[] } {
+  const out: AiMessage[] = [];
+  let title = "";
+  let date = "";
+  const o = obj as Record<string, unknown>;
+  if (o && typeof o === "object") {
+    title = (o.title as string) || (o.name as string) || "";
+    date = (o.create_time as string) || (o.created_at as string) || (o.update_time as string) || "";
+    // ChatGPT: mapping { id: { message: { author:{role}, content:{parts:[...]}, create_time } } }
+    const mapping = o.mapping as Record<string, { message?: { author?: { role?: string }; content?: { parts?: unknown[]; text?: string }; create_time?: number } }> | undefined;
+    if (mapping && typeof mapping === "object") {
+      const nodes = Object.values(mapping)
+        .map((n) => n?.message)
+        .filter((m): m is NonNullable<typeof m> => !!m && !!m.author?.role)
+        .sort((a, b) => (a.create_time ?? 0) - (b.create_time ?? 0));
+      for (const m of nodes) {
+        const parts = m.content?.parts;
+        const text = Array.isArray(parts) ? parts.map((p) => (typeof p === "string" ? p : JSON.stringify(p))).join("\n") : (m.content?.text ?? "");
+        if (text && text.trim()) out.push({ role: m.author!.role || "?", text });
+      }
+    }
+    // Claude: chat_messages: [{ sender/role, text, created_at }]
+    const cm = o.chat_messages as Array<{ sender?: string; role?: string; text?: string; content?: unknown; created_at?: string }> | undefined;
+    if (Array.isArray(cm)) {
+      for (const m of cm) {
+        let text = m.text ?? "";
+        if (!text && Array.isArray(m.content)) text = (m.content as Array<{ text?: string }>).map((c) => c.text ?? "").join("\n");
+        if (text && text.trim()) out.push({ role: m.sender || m.role || "?", text, time: m.created_at });
+      }
+    }
+  }
+  return { title, date, messages: out };
+}
+
+function extractAiConversations(entries: CacheEntry[]): AiConversation[] {
+  const out: AiConversation[] = [];
+  for (const e of entries) {
+    const host = hostOf(e.url);
+    if (!AI_HOSTS.some((h) => host.endsWith(h))) continue;
+    if (!e.contentType.toLowerCase().includes("json")) continue;
+    const text = b64ToText(e.bodyB64);
+    if (!text) continue;
+    const cleaned = text.replace(/^\)\]\}'?\s*/, "");
+    let obj: unknown;
+    try { obj = JSON.parse(cleaned); } catch { continue; }
+    const { title, date, messages } = parseAiJson(obj);
+    // Only surface JSON that actually looks like a conversation.
+    if (messages.length === 0 && !/conversation|chat|message/i.test(e.url)) continue;
+    const provider = host.includes("claude") || host.includes("anthropic") ? "Claude"
+      : host.includes("openai") || host.includes("chatgpt") ? "ChatGPT"
+      : host.includes("gemini") || host.includes("bard") ? "Gemini" : host;
+    out.push({ provider, title: title || "(제목 없음)", date: date || e.responseTime || "", url: e.url, messages, raw: prettyJson(text) });
+  }
+  return out;
+}
+
 interface Props {
   data: CsvData;
+  /** Host folder — used to load cached response bodies (image/text previews +
+   * AI-conversation detection). */
+  hostDir?: string;
   /** Global incident-window filter from the sidebar; applied to every row. */
   timeRange?: TimeRange;
   /** Rowids (of this table) currently bookmarked, + the toggle — same
@@ -98,7 +190,9 @@ function decodeJwt(token: string): { header: string; payload: string } | null {
   return { header: pretty(b64urlDecode(parts[0])), payload: pretty(b64urlDecode(parts[1])) };
 }
 
-export default function BrowserHistoryView({ data, timeRange = EMPTY_TIME_RANGE, bookmarkedRowids, onToggleBookmark }: Props) {
+export default function BrowserHistoryView({ data, hostDir = "", timeRange = EMPTY_TIME_RANGE, bookmarkedRowids, onToggleBookmark }: Props) {
+  const [cacheEntries, setCacheEntries] = useState<CacheEntry[]>([]);
+  const [aiConvo, setAiConvo] = useState<AiConversation | null>(null);
   const [account, setAccount] = useState<string>("(전체)");
   const [selectedDay, setSelectedDay] = useState<string>("");
   const [month, setMonth] = useState<{ y: number; m: number } | null>(null);
@@ -109,6 +203,23 @@ export default function BrowserHistoryView({ data, timeRange = EMPTY_TIME_RANGE,
   const [domainSort, setDomainSort] = useState<"desc" | "asc">("desc");
   const [dlSort, setDlSort] = useState<"date" | "size" | "name">("date");
   const [search, setSearch] = useState("");
+
+  useEffect(() => {
+    if (!hostDir) { setCacheEntries([]); return; }
+    let alive = true;
+    window.api.cacheEntries(hostDir).then((e) => { if (alive) setCacheEntries(e); }).catch(() => {});
+    return () => { alive = false; };
+  }, [hostDir]);
+
+  // url(lowercased) -> cache entry, so a cache row's detail can show its body.
+  const cacheByUrl = useMemo(() => {
+    const m = new Map<string, CacheEntry>();
+    for (const e of cacheEntries) if (e.url) m.set(e.url.toLowerCase(), e);
+    return m;
+  }, [cacheEntries]);
+
+  // AI chat conversations found in the cache (chatgpt/claude/... JSON bodies).
+  const aiConversations = useMemo(() => extractAiConversations(cacheEntries), [cacheEntries]);
 
   const KINDS = [
     { k: "visit", label: "🔗 방문" },
@@ -457,14 +568,40 @@ export default function BrowserHistoryView({ data, timeRange = EMPTY_TIME_RANGE,
         </div>
       </div>
 
+      {aiConversations.length > 0 && (
+        <div style={{ marginTop: 24, borderTop: "1px solid var(--border)", paddingTop: 16 }}>
+          <div style={{ display: "flex", alignItems: "baseline", gap: 10, marginBottom: 10 }}>
+            <span style={{ fontSize: 15, fontWeight: 700 }}>🤖 AI 대화 확인</span>
+            <span style={{ fontSize: 12, color: "var(--text-faint)" }}>캐시에서 발견한 ChatGPT/Claude 등 대화 {aiConversations.length}건</span>
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            {aiConversations.map((c, i) => (
+              <div key={i} onClick={() => setAiConvo(c)} title="클릭하면 대화 내용 보기"
+                style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 10px", background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", cursor: "pointer" }}
+                onMouseEnter={(e) => (e.currentTarget.style.background = "var(--bg-hover)")}
+                onMouseLeave={(e) => (e.currentTarget.style.background = "var(--bg-panel)")}
+              >
+                <span style={{ flexShrink: 0, fontSize: 11, fontWeight: 700, color: "var(--accent)", border: "1px solid var(--accent)", borderRadius: "var(--radius-lg)", padding: "1px 8px" }}>{c.provider}</span>
+                <span style={{ flexShrink: 0, fontSize: 11, color: "var(--text-faint)", fontFamily: "var(--mono)", width: 150 }}>{c.date || "-"}</span>
+                <span style={{ flex: 1, minWidth: 0, fontSize: 12.5, color: "var(--text)", wordBreak: "break-all" }}>{c.title}</span>
+                {c.messages.length > 0 && <span style={{ flexShrink: 0, fontSize: 11, color: "var(--text-faint)" }}>{c.messages.length}개 메시지</span>}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       {detail && (
         <DetailModal
           row={detail}
+          cacheBody={detail.kind === "cache" ? cacheByUrl.get((detail.url || "").toLowerCase()) : undefined}
           onClose={() => setDetail(null)}
           isBookmarked={bookmarkedRowids?.has(rowidOf(detail)) ?? false}
           onToggleBookmark={onToggleBookmark && Number.isFinite(rowidOf(detail)) ? () => onToggleBookmark(rowidOf(detail)) : undefined}
         />
       )}
+
+      {aiConvo && <AiConvoModal convo={aiConvo} onClose={() => setAiConvo(null)} />}
 
       {modal === "domains" && (
         <ListModal title={`🌐 접근 도메인 (${stats.domains.length}개)`} onClose={() => setModal(null)}
@@ -530,7 +667,7 @@ const pgBtn = (disabled: boolean): React.CSSProperties => ({ fontSize: 12, paddi
 const KIND_LABEL: Record<string, string> = { visit: "🔗 방문", download: "⬇ 다운로드", cache: "📦 리소스(캐시)" };
 const jwtPre: React.CSSProperties = { margin: 0, padding: 8, background: "var(--bg-input)", border: "1px solid var(--border-subtle)", borderRadius: "var(--radius-sm)", fontFamily: "var(--mono)", fontSize: 11.5, whiteSpace: "pre-wrap", wordBreak: "break-all", color: "var(--text)" };
 
-function DetailModal({ row, onClose, isBookmarked, onToggleBookmark }: { row: Row; onClose: () => void; isBookmarked?: boolean; onToggleBookmark?: () => void }) {
+function DetailModal({ row, cacheBody, onClose, isBookmarked, onToggleBookmark }: { row: Row; cacheBody?: CacheEntry; onClose: () => void; isBookmarked?: boolean; onToggleBookmark?: () => void }) {
   const isDl = row.kind === "download";
   const isCache = row.kind === "cache";
   const jwts = findJwts(row.url || "", row.url_raw || "", row.source_url || "");
@@ -570,6 +707,32 @@ function DetailModal({ row, onClose, isBookmarked, onToggleBookmark }: { row: Ro
             </div>
           ))}
 
+          {/* Cached response body: show the actual content — image preview, or
+              text/JSON/JS/HTML (pretty-printed for JSON). */}
+          {isCache && cacheBody && cacheBody.bodyB64 && (
+            <div style={{ marginTop: 14 }}>
+              <div style={{ fontSize: 12, fontWeight: 700, color: "var(--text-dim)", marginBottom: 6 }}>📦 캐시된 실제 데이터</div>
+              {isImageType(cacheBody.contentType) ? (
+                <div style={{ border: "1px solid var(--border)", borderRadius: "var(--radius-md)", padding: 8, background: "var(--bg)", textAlign: "center" }}>
+                  <img
+                    src={`data:${cacheBody.contentType.split(";")[0]};base64,${cacheBody.bodyB64}`}
+                    alt="cached"
+                    style={{ maxWidth: "100%", maxHeight: 360, imageRendering: "auto" }}
+                  />
+                </div>
+              ) : isTextType(cacheBody.contentType) ? (
+                <pre style={{ ...jwtPre, maxHeight: 360, overflow: "auto" }}>
+                  {(() => {
+                    const t = b64ToText(cacheBody.bodyB64);
+                    return cacheBody.contentType.toLowerCase().includes("json") ? prettyJson(t) : t;
+                  })()}
+                </pre>
+              ) : (
+                <div style={{ fontSize: 11.5, color: "var(--text-faint)" }}>미리보기를 지원하지 않는 형식입니다.</div>
+              )}
+            </div>
+          )}
+
           {/* JWT: URLs (esp. token=… login links) often carry a JWT. Offer to decode it. */}
           {jwts.length > 0 && (
             <div style={{ marginTop: 12 }}>
@@ -595,6 +758,40 @@ function DetailModal({ row, onClose, isBookmarked, onToggleBookmark }: { row: Ro
                   </div>
                 );
               })}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function AiConvoModal({ convo, onClose }: { convo: AiConversation; onClose: () => void }) {
+  const [showRaw, setShowRaw] = useState(false);
+  const roleColor = (role: string) => /assistant|claude|gpt|model|ai/i.test(role) ? "var(--accent)" : "var(--success)";
+  return (
+    <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(1,4,9,0.6)", zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
+      <div onClick={(e) => e.stopPropagation()} style={{ width: 760, maxWidth: "100%", maxHeight: "85vh", overflow: "auto", background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "var(--radius-lg)", boxShadow: "var(--shadow-panel)" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "14px 18px", borderBottom: "1px solid var(--border)", position: "sticky", top: 0, background: "var(--bg-panel)" }}>
+          <span style={{ fontSize: 11, fontWeight: 700, color: "var(--accent)", border: "1px solid var(--accent)", borderRadius: "var(--radius-lg)", padding: "1px 8px" }}>{convo.provider}</span>
+          <span style={{ fontSize: 14, fontWeight: 700, wordBreak: "break-all" }}>{convo.title}</span>
+          {convo.messages.length > 0 && (
+            <button onClick={() => setShowRaw((v) => !v)} style={{ marginLeft: "auto", fontSize: 11.5, padding: "3px 10px", background: showRaw ? "var(--accent-subtle)" : "var(--bg-elevated)", color: "var(--accent)", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", cursor: "pointer" }}>{showRaw ? "대화 보기" : "원본 JSON"}</button>
+          )}
+          <button onClick={onClose} style={{ marginLeft: convo.messages.length > 0 ? 8 : "auto", background: "transparent", border: "none", color: "var(--text-faint)", fontSize: 18, cursor: "pointer" }}>×</button>
+        </div>
+        <div style={{ fontSize: 11, color: "var(--text-faint)", padding: "6px 18px", fontFamily: "var(--mono)", wordBreak: "break-all", borderBottom: "1px solid var(--border-subtle)" }}>{convo.date} · {convo.url}</div>
+        <div style={{ padding: 16 }}>
+          {showRaw || convo.messages.length === 0 ? (
+            <pre style={{ ...jwtPre, maxHeight: "62vh", overflow: "auto" }}>{convo.raw}</pre>
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+              {convo.messages.map((m, i) => (
+                <div key={i} style={{ borderLeft: `3px solid ${roleColor(m.role)}`, paddingLeft: 12 }}>
+                  <div style={{ fontSize: 11, fontWeight: 700, color: roleColor(m.role), marginBottom: 3 }}>{m.role}{m.time ? ` · ${m.time}` : ""}</div>
+                  <div style={{ fontSize: 12.5, color: "var(--text)", whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{m.text}</div>
+                </div>
+              ))}
             </div>
           )}
         </div>

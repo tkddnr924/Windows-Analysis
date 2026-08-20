@@ -461,6 +461,53 @@ fn search_case(query: String, hosts: Vec<SearchHost>) -> Vec<SearchHit> {
     hits
 }
 
+// --- commands: browser cache bodies ----------------------------------------
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CacheEntry {
+    account: String,
+    url: String,
+    content_type: String,
+    status: String,
+    response_time: String,
+    body_size: String,
+    /// Decoded response body, base64 (image bytes / text). Empty when the body
+    /// wasn't kept (too big, or a non-previewable type like fonts/video).
+    body_b64: String,
+    cache_key: String,
+}
+
+/// All cached HTTP responses for a host that carry a kept body — feeds the
+/// cache-content preview and the AI-conversation section in the browser view.
+#[tauri::command]
+fn cache_entries(host_dir: String) -> Vec<CacheEntry> {
+    let dir = PathBuf::from(&host_dir).join("BROWSER");
+    let mut out = Vec::new();
+    let files = match std::fs::read_dir(&dir) {
+        Ok(rd) => rd.filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.file_name().map(|n| n.to_string_lossy().ends_with("_Chrome_Cache.sqlite")).unwrap_or(false))
+            .collect::<Vec<_>>(),
+        Err(_) => return out,
+    };
+    for f in files {
+        let conn = match open_ro(&f.to_string_lossy()) { Ok(c) => c, Err(_) => continue };
+        let sql = "SELECT account, url, content_type, status, response_time, body_size, body_b64, cache_key \
+                   FROM CacheEntries WHERE body_b64 IS NOT NULL AND body_b64 != ''";
+        if let Ok(rows) = query_rows(&conn, sql, &[]) {
+            for r in rows {
+                let g = |k: &str| r.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+                out.push(CacheEntry {
+                    account: g("account"), url: g("url"), content_type: g("content_type"),
+                    status: g("status"), response_time: g("response_time"), body_size: g("body_size"),
+                    body_b64: g("body_b64"), cache_key: g("cache_key"),
+                });
+            }
+        }
+    }
+    out
+}
+
 // --- commands: cross-artifact path references ------------------------------
 
 /// One other-artifact sighting of a filesystem path — currently JumpList
@@ -751,7 +798,7 @@ fn main() {
             list_cases, create_case, create_host, delete_case, delete_host, list_artifacts,
             run_host, cancel_pipeline, list_categories, list_result_files, read_result_file,
             list_column_values, mft_children, mft_search, mft_row, search_case,
-            list_bookmarks, toggle_bookmark, update_bookmark_note, pick_folder, path_references
+            list_bookmarks, toggle_bookmark, update_bookmark_note, pick_folder, path_references, cache_entries
         ])
         .setup(|_app| Ok(()))
         .run(tauri::generate_context!())

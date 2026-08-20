@@ -15,8 +15,46 @@ pub const CACHE_FIELD_ORDER: &[&str] = &[
     "request_time", "response_time", "creation_time", "url", "status",
     "content_type", "content_length", "content_encoding", "server", "date",
     "last_modified", "etag", "cache_control", "location", "body_size",
-    "body_file", "cache_key", "all_headers", "account", "_source_file", "_status", "_error",
+    "body_file", "cache_key", "all_headers", "body_b64", "account", "_source_file", "_status", "_error",
 ];
+
+// Body-extraction caps: read at most RAW_CAP stored bytes and keep the decoded
+// body only if it's <= DECODED_CAP — enough for icons, thumbnails, JS/JSON/HTML
+// and small images without bloating the sqlite with big media.
+const RAW_CAP: usize = 6 * 1024 * 1024;
+const DECODED_CAP: usize = 4 * 1024 * 1024;
+
+/// True for content types worth keeping the body of (previewable/text).
+fn is_displayable(ct: &str) -> bool {
+    let ct = ct.trim();
+    ct.starts_with("image/")
+        || ct.starts_with("text/")
+        || ct.starts_with("application/json")
+        || ct.starts_with("application/javascript")
+        || ct.starts_with("application/x-javascript")
+        || ct.starts_with("application/xml")
+        || ct.starts_with("application/xhtml")
+}
+
+/// Decode a cached body per its Content-Encoding (Chrome stores it as received).
+/// Falls back to the raw bytes if the encoding is unknown or decoding fails.
+fn decode_body(raw: &[u8], encoding: &str) -> Vec<u8> {
+    use std::io::Read;
+    let enc = encoding.to_lowercase();
+    if enc.contains("br") {
+        let mut out = Vec::new();
+        if brotli::Decompressor::new(raw, 4096).read_to_end(&mut out).is_ok() && !out.is_empty() { return out; }
+    } else if enc.contains("gzip") {
+        let mut out = Vec::new();
+        if flate2::read::GzDecoder::new(raw).read_to_end(&mut out).is_ok() && !out.is_empty() { return out; }
+    } else if enc.contains("deflate") {
+        let mut out = Vec::new();
+        if flate2::read::ZlibDecoder::new(raw).read_to_end(&mut out).is_ok() && !out.is_empty() { return out; }
+        let mut out2 = Vec::new();
+        if flate2::read::DeflateDecoder::new(raw).read_to_end(&mut out2).is_ok() && !out2.is_empty() { return out2; }
+    }
+    raw.to_vec()
+}
 
 const INDEX_MAGIC: u32 = 0xC103_CAC3;
 const INDEX_HEADER_SIZE: usize = 368;
@@ -197,9 +235,24 @@ fn entry_row(cache: &mut Cache, addr: u32, account: &str, source: &str) -> Optio
     r.insert("etag".into(), hd("etag"));
     r.insert("cache_control".into(), hd("cache-control"));
     r.insert("location".into(), hd("location"));
+    // Extract the response body (stream 1) for previewable types, decoded per
+    // Content-Encoding, base64 so the viewer can show images / read text.
+    let ct = hd("content-type").to_lowercase();
+    let body_b64 = if body_addr != 0 && data_size[1] > 0 && (data_size[1] as usize) <= RAW_CAP && is_displayable(&ct) {
+        let raw = cache.read(body_addr, data_size[1] as usize);
+        if raw.is_empty() { String::new() } else {
+            let dec = decode_body(&raw, &hd("content-encoding"));
+            if !dec.is_empty() && dec.len() <= DECODED_CAP {
+                use base64::Engine;
+                base64::engine::general_purpose::STANDARD.encode(&dec)
+            } else { String::new() }
+        }
+    } else { String::new() };
+
     r.insert("body_size".into(), if data_size[1] != 0 { data_size[1].to_string() } else { String::new() });
     r.insert("body_file".into(), body_file);
     r.insert("all_headers".into(), h.all_headers);
+    r.insert("body_b64".into(), body_b64);
     r.insert("_source_file".into(), source.into());
     Some(r)
 }
