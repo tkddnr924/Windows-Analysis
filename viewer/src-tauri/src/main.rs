@@ -474,6 +474,12 @@ struct PathReference {
     account: String,
     label: String,
     fields: Map<String, Value>,
+    /// Source sqlite + row so the viewer can bookmark this reference's
+    /// timestamps. Empty full_path / rowid < 0 means "not bookmarkable"
+    /// (e.g. a Shellbag reconstructed from the registry, which has no row).
+    full_path: String,
+    table_name: String,
+    rowid: i64,
 }
 
 /// Normalize a path to the volume-relative, lowercased form $MFT uses:
@@ -514,7 +520,7 @@ fn path_references(host_dir: String) -> Vec<PathReference> {
     let mut out = Vec::new();
     let jl = PathBuf::from(&host_dir).join("JUMPLIST").join("JumpList_Entries.sqlite");
     if let Ok(conn) = open_ro(&jl.to_string_lossy()) {
-        let sql = "SELECT target_path, app_id, jumplist_type, arguments, working_directory, \
+        let sql = "SELECT rowid AS __rowid, target_path, app_id, jumplist_type, arguments, working_directory, \
                    machine_id, timestamp, created_time, modified_time, _source_file \
                    FROM JumpList_Entries WHERE target_path IS NOT NULL AND target_path != ''";
         if let Ok(rows) = query_rows(&conn, sql, &[]) {
@@ -523,6 +529,7 @@ fn path_references(host_dir: String) -> Vec<PathReference> {
                 let target = get("target_path");
                 if target.is_empty() { continue; }
                 let src = get("_source_file");
+                let rowid = r.get("__rowid").and_then(|v| v.as_i64()).unwrap_or(-1);
                 let mut fields = Map::new();
                 for k in ["target_path", "app_id", "jumplist_type", "arguments", "working_directory",
                           "machine_id", "timestamp", "created_time", "modified_time", "_source_file"] {
@@ -535,6 +542,9 @@ fn path_references(host_dir: String) -> Vec<PathReference> {
                     account: account_from_source(&src),
                     label: target.clone(),
                     fields,
+                    full_path: jl.to_string_lossy().to_string(),
+                    table_name: "JumpList_Entries".to_string(),
+                    rowid,
                 });
             }
         }
@@ -578,7 +588,8 @@ fn shellbag_references(host_dir: &str) -> Vec<PathReference> {
         let mut fields = Map::new();
         fields.insert("path".into(), Value::from(s.display.clone()));
         if !s.account.is_empty() { fields.insert("account".into(), Value::from(s.account.clone())); }
-        PathReference { path: s.path, kind: "Shellbag".to_string(), account: s.account, label: s.display, fields }
+        PathReference { path: s.path, kind: "Shellbag".to_string(), account: s.account, label: s.display, fields,
+            full_path: String::new(), table_name: String::new(), rowid: -1 }
     }).collect()
 }
 

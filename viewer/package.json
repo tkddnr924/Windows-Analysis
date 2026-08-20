@@ -1,6 +1,6 @@
 {
   "name": "windows-analysis-viewer",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "private": true,
   "description": "Desktop viewer for Windows-Analysis parsed output (Tauri + Next.js)",
   "scripts": {

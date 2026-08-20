@@ -145,6 +145,11 @@ export interface PathReference {
   account: string;
   label: string;
   fields: Record<string, string>;
+  /** Source sqlite + row, so the viewer can bookmark this reference's
+   * timestamps. Empty fullPath / rowid < 0 = not bookmarkable (e.g. Shellbag). */
+  fullPath: string;
+  tableName: string;
+  rowid: number;
 }
 
 export interface ElectronApi {

@@ -20,6 +20,12 @@ interface Props {
    *  specific timestamps) are starred. */
   tableBookmarks: Bookmark[];
   onToggleBookmark: (rowid: number, field: string) => void;
+  /** All bookmarks for the case (any table) — lets the JumpList/Shellbag detail
+   *  modal show whether a reference's timestamp is already bookmarked. */
+  allBookmarks: Bookmark[];
+  /** Toggle a bookmark on an arbitrary (source sqlite, table, row, field) —
+   *  used for JumpList reference timestamps. */
+  onBookmarkRef: (fullPath: string, tableName: string, rowid: number, field: string) => void;
 }
 
 const TIME_FIELDS: { key: string; label: string }[] = [
@@ -70,7 +76,7 @@ function rowIcon(r: Row, isOpen: boolean): string {
   return "📄";
 }
 
-export default function MftView({ dbPath, tableBookmarks, onToggleBookmark }: Props) {
+export default function MftView({ dbPath, tableBookmarks, onToggleBookmark, allBookmarks, onBookmarkRef }: Props) {
   const [root, setRoot] = useState<Row[] | null>(null);
   const [childrenCache, setChildrenCache] = useState<Record<string, Row[]>>({});
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
@@ -255,7 +261,7 @@ export default function MftView({ dbPath, tableBookmarks, onToggleBookmark }: Pr
           )}
         </div>
       </div>
-      {refModal && <RefModal ref={refModal} onClose={() => setRefModal(null)} />}
+      {refModal && <RefModal reference={refModal} allBookmarks={allBookmarks} onBookmarkRef={onBookmarkRef} onClose={() => setRefModal(null)} />}
     </div>
   );
 }
@@ -486,7 +492,27 @@ function DetailPane({ row, bmFieldKeys, onToggleBookmark, refs, onOpenRef }: { r
 }
 
 // Modal showing all raw fields of one cross-artifact reference.
-function RefModal({ ref: r, onClose }: { ref: PathReference; onClose: () => void }) {
+// Fields that are timestamps — these get a bookmark toggle in the modal.
+const REF_TIME_FIELDS: Record<string, string> = {
+  timestamp: "마지막 실행/사용",
+  created_time: "생성",
+  modified_time: "수정",
+};
+
+function RefModal({ reference: r, allBookmarks, onBookmarkRef, onClose }: {
+  reference: PathReference;
+  allBookmarks: Bookmark[];
+  onBookmarkRef: (fullPath: string, tableName: string, rowid: number, field: string) => void;
+  onClose: () => void;
+}) {
+  // A timestamp is bookmarkable only if the reference points at a real source
+  // row (JumpList); Shellbags are reconstructed and have no row.
+  const canBookmark = !!r.fullPath && r.rowid >= 0;
+  const bmKeys = new Set(
+    allBookmarks
+      .filter((b) => b.fullPath === r.fullPath && b.rowid === r.rowid)
+      .map((b) => b.field ?? ""),
+  );
   return (
     <div
       onClick={onClose}
@@ -501,12 +527,26 @@ function RefModal({ ref: r, onClose }: { ref: PathReference; onClose: () => void
           <span style={{ fontSize: 15, fontWeight: 700 }}>{r.account || "(계정 미상)"}</span>
           <button onClick={onClose} style={{ marginLeft: "auto", background: "transparent", border: "none", color: "var(--text-faint)", fontSize: 18, cursor: "pointer" }}>✕</button>
         </div>
-        {Object.entries(r.fields).map(([k, v]) => (
-          <div key={k} style={{ display: "flex", gap: 12, padding: "6px 0", borderBottom: "1px solid var(--border-subtle)" }}>
-            <span style={{ flex: "0 0 150px", color: "var(--text-faint)", fontSize: 11.5, fontFamily: "var(--mono)" }}>{k}</span>
-            <span style={{ flex: 1, color: "var(--text)", fontSize: 12, wordBreak: "break-all", fontFamily: "var(--mono)" }}>{v}</span>
-          </div>
-        ))}
+        {Object.entries(r.fields).map(([k, v]) => {
+          const timeLabel = REF_TIME_FIELDS[k];
+          const bookmarkable = canBookmark && timeLabel !== undefined && !!v;
+          const isBm = bookmarkable && bmKeys.has(k);
+          return (
+            <div key={k} style={{ display: "flex", alignItems: "center", gap: 12, padding: "6px 0", borderBottom: "1px solid var(--border-subtle)" }}>
+              <span style={{ flex: "0 0 150px", color: "var(--text-faint)", fontSize: 11.5, fontFamily: "var(--mono)" }}>{timeLabel ? `${k} · ${timeLabel}` : k}</span>
+              <span style={{ flex: 1, color: "var(--text)", fontSize: 12, wordBreak: "break-all", fontFamily: "var(--mono)" }}>{v}</span>
+              {bookmarkable && (
+                <button
+                  onClick={() => onBookmarkRef(r.fullPath, r.tableName, r.rowid, k)}
+                  title={isBm ? "이 시각 북마크 해제" : "이 시각 북마크"}
+                  style={{ flexShrink: 0, fontSize: 12, padding: "2px 8px", borderRadius: "var(--radius-lg)", cursor: "pointer", background: isBm ? "var(--warning-subtle)" : "transparent", color: isBm ? "var(--warning)" : "var(--text-dim)", border: `1px solid ${isBm ? "var(--warning)" : "var(--border)"}`, fontWeight: 600 }}
+                >
+                  {isBm ? "★" : "☆"}
+                </button>
+              )}
+            </div>
+          );
+        })}
       </div>
     </div>
   );
