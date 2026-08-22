@@ -1,12 +1,26 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
+import AddIcon from "@mui/icons-material/Add";
+import CancelOutlinedIcon from "@mui/icons-material/CancelOutlined";
+import DeleteOutlineIcon from "@mui/icons-material/DeleteOutlineOutlined";
+import DeselectIcon from "@mui/icons-material/Deselect";
+import DnsOutlinedIcon from "@mui/icons-material/DnsOutlined";
+import ErrorOutlineIcon from "@mui/icons-material/ErrorOutlineOutlined";
+import ExpandLessIcon from "@mui/icons-material/ExpandLess";
+import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
+import FolderOpenOutlinedIcon from "@mui/icons-material/FolderOpenOutlined";
+import MemoryOutlinedIcon from "@mui/icons-material/MemoryOutlined";
+import PlayArrowIcon from "@mui/icons-material/PlayArrow";
+import SelectAllIcon from "@mui/icons-material/SelectAll";
+import TaskAltIcon from "@mui/icons-material/TaskAlt";
+import TimerOutlinedIcon from "@mui/icons-material/TimerOutlined";
+import VisibilityOutlinedIcon from "@mui/icons-material/VisibilityOutlined";
 import type { Case, Host } from "@/lib/types";
 import type { PipelineRun } from "@/lib/usePipelineRun";
 
 interface RunPipelineProps {
   activeCase: Case;
-  onBack: () => void;
   onChanged: () => void;
   onOpenHost: (h: Host) => void;
   /** Shared parse state, hoisted to Home so it survives screen changes. */
@@ -14,6 +28,10 @@ interface RunPipelineProps {
 }
 
 const primaryButtonStyle: React.CSSProperties = {
+  display: "inline-flex",
+  alignItems: "center",
+  justifyContent: "center",
+  gap: 5,
   padding: "7px 16px",
   background: "var(--accent-emphasis)",
   color: "#ffffff",
@@ -26,6 +44,10 @@ const primaryButtonStyle: React.CSSProperties = {
 };
 
 const dangerButtonStyle: React.CSSProperties = {
+  display: "inline-flex",
+  alignItems: "center",
+  justifyContent: "center",
+  gap: 5,
   padding: "7px 16px",
   background: "transparent",
   color: "var(--danger)",
@@ -37,6 +59,10 @@ const dangerButtonStyle: React.CSSProperties = {
 };
 
 const successButtonStyle: React.CSSProperties = {
+  display: "inline-flex",
+  alignItems: "center",
+  justifyContent: "center",
+  gap: 5,
   padding: "7px 16px",
   background: "var(--success-subtle)",
   color: "var(--success)",
@@ -49,6 +75,9 @@ const successButtonStyle: React.CSSProperties = {
 };
 
 const linkButtonStyle: React.CSSProperties = {
+  display: "inline-flex",
+  alignItems: "center",
+  gap: 4,
   marginLeft: 10,
   fontSize: 11,
   background: "transparent",
@@ -69,13 +98,53 @@ function formatDuration(secs: number): string {
 
 function StatusPill({ status }: { status: string | null }) {
   if (status === "ok")
-    return <span style={{ fontSize: 11, fontWeight: 600, color: "var(--success)", background: "var(--success-subtle)", padding: "2px 8px", borderRadius: "var(--radius-lg)" }}>✓ 완료</span>;
+    return <span style={statusPillStyle("var(--success)", "var(--success-subtle)")}><TaskAltIcon sx={{ fontSize: 13 }} />완료</span>;
   if (status === "error")
-    return <span style={{ fontSize: 11, fontWeight: 600, color: "var(--danger)", background: "var(--danger-subtle)", padding: "2px 8px", borderRadius: "var(--radius-lg)" }}>⛔ 오류</span>;
-  return <span style={{ fontSize: 11, color: "var(--text-faint)", background: "var(--bg-elevated)", padding: "2px 8px", borderRadius: "var(--radius-lg)" }}>미실행</span>;
+    return <span style={statusPillStyle("var(--danger)", "var(--danger-subtle)")}><ErrorOutlineIcon sx={{ fontSize: 13 }} />오류</span>;
+  return <span style={statusPillStyle("var(--text-faint)", "var(--bg-elevated)")}><TimerOutlinedIcon sx={{ fontSize: 13 }} />미실행</span>;
 }
 
-export default function RunPipeline({ activeCase, onBack, onChanged, onOpenHost, run }: RunPipelineProps) {
+function statusPillStyle(color: string, background: string): React.CSSProperties {
+  return { display: "inline-flex", alignItems: "center", gap: 4, fontSize: 11, fontWeight: 600, color, background, padding: "2px 8px", borderRadius: "var(--radius-lg)" };
+}
+
+function folderName(path: string): string {
+  const trimmed = path.replace(/[\\/]+$/, "");
+  return trimmed.split(/[\\/]/).pop() ?? "";
+}
+
+function InlineParseProgress({
+  stepLabel,
+  percent,
+  completedSteps,
+  totalSteps,
+}: {
+  stepLabel: string;
+  percent: number;
+  completedSteps: number;
+  totalSteps: number;
+}) {
+  const color = "var(--accent)";
+  const label = stepLabel.replace(/…$/, "");
+  return (
+    <div style={{ padding: "8px 18px 16px", display: "flex", flexDirection: "column", gap: 9 }}>
+      <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: 12 }}>
+        <span style={{ fontSize: 13, fontWeight: 600, color }}>
+          {label}<span className="parse-progress__dots" aria-label="진행 중">...</span>
+        </span>
+        <span style={{ fontSize: 20, fontWeight: 700, fontVariantNumeric: "tabular-nums", color }}>{percent}%</span>
+      </div>
+      <div className="parse-progress__track">
+        <div className="parse-progress__fill" style={{ width: `${percent}%`, background: color }} />
+      </div>
+      <span style={{ fontSize: 11.5, color: "var(--text-faint)" }}>
+        {totalSteps > 0 ? `${Math.min(completedSteps, totalSteps)} / ${totalSteps} 단계` : "파싱 준비 중"}
+      </span>
+    </div>
+  );
+}
+
+export default function RunPipeline({ activeCase, onChanged, onOpenHost, run }: RunPipelineProps) {
   const hosts = activeCase.hosts;
 
   const [newHostName, setNewHostName] = useState("");
@@ -84,14 +153,13 @@ export default function RunPipeline({ activeCase, onBack, onChanged, onOpenHost,
 
   const [artifacts, setArtifacts] = useState<string[]>([]);
   const [selectedArtifacts, setSelectedArtifacts] = useState<Set<string>>(new Set());
-  const [showLog, setShowLog] = useState(false);
+  const [artifactListExpanded, setArtifactListExpanded] = useState(false);
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
   const [deleting, setDeleting] = useState(false);
-  const logEndRef = useRef<HTMLDivElement>(null);
 
   // The parse state (runningHostId, logs, progress, …) lives in the `run` hook
   // hoisted to Home so it survives navigating away mid-parse.
-  const { runningHostId, logs, currentArtifact, doneArtifacts, totalSteps, completedSteps, percent, stepLabel, hadError } = run;
+  const { runningHostId, currentArtifact, totalSteps, completedSteps, percent, stepLabel, runComplete, completedHostId, failedArtifacts } = run;
 
   useEffect(() => {
     window.api.listArtifacts().then((names) => {
@@ -100,13 +168,12 @@ export default function RunPipeline({ activeCase, onBack, onChanged, onOpenHost,
     });
   }, []);
 
-  useEffect(() => {
-    if (showLog) logEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [logs, showLog]);
-
   async function pickTarget() {
     const dir = await window.api.pickFolder();
-    if (dir) setNewHostTarget(dir);
+    if (!dir) return;
+    setNewHostTarget(dir);
+    const suggestedName = folderName(dir);
+    if (suggestedName) setNewHostName(suggestedName);
   }
 
   async function handleAddHost() {
@@ -163,23 +230,17 @@ export default function RunPipeline({ activeCase, onBack, onChanged, onOpenHost,
     }
   }
 
-  const barColor = hadError ? "var(--danger)" : run.runComplete ? "var(--success)" : "var(--accent)";
-
   return (
-    <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", padding: 24, gap: 22, overflow: "hidden", maxWidth: 980, margin: "0 auto", width: "100%" }}>
-      {/* breadcrumb */}
+    <div className="dfir-view" style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", padding: "42px 32px 28px", gap: 22, overflow: "hidden", maxWidth: 1120, margin: "0 auto", width: "100%" }}>
       <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-        <button onClick={onBack} style={{ background: "transparent", border: "none", color: "var(--accent)", cursor: "pointer", fontSize: 12.5, fontWeight: 600 }}>
-          ‹ 케이스 목록
-        </button>
-        <span style={{ color: "var(--text-faint)" }}>/</span>
-        <span style={{ fontSize: 15, fontWeight: 700 }}>🗂️ {activeCase.name}</span>
-        <span style={{ fontSize: 12, color: "var(--text-faint)" }}>호스트 {hosts.length}개</span>
+        <span className="dfir-page-title">호스트 등록</span>
+        <span className="dfir-tag" style={{ display: "inline-flex", alignItems: "center", gap: 4 }}><DnsOutlinedIcon sx={{ fontSize: 14 }} />등록된 호스트 {hosts.length}개</span>
       </div>
 
       {/* add host */}
-      <section style={{ background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "var(--radius-lg)", padding: 18, boxShadow: "var(--shadow-card)" }}>
-        <h3 style={{ margin: "0 0 12px", fontSize: 13.5 }}>🖥️ 새 호스트 추가</h3>
+      <section className="dfir-surface" style={{ padding: 22 }}>
+        <div className="dfir-section-label" style={{ marginBottom: 7 }}>EVIDENCE SOURCE</div>
+        <h3 style={{ margin: "0 0 14px", fontSize: 16 }}>새 호스트 추가</h3>
         <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
           <input
             placeholder="호스트 이름 (예: WEB-01)"
@@ -187,8 +248,8 @@ export default function RunPipeline({ activeCase, onBack, onChanged, onOpenHost,
             onChange={(e) => setNewHostName(e.target.value)}
             style={{ padding: "7px 10px", background: "var(--bg-input)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", color: "var(--text)", minWidth: 180 }}
           />
-          <button onClick={pickTarget} style={{ padding: "7px 12px", background: "var(--bg-elevated)", color: "var(--text)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", cursor: "pointer" }}>
-            📁 수집 데이터 폴더
+          <button onClick={pickTarget} style={{ display: "inline-flex", alignItems: "center", gap: 5, padding: "7px 12px", background: "var(--bg-elevated)", color: "var(--text)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", cursor: "pointer" }}>
+            <FolderOpenOutlinedIcon sx={{ fontSize: 16 }} />수집 데이터 폴더
           </button>
           <span style={{ fontSize: 12, color: "var(--text-dim)", maxWidth: 340, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={newHostTarget ?? ""}>
             {newHostTarget ?? "선택 안 됨"}
@@ -198,42 +259,50 @@ export default function RunPipeline({ activeCase, onBack, onChanged, onOpenHost,
             disabled={creating || !newHostName.trim() || !newHostTarget}
             style={{ ...primaryButtonStyle, marginLeft: "auto", opacity: creating || !newHostName.trim() || !newHostTarget ? 0.5 : 1 }}
           >
-            호스트 추가
+            <AddIcon sx={{ fontSize: 16 }} />호스트 추가
           </button>
         </div>
       </section>
 
       {/* artifact selection */}
       {artifacts.length > 0 && (
-        <section style={{ background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "var(--radius-lg)", padding: 18, boxShadow: "var(--shadow-card)" }}>
+        <section className="dfir-surface" style={{ padding: 22 }}>
           <div style={{ fontSize: 13, marginBottom: 10, display: "flex", alignItems: "center" }}>
-            <span style={{ fontWeight: 700 }}>⚙️ 실행할 아티팩트</span>
-            <span style={{ color: "var(--text-faint)", marginLeft: 6 }}>{selectedArtifacts.size}/{artifacts.length}</span>
-            <button onClick={() => setSelectedArtifacts(new Set(artifacts))} disabled={!!runningHostId} style={linkButtonStyle}>전체 선택</button>
-            <button onClick={() => setSelectedArtifacts(new Set())} disabled={!!runningHostId} style={linkButtonStyle}>전체 해제</button>
+            <span style={{ fontWeight: 700 }}>실행할 아티팩트</span>
+            <span className="dfir-tag" style={{ marginLeft: 4, display: "inline-flex", alignItems: "center", gap: 4 }}><MemoryOutlinedIcon sx={{ fontSize: 14 }} />{selectedArtifacts.size}/{artifacts.length}</span>
+            <button onClick={() => setSelectedArtifacts(new Set(artifacts))} disabled={!!runningHostId} style={linkButtonStyle}><SelectAllIcon sx={{ fontSize: 14 }} />전체 선택</button>
+            <button onClick={() => setSelectedArtifacts(new Set())} disabled={!!runningHostId} style={linkButtonStyle}><DeselectIcon sx={{ fontSize: 14 }} />전체 해제</button>
+            <button onClick={() => setArtifactListExpanded((expanded) => !expanded)} style={linkButtonStyle}>
+              {artifactListExpanded ? <ExpandLessIcon sx={{ fontSize: 15 }} /> : <ExpandMoreIcon sx={{ fontSize: 15 }} />}{artifactListExpanded ? "접기" : "펼치기"}
+            </button>
           </div>
-          <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
-            {artifacts.map((name) => {
-              const isDone = doneArtifacts.has(name);
-              const isCurrent = currentArtifact === name;
-              const checked = selectedArtifacts.has(name);
-              return (
-                <label key={name} style={{ display: "flex", alignItems: "center", gap: 6, padding: "5px 12px", border: `1px solid ${isCurrent ? "var(--accent)" : checked ? "var(--border)" : "var(--border-subtle)"}`, borderRadius: "var(--radius-lg)", fontSize: 12.5, cursor: runningHostId ? "default" : "pointer", background: isCurrent ? "var(--accent-subtle)" : isDone ? "var(--success-subtle)" : checked ? "var(--bg-elevated)" : "transparent", color: checked ? "var(--text)" : "var(--text-faint)" }}>
-                  <input type="checkbox" checked={checked} disabled={!!runningHostId} onChange={() => toggleArtifact(name)} />
-                  {name}
-                  {isDone && <span style={{ color: "var(--success)" }}>✓</span>}
-                  {isCurrent && <span style={{ color: "var(--accent)" }}>●</span>}
-                </label>
-              );
-            })}
-          </div>
+          {artifactListExpanded && (
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(130px, 1fr))", gap: 8 }}>
+              {artifacts.map((name) => {
+                const isCurrent = currentArtifact === name;
+                const checked = selectedArtifacts.has(name);
+                return (
+                  <button
+                    key={name}
+                    type="button"
+                    aria-pressed={checked}
+                    onClick={() => toggleArtifact(name)}
+                    disabled={!!runningHostId}
+                    style={{ display: "flex", alignItems: "center", minWidth: 0, padding: "7px 12px", border: `1px solid ${isCurrent || checked ? "color-mix(in srgb, var(--accent) 58%, var(--border))" : "var(--border-subtle)"}`, borderRadius: "var(--radius-md)", fontSize: 12.5, cursor: runningHostId ? "default" : "pointer", background: isCurrent ? "color-mix(in srgb, var(--accent) 20%, var(--bg-elevated))" : checked ? "var(--accent-subtle)" : "color-mix(in srgb, var(--bg-input) 72%, var(--bg))", color: checked ? "var(--accent)" : "var(--text-faint)", fontWeight: checked ? 650 : 500, textAlign: "left", opacity: runningHostId && !isCurrent ? 0.62 : 1 }}
+                  >
+                    {name}
+                  </button>
+                );
+              })}
+            </div>
+          )}
         </section>
       )}
 
       {/* host list */}
       <section style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 10, margin: "0 0 10px" }}>
-          <h3 style={{ margin: 0, fontSize: 13.5 }}>🖥️ 호스트 목록</h3>
+          <h3 style={{ margin: 0, fontSize: 13.5 }}>호스트 목록</h3>
           {hosts.length > 1 && (
             <button
               onClick={handleRunAll}
@@ -241,91 +310,76 @@ export default function RunPipeline({ activeCase, onBack, onChanged, onOpenHost,
               title="이 케이스의 모든 호스트를 순서대로 파싱"
               style={{ ...primaryButtonStyle, padding: "5px 12px", fontSize: 12, opacity: !!runningHostId || selectedArtifacts.size === 0 ? 0.5 : 1 }}
             >
-              ▶ 전체 파싱 ({hosts.length})
+              <PlayArrowIcon sx={{ fontSize: 15 }} />전체 파싱 ({hosts.length})
             </button>
           )}
         </div>
         <div style={{ display: "flex", flexDirection: "column", gap: 10, overflow: "auto", flex: 1, minHeight: 0, paddingRight: 4 }}>
           {hosts.length === 0 && (
             <div style={{ padding: 24, textAlign: "center", color: "var(--text-faint)", border: "1px dashed var(--border)", borderRadius: "var(--radius-lg)" }}>
-              이 케이스에 호스트가 없습니다. 위에서 호스트를 추가하세요.
+              등록된 호스트가 없습니다. 위에서 호스트를 추가하세요.
             </div>
           )}
           {hosts.map((h) => (
-            <div key={h.id} style={{ display: "flex", alignItems: "center", gap: 12, padding: "14px 16px", background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "var(--radius-lg)", boxShadow: "var(--shadow-card)" }}>
+            <div key={h.id} className="dfir-surface" style={{ overflow: "hidden" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 14, padding: "16px 18px" }}>
               <div style={{ flex: 1, minWidth: 0 }}>
                 <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                  <span style={{ fontWeight: 700, fontSize: 13.5 }}>🖥️ {h.name}</span>
+                  <span style={{ fontWeight: 700, fontSize: 13.5 }}>{h.name}</span>
                   <StatusPill status={h.lastRunStatus} />
-                  {h.lastRunStatus === "ok" && h.lastRunDurationSecs != null && (
+                  {(h.lastRunStatus === "ok" || h.lastRunStatus === "error") && h.lastRunDurationSecs != null && (
                     <span
                       title="마지막 파싱 소요 시간"
                       style={{ fontSize: 11, fontWeight: 600, color: "var(--accent)", background: "var(--accent-subtle, var(--bg-elevated))", padding: "2px 8px", borderRadius: "var(--radius-lg)" }}
                     >
-                      ⏱ {formatDuration(h.lastRunDurationSecs)} 소요
+                      {formatDuration(h.lastRunDurationSecs)} 소요
                     </span>
                   )}
                 </div>
                 <div style={{ fontSize: 11.5, color: "var(--text-faint)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", marginTop: 3 }} title={h.targetDir}>
-                  📁 {h.targetDir}
+                  {h.targetDir}
                 </div>
                 {h.lastRunAt && <div style={{ fontSize: 11.5, color: "var(--text-faint)", marginTop: 2 }}>마지막 실행: {h.lastRunAt}</div>}
               </div>
               {confirmDeleteId === h.id ? (
                 <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                  <span style={{ fontSize: 12, color: "var(--danger)" }}>삭제할까요?</span>
-                  <button onClick={() => handleDelete(h.id)} disabled={deleting} style={{ ...dangerButtonStyle, opacity: deleting ? 0.5 : 1 }}>삭제</button>
-                  <button onClick={() => setConfirmDeleteId(null)} disabled={deleting} style={{ padding: "7px 12px", background: "var(--bg-elevated)", color: "var(--text)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", cursor: "pointer", fontSize: 12.5 }}>취소</button>
+                  <span style={{ fontSize: 12, color: "var(--danger)" }}>분석 결과와 해당 호스트의 북마크가 삭제됩니다.</span>
+                  <button onClick={() => handleDelete(h.id)} disabled={deleting} style={{ ...dangerButtonStyle, opacity: deleting ? 0.5 : 1 }}><DeleteOutlineIcon sx={{ fontSize: 15 }} />삭제</button>
+                  <button onClick={() => setConfirmDeleteId(null)} disabled={deleting} style={{ display: "inline-flex", alignItems: "center", gap: 5, padding: "7px 12px", background: "var(--bg-elevated)", color: "var(--text)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", cursor: "pointer", fontSize: 12.5 }}><CancelOutlinedIcon sx={{ fontSize: 15 }} />취소</button>
                 </div>
               ) : (
                 <>
                   {runningHostId === h.id ? (
-                    <button onClick={handleCancel} style={dangerButtonStyle}>취소</button>
+                    <button onClick={handleCancel} style={dangerButtonStyle}><CancelOutlinedIcon sx={{ fontSize: 15 }} />취소</button>
                   ) : (
                     <button onClick={() => handleRun(h.id)} disabled={!!runningHostId || selectedArtifacts.size === 0} style={{ ...primaryButtonStyle, opacity: !!runningHostId || selectedArtifacts.size === 0 ? 0.5 : 1 }}>
-                      ▶ 파싱
+                      <PlayArrowIcon sx={{ fontSize: 16 }} />파싱
                     </button>
                   )}
-                  {h.lastRunStatus === "ok" && (
-                    <button onClick={() => onOpenHost(h)} style={successButtonStyle}>결과 보기 →</button>
+                  {(h.lastRunStatus === "ok" || h.lastRunStatus === "error") && (
+                    <button onClick={() => onOpenHost(h)} style={successButtonStyle}><VisibilityOutlinedIcon sx={{ fontSize: 16 }} />결과 보기</button>
                   )}
-                  <button onClick={() => setConfirmDeleteId(h.id)} disabled={!!runningHostId} title="호스트 삭제 (분석 결과만, 원본 수집 데이터는 유지)" style={{ padding: "7px 10px", background: "transparent", color: "var(--text-faint)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", cursor: runningHostId ? "default" : "pointer", fontSize: 12.5, opacity: runningHostId ? 0.4 : 1 }}>🗑</button>
+                  <button onClick={() => setConfirmDeleteId(h.id)} disabled={!!runningHostId} title="호스트 삭제 (분석 결과만, 원본 수집 데이터는 유지)" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", padding: "7px 10px", background: "transparent", color: "var(--text-faint)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", cursor: runningHostId ? "default" : "pointer", fontSize: 12.5, opacity: runningHostId ? 0.4 : 1 }}><DeleteOutlineIcon sx={{ fontSize: 16 }} /></button>
                 </>
               )}
+            </div>
+            {runningHostId === h.id && (
+              <InlineParseProgress
+                stepLabel={stepLabel}
+                percent={percent}
+                completedSteps={completedSteps}
+                totalSteps={totalSteps}
+              />
+            )}
+            {runComplete && completedHostId === h.id && failedArtifacts.length > 0 && (
+              <div style={{ padding: "8px 18px 16px", color: "var(--danger)", fontSize: 12.5, fontWeight: 650 }}>
+                파싱 실패: {failedArtifacts.join(", ")}
+              </div>
+            )}
             </div>
           ))}
         </div>
       </section>
-
-      {/* progress */}
-      <div style={{ background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "var(--radius-lg)", padding: 18, boxShadow: "var(--shadow-card)", display: "flex", flexDirection: "column", gap: 10 }}>
-        <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: 12 }}>
-          <span style={{ fontSize: 13, fontWeight: 600, color: hadError ? "var(--danger)" : "var(--text)" }}>
-            {runningHostId && <span style={{ marginRight: 6 }}>⏳</span>}
-            {stepLabel}
-          </span>
-          <span style={{ fontSize: 22, fontWeight: 700, fontVariantNumeric: "tabular-nums", color: barColor }}>{percent}%</span>
-        </div>
-        <div style={{ height: 8, background: "var(--bg-elevated)", borderRadius: 999, overflow: "hidden" }}>
-          <div style={{ height: "100%", width: `${percent}%`, background: barColor, borderRadius: 999, transition: "width 0.3s ease" }} />
-        </div>
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", fontSize: 11.5, color: "var(--text-faint)" }}>
-          <span>{totalSteps > 0 ? `${Math.min(completedSteps, totalSteps)} / ${totalSteps} 단계` : "호스트의 ‘파싱’을 누르면 진행 상황이 표시됩니다."}</span>
-          {logs.length > 0 && (
-            <button onClick={() => setShowLog((v) => !v)} style={{ background: "transparent", border: "none", color: "var(--accent)", cursor: "pointer", fontSize: 11.5, fontWeight: 600 }}>
-              {showLog ? "로그 숨기기" : "자세한 로그 보기"}
-            </button>
-          )}
-        </div>
-        {showLog && (
-          <div style={{ marginTop: 4, maxHeight: 220, background: "var(--bg)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", padding: 12, fontFamily: "var(--mono)", fontSize: 12, overflow: "auto" }}>
-            {logs.map((entry, i) => (
-              <div key={i} style={{ color: entry.stream === "stderr" ? "var(--danger)" : "var(--text-dim)", whiteSpace: "pre-wrap" }}>{entry.line}</div>
-            ))}
-            <div ref={logEndRef} />
-          </div>
-        )}
-      </div>
     </div>
   );
 }

@@ -254,6 +254,7 @@ fn fragment_image(members: &[usize], pos: &HashMap<usize, (i32, i32)>, byid: &Ha
     let (minx, miny) = (*xs.iter().min().unwrap(), *ys.iter().min().unwrap());
     let cols = (*xs.iter().max().unwrap() - minx + 1) as usize;
     let rows = (*ys.iter().max().unwrap() - miny + 1) as usize;
+    if cols > 200 || rows > 200 { return (0, 0, 0, 0, Vec::new()); } // cap at ~12800x12800 px to prevent OOM
     let (w, h) = (cols * TILE, rows * TILE);
     let mut canvas = bg_canvas(w, h);
     for m in members {
@@ -273,6 +274,7 @@ fn tile_rows(src: &str, full: &str, tiles: &[Tile]) -> Vec<Row> {
         if members.len() >= MIN_FRAGMENT {
             frag_no += 1;
             let (cols, rowsn, w, h, rgb) = fragment_image(members, &pos, &byid);
+            if w == 0 || h == 0 { continue; } // skipped due to OOM protection
             let mut r = Row::new();
             r.insert("kind".into(), "fragment".into()); r.insert("source_file".into(), src.into());
             r.insert("fragment_index".into(), frag_no.to_string());

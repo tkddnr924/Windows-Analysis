@@ -22,6 +22,10 @@ export interface PipelineRun {
   totalSteps: number;
   completedSteps: number;
   runComplete: boolean;
+  /** Host whose parse has just completed, retained after runningHostId clears. */
+  completedHostId: string | null;
+  /** Artifact names that reported a recoverable parse failure in the latest run. */
+  failedArtifacts: string[];
   /** running, or finished-and-not-yet-dismissed (so the banner stays up). */
   active: boolean;
   percent: number;
@@ -48,6 +52,8 @@ export function usePipelineRun(onDone?: () => void): PipelineRun {
   const [totalSteps, setTotalSteps] = useState(0);
   const [completedSteps, setCompletedSteps] = useState(0);
   const [runComplete, setRunComplete] = useState(false);
+  const [completedHostId, setCompletedHostId] = useState<string | null>(null);
+  const [failedArtifacts, setFailedArtifacts] = useState<string[]>([]);
   const [dismissed, setDismissed] = useState(true);
   const currentRef = useRef<string | null>(null);
   const onDoneRef = useRef(onDone);
@@ -82,6 +88,11 @@ export function usePipelineRun(onDone?: () => void): PipelineRun {
         setCurrentArtifact(match[1]);
         setCompletedSteps((c) => c + 1);
       }
+      const failure = entry.line.match(/^\[!\]\s+(.+?)\s+failed:/);
+      if (failure) {
+        const artifact = failure[1].trim();
+        setFailedArtifacts((previous) => previous.includes(artifact) ? previous : [...previous, artifact]);
+      }
     });
     return unsubscribe;
   }, []);
@@ -96,10 +107,16 @@ export function usePipelineRun(onDone?: () => void): PipelineRun {
     setDoneArtifacts(new Set());
     setCompletedSteps(0);
     setRunComplete(false);
+    setCompletedHostId(null);
+    setFailedArtifacts([]);
     setDismissed(false);
     setTotalSteps((opts.only ? opts.only.length : opts.totalArtifacts) + 1);
 
-    await window.api.runHost({ caseId: opts.caseId, hostId: opts.hostId, only: opts.only });
+    try {
+      await window.api.runHost({ caseId: opts.caseId, hostId: opts.hostId, only: opts.only });
+    } catch {
+      setFailedArtifacts(["파서 실행"]);
+    }
 
     // A cancelled run already tore the UI down in cancel(); don't flip it back
     // to "완료" when the backend finally returns.
@@ -111,6 +128,7 @@ export function usePipelineRun(onDone?: () => void): PipelineRun {
     flushCurrentSection();
     setRunningHostId(null);
     setCurrentArtifact(null);
+    setCompletedHostId(opts.hostId);
     setRunComplete(true);
     onDoneRef.current?.();
   }
@@ -126,6 +144,8 @@ export function usePipelineRun(onDone?: () => void): PipelineRun {
     setRunningHostId(null);
     setCurrentArtifact(null);
     setRunComplete(false);
+    setCompletedHostId(null);
+    setFailedArtifacts([]);
     setDismissed(true);
   }
 
@@ -149,7 +169,7 @@ export function usePipelineRun(onDone?: () => void): PipelineRun {
 
   return {
     runningHostId, runningHostName, logs, currentArtifact, doneArtifacts,
-    totalSteps, completedSteps, runComplete, active, percent, stepLabel, hadError,
+    totalSteps, completedSteps, runComplete, completedHostId, failedArtifacts, active, percent, stepLabel, hadError,
     start, cancel, dismiss,
   };
 }

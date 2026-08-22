@@ -2,13 +2,21 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { Bookmark, PathReference } from "@/lib/types";
+import CircularProgress from "@mui/material/CircularProgress";
+import IconButton from "@mui/material/IconButton";
+import KeyboardArrowDownOutlinedIcon from "@mui/icons-material/KeyboardArrowDownOutlined";
+import KeyboardArrowRightOutlinedIcon from "@mui/icons-material/KeyboardArrowRightOutlined";
+import ChevronRightOutlinedIcon from "@mui/icons-material/ChevronRightOutlined";
+import CloseOutlinedIcon from "@mui/icons-material/CloseOutlined";
+import FolderOpenOutlinedIcon from "@mui/icons-material/FolderOpenOutlined";
+import FolderOutlinedIcon from "@mui/icons-material/FolderOutlined";
+import InsertDriveFileOutlinedIcon from "@mui/icons-material/InsertDriveFileOutlined";
+import SearchOutlinedIcon from "@mui/icons-material/SearchOutlined";
+import RowDetailPanel from "./RowDetailPanel";
 
-// $MFT Explorer — a two-pane view: a lazily-loaded folder tree on the left,
-// a live detail panel on the right that updates as you click rows (files AND
-// folders), so inspecting a folder's timestamps is a single click. The table
-// can hold ~1M rows, so nothing is loaded up front: folders load their
-// children on expand and search hits query SQLite directly (window.api.mft*).
-// Each of a record's eight SI/FN timestamps can be bookmarked independently.
+// File-system information is read from the MFT_Records overview table. The
+// table can hold ~1M rows, so folders load lazily and search queries SQLite
+// directly instead of materializing all records in the browser.
 
 type Row = Record<string, string>;
 
@@ -28,18 +36,6 @@ interface Props {
   onBookmarkRef: (fullPath: string, tableName: string, rowid: number, field: string) => void;
 }
 
-const TIME_FIELDS: { key: string; label: string }[] = [
-  { key: "si_created", label: "생성 (Created)" },
-  { key: "si_modified", label: "수정 (Modified)" },
-  { key: "si_mft_modified", label: "MFT 수정 (Changed)" },
-  { key: "si_accessed", label: "접근 (Accessed)" },
-];
-const FN_FIELDS: { key: string; label: string }[] = [
-  { key: "fn_created", label: "생성 (Created)" },
-  { key: "fn_modified", label: "수정 (Modified)" },
-  { key: "fn_mft_modified", label: "MFT 수정 (Changed)" },
-  { key: "fn_accessed", label: "접근 (Accessed)" },
-];
 
 /** dbPath is <hostDir>/_OVERVIEW/MFT_Records.sqlite — strip the tail to get
  *  the host folder the other artifacts live under. */
@@ -60,6 +56,18 @@ function refsFor(refs: RefMap, row: Row, accountFilter: Set<string> | null): Pat
   return all.filter((r) => accountFilter.has(r.account));
 }
 
+function referenceTags(refs: RefMap, row: Row, accountFilter: Set<string> | null): { account: string; kind: string }[] {
+  const seen = new Set<string>();
+  const tags: { account: string; kind: string }[] = [];
+  for (const reference of refsFor(refs, row, accountFilter)) {
+    const key = `${reference.account}|${reference.kind}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    tags.push({ account: reference.account, kind: reference.kind });
+  }
+  return tags;
+}
+
 function isDir(r: Row): boolean {
   return r.is_directory === "Y";
 }
@@ -71,21 +79,20 @@ function fmtSize(v: string): string {
   if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`;
   return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }
-function rowIcon(r: Row, isOpen: boolean): string {
-  if (isDir(r)) return isOpen ? "📂" : "📁";
-  return "📄";
-}
 
 export default function MftView({ dbPath, tableBookmarks, onToggleBookmark, allBookmarks, onBookmarkRef }: Props) {
   const [root, setRoot] = useState<Row[] | null>(null);
   const [childrenCache, setChildrenCache] = useState<Record<string, Row[]>>({});
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [loadingEntry, setLoadingEntry] = useState<Set<string>>(new Set());
+  const [failedEntries, setFailedEntries] = useState<Set<string>>(new Set());
+  const [rootError, setRootError] = useState<string | null>(null);
   const [selected, setSelected] = useState<Row | null>(null);
+  const [referenceDetail, setReferenceDetail] = useState<PathReference | null>(null);
   // Cross-artifact sightings of a path (JumpList today), indexed by lowercased
   // path so the tree can tag rows without a query per row.
   const [pathRefs, setPathRefs] = useState<RefMap>(new Map());
-  const [refModal, setRefModal] = useState<PathReference | null>(null);
+  const [pathRefsError, setPathRefsError] = useState<string | null>(null);
   // Accounts seen across all references, and which are currently shown. An
   // investigator can uncheck accounts unrelated to the attack so their
   // JumpList/Shellbag tags stop cluttering the tree.
@@ -107,7 +114,16 @@ export default function MftView({ dbPath, tableBookmarks, onToggleBookmark, allB
       setPathRefs(m);
       setRefAccounts(sorted);
       setSelAccounts(new Set(sorted)); // default: all accounts shown
-    }).catch(() => {});
+      setPathRefsError(null);
+    }).catch(() => {
+      if (!alive) return;
+      // $MFT evidence remains usable without optional cross-artifact tags;
+      // make that degraded state explicit instead of silently looking empty.
+      setPathRefs(new Map());
+      setRefAccounts([]);
+      setSelAccounts(new Set());
+      setPathRefsError("교차 참조 정보를 불러오지 못했습니다.");
+    });
     return () => { alive = false; };
   }, [dbPath]);
 
@@ -118,12 +134,25 @@ export default function MftView({ dbPath, tableBookmarks, onToggleBookmark, allB
   const [search, setSearch] = useState("");
   const [results, setResults] = useState<Row[] | null>(null);
   const [searching, setSearching] = useState(false);
+  const [searchError, setSearchError] = useState<string | null>(null);
   const searchSeq = useRef(0);
 
   useEffect(() => {
     let cancelled = false;
+    setRoot(null);
+    setRootError(null);
+    setChildrenCache({});
+    setExpanded(new Set());
+    setFailedEntries(new Set());
+    setSelected(null);
+    setReferenceDetail(null);
     window.api.mftChildren(dbPath, ROOT_ENTRY).then((rows) => {
       if (!cancelled) setRoot(rows);
+    }).catch(() => {
+      if (!cancelled) {
+        setRoot([]);
+        setRootError("최상위 파일 시스템 레코드를 읽지 못했습니다.");
+      }
     });
     return () => {
       cancelled = true;
@@ -134,13 +163,19 @@ export default function MftView({ dbPath, tableBookmarks, onToggleBookmark, allB
     async (entry: string) => {
       if (childrenCache[entry]) return;
       setLoadingEntry((s) => new Set(s).add(entry));
-      const rows = await window.api.mftChildren(dbPath, Number(entry));
-      setChildrenCache((c) => ({ ...c, [entry]: rows }));
-      setLoadingEntry((s) => {
-        const n = new Set(s);
-        n.delete(entry);
-        return n;
-      });
+      setFailedEntries((s) => { const next = new Set(s); next.delete(entry); return next; });
+      try {
+        const rows = await window.api.mftChildren(dbPath, Number(entry));
+        setChildrenCache((c) => ({ ...c, [entry]: rows }));
+      } catch {
+        setFailedEntries((s) => new Set(s).add(entry));
+      } finally {
+        setLoadingEntry((s) => {
+          const n = new Set(s);
+          n.delete(entry);
+          return n;
+        });
+      }
     },
     [dbPath, childrenCache],
   );
@@ -163,19 +198,27 @@ export default function MftView({ dbPath, tableBookmarks, onToggleBookmark, allB
 
   // debounced search
   useEffect(() => {
+    const seq = ++searchSeq.current;
     const q = search.trim();
     if (q.length < 2) {
       setResults(null);
       setSearching(false);
+      setSearchError(null);
       return;
     }
     setSearching(true);
-    const seq = ++searchSeq.current;
+    setSearchError(null);
     const t = setTimeout(() => {
       window.api.mftSearch(dbPath, q, 500).then((rows) => {
         if (seq === searchSeq.current) {
           setResults(rows);
           setSearching(false);
+        }
+      }).catch(() => {
+        if (seq === searchSeq.current) {
+          setResults([]);
+          setSearching(false);
+          setSearchError("파일 시스템 검색 결과를 읽지 못했습니다.");
         }
       });
     }, 250);
@@ -187,31 +230,39 @@ export default function MftView({ dbPath, tableBookmarks, onToggleBookmark, allB
   const selectedRowid = selected ? Number(selected.__rowid) : null;
 
   return (
-    <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
-      <div style={{ padding: "16px 20px 10px", flexShrink: 0 }}>
-        <div style={{ display: "flex", alignItems: "baseline", gap: 12, marginBottom: 10 }}>
-          <span style={{ fontSize: 22, fontWeight: 700, color: "var(--text)" }}>🗂️ $MFT 파일 탐색기</span>
-          <span style={{ fontSize: 12, color: "var(--text-faint)" }}>폴더 왼쪽 화살표로 펼치고, 행을 클릭하면 오른쪽에 상세가 표시됩니다.</span>
+    <div className="dfir-view" style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
+      <header style={{ padding: "14px 18px 12px", flexShrink: 0, borderBottom: "1px solid var(--border)" }}>
+        <div style={{ display: "flex", alignItems: "baseline", gap: 10, marginBottom: 10 }}>
+          <h1 style={{ margin: 0, fontSize: 20, lineHeight: 1.2, fontWeight: 700, color: "var(--text)" }}>파일 시스템 정보</h1>
+          <span style={{ color: "var(--text-faint)", fontFamily: "var(--mono)", fontSize: 11.5 }}>$MFT</span>
         </div>
-        <div style={{ position: "relative", maxWidth: 460 }}>
-          <span style={{ position: "absolute", left: 10, top: "50%", transform: "translateY(-50%)", fontSize: 12, color: "var(--text-faint)", pointerEvents: "none" }}>🔍</span>
+        <div style={{ position: "relative", width: "min(560px, 100%)" }}>
+          <SearchOutlinedIcon aria-hidden="true" sx={{ position: "absolute", left: 9, top: "50%", transform: "translateY(-50%)", fontSize: 17, color: "var(--text-faint)", pointerEvents: "none" }} />
           <input
             value={search}
             onChange={(e) => setSearch(e.target.value)}
             placeholder="파일명 · 경로 검색 (2자 이상)"
-            style={{ width: "100%", padding: "7px 26px 7px 30px", fontSize: 12.5, fontFamily: "var(--mono)", background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", color: "var(--text)", outline: "none" }}
+            aria-label="파일명 또는 경로 검색"
+            style={{ boxSizing: "border-box", width: "100%", height: 34, padding: "7px 38px 7px 31px", fontSize: 12.5, fontFamily: "var(--mono)", background: "var(--bg-input)", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", color: "var(--text)", outline: "none" }}
           />
           {search && (
-            <span onClick={() => setSearch("")} style={{ position: "absolute", right: 8, top: "50%", transform: "translateY(-50%)", cursor: "pointer", color: "var(--text-faint)", fontSize: 13 }}>✕</span>
+            <IconButton
+              size="small"
+              aria-label="검색어 지우기"
+              onClick={() => setSearch("")}
+              sx={{ position: "absolute", right: 3, top: "50%", transform: "translateY(-50%)", color: "var(--text-faint)", p: "4px", borderRadius: "var(--radius-sm)" }}
+            >
+              <CloseOutlinedIcon sx={{ fontSize: 16 }} />
+            </IconButton>
           )}
         </div>
         {refAccounts.length > 0 && (
-          <div style={{ display: "flex", alignItems: "center", flexWrap: "wrap", gap: 8, marginTop: 10 }}>
-            <span style={{ fontSize: 11, color: "var(--text-faint)" }}>👤 JumpList/Shellbag 계정:</span>
+          <div style={{ display: "flex", alignItems: "center", flexWrap: "wrap", gap: 6, marginTop: 9 }}>
+            <span style={{ fontSize: 11.5, color: "var(--text-faint)", marginRight: 2 }}>교차 참조 계정</span>
             {refAccounts.map((a) => {
               const on = selAccounts.has(a);
               return (
-                <label key={a || "(none)"} style={{ display: "inline-flex", alignItems: "center", gap: 4, cursor: "pointer", fontSize: 11.5, fontWeight: 600, padding: "2px 8px", borderRadius: "var(--radius-lg)", border: `1px solid ${on ? "var(--accent)" : "var(--border)"}`, color: on ? "var(--accent)" : "var(--text-faint)", background: on ? "var(--accent-subtle, transparent)" : "transparent" }}>
+                <label key={a || "(none)"} style={{ display: "inline-flex", alignItems: "center", gap: 4, cursor: "pointer", fontSize: 11.5, fontWeight: 600, minHeight: 24, padding: "1px 7px", borderRadius: "var(--radius-sm)", border: `1px solid ${on ? "var(--accent)" : "var(--border)"}`, color: on ? "var(--accent)" : "var(--text-faint)", background: on ? "var(--accent-subtle, transparent)" : "transparent" }}>
                   <input type="checkbox" checked={on} onChange={() => toggleAccount(a)} style={{ accentColor: "var(--accent)", width: 12, height: 12 }} />
                   {a || "(계정 미상)"}
                 </label>
@@ -219,15 +270,24 @@ export default function MftView({ dbPath, tableBookmarks, onToggleBookmark, allB
             })}
           </div>
         )}
-      </div>
+        {pathRefsError && <div role="status" style={{ marginTop: 8, color: "var(--warning)", fontSize: 11.5 }}>{pathRefsError}</div>}
+      </header>
 
-      <div style={{ flex: 1, minHeight: 0, display: "flex", borderTop: "1px solid var(--border)" }}>
-        {/* left: Explorer (60%) */}
-        <div style={{ flex: 6, minWidth: 0, overflow: "auto", padding: "8px 10px 16px" }}>
+      <div style={{ flex: 1, minHeight: 0, display: "grid", gridTemplateColumns: "minmax(360px, 44%) minmax(0, 1fr)" }}>
+        <aside aria-label="파일 탐색기" style={{ minWidth: 0, overflow: "auto", padding: "8px 12px 16px", borderRight: "1px solid var(--border)" }}>
+          <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) 28px", alignItems: "center", minHeight: 27, padding: "0 7px", borderBottom: "1px solid var(--border)", color: "var(--text-faint)", fontSize: 10.5, fontWeight: 700, letterSpacing: "0.02em" }}>
+            <span>이름</span>
+            <span aria-hidden="true" />
+          </div>
           {results !== null ? (
-            <SearchResults rows={results} searching={searching} bmRowids={bmRowids} selectedRowid={selectedRowid} onSelect={setSelected} />
+            <SearchResults rows={results} searching={searching} error={searchError} bmRowids={bmRowids} selectedRowid={selectedRowid} onSelect={setSelected} refs={pathRefs} accountFilter={selAccounts} />
           ) : root === null ? (
-            <div style={{ padding: 20, color: "var(--text-dim)" }}>불러오는 중...</div>
+            <div style={{ minHeight: 100, display: "flex", alignItems: "center", justifyContent: "center", gap: 8, color: "var(--text-dim)", fontSize: 12.5 }}>
+              <CircularProgress size={17} thickness={4} />
+              파일 시스템 레코드를 불러오는 중
+            </div>
+          ) : rootError ? (
+            <div style={{ padding: "16px 8px", color: "var(--danger)", fontSize: 12.5 }}>{rootError}</div>
           ) : (
             root.map((r) => (
               <TreeNode
@@ -237,6 +297,7 @@ export default function MftView({ dbPath, tableBookmarks, onToggleBookmark, allB
                 expanded={expanded}
                 childrenCache={childrenCache}
                 loadingEntry={loadingEntry}
+                failedEntries={failedEntries}
                 bmRowids={bmRowids}
                 selectedRowid={selectedRowid}
                 onToggle={toggle}
@@ -246,22 +307,45 @@ export default function MftView({ dbPath, tableBookmarks, onToggleBookmark, allB
               />
             ))
           )}
-        </div>
-
-        {/* right: live detail (40%) */}
-        <div style={{ flex: 4, minWidth: 320, overflow: "auto", borderLeft: "1px solid var(--border)", background: "var(--bg-panel)" }}>
+        </aside>
+        <section aria-label="선택 항목 MFT 정보" style={{ minWidth: 0, overflow: "auto" }}>
           {selected ? (
-            <DetailPane row={selected} bmFieldKeys={bmFieldKeys} onToggleBookmark={onToggleBookmark} refs={refsFor(pathRefs, selected, selAccounts)} onOpenRef={setRefModal} />
+            <RowDetailPanel
+              row={selected}
+              columns={Object.keys(selected).filter((key) => key !== "__rowid")}
+              focusedColumn={null}
+              fileBaseName="MFT_Records"
+              variant="docked"
+              onClose={() => setSelected(null)}
+              onNavigate={() => {}}
+              isBookmarked={bmRowids.has(Number(selected.__rowid))}
+              onToggleBookmark={() => onToggleBookmark(Number(selected.__rowid), "")}
+              onToggleFieldBookmark={(field) => onToggleBookmark(Number(selected.__rowid), field)}
+              isFieldBookmarked={(field) => bmFieldKeys.has(`${selected.__rowid}@${field}`)}
+              relatedEvidence={refsFor(pathRefs, selected, selAccounts).map((reference, index) => ({
+                id: `${reference.fullPath}:${reference.tableName}:${reference.rowid}:${index}`,
+                label: `${reference.kind} · 계정 ${reference.account || "미상"}`,
+                subtitle: reference.label,
+                onOpen: () => setReferenceDetail(reference),
+              }))}
+            />
           ) : (
-            <div style={{ padding: 20, color: "var(--text-faint)", fontSize: 12.5, textAlign: "center", marginTop: 40 }}>
-              왼쪽에서 파일·폴더를 클릭하면
-              <br />
-              여기에 상세 정보가 표시됩니다.
-            </div>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "center", minHeight: "100%", padding: 24, color: "var(--text-faint)", fontSize: 13 }}>파일을 선택하면 MFT 정보를 표시합니다.</div>
           )}
-        </div>
+        </section>
       </div>
-      {refModal && <RefModal reference={refModal} allBookmarks={allBookmarks} onBookmarkRef={onBookmarkRef} onClose={() => setRefModal(null)} />}
+      {referenceDetail && (
+        <RowDetailPanel
+          row={{ ...referenceDetail.fields, __rowid: String(referenceDetail.rowid) }}
+          columns={Object.keys(referenceDetail.fields)}
+          focusedColumn={null}
+          fileBaseName={referenceDetail.tableName || referenceDetail.kind}
+          onClose={() => setReferenceDetail(null)}
+          onNavigate={() => {}}
+          isBookmarked={referenceDetail.rowid >= 0 && allBookmarks.some((bookmark) => bookmark.fullPath === referenceDetail.fullPath && bookmark.rowid === referenceDetail.rowid)}
+          onToggleBookmark={referenceDetail.rowid >= 0 ? () => onBookmarkRef(referenceDetail.fullPath, referenceDetail.tableName, referenceDetail.rowid, "") : undefined}
+        />
+      )}
     </div>
   );
 }
@@ -272,6 +356,7 @@ function TreeNode({
   expanded,
   childrenCache,
   loadingEntry,
+  failedEntries,
   bmRowids,
   selectedRowid,
   onToggle,
@@ -284,6 +369,7 @@ function TreeNode({
   expanded: Set<string>;
   childrenCache: Record<string, Row[]>;
   loadingEntry: Set<string>;
+  failedEntries: Set<string>;
   bmRowids: Set<number>;
   selectedRowid: number | null;
   onToggle: (r: Row) => void;
@@ -298,60 +384,62 @@ function TreeNode({
   const bm = bmRowids.has(Number(row.__rowid));
   const isSel = selectedRowid !== null && Number(row.__rowid) === selectedRowid;
 
-  // Clicking a folder row selects it AND toggles open/closed — click to open,
-  // click again to collapse (the little arrow does the same).
+  // A folder click updates the same shared MFT inspector and expands/collapses
+  // the branch; a file click only updates the inspector.
   const handleRowClick = () => { onSelect(row); if (dir) onToggle(row); };
 
   // (account, kind) chips for other artifacts that reference this exact path,
   // de-duplicated (a path can appear many times in one JumpList).
-  const rowTags = (() => {
-    const seen = new Set<string>();
-    const out: { account: string; kind: string }[] = [];
-    for (const r of refsFor(refs, row, accountFilter)) {
-      const key = `${r.account}|${r.kind}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      out.push({ account: r.account, kind: r.kind });
-    }
-    return out;
-  })();
+  const rowTags = referenceTags(refs, row, accountFilter);
 
   return (
     <>
       <div
+        role="button"
+        tabIndex={0}
         onClick={handleRowClick}
-        style={{ display: "flex", alignItems: "center", gap: 4, padding: "3px 6px", paddingLeft: 6 + depth * 16, borderRadius: "var(--radius-sm)", cursor: "pointer", opacity: deleted ? 0.55 : 1, background: isSel ? "var(--bg-selected)" : "transparent" }}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            handleRowClick();
+          }
+        }}
+        style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) 28px", alignItems: "center", columnGap: 6, minHeight: 29, padding: "2px 7px", paddingLeft: 7 + depth * 16, borderRadius: "var(--radius-sm)", cursor: "pointer", opacity: deleted ? 0.55 : 1, background: isSel ? "var(--bg-selected)" : "transparent", borderLeft: bm ? "2px solid var(--warning)" : "2px solid transparent" }}
         onMouseEnter={(e) => { if (!isSel) e.currentTarget.style.background = "var(--bg-hover)"; }}
         onMouseLeave={(e) => { if (!isSel) e.currentTarget.style.background = "transparent"; }}
-        title={dir ? "클릭: 열기 + 상세 · 화살표: 접기/펼치기" : "클릭: 상세 보기"}
+        title={dir ? "클릭: MFT 정보 보기 및 폴더 접기/펼치기" : "클릭: MFT 정보 보기"}
       >
-        <span
-          onClick={(e) => {
-            if (dir) {
-              e.stopPropagation();
-              onToggle(row);
-            }
-          }}
-          style={{ width: 14, textAlign: "center", color: "var(--text-faint)", fontSize: 10, cursor: dir ? "pointer" : "default" }}
-        >
-          {dir ? (open ? "▾" : "▸") : ""}
-        </span>
-        <span style={{ fontSize: 13 }}>{rowIcon(row, open)}</span>
-        <span style={{ fontSize: 12.5, color: "var(--text)", wordBreak: "break-all" }}>{row.file_name || "(이름 없음)"}</span>
-        {deleted && <span style={{ fontSize: 9.5, fontWeight: 700, color: "var(--danger)", border: "1px solid var(--danger)", borderRadius: 3, padding: "0 4px" }}>삭제됨</span>}
-        {bm && <span style={{ fontSize: 11, color: "var(--warning)" }}>★</span>}
-        {rowTags.map((t, i) => (
-          <span key={i} title={`${t.account || "?"} 계정의 ${t.kind}`} style={{ fontSize: 9.5, fontWeight: 700, color: "var(--accent)", border: "1px solid var(--accent)", borderRadius: 3, padding: "0 4px", whiteSpace: "nowrap" }}>
-            {t.account ? `${t.account}, ${t.kind}` : t.kind}
-          </span>
-        ))}
-        {!dir && <span style={{ marginLeft: "auto", fontSize: 10.5, color: "var(--text-faint)", fontFamily: "var(--mono)" }}>{fmtSize(row.file_size)}</span>}
+        <div style={{ minWidth: 0, display: "flex", alignItems: "center", gap: 5 }}>
+          {dir ? (
+            <IconButton
+              size="small"
+              aria-label={open ? "폴더 접기" : "폴더 펼치기"}
+              onClick={(e) => { e.stopPropagation(); onToggle(row); }}
+              sx={{ flexShrink: 0, width: 20, height: 20, p: 0, color: "var(--text-faint)", borderRadius: "var(--radius-sm)" }}
+            >
+              {open ? <KeyboardArrowDownOutlinedIcon sx={{ fontSize: 17 }} /> : <KeyboardArrowRightOutlinedIcon sx={{ fontSize: 17 }} />}
+            </IconButton>
+          ) : <span style={{ flex: "0 0 20px" }} />}
+          {dir
+            ? (open ? <FolderOpenOutlinedIcon aria-hidden="true" sx={{ flexShrink: 0, fontSize: 17, color: "var(--accent)" }} /> : <FolderOutlinedIcon aria-hidden="true" sx={{ flexShrink: 0, fontSize: 17, color: "var(--text-faint)" }} />)
+            : <InsertDriveFileOutlinedIcon aria-hidden="true" sx={{ flexShrink: 0, fontSize: 16, color: "var(--text-faint)" }} />}
+          <span style={{ minWidth: 0, fontSize: 12.5, color: "var(--text)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{row.file_name || "(이름 없음)"}</span>
+          {deleted && <span style={{ flexShrink: 0, fontSize: 9.5, fontWeight: 700, color: "var(--danger)", border: "1px solid var(--danger)", borderRadius: 3, padding: "0 4px" }}>삭제됨</span>}
+          {rowTags.map((t, i) => (
+            <span key={i} title={`${t.kind} 원본 · ${t.account ? `계정 ${t.account}` : "계정 미상"}`} style={{ flexShrink: 0, fontSize: 9.5, fontWeight: 700, color: "var(--accent)", border: "1px solid var(--accent)", borderRadius: 3, padding: "0 4px", whiteSpace: "nowrap" }}>
+              {`${t.kind} · ${t.account ? `계정 ${t.account}` : "계정 미상"}`}
+            </span>
+          ))}
+        </div>
+        {!dir && <ChevronRightOutlinedIcon aria-hidden="true" sx={{ fontSize: 17, color: "var(--text-faint)" }} />}
       </div>
       {dir && open && (
         loadingEntry.has(row.entry) && !kids ? (
-          <div style={{ paddingLeft: 6 + (depth + 1) * 16 + 18, fontSize: 11.5, color: "var(--text-faint)", padding: "2px 0" }}>불러오는 중...</div>
+          <div style={{ display: "flex", alignItems: "center", gap: 6, paddingLeft: 7 + (depth + 1) * 16 + 20, minHeight: 27, fontSize: 11.5, color: "var(--text-faint)" }}><CircularProgress size={13} thickness={4} /> 하위 항목을 불러오는 중</div>
+        ) : failedEntries.has(row.entry) ? (
+          <div style={{ paddingLeft: 7 + (depth + 1) * 16 + 20, minHeight: 27, fontSize: 11.5, lineHeight: "27px", color: "var(--danger)" }}>하위 항목을 읽지 못했습니다. 접었다가 다시 펼쳐 재시도할 수 있습니다.</div>
         ) : kids && kids.length === 0 ? (
-          <div style={{ paddingLeft: 6 + (depth + 1) * 16 + 18, fontSize: 11.5, color: "var(--text-faint)" }}>(비어 있음)</div>
+          <div style={{ paddingLeft: 7 + (depth + 1) * 16 + 20, minHeight: 27, fontSize: 11.5, lineHeight: "27px", color: "var(--text-faint)" }}>비어 있음</div>
         ) : (
           (kids ?? []).map((c) => (
             <TreeNode
@@ -361,6 +449,7 @@ function TreeNode({
               expanded={expanded}
               childrenCache={childrenCache}
               loadingEntry={loadingEntry}
+              failedEntries={failedEntries}
               bmRowids={bmRowids}
               selectedRowid={selectedRowid}
               onToggle={onToggle}
@@ -375,30 +464,40 @@ function TreeNode({
   );
 }
 
-function SearchResults({ rows, searching, bmRowids, selectedRowid, onSelect }: { rows: Row[]; searching: boolean; bmRowids: Set<number>; selectedRowid: number | null; onSelect: (r: Row) => void }) {
-  if (searching && rows.length === 0) return <div style={{ padding: 16, color: "var(--text-faint)", fontSize: 12.5 }}>검색 중...</div>;
-  if (rows.length === 0) return <div style={{ padding: 16, color: "var(--text-faint)", fontSize: 12.5 }}>일치하는 항목이 없습니다.</div>;
+function SearchResults({ rows, searching, error, bmRowids, selectedRowid, onSelect, refs, accountFilter }: { rows: Row[]; searching: boolean; error: string | null; bmRowids: Set<number>; selectedRowid: number | null; onSelect: (r: Row) => void; refs: RefMap; accountFilter: Set<string> | null }) {
+  if (searching && rows.length === 0) return <div style={{ display: "flex", alignItems: "center", gap: 7, padding: "16px 8px", color: "var(--text-faint)", fontSize: 12.5 }}><CircularProgress size={15} thickness={4} /> 검색 중</div>;
+  if (error) return <div style={{ padding: "16px 8px", color: "var(--danger)", fontSize: 12.5 }}>{error}</div>;
+  if (rows.length === 0) return <div style={{ padding: "16px 8px", color: "var(--text-faint)", fontSize: 12.5 }}>일치하는 항목이 없습니다.</div>;
   return (
     <div style={{ paddingTop: 4 }}>
-      <div style={{ fontSize: 11, color: "var(--text-faint)", padding: "4px 8px" }}>검색 결과 {rows.length}건{rows.length >= 500 ? " (상위 500건)" : ""}</div>
+      <div style={{ fontSize: 11, color: "var(--text-faint)", padding: "6px 7px" }}>검색 결과 {rows.length}건{rows.length >= 500 ? " (상위 500건)" : ""}</div>
       {rows.map((r) => {
         const deleted = r.in_use === "N";
         const isSel = selectedRowid !== null && Number(r.__rowid) === selectedRowid;
+        const rowTags = referenceTags(refs, r, accountFilter);
         return (
           <div
             key={r.entry + "-" + r.__rowid}
+            role="button"
+            tabIndex={0}
             onClick={() => onSelect(r)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onSelect(r); }
+            }}
             onMouseEnter={(e) => { if (!isSel) e.currentTarget.style.background = "var(--bg-hover)"; }}
             onMouseLeave={(e) => { if (!isSel) e.currentTarget.style.background = "transparent"; }}
-            style={{ padding: "5px 8px", borderRadius: "var(--radius-sm)", cursor: "pointer", opacity: deleted ? 0.55 : 1, background: isSel ? "var(--bg-selected)" : "transparent" }}
+            style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) 28px", alignItems: "center", columnGap: 6, minHeight: 34, padding: "3px 7px", borderRadius: "var(--radius-sm)", cursor: "pointer", opacity: deleted ? 0.55 : 1, background: isSel ? "var(--bg-selected)" : "transparent", borderLeft: bmRowids.has(Number(r.__rowid)) ? "2px solid var(--warning)" : "2px solid transparent" }}
           >
-            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-              <span style={{ fontSize: 13 }}>{rowIcon(r, false)}</span>
-              <span style={{ fontSize: 12.5, color: "var(--text)", wordBreak: "break-all" }}>{r.file_name || "(이름 없음)"}</span>
+            <div style={{ minWidth: 0 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              {isDir(r) ? <FolderOutlinedIcon aria-hidden="true" sx={{ flexShrink: 0, fontSize: 16, color: "var(--text-faint)" }} /> : <InsertDriveFileOutlinedIcon aria-hidden="true" sx={{ flexShrink: 0, fontSize: 15, color: "var(--text-faint)" }} />}
+              <span style={{ fontSize: 12.5, color: "var(--text)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{r.file_name || "(이름 없음)"}</span>
               {deleted && <span style={{ fontSize: 9.5, fontWeight: 700, color: "var(--danger)", border: "1px solid var(--danger)", borderRadius: 3, padding: "0 4px" }}>삭제됨</span>}
-              {bmRowids.has(Number(r.__rowid)) && <span style={{ fontSize: 11, color: "var(--warning)" }}>★</span>}
+              {rowTags.map((tag, index) => <span key={index} title={`${tag.kind} 원본 · ${tag.account ? `계정 ${tag.account}` : "계정 미상"}`} style={{ flexShrink: 0, fontSize: 9.5, fontWeight: 700, color: "var(--accent)", border: "1px solid var(--accent)", borderRadius: 3, padding: "0 4px", whiteSpace: "nowrap" }}>{`${tag.kind} · ${tag.account ? `계정 ${tag.account}` : "계정 미상"}`}</span>)}
+              </div>
+              <div style={{ fontSize: 10.5, color: "var(--text-faint)", fontFamily: "var(--mono)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", marginTop: 1 }}>{r.path}</div>
             </div>
-            <div style={{ fontSize: 10.5, color: "var(--text-faint)", fontFamily: "var(--mono)", marginTop: 1, wordBreak: "break-all" }}>{r.path}</div>
+            <ChevronRightOutlinedIcon aria-hidden="true" sx={{ fontSize: 17, color: "var(--text-faint)" }} />
           </div>
         );
       })}
@@ -406,7 +505,12 @@ function SearchResults({ rows, searching, bmRowids, selectedRowid, onSelect }: {
   );
 }
 
-function DetailPane({ row, bmFieldKeys, onToggleBookmark, refs, onOpenRef }: { row: Row; bmFieldKeys: Set<string>; onToggleBookmark: (rowid: number, field: string) => void; refs: PathReference[]; onOpenRef: (r: PathReference) => void }) {
+/*
+ * Superseded local MFT detail and reference modal implementation. The active
+ * view now uses the shared RowDetailPanel (docked for MFT, drawer for a
+ * linked source record). Kept out of the type-checked module temporarily to
+ * avoid a broad unrelated formatting rewrite in this dirty worktree.
+function DetailPane({ row, bmFieldKeys, onToggleBookmark, refs, onOpenRef, onOpenFullDetails }: { row: Row; bmFieldKeys: Set<string>; onToggleBookmark: (rowid: number, field: string) => void; refs: PathReference[]; onOpenRef: (r: PathReference) => void; onOpenFullDetails: () => void }) {
   const dir = isDir(row);
   const rowid = Number(row.__rowid);
   const meta: [string, string][] = [
@@ -422,53 +526,57 @@ function DetailPane({ row, bmFieldKeys, onToggleBookmark, refs, onOpenRef }: { r
     const val = row[f.key] || "";
     const isBm = bmFieldKeys.has(`${rowid}@${f.key}`);
     return (
-      <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "5px 0", borderTop: "1px solid var(--border-subtle)" }}>
+      <div style={{ display: "grid", gridTemplateColumns: "120px minmax(0, 1fr) 30px", alignItems: "center", columnGap: 10, minHeight: 34, borderTop: "1px solid var(--border-subtle)" }}>
         <div style={{ flex: 1, minWidth: 0 }}>
-          <div style={{ fontSize: 11, color: "var(--text-faint)" }}>{f.label}</div>
-          <div style={{ fontSize: 11.5, fontFamily: "var(--mono)", color: val ? "var(--text)" : "var(--text-faint)", wordBreak: "break-all" }}>{val || "—"}</div>
+          <div style={{ fontSize: 11.5, color: "var(--text-dim)", fontWeight: 650 }}>{f.label}</div>
         </div>
+        <div style={{ minWidth: 0, fontSize: 11.5, fontFamily: "var(--mono)", color: val ? "var(--text)" : "var(--text-faint)", overflowWrap: "anywhere" }}>{val || "값 없음"}</div>
         {val && (
-          <button
+          <IconButton
+            size="small"
             onClick={() => onToggleBookmark(rowid, f.key)}
             title={isBm ? "이 시각 북마크 해제" : "이 시각 북마크"}
-            style={{ flexShrink: 0, fontSize: 12, padding: "2px 8px", borderRadius: "var(--radius-lg)", cursor: "pointer", background: isBm ? "var(--warning-subtle)" : "transparent", color: isBm ? "var(--warning)" : "var(--text-dim)", border: `1px solid ${isBm ? "var(--warning)" : "var(--border)"}`, fontWeight: 600 }}
+            aria-label={`${f.label} ${isBm ? "북마크 해제" : "북마크"}`}
+            sx={{ width: 26, height: 26, p: 0, borderRadius: "var(--radius-sm)", color: isBm ? "var(--warning)" : "var(--text-faint)", background: isBm ? "var(--warning-subtle)" : "transparent", border: `1px solid ${isBm ? "var(--warning)" : "var(--border)"}` }}
           >
-            {isBm ? "★" : "☆"}
-          </button>
+            {isBm ? <BookmarkOutlinedIcon sx={{ fontSize: 15 }} /> : <BookmarkBorderOutlinedIcon sx={{ fontSize: 15 }} />}
+          </IconButton>
         )}
+        {!val && <span aria-hidden="true" />}
       </div>
     );
   };
 
   return (
     <div style={{ padding: "14px 16px 18px" }}>
-      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
-        <span style={{ fontSize: 16 }}>{rowIcon(row, false)}</span>
-        <span style={{ fontSize: 14, fontWeight: 700, wordBreak: "break-all" }}>{row.file_name || "(이름 없음)"}</span>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, paddingBottom: 10, marginBottom: 10, borderBottom: "1px solid var(--border)" }}>
+        <div style={{ minWidth: 0, flex: 1 }}>
+          <div style={{ fontSize: 11, color: "var(--text-faint)", marginBottom: 3 }}>선택 항목 MFT 정보</div>
+          <div style={{ fontSize: 15, fontWeight: 750, color: "var(--text)", overflowWrap: "anywhere" }}>{row.file_name || "(이름 없음)"}</div>
+        </div>
         {row.in_use === "N" && <span style={{ fontSize: 10, fontWeight: 700, color: "var(--danger)", border: "1px solid var(--danger)", borderRadius: 3, padding: "0 5px" }}>삭제됨</span>}
+        <button onClick={onOpenFullDetails} style={{ flexShrink: 0, fontSize: 11, padding: "5px 8px", background: "transparent", color: "var(--text-dim)", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", cursor: "pointer" }}>전체 필드</button>
       </div>
-      <div style={{ fontSize: 10.5, color: "var(--text-faint)", fontFamily: "var(--mono)", wordBreak: "break-all", marginBottom: 12 }}>{row.path}</div>
+      <div style={{ fontSize: 10.5, color: "var(--text-faint)", fontFamily: "var(--mono)", overflowWrap: "anywhere", paddingBottom: 10, borderBottom: "1px solid var(--border-subtle)" }}>{row.path || "경로 정보 없음"}</div>
 
       {meta.filter(([, v]) => v).map(([k, v]) => (
-        <div key={k} style={{ display: "flex", gap: 10, padding: "5px 0", borderBottom: "1px solid var(--border-subtle)" }}>
-          <span style={{ flex: "0 0 96px", color: "var(--text-faint)", fontSize: 11.5 }}>{k}</span>
-          <span style={{ flex: 1, color: "var(--text)", fontSize: 12, wordBreak: "break-all", fontFamily: /확장자|엔트리|부모/.test(k) ? "var(--mono)" : undefined }}>{v}</span>
+        <div key={k} style={{ display: "grid", gridTemplateColumns: "120px minmax(0, 1fr)", columnGap: 10, padding: "7px 0", borderBottom: "1px solid var(--border-subtle)" }}>
+          <span style={{ color: "var(--text-faint)", fontSize: 11.5 }}>{k}</span>
+          <span style={{ color: "var(--text)", fontSize: 12, overflowWrap: "anywhere", fontFamily: /확장자|엔트리|부모/.test(k) ? "var(--mono)" : undefined }}>{v}</span>
         </div>
       ))}
 
-      <div style={{ fontSize: 10.5, fontWeight: 700, color: "var(--text-faint)", margin: "14px 0 0" }}>$STANDARD_INFORMATION (0x10)</div>
-      <div style={{ fontSize: 10, color: "var(--text-faint)", marginBottom: 2 }}>각 시각을 개별 북마크할 수 있습니다</div>
+      <div style={{ fontSize: 11.5, fontWeight: 750, color: "var(--text-dim)", margin: "16px 0 3px" }}>$STANDARD_INFORMATION (0x10)</div>
       {TIME_FIELDS.map((f) => <TimeRow key={f.key} f={f} />)}
 
-      <div style={{ fontSize: 10.5, fontWeight: 700, color: "var(--text-faint)", margin: "14px 0 2px" }}>$FILE_NAME (0x30)</div>
+      <div style={{ fontSize: 11.5, fontWeight: 750, color: "var(--text-dim)", margin: "16px 0 3px" }}>$FILE_NAME (0x30)</div>
       {FN_FIELDS.map((f) => <TimeRow key={f.key} f={f} />)}
 
       {refs.length > 0 && (
         <>
-          <div style={{ fontSize: 10.5, fontWeight: 700, color: "var(--accent)", margin: "16px 0 2px" }}>
-            다른 아티팩트에서 발견 ({refs.length})
+          <div style={{ fontSize: 11.5, fontWeight: 750, color: "var(--text-dim)", margin: "16px 0 5px" }}>
+            교차 참조 증거 ({refs.length})
           </div>
-          <div style={{ fontSize: 10, color: "var(--text-faint)", marginBottom: 4 }}>클릭하면 상세 내용을 볼 수 있습니다</div>
           {refs.map((r, i) => (
             <div
               key={i}
@@ -479,10 +587,10 @@ function DetailPane({ row, bmFieldKeys, onToggleBookmark, refs, onOpenRef }: { r
             >
               <span style={{ fontSize: 9.5, fontWeight: 700, color: "var(--accent)", border: "1px solid var(--accent)", borderRadius: 3, padding: "0 4px", whiteSpace: "nowrap" }}>{r.kind}</span>
               <div style={{ flex: 1, minWidth: 0 }}>
-                <div style={{ fontSize: 11.5, color: "var(--text)" }}>{r.account || "(계정 미상)"}</div>
+                <div style={{ fontSize: 11.5, color: "var(--text)" }}>계정: {r.account || "미상"}</div>
                 {r.label && <div style={{ fontSize: 10, color: "var(--text-faint)", fontFamily: "var(--mono)", wordBreak: "break-all" }}>{r.label}</div>}
               </div>
-              <span style={{ fontSize: 12, color: "var(--text-faint)" }}>›</span>
+              <ChevronRightOutlinedIcon aria-hidden="true" sx={{ fontSize: 17, color: "var(--text-faint)" }} />
             </div>
           ))}
         </>
@@ -490,7 +598,9 @@ function DetailPane({ row, bmFieldKeys, onToggleBookmark, refs, onOpenRef }: { r
     </div>
   );
 }
+*/
 
+/* Superseded by the shared RowDetailPanel reference drawer above.
 // Modal showing all raw fields of one cross-artifact reference.
 // Fields that are timestamps — these get a bookmark toggle in the modal.
 const REF_TIME_FIELDS: Record<string, string> = {
@@ -525,7 +635,7 @@ function RefModal({ reference: r, allBookmarks, onBookmarkRef, onClose }: {
         <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
           <span style={{ fontSize: 11, fontWeight: 700, color: "var(--accent)", border: "1px solid var(--accent)", borderRadius: 3, padding: "1px 6px" }}>{r.kind}</span>
           <span style={{ fontSize: 15, fontWeight: 700 }}>{r.account || "(계정 미상)"}</span>
-          <button onClick={onClose} style={{ marginLeft: "auto", background: "transparent", border: "none", color: "var(--text-faint)", fontSize: 18, cursor: "pointer" }}>✕</button>
+          <button aria-label="닫기" onClick={onClose} style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", marginLeft: "auto", background: "transparent", border: "none", color: "var(--text-faint)", cursor: "pointer" }}><CloseOutlinedIcon sx={{ fontSize: 18 }} /></button>
         </div>
         {Object.entries(r.fields).map(([k, v]) => {
           const timeLabel = REF_TIME_FIELDS[k];
@@ -541,7 +651,7 @@ function RefModal({ reference: r, allBookmarks, onBookmarkRef, onClose }: {
                   title={isBm ? "이 시각 북마크 해제" : "이 시각 북마크"}
                   style={{ flexShrink: 0, fontSize: 12, padding: "2px 8px", borderRadius: "var(--radius-lg)", cursor: "pointer", background: isBm ? "var(--warning-subtle)" : "transparent", color: isBm ? "var(--warning)" : "var(--text-dim)", border: `1px solid ${isBm ? "var(--warning)" : "var(--border)"}`, fontWeight: 600 }}
                 >
-                  {isBm ? "★" : "☆"}
+                  {isBm ? "북마크 해제" : "북마크"}
                 </button>
               )}
             </div>
@@ -551,3 +661,4 @@ function RefModal({ reference: r, allBookmarks, onBookmarkRef, onClose }: {
     </div>
   );
 }
+*/

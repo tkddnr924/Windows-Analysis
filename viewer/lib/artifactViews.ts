@@ -1,12 +1,19 @@
-import { tagsForBoolean, tagsForEventLevel, tagsForNameMismatch, tagsForPath, type Tag } from "./tagging";
+import { tagsForBoolean, tagsForDangerType, tagsForEventLevel, tagsForNameMismatch, tagsForPath, type Tag } from "./tagging";
 import { lookupEventCatalog, parseEventData, extractEventField, tagsForSecurityEvent, EVENT_QUICK_FIELDS, LOGON_TYPE_LABELS } from "./eventCatalog";
 
-export type FieldKind = "text" | "path" | "code" | "hash" | "bytes" | "json" | "badge" | "privileges";
+export type FieldKind = "text" | "path" | "code" | "hash" | "bytes" | "json" | "badge" | "privileges" | "accountSid" | "account" | "byteSize" | "durationMs" | "cacheData";
 
 export interface FieldSpec {
   key: string;
   label?: string;
   kind?: FieldKind;
+  /** Keep an evidence field visible even when this record has no value. */
+  showWhenEmpty?: boolean;
+  /** Evidence-specific fallback when an original source does not carry this field. */
+  emptyLabel?: string;
+  /** Field-level bookmarking is only enabled where the source contract
+   * identifies a stable row + field (currently MFT SI/FN timestamps). */
+  bookmarkable?: boolean;
   badgeColors?: Record<string, string>;
   /** Remap a raw coded value (e.g. "1") to a human label before display —
    * badge color lookups use the remapped label, not the raw code. */
@@ -38,12 +45,39 @@ export interface LinkSpec {
   targetColumn: string;
 }
 
+export interface DetailSectionSpec {
+  heading: string | ((row: Record<string, string>) => string);
+  fields: FieldSpec[];
+  /**
+   * Keeps evidence-dense, repeated values (for example Prefetch run times)
+   * out of the way until an analyst asks to inspect them.  The same section
+   * definition is consumed by every RowDetailPanel, regardless of the view
+   * that opened it.
+   */
+  collapsible?: {
+    defaultExpanded?: boolean;
+    summary?: (row: Record<string, string>, fieldCount: number) => string;
+  };
+}
+
 export interface ArtifactViewSpec {
   title: (row: Record<string, string>) => string;
+  /** Optional compact title for the cross-artifact timeline. Detail panels
+   * continue to use `title`, so their evidence framing can differ safely. */
+  timelineTitle?: (row: Record<string, string>) => string;
+  /** Optional secondary line for the cross-artifact timeline. This is kept
+   * separate from detail-panel `subtitle` when their evidence roles differ. */
+  timelineSubtitle?: (row: Record<string, string>) => string;
   subtitle?: (row: Record<string, string>) => string;
+  /** Suppress the generic overview time when the artifact includes it in its
+   * own concise evidence summary. */
+  overviewTime?: "show" | "hide";
   badges?: FieldSpec[];
   tags?: (row: Record<string, string>) => Tag[];
   timelineFields?: TimelineFieldSpec[];
+  /** The timeline's evidence source when its points are not generic activity
+   * timestamps (for example, the three timestamps in an LNK header). */
+  timelineHeading?: string;
   /**
    * Name of the row's leading time column, ONLY when this artifact belongs
    * in the cross-artifact Master Timeline. Absent on purpose for tables with
@@ -52,8 +86,14 @@ export interface ArtifactViewSpec {
    * would double-count the same events alongside their raw source rows).
    */
   timelineField?: string;
+  /** Optional record-level admission rule for the master timeline. This keeps
+   * a mixed overview table usable without promoting every source record into
+   * the chronological investigation view. */
+  timelineInclude?: (row: Record<string, string>) => boolean;
+  /** Related evidence rendered as an immediately loaded, queryable detail section. */
+  embeddedLinks?: LinkSpec[];
   links?: LinkSpec[];
-  sections: { heading: string; fields: FieldSpec[] }[];
+  sections: DetailSectionSpec[];
   /**
    * Column order for the TABLE view — separate from CSV column order on
    * disk. The CSV always leads with time (that's the right convention for
@@ -131,6 +171,39 @@ function logonTypeLabel(r: Record<string, string>): string {
   return lt ? formatLogonType(lt) : "";
 }
 
+function eventLogTimelineTitle(r: Record<string, string>): string {
+  const catalog = lookupEventCatalog(r.Provider, r.EventID);
+  const base = catalog ? `Event ${r.EventID} · ${catalog.label}` : `Event ${r.EventID}`;
+  // On logon events the LogonType is the single most important qualifier
+  // (network vs RDP vs console), so fold it straight into the timeline event.
+  const logonType = logonTypeLabel(r);
+  return logonType ? `${base} · ${logonType}` : base;
+}
+
+// Registry findings already retain their parser explanation in `detail` for
+// the raw-field view. In the analyst-facing detail we expose that explanation
+// only when the parser actually marked the finding for attention, and make it
+// available as the tag hover text rather than duplicating it as a prose row.
+// Informational and normal configuration rows intentionally stay untagged.
+function tagsForRegistryFinding(r: Record<string, string>): Tag[] {
+  if (!r.detail) return [];
+  if (r.status === "의심") {
+    return [{ label: "의심", severity: "danger", description: r.detail }];
+  }
+  if (r.status === "주의") {
+    return [{ label: "주의", severity: "warning", description: r.detail }];
+  }
+  return [];
+}
+
+// Event ID 0 is emitted by several application providers for their own
+// heartbeat/status messages. It is kept in the raw EventLog table so the
+// evidence remains complete, but it has no stable investigation meaning on
+// the cross-artifact timeline (where it can dominate the chronology).
+function includeEventLogTimeline(r: Record<string, string>): boolean {
+  return r.EventID.trim() !== "0";
+}
+
 function edField(jsonKey: string, label: string, opts: Partial<FieldSpec> = {}): FieldSpec {
   return {
     key: `EventData.${jsonKey}`,
@@ -184,6 +257,56 @@ function basename(path: string | undefined): string {
   if (!path) return "";
   const parts = path.split(/[\\/]/);
   return parts[parts.length - 1] || path;
+}
+
+// JumpList collections preserve the source user in the path directly below
+// either LNK or JUMPLIST. This mirrors the evidence-backed extraction used by
+// the Tauri path-reference command; if the collection layout is absent, the
+// value stays hidden instead of guessing an account.
+function accountFromJumpListSource(path: string | undefined): string {
+  if (!path) return "";
+  const parts = path.split(/[\\/]/);
+  for (let index = 0; index + 1 < parts.length; index += 1) {
+    const collection = parts[index].toUpperCase();
+    if (collection === "LNK" || collection === "JUMPLIST") return parts[index + 1];
+  }
+  return "";
+}
+
+type ExecutionEvidence = "amcache" | "userAssist" | "srum" | "bam" | "prefetch" | "other";
+
+function executionEvidence(row: Record<string, string>): ExecutionEvidence {
+  const source = (row.source_artifact || "").toLowerCase();
+  if (source.startsWith("amcache")) return "amcache";
+  if (source === "userassist") return "userAssist";
+  if (source === "srum") return "srum";
+  if (source === "bam") return "bam";
+  if (source === "prefetch") return "prefetch";
+  return "other";
+}
+
+function executionSourceLabel(row: Record<string, string>): string {
+  switch (executionEvidence(row)) {
+    case "amcache": return "Amcache";
+    case "userAssist": return "UserAssist";
+    case "srum": return "SRUM";
+    case "bam": return "BAM";
+    case "prefetch": return "Prefetch";
+    default: return row.source_artifact || "ExecutionHistory";
+  }
+}
+
+function executionValue(source: ExecutionEvidence, key: string, row: Record<string, string>): string {
+  return executionEvidence(row) === source ? row[key] || "" : "";
+}
+
+function tagsForMissingAmcachePublisher(publisher: string | undefined): Tag[] {
+  if (publisher?.trim()) return [];
+  return [{
+    label: "게시자 정보 없음",
+    severity: "warning",
+    description: "Amcache 레코드에 게시자(서명 메타데이터) 값이 없습니다. 서명·파일 평판과 함께 실행 파일의 출처를 추가 확인해야 합니다.",
+  }];
 }
 
 // A SID with a human label where one is knowable from the SID alone (built-in /
@@ -259,16 +382,19 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     customView: "mft",
     title: (r) => r.file_name || (r.path ? r.path.split("\\").filter(Boolean).pop() ?? r.path : "") || "(MFT)",
     subtitle: (r) => r.path || "",
-    priorityColumns: ["path", "file_name", "extension", "is_directory", "in_use", "file_size"],
-    sections: [{ heading: "$STANDARD_INFORMATION (0x10)", fields: [
-      { key: "si_created", label: "생성" }, { key: "si_modified", label: "수정" },
-      { key: "si_mft_modified", label: "MFT 수정" }, { key: "si_accessed", label: "접근" },
+    priorityColumns: ["path", "file_name", "file_size", "extension", "is_directory", "in_use", "entry", "seq", "parent_entry", "owner_id", "security_id"],
+    sections: [{ heading: "MFT 레코드", fields: [
+      { key: "path", label: "경로", kind: "path" }, { key: "file_size", label: "크기", kind: "bytes" },
+      { key: "extension", label: "확장자" }, { key: "is_directory", label: "디렉터리" }, { key: "in_use", label: "할당 상태" },
+      { key: "entry", label: "엔트리" }, { key: "seq", label: "시퀀스" }, { key: "parent_entry", label: "부모 엔트리" },
+    ]}, { heading: "$STANDARD_INFORMATION (0x10)", fields: [
+      { key: "si_created", label: "생성", showWhenEmpty: true, bookmarkable: true }, { key: "si_modified", label: "수정", showWhenEmpty: true, bookmarkable: true },
+      { key: "si_mft_modified", label: "MFT 수정", showWhenEmpty: true, bookmarkable: true }, { key: "si_accessed", label: "접근", showWhenEmpty: true, bookmarkable: true },
+      { key: "owner_id", label: "할당량 소유자 ID", showWhenEmpty: true, emptyLabel: "원본 정보 없음" },
+      { key: "security_id", label: "보안 ID ($Secure)", showWhenEmpty: true, emptyLabel: "원본 정보 없음" },
     ]}, { heading: "$FILE_NAME (0x30)", fields: [
-      { key: "fn_created", label: "생성" }, { key: "fn_modified", label: "수정" },
-      { key: "fn_mft_modified", label: "MFT 수정" }, { key: "fn_accessed", label: "접근" },
-    ]}, { heading: "레코드", fields: [
-      { key: "path", label: "경로" }, { key: "entry", label: "엔트리" }, { key: "seq", label: "시퀀스" },
-      { key: "parent_entry", label: "부모" }, { key: "in_use", label: "사용중" }, { key: "file_size", label: "크기" },
+      { key: "fn_created", label: "생성", showWhenEmpty: true, bookmarkable: true }, { key: "fn_modified", label: "수정", showWhenEmpty: true, bookmarkable: true },
+      { key: "fn_mft_modified", label: "MFT 수정", showWhenEmpty: true, bookmarkable: true }, { key: "fn_accessed", label: "접근", showWhenEmpty: true, bookmarkable: true },
     ]}],
   },
 
@@ -290,6 +416,53 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     ]}],
   },
 
+  // TargetInfo renders a compact host-oriented dashboard. Network interfaces
+  // open this dedicated shared-drawer definition so the list can stay IP-only
+  // without losing any recovered TCP/IP evidence fields.
+  TargetInfo_NetworkInterface: {
+    title: () => "네트워크 어댑터",
+    subtitle: (r) => r.value || "",
+    overviewTime: "hide",
+    priorityColumns: ["value", "subnet_mask", "gateway", "dns_server", "dhcp_server", "domain"],
+    sections: [
+      { heading: "네트워크 인터페이스", fields: [
+        { key: "value", label: "IP 주소" },
+        { key: "subnet_mask", label: "서브넷 마스크" },
+        { key: "gateway", label: "기본 게이트웨이" },
+      ]},
+      { heading: "네트워크 구성", fields: [
+        { key: "dns_server", label: "DNS 서버" },
+        { key: "dhcp_server", label: "DHCP 서버" },
+        { key: "dhcp_enabled", label: "DHCP 사용" },
+        { key: "domain", label: "도메인" },
+      ]},
+      { heading: "DHCP 임대", fields: [
+        { key: "lease_obtained", label: "임대 시작" },
+        { key: "lease_terminates", label: "임대 만료" },
+      ]},
+      { heading: "식별 정보", fields: [
+        { key: "name", label: "인터페이스 GUID" },
+        { key: "source_artifact", label: "수집 아티팩트" },
+      ]},
+    ],
+  },
+
+  // NetworkList profile evidence is distinct from the TCP/IP interface
+  // configuration above. The parser currently preserves the profile name,
+  // last-connected time, and source artifact — no uncollected registry value
+  // is inferred here.
+  TargetInfo_NetworkProfile: {
+    title: () => "연결한 네트워크",
+    subtitle: (r) => r.timestamp || "",
+    overviewTime: "hide",
+    priorityColumns: ["value", "timestamp", "source_artifact"],
+    sections: [{ heading: "레지스트리 NetworkList 프로필", fields: [
+      { key: "value", label: "프로필 이름" },
+      { key: "timestamp", label: "마지막 연결 시각" },
+      { key: "source_artifact", label: "수집 아티팩트" },
+    ]}],
+  },
+
   ExecutionHistory: {
     customView: "executionHistory",
     // Feed the master timeline from this curated stream, not the raw execution
@@ -298,70 +471,181 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     // merges + dedups Amcache/Prefetch. The raw Amcache/Prefetch specs drop
     // their own timelineField so those don't double-count here.
     timelineField: "timestamp",
-    title: (r) => r.program_name || basename(r.program_path) || "(no name)",
-    // Lead with the source (SRUM / AppCompatCache / Amcache / BAM / UserAssist)
-    // so the merged execution entries stay distinguishable in the timeline.
-    subtitle: (r) => [r.source_artifact, r.program_path].filter(Boolean).join(" · "),
-    badges: [{ key: "source_artifact", label: "출처", kind: "badge" }],
-    tags: (r) => tagsForPath(r.program_path),
+    title: (r) => `ExecutionHistory:${executionSourceLabel(r)}`,
+    timelineTitle: (r) => r.program_name || basename(r.program_path) || "(이름 없음)",
+    // The timeline keeps the evidence source and path visible while the detail
+    // drawer has one concise timestamp in its evidence overview.
+    timelineSubtitle: (r) => [executionSourceLabel(r), r.program_path].filter(Boolean).join(" · "),
+    subtitle: (r) => r.timestamp || "",
+    overviewTime: "hide",
+    tags: (r) => executionEvidence(r) === "amcache"
+      ? tagsForPath(r.program_path).concat(tagsForMissingAmcachePublisher(r.publisher))
+      : tagsForPath(r.program_path),
     priorityColumns: ["timestamp", "program_name", "program_path", "run_count", "source_artifact"],
     sections: [
-      { heading: "실행/사용 통계", fields: [
-        { key: "run_count", label: "실행 횟수" },
-        { key: "focus_count", label: "포커스 횟수" },
-        { key: "focus_time_ms", label: "포커스 시간(ms)" },
+      { heading: "Amcache 프로그램 정보", fields: [
+        { key: "program_name", label: "프로그램 이름", compute: (r) => executionValue("amcache", "program_name", r) },
+        { key: "program_path", label: "프로그램 경로", kind: "path", compute: (r) => executionValue("amcache", "program_path", r) },
+        { key: "publisher", label: "게시자", compute: (r) => executionValue("amcache", "publisher", r) },
+        { key: "sha1", label: "SHA-1", kind: "hash", compute: (r) => executionValue("amcache", "sha1", r) },
       ]},
-      { heading: "정보", fields: [
-        { key: "publisher" },
-        { key: "sha1", kind: "hash" },
+      { heading: "UserAssist 실행 정보", fields: [
+        { key: "program_name", label: "실행 항목", compute: (r) => executionValue("userAssist", "program_name", r) },
+        { key: "program_path", label: "원본 경로", kind: "path", compute: (r) => executionValue("userAssist", "program_path", r) },
+        { key: "user", label: "실행 계정", kind: "account", compute: (r) => executionValue("userAssist", "user", r) },
+        { key: "run_count", label: "실행 횟수", compute: (r) => executionValue("userAssist", "run_count", r) },
+        { key: "focus_count", label: "포커스 횟수", compute: (r) => executionValue("userAssist", "focus_count", r) },
+        { key: "focus_time_ms", label: "포커스 시간", kind: "durationMs", compute: (r) => executionValue("userAssist", "focus_time_ms", r) },
+      ]},
+      { heading: "SRUM 사용 정보", fields: [
+        { key: "program_name", label: "응용 프로그램", compute: (r) => executionValue("srum", "program_name", r) },
+        { key: "program_path", label: "응용 프로그램 경로", kind: "path", compute: (r) => executionValue("srum", "program_path", r) },
+        { key: "user", label: "사용자", kind: "account", compute: (r) => executionValue("srum", "user", r) },
+      ]},
+      { heading: "BAM 실행 정보", fields: [
+        { key: "program_name", label: "실행 파일", compute: (r) => executionValue("bam", "program_name", r) },
+        { key: "program_path", label: "실행 경로", kind: "path", compute: (r) => executionValue("bam", "program_path", r) },
+        { key: "user", label: "실행 계정", kind: "accountSid", compute: (r) => executionValue("bam", "user", r) },
+      ]},
+      { heading: "Prefetch 실행 정보", fields: [
+        { key: "program_name", label: "실행 파일", compute: (r) => executionValue("prefetch", "program_name", r) },
+        { key: "run_count", label: "실행 횟수", compute: (r) => executionValue("prefetch", "run_count", r) },
+      ]},
+      { heading: "Prefetch 실행 시간", collapsible: {
+        defaultExpanded: false,
+        summary: (r, count) => `${executionValue("prefetch", "timestamp", r) || "시간 정보 없음"} · ${count}건`,
+      }, fields: [
+        { key: "timestamp", label: "최근 실행 시각", compute: (r) => executionValue("prefetch", "timestamp", r) },
+        { key: "run_time_2", label: "이전 실행 1", compute: (r) => executionValue("prefetch", "run_time_2", r) },
+        { key: "run_time_3", label: "이전 실행 2", compute: (r) => executionValue("prefetch", "run_time_3", r) },
+        { key: "run_time_4", label: "이전 실행 3", compute: (r) => executionValue("prefetch", "run_time_4", r) },
+        { key: "run_time_5", label: "이전 실행 4", compute: (r) => executionValue("prefetch", "run_time_5", r) },
+        { key: "run_time_6", label: "이전 실행 5", compute: (r) => executionValue("prefetch", "run_time_6", r) },
+        { key: "run_time_7", label: "이전 실행 6", compute: (r) => executionValue("prefetch", "run_time_7", r) },
+        { key: "run_time_8", label: "이전 실행 7", compute: (r) => executionValue("prefetch", "run_time_8", r) },
+      ]},
+      { heading: "Prefetch 볼륨 정보", fields: [
+        { key: "volume_device_path", label: "볼륨 경로", kind: "path", compute: (r) => executionValue("prefetch", "volume_device_path", r) },
+        { key: "volume_serial_number", label: "볼륨 일련 번호", kind: "hash", compute: (r) => executionValue("prefetch", "volume_serial_number", r) },
+        { key: "volume_creation_time", label: "볼륨 생성 시각", compute: (r) => executionValue("prefetch", "volume_creation_time", r) },
+      ]},
+      { heading: "실행 정보", fields: [
+        { key: "program_name", label: "항목 이름", compute: (r) => executionEvidence(r) === "other" ? r.program_name : "" },
+        { key: "program_path", label: "항목 경로", kind: "path", compute: (r) => executionEvidence(r) === "other" ? r.program_path : "" },
+        { key: "source_artifact", label: "원본 아티팩트", compute: (r) => executionEvidence(r) === "other" ? r.source_artifact : "" },
       ]},
     ],
+    embeddedLinks: [{ key: "prefetch_hash", label: "Prefetch에 기록된 참조 파일", targetFile: "Prefetch_LoadedFiles", targetColumn: "prefetch_hash" }],
   },
 
   ScheduledTasks: {
     customView: "scheduledTasks",
-    title: (r) => r.task_name || "(이름 없음)",
-    subtitle: (r) => r.actions || "",
+    // The overview identifies the evidence type first; the task's own name is
+    // kept in the information section, consistently for every task record.
+    title: () => "ScheduledTasks",
+    timelineTitle: (r) => r.task_name || "(이름 없음)",
+    // The evidence overview stays intentionally terse: task type + the raw
+    // registration timestamp. The action itself belongs in "실행 명령" below.
+    subtitle: (r) => r.timestamp || "",
+    overviewTime: "hide",
     tags: (r) => tagsForPath(r.actions),
     timelineField: "timestamp",
-    sections: [
-      { heading: "실행", fields: [
-        { key: "actions", label: "동작(실행 명령)", kind: "code" },
-        { key: "run_as", label: "실행 계정" },
-        { key: "run_level", label: "권한 수준" },
-        { key: "logon_type", label: "로그온 유형" },
-      ]},
-      { heading: "트리거", fields: [
-        { key: "trigger_types", label: "트리거" },
-        { key: "trigger_start", label: "시작 시각" },
-      ]},
-      { heading: "정보", fields: [
-        { key: "timestamp", label: "생성 시각" },
-        { key: "enabled", label: "사용" },
-        { key: "hidden", label: "숨김" },
-        { key: "author", label: "작성자" },
-        { key: "description", label: "설명" },
-        { key: "uri", label: "경로(URI)" },
-      ]},
-    ],
+    sections: [{ heading: "작업 스케줄러 정보", fields: [
+      { key: "task_name", label: "작업 이름" },
+      { key: "run_as", label: "실행 계정", kind: "accountSid" },
+      { key: "actions", label: "실행 명령", kind: "code" },
+      {
+        key: "enabled",
+        label: "작업 상태",
+        kind: "badge",
+        compute: (r) => {
+          const value = (r.enabled || "").trim().toLowerCase();
+          if (["1", "true", "yes", "enabled"].includes(value)) return "활성화됨";
+          if (["0", "false", "no", "disabled"].includes(value)) return "비활성화됨";
+          return value ? r.enabled : "설정 정보 없음";
+        },
+        badgeColors: { "활성화됨": "#3fb950", "비활성화됨": "#8a8a8a", "설정 정보 없음": "#8a8a8a" },
+      },
+      {
+        key: "hidden",
+        label: "표시 정책",
+        kind: "badge",
+        compute: (r) => {
+          const value = (r.hidden || "").trim().toLowerCase();
+          if (["1", "true", "yes"].includes(value)) return "숨김 처리됨";
+          if (["0", "false", "no"].includes(value)) return "일반 표시";
+          return value ? r.hidden : "설정 정보 없음";
+        },
+        badgeColors: { "숨김 처리됨": "#d29922", "일반 표시": "#4fc1ff", "설정 정보 없음": "#8a8a8a" },
+      },
+      {
+        key: "trigger_types",
+        label: "트리거 정보",
+        compute: (r) => [r.trigger_types, r.trigger_start && `시작 경계 ${r.trigger_start}`].filter(Boolean).join(" · "),
+      },
+      { key: "description", label: "설명" },
+    ]}],
   },
 
   BrowserActivity: {
     customView: "browserHistory",
-    title: (r) => r.title || r.url || "(no url)",
-    subtitle: (r) => r.url || "",
-    badges: [{ key: "kind", kind: "badge" }],
-    priorityColumns: ["account", "kind", "timestamp", "title", "url", "size", "source_url"],
-    sections: [{ heading: "상세", fields: [
-      { key: "account", label: "계정" },
-      { key: "kind", label: "종류" },
-      { key: "url", label: "URL(디코딩)" },
-      { key: "url_raw", label: "URL(원본)" },
-      { key: "visit_count", label: "방문 횟수" },
-      { key: "detail", label: "저장 경로" },
-      { key: "source_url", label: "출처" },
-      { key: "size", label: "크기" },
-      { key: "mime", label: "유형" },
+    // Browser records use an evidence-type title, not a page title or URL:
+    // those vary by source and belong in the browser-specific fields below.
+    title: (r) => `BrowserActivity:${r.kind === "download" ? "Download" : r.kind === "cache" ? "Cache" : "Visit"}`,
+    subtitle: (r) => r.timestamp || "",
+    overviewTime: "hide",
+    // The timeline already owns the timestamp column. Show the actual URL as
+    // the event and keep its type on the secondary line; never reuse the
+    // concise detail-panel evidence title here.
+    timelineTitle: (r) => r.url || r.url_raw || r.title || "(URL 없음)",
+    timelineSubtitle: (r) => r.kind === "download" ? "Download" : r.kind === "cache" ? "Cache" : "Visit",
+    // BrowserActivity retains cache rows for the browser evidence view, but a
+    // cache response is not a defensible browsing event. The master timeline
+    // therefore contains only actual visits and downloads.
+    timelineField: "timestamp",
+    timelineInclude: (r) => r.kind === "visit" || r.kind === "download",
+    tags: (r) => tagsForDangerType(r.danger).concat(r.kind === "download" ? tagsForPath(r.detail) : []),
+    priorityColumns: ["account", "kind", "timestamp", "title", "url", "size_bytes", "source_url"],
+    sections: [{
+      heading: (r) => `브라우저 ${r.kind === "download" ? "다운로드" : r.kind === "cache" ? "캐시" : "접근"}`,
+      fields: [
+      {
+        key: "url_raw",
+        label: "URL 원본",
+        kind: "path",
+        compute: (r) => r.kind === "cache" ? r.url : r.url_raw || r.url,
+      },
+      { key: "account", label: "브라우저 접근 계정", kind: "account" },
+      {
+        key: "url",
+        label: "URL (디코딩)",
+        kind: "path",
+        compute: (r) => {
+          const value = r.url || "";
+          try { return decodeURIComponent(value); } catch { return value; }
+        },
+      },
+      { key: "visit_count", label: "방문 횟수", compute: (r) => r.kind === "visit" ? r.visit_count : "" },
+      { key: "detail", label: "저장 경로", kind: "path", compute: (r) => r.kind === "download" ? r.detail : "" },
+      {
+        key: "size_bytes",
+        label: "크기 (Bytes)",
+        kind: "byteSize",
+        compute: (r) => r.kind === "download" || r.kind === "cache" ? r.size_bytes || r.size : "",
+      },
+      { key: "mime", label: "다운로드 파일 유형", compute: (r) => r.kind === "download" ? r.mime : "" },
+      {
+        key: "cache_file_type",
+        label: "파일 유형",
+        compute: (r) => {
+          if (r.kind !== "cache") return "";
+          if (r.mime) return r.mime;
+          const path = (r.url || "").split(/[?#]/)[0];
+          const extension = path.includes(".") ? path.slice(path.lastIndexOf(".") + 1).toLowerCase() : "";
+          return extension ? `.${extension}` : "알 수 없음";
+        },
+      },
+      { key: "cache_data", label: "캐시 데이터", kind: "cacheData", compute: (r) => r.kind === "cache" ? "cache" : "" },
     ]}],
   },
 
@@ -401,14 +685,14 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
   RegistryFindings: {
     customView: "registryFindings",
     title: (r) => r.name || "(no name)",
-    subtitle: (r) => r.value || "",
-    badges: [{ key: "status", kind: "badge" }],
+    // The overview is intentionally terse: the registry path and status are
+    // evidence fields below, while attention-only status appears once at the
+    // bottom as a hoverable analysis tag.
+    tags: tagsForRegistryFinding,
     priorityColumns: ["category", "status", "name", "value", "detail", "user", "source"],
     sections: [{ heading: "상세", fields: [
       { key: "category", label: "분류" },
-      { key: "status", label: "상태" },
       { key: "value", label: "값" },
-      { key: "detail", label: "설명" },
       { key: "command", label: "명령" },
       { key: "user", label: "사용자" },
       { key: "key_path", label: "키 경로" },
@@ -531,6 +815,9 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
 
   PowerShellHistory: {
     customView: "powershellFlow",
+    // ScriptBlock and HostApplication can be arbitrarily long. Keep the
+    // shared drawer's evidence title stable; both values are first-class
+    // fields in the execution section below.
     title: (r) => r.command || r.kind || "(명령 없음)",
     subtitle: (r) => [r.account, r.process].filter(Boolean).join(" · "),
     badges: [
@@ -548,6 +835,7 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
         { key: "account", label: "수행 계정" },
         { key: "process", label: "수행 프로세스" },
         { key: "process_id", label: "프로세스 ID" },
+        { key: "host_application", label: "호스트 애플리케이션", kind: "code", showWhenEmpty: true, emptyLabel: "기록되지 않음" },
         { key: "script_path", label: "스크립트 경로", kind: "path" },
       ]},
       { heading: "명령어", fields: [{ key: "command", kind: "code" }] },
@@ -611,7 +899,9 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     ],
     // Filename-vs-internal-name mismatch is a classic masquerading signal
     // on top of the general suspicious-path check.
-    tags: (r) => tagsForPath(r.lower_case_long_path).concat(tagsForNameMismatch(r.name, r.original_file_name)),
+    tags: (r) => tagsForPath(r.lower_case_long_path)
+      .concat(tagsForNameMismatch(r.name, r.original_file_name))
+      .concat(tagsForMissingAmcachePublisher(r.publisher)),
     links: [{ key: "program_id", label: "이 파일을 설치한 프로그램 보기", targetFile: "Amcache_Programs", targetColumn: "ProgramId" }],
     // No timelineField: reaches the master timeline via ExecutionHistory.
     priorityColumns: ["timestamp", "name", "lower_case_long_path", "product_name", "publisher", "size"],
@@ -642,30 +932,14 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
   // resolved to this shared spec by resolveArtifactView() via its columns —
   // so the per-file logs still get the full catalog/tags/detail view.
   EventLog_Events: {
-    title: (r) => {
-      const catalog = lookupEventCatalog(r.Provider, r.EventID);
-      const base = catalog ? `Event ${r.EventID} · ${catalog.label}` : `Event ${r.EventID}`;
-      // On logon events the LogonType is the single most important qualifier
-      // (network vs RDP vs console), so fold it straight into the title.
-      const logonType = logonTypeLabel(r);
-      return logonType ? `${base} · ${logonType}` : base;
-    },
-    badges: [
-      { key: "LevelName", kind: "badge", badgeColors: LEVEL_COLORS },
-      { key: "_status", kind: "badge", badgeColors: STATUS_COLORS },
-      {
-        key: "_ir_category",
-        label: "구분",
-        kind: "badge",
-        compute: (r) => lookupEventCatalog(r.Provider, r.EventID)?.category,
-      },
-      {
-        key: "_logon_type",
-        label: "로그온 유형",
-        kind: "badge",
-        compute: (r) => logonTypeLabel(r) || undefined,
-      },
-    ],
+    // Detail framing names the evidence type only. The timeline has its own
+    // event title below, so EventLog's internal source table never leaks as
+    // an analyst-facing title such as "EventLogs".
+    title: () => "EventLog",
+    subtitle: (r) => r.timestamp || "",
+    overviewTime: "hide",
+    timelineTitle: eventLogTimelineTitle,
+    timelineSubtitle: (r) => [r.Provider, r.Channel].filter(Boolean).join(" · "),
     // Level (Critical/Error) is a generic OS signal; tagsForSecurityEvent
     // adds the IR-specific ones — RDP/network logon type, SMB share access,
     // service/scheduled-task persistence, audit log clearing, suspicious
@@ -673,6 +947,7 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     // curated catalog simply yields no extra tag, it isn't hidden.
     tags: (r) => tagsForEventLevel(r.LevelName).concat(tagsForSecurityEvent(r.Provider, r.EventID, r.EventData)),
     timelineField: "timestamp",
+    timelineInclude: includeEventLogTimeline,
     computedColumns: [
       { key: "_ir_label", label: "이벤트 설명", size: 240, compute: (r) => lookupEventCatalog(r.Provider, r.EventID)?.label ?? "" },
       { key: "_ir_category_col", label: "구분", size: 100, compute: (r) => lookupEventCatalog(r.Provider, r.EventID)?.category ?? "" },
@@ -688,10 +963,11 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     ],
     priorityColumns: ["timestamp", "Provider", "EventID", "LevelName", "Channel", "Computer"],
     sections: [
-      { heading: "기본 정보", fields: [
-        { key: "timestamp", label: "시각" },
+      { heading: "이벤트 로그", fields: [
         { key: "Channel", label: "채널" },
+        { key: "Provider", label: "공급자" },
         { key: "EventID", label: "Event ID" },
+        { key: "LevelName", label: "수준", kind: "badge", badgeColors: LEVEL_COLORS },
         {
           key: "_logon_type_field",
           label: "로그온 유형",
@@ -749,37 +1025,44 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
   },
 
   JumpList_Entries: {
-    title: (r) => basename(r.target_path) || r.app_id || "(no target)",
-    subtitle: (r) => r.target_path || "",
-    badges: [
-      { key: "jumplist_type", kind: "badge" },
-      { key: "_status", kind: "badge", badgeColors: STATUS_COLORS },
-    ],
+    // Evidence overview follows the shared detail rule: the evidence type and
+    // its primary time only. Target path, collection type, and parsing state
+    // are evidence fields, so they belong in the sections below.
+    title: () => "JumpList",
+    subtitle: (r) => r.timestamp || "",
+    overviewTime: "hide",
+    // The timeline describes the observed target, while the detail drawer
+    // intentionally keeps its evidence-type-only overview above.
+    timelineTitle: (r) => basename(r.target_path) || r.app_id || "JumpList 항목",
+    timelineSubtitle: (r) => r.target_path || "",
     tags: (r) => tagsForPath(r.target_path),
     timelineFields: [
-      { key: "created_time", label: "생성" },
-      { key: "modified_time", label: "수정" },
-      { key: "timestamp", label: "마지막 접근" },
+      { key: "created_time", label: "LNK 생성" },
+      { key: "modified_time", label: "LNK 수정" },
+      { key: "timestamp", label: "LNK 접근" },
     ],
+    timelineHeading: "LNK 헤더 시간 흐름",
     timelineField: "timestamp",
     priorityColumns: ["timestamp", "target_path", "jumplist_type", "arguments"],
     sections: [
-      { heading: "시간", fields: [
-        { key: "timestamp", label: "마지막 접근 시각" },
-        { key: "created_time" },
-        { key: "modified_time" },
+      { heading: "LNK 헤더 시간", fields: [
+        { key: "timestamp", label: "LNK 헤더 접근 시각" },
+        { key: "created_time", label: "LNK 헤더 생성 시각" },
+        { key: "modified_time", label: "LNK 헤더 수정 시각" },
       ]},
-      { heading: "실행 정보", fields: [
-        { key: "target_path", kind: "path" },
-        { key: "arguments", kind: "code" },
-        { key: "working_directory", kind: "path" },
+      { heading: "대상 및 실행 정보", fields: [
+        { key: "target_path", label: "대상 경로", kind: "path" },
+        { key: "arguments", label: "실행 인수", kind: "code" },
+        { key: "working_directory", label: "작업 디렉터리", kind: "path" },
       ]},
-      // machine_id / stream_id are internal jumplist bookkeeping — dropped;
-      // app_id stays (it identifies the source application).
-      { heading: "식별자", fields: [
-        { key: "app_id", kind: "hash" },
+      { heading: "JumpList 출처", fields: [
+        { key: "_source_account", label: "수집 사용자", kind: "account", compute: (r) => accountFromJumpListSource(r._source_file) || undefined },
+        { key: "app_id", label: "App ID", kind: "hash" },
+        { key: "jumplist_type", label: "JumpList 유형", kind: "badge" },
+        { key: "stream_id", label: "LNK 스트림 / 엔트리 ID" },
+        { key: "machine_id", label: "Distributed Link Tracker Machine ID" },
       ]},
-      { heading: "오류", fields: [{ key: "_error", kind: "code" }] },
+      { heading: "파싱 상태", fields: [{ key: "_error", label: "파싱 오류", kind: "code" }] },
     ],
   },
 
@@ -787,29 +1070,22 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     title: (r) => r.executable_filename || "(no exe)",
     subtitle: (r) => (r.run_count ? `실행 ${r.run_count}회` : ""),
     badges: [{ key: "_status", kind: "badge", badgeColors: STATUS_COLORS }],
-    links: [{ key: "executable_filename", label: "이 실행 파일이 로드한 DLL/파일 보기", targetFile: "Prefetch_LoadedFiles", targetColumn: "executable_filename" }],
-    timelineFields: [
-      { key: "run_time_8", label: "8회 전" },
-      { key: "run_time_7", label: "7회 전" },
-      { key: "run_time_6", label: "6회 전" },
-      { key: "run_time_5", label: "5회 전" },
-      { key: "run_time_4", label: "4회 전" },
-      { key: "run_time_3", label: "3회 전" },
-      { key: "run_time_2", label: "2회 전" },
-      { key: "last_run_time", label: "최근 실행" },
-    ],
+    embeddedLinks: [{ key: "prefetch_hash", label: "Prefetch에 기록된 참조 파일", targetFile: "Prefetch_LoadedFiles", targetColumn: "prefetch_hash" }],
     // No timelineField: Prefetch reaches the master timeline via ExecutionHistory.
     priorityColumns: ["last_run_time", "executable_filename", "run_count"],
     sections: [
-      { heading: "최근 실행 시각 (최신순)", fields: [
-        { key: "last_run_time" },
-        { key: "run_time_2" },
-        { key: "run_time_3" },
-        { key: "run_time_4" },
-        { key: "run_time_5" },
-        { key: "run_time_6" },
-        { key: "run_time_7" },
-        { key: "run_time_8" },
+      { heading: "Prefetch 실행 시간", collapsible: {
+        defaultExpanded: false,
+        summary: (r, count) => `${r.last_run_time || "시간 정보 없음"} · ${count}건`,
+      }, fields: [
+        { key: "last_run_time", label: "최근 실행 시각" },
+        { key: "run_time_2", label: "이전 실행 1" },
+        { key: "run_time_3", label: "이전 실행 2" },
+        { key: "run_time_4", label: "이전 실행 3" },
+        { key: "run_time_5", label: "이전 실행 4" },
+        { key: "run_time_6", label: "이전 실행 5" },
+        { key: "run_time_7", label: "이전 실행 6" },
+        { key: "run_time_8", label: "이전 실행 7" },
       ]},
       { heading: "볼륨", fields: [
         { key: "volume_device_path" },

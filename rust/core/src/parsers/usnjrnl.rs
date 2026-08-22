@@ -54,7 +54,9 @@ pub fn parse_usn_stream(path: &Path, out: &Path) -> Result<usize> {
         if data[pos] == 0 { pos += 1; continue; }
         if pos + 4 > n { break; }
         let reclen = u32le(&data, pos) as usize;
-        if reclen < 60 || pos + reclen > n { break; }
+        // A corrupt record length must not hide valid records that follow.
+        // USN records are 8-byte aligned, so resynchronize conservatively.
+        if reclen < 60 || reclen > n.saturating_sub(pos) { pos = (pos + 8).min(n); continue; }
         let major = u16le(&data, pos + 4);
         let advance = (reclen + 7) & !7;
 
@@ -64,7 +66,7 @@ pub fn parse_usn_stream(path: &Path, out: &Path) -> Result<usize> {
             _ => { pos += advance; continue; }
         };
         // <QQIIIIHH at hdr: usn, ts, reason, source_info, security_id, attrs, name_len, name_off
-        if hdr + 40 > n { pos += advance; continue; }
+        if hdr > n || 40 > n.saturating_sub(hdr) { pos += advance.min(n - pos); continue; }
         let usn = u64le(&data, hdr);
         let ts = u64le(&data, hdr + 8) as i64;
         let reason = u32le(&data, hdr + 16);

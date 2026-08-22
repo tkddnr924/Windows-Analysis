@@ -1,6 +1,22 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import KeyboardArrowDownIcon from "@mui/icons-material/KeyboardArrowDown";
+import KeyboardArrowRightIcon from "@mui/icons-material/KeyboardArrowRight";
+import SearchIcon from "@mui/icons-material/Search";
+import AccountTreeIcon from "@mui/icons-material/AccountTree";
+import BookmarkBorderIcon from "@mui/icons-material/BookmarkBorder";
+import DashboardOutlinedIcon from "@mui/icons-material/DashboardOutlined";
+import TimelineIcon from "@mui/icons-material/Timeline";
+import InfoOutlinedIcon from "@mui/icons-material/InfoOutlined";
+import FolderOpenOutlinedIcon from "@mui/icons-material/FolderOpenOutlined";
+import DesktopWindowsOutlinedIcon from "@mui/icons-material/DesktopWindowsOutlined";
+import BoltOutlinedIcon from "@mui/icons-material/BoltOutlined";
+import ManageSearchOutlinedIcon from "@mui/icons-material/ManageSearchOutlined";
+import TerminalOutlinedIcon from "@mui/icons-material/TerminalOutlined";
+import DnsOutlinedIcon from "@mui/icons-material/DnsOutlined";
+import TaskOutlinedIcon from "@mui/icons-material/TaskOutlined";
+import LanguageOutlinedIcon from "@mui/icons-material/LanguageOutlined";
 import type { Case, Host, CategoryEntry, ResultFileEntry } from "@/lib/types";
 import { EMPTY_TIME_RANGE, rangeActive, type TimeRange } from "@/lib/timeRange";
 import DateTimeInput from "./DateTimeInput";
@@ -17,28 +33,13 @@ const timeInputStyle: React.CSSProperties = {
   colorScheme: "dark",
 };
 
-export const CATEGORY_ICONS: Record<string, string> = {
-  AMCACHE: "📦",
-  EVENTLOG: "📋",
-  JUMPLIST: "🔗",
-  PREFETCH: "⚡",
-  REGISTRY: "🗂️",
-  SRUM: "📊",
-  WER: "💥",
-  TASKSCHEDULER: "⏰",
-  POWERSHELL: "💻",
-  RDPCACHE: "🖼️",
-  BROWSER: "🌐",
-  FILESYSTEM: "🗄️",
-};
-
 // Maps a run-list artifact name to its output CATEGORY folder (upper-cased),
 // so the sidebar can show every artifact that ran — including ones that found
 // no source files (no folder on disk) — as a "데이터 없음" placeholder.
 // Category defaults to the artifact name; only UsnJrnl files under FileSystem.
 const ARTIFACT_CATEGORY: Record<string, string> = {
   UsnJrnl: "FILESYSTEM",
-  // MFT is a 종합 분석 item (_OVERVIEW/MFT_Records.sqlite → "MFT Explorer"),
+  // MFT is a 종합 분석 item (_OVERVIEW/MFT_Records.sqlite → "파일 시스템 정보"),
   // not a raw category — map it there so it never shows as an empty "MFT"
   // placeholder in the 원본 데이터 list.
   MFT: "_OVERVIEW",
@@ -77,27 +78,11 @@ function EmptyCategoryRow({ name, label }: { name: string; label?: string }) {
         cursor: "default",
       }}
     >
-      <span style={{ width: 10, display: "inline-block" }} />
-      {CATEGORY_ICONS[name] && <span>{CATEGORY_ICONS[name]}</span>}
       <span>{label ?? name}</span>
       <span style={{ marginLeft: "auto", fontSize: 10.5, fontWeight: 400 }}>데이터 없음</span>
     </div>
   );
 }
-
-const OVERVIEW_TABLE_ICONS: Record<string, string> = {
-  TargetInfo: "🖥️",
-  ExecutionHistory: "⚡",
-  Defender: "🛡️",
-  RegistryFindings: "🔎",
-  BrowserActivity: "🌐",
-  RemoteDesktopHistory: "🖥️",
-  SmbHistory: "📁",
-  PowerShellHistory: "💻",
-  RdpCache: "🖼️",
-  ScheduledTasks: "⏰",
-  MFT_Records: "🗂️",
-};
 
 // Friendlier labels for overview tables whose raw name reads awkwardly.
 // Curated display order for the 종합 분석(_OVERVIEW) tables (by sqlite/table
@@ -118,18 +103,35 @@ const OVERVIEW_ORDER: string[] = [
 // 종합 분석(_OVERVIEW) items are labeled in English; the rest of the UI stays
 // Korean. Every overview table gets an explicit English name here.
 const OVERVIEW_TABLE_NAMES: Record<string, string> = {
-  TargetInfo: "Target Info",
-  ExecutionHistory: "Execution History",
+  TargetInfo: "호스트 정보",
+  ExecutionHistory: "실행 이력",
   Defender: "Defender",
-  RegistryFindings: "Registry Findings",
-  BrowserActivity: "Browser Activity",
-  RemoteDesktopHistory: "Remote Desktop",
-  SmbHistory: "SMB History",
-  PowerShellHistory: "PowerShell History",
+  RegistryFindings: "레지스트리 특이사항",
+  BrowserActivity: "브라우저 활동",
+  RemoteDesktopHistory: "원격 접근 이력 (RDP)",
+  SmbHistory: "SMB 접속 이력",
+  PowerShellHistory: "파워셸 실행 이력",
   RdpCache: "RDP Cache",
-  ScheduledTasks: "Scheduled Tasks",
-  MFT_Records: "MFT Explorer",
+  ScheduledTasks: "작업 스케줄러",
+  MFT_Records: "파일 시스템 정보",
 };
+
+function OverviewTableIcon({ name }: { name: string }) {
+  const props = { sx: { fontSize: 18, color: "var(--text-faint)", flexShrink: 0 } };
+  switch (name) {
+    case "TargetInfo": return <InfoOutlinedIcon {...props} />;
+    // This icon identifies a file-system evidence view, rather than decorating
+    // the navigation label.
+    case "MFT_Records": return <FolderOpenOutlinedIcon {...props} />;
+    case "RemoteDesktopHistory": return <DesktopWindowsOutlinedIcon {...props} />;
+    case "ExecutionHistory": return <BoltOutlinedIcon {...props} />;
+    case "RegistryFindings": return <ManageSearchOutlinedIcon {...props} />;
+    case "PowerShellHistory": return <TerminalOutlinedIcon {...props} />;
+    case "SmbHistory": return <DnsOutlinedIcon {...props} />;
+    case "ScheduledTasks": return <TaskOutlinedIcon {...props} />;
+    default: return <LanguageOutlinedIcon {...props} />;
+  }
+}
 
 function sameEntry(a: ResultFileEntry | null, b: ResultFileEntry): boolean {
   return !!a && a.fullPath === b.fullPath && a.tableName === b.tableName;
@@ -140,16 +142,19 @@ function FileRow({
   label,
   selected,
   indent,
-  icon,
+  leading,
   count,
+  prominent = false,
   onSelectFile,
 }: {
   entry: ResultFileEntry;
   label: string;
   selected: boolean;
   indent: number;
-  icon?: string;
+  leading?: React.ReactNode;
   count?: number;
+  /** Host-analysis navigation uses the same tab scale as Dashboard/Timeline. */
+  prominent?: boolean;
   onSelectFile: (file: ResultFileEntry) => void;
 }) {
   return (
@@ -161,10 +166,15 @@ function FileRow({
         alignItems: "center",
         justifyContent: "space-between",
         gap: 6,
-        padding: `5px 10px 5px ${indent}px`,
+        padding: `${prominent ? 10 : 7}px 10px ${prominent ? 10 : 7}px ${indent}px`,
         cursor: "pointer",
-        background: selected ? "var(--bg-selected)" : "transparent",
-        borderLeft: `2px solid ${selected ? "var(--accent)" : "transparent"}`,
+        background: selected
+          ? "linear-gradient(135deg, rgba(74, 146, 218, 0.31), rgba(37, 78, 118, 0.38))"
+          : "transparent",
+        borderLeft: `3px solid ${selected ? "var(--accent)" : "transparent"}`,
+        boxShadow: selected
+          ? "inset 3px 3px 7px rgba(3, 8, 14, 0.45), inset -2px -2px 6px rgba(142, 188, 230, 0.12), 0 1px 0 rgba(142, 188, 230, 0.12)"
+          : "none",
         whiteSpace: "nowrap",
         overflow: "hidden",
         textOverflow: "ellipsis",
@@ -176,11 +186,11 @@ function FileRow({
         if (!selected) e.currentTarget.style.background = "transparent";
       }}
     >
-      <span style={{ display: "flex", alignItems: "center", gap: 5, overflow: "hidden", textOverflow: "ellipsis", color: selected ? "var(--text)" : "var(--text-dim)" }}>
-        {icon && <span style={{ flexShrink: 0, fontSize: 12 }}>{icon}</span>}
+      <span style={{ display: "flex", alignItems: "center", gap: 7, overflow: "hidden", textOverflow: "ellipsis", color: selected ? "var(--text)" : "var(--text-dim)", fontSize: prominent ? 14 : 13.5, fontWeight: selected ? 700 : prominent ? 600 : 400 }}>
+        {leading}
         <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>{label}</span>
       </span>
-      <span style={{ color: "var(--text-faint)", fontSize: 11, flexShrink: 0 }}>{(count ?? entry.rowCount).toLocaleString()}</span>
+      <span style={{ color: "var(--text-faint)", fontSize: 11.5, flexShrink: 0 }}>{(count ?? entry.rowCount).toLocaleString()}</span>
     </div>
   );
 }
@@ -194,7 +204,8 @@ function FileNode({
   tables,
   selectedFile,
   indent,
-  icon,
+  leading,
+  prominent = false,
   onSelectFile,
 }: {
   fileName: string;
@@ -202,14 +213,15 @@ function FileNode({
   tables: ResultFileEntry[];
   selectedFile: ResultFileEntry | null;
   indent: number;
-  icon?: string;
+  leading?: React.ReactNode;
+  prominent?: boolean;
   onSelectFile: (file: ResultFileEntry) => void;
 }) {
   const [open, setOpen] = useState(false);
 
   if (tables.length === 1) {
     return (
-      <FileRow entry={tables[0]} label={label ?? fileName} selected={sameEntry(selectedFile, tables[0])} indent={indent} icon={icon} onSelectFile={onSelectFile} />
+      <FileRow entry={tables[0]} label={label ?? fileName} selected={sameEntry(selectedFile, tables[0])} indent={indent} leading={leading} prominent={prominent} onSelectFile={onSelectFile} />
     );
   }
 
@@ -224,7 +236,7 @@ function FileNode({
           alignItems: "center",
           justifyContent: "space-between",
           gap: 6,
-          padding: `5px 10px 5px ${indent}px`,
+          padding: `${prominent ? 10 : 7}px 10px ${prominent ? 10 : 7}px ${indent}px`,
           cursor: "pointer",
           userSelect: "none",
           color: anySelected ? "var(--text)" : "var(--text-dim)",
@@ -235,16 +247,16 @@ function FileNode({
         onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
       >
         <span style={{ display: "flex", alignItems: "center", gap: 5, overflow: "hidden", textOverflow: "ellipsis" }}>
-          <span style={{ width: 10, display: "inline-block", fontSize: 9, color: "var(--text-faint)" }}>{open ? "▾" : "▸"}</span>
-          {icon && <span style={{ flexShrink: 0, fontSize: 12 }}>{icon}</span>}
-          <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>{fileName}</span>
-          <span style={{ color: "var(--text-faint)", fontSize: 11 }}>{tables.length}</span>
+          {open ? <KeyboardArrowDownIcon sx={{ fontSize: 17, color: "var(--text-faint)", flexShrink: 0 }} /> : <KeyboardArrowRightIcon sx={{ fontSize: 17, color: "var(--text-faint)", flexShrink: 0 }} />}
+          {leading}
+          <span style={{ overflow: "hidden", textOverflow: "ellipsis", fontSize: prominent ? 14 : 13.5, fontWeight: prominent ? 600 : 400 }}>{fileName}</span>
+          <span style={{ color: "var(--text-faint)", fontSize: 11.5 }}>{tables.length}</span>
         </span>
         <span style={{ color: "var(--text-faint)", fontSize: 11, flexShrink: 0 }}>{total.toLocaleString()}</span>
       </div>
       {open &&
         tables.map((t) => (
-          <FileRow key={t.tableName} entry={t} label={t.tableName} selected={sameEntry(selectedFile, t)} indent={indent + 16} onSelectFile={onSelectFile} />
+          <FileRow key={t.tableName} entry={t} label={t.tableName} selected={sameEntry(selectedFile, t)} indent={indent + 16} prominent={prominent} onSelectFile={onSelectFile} />
         ))}
     </div>
   );
@@ -259,10 +271,11 @@ interface CategoryNodeProps {
   /** Pinned sections (the curated cross-artifact overview) are always
    * expanded and visually distinguished from the raw per-artifact tree. */
   pinned?: boolean;
+  hideHeader?: boolean;
   onNavigate?: (targetFile: string, targetColumn: string, value: string) => void;
 }
 
-function CategoryNode({ category, selectedFile, onSelectFile, displayName, pinned, onNavigate }: CategoryNodeProps) {
+function CategoryNode({ category, selectedFile, onSelectFile, displayName, pinned, hideHeader, onNavigate }: CategoryNodeProps) {
   const [expanded, setExpanded] = useState(false);
   const [files, setFiles] = useState<ResultFileEntry[] | null>(null);
 
@@ -291,38 +304,26 @@ function CategoryNode({ category, selectedFile, onSelectFile, displayName, pinne
   }, [files, pinned]);
 
   const isExpanded = pinned || expanded;
-  const icon = pinned ? undefined : CATEGORY_ICONS[category.name];
-
   return (
-    <div
-      style={
-        pinned
-          ? { background: "linear-gradient(180deg, rgba(88,166,255,0.07), rgba(88,166,255,0.02))", borderBottom: "1px solid var(--border-subtle)" }
-          : undefined
-      }
-    >
-      <div
+    <div>
+      {!hideHeader && <div
         onClick={() => !pinned && setExpanded((e) => !e)}
         style={{
           display: "flex",
           alignItems: "center",
           gap: 6,
-          padding: "8px 10px",
+          padding: "10px 10px",
           cursor: pinned ? "default" : "pointer",
           fontWeight: 600,
-          fontSize: 12.5,
+          fontSize: 13.5,
           userSelect: "none",
           color: pinned ? "var(--accent)" : "var(--text)",
         }}
       >
-        {!pinned && (
-          <span style={{ width: 10, display: "inline-block", fontSize: 9, color: "var(--text-faint)" }}>{expanded ? "▾" : "▸"}</span>
-        )}
-        {icon && <span>{icon}</span>}
-        {pinned && <span style={{ fontSize: 12 }}>✦</span>}
+        {!pinned && (expanded ? <KeyboardArrowDownIcon sx={{ fontSize: 17, color: "var(--text-faint)", flexShrink: 0 }} /> : <KeyboardArrowRightIcon sx={{ fontSize: 17, color: "var(--text-faint)", flexShrink: 0 }} />)}
         <span>{displayName ?? category.name}</span>
         <span style={{ color: "var(--text-faint)", fontWeight: 400, fontSize: 11.5 }}>{byFile ? byFile.length : ""}</span>
-      </div>
+      </div>}
       {isExpanded && byFile && (
         <div style={{ paddingBottom: pinned ? 4 : 0 }}>
           {byFile.length === 0 && (
@@ -335,8 +336,9 @@ function CategoryNode({ category, selectedFile, onSelectFile, displayName, pinne
               label={pinned ? OVERVIEW_TABLE_NAMES[fileName] : undefined}
               tables={tables}
               selectedFile={selectedFile}
-              indent={pinned ? 20 : 26}
-              icon={pinned ? OVERVIEW_TABLE_ICONS[fileName] : undefined}
+              indent={pinned ? 12 : 26}
+              leading={pinned ? <OverviewTableIcon name={fileName} /> : undefined}
+              prominent={pinned}
               onSelectFile={onSelectFile}
             />
           ))}
@@ -347,7 +349,7 @@ function CategoryNode({ category, selectedFile, onSelectFile, displayName, pinne
 }
 
 interface PinnedNavRowProps {
-  icon: string;
+  icon: React.ReactNode;
   label: string;
   count?: number;
   selected: boolean;
@@ -365,13 +367,18 @@ function PinnedNavRow({ icon, label, count, selected, onClick, busy }: PinnedNav
       style={{
         display: "flex",
         alignItems: "center",
-        gap: 8,
-        padding: "9px 12px",
+        gap: 10,
+        padding: "10px 12px",
         cursor: busy ? "progress" : "pointer",
-        fontSize: 12.5,
-        fontWeight: 600,
-        background: selected ? "var(--bg-selected)" : "transparent",
-        borderLeft: `2px solid ${selected ? "var(--accent)" : "transparent"}`,
+        fontSize: 14,
+        fontWeight: selected ? 700 : 600,
+        background: selected
+          ? "linear-gradient(135deg, rgba(74, 146, 218, 0.34), rgba(36, 75, 113, 0.42))"
+          : "transparent",
+        borderLeft: `3px solid ${selected ? "var(--accent)" : "transparent"}`,
+        boxShadow: selected
+          ? "inset 4px 4px 9px rgba(3, 8, 14, 0.50), inset -3px -3px 7px rgba(142, 188, 230, 0.13), 0 1px 0 rgba(142, 188, 230, 0.14)"
+          : "none",
         color: busy ? "var(--text-faint)" : selected ? "var(--text)" : "var(--text-dim)",
       }}
       onMouseEnter={(e) => {
@@ -381,7 +388,7 @@ function PinnedNavRow({ icon, label, count, selected, onClick, busy }: PinnedNav
         if (!selected) e.currentTarget.style.background = "transparent";
       }}
     >
-      <span>{icon}</span>
+      <span style={{ display: "flex", color: selected ? "var(--accent)" : "var(--text-faint)" }}>{icon}</span>
       <span>{label}</span>
       {busy ? (
         <span className="wa-spin" style={{ marginLeft: "auto" }} />
@@ -396,8 +403,8 @@ interface SidebarProps {
   activeCase: Case;
   activeHost: Host;
   onSelectHost: (h: Host) => void;
-  onBackToCases: () => void;
   onBackToHosts: () => void;
+  onRefresh: () => void;
   categories: CategoryEntry[];
   selectedFile: ResultFileEntry | null;
   onSelectFile: (file: ResultFileEntry) => void;
@@ -417,8 +424,8 @@ export default function Sidebar({
   activeCase,
   activeHost,
   onSelectHost,
-  onBackToCases,
   onBackToHosts,
+  onRefresh,
   categories,
   selectedFile,
   onSelectFile,
@@ -433,6 +440,7 @@ export default function Sidebar({
   onTimeRangeChange,
   onNavigate,
 }: SidebarProps) {
+  const [rawDataExpanded, setRawDataExpanded] = useState(false);
   const overviewCategory = categories.find((c) => c.name === "_OVERVIEW");
   const rawCategories = categories.filter((c) => c.name !== "_OVERVIEW");
 
@@ -455,6 +463,7 @@ export default function Sidebar({
 
   return (
     <div
+      className="dfir-sidebar"
       style={{
         width: 300,
         flexShrink: 0,
@@ -466,21 +475,17 @@ export default function Sidebar({
       }}
     >
       <div style={{ padding: 12, borderBottom: "1px solid var(--border)" }}>
-        {/* breadcrumb: case name (click → back to host list / case list) */}
+        {/* Current host control. The internal session case is intentionally not shown. */}
         <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 8, fontSize: 11.5 }}>
-          <button onClick={onBackToCases} title="케이스 목록" style={{ background: "transparent", border: "none", color: "var(--accent)", cursor: "pointer", fontWeight: 600, padding: 0 }}>
-            🗂️ {activeCase.name}
-          </button>
-          <span style={{ color: "var(--text-faint)" }}>/</span>
           <button onClick={onBackToHosts} title="호스트 목록" style={{ background: "transparent", border: "none", color: "var(--accent)", cursor: "pointer", fontWeight: 600, padding: 0 }}>
-            호스트 목록
+            호스트 등록
+          </button>
+          <button onClick={onRefresh} title="케이스·호스트·분석 결과를 다시 불러옵니다" style={{ marginLeft: "auto", background: "var(--bg-elevated)", border: "1px solid var(--border)", color: "var(--text-dim)", borderRadius: "var(--radius-sm)", cursor: "pointer", fontSize: 11, padding: "3px 7px" }}>
+            새로고침
           </button>
         </div>
         {/* host selector — switch between machines in this case */}
-        <div style={{ position: "relative" }}>
-          <span style={{ position: "absolute", left: 10, top: "50%", transform: "translateY(-50%)", fontSize: 13, pointerEvents: "none" }}>
-            🖥️
-          </span>
+        <div>
           <select
             value={activeHost.id}
             onChange={(e) => {
@@ -489,7 +494,7 @@ export default function Sidebar({
             }}
             style={{
               width: "100%",
-              padding: "7px 10px 7px 32px",
+              padding: "7px 10px",
               background: "var(--bg-input)",
               color: "var(--text)",
               border: "1px solid var(--border)",
@@ -506,16 +511,7 @@ export default function Sidebar({
             ))}
           </select>
         </div>
-        <div style={{ marginTop: 8, fontSize: 11, color: "var(--text-faint)", display: "flex", alignItems: "center", gap: 5 }}>
-          <span
-            style={{
-              width: 6,
-              height: 6,
-              borderRadius: "50%",
-              flexShrink: 0,
-              background: activeHost.lastRunStatus === "ok" ? "var(--success)" : activeHost.lastRunStatus === "error" ? "var(--danger)" : "var(--text-faint)",
-            }}
-          />
+        <div style={{ marginTop: 8, fontSize: 11, color: "var(--text-faint)" }}>
           {activeHost.lastRunAt ? `마지막 실행: ${activeHost.lastRunAt}` : "아직 파싱되지 않음"}
         </div>
         {(
@@ -565,23 +561,23 @@ export default function Sidebar({
           </div>
         )}
         <>
-          {/* 케이스 분석 — spans every host in the case */}
+          {/* Integrated analysis spans every host in the current session. */}
           <div style={{ borderBottom: "1px solid var(--border-subtle)" }}>
-            <div style={{ padding: "8px 14px 4px", fontSize: 10.5, fontWeight: 700, letterSpacing: 0.5, color: "var(--text-faint)", textTransform: "uppercase" }}>케이스 분석</div>
+            <div style={{ padding: "12px 14px 6px", fontSize: 11.5, fontWeight: 750, letterSpacing: 0.6, color: "var(--text-faint)", textTransform: "uppercase" }}>통합 분석</div>
             <PinnedNavRow
-              icon="🔍"
+              icon={<SearchIcon sx={{ fontSize: 19 }} />}
               label="전체 검색"
               selected={activeVirtualTab === "search"}
               onClick={onSelectSearch}
             />
             <PinnedNavRow
-              icon="🔗"
+              icon={<AccountTreeIcon sx={{ fontSize: 19 }} />}
               label="호스트 연결"
               selected={activeVirtualTab === "connections"}
               onClick={onSelectConnections}
             />
             <PinnedNavRow
-              icon="🔖"
+              icon={<BookmarkBorderIcon sx={{ fontSize: 19 }} />}
               label="북마크"
               count={bookmarkCount}
               selected={activeVirtualTab === "bookmarks"}
@@ -590,36 +586,41 @@ export default function Sidebar({
           </div>
           {/* 호스트 분석 — the currently open host */}
           <div style={{ borderBottom: "1px solid var(--border-subtle)" }}>
-            <div style={{ padding: "8px 14px 4px", fontSize: 10.5, fontWeight: 700, letterSpacing: 0.5, color: "var(--text-faint)", textTransform: "uppercase" }}>호스트 분석</div>
+            <div style={{ padding: "12px 14px 6px", fontSize: 11.5, fontWeight: 750, letterSpacing: 0.6, color: "var(--text-faint)", textTransform: "uppercase" }}>호스트 분석</div>
             <PinnedNavRow
-              icon="🏠"
+              icon={<DashboardOutlinedIcon sx={{ fontSize: 19 }} />}
               label="대시보드"
               selected={!activeVirtualTab && !selectedFile}
               onClick={onSelectDashboard}
             />
             <PinnedNavRow
-              icon="🕐"
+              icon={<TimelineIcon sx={{ fontSize: 19 }} />}
               label="통합 타임라인"
               selected={activeVirtualTab === "timeline"}
               onClick={onSelectTimeline}
             />
+            {overviewCategory && (
+              <CategoryNode
+                category={overviewCategory}
+                pinned
+                hideHeader
+                selectedFile={selectedFile}
+                onSelectFile={onSelectFile}
+              />
+            )}
           </div>
         </>
-        {overviewCategory && (
-          <CategoryNode
-            category={overviewCategory}
-            displayName="종합 분석"
-            pinned
-            selectedFile={selectedFile}
-            onSelectFile={onSelectFile}
-          />
-        )}
         {hasRawSection && (
-          <div style={{ padding: "10px 10px 4px", fontSize: 10.5, fontWeight: 700, color: "var(--text-faint)", textTransform: "uppercase", letterSpacing: 0.8 }}>
+          <button
+            onClick={() => setRawDataExpanded((expanded) => !expanded)}
+            aria-expanded={rawDataExpanded}
+            style={{ width: "100%", display: "flex", alignItems: "center", gap: 4, padding: "10px 8px 6px", border: "none", background: "transparent", color: "var(--text-faint)", cursor: "pointer", fontSize: 10.5, fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.8, textAlign: "left" }}
+          >
+            {rawDataExpanded ? <KeyboardArrowDownIcon sx={{ fontSize: 17, color: "var(--text-faint)" }} /> : <KeyboardArrowRightIcon sx={{ fontSize: 17, color: "var(--text-faint)" }} />}
             원본 데이터
-          </div>
+          </button>
         )}
-        {orderedNames.map((name) => {
+        {rawDataExpanded && orderedNames.map((name) => {
           const category = presentByName.get(name);
           return category ? (
             <CategoryNode key={category.fullPath} category={category} displayName={CATEGORY_LABELS[category.name]} selectedFile={selectedFile} onSelectFile={onSelectFile} onNavigate={onNavigate} />
@@ -627,7 +628,7 @@ export default function Sidebar({
             <EmptyCategoryRow key={name} name={name} label={CATEGORY_LABELS[name]} />
           );
         })}
-        {leftoverCategories.map((category) => (
+        {rawDataExpanded && leftoverCategories.map((category) => (
           <CategoryNode key={category.fullPath} category={category} selectedFile={selectedFile} onSelectFile={onSelectFile} onNavigate={onNavigate} />
         ))}
       </div>

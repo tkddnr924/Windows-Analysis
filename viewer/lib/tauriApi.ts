@@ -8,11 +8,12 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type {
   Bookmark, BookmarkInput, Case, CategoryEntry, CsvData, ElectronApi, Host,
-  ListCasesResult, CacheEntry, PathReference, PipelineLogEntry, PipelineResult, ResultFileEntry, RunHostOptions, SearchHit,
+  ListCasesResult, CacheMeta, CacheBodyPreview, PathReference, PipelineLogEntry, PipelineResult, ResultFileEntry, ResultProvenance, ArtifactInputFile, ParseReport, RunHostOptions, SearchHit, AiConversation, AiConversationPage, BrowserActivityQuery, BrowserActivitySummary, BrowserActivityInsights, BrowserDomainStatsPage, AccountEventPage, AccountEventQuery, AccountEventSource, ResultRow,
 } from "./types";
 
 function makeApi(): ElectronApi {
   return {
+    setWindowLayout: (layout) => invoke<void>("set_window_layout", { layout }),
     pickFolder: () => invoke<string | null>("pick_folder"),
     listCases: () => invoke<ListCasesResult>("list_cases"),
     createCase: (name) => invoke<Case>("create_case", { name }),
@@ -33,7 +34,19 @@ function makeApi(): ElectronApi {
     },
     listCategories: (hostDir) => invoke<CategoryEntry[]>("list_categories", { hostDir }),
     listResultFiles: (categoryDir) => invoke<ResultFileEntry[]>("list_result_files", { categoryDir }),
+    refreshExecutionHistoryOverview: (hostDir) => invoke<boolean>("refresh_execution_history_overview", { hostDir }),
+    resultProvenance: (fullPath, tableName) => invoke<ResultProvenance[]>("result_provenance", { fullPath, tableName }),
+    artifactInputFiles: (sourceFile) => invoke<ArtifactInputFile[]>("artifact_input_files", { sourceFile }),
+    parseReport: (hostDir) => invoke<ParseReport | null>("parse_report", { hostDir }),
     readResultFile: (fullPath, tableName) => invoke<CsvData>("read_result_file", { fullPath, tableName: tableName ?? null }),
+    linkedResultRows: (fullPath, tableName, matchColumn, matchValue, search, offset, limit) => invoke("linked_result_rows", { fullPath, tableName, matchColumn, matchValue, search, offset, limit }),
+    resultRow: (fullPath, tableName, rowid) => invoke<ResultRow>("result_row", { fullPath, tableName, rowid }),
+    browserActivitySummary: (fullPath, tableName, query) => invoke<BrowserActivitySummary>("browser_activity_summary", { fullPath, tableName, query }),
+    browserActivityInsights: (fullPath, tableName, account, start, end) => invoke<BrowserActivityInsights>("browser_activity_insights", { fullPath, tableName, account, start, end }),
+    browserActivityDomains: (fullPath, tableName, account, start, end, offset, limit) => invoke<BrowserDomainStatsPage>("browser_activity_domains", { fullPath, tableName, account, start, end, offset, limit }),
+    browserActivityPage: (fullPath, tableName, query) => invoke<CsvData>("browser_activity_page", { fullPath, tableName, query }),
+    accountEventPage: (sources: AccountEventSource[], query: AccountEventQuery) => invoke<AccountEventPage>("account_event_page", { sources, query }),
+    aiReferrals: (fullPath, tableName, start, end, offset, limit) => invoke<CsvData>("ai_referrals", { fullPath, tableName, start, end, offset, limit }),
     mftChildren: (fullPath, parentEntry) => invoke<Record<string, string>[]>("mft_children", { fullPath, parentEntry }),
     mftSearch: (fullPath, query, limit) => invoke<Record<string, string>[]>("mft_search", { fullPath, query, limit }),
     mftRow: (fullPath, rowid) => invoke<Record<string, string> | null>("mft_row", { fullPath, rowid }),
@@ -44,7 +57,8 @@ function makeApi(): ElectronApi {
     toggleBookmark: (caseDir, entry: BookmarkInput) => invoke<Bookmark[]>("toggle_bookmark", { caseDir, entry }),
     updateBookmarkNote: (caseDir, id, note) => invoke<Bookmark[]>("update_bookmark_note", { caseDir, id, note }),
     pathReferences: (hostDir) => invoke<PathReference[]>("path_references", { hostDir }),
-    cacheEntries: (hostDir) => invoke<CacheEntry[]>("cache_entries", { hostDir }),
+    cacheEntryBody: (hostDir, account, url, cacheKey) => invoke<CacheBodyPreview>("cache_entry_body", { hostDir, account, url, cacheKey }),
+    aiConversations: (hostDir, query) => invoke<AiConversationPage>("ai_conversations", { hostDir, query }),
   };
 }
 

@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
+import { useModalDialog } from "@/lib/useModalDialog";
 
 // A focused analysis view for one PowerShell script block: the source on the
 // left, a decoding/deobfuscation workbench on the right. Separate from the
@@ -136,25 +137,34 @@ export default function PowerShellSourceView({
   const [selection, setSelection] = useState("");
   const [results, setResults] = useState<Result[]>([]);
   const [copiedAll, setCopiedAll] = useState(false);
+  const [copyError, setCopyError] = useState(false);
   const counter = useRef(0);
+  const titleId = useId();
+  const dialogRef = useModalDialog(onClose);
 
   const norm = useMemo(() => normalizeVariables(code), [code]);
   const shown = normalized ? norm.code : code;
 
   useEffect(() => {
-    function onKey(e: KeyboardEvent) {
-      if (e.key === "Escape") onClose();
-    }
     function onSel() {
       setSelection(window.getSelection?.()?.toString() ?? "");
     }
-    window.addEventListener("keydown", onKey);
     document.addEventListener("selectionchange", onSel);
     return () => {
-      window.removeEventListener("keydown", onKey);
       document.removeEventListener("selectionchange", onSel);
     };
-  }, [onClose]);
+  }, []);
+
+  async function copyText(value: string, onSuccess?: () => void) {
+    try {
+      await navigator.clipboard.writeText(value);
+      setCopyError(false);
+      onSuccess?.();
+    } catch {
+      setCopyError(true);
+      window.setTimeout(() => setCopyError(false), 2400);
+    }
+  }
 
   function runConvert(kind: "base64" | "url" | "bytes") {
     const sel = (window.getSelection?.()?.toString() ?? selection).trim();
@@ -193,7 +203,12 @@ export default function PowerShellSourceView({
       style={{ position: "fixed", inset: 0, background: "rgba(1,4,9,0.75)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 200, padding: 24 }}
     >
       <div
+        ref={dialogRef}
         onClick={(e) => e.stopPropagation()}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        tabIndex={-1}
         style={{
           width: "min(1280px, 96vw)",
           height: "min(860px, 90vh)",
@@ -208,7 +223,7 @@ export default function PowerShellSourceView({
       >
         {/* header */}
         <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "10px 14px", borderBottom: "1px solid var(--border)", background: "var(--bg-elevated)", flexShrink: 0 }}>
-          <strong style={{ fontSize: 13 }}>{"</> "}{title}</strong>
+          <strong id={titleId} style={{ fontSize: 13 }}>{title}</strong>
           <span style={{ fontSize: 11, color: "var(--text-faint)" }}>{code.length.toLocaleString()}자</span>
           <button
             onClick={() => setNormalized((v) => !v)}
@@ -218,19 +233,12 @@ export default function PowerShellSourceView({
             {normalized ? "✓ 변수 정리됨" : "변수 정리"}
           </button>
           <button onClick={() => setWrap((w) => !w)} style={btn}>{wrap ? "줄바꿈 끄기" : "줄바꿈 켜기"}</button>
-          <button
-            onClick={() => {
-              navigator.clipboard.writeText(shown).then(() => {
-                setCopiedAll(true);
-                setTimeout(() => setCopiedAll(false), 1200);
-              });
-            }}
-            style={btn}
-          >
-            {copiedAll ? "복사됨" : "코드 복사"}
+          <button onClick={() => void copyText(shown, () => { setCopiedAll(true); window.setTimeout(() => setCopiedAll(false), 1200); })} style={{ ...btn, color: copyError ? "var(--danger)" : btn.color }}>
+            {copyError ? "복사 실패" : copiedAll ? "복사됨" : "코드 복사"}
           </button>
-          <button onClick={onClose} title="닫기 (Esc)" style={{ ...btn, fontSize: 16, lineHeight: 1, padding: "2px 8px" }}>×</button>
+          <button onClick={onClose} data-dialog-autofocus aria-label="소스코드 보기 닫기" title="닫기 (Esc)" style={{ ...btn, fontSize: 16, lineHeight: 1, padding: "2px 8px" }}>×</button>
         </div>
+        {copyError && <div role="status" style={{ padding: "6px 14px", color: "var(--danger)", borderBottom: "1px solid var(--border-subtle)", fontSize: 11.5 }}>클립보드에 복사하지 못했습니다. 권한을 확인한 뒤 다시 시도하세요.</div>}
 
         {/* body: code | analysis */}
         <div style={{ flex: 1, minHeight: 0, display: "flex" }}>
@@ -302,7 +310,7 @@ export default function PowerShellSourceView({
                     <span style={{ color: r.error ? "var(--danger)" : "var(--accent)", fontWeight: 600 }}>{r.note}</span>
                     {!r.error && (
                       <button
-                        onClick={() => navigator.clipboard.writeText(r.output)}
+                        onClick={() => void copyText(r.output)}
                         style={{ marginLeft: "auto", ...btn, fontSize: 10, padding: "1px 7px" }}
                       >
                         복사

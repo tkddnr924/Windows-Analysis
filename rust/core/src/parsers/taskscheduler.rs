@@ -5,6 +5,7 @@ use std::path::Path;
 
 use anyhow::Result;
 use chrono::{DateTime, FixedOffset, NaiveDateTime, TimeZone};
+use rayon::prelude::*;
 use walkdir::WalkDir;
 
 use crate::sqlite::Row;
@@ -148,24 +149,28 @@ fn parse_task(path: &Path) -> Result<Row> {
 
 /// Walk `root`, parse every file whose content carries the task XML namespace.
 pub fn parse_tasks(root: &Path) -> Result<Vec<Row>> {
-    let mut rows = Vec::new();
-    for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
-        if !entry.file_type().is_file() { continue; }
-        let path = entry.path();
+    let paths: Vec<_> = WalkDir::new(root).into_iter().filter_map(|e| e.ok())
+        .filter(|entry| entry.file_type().is_file())
+        .map(|entry| entry.into_path())
+        .collect();
+    let utf8 = TASK_NAMESPACE.as_bytes().to_vec();
+    let utf16: Vec<u8> = TASK_NAMESPACE.bytes().flat_map(|b| [b, 0]).collect();
+    Ok(paths.par_iter().filter_map(|path| {
         // Read only the first 4 KB to test for the task namespace — never the
         // whole file. A target can hold huge unrelated files (images, dumps);
         // slurping each one just to check its header made discovery crawl.
         let mut head = Vec::new();
         match std::fs::File::open(path) {
-            Ok(f) => { use std::io::Read; if std::io::Read::take(f, 4096).read_to_end(&mut head).is_err() { continue; } }
-            Err(_) => continue,
+            Ok(f) => {
+                use std::io::Read;
+                if std::io::Read::take(f, 4096).read_to_end(&mut head).is_err() { return None; }
+            }
+            Err(_) => return None,
         }
-        let utf8 = TASK_NAMESPACE.as_bytes().to_vec();
-        let utf16: Vec<u8> = TASK_NAMESPACE.bytes().flat_map(|b| [b, 0]).collect();
         let has = |needle: &[u8]| head.windows(needle.len()).any(|w| w == needle);
-        if !(has(&utf8) || has(&utf16)) { continue; }
+        if !(has(&utf8) || has(&utf16)) { return None; }
         match parse_task(path) {
-            Ok(r) => rows.push(r),
+            Ok(r) => Some(r),
             Err(e) => {
                 let mut row = Row::new();
                 row.insert("timestamp".into(), String::new());
@@ -173,9 +178,8 @@ pub fn parse_tasks(root: &Path) -> Result<Vec<Row>> {
                 row.insert("_source_file".into(), path.to_string_lossy().to_string());
                 row.insert("_status".into(), "unreadable_file".into());
                 row.insert("_error".into(), e.to_string());
-                rows.push(row);
+                Some(row)
             }
         }
-    }
-    Ok(rows)
+    }).collect())
 }

@@ -137,7 +137,7 @@ fn dump_table_stream(table: &libesedb::Table, id_map: &HashMap<i64, String>, sou
 
 pub fn parse_srum_stream(path: &Path, out_db: &Path) -> Result<Vec<(String, usize)>> {
     let source = path.to_string_lossy().to_string();
-    let db = EseDb::open(path)?;
+    let db = EseDb::open(path).map_err(|e| anyhow::anyhow!("SRUDB.dat is corrupted or dirty (requires esentutl /p). Original error: {}", e))?;
     let id_map = build_id_map(&db);
     let mut out: Vec<(String, usize)> = Vec::new();
     for table in db.iter_tables()?.filter_map(|t| t.ok()) {

@@ -13,9 +13,25 @@ use crate::sqlite::Row;
 /// Read an entire table as Vec<Row> (TEXT cells; NULL -> absent key). Returns
 /// empty if the DB/table is missing.
 pub fn read_table(db: &Path, table: &str) -> Vec<Row> {
+    read_table_inner(db, table, false)
+}
+
+/// Read a table together with each SQLite rowid. Overview tables use this only
+/// to preserve a stable pointer back to the raw parsed record; the additional
+/// column is deliberately private and never emitted as analyst-facing data.
+fn read_table_with_rowid(db: &Path, table: &str) -> Vec<Row> {
+    read_table_inner(db, table, true)
+}
+
+fn read_table_inner(db: &Path, table: &str, include_rowid: bool) -> Vec<Row> {
     if !db.exists() { return Vec::new(); }
     let con = match Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY) { Ok(c) => c, Err(_) => return Vec::new() };
-    let mut stmt = match con.prepare(&format!("SELECT * FROM \"{}\"", table)) { Ok(s) => s, Err(_) => return Vec::new() };
+    let query = if include_rowid {
+        format!("SELECT rowid AS \"__source_rowid\", * FROM \"{}\"", table)
+    } else {
+        format!("SELECT * FROM \"{}\"", table)
+    };
+    let mut stmt = match con.prepare(&query) { Ok(s) => s, Err(_) => return Vec::new() };
     let cols: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
     let mut out = Vec::new();
     let mut q = match stmt.query([]) { Ok(q) => q, Err(_) => return Vec::new() };
@@ -377,7 +393,7 @@ pub fn build_smb_history(out_dir: &Path) -> Vec<Row> {
             remote = smb_client_ip(&inner.get("ClientName").map(vstr).unwrap_or_default());
             account = inner.get("UserName").map(vstr).unwrap_or_default();
             if eid == "551" { result = "실패".into(); description = "SMB 인증 실패".into(); }
-            else { result = String::new(); description = "SMB 세션 인증 실패".into(); }
+            else { result = "실패".into(); description = "SMB 세션 인증 실패".into(); }
         } else {
             continue;
         }
@@ -593,7 +609,7 @@ fn to_int(v: Option<&serde_json::Value>, default: i64) -> i64 {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn ps_row(timestamp: &str, account: &str, process: &str, process_id: &str, command: &str, script_block: &str, kind: &str, event_id: &str, provider: &str, script_path: &str, record_key: &str) -> Row {
+fn ps_row(timestamp: &str, account: &str, process: &str, process_id: &str, command: &str, script_block: &str, host_application: &str, kind: &str, event_id: &str, provider: &str, script_path: &str, record_key: &str) -> Row {
     let mut r = Row::new();
     r.insert("timestamp".into(), timestamp.into());
     r.insert("account".into(), account.into());
@@ -601,6 +617,10 @@ fn ps_row(timestamp: &str, account: &str, process: &str, process_id: &str, comma
     r.insert("process_id".into(), process_id.into());
     r.insert("command".into(), command.into());
     r.insert("script_block".into(), script_block.into());
+    // HostApplication is an independent execution evidence source in 4103/800.
+    // Keep it even when CommandLine/Payload is empty: otherwise an investigator
+    // loses the only recorded invocation context for the EventLog record.
+    r.insert("host_application".into(), host_application.into());
     r.insert("kind".into(), kind.into());
     r.insert("event_id".into(), event_id.into());
     r.insert("provider".into(), provider.into());
@@ -642,7 +662,7 @@ pub fn build_powershell_history(out_dir: &Path) -> Vec<Row> {
                 if !ts.is_empty() && (slot.1.is_empty() || ts < slot.1) { slot.1 = ts.clone(); slot.4 = rk.clone(); }
                 continue;
             }
-            rows.push(ps_row(&ts, &account_for(&sid), "powershell.exe", &pid, "", &text, "스크립트 블록", &event_id, &provider, &path, &rk));
+            rows.push(ps_row(&ts, &account_for(&sid), "powershell.exe", &pid, "", &text, "", "스크립트 블록", &event_id, &provider, &path, &rk));
         } else if provider == "Microsoft-Windows-PowerShell" && event_id == "4103" {
             let ctx = ed.get("ContextInfo").map(vstr).unwrap_or_default();
             let host = ctx_value(&ctx, &["Host Application", "호스트 응용"]);
@@ -651,22 +671,29 @@ pub fn build_powershell_history(out_dir: &Path) -> Vec<Row> {
             let command = if !payload.is_empty() { payload } else { ctx_value(&ctx, &["Command Name", "명령 이름"]) };
             let acct = if !user.is_empty() { user } else { account_for(&sid) };
             let proc = { let e = exe_from_host(&host); if e.is_empty() { "powershell.exe".to_string() } else { e } };
-            rows.push(ps_row(&ts, &acct, &proc, &pid, &first_line(&command, 400), "", "파이프라인", &event_id, &provider, "", &rk));
+            rows.push(ps_row(&ts, &acct, &proc, &pid, &first_line(&command, 400), "", &host, "파이프라인", &event_id, &provider, "", &rk));
         } else if provider == "PowerShell" && event_id == "800" {
             let mut strs = Vec::new(); all_strings(&serde_json::Value::Object(ed.clone()), &mut strs);
             let blob = strs.join("\n");
             let host = find_token(&blob, "HostApplication=");
             let command = find_token(&blob, "CommandLine=");
-            if command.is_empty() { continue; }
+            // Classic Windows PowerShell events frequently leave the outer
+            // UserID empty while carrying the actual user in EventData.
+            let event_user = find_token(&blob, "UserId=");
+            let account = if event_user.is_empty() { account_for(&sid) } else { event_user };
+            // Event 800 can have no CommandLine while still carrying the
+            // launching HostApplication. Preserve that evidence rather than
+            // dropping the raw-event-linked overview row.
+            if command.is_empty() && host.is_empty() { continue; }
             let proc = { let e = exe_from_host(&host); if e.is_empty() { "powershell.exe".to_string() } else { e } };
-            rows.push(ps_row(&ts, &account_for(&sid), &proc, &pid, &first_line(&command, 400), "", "명령 실행", &event_id, &provider, "", &rk));
+            rows.push(ps_row(&ts, &account, &proc, &pid, &first_line(&command, 400), "", &host, "명령 실행", &event_id, &provider, "", &rk));
         }
     }
 
     for k in &block_keys {
         let slot = &blocks[k];
         let text: String = slot.0.values().cloned().collect();
-        rows.push(ps_row(&slot.1, &account_for(&slot.2), "powershell.exe", &slot.3, "", &text, "스크립트 블록", "4104", "Microsoft-Windows-PowerShell", &slot.5, &slot.4));
+        rows.push(ps_row(&slot.1, &account_for(&slot.2), "powershell.exe", &slot.3, "", &text, "", "스크립트 블록", "4104", "Microsoft-Windows-PowerShell", &slot.5, &slot.4));
     }
     rows
 }
@@ -674,7 +701,7 @@ pub fn build_powershell_history(out_dir: &Path) -> Vec<Row> {
 // --- BrowserActivity ("BrowserActivity") — visits + downloads + cache ---
 const BH_KEYS: &[&str] = &[
     "account", "kind", "timestamp", "title", "url", "url_raw",
-    "visit_count", "typed_count", "detail", "size", "mime", "danger", "source_url", "status",
+    "visit_count", "typed_count", "detail", "size", "size_bytes", "mime", "danger", "source_url", "status", "cache_key", "cache_body_recovered",
 ];
 fn bh_row(pairs: &[(&str, String)]) -> Row {
     let mut r = Row::new();
@@ -750,8 +777,13 @@ pub fn build_browser_history(out_dir: &Path) -> Vec<Row> {
             let acct = { let a = g("account"); if !a.is_empty() { a } else { account.clone() } };
             let size = { let s = g("content_length"); if !s.is_empty() { s } else { g("body_size") } };
             let title = { let b = basename_win(&url); if b.is_empty() { url.clone() } else { b } };
+            // A cache response is marked as recovered only when the cache
+            // parser retained an actual decoded response body. Metadata or a
+            // body address alone is not sufficient: those cannot be opened
+            // as recovered evidence in the common detail panel.
+            let cache_body_recovered = if g("body_b64").is_empty() { String::new() } else { "1".into() };
             rows.push(bh_row(&[("account", acct), ("kind", "cache".into()), ("timestamp", ts),
-                ("title", title), ("url", url), ("mime", g("content_type")), ("size", size), ("status", g("status"))]));
+                ("title", title), ("url", url), ("mime", g("content_type")), ("size", size.clone()), ("size_bytes", size), ("status", g("status")), ("cache_key", g("cache_key")), ("cache_body_recovered", cache_body_recovered)]));
         }
     }
     for (account, db) in browser_sources(out_dir, "BROWSER", "_Chrome_History") {
@@ -779,7 +811,7 @@ pub fn build_browser_history(out_dir: &Path) -> Vec<Row> {
                 ("timestamp", chrome_time(&g("start_time"))),
                 ("title", basename_win(&url_decode(&tgt))), ("detail", url_decode(&tgt)),
                 ("url", url_decode(&src)), ("url_raw", src.clone()), ("source_url", url_decode(&src)),
-                ("size", human_bytes(&size_raw)), ("mime", g("mime_type")),
+                ("size", human_bytes(&size_raw)), ("size_bytes", size_raw), ("mime", g("mime_type")),
                 ("danger", danger)]));
         }
     }
@@ -858,6 +890,26 @@ fn registry_hive(out_dir: &Path, name: &str) -> Vec<Row> {
     for p in files {
         let stem = p.file_stem().map(|s| s.to_string_lossy().to_uppercase()).unwrap_or_default();
         if stem == name { out.extend(read_table(&p, "Registry").into_iter().filter(is_live)); }
+    }
+    out
+}
+
+/// Same as `registry_hive`, but retains the raw hive filename and SQLite rowid
+/// for a derived overview record that must share bookmark state with it.
+fn registry_hive_with_rowid(out_dir: &Path, name: &str) -> Vec<(std::path::PathBuf, Row)> {
+    let dir = out_dir.join("REGISTRY");
+    let mut files: Vec<_> = match std::fs::read_dir(&dir) {
+        Ok(rd) => rd.filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().map(|x| x == "sqlite").unwrap_or(false)).collect(),
+        Err(_) => return Vec::new(),
+    };
+    files.sort();
+    let mut out = Vec::new();
+    for p in files {
+        let stem = p.file_stem().map(|s| s.to_string_lossy().to_uppercase()).unwrap_or_default();
+        if stem == name {
+            out.extend(read_table_with_rowid(&p, "Registry").into_iter().filter(is_live).map(|row| (p.clone(), row)));
+        }
     }
     out
 }
@@ -1137,7 +1189,12 @@ pub fn build_target_info(out_dir: &Path) -> Vec<Row> {
 // --- ExecutionHistory ("ExecutionHistory") — amcache + userassist + srum + bam ---
 const ROW_KEYS: &[&str] = &[
     "timestamp", "program_name", "program_path", "run_count",
-    "focus_count", "focus_time_ms", "publisher", "sha1", "user", "source_artifact",
+    "focus_count", "focus_time_ms", "publisher", "sha1", "user", "source_artifact", "record_key",
+    // Prefetch preserves its execution-cache structure here so the common
+    // ExecutionHistory detail can show the run-time ring, volume provenance
+    // and linked loaded-file cache without a second, ambiguous lookup.
+    "prefetch_hash", "run_time_2", "run_time_3", "run_time_4", "run_time_5", "run_time_6", "run_time_7", "run_time_8",
+    "volume_device_path", "volume_serial_number", "volume_creation_time", "source_file",
 ];
 fn eh_row(pairs: &[(&str, String)]) -> Row {
     let mut r = Row::new();
@@ -1146,8 +1203,10 @@ fn eh_row(pairs: &[(&str, String)]) -> Row {
     r
 }
 
-/// Concatenate `table` across every *.sqlite in a category dir.
-fn read_category_all(out_dir: &Path, category: &str, table: &str) -> Vec<Row> {
+/// Keep the parsed database filename and raw SQLite rowid while building an
+/// overview. The key is intentionally source-qualified because categories such
+/// as AMCACHE can contain several SQLite databases with the same table name.
+fn read_category_all_with_rowid(out_dir: &Path, category: &str, table: &str) -> Vec<(std::path::PathBuf, Row)> {
     let dir = out_dir.join(category);
     let mut files: Vec<_> = match std::fs::read_dir(&dir) {
         Ok(rd) => rd.filter_map(|e| e.ok().map(|e| e.path()))
@@ -1156,8 +1215,17 @@ fn read_category_all(out_dir: &Path, category: &str, table: &str) -> Vec<Row> {
     };
     files.sort();
     let mut out = Vec::new();
-    for p in files { out.extend(read_table(&p, table)); }
+    for p in files {
+        out.extend(read_table_with_rowid(&p, table).into_iter().map(|row| (p.clone(), row)));
+    }
     out
+}
+
+fn source_record_key(db: &Path, table: &str, row: &Row) -> String {
+    let Some(rowid) = row.get("__source_rowid").filter(|value| !value.is_empty()) else { return String::new(); };
+    let file_name = db.file_stem().map(|stem| stem.to_string_lossy().to_string()).unwrap_or_default();
+    if file_name.is_empty() { return String::new(); }
+    format!("{}::{}::{}", file_name, table, rowid)
 }
 
 fn rot13(s: &str) -> String {
@@ -1172,16 +1240,18 @@ const UA_MARKERS: &[&str] = &["UEME_CTLSESSION", "UEME_CTLCUACount:ctor"];
 
 fn eh_from_amcache(out_dir: &Path) -> Vec<Row> {
     let mut rows = Vec::new();
-    for r in read_category_all(out_dir, "AMCACHE", "Amcache_Programs") {
+    for (db, r) in read_category_all_with_rowid(out_dir, "AMCACHE", "Amcache_Programs") {
         let g = |k: &str| r.get(k).cloned().unwrap_or_default();
         rows.push(eh_row(&[("timestamp", g("timestamp")), ("program_name", g("Name")),
-            ("program_path", g("RootDirPath")), ("publisher", g("Publisher")), ("source_artifact", "Amcache_Programs".into())]));
+            ("program_path", g("RootDirPath")), ("publisher", g("Publisher")), ("source_artifact", "Amcache_Programs".into()),
+            ("record_key", source_record_key(&db, "Amcache_Programs", &r))]));
     }
-    for r in read_category_all(out_dir, "AMCACHE", "Amcache_Files") {
+    for (db, r) in read_category_all_with_rowid(out_dir, "AMCACHE", "Amcache_Files") {
         let g = |k: &str| r.get(k).cloned().unwrap_or_default();
         rows.push(eh_row(&[("timestamp", g("timestamp")), ("program_name", g("name")),
             ("program_path", g("lower_case_long_path")), ("publisher", g("publisher")),
-            ("sha1", g("SHA1")), ("source_artifact", "Amcache_Files".into())]));
+            ("sha1", g("SHA1")), ("source_artifact", "Amcache_Files".into()),
+            ("record_key", source_record_key(&db, "Amcache_Files", &r))]));
     }
     rows
 }
@@ -1199,7 +1269,7 @@ fn eh_from_userassist(out_dir: &Path) -> Vec<Row> {
         let stem = p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
         if !stem.to_uppercase().ends_with("NTUSER.DAT") { continue; }
         let user = if stem.to_uppercase().ends_with("_NTUSER.DAT") { stem[..stem.len() - "_NTUSER.DAT".len()].to_string() } else { stem.clone() };
-        for r in read_table(&p, "Registry").into_iter().filter(is_live) {
+        for r in read_table_with_rowid(&p, "Registry").into_iter().filter(is_live) {
             let kp = r.get("key_path").cloned().unwrap_or_default();
             let name = r.get("value_name").cloned().unwrap_or_default();
             if !kp.contains("UserAssist") || !kp.ends_with("\\Count") || name.is_empty() || name == "(default)" { continue; }
@@ -1215,7 +1285,8 @@ fn eh_from_userassist(out_dir: &Path) -> Vec<Row> {
             }
             rows.push(eh_row(&[("timestamp", ts), ("program_name", basename_win(&decoded)), ("program_path", decoded),
                 ("run_count", run_count), ("focus_count", focus_count), ("focus_time_ms", focus_ms),
-                ("user", user.clone()), ("source_artifact", "UserAssist".into())]));
+                ("user", user.clone()), ("source_artifact", "UserAssist".into()),
+                ("record_key", source_record_key(&p, "Registry", &r))]));
         }
     }
     rows
@@ -1223,29 +1294,29 @@ fn eh_from_userassist(out_dir: &Path) -> Vec<Row> {
 
 fn eh_from_srum(out_dir: &Path) -> Vec<Row> {
     let mut order: Vec<(String, String)> = Vec::new();
-    let mut earliest: HashMap<(String, String), String> = HashMap::new();
-    for r in read_category_all(out_dir, "SRUM", "SRUM_ApplicationResourceUsage") {
+    let mut earliest: HashMap<(String, String), (String, String)> = HashMap::new();
+    for (db, r) in read_category_all_with_rowid(out_dir, "SRUM", "SRUM_ApplicationResourceUsage") {
         let app = r.get("app").cloned().unwrap_or_default();
         if app.is_empty() || app.to_lowercase().starts_with("svc.") { continue; }
         let user = r.get("user").cloned().unwrap_or_default();
         let ts = r.get("timestamp").cloned().unwrap_or_default();
         let key = (app, user);
         match earliest.get(&key) {
-            None => { order.push(key.clone()); earliest.insert(key, ts); }
-            Some(cur) => { if earlier(&ts, cur) { earliest.insert(key, ts); } }
+            None => { order.push(key.clone()); earliest.insert(key, (ts, source_record_key(&db, "SRUM_ApplicationResourceUsage", &r))); }
+            Some((cur, _)) => { if earlier(&ts, cur) { earliest.insert(key, (ts, source_record_key(&db, "SRUM_ApplicationResourceUsage", &r))); } }
         }
     }
     order.into_iter().map(|key| {
-        let ts = earliest.get(&key).cloned().unwrap_or_default();
+        let (ts, record_key) = earliest.get(&key).cloned().unwrap_or_default();
         let app = key.0.clone();
         let pname = { let b = basename_win(&app); if b.is_empty() { app.clone() } else { b } };
-        eh_row(&[("timestamp", ts), ("program_name", pname), ("program_path", app), ("user", key.1), ("source_artifact", "SRUM".into())])
+        eh_row(&[("timestamp", ts), ("program_name", pname), ("program_path", app), ("user", key.1), ("source_artifact", "SRUM".into()), ("record_key", record_key)])
     }).collect()
 }
 
 fn eh_from_bam(out_dir: &Path) -> Vec<Row> {
     let mut rows = Vec::new();
-    for r in registry_hive(out_dir, "SYSTEM") {
+    for (db, r) in registry_hive_with_rowid(out_dir, "SYSTEM") {
         let kp = r.get("key_path").cloned().unwrap_or_default();
         let low = kp.to_lowercase();
         if !low.contains("\\services\\bam") || !low.contains("\\usersettings\\") { continue; }
@@ -1256,17 +1327,27 @@ fn eh_from_bam(out_dir: &Path) -> Vec<Row> {
         let data = unhex(&r.get("value_data").cloned().unwrap_or_default());
         let ts = if data.len() >= 8 { filetime(le_u64(&data, 0)) } else { String::new() };
         rows.push(eh_row(&[("timestamp", ts), ("program_name", basename_win(&exe)), ("program_path", exe),
-            ("user", sid), ("source_artifact", "BAM".into())]));
+            ("user", sid), ("source_artifact", "BAM".into()), ("record_key", source_record_key(&db, "Registry", &r))]));
     }
     rows
 }
 
 fn eh_from_prefetch(out_dir: &Path) -> Vec<Row> {
-    read_table(&out_dir.join("PREFETCH").join("Prefetch_Execution.sqlite"), "Prefetch_Execution")
+    let db = out_dir.join("PREFETCH").join("Prefetch_Execution.sqlite");
+    read_table_with_rowid(&db, "Prefetch_Execution")
         .into_iter().map(|r| {
             let g = |k: &str| r.get(k).cloned().unwrap_or_default();
             eh_row(&[("timestamp", g("last_run_time")), ("program_name", g("executable_filename")),
-                ("run_count", g("run_count")), ("source_artifact", "Prefetch".into())])
+                ("run_count", g("run_count")), ("source_artifact", "Prefetch".into()),
+                ("prefetch_hash", g("prefetch_hash")), ("run_time_2", g("run_time_2")),
+                ("run_time_3", g("run_time_3")), ("run_time_4", g("run_time_4")),
+                ("run_time_5", g("run_time_5")), ("run_time_6", g("run_time_6")),
+                ("run_time_7", g("run_time_7")), ("run_time_8", g("run_time_8")),
+                ("volume_device_path", g("volume_device_path")),
+                ("volume_serial_number", g("volume_serial_number")),
+                ("volume_creation_time", g("volume_creation_time")),
+                ("source_file", g("_source_file")),
+                ("record_key", source_record_key(&db, "Prefetch_Execution", &r))])
         }).collect()
 }
 
@@ -1486,11 +1567,11 @@ fn rf_execution_traces(hives: &[(String, Vec<Row>)]) -> Vec<Row> {
             let data = r.get("value_data").cloned().unwrap_or_default();
             if low.ends_with("\\explorer\\runmru") {
                 let cmd = if data.ends_with("\\1") { data[..data.len() - 2].to_string() } else { data.clone() };
-                rows.push(rf_row(&[("category", "기타 레지스트리".into()), ("subtype", "RunMRU".into()), ("name", "Run 대화상자 입력 (RunMRU)".into()), ("value", cmd.clone()), ("status", "정보".into()),
+                rows.push(rf_row(&[("category", "기타 레지스트리".into()), ("subtype", "RunMRU".into()), ("name", "RunMRU".into()), ("value", cmd.clone()), ("status", "정보".into()),
                     ("command", cmd), ("user", user.clone()), ("key_path", r.get("key_path").cloned().unwrap_or_default()), ("source", fname.clone()),
                     ("timestamp", r.get("last_write").cloned().unwrap_or_default())]));
             } else if low.ends_with("\\explorer\\typedpaths") {
-                rows.push(rf_row(&[("category", "기타 레지스트리".into()), ("subtype", "TypedPaths".into()), ("name", "탐색기 주소 입력 (TypedPaths)".into()), ("value", data), ("status", "정보".into()),
+                rows.push(rf_row(&[("category", "기타 레지스트리".into()), ("subtype", "TypedPaths".into()), ("name", "TypedPath".into()), ("value", data), ("status", "정보".into()),
                     ("user", user.clone()), ("key_path", r.get("key_path").cloned().unwrap_or_default()), ("source", fname.clone()),
                     ("timestamp", r.get("last_write").cloned().unwrap_or_default())]));
             }
@@ -1510,7 +1591,7 @@ fn rf_shimcache(out_dir: &Path) -> Vec<Row> {
             for (path, ft) in parse_shimcache(&data) {
                 if seen.contains(&path) { continue; }
                 seen.insert(path.clone());
-                rows.push(rf_row(&[("category", "기타 레지스트리".into()), ("subtype", "ShimCache".into()), ("name", basename_win(&path)),
+                rows.push(rf_row(&[("category", "기타 레지스트리".into()), ("subtype", "ShimCache".into()), ("name", "ShimCache (AppcompatCache)".into()),
                     ("value", path), ("status", "정보".into()), ("timestamp", filetime(ft)),
                     ("key_path", "…\\Control\\Session Manager\\AppCompatCache".into()), ("source", "SYSTEM".into())]));
             }
@@ -1531,4 +1612,106 @@ pub fn build_registry_findings(out_dir: &Path) -> Vec<Row> {
     rows.extend(rf_execution_traces(&hives));
     rows.extend(rf_shimcache(out_dir));
     rows
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn powershell_event_800_keeps_host_application_and_eventdata_account() {
+        let root = std::env::temp_dir().join(format!("wina-powershell-overview-{}", std::process::id()));
+        let event_dir = root.join("EVENTLOG");
+        std::fs::create_dir_all(&event_dir).unwrap();
+        let db_path = event_dir.join("PowerShell.sqlite");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "CREATE TABLE PowerShell (Provider TEXT, EventID TEXT, EventData TEXT, UserID TEXT, ProcessID TEXT, timestamp TEXT, _record_key TEXT)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO PowerShell VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                "PowerShell",
+                "800",
+                r#"{"Message":"HostApplication=C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe -NoProfile\nUserId=NAMYANG\\2505002"}"#,
+                "",
+                "4242",
+                "2026-08-21 10:00:00.000",
+                "Windows PowerShell.evtx::41",
+            ],
+        ).unwrap();
+        drop(conn);
+
+        let rows = build_powershell_history(&root);
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.get("account").map(String::as_str), Some("NAMYANG\\2505002"));
+        assert_eq!(row.get("host_application").map(String::as_str), Some("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe -NoProfile"));
+        assert_eq!(row.get("command").map(String::as_str), Some(""));
+        assert_eq!(row.get("record_key").map(String::as_str), Some("Windows PowerShell.evtx::41"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn smb_server_event_1009_is_retained_as_failure() {
+        let root = std::env::temp_dir().join(format!("wina-smb-overview-{}", std::process::id()));
+        let event_dir = root.join("EVENTLOG");
+        std::fs::create_dir_all(&event_dir).unwrap();
+        let db_path = event_dir.join("SMBServer.sqlite");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "CREATE TABLE SMBServer (Provider TEXT, EventID TEXT, EventData TEXT, timestamp TEXT, _record_key TEXT)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO SMBServer VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                "Microsoft-Windows-SMBServer",
+                "1009",
+                r#"{"EventData":{"ClientName":"\\\\192.0.2.15","UserName":"CONTOSO\\analyst"}}"#,
+                "2026-08-21 10:00:00.000",
+                "SMBServer.evtx::1009",
+            ],
+        ).unwrap();
+        drop(conn);
+
+        let rows = build_smb_history(&root);
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.get("remote_address").map(String::as_str), Some("192.0.2.15"));
+        assert_eq!(row.get("account").map(String::as_str), Some("analyst"));
+        assert_eq!(row.get("result").map(String::as_str), Some("실패"));
+        assert_eq!(row.get("description").map(String::as_str), Some("SMB 세션 인증 실패"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn browser_activity_marks_only_cache_rows_with_stored_recovered_bodies() {
+        let root = std::env::temp_dir().join(format!("wina-browser-cache-overview-{}", std::process::id()));
+        let browser_dir = root.join("BROWSER");
+        std::fs::create_dir_all(&browser_dir).unwrap();
+        let db_path = browser_dir.join("analyst_Chrome_Cache.sqlite");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "CREATE TABLE CacheEntries (account TEXT, url TEXT, response_time TEXT, creation_time TEXT, content_length TEXT, body_size TEXT, content_type TEXT, status TEXT, cache_key TEXT, body_b64 TEXT)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO CacheEntries VALUES (?1, ?2, ?3, '', '12', '12', 'text/plain', '200 OK', 'cache-1', ?4)",
+            rusqlite::params!["analyst", "https://example.test/recovered.txt", "2026-08-22 10:00:00.000", "aGVsbG8="],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO CacheEntries VALUES (?1, ?2, ?3, '', '12', '12', 'text/plain', '200 OK', 'cache-2', '')",
+            rusqlite::params!["analyst", "https://example.test/metadata-only.txt", "2026-08-22 10:00:01.000"],
+        ).unwrap();
+        drop(conn);
+
+        let rows = build_browser_history(&root);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].get("cache_body_recovered").map(String::as_str), Some("1"));
+        assert_eq!(rows[1].get("cache_body_recovered").map(String::as_str), Some(""));
+        assert!(rows.iter().all(|row| row.get("kind").map(String::as_str) == Some("cache")));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

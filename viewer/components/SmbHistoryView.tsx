@@ -1,19 +1,21 @@
 "use client";
 
 import { useMemo, useState } from "react";
+import BookmarkBorderOutlinedIcon from "@mui/icons-material/BookmarkBorderOutlined";
+import BookmarkOutlinedIcon from "@mui/icons-material/BookmarkOutlined";
+import CloseOutlinedIcon from "@mui/icons-material/CloseOutlined";
+import KeyboardArrowDownOutlinedIcon from "@mui/icons-material/KeyboardArrowDownOutlined";
+import KeyboardArrowRightOutlinedIcon from "@mui/icons-material/KeyboardArrowRightOutlined";
 import type { CsvData, FetchLinkedRows } from "@/lib/types";
 import { getArtifactView } from "@/lib/artifactViews";
 import { inRange, EMPTY_TIME_RANGE, type TimeRange } from "@/lib/timeRange";
 import RowDetailPanel from "./RowDetailPanel";
 
-// SMB is not a session protocol like RDP — it's a stream of per-attempt auth
-// records, overwhelmingly failures (SMBServer/Security 551). So instead of the
-// RDP session flow, group by SOURCE IP: one card per client address with its
-// attempt volume, accounts tried and time span. A single IP with thousands of
-// failures is a brute-force / password-spray source, which this surfaces at a
-// glance.
-
 const TABLE = "SmbHistory";
+const RESULT_COLOR: Record<string, string> = {
+  성공: "var(--success)",
+  실패: "var(--danger)",
+};
 
 interface Row {
   __rowid?: number;
@@ -43,6 +45,12 @@ function bareAccount(name: string): string {
   return tail.split("@")[0].trim();
 }
 
+function timeSpan(first: string, last: string): string {
+  if (!first) return "시간 정보 없음";
+  if (!last || first === last) return first;
+  return `${first} ~ ${last}`;
+}
+
 interface Props {
   fileName: string;
   data: CsvData;
@@ -53,166 +61,186 @@ interface Props {
   timeRange?: TimeRange;
 }
 
-export default function SmbHistoryView({ data, onNavigate, onFetchLinkedRows, bookmarkedRowids, onToggleBookmark, timeRange = EMPTY_TIME_RANGE }: Props) {
+type ResultFilter = "all" | "fail" | "success";
+
+/**
+ * SMB authentication is represented as individual event records rather than
+ * durable sessions. The analyst ledger therefore groups only the navigation
+ * surface by source IP, while the expanded rows retain every original event.
+ */
+export default function SmbHistoryView({
+  data,
+  onNavigate,
+  onFetchLinkedRows,
+  bookmarkedRowids,
+  onToggleBookmark,
+  timeRange = EMPTY_TIME_RANGE,
+}: Props) {
   const [query, setQuery] = useState("");
-  const [failOnly, setFailOnly] = useState(false);
+  const [resultFilter, setResultFilter] = useState<ResultFilter>("all");
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [selected, setSelected] = useState<Record<string, string> | null>(null);
   const spec = getArtifactView(TABLE);
 
-  const { peers, totals } = useMemo(() => {
+  const peers = useMemo(() => {
     const byIp = new Map<string, Peer>();
-    let attempts = 0, fail = 0, success = 0;
     for (const raw of data.rows as Row[]) {
-      const ts = raw.timestamp ?? "";
-      if (ts && !inRange(ts, timeRange)) continue;
-      const ip = raw.remote_address || "(주소 없음)";
-      let p = byIp.get(ip);
-      if (!p) {
-        p = { ip, attempts: 0, fail: 0, success: 0, accounts: [], first: ts, last: ts, events: [] };
-        byIp.set(ip, p);
+      const timestamp = raw.timestamp ?? "";
+      if (!inRange(timestamp, timeRange)) continue;
+
+      const ip = raw.remote_address || "주소 정보 없음";
+      const peer = byIp.get(ip) ?? {
+        ip,
+        attempts: 0,
+        fail: 0,
+        success: 0,
+        accounts: [],
+        first: timestamp,
+        last: timestamp,
+        events: [],
+      };
+      if (!byIp.has(ip)) byIp.set(ip, peer);
+
+      peer.attempts += 1;
+      if (raw.result === "실패") peer.fail += 1;
+      if (raw.result === "성공") peer.success += 1;
+
+      const account = bareAccount(raw.account ?? "");
+      if (account && !peer.accounts.includes(account)) peer.accounts.push(account);
+      if (timestamp) {
+        if (!peer.first || timestamp < peer.first) peer.first = timestamp;
+        if (!peer.last || timestamp > peer.last) peer.last = timestamp;
       }
-      p.attempts++;
-      attempts++;
-      if (raw.result === "실패") { p.fail++; fail++; }
-      else if (raw.result === "성공") { p.success++; success++; }
-      const acct = bareAccount(raw.account ?? "");
-      if (acct && !p.accounts.includes(acct)) p.accounts.push(acct);
-      if (ts) {
-        if (!p.first || ts < p.first) p.first = ts;
-        if (!p.last || ts > p.last) p.last = ts;
-      }
-      p.events.push(raw);
+      peer.events.push(raw);
     }
-    const peers = [...byIp.values()].sort((a, b) => b.attempts - a.attempts);
-    return { peers, totals: { attempts, fail, success, ips: peers.length } };
+
+    return [...byIp.values()]
+      .map((peer) => ({ ...peer, events: peer.events.sort((left, right) => (left.timestamp ?? "").localeCompare(right.timestamp ?? "")) }))
+      .sort((left, right) => right.attempts - left.attempts || left.ip.localeCompare(right.ip));
   }, [data.rows, timeRange]);
 
-  const shown = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    return peers.filter((p) => {
-      if (failOnly && p.fail === 0) return false;
-      if (q && !p.ip.toLowerCase().includes(q) && !p.accounts.some((a) => a.toLowerCase().includes(q))) return false;
-      return true;
+  const shownPeers = useMemo(() => {
+    const needle = query.trim().toLowerCase();
+    return peers.filter((peer) => {
+      if (resultFilter === "fail" && peer.fail === 0) return false;
+      if (resultFilter === "success" && peer.success === 0) return false;
+      if (!needle) return true;
+      return peer.ip.toLowerCase().includes(needle) || peer.accounts.some((account) => account.toLowerCase().includes(needle));
     });
-  }, [peers, query, failOnly]);
+  }, [peers, query, resultFilter]);
+
+  const eventCount = useMemo(() => shownPeers.reduce((count, peer) => count + peer.attempts, 0), [shownPeers]);
 
   function toggle(ip: string) {
-    setExpanded((prev) => {
-      const n = new Set(prev);
-      if (n.has(ip)) n.delete(ip);
-      else n.add(ip);
-      return n;
+    setExpanded((previous) => {
+      const next = new Set(previous);
+      if (next.has(ip)) next.delete(ip);
+      else next.add(ip);
+      return next;
     });
   }
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", flex: 1, minHeight: 0, minWidth: 0 }}>
-      <div style={{ padding: "12px 16px", borderBottom: "1px solid var(--border)", background: "var(--bg-panel)", flexShrink: 0 }}>
-        <div style={{ display: "flex", alignItems: "baseline", gap: 12, marginBottom: 3 }}>
-          <span style={{ fontSize: 16, fontWeight: 700 }}>📁 SMB 접속 시도 (소스 IP별)</span>
-          <span style={{ fontSize: 12, color: "var(--text-faint)" }}>인바운드 네트워크 인증 — 반복 실패는 브루트포스/패스워드 스프레이 신호입니다.</span>
+    <div style={{ display: "flex", flexDirection: "column", flex: 1, minHeight: 0, minWidth: 0, background: "var(--bg)" }}>
+      <header style={{ flexShrink: 0, padding: "12px 16px 10px", borderBottom: "1px solid var(--border)", background: "var(--bg-panel)" }}>
+        <div style={{ display: "flex", alignItems: "baseline", gap: 10, flexWrap: "wrap" }}>
+          <strong style={{ fontSize: 15, color: "var(--text)" }}>SMB 접속 이력</strong>
+          <span style={{ color: "var(--text-faint)", fontSize: 12, fontFamily: "var(--mono)" }}>{shownPeers.length.toLocaleString()}개 원격 주소 · {eventCount.toLocaleString()}건</span>
         </div>
-        {/* summary tiles */}
-        <div style={{ display: "flex", flexWrap: "wrap", gap: 8, margin: "10px 0 4px" }}>
-          <Stat label="소스 IP" value={totals.ips.toLocaleString()} />
-          <Stat label="총 시도" value={totals.attempts.toLocaleString()} />
-          <Stat label="실패" value={totals.fail.toLocaleString()} tone="danger" />
-          <Stat label="성공" value={totals.success.toLocaleString()} tone={totals.success ? "danger" : "ok"} />
-        </div>
-        <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", marginTop: 6 }}>
-          <div style={{ position: "relative", flex: "0 1 260px", minWidth: 160 }}>
-            <span style={{ position: "absolute", left: 9, top: "50%", transform: "translateY(-50%)", fontSize: 12, color: "var(--text-faint)" }}>🔍</span>
-            <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="IP · 계정 검색"
-              style={{ width: "100%", padding: "6px 10px 6px 28px", fontSize: 12.5, fontFamily: "var(--mono)", background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", color: "var(--text)", outline: "none" }} />
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 9, flexWrap: "wrap" }}>
+          <div style={{ position: "relative", flex: "1 1 260px", maxWidth: 430 }}>
+            <input
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+              placeholder="원격 주소 · 계정 검색"
+              aria-label="SMB 접속 이력 검색"
+              onFocus={(event) => { event.currentTarget.style.borderColor = "var(--accent)"; event.currentTarget.style.boxShadow = "0 0 0 2px var(--accent-subtle)"; }}
+              onBlur={(event) => { event.currentTarget.style.borderColor = "var(--border)"; event.currentTarget.style.boxShadow = "none"; }}
+              style={{ width: "100%", height: 31, padding: "0 31px 0 10px", fontSize: 12, fontFamily: "var(--mono)", borderRadius: "var(--radius-sm)", border: "1px solid var(--border)", color: "var(--text)", background: "var(--bg-elevated)", outline: "none" }}
+            />
+            {query && <button type="button" onClick={() => setQuery("")} aria-label="검색어 지우기" style={clearButtonStyle}><CloseOutlinedIcon sx={{ fontSize: 16 }} /></button>}
           </div>
-          <button onClick={() => setFailOnly((v) => !v)} style={{ ...chipBtn, borderColor: failOnly ? "var(--danger)" : "var(--border)", color: failOnly ? "var(--danger)" : "var(--text-dim)", background: failOnly ? "color-mix(in srgb, var(--danger) 14%, transparent)" : "var(--bg-elevated)" }}>
-            {failOnly ? "☑" : "☐"} 실패만
-          </button>
-          <span style={{ marginLeft: "auto", fontSize: 11.5, color: "var(--text-faint)" }}>{shown.length.toLocaleString()} / {peers.length.toLocaleString()} IP</span>
+          <div style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+            {([
+              ["전체", "all", "var(--accent)"],
+              ["실패 포함", "fail", "var(--danger)"],
+              ["성공 포함", "success", "var(--success)"],
+            ] as const).map(([label, value, color]) => {
+              const active = resultFilter === value;
+              return <button key={value} type="button" onClick={() => setResultFilter(value)} aria-pressed={active} style={{ height: 30, padding: "0 10px", fontSize: 11.5, fontWeight: active ? 700 : 550, color: active ? color : "var(--text-dim)", background: active ? `color-mix(in srgb, ${color} 13%, transparent)` : "transparent", border: `1px solid ${active ? color : "var(--border)"}`, borderRadius: "var(--radius-sm)", cursor: "pointer" }}>{label}</button>;
+            })}
+          </div>
         </div>
-      </div>
+      </header>
 
-      <div style={{ flex: 1, minHeight: 0, overflow: "auto", padding: 12, display: "flex", flexDirection: "column", gap: 8 }}>
-        {shown.length === 0 && <div style={{ color: "var(--text-faint)", textAlign: "center", padding: 24 }}>표시할 SMB 접속 시도가 없습니다.</div>}
-        {shown.map((p) => {
-          const open = expanded.has(p.ip);
-          const heavy = p.attempts >= 100; // a lot of attempts from one IP = likely automated
-          const accent = p.success > 0 ? "var(--danger)" : p.fail > 0 ? "var(--warning)" : "var(--text-faint)";
-          return (
-            <div key={p.ip} style={{ flexShrink: 0, border: "1px solid var(--border)", borderLeft: `3px solid ${accent}`, borderRadius: "var(--radius-md)", background: "var(--bg-panel)", overflow: "hidden" }}>
-              <div onClick={() => toggle(p.ip)} style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 12px", cursor: "pointer", flexWrap: "wrap" }}
-                onMouseEnter={(e) => (e.currentTarget.style.background = "var(--bg-hover)")} onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}>
-                <span style={{ fontSize: 10, color: "var(--text-faint)", width: 10 }}>{open ? "▾" : "▸"}</span>
-                <span style={{ fontFamily: "var(--mono)", fontSize: 14, fontWeight: 700 }}>{p.ip}</span>
-                {heavy && <span style={{ fontSize: 10, fontWeight: 700, color: "var(--danger)", background: "color-mix(in srgb, var(--danger) 15%, transparent)", borderRadius: 4, padding: "1px 6px" }}>대량 시도</span>}
-                <span style={{ fontSize: 12.5, color: "var(--text-dim)" }}>{p.attempts.toLocaleString()}회 시도</span>
-                <span style={{ display: "flex", gap: 6, fontSize: 11 }}>
-                  {p.fail > 0 && <Pill color="var(--danger)">실패 {p.fail.toLocaleString()}</Pill>}
-                  {p.success > 0 && <Pill color="var(--danger)">성공 {p.success.toLocaleString()}</Pill>}
+      <main style={{ flex: 1, minHeight: 0, overflow: "auto", padding: 12 }}>
+        <div style={{ minWidth: 720, border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", overflow: "hidden", background: "var(--bg-panel)" }}>
+          {shownPeers.length > 0 && <div style={{ display: "grid", gridTemplateColumns: "32px minmax(140px, .8fr) minmax(150px, .9fr) minmax(210px, 1.35fr) minmax(170px, 1.05fr) minmax(118px, .7fr) 50px", gap: 8, alignItems: "center", padding: "8px 12px", borderBottom: "1px solid var(--border)", color: "var(--text-faint)", fontSize: 10.5, fontWeight: 700 }}><span /><span>원격 주소</span><span>시도 계정</span><span>관찰 시간</span><span>결과</span><span style={{ textAlign: "right" }}>이벤트</span><span /></div>}
+          {shownPeers.length === 0 ? <div style={{ padding: 28, textAlign: "center", color: "var(--text-faint)", fontSize: 12.5 }}>{peers.length === 0 ? "기간 내 SMB 접속 이력이 없습니다." : "검색 또는 필터 조건에 맞는 SMB 접속 이력이 없습니다."}</div> : shownPeers.map((peer) => {
+            const open = expanded.has(peer.ip);
+            return <section key={peer.ip} style={{ borderTop: "1px solid var(--border-subtle)" }}>
+              <button
+                type="button"
+                onClick={() => toggle(peer.ip)}
+                aria-expanded={open}
+                style={{ width: "100%", display: "grid", gridTemplateColumns: "32px minmax(140px, .8fr) minmax(150px, .9fr) minmax(210px, 1.35fr) minmax(170px, 1.05fr) minmax(118px, .7fr) 50px", gap: 8, alignItems: "center", padding: "10px 12px", color: "var(--text)", border: "none", background: "transparent", cursor: "pointer", textAlign: "left", outlineOffset: -2 }}
+                onMouseEnter={(event) => { event.currentTarget.style.background = "var(--bg-hover)"; }}
+                onMouseLeave={(event) => { event.currentTarget.style.background = "transparent"; }}
+              >
+                {open ? <KeyboardArrowDownOutlinedIcon aria-hidden="true" sx={{ fontSize: 18, color: "var(--text-faint)" }} /> : <KeyboardArrowRightOutlinedIcon aria-hidden="true" sx={{ fontSize: 18, color: "var(--text-faint)" }} />}
+                <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontFamily: "var(--mono)", fontSize: 13, fontWeight: 700 }}>{peer.ip}</span>
+                <span title={peer.accounts.join(", ") || "계정 정보 없음"} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: peer.accounts.length ? "var(--text-dim)" : "var(--text-faint)", fontSize: 11.5 }}>{peer.accounts.length ? peer.accounts.join(", ") : "계정 정보 없음"}</span>
+                <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text-time)", fontFamily: "var(--mono)", fontSize: 10.5 }}>{timeSpan(peer.first, peer.last)}</span>
+                <span style={{ display: "inline-flex", alignItems: "center", gap: 5, minWidth: 0, fontSize: 10.5 }}>
+                  {peer.success > 0 && <ResultPill color="var(--success)">성공 {peer.success.toLocaleString()}</ResultPill>}
+                  {peer.fail > 0 && <ResultPill color="var(--danger)">실패 {peer.fail.toLocaleString()}</ResultPill>}
+                  {peer.success === 0 && peer.fail === 0 && <span style={{ color: "var(--text-faint)" }}>결과 정보 없음</span>}
                 </span>
-                <span style={{ marginLeft: "auto", fontSize: 10.5, color: "var(--text-time)", fontFamily: "var(--mono)" }}>{p.first?.slice(0, 16)} ~ {p.last?.slice(11, 16) || p.last}</span>
-                {p.accounts.length > 0 && (
-                  <div style={{ flexBasis: "100%", fontSize: 11, color: "var(--text-faint)", marginLeft: 20 }}>
-                    👤 시도 계정: {p.accounts.slice(0, 8).join(", ")}{p.accounts.length > 8 ? ` 외 ${p.accounts.length - 8}` : ""}
-                  </div>
-                )}
-              </div>
-              {open && (
-                <div style={{ borderTop: "1px solid var(--border)", background: "color-mix(in srgb, var(--bg-elevated) 40%, transparent)", maxHeight: 320, overflow: "auto" }}>
-                  {p.events.slice(0, 500).map((ev, i) => {
-                    const rid = Number((ev as Record<string, unknown>).__rowid);
-                    const bm = (bookmarkedRowids?.has(rid) ?? false) && Number.isFinite(rid);
-                    const bmBg = bm ? "color-mix(in srgb, var(--warning) 14%, transparent)" : "transparent";
-                    return (
-                    <div key={i} onClick={() => setSelected(ev as Record<string, string>)} style={{ display: "flex", alignItems: "center", gap: 10, padding: "5px 12px 5px 30px", cursor: "pointer", fontSize: 12, background: bmBg, boxShadow: bm ? "inset 3px 0 0 var(--warning)" : undefined }}
-                      onMouseEnter={(e) => (e.currentTarget.style.background = "var(--bg-hover)")} onMouseLeave={(e) => (e.currentTarget.style.background = bmBg)}>
-                      <span style={{ fontFamily: "var(--mono)", fontSize: 11.5, color: "var(--text-time)", width: 168, flexShrink: 0 }}>{ev.timestamp}</span>
-                      <span style={{ width: 8, height: 8, borderRadius: "50%", flexShrink: 0, background: ev.result === "실패" ? "var(--danger)" : ev.result === "성공" ? "var(--success)" : "var(--text-faint)" }} />
-                      <span style={{ color: "var(--text-dim)", flex: 1 }}>{ev.description}</span>
-                      {ev.account && <span style={{ fontSize: 11, color: "var(--text-faint)" }}>👤 {bareAccount(ev.account)}</span>}
-                      {onToggleBookmark && Number.isFinite(rid) && (
-                        <span onClick={(e) => { e.stopPropagation(); onToggleBookmark(rid); }} title={bm ? "북마크 해제" : "북마크에 추가"} style={{ cursor: "pointer", color: bm ? "var(--warning)" : "var(--text-faint)" }}>{bm ? "★" : "☆"}</span>
-                      )}
+                <span style={{ textAlign: "right", color: "var(--text-faint)", fontFamily: "var(--mono)", fontSize: 10.5 }}>{peer.attempts.toLocaleString()}건</span>
+                <span />
+              </button>
+              {open && <div style={{ borderTop: "1px solid var(--border-subtle)", background: "color-mix(in srgb, var(--bg-elevated) 34%, transparent)" }}>
+                <div style={{ display: "grid", gridTemplateColumns: "170px 80px minmax(130px, .6fr) minmax(250px, 1.45fr) 68px 32px", gap: 8, padding: "6px 12px 6px 44px", borderBottom: "1px solid var(--border-subtle)", color: "var(--text-faint)", fontSize: 10, fontWeight: 700 }}><span>시간</span><span>결과</span><span>계정</span><span>이벤트</span><span>Event ID</span><span /></div>
+                {peer.events.map((event, index) => {
+                  const rowid = Number((event as Record<string, unknown>).__rowid);
+                  const bookmarked = Number.isFinite(rowid) && (bookmarkedRowids?.has(rowid) ?? false);
+                  const rowBackground = bookmarked ? "color-mix(in srgb, var(--accent) 14%, transparent)" : "transparent";
+                  const resultColor = RESULT_COLOR[event.result ?? ""] ?? "var(--text-faint)";
+                  return <div key={`${rowid}-${event.timestamp}-${index}`} style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) 32px", gap: 8, alignItems: "center", minHeight: 36, padding: "6px 12px 6px 44px", background: rowBackground, boxShadow: bookmarked ? "inset 3px 0 0 var(--accent)" : undefined }} onMouseEnter={(mouseEvent) => { mouseEvent.currentTarget.style.background = "var(--bg-hover)"; }} onMouseLeave={(mouseEvent) => { mouseEvent.currentTarget.style.background = rowBackground; }}>
+                    <div role="button" tabIndex={0} onClick={() => setSelected(event as Record<string, string>)} onKeyDown={(keyboardEvent) => { if (keyboardEvent.key === "Enter" || keyboardEvent.key === " ") { keyboardEvent.preventDefault(); setSelected(event as Record<string, string>); } }} style={{ display: "grid", gridTemplateColumns: "170px 80px minmax(130px, .6fr) minmax(250px, 1.45fr) 68px", gap: 8, alignItems: "center", minWidth: 0, color: "var(--text)", cursor: "pointer", outlineOffset: 2 }}>
+                      <span style={{ color: "var(--text-time)", fontFamily: "var(--mono)", fontSize: 11.5, whiteSpace: "nowrap" }}>{event.timestamp || "시간 정보 없음"}</span>
+                      <span style={{ color: resultColor, fontSize: 11.5, fontWeight: 700 }}>{event.result || "정보"}</span>
+                      <span title={bareAccount(event.account ?? "") || "계정 정보 없음"} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: event.account ? "var(--text-dim)" : "var(--text-faint)", fontSize: 11.5 }}>{bareAccount(event.account ?? "") || "계정 정보 없음"}</span>
+                      <span title={event.description || "상세 정보 없음"} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text-dim)", fontSize: 11.5 }}>{event.description || "상세 정보 없음"}</span>
+                      <span style={{ color: "var(--text-faint)", fontFamily: "var(--mono)", fontSize: 10.5 }}>{event.event_id || "—"}</span>
                     </div>
-                    );
-                  })}
-                  {p.events.length > 500 && <div style={{ padding: "6px 30px", fontSize: 11, color: "var(--text-faint)" }}>… 외 {(p.events.length - 500).toLocaleString()}건 (원본 테이블에서 전체 확인)</div>}
-                </div>
-              )}
-            </div>
-          );
-        })}
-      </div>
+                    {onToggleBookmark && Number.isFinite(rowid) && <button type="button" onClick={() => onToggleBookmark(rowid)} aria-label={bookmarked ? "북마크 해제" : "북마크 추가"} title={bookmarked ? "북마크 해제" : "북마크 추가"} style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 26, height: 26, padding: 0, border: "none", background: "transparent", color: bookmarked ? "var(--accent)" : "var(--text-faint)", cursor: "pointer" }}>{bookmarked ? <BookmarkOutlinedIcon sx={{ fontSize: 16 }} /> : <BookmarkBorderOutlinedIcon sx={{ fontSize: 16 }} />}</button>}
+                  </div>;
+                })}
+              </div>}
+            </section>;
+          })}
+        </div>
+      </main>
 
-      {selected && spec && (
-        <RowDetailPanel
-          row={selected}
-          columns={data.columns}
-          focusedColumn={null}
-          fileBaseName={TABLE}
-          onClose={() => setSelected(null)}
-          onNavigate={(tf, tc, v) => { setSelected(null); onNavigate(tf, tc, v); }}
-          onFetchLinkedRows={onFetchLinkedRows}
-          isBookmarked={onToggleBookmark ? bookmarkedRowids?.has(Number((selected as Record<string, unknown>).__rowid)) ?? false : undefined}
-          onToggleBookmark={onToggleBookmark ? () => onToggleBookmark(Number((selected as Record<string, unknown>).__rowid)) : undefined}
-        />
-      )}
+      {selected && spec && <RowDetailPanel row={selected} columns={data.columns} focusedColumn={null} fileBaseName={TABLE} onClose={() => setSelected(null)} onNavigate={(targetFile, targetColumn, value) => { setSelected(null); onNavigate(targetFile, targetColumn, value); }} onFetchLinkedRows={onFetchLinkedRows} isBookmarked={onToggleBookmark ? bookmarkedRowids?.has(Number((selected as Record<string, unknown>).__rowid)) ?? false : undefined} onToggleBookmark={onToggleBookmark ? () => onToggleBookmark(Number((selected as Record<string, unknown>).__rowid)) : undefined} />}
     </div>
   );
 }
 
-const chipBtn: React.CSSProperties = { padding: "6px 11px", fontSize: 12, fontWeight: 600, borderRadius: "var(--radius-md)", cursor: "pointer", border: "1px solid var(--border)" };
+const clearButtonStyle: React.CSSProperties = {
+  position: "absolute",
+  right: 5,
+  top: "50%",
+  transform: "translateY(-50%)",
+  display: "inline-flex",
+  padding: 2,
+  color: "var(--text-faint)",
+  border: "none",
+  background: "transparent",
+  cursor: "pointer",
+};
 
-function Stat({ label, value, tone }: { label: string; value: string; tone?: "danger" | "ok" }) {
-  const color = tone === "danger" ? "var(--danger)" : tone === "ok" ? "var(--success)" : "var(--text)";
-  return (
-    <div style={{ minWidth: 92, padding: "6px 12px", background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)" }}>
-      <div style={{ fontSize: 10.5, color: "var(--text-faint)" }}>{label}</div>
-      <div style={{ fontSize: 16, fontWeight: 700, color }}>{value}</div>
-    </div>
-  );
-}
-function Pill({ color, children }: { color: string; children: React.ReactNode }) {
-  return <span style={{ color, fontWeight: 700, padding: "1px 7px", borderRadius: 999, background: `color-mix(in srgb, ${color} 15%, transparent)` }}>{children}</span>;
+function ResultPill({ color, children }: { color: string; children: React.ReactNode }) {
+  return <span style={{ color, fontWeight: 700, padding: "1px 7px", borderRadius: "var(--radius-sm)", background: `color-mix(in srgb, ${color} 15%, transparent)`, whiteSpace: "nowrap" }}>{children}</span>;
 }

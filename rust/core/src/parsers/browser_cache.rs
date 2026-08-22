@@ -265,10 +265,11 @@ fn account_of(path: &Path) -> String {
     path.parent().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().to_string()).unwrap_or_default()
 }
 
-/// Parse each `index` path that is a real HTTP blockfile cache. Returns
-/// (output_name, rows) with `<account>_Chrome_Cache` de-duplicated naming.
-pub fn parse_caches(paths: &[PathBuf]) -> Vec<(String, Vec<Row>)> {
-    let mut outputs: Vec<(String, Vec<Row>)> = Vec::new();
+/// Parse each `index` path that is a real HTTP blockfile cache. Returns the
+/// output name, the consumed cache index, and rows so callers can retain
+/// per-evidence-file extraction counts.
+pub fn parse_caches(paths: &[PathBuf]) -> Vec<(String, PathBuf, Vec<Row>)> {
+    let mut outputs: Vec<(String, PathBuf, Vec<Row>)> = Vec::new();
     let mut taken: HashSet<String> = HashSet::new();
     for index_path in paths {
         let parent_name = index_path.parent().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
@@ -290,7 +291,7 @@ pub fn parse_caches(paths: &[PathBuf]) -> Vec<(String, Vec<Row>)> {
         let mut i = 2;
         while taken.contains(&name) { name = format!("{}_{}", base, i); i += 1; }
         taken.insert(name.clone());
-        outputs.push((name, rows));
+        outputs.push((name, index_path.clone(), rows));
     }
     outputs
 }

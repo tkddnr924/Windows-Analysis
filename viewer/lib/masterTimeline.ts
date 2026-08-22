@@ -50,18 +50,25 @@ export async function buildMasterTimeline(categories: CategoryEntry[]): Promise<
       const timelineField = spec.timelineField;
       let sinceYield = 0;
       for (const row of data.rows) {
-        entries.push({
-          timestamp: row[timelineField] ?? "",
-          category: category.name,
-          table: file.name,
-          summary: spec.title(row),
-          subtitle: spec.subtitle?.(row) ?? "",
-          tags: spec.tags?.(row) ?? [],
-          rowid: Number((row as unknown as Record<string, unknown>).__rowid),
-          fullPath: file.fullPath,
-          row,
-          columns: data.columns,
-        });
+        const timestamp = (row[timelineField] ?? "").trim();
+        // A timeline has no defensible position for a record without a time.
+        // Do not allocate/render it only to sink it below chronological data.
+        if (timestamp && (spec.timelineInclude?.(row) ?? true)) {
+          entries.push({
+            timestamp,
+            category: category.name,
+            table: file.name,
+            // The timeline names the event itself (for ScheduledTasks, the
+            // task name), while a detail panel may use an evidence-type title.
+            summary: (spec.timelineTitle ?? spec.title)(row),
+            subtitle: (spec.timelineSubtitle ?? spec.subtitle)?.(row) ?? "",
+            tags: spec.tags?.(row) ?? [],
+            rowid: Number((row as unknown as Record<string, unknown>).__rowid),
+            fullPath: file.fullPath,
+            row,
+            columns: data.columns,
+          });
+        }
         // Big tables (EventLog can be ~700k rows) would otherwise block the
         // renderer's single thread for seconds; yield so the UI stays live.
         if (++sinceYield >= YIELD_EVERY) {
@@ -74,8 +81,7 @@ export async function buildMasterTimeline(categories: CategoryEntry[]): Promise<
 
   // Plain string compare works because every timestamp is already
   // formatted YYYY-MM-DD hh:mm:ss.fff by the parser — lexicographic order
-  // is chronological order. Rows with no timestamp value (empty string)
-  // sort last rather than being dropped from the merged view.
+  // is chronological order. Rows without timestamps were excluded above.
   await yieldToEventLoop(); // let queued UI events through before the big sort
   entries.sort((a, b) => (a.timestamp < b.timestamp ? 1 : a.timestamp > b.timestamp ? -1 : 0));
   return entries;

@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import type { Bookmark, CsvData, FetchLinkedRows, Host } from "@/lib/types";
+import type { Bookmark, FetchLinkedRows, Host, ResultRow } from "@/lib/types";
 import { getArtifactView, resolveArtifactView } from "@/lib/artifactViews";
 import TagList from "./TagList";
 import RowDetailPanel from "./RowDetailPanel";
@@ -14,6 +14,15 @@ interface BookmarksViewProps {
   onRemove: (bookmark: Bookmark) => void;
   onNavigate: (targetFile: string, targetColumn: string, value: string) => void;
   onFetchLinkedRows: FetchLinkedRows;
+}
+
+// Bookmark entries retain their source SQLite path. BrowserActivity cache
+// bodies live one host-directory above ANALYSIS_OVERVIEW/BROWSER, so derive
+// that directory instead of relying on whichever host happens to be selected.
+function hostDirFromResultPath(fullPath: string): string | undefined {
+  const normalized = fullPath.replace(/\\/g, "/");
+  const match = normalized.match(/^(.*)\/(?:ANALYSIS_OVERVIEW|BROWSER)\//i);
+  return match?.[1];
 }
 
 function SortChip({ active, onClick, children }: { active: boolean; onClick: () => void; children: React.ReactNode }) {
@@ -47,42 +56,38 @@ export default function BookmarksView({ bookmarks, hosts, hostIpMap, currentHost
     const h = hosts.find((x) => b.fullPath.startsWith(x.dir));
     return { id: h?.id ?? "", name: h?.name ?? "(알 수 없는 호스트)" };
   };
-  const [rowCache, setRowCache] = useState<Record<string, CsvData>>({});
+  const [rowCache, setRowCache] = useState<Record<string, ResultRow>>({});
   // Bookmarks are the analyst's shortlist of key events; reading them oldest →
   // newest by when each event happened reconstructs the incident timeline. That
   // "event time" needs the source row, so it's resolved here (against rowCache)
   // rather than sorting on the bookmark's own taggedAt.
   const [sortDir, setSortDir] = useState<"asc" | "desc">("asc");
   const [viewMode, setViewMode] = useState<"timeline" | "sequence">("timeline");
-  const [mftRowCache, setMftRowCache] = useState<Record<string, Record<string, string>>>({});
-
-  // Non-$MFT tables are small — load each whole table once, index by rowid.
+  // Resolve exactly the bookmarked row.  Loading whole BrowserActivity or
+  // Registry tables here made an 8-item bookmark list appear to hang.
   useEffect(() => {
-    const mftPaths = new Set(bookmarks.filter((b) => b.tableName === "MFT_Records").map((b) => b.fullPath));
-    const missing = [...new Set(bookmarks.map((b) => b.fullPath))].filter((p) => !rowCache[p] && !mftPaths.has(p));
+    const keyOf = (b: Bookmark) => `${b.fullPath}\u0000${b.tableName}#${b.rowid}`;
+    const missing = [...bookmarks.reduce((unique, b) => {
+      const key = keyOf(b);
+      if (rowCache[key] === undefined) unique.set(key, b);
+      return unique;
+    }, new Map<string, Bookmark>()).values()];
     if (missing.length === 0) return;
-    Promise.all(missing.map((p) => window.api.readResultFile(p).then((data) => [p, data] as const))).then((pairs) => {
+    let cancelled = false;
+    Promise.all(missing.map(async (b) => {
+      const key = keyOf(b);
+      try { return [key, await window.api.resultRow(b.fullPath, b.tableName, b.rowid)] as const; }
+      catch { return [key, { columns: [] as string[], row: null }] as const; }
+    })).then((pairs) => {
+      if (cancelled) return;
       setRowCache((prev) => {
         const next = { ...prev };
-        for (const [p, data] of pairs) next[p] = data;
+        for (const [key, data] of pairs) next[key] = data;
         return next;
       });
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [bookmarks]);
-
-  // $MFT is ~1M rows — never load the whole table; fetch only bookmarked rows.
-  useEffect(() => {
-    const missing = bookmarks.filter((b) => b.tableName === "MFT_Records" && mftRowCache[`${b.fullPath}#${b.rowid}`] === undefined);
-    if (missing.length === 0) return;
-    Promise.all(missing.map((b) => window.api.mftRow(b.fullPath, b.rowid).then((r) => [`${b.fullPath}#${b.rowid}`, r] as const))).then((pairs) => {
-      setMftRowCache((prev) => {
-        const next = { ...prev };
-        for (const [k, r] of pairs) next[k] = r ?? {}; // {} marks "looked up, missing"
-        return next;
-      });
-    });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    return () => { cancelled = true; };
   }, [bookmarks]);
 
   if (bookmarks.length === 0) {
@@ -99,19 +104,10 @@ export default function BookmarksView({ bookmarks, hosts, hostIpMap, currentHost
   // time. Rows still loading (or missing) have no event time and sink to the
   // bottom so the loaded, placeable events read as a clean chronology.
   const entries = bookmarks.map((bookmark) => {
-    const isMft = bookmark.tableName === "MFT_Records";
-    const data = isMft ? undefined : rowCache[bookmark.fullPath];
-    let row: Record<string, string> | undefined;
-    let loaded: boolean;
-    if (isMft) {
-      const cached = mftRowCache[`${bookmark.fullPath}#${bookmark.rowid}`];
-      loaded = cached !== undefined;
-      row = cached && Object.keys(cached).length ? cached : undefined;
-    } else {
-      loaded = data !== undefined;
-      row = data?.rows.find((r) => Number((r as unknown as Record<string, unknown>).__rowid) === bookmark.rowid);
-    }
-    const columns = isMft ? (row ? Object.keys(row).filter((c) => c !== "__rowid") : []) : (data?.columns ?? []);
+    const data = rowCache[`${bookmark.fullPath}\u0000${bookmark.tableName}#${bookmark.rowid}`];
+    const loaded = data !== undefined;
+    const row = data?.row ?? undefined;
+    const columns = data?.columns ?? [];
     const spec = resolveArtifactView(bookmark.tableName, columns) ?? getArtifactView(bookmark.tableName);
     // A field-scoped bookmark (e.g. $MFT SI-Created) reads its time from that
     // field; others use the artifact's timeline/timestamp column.
@@ -146,7 +142,7 @@ export default function BookmarksView({ bookmarks, hosts, hostIpMap, currentHost
   });
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", flex: 1, minHeight: 0, minWidth: 0 }}>
+    <div className="dfir-view" style={{ display: "flex", flexDirection: "column", flex: 1, minHeight: 0, minWidth: 0 }}>
       <div
         style={{
           display: "flex",
@@ -263,6 +259,7 @@ export default function BookmarksView({ bookmarks, hosts, hostIpMap, currentHost
           onClose={() => setDetail(null)}
           onNavigate={(f, c, v) => { setDetail(null); onNavigate(f, c, v); }}
           onFetchLinkedRows={onFetchLinkedRows}
+          hostDir={hostDirFromResultPath(detail.bookmark.fullPath)}
           isBookmarked
           onToggleBookmark={() => { onRemove(detail.bookmark); setDetail(null); }}
         />

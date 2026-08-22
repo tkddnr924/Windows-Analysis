@@ -31,9 +31,9 @@ pub struct BagRow {
 }
 
 enum Name {
-    Root,          // My Computer / Desktop / GUID — dropped from the path
-    Volume(String),// "C:"
-    Dir(String),   // a folder name
+    Root,           // My Computer / Desktop / GUID — dropped from the path
+    Volume(String), // "C:"
+    Dir(String),    // a folder name
     Unknown,
 }
 
@@ -48,12 +48,16 @@ fn longest_utf16(b: &[u8]) -> String {
         if printable {
             cur.push(u);
         } else {
-            if cur.len() > best.len() { best = cur.clone(); }
+            if cur.len() > best.len() {
+                best = cur.clone();
+            }
             cur.clear();
         }
         i += 2;
     }
-    if cur.len() > best.len() { best = cur; }
+    if cur.len() > best.len() {
+        best = cur;
+    }
     String::from_utf16_lossy(&best).trim().to_string()
 }
 
@@ -63,7 +67,9 @@ fn utf16_at(b: &[u8], off: usize) -> String {
     let mut i = off;
     while i + 1 < b.len() {
         let u = u16::from_le_bytes([b[i], b[i + 1]]);
-        if u == 0 { break; }
+        if u == 0 {
+            break;
+        }
         units.push(u);
         i += 2;
     }
@@ -71,7 +77,9 @@ fn utf16_at(b: &[u8], off: usize) -> String {
 }
 
 fn find_sub(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || hay.len() < needle.len() { return None; }
+    if needle.is_empty() || hay.len() < needle.len() {
+        return None;
+    }
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
@@ -84,48 +92,79 @@ fn folder_long_name(b: &[u8]) -> String {
         if sig >= 4 {
             let block_start = sig - 4;
             let version = u16::from_le_bytes([b[block_start + 2], b[block_start + 3]]);
-            let name_off = block_start + if version >= 9 { 46 } else if version >= 8 { 42 } else { 34 };
+            let name_off = block_start
+                + if version >= 9 {
+                    46
+                } else if version >= 8 {
+                    42
+                } else {
+                    34
+                };
             if name_off < b.len() {
                 let first = u16::from_le_bytes([b[name_off], *b.get(name_off + 1).unwrap_or(&0)]);
                 if (0x20..=0xFFFD).contains(&first) {
                     let n = utf16_at(b, name_off);
-                    if !n.trim().is_empty() { return n.trim().to_string(); }
+                    if !n.trim().is_empty() {
+                        return n.trim().to_string();
+                    }
                 }
             }
         }
     }
     let long = longest_utf16(b);
-    if long.len() >= 2 { return long; }
+    if long.len() >= 2 {
+        return long;
+    }
     ascii_at(b, 14)
 }
 
 /// ASCII (single-byte) null-terminated string starting at `off`.
 fn ascii_at(b: &[u8], off: usize) -> String {
-    if off >= b.len() { return String::new(); }
-    let end = b[off..].iter().position(|&c| c == 0).map(|p| off + p).unwrap_or(b.len());
+    if off >= b.len() {
+        return String::new();
+    }
+    let end = b[off..]
+        .iter()
+        .position(|&c| c == 0)
+        .map(|p| off + p)
+        .unwrap_or(b.len());
     String::from_utf8_lossy(&b[off..end]).trim().to_string()
 }
 
 fn decode_item(b: &[u8]) -> Name {
-    if b.len() < 3 { return Name::Unknown; }
+    if b.len() < 3 {
+        return Name::Unknown;
+    }
     let typ = b[2]; // b[0..2] = item size
     match typ & 0x70 {
         0x00 if typ == 0x1f || (typ & 0xf0) == 0x10 => Name::Root,
-        0x10 => Name::Root,                                   // 0x1x root/GUID
-        0x20 => {                                             // 0x2x volume: "C:\"
+        0x10 => Name::Root, // 0x1x root/GUID
+        0x20 => {
+            // 0x2x volume: "C:\"
             let v = ascii_at(b, 3);
             let drive = v.trim_end_matches('\\').to_string();
-            if drive.is_empty() { Name::Unknown } else { Name::Volume(drive) }
+            if drive.is_empty() {
+                Name::Unknown
+            } else {
+                Name::Volume(drive)
+            }
         }
-        0x30 => {                                             // 0x3x file/folder
+        0x30 => {
+            // 0x3x file/folder
             let n = folder_long_name(b);
-            if n.is_empty() { Name::Unknown } else { Name::Dir(n) }
+            if n.is_empty() {
+                Name::Unknown
+            } else {
+                Name::Dir(n)
+            }
         }
         _ => Name::Unknown,
     }
 }
 
-fn lower(s: &str) -> String { s.to_lowercase() }
+fn lower(s: &str) -> String {
+    s.to_lowercase()
+}
 
 /// Reconstruct every shellbag folder from a flat list of BagMRU numbered values.
 pub fn reconstruct(rows: Vec<BagRow>) -> Vec<Shellbag> {
@@ -149,8 +188,13 @@ pub fn reconstruct(rows: Vec<BagRow>) -> Vec<Shellbag> {
         let mut guard = 0;
         loop {
             guard += 1;
-            if guard > 64 { break; }
-            let bytes = match item.get(&cur) { Some(b) => b, None => break };
+            if guard > 64 {
+                break;
+            }
+            let bytes = match item.get(&cur) {
+                Some(b) => b,
+                None => break,
+            };
             chain.push(decode_item(bytes));
             match parent.get(&cur) {
                 Some(p) if item.contains_key(p) => cur = p.clone(),
@@ -165,14 +209,26 @@ pub fn reconstruct(rows: Vec<BagRow>) -> Vec<Shellbag> {
         for n in chain {
             match n {
                 Name::Root => {}
-                Name::Volume(d) => { drive = d; ok = true; }
-                Name::Dir(name) => { dirs.push(name); ok = true; }
+                Name::Volume(d) => {
+                    drive = d;
+                    ok = true;
+                }
+                Name::Dir(name) => {
+                    dirs.push(name);
+                    ok = true;
+                }
                 Name::Unknown => {}
             }
         }
-        if !ok || dirs.is_empty() { continue; } // need at least one folder name
+        if !ok || dirs.is_empty() {
+            continue;
+        } // need at least one folder name
         let rel = format!("\\{}", dirs.join("\\"));
-        let display = if drive.is_empty() { rel.clone() } else { format!("{}{}", drive, rel) };
+        let display = if drive.is_empty() {
+            rel.clone()
+        } else {
+            format!("{}{}", drive, rel)
+        };
         out.push(Shellbag {
             path: rel.to_lowercase(),
             display,

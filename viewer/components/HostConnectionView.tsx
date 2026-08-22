@@ -425,7 +425,7 @@ export default function HostConnectionView({ graph, loading, timeRange = EMPTY_T
   const hasLoopbackNode = topo.ids.some((id) => topo.meta[id]?.kind === "loopback");
 
   return (
-    <div style={{ flex: 1, minHeight: 0, overflow: "auto", padding: "18px 22px" }}>
+    <div className="dfir-view" style={{ flex: 1, minHeight: 0, overflow: "auto", padding: "28px 32px" }}>
       <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 12 }}>
         <div>
           <div style={{ fontSize: 22, fontWeight: 700, marginBottom: 2 }}>🔗 호스트 연결</div>

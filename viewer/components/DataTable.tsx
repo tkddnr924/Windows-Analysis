@@ -54,7 +54,8 @@ interface DataTableProps {
   onInitialFilterConsumed?: () => void;
   onNavigate: (targetFile: string, targetColumn: string, value: string) => void;
   onFetchLinkedRows?: FetchLinkedRows;
-  /** rowids (this file's __rowid) currently bookmarked — undefined/omitted hides the star entirely. */
+  /** rowids (this file's __rowid) currently bookmarked. Bookmarks are
+   * communicated by a row tint, not a competing icon in every row. */
   bookmarkedRowids?: Set<number>;
   onToggleBookmark?: (rowid: number) => void;
   /** Global incident-window filter from the sidebar; applied to this table's time column if it has one. */
@@ -126,22 +127,8 @@ export default function DataTable({
         enableResizing: false,
         cell: ({ row }) => {
           const tags = artifactSpec?.tags?.(row.original) ?? [];
-          const rowid = Number((row.original as Record<string, unknown>).__rowid);
-          const bookmarked = bookmarkedRowids?.has(rowid) ?? false;
           return (
             <span style={{ display: "inline-flex", alignItems: "center", gap: 3 }}>
-              {onToggleBookmark && Number.isFinite(rowid) && (
-                <span
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    onToggleBookmark(rowid);
-                  }}
-                  title={bookmarked ? "북마크 해제" : "북마크에 추가"}
-                  style={{ cursor: "pointer", color: bookmarked ? "var(--warning)" : "var(--text-faint)" }}
-                >
-                  {bookmarked ? "★" : "☆"}
-                </span>
-              )}
               {tags.length > 0 && (
                 <span
                   title={tags.map((t) => (t.description ? `${t.label} — ${t.description}` : t.label)).join("\n\n")}
@@ -174,7 +161,7 @@ export default function DataTable({
         })
       ),
     ],
-    [displayColumns, artifactSpec, bookmarkedRowids, onToggleBookmark] // eslint-disable-line react-hooks/exhaustive-deps
+    [displayColumns, artifactSpec] // eslint-disable-line react-hooks/exhaustive-deps
   );
 
   // The column the global incident-window filter applies to (null = this table
@@ -237,7 +224,7 @@ export default function DataTable({
   const activeFilterCount = columnFilters.length;
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", flex: 1, minHeight: 0, minWidth: 0 }}>
+    <div className="dfir-view" style={{ display: "flex", flexDirection: "column", flex: 1, minHeight: 0, minWidth: 0 }}>
       <div
         style={{
           display: "flex",
@@ -459,15 +446,16 @@ export default function DataTable({
               const danger = tags.some((t) => t.severity === "danger");
               const rowid = Number((row.original as Record<string, unknown>).__rowid);
               const bookmarked = (bookmarkedRowids?.has(rowid) ?? false) && Number.isFinite(rowid);
-              // A bookmarked row is the analyst's explicit mark — make the whole
-              // row stand out (tinted fill + a full amber ring), not just the ★.
+              // A bookmark is analyst context, not a warning. It gets the
+              // same blue semantic colour as the selected/navigation context;
+              // warning and red remain reserved for evidence signals.
               const baseBg = bookmarked
-                ? "color-mix(in srgb, var(--warning) 15%, transparent)"
+                ? "var(--accent-subtle)"
                 : tags.length > 0
                   ? danger ? "var(--danger-subtle)" : "var(--warning-subtle)"
                   : virtualRow.index % 2 === 0 ? "transparent" : "rgba(255,255,255,0.02)";
               const boxShadow = bookmarked
-                ? "inset 3px 0 0 var(--warning), inset 0 0 0 1px color-mix(in srgb, var(--warning) 55%, transparent)"
+                ? "inset 3px 0 0 var(--accent), inset 0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent)"
                 : tags.length > 0
                   ? `inset 3px 0 0 ${danger ? "var(--danger)" : "var(--warning)"}`
                   : undefined;

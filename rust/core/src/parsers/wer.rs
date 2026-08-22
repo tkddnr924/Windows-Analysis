@@ -6,6 +6,7 @@
 use std::path::Path;
 
 use anyhow::Result;
+use rayon::prelude::*;
 use serde::Serialize;
 use serde_json::{Map, Value};
 use walkdir::WalkDir;
@@ -149,13 +150,12 @@ fn parse_report(path: &Path) -> Row {
 }
 
 pub fn parse_wer(root: &Path) -> Result<Vec<Row>> {
-    let mut rows = Vec::new();
-    for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
-        if entry.file_type().is_file()
-            && entry.path().extension().map(|e| e.eq_ignore_ascii_case("wer")).unwrap_or(false)
-        {
-            rows.push(parse_report(entry.path()));
-        }
-    }
-    Ok(rows)
+    let paths: Vec<_> = WalkDir::new(root).into_iter().filter_map(|e| e.ok())
+        .filter(|entry| entry.file_type().is_file()
+            && entry.path().extension().map(|e| e.eq_ignore_ascii_case("wer")).unwrap_or(false))
+        .map(|entry| entry.into_path())
+        .collect();
+    // Reports are independent. Parallel decoding/parsing leaves every report
+    // represented, while indexed parallel collection keeps discovery order.
+    Ok(paths.par_iter().map(|path| parse_report(path)).collect())
 }

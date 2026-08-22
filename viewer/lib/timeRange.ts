@@ -48,6 +48,15 @@ export function inRange(ts: string, range: TimeRange): boolean {
   return true;
 }
 
+/** Display parser-local evidence time without applying browser locale or a
+ * timezone conversion. This keeps every analyst view on the fixed
+ * YYYY-MM-DD HH:mm:ss.fff convention even when old records lack milliseconds. */
+export function formatEvidenceTimestamp(value: string): string {
+  const match = value.trim().match(/^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})(?:\.(\d{1,3}))?$/);
+  if (!match) return value || "시간 정보 없음";
+  return `${match[1]} ${match[2]}.${(match[3] ?? "").padEnd(3, "0")}`;
+}
+
 const TS_RE = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/;
 
 /** The column a table should be time-filtered on: the artifact's declared

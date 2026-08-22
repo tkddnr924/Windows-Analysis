@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useId, useState } from "react";
+import { useModalDialog } from "@/lib/useModalDialog";
 
 // A full-screen overlay that shows one code/text blob on its own — for when a
 // ScriptBlock (or any long code field) is too big to read inside the detail
@@ -15,15 +16,22 @@ export default function CodeModal({
   onClose: () => void;
 }) {
   const [copied, setCopied] = useState(false);
+  const [copyError, setCopyError] = useState(false);
   const [wrap, setWrap] = useState(true);
+  const titleId = useId();
+  const dialogRef = useModalDialog(onClose);
 
-  useEffect(() => {
-    function onKey(e: KeyboardEvent) {
-      if (e.key === "Escape") onClose();
+  async function copyCode() {
+    try {
+      await navigator.clipboard.writeText(code);
+      setCopied(true);
+      setCopyError(false);
+      window.setTimeout(() => setCopied(false), 1200);
+    } catch {
+      setCopyError(true);
+      window.setTimeout(() => setCopyError(false), 2400);
     }
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
+  }
 
   const btnStyle: React.CSSProperties = {
     fontSize: 11,
@@ -50,7 +58,12 @@ export default function CodeModal({
       }}
     >
       <div
+        ref={dialogRef}
         onClick={(e) => e.stopPropagation()}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        tabIndex={-1}
         style={{
           width: "min(1000px, 92vw)",
           height: "min(820px, 86vh)",
@@ -74,30 +87,25 @@ export default function CodeModal({
             flexShrink: 0,
           }}
         >
-          <strong style={{ fontSize: 13 }}>{title}</strong>
+          <strong id={titleId} style={{ fontSize: 13 }}>{title}</strong>
           <span style={{ fontSize: 11, color: "var(--text-faint)" }}>{code.length.toLocaleString()}자</span>
           <button onClick={() => setWrap((w) => !w)} style={{ ...btnStyle, marginLeft: "auto" }}>
             {wrap ? "줄바꿈 끄기" : "줄바꿈 켜기"}
           </button>
-          <button
-            onClick={() => {
-              navigator.clipboard.writeText(code).then(() => {
-                setCopied(true);
-                setTimeout(() => setCopied(false), 1200);
-              });
-            }}
-            style={btnStyle}
-          >
-            {copied ? "복사됨" : "복사"}
+          <button onClick={copyCode} style={{ ...btnStyle, color: copyError ? "var(--danger)" : btnStyle.color }}>
+            {copyError ? "복사 실패" : copied ? "복사됨" : "복사"}
           </button>
           <button
             onClick={onClose}
+            data-dialog-autofocus
+            aria-label="코드 보기 닫기"
             title="닫기 (Esc)"
             style={{ ...btnStyle, fontSize: 16, lineHeight: 1, padding: "2px 8px" }}
           >
             ×
           </button>
         </div>
+        {copyError && <div role="status" style={{ padding: "6px 14px", color: "var(--danger)", borderBottom: "1px solid var(--border-subtle)", fontSize: 11.5 }}>클립보드에 복사하지 못했습니다. 권한을 확인한 뒤 다시 시도하세요.</div>}
         <pre
           style={{
             margin: 0,

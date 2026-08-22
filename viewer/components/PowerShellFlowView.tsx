@@ -1,26 +1,19 @@
 "use client";
 
 import { useMemo, useState } from "react";
+import BookmarkBorderOutlinedIcon from "@mui/icons-material/BookmarkBorderOutlined";
+import BookmarkOutlinedIcon from "@mui/icons-material/BookmarkOutlined";
+import CloseOutlinedIcon from "@mui/icons-material/CloseOutlined";
+import KeyboardArrowDownOutlinedIcon from "@mui/icons-material/KeyboardArrowDownOutlined";
+import KeyboardArrowRightOutlinedIcon from "@mui/icons-material/KeyboardArrowRightOutlined";
 import type { CsvData, FetchLinkedRows } from "@/lib/types";
-import { getArtifactView } from "@/lib/artifactViews";
-import { inRange, EMPTY_TIME_RANGE, type TimeRange } from "@/lib/timeRange";
+import { formatEvidenceTimestamp, inRange, EMPTY_TIME_RANGE, type TimeRange } from "@/lib/timeRange";
 import RowDetailPanel from "./RowDetailPanel";
-import PowerShellSourceView from "./PowerShellSourceView";
 
 const TABLE_NAME = "PowerShellHistory";
-// Commands run inside one powershell.exe instance cluster together; a gap
-// longer than this (same account + PID) starts a new session. PIDs are reused
-// over time, so the gap guard keeps two unrelated sessions that happen to
-// share a recycled PID from merging.
 const SESSION_GAP_MS = 30 * 60 * 1000;
 
-// One dot color per event kind, so a session's command list shows at a glance
-// which entries carry actual code (script blocks) vs. pipeline/classic records.
-const KIND_COLOR: Record<string, string> = {
-  "스크립트 블록": "var(--accent)",
-  파이프라인: "var(--text-dim)",
-  "명령 실행": "var(--warning)",
-};
+type PsKind = "스크립트 블록" | "파이프라인" | "명령 실행";
 
 interface PsEvent {
   row: Record<string, string>;
@@ -31,7 +24,8 @@ interface PsEvent {
   processId: string;
   command: string;
   scriptBlock: string;
-  kind: string;
+  hostApplication: string;
+  kind: PsKind | string;
 }
 
 interface PsSession {
@@ -42,16 +36,25 @@ interface PsSession {
   start: string;
   end: string;
   events: PsEvent[];
-  codeBlocks: number;
 }
 
-// "YYYY-MM-DD HH:MM:SS.fff" (KST) — parsed as local; only relative deltas feed
-// gap detection, so the fixed offset cancels out.
-function tsMs(ts: string): number {
-  return ts ? new Date(ts.replace(" ", "T")).getTime() : NaN;
+function tsMs(timestamp: string): number {
+  return timestamp ? new Date(timestamp.replace(" ", "T")).getTime() : Number.NaN;
 }
 
-function clusterSessions(data: CsvData, timeRange: TimeRange, kindFilter?: string): PsSession[] {
+function firstLine(value: string, limit = 220): string {
+  const line = value.split(/\r?\n/).find((item) => item.trim())?.trim() ?? value.trim();
+  return line.length > limit ? `${line.slice(0, limit)}…` : line;
+}
+
+function eventEvidence(event: PsEvent): { label: string; value: string } {
+  if (event.scriptBlock) return { label: "스크립트", value: firstLine(event.scriptBlock) };
+  if (event.command) return { label: "명령", value: firstLine(event.command) };
+  if (event.hostApplication) return { label: "HostApplication", value: firstLine(event.hostApplication) };
+  return { label: "기록", value: "표시할 실행 문자열이 없습니다." };
+}
+
+function clusterSessions(data: CsvData, timeRange: TimeRange): PsSession[] {
   const events: PsEvent[] = data.rows
     .map((row) => ({
       row,
@@ -62,50 +65,39 @@ function clusterSessions(data: CsvData, timeRange: TimeRange, kindFilter?: strin
       processId: row.process_id ?? "",
       command: row.command ?? "",
       scriptBlock: row.script_block ?? "",
+      hostApplication: row.host_application ?? "",
       kind: row.kind ?? "",
     }))
-    .filter((e) => e.timestamp && inRange(e.timestamp, timeRange) && (!kindFilter || e.kind === kindFilter))
-    .sort((a, b) => (a.timestamp < b.timestamp ? -1 : a.timestamp > b.timestamp ? 1 : 0));
+    .filter((event) => event.timestamp && inRange(event.timestamp, timeRange))
+    .sort((left, right) => left.timestamp.localeCompare(right.timestamp));
 
-  // Group by the running identity (account + process instance), then split
-  // each group into sessions on a time gap. Grouping first (rather than a
-  // single sequential sweep) keeps interleaved runspaces from tangling.
   const byIdentity = new Map<string, PsEvent[]>();
-  for (const e of events) {
-    const key = `${e.account}||${e.processId || e.process}`;
-    if (!byIdentity.has(key)) byIdentity.set(key, []);
-    byIdentity.get(key)!.push(e);
+  for (const event of events) {
+    const key = `${event.account}||${event.processId || event.process}`;
+    const group = byIdentity.get(key) ?? [];
+    group.push(event);
+    byIdentity.set(key, group);
   }
 
   const sessions: PsSession[] = [];
-  for (const [, group] of byIdentity) {
-    let cur: PsSession | null = null;
-    let lastMs = NaN;
-    for (const e of group) {
-      const t = tsMs(e.timestamp);
-      const gap = Number.isFinite(t) && Number.isFinite(lastMs) && t - lastMs > SESSION_GAP_MS;
-      if (!cur || gap) {
-        cur = {
-          key: `${sessions.length}`,
-          account: e.account,
-          process: e.process,
-          processId: e.processId,
-          start: e.timestamp,
-          end: e.timestamp,
-          events: [],
-          codeBlocks: 0,
-        };
-        sessions.push(cur);
+  for (const group of byIdentity.values()) {
+    let current: PsSession | null = null;
+    let previousMs = Number.NaN;
+    for (const event of group) {
+      const currentMs = tsMs(event.timestamp);
+      const hasGap = Number.isFinite(currentMs) && Number.isFinite(previousMs) && currentMs - previousMs > SESSION_GAP_MS;
+      if (!current || hasGap) {
+        current = { key: `${sessions.length}`, account: event.account, process: event.process, processId: event.processId, start: event.timestamp, end: event.timestamp, events: [] };
+        sessions.push(current);
       }
-      if (!cur.process && e.process) cur.process = e.process;
-      cur.events.push(e);
-      cur.end = e.timestamp;
-      if (e.scriptBlock) cur.codeBlocks += 1;
-      lastMs = t;
+      if (!current.process && event.process) current.process = event.process;
+      if (!current.account && event.account) current.account = event.account;
+      current.events.push(event);
+      current.end = event.timestamp;
+      previousMs = currentMs;
     }
   }
-
-  return sessions.sort((a, b) => (a.start < b.start ? -1 : a.start > b.start ? 1 : 0));
+  return sessions.sort((left, right) => left.start.localeCompare(right.start));
 }
 
 interface PowerShellFlowViewProps {
@@ -117,219 +109,103 @@ interface PowerShellFlowViewProps {
   timeRange?: TimeRange;
 }
 
+const FILTERS: { label: string; value?: PsKind }[] = [
+  { label: "전체" },
+  { label: "스크립트 블록", value: "스크립트 블록" },
+  { label: "파이프라인", value: "파이프라인" },
+  { label: "명령 실행", value: "명령 실행" },
+];
+
 export default function PowerShellFlowView({
-  data,
-  onNavigate,
-  onFetchLinkedRows,
-  bookmarkedRowids,
-  onToggleBookmark,
-  timeRange = EMPTY_TIME_RANGE,
+  data, onNavigate, onFetchLinkedRows, bookmarkedRowids, onToggleBookmark, timeRange = EMPTY_TIME_RANGE,
 }: PowerShellFlowViewProps) {
-  const [kindFilter, setKindFilter] = useState<string | undefined>(undefined);
+  const [kindFilter, setKindFilter] = useState<PsKind | undefined>();
+  const [query, setQuery] = useState("");
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [selected, setSelected] = useState<Record<string, string> | null>(null);
-  const [sourceView, setSourceView] = useState<{ code: string; title: string } | null>(null);
 
-  const spec = getArtifactView(TABLE_NAME);
-  const sessions = useMemo(() => clusterSessions(data, timeRange, kindFilter), [data, timeRange, kindFilter]);
-  const totalCommands = useMemo(() => sessions.reduce((n, s) => n + s.events.length, 0), [sessions]);
+  const allSessions = useMemo(() => clusterSessions(data, timeRange), [data, timeRange]);
+  const sessions = useMemo(() => {
+    const needle = query.trim().toLowerCase();
+    return allSessions.flatMap((session) => {
+      const events = session.events.filter((event) => {
+        if (kindFilter && event.kind !== kindFilter) return false;
+        if (!needle) return true;
+        return [event.account, event.process, event.processId, event.command, event.scriptBlock, event.hostApplication]
+          .some((value) => value.toLowerCase().includes(needle));
+      });
+      return events.length ? [{ ...session, events, start: events[0].timestamp, end: events[events.length - 1].timestamp }] : [];
+    });
+  }, [allSessions, kindFilter, query]);
+  const eventCount = useMemo(() => sessions.reduce((count, session) => count + session.events.length, 0), [sessions]);
 
-  function toggle(key: string) {
-    setExpanded((prev) => {
-      const next = new Set(prev);
-      if (next.has(key)) next.delete(key);
-      else next.add(key);
+  function toggle(sessionKey: string) {
+    setExpanded((previous) => {
+      const next = new Set(previous);
+      if (next.has(sessionKey)) next.delete(sessionKey);
+      else next.add(sessionKey);
       return next;
     });
   }
 
-  const kindTabs = [
-    { label: "전체", value: undefined as string | undefined },
-    { label: "스크립트 블록", value: "스크립트 블록" },
-    { label: "파이프라인", value: "파이프라인" },
-    { label: "명령 실행", value: "명령 실행" },
-  ];
-
   return (
-    <div style={{ display: "flex", flexDirection: "column", flex: 1, minHeight: 0, minWidth: 0 }}>
-      <div
-        style={{
-          display: "flex",
-          alignItems: "center",
-          gap: 10,
-          padding: "9px 14px",
-          borderBottom: "1px solid var(--border)",
-          background: "var(--bg-panel)",
-          flexShrink: 0,
-          flexWrap: "wrap",
-          rowGap: 6,
-        }}
-      >
-        <strong style={{ fontSize: 13 }}>💻 PowerShell 실행 기록</strong>
-        <span style={{ color: "var(--text-faint)", fontSize: 11.5 }}>
-          {sessions.length.toLocaleString()}개 세션 · 명령 {totalCommands.toLocaleString()}건
-        </span>
-        <div style={{ display: "flex", gap: 6, marginLeft: "auto", flexWrap: "wrap" }}>
-          {kindTabs.map((t) => {
-            const active = kindFilter === t.value;
-            return (
-              <button
-                key={t.label}
-                onClick={() => setKindFilter(t.value)}
-                style={{
-                  fontSize: 12,
-                  padding: "4px 12px",
-                  background: active ? "var(--accent-subtle)" : "transparent",
-                  color: active ? "var(--accent)" : "var(--text-dim)",
-                  border: `1px solid ${active ? "var(--accent)" : "var(--border)"}`,
-                  borderRadius: "var(--radius-lg)",
-                  cursor: "pointer",
-                  fontWeight: active ? 700 : 500,
-                }}
-              >
-                {t.label}
+    <div style={{ display: "flex", flexDirection: "column", flex: 1, minHeight: 0, minWidth: 0, background: "var(--bg)" }}>
+      <header style={{ flexShrink: 0, padding: "12px 16px 10px", borderBottom: "1px solid var(--border)", background: "var(--bg-panel)" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 9, minHeight: 25, flexWrap: "wrap" }}>
+          <strong style={{ fontSize: 15, color: "var(--text)" }}>파워셸 실행 이력</strong>
+          <span style={{ color: "var(--text-faint)", fontSize: 12, fontFamily: "var(--mono)" }}>{sessions.length.toLocaleString()}개 세션 · {eventCount.toLocaleString()}건</span>
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 9, flexWrap: "wrap" }}>
+          <div style={{ position: "relative", flex: "1 1 260px", maxWidth: 430 }}>
+            <input value={query} onChange={(event) => setQuery(event.target.value)} onFocus={(event) => { event.currentTarget.style.borderColor = "var(--accent)"; event.currentTarget.style.boxShadow = "0 0 0 2px var(--accent-subtle)"; }} onBlur={(event) => { event.currentTarget.style.borderColor = "var(--border)"; event.currentTarget.style.boxShadow = "none"; }} placeholder="명령 · 스크립트 · HostApplication · 계정 검색" aria-label="PowerShell 실행 증거 검색" style={{ width: "100%", height: 31, padding: "0 31px 0 10px", fontSize: 12, fontFamily: "var(--mono)", borderRadius: "var(--radius-sm)", border: "1px solid var(--border)", color: "var(--text)", background: "var(--bg-elevated)", outline: "none" }} />
+            {query && <button type="button" onClick={() => setQuery("")} aria-label="검색어 지우기" style={{ position: "absolute", right: 5, top: "50%", transform: "translateY(-50%)", display: "inline-flex", padding: 2, color: "var(--text-faint)", border: "none", background: "transparent", cursor: "pointer" }}><CloseOutlinedIcon sx={{ fontSize: 16 }} /></button>}
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 5, flexWrap: "wrap" }}>
+            {FILTERS.map((filter) => {
+              const active = kindFilter === filter.value;
+              return <button key={filter.label} type="button" onClick={() => setKindFilter(filter.value)} aria-pressed={active} style={{ height: 30, padding: "0 10px", fontSize: 11.5, fontWeight: active ? 700 : 550, color: active ? "var(--accent)" : "var(--text-dim)", background: active ? "var(--accent-subtle)" : "transparent", border: `1px solid ${active ? "var(--accent)" : "var(--border)"}`, borderRadius: "var(--radius-sm)", cursor: "pointer" }}>{filter.label}</button>;
+            })}
+          </div>
+        </div>
+      </header>
+
+      <main style={{ flex: 1, minHeight: 0, overflow: "auto", padding: 12 }}>
+        <div style={{ minWidth: 730, border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", overflow: "hidden", background: "var(--bg-panel)" }}>
+          {sessions.length > 0 && <div style={{ display: "grid", gridTemplateColumns: "32px minmax(150px, .72fr) minmax(110px, .46fr) minmax(210px, 1.4fr) 164px 54px", gap: 8, alignItems: "center", padding: "8px 12px", borderBottom: "1px solid var(--border)", color: "var(--text-faint)", fontSize: 10.5, fontWeight: 700 }}><span /><span>실행 프로세스</span><span>계정</span><span>명령 / 스크립트</span><span>시간</span><span style={{ textAlign: "right" }}>이벤트</span></div>}
+          {sessions.length === 0 ? <div style={{ padding: 28, textAlign: "center", color: "var(--text-faint)", fontSize: 12.5 }}>{allSessions.length === 0 ? "기간 내 파워셸 실행 이력이 없습니다." : "검색 또는 필터 조건에 맞는 실행 이력이 없습니다."}</div> : sessions.map((session) => {
+            const open = expanded.has(session.key);
+            const summary = eventEvidence(session.events[0]);
+            return <section key={session.key} style={{ borderTop: "1px solid var(--border-subtle)" }}>
+              <button type="button" onClick={() => toggle(session.key)} aria-expanded={open} style={{ width: "100%", display: "grid", gridTemplateColumns: "32px minmax(150px, .72fr) minmax(110px, .46fr) minmax(210px, 1.4fr) 164px 54px", gap: 8, alignItems: "center", padding: "10px 12px", color: "var(--text)", border: "none", background: "transparent", cursor: "pointer", textAlign: "left", outlineOffset: -2 }} onMouseEnter={(event) => { event.currentTarget.style.background = "var(--bg-hover)"; }} onMouseLeave={(event) => { event.currentTarget.style.background = "transparent"; }}>
+                {open ? <KeyboardArrowDownOutlinedIcon aria-hidden="true" sx={{ fontSize: 18, color: "var(--text-faint)" }} /> : <KeyboardArrowRightOutlinedIcon aria-hidden="true" sx={{ fontSize: 18, color: "var(--text-faint)" }} />}
+                <span style={{ minWidth: 0 }}><span style={{ display: "block", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontFamily: "var(--mono)", fontSize: 12.5, fontWeight: 700 }}>{session.process || "powershell.exe"}</span>{session.processId && <span style={{ display: "block", marginTop: 2, color: "var(--text-faint)", fontSize: 10.5, fontFamily: "var(--mono)" }}>PID {session.processId}</span>}</span>
+                <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: session.account ? "var(--text)" : "var(--text-faint)", fontSize: 12 }}>{session.account || "계정 정보 없음"}</span>
+                <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text-dim)", fontFamily: "var(--mono)", fontSize: 11.5 }}><span style={{ marginRight: 7, color: summary.label === "HostApplication" ? "var(--accent)" : "var(--text-faint)", fontFamily: "inherit", fontSize: 10.5 }}>{summary.label}</span>{summary.value}</span>
+                <span style={{ color: "var(--text-time)", fontFamily: "var(--mono)", fontSize: 10.5, lineHeight: 1.4, whiteSpace: "nowrap" }}>{formatEvidenceTimestamp(session.start)}<br />{formatEvidenceTimestamp(session.end)}</span>
+                <span style={{ display: "block", textAlign: "right", color: "var(--text-faint)", fontFamily: "var(--mono)", fontSize: 10.5 }}>{session.events.length}건</span>
               </button>
-            );
+              {open && <div style={{ borderTop: "1px solid var(--border-subtle)", background: "color-mix(in srgb, var(--bg-elevated) 34%, transparent)" }}>
+                <div style={{ display: "grid", gridTemplateColumns: "160px 104px minmax(190px, 1fr) minmax(220px, .9fr) 32px", gap: 8, padding: "6px 12px 6px 44px", borderBottom: "1px solid var(--border-subtle)", color: "var(--text-faint)", fontSize: 10, fontWeight: 700 }}><span>시간</span><span>기록 유형</span><span>명령 / 스크립트</span><span>HostApplication</span><span /></div>
+                {session.events.map((event) => {
+                  const evidence = eventEvidence(event);
+                  const bookmarked = Number.isFinite(event.rowid) && (bookmarkedRowids?.has(event.rowid) ?? false);
+                  const rowBackground = bookmarked ? "color-mix(in srgb, var(--warning) 14%, transparent)" : "transparent";
+                  return <div key={`${event.rowid}-${event.timestamp}`} style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) 32px", gap: 8, alignItems: "center", minHeight: 35, padding: "6px 12px 6px 44px", background: rowBackground, boxShadow: bookmarked ? "inset 3px 0 0 var(--warning)" : undefined }} onMouseEnter={(mouseEvent) => { mouseEvent.currentTarget.style.background = "var(--bg-hover)"; }} onMouseLeave={(mouseEvent) => { mouseEvent.currentTarget.style.background = rowBackground; }}>
+                    <div role="button" tabIndex={0} onClick={() => setSelected(event.row)} onKeyDown={(keyboardEvent) => { if (keyboardEvent.key === "Enter" || keyboardEvent.key === " ") { keyboardEvent.preventDefault(); setSelected(event.row); } }} style={{ display: "grid", gridTemplateColumns: "160px 104px minmax(190px, 1fr) minmax(220px, .9fr)", gap: 8, alignItems: "center", minWidth: 0, color: "var(--text)", cursor: "pointer", outlineOffset: 2 }}>
+                      <span style={{ color: "var(--text-time)", fontFamily: "var(--mono)", fontSize: 11.5, whiteSpace: "nowrap" }}>{formatEvidenceTimestamp(event.timestamp)}</span>
+                      <span style={{ color: "var(--text-dim)", fontSize: 11.5 }}>{event.kind || "기타"}</span>
+                      <span title={evidence.value} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: evidence.label === "HostApplication" ? "var(--accent)" : "var(--text-dim)", fontFamily: "var(--mono)", fontSize: 11.5 }}><span style={{ color: "var(--text-faint)", fontFamily: "inherit", marginRight: 7 }}>{evidence.label}</span>{evidence.value}</span>
+                      <span title={event.hostApplication || "HostApplication 기록 없음"} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: event.hostApplication ? "var(--accent)" : "var(--text-faint)", fontFamily: "var(--mono)", fontSize: 11.5 }}>{event.hostApplication || "—"}</span>
+                    </div>
+                    {onToggleBookmark && Number.isFinite(event.rowid) && <button type="button" onClick={() => onToggleBookmark(event.rowid)} aria-label={bookmarked ? "북마크 해제" : "북마크 추가"} title={bookmarked ? "북마크 해제" : "북마크 추가"} style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 26, height: 26, padding: 0, border: "none", background: "transparent", color: bookmarked ? "var(--warning)" : "var(--text-faint)", cursor: "pointer" }}>{bookmarked ? <BookmarkOutlinedIcon sx={{ fontSize: 16 }} /> : <BookmarkBorderOutlinedIcon sx={{ fontSize: 16 }} />}</button>}
+                  </div>;
+                })}
+              </div>}
+            </section>;
           })}
         </div>
-      </div>
-
-      <div style={{ flex: 1, minHeight: 0, overflow: "auto", padding: 12, display: "flex", flexDirection: "column", gap: 8 }}>
-        {sessions.length === 0 && (
-          <div style={{ color: "var(--text-faint)", textAlign: "center", padding: 24 }}>PowerShell 실행 기록이 없습니다.</div>
-        )}
-        {sessions.map((s) => {
-          const open = expanded.has(s.key);
-          return (
-            <div key={s.key} style={{ flexShrink: 0, border: "1px solid var(--border)", borderRadius: "var(--radius-md)", background: "var(--bg-panel)", overflow: "hidden" }}>
-              <div
-                onClick={() => toggle(s.key)}
-                style={{ display: "flex", alignItems: "center", gap: 10, padding: "9px 12px", cursor: "pointer" }}
-                onMouseEnter={(e) => (e.currentTarget.style.background = "var(--bg-hover)")}
-                onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
-              >
-                <span style={{ fontSize: 10, color: "var(--text-faint)", width: 10 }}>{open ? "▾" : "▸"}</span>
-                <span style={{ fontFamily: "var(--mono)", fontSize: 13, fontWeight: 600, minWidth: 110 }}>
-                  {s.process || "powershell"}
-                </span>
-                {s.processId && <span style={{ fontSize: 11, color: "var(--text-faint)" }}>PID {s.processId}</span>}
-                {s.account && <span style={{ fontSize: 12, color: "var(--text-dim)" }}>{s.account}</span>}
-                <span style={{ fontSize: 11.5, color: "var(--text-faint)", fontFamily: "var(--mono)" }}>
-                  {s.start} ~ {s.end.slice(11) || s.end}
-                </span>
-                <span style={{ marginLeft: "auto", display: "flex", gap: 8, alignItems: "center", fontSize: 11 }}>
-                  {s.codeBlocks > 0 && <span style={{ color: "var(--accent)" }}>{"</>"} {s.codeBlocks}</span>}
-                  <span style={{ color: "var(--text-faint)" }}>{s.events.length}건</span>
-                </span>
-              </div>
-              {open && (
-                <div style={{ borderTop: "1px solid var(--border)", padding: "4px 0" }}>
-                  {s.events.map((ev, i) => {
-                    const bm = (bookmarkedRowids?.has(ev.rowid) ?? false) && Number.isFinite(ev.rowid);
-                    const bmBg = bm ? "color-mix(in srgb, var(--warning) 14%, transparent)" : "transparent";
-                    return (
-                    <div
-                      key={i}
-                      onClick={() => setSelected(ev.row)}
-                      style={{
-                        display: "flex",
-                        alignItems: "center",
-                        gap: 10,
-                        padding: "5px 12px 5px 30px",
-                        cursor: "pointer",
-                        fontSize: 12,
-                        background: bmBg,
-                        boxShadow: bm ? "inset 3px 0 0 var(--warning)" : undefined,
-                      }}
-                      onMouseEnter={(e) => (e.currentTarget.style.background = "var(--bg-hover)")}
-                      onMouseLeave={(e) => (e.currentTarget.style.background = bmBg)}
-                    >
-                      <span style={{ fontFamily: "var(--mono)", fontSize: 11.5, color: "var(--text-dim)", width: 168, flexShrink: 0 }}>
-                        {ev.timestamp}
-                      </span>
-                      <span
-                        title={ev.kind}
-                        style={{ width: 8, height: 8, borderRadius: "50%", flexShrink: 0, background: KIND_COLOR[ev.kind] ?? "var(--text-faint)" }}
-                      />
-                      <span
-                        style={{
-                          flex: 1,
-                          minWidth: 0,
-                          fontFamily: "var(--mono)",
-                          overflow: "hidden",
-                          textOverflow: "ellipsis",
-                          whiteSpace: "nowrap",
-                          color: ev.command ? undefined : "var(--text-faint)",
-                        }}
-                      >
-                        {ev.command || (ev.scriptBlock ? "코드 블록 (상세에서 확인)" : "-")}
-                      </span>
-                      {ev.scriptBlock && (
-                        <button
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            setSourceView({ code: ev.scriptBlock, title: `PowerShell 스크립트 블록${ev.account ? ` · ${ev.account}` : ""}` });
-                          }}
-                          title="소스코드 보기 (분석 뷰)"
-                          style={{
-                            flexShrink: 0,
-                            fontSize: 10.5,
-                            fontFamily: "var(--mono)",
-                            padding: "1px 7px",
-                            color: "var(--accent)",
-                            background: "var(--accent-subtle)",
-                            border: "1px solid var(--accent)",
-                            borderRadius: "var(--radius-sm)",
-                            cursor: "pointer",
-                          }}
-                        >
-                          {"</> 소스코드"}
-                        </button>
-                      )}
-                      {onToggleBookmark && Number.isFinite(ev.rowid) && (
-                        <span
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            onToggleBookmark(ev.rowid);
-                          }}
-                          title={bookmarkedRowids?.has(ev.rowid) ? "북마크 해제" : "북마크에 추가"}
-                          style={{ flexShrink: 0, cursor: "pointer", color: bookmarkedRowids?.has(ev.rowid) ? "var(--warning)" : "var(--text-faint)" }}
-                        >
-                          {bookmarkedRowids?.has(ev.rowid) ? "★" : "☆"}
-                        </span>
-                      )}
-                    </div>
-                    );
-                  })}
-                </div>
-              )}
-            </div>
-          );
-        })}
-      </div>
-
-      {selected && spec && (
-        <RowDetailPanel
-          row={selected}
-          columns={data.columns}
-          focusedColumn={null}
-          fileBaseName={TABLE_NAME}
-          onClose={() => setSelected(null)}
-          onNavigate={(targetFile, targetColumn, value) => {
-            setSelected(null);
-            onNavigate(targetFile, targetColumn, value);
-          }}
-          onFetchLinkedRows={onFetchLinkedRows}
-          isBookmarked={onToggleBookmark ? bookmarkedRowids?.has(Number((selected as Record<string, unknown>).__rowid)) ?? false : undefined}
-          onToggleBookmark={
-            onToggleBookmark ? () => onToggleBookmark(Number((selected as Record<string, unknown>).__rowid)) : undefined
-          }
-        />
-      )}
-
-      {sourceView && (
-        <PowerShellSourceView code={sourceView.code} title={sourceView.title} onClose={() => setSourceView(null)} />
-      )}
+      </main>
+      {selected && <RowDetailPanel row={selected} columns={data.columns} focusedColumn={null} fileBaseName={TABLE_NAME} onClose={() => setSelected(null)} onNavigate={(targetFile, targetColumn, value) => { setSelected(null); onNavigate(targetFile, targetColumn, value); }} onFetchLinkedRows={onFetchLinkedRows} isBookmarked={onToggleBookmark ? bookmarkedRowids?.has(Number((selected as Record<string, unknown>).__rowid)) ?? false : undefined} onToggleBookmark={onToggleBookmark ? () => onToggleBookmark(Number((selected as Record<string, unknown>).__rowid)) : undefined} />}
     </div>
   );
 }

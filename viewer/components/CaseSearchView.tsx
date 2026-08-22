@@ -52,7 +52,7 @@ export default function CaseSearchView({ hosts, currentHostId, onOpenHit }: Prop
   const capped = hits.length >= 600;
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", flex: 1, minHeight: 0, minWidth: 0 }}>
+    <div className="dfir-view" style={{ display: "flex", flexDirection: "column", flex: 1, minHeight: 0, minWidth: 0 }}>
       <div style={{ padding: "12px 16px", borderBottom: "1px solid var(--border)", background: "var(--bg-panel)", flexShrink: 0 }}>
         <div style={{ fontSize: 16, fontWeight: 700, marginBottom: 8 }}>🔍 케이스 전체 검색</div>
         <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>

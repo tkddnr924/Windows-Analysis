@@ -1,319 +1,185 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useVirtualizer } from "@tanstack/react-virtual";
+import BookmarkBorderOutlinedIcon from "@mui/icons-material/BookmarkBorderOutlined";
+import BookmarkIcon from "@mui/icons-material/Bookmark";
+import FolderSharedOutlinedIcon from "@mui/icons-material/FolderSharedOutlined";
+import KeyOutlinedIcon from "@mui/icons-material/KeyOutlined";
+import ManageSearchOutlinedIcon from "@mui/icons-material/ManageSearchOutlined";
+import PlayCircleOutlineOutlinedIcon from "@mui/icons-material/PlayCircleOutlineOutlined";
+import SearchOutlinedIcon from "@mui/icons-material/SearchOutlined";
+import StorageOutlinedIcon from "@mui/icons-material/StorageOutlined";
+import VpnKeyOutlinedIcon from "@mui/icons-material/VpnKeyOutlined";
+import IconButton from "@mui/material/IconButton";
+import Tooltip from "@mui/material/Tooltip";
+import RowDetailPanel from "./RowDetailPanel";
 import { tagsForPath } from "@/lib/tagging";
 import { inRange, rangeActive, EMPTY_TIME_RANGE, type TimeRange } from "@/lib/timeRange";
 import type { CsvData } from "@/lib/types";
 
 type Row = Record<string, string>;
+type CategoryMeta = { icon: typeof KeyOutlinedIcon; label: string };
 
 interface Props {
   data: CsvData;
-  // Bookmarking: the rowids (this table's __rowid) currently bookmarked, and a
-  // toggle. Omitted when the view is opened outside a bookmarkable context.
   bookmarkedRowids?: Set<number>;
   onToggleBookmark?: (rowid: number) => void;
-  // Global incident-window filter. Findings that carry a time (autoruns'
-  // key-write time, ShimCache file-mtime, RunMRU/TypedPaths) are narrowed to
-  // the window; timeless config findings always stay visible.
   timeRange?: TimeRange;
 }
 
-// status → color. 의심(danger) / 주의(warning) / 정보·정상(neutral/ok)
-function statusColor(status: string): string {
-  if (status === "의심") return "var(--danger)";
-  if (status === "주의") return "var(--warning)";
-  if (status === "정상") return "var(--success)";
-  return "var(--text-faint)";
-}
-
-// Category display order + icon (unknown categories fall through, appended).
-const CATEGORY_META: { key: string; icon: string }[] = [
-  { key: "자격 증명 보호", icon: "🔑" },
-  { key: "공유 폴더", icon: "📁" },
-  { key: "SQL 인증", icon: "🗄️" },
-  { key: "자동 실행", icon: "🚀" },
-  { key: "기타 레지스트리", icon: "🧩" },
-];
-
-// Categories that split into sub-tabs, and the row field each tabs on:
-// autoruns by the account (user) they belong to, 기타 레지스트리 by finding
-// type (RunMRU / TypedPaths / ShimCache).
+const ROW_HEIGHT = 58;
+const ALL_ITEMS = "전체 항목";
 const TAB_FIELD: Record<string, string> = { "자동 실행": "user", "기타 레지스트리": "subtype" };
+const CATEGORY_ORDER = ["자격 증명 보호", "공유 폴더", "SQL 인증", "자동 실행", "기타 레지스트리"];
+const CATEGORY_META: Record<string, CategoryMeta> = {
+  [ALL_ITEMS]: { icon: ManageSearchOutlinedIcon, label: ALL_ITEMS },
+  "자격 증명 보호": { icon: VpnKeyOutlinedIcon, label: "자격 증명 보호" },
+  "공유 폴더": { icon: FolderSharedOutlinedIcon, label: "공유 폴더" },
+  "SQL 인증": { icon: StorageOutlinedIcon, label: "SQL 인증" },
+  "자동 실행": { icon: PlayCircleOutlineOutlinedIcon, label: "자동 실행" },
+  "기타 레지스트리": { icon: ManageSearchOutlinedIcon, label: "실행 흔적" },
+};
+const LEGACY_RUN_MRU_TITLE = "Run 대화상자 입력 (RunMRU)";
+const LEGACY_TYPED_PATHS_TITLE = "탐색기 주소 입력 (TypedPaths)";
+const TYPED_PATH_LABEL = "TypedPath";
+const SHIM_CACHE_LABEL = "ShimCache (AppcompatCache)";
 
-// A value that reads as a filesystem/UNC path (share folders, typed paths).
-function looksLikePath(v: string): boolean {
-  return /^[a-zA-Z]:\\|^\\\\/.test(v);
+function rowId(row: Row): number { return Number((row as Record<string, unknown>).__rowid); }
+function categoryMeta(category: string): CategoryMeta { return CATEGORY_META[category] ?? { icon: KeyOutlinedIcon, label: category }; }
+function looksLikePath(value: string): boolean { return /^[a-zA-Z]:\\|^\\\\/.test(value); }
+function statusTone(status: string) {
+  if (status === "의심") return { bg: "var(--danger)", fg: "#fff", border: "var(--danger)" };
+  if (status === "주의") return { bg: "var(--warning)", fg: "#fff", border: "var(--warning)" };
+  if (status === "정상") return { bg: "var(--success)", fg: "#fff", border: "var(--success)" };
+  return { bg: "var(--tag-neutral-bg)", fg: "var(--tag-neutral-fg)", border: "var(--border)" };
+}
+function registryRow(row: Row): Row {
+  // Missing publisher is not inferred here. This display-only attention state
+  // applies only to autorun paths whose collected command matches a path tag.
+  let normalized = row.name === LEGACY_RUN_MRU_TITLE ? { ...row, name: "RunMRU" } : row;
+  // Preserve existing evidence databases while presenting the artifact names
+  // consistently with newly parsed rows. The original path stays in `value`.
+  if (normalized.subtype === "TypedPaths" || normalized.name === LEGACY_TYPED_PATHS_TITLE) {
+    normalized = { ...normalized, name: TYPED_PATH_LABEL };
+  }
+  if (normalized.subtype === "ShimCache") {
+    normalized = { ...normalized, name: SHIM_CACHE_LABEL };
+  }
+  return normalized.category === "자동 실행" && tagsForPath(normalized.command || normalized.value).length > 0
+    ? { ...normalized, status: "의심" }
+    : normalized;
 }
 
 export default function RegistryFindingsView({ data, bookmarkedRowids, onToggleBookmark, timeRange = EMPTY_TIME_RANGE }: Props) {
-  const [detail, setDetail] = useState<Row | null>(null);
+  const [selectedCategory, setSelectedCategory] = useState(ALL_ITEMS);
+  const [selectedTab, setSelectedTab] = useState("전체");
   const [search, setSearch] = useState("");
+  const [detail, setDetail] = useState<Row | null>(null);
   const rangeOn = rangeActive(timeRange);
-  const { groups, warnCount, dangerCount, shownCount, totalCount } = useMemo(() => {
-    const rows = data.rows;
-    // autoruns get a suspicious re-classification from the command path so the
-    // view flags them even though the parser leaves them as neutral "정보".
-    const enriched = rows.map((r) => {
-      if (r.category === "자동 실행" && tagsForPath(r.command || r.value).length > 0) {
-        return { ...r, status: "의심" };
-      }
-      return r;
+  const allRows = useMemo(() => (data.rows as Row[]).map(registryRow), [data.rows]);
+  const groups = useMemo(() => {
+    const byCategory = new Map<string, Row[]>();
+    for (const row of allRows) {
+      const category = row.category || "기타";
+      byCategory.set(category, [...(byCategory.get(category) ?? []), row]);
+    }
+    const known = CATEGORY_ORDER.filter((category) => byCategory.has(category));
+    const unknown = [...byCategory.keys()].filter((category) => !CATEGORY_ORDER.includes(category)).sort((a, b) => a.localeCompare(b));
+    return [...known, ...unknown].map((category) => ({ category, rows: byCategory.get(category) ?? [] }));
+  }, [allRows]);
+
+  useEffect(() => {
+    const selectedIsData = selectedCategory === ALL_ITEMS || groups.some((group) => group.category === selectedCategory);
+    if (!selectedIsData) setSelectedCategory(ALL_ITEMS);
+  }, [groups, selectedCategory]);
+  useEffect(() => setSelectedTab("전체"), [selectedCategory]);
+
+  const currentGroup = selectedCategory === ALL_ITEMS
+    ? { category: ALL_ITEMS, rows: allRows }
+    : groups.find((group) => group.category === selectedCategory);
+  const tabField = currentGroup ? TAB_FIELD[currentGroup.category] : undefined;
+  const tabs = useMemo(() => !currentGroup || !tabField ? [] : [...new Set(currentGroup.rows.map((row) => row[tabField] || "(기타)"))], [currentGroup, tabField]);
+  const rows = useMemo(() => {
+    if (!currentGroup) return [];
+    const needle = search.trim().toLowerCase();
+    return currentGroup.rows.filter((row) => {
+      // Untimed configuration cannot be truthfully excluded by an incident window.
+      if (rangeOn && row.timestamp && !inRange(row.timestamp, timeRange)) return false;
+      if (tabField && selectedTab !== "전체" && (row[tabField] || "(기타)") !== selectedTab) return false;
+      return !needle || [row.name, row.value, row.key_path, row.command, row.detail, row.source, row.user, row.subtype]
+        .some((value) => (value || "").toLowerCase().includes(needle));
     });
-    const warnCountAll = enriched.filter((r) => r.status === "주의").length;
-    const dangerCountAll = enriched.filter((r) => r.status === "의심").length;
-    const q = search.trim().toLowerCase();
-    let shownRows = q
-      ? enriched.filter((r) => [r.name, r.value, r.key_path, r.command, r.detail, r.source, r.user].some((v) => (v || "").toLowerCase().includes(q)))
-      : enriched;
-    // Time-range filter: drop time-bearing findings outside the window, but
-    // keep findings that have no time at all (config settings can't be placed
-    // in a window, so a window filter shouldn't hide them).
-    if (rangeOn) shownRows = shownRows.filter((r) => !r.timestamp || inRange(r.timestamp, timeRange));
-    const byCat = new Map<string, Row[]>();
-    for (const r of shownRows) {
-      const c = r.category || "기타";
-      if (!byCat.has(c)) byCat.set(c, []);
-      byCat.get(c)!.push(r);
-    }
-    const ordered: { cat: string; icon: string; rows: Row[] }[] = [];
-    for (const { key, icon } of CATEGORY_META) {
-      if (byCat.has(key)) {
-        ordered.push({ cat: key, icon, rows: byCat.get(key)! });
-        byCat.delete(key);
-      }
-    }
-    for (const [cat, rows2] of byCat) ordered.push({ cat, icon: "🔧", rows: rows2 });
-
-    return { groups: ordered, warnCount: warnCountAll, dangerCount: dangerCountAll, shownCount: shownRows.length, totalCount: enriched.length };
-  }, [data.rows, search, rangeOn, timeRange]);
-
-  return (
-    <div style={{ flex: 1, minHeight: 0, overflow: "auto", padding: "20px 24px" }}>
-      <div style={{ display: "flex", alignItems: "baseline", gap: 12, marginBottom: 2, flexWrap: "wrap" }}>
-        <span style={{ fontSize: 22, fontWeight: 700, color: "var(--text)" }}>🔎 레지스트리 특이사항</span>
-        {rangeOn && (
-          <span style={{ fontSize: 11.5, padding: "2px 9px", borderRadius: 999, border: "1px solid var(--accent)", background: "color-mix(in srgb, var(--accent) 12%, transparent)", color: "var(--text-dim)" }}>
-            기간 필터 적용됨 · 시간 있는 항목 {shownCount.toLocaleString()} / {totalCount.toLocaleString()}
-          </span>
-        )}
-      </div>
-      <div style={{ fontSize: 12, color: "var(--text-faint)", marginBottom: 12 }}>레지스트리에서 점검 가치가 있는 설정을 추려 보여줍니다.</div>
-      <div style={{ position: "relative", maxWidth: 420, marginBottom: 18 }}>
-        <span style={{ position: "absolute", left: 10, top: "50%", transform: "translateY(-50%)", fontSize: 12, color: "var(--text-faint)", pointerEvents: "none" }}>🔍</span>
-        <input
-          value={search}
-          onChange={(e) => setSearch(e.target.value)}
-          placeholder="키 경로 · 값 · 이름 검색 (기타 레지스트리 포함)"
-          style={{ width: "100%", padding: "7px 26px 7px 30px", fontSize: 12.5, fontFamily: "var(--mono)", background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", color: "var(--text)", outline: "none" }}
-        />
-        {search && <span onClick={() => setSearch("")} style={{ position: "absolute", right: 8, top: "50%", transform: "translateY(-50%)", cursor: "pointer", color: "var(--text-faint)", fontSize: 13 }}>✕</span>}
-      </div>
-
-      <div style={{ display: "flex", flexWrap: "wrap", gap: 10, marginBottom: 20 }}>
-        <Tile label="의심" value={dangerCount} tone={dangerCount ? "danger" : "ok"} />
-        <Tile label="주의" value={warnCount} tone={warnCount ? "warning" : "ok"} />
-        <Tile label="전체 항목" value={data.rows.length} tone="neutral" />
-      </div>
-
-      {data.rows.length === 0 && <div style={{ color: "var(--text-faint)", fontSize: 13 }}>레지스트리 특이사항이 없습니다.</div>}
-
-      <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-        {groups.map(({ cat, icon, rows }) => (
-          <FindingSection key={cat} cat={cat} icon={icon} rows={rows} tabField={TAB_FIELD[cat]} onSelect={setDetail} bookmarkedRowids={bookmarkedRowids} />
-        ))}
-      </div>
-
-      {detail && (
-        <RfDetailModal
-          row={detail}
-          onClose={() => setDetail(null)}
-          isBookmarked={onToggleBookmark ? bookmarkedRowids?.has(Number((detail as Record<string, unknown>).__rowid)) ?? false : undefined}
-          onToggleBookmark={onToggleBookmark ? () => onToggleBookmark(Number((detail as Record<string, unknown>).__rowid)) : undefined}
-        />
-      )}
+  }, [currentGroup, rangeOn, search, selectedTab, tabField, timeRange]);
+  return <div className="dfir-view" style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", padding: "18px 20px" }}>
+    <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12 }}>
+      <h1 className="dfir-page-title" style={{ margin: 0, fontSize: 20 }}>레지스트리 특이사항</h1>
+      {rangeOn && <span style={{ color: "var(--accent)", fontSize: 11.5 }}>기간 필터 적용</span>}
     </div>
-  );
+    <div style={{ minHeight: 0, flex: 1, display: "grid", gridTemplateColumns: "210px minmax(0, 1fr)", overflow: "hidden", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", background: "var(--bg-panel)", boxShadow: "var(--shadow-card)" }}>
+      <CategoryNavigation groups={groups} selected={selectedCategory} onSelect={setSelectedCategory} />
+      <section style={{ minWidth: 0, minHeight: 0, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+        <RegistryToolbar search={search} onSearch={setSearch} tabs={tabs} activeTab={selectedTab} onTab={setSelectedTab} tabField={tabField} />
+        <RegistryLedger rows={rows} category={selectedCategory} onSelect={setDetail} bookmarkedRowids={bookmarkedRowids} onToggleBookmark={onToggleBookmark} />
+      </section>
+    </div>
+    {detail && <RowDetailPanel row={detail} columns={data.columns} focusedColumn={null} fileBaseName="RegistryFindings" onClose={() => setDetail(null)} onNavigate={() => {}} isBookmarked={onToggleBookmark ? bookmarkedRowids?.has(rowId(detail)) ?? false : undefined} onToggleBookmark={onToggleBookmark ? () => onToggleBookmark(rowId(detail)) : undefined} />}
+  </div>;
 }
 
-// One category card. When `tabField` is set (자동 실행 → user, 기타 레지스트리 →
-// subtype) it shows a tab bar and filters its rows to the active tab.
-function FindingSection({ cat, icon, rows, tabField, onSelect, bookmarkedRowids }: { cat: string; icon: string; rows: Row[]; tabField?: string; onSelect: (r: Row) => void; bookmarkedRowids?: Set<number> }) {
-  const tabs = useMemo(() => {
-    if (!tabField) return [];
-    const seen: string[] = [];
-    for (const r of rows) {
-      const v = r[tabField] || "(기타)";
-      if (!seen.includes(v)) seen.push(v);
-    }
-    return seen;
-  }, [rows, tabField]);
-  const [tab, setTab] = useState<string>("전체");
-  const filtered = tabField && tab !== "전체" ? rows.filter((r) => (r[tabField] || "(기타)") === tab) : rows;
+function CategoryNavigation({ groups, selected, onSelect }: { groups: { category: string; rows: Row[] }[]; selected: string; onSelect: (category: string) => void }) {
+  return <nav aria-label="레지스트리 범주" style={{ minHeight: 0, overflow: "auto", padding: 7, borderRight: "1px solid var(--border)" }}>
+    <div style={{ padding: "5px 7px 8px", color: "var(--text-faint)", fontSize: 11.5, fontWeight: 700 }}>레지스트리 범주</div>
+    <CategoryButton category={ALL_ITEMS} active={selected === ALL_ITEMS} onClick={() => onSelect(ALL_ITEMS)} />
+    {groups.map(({ category }) => <CategoryButton key={category} category={category} active={selected === category} onClick={() => onSelect(category)} />)}
+  </nav>;
+}
 
-  // Fixed 10 rows per page; the rest paginates.
-  const PAGE = 10;
-  const [page, setPage] = useState(0);
-  useEffect(() => setPage(0), [tab]);
-  const pageCount = Math.max(1, Math.ceil(filtered.length / PAGE));
-  const safePage = Math.min(page, pageCount - 1);
-  const shown = filtered.slice(safePage * PAGE, (safePage + 1) * PAGE);
+function CategoryButton({ category, active, onClick }: { category: string; active: boolean; onClick: () => void }) {
+  const meta = categoryMeta(category);
+  const Icon = meta.icon;
+  return <button type="button" onClick={onClick} style={{ width: "100%", minHeight: 35, padding: "0 8px", display: "flex", alignItems: "center", gap: 8, border: 0, borderLeft: `3px solid ${active ? "var(--accent)" : "transparent"}`, borderRadius: "var(--radius-sm)", background: active ? "var(--accent-subtle)" : "transparent", color: active ? "var(--text)" : "var(--text-dim)", cursor: "pointer", textAlign: "left" }}>
+    <Icon sx={{ fontSize: 16, flexShrink: 0, color: active ? "var(--accent)" : "inherit" }} />
+    <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 12.5, fontWeight: active ? 700 : 550 }}>{meta.label}</span>
+  </button>;
+}
 
-  const worst = rows.some((r) => r.status === "의심") ? "var(--danger)" : rows.some((r) => r.status === "주의") ? "var(--warning)" : "var(--border)";
-  return (
-    <section style={{ background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "var(--radius-lg)", boxShadow: "var(--shadow-card)", overflow: "hidden" }}>
-      <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "11px 14px", borderBottom: "1px solid var(--border-subtle)", borderLeft: `3px solid ${worst}` }}>
-        <span style={{ fontSize: 13, fontWeight: 700, color: "var(--text)" }}>{icon} {cat}</span>
-        <span style={{ fontSize: 12, color: "var(--text-faint)" }}>{rows.length}</span>
-      </div>
+function RegistryToolbar({ search, onSearch, tabs, activeTab, onTab, tabField }: { search: string; onSearch: (value: string) => void; tabs: string[]; activeTab: string; onTab: (value: string) => void; tabField?: string }) {
+  return <div style={{ flexShrink: 0, padding: "9px 10px", display: "flex", alignItems: "center", gap: 7, flexWrap: "wrap", borderBottom: "1px solid var(--border)" }}>
+    <div style={{ position: "relative", width: 250, maxWidth: "100%" }}>
+      <SearchOutlinedIcon sx={{ position: "absolute", left: 8, top: 7, fontSize: 17, color: "var(--text-faint)", pointerEvents: "none" }} />
+      <input value={search} onChange={(event) => onSearch(event.target.value)} aria-label="레지스트리 검색" placeholder="키 경로 · 값 · 이름 검색" style={{ width: "100%", height: 30, padding: "5px 8px 5px 31px", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", color: "var(--text)", fontSize: 12.5 }} />
+    </div>
+    {tabField && tabs.length > 1 && <><span style={{ width: 1, height: 20, background: "var(--border)" }} />{["전체", ...tabs].map((tab) => <button key={tab} type="button" onClick={() => onTab(tab)} style={{ minHeight: 28, padding: "3px 8px", border: `1px solid ${activeTab === tab ? "var(--accent)" : "var(--border)"}`, borderRadius: "var(--radius-sm)", background: activeTab === tab ? "var(--accent-subtle)" : "var(--bg-input)", color: activeTab === tab ? "var(--text)" : "var(--text-dim)", fontSize: 11.5, cursor: "pointer" }}>{tab === "(시스템)" ? "시스템" : tab}</button>)}</>}
+  </div>;
+}
 
-      {tabField && tabs.length > 1 && (
-        <div style={{ display: "flex", gap: 6, flexWrap: "wrap", padding: "8px 14px 0" }}>
-          {["전체", ...tabs].map((t) => {
-            const active = tab === t;
-            const count = t === "전체" ? rows.length : rows.filter((r) => (r[tabField] || "(기타)") === t).length;
-            const label = tabField === "user" && t !== "전체" ? (t === "(시스템)" ? t : `👤 ${t}`) : t;
-            return (
-              <button
-                key={t}
-                onClick={() => setTab(t)}
-                style={{ fontSize: 11.5, padding: "3px 10px", borderRadius: 999, cursor: "pointer", whiteSpace: "nowrap",
-                  background: active ? "var(--accent-subtle)" : "transparent",
-                  color: active ? "var(--accent)" : "var(--text-dim)",
-                  border: `1px solid ${active ? "var(--accent)" : "var(--border)"}` }}
-              >
-                {label} <span style={{ color: "var(--text-faint)" }}>{count.toLocaleString()}</span>
-              </button>
-            );
-          })}
-        </div>
-      )}
-
-      <div style={{ padding: "6px 14px 12px" }}>
-        {shown.map((r, i) => (
-          <div
-            key={i}
-            onClick={() => onSelect(r)}
-            onMouseEnter={(e) => (e.currentTarget.style.background = "var(--bg-hover)")}
-            onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
-            style={{ padding: "8px 8px", margin: "0 -8px", borderRadius: "var(--radius-sm)", borderBottom: i < shown.length - 1 ? "1px solid var(--border-subtle)" : "none", cursor: "pointer", boxShadow: (bookmarkedRowids?.has(Number((r as Record<string, unknown>).__rowid)) ?? false) ? "inset 3px 0 0 var(--warning)" : undefined }}
-            title="클릭하면 레지스트리 키·값 상세 보기"
-          >
-            <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-              <span style={{ fontSize: 12.5, fontWeight: 600, color: "var(--text)", wordBreak: "break-all" }}>{r.name}</span>
-              <Pill text={r.status} color={statusColor(r.status)} />
-              {r.subtype && <span style={{ fontSize: 10, color: "var(--text-faint)", border: "1px solid var(--border)", borderRadius: 4, padding: "0 5px" }}>{r.subtype}</span>}
-              {(r.detail === "Run" || r.detail === "RunOnce" || r.detail === "Policy Run") && (
-                <span style={{ fontSize: 10, color: "var(--text-faint)", border: "1px solid var(--border)", borderRadius: 4, padding: "0 5px" }}>{r.detail}</span>
-              )}
-              {r.user && r.user !== "(시스템)" && <span style={{ fontSize: 10.5, color: "var(--text-faint)" }}>👤 {r.user}</span>}
-            </div>
-            {r.value && (
-              <div style={{ fontSize: looksLikePath(r.value) ? 12.5 : 12, fontWeight: looksLikePath(r.value) ? 600 : 400, color: looksLikePath(r.value) ? "var(--accent)" : "var(--text-dim)", fontFamily: "var(--mono)", marginTop: 3, wordBreak: "break-all" }}>
-                {looksLikePath(r.value) ? "📂 " : ""}{r.value}
-              </div>
-            )}
-            {r.detail && !["Run", "RunOnce", "Policy Run"].includes(r.detail) && r.subtype === "ShimCache" && (
-              <div style={{ fontSize: 10.5, color: "var(--text-faint)", marginTop: 3 }}>{r.detail}</div>
-            )}
-            {r.key_path && (
-              <div style={{ fontSize: 10.5, color: "var(--text-faint)", fontFamily: "var(--mono)", marginTop: 3, wordBreak: "break-all" }} title={r.key_path}>
-                🔑 {r.key_path}{r.source ? `  ·  ${r.source}` : ""}
-              </div>
-            )}
-            {r.timestamp && (
-              <div style={{ fontSize: 10.5, color: "var(--text-dim)", fontFamily: "var(--mono)", marginTop: 2 }}>🕑 {r.timestamp}</div>
-            )}
+function RegistryLedger({ rows, category, onSelect, bookmarkedRowids, onToggleBookmark }: { rows: Row[]; category: string; onSelect: (row: Row) => void; bookmarkedRowids?: Set<number>; onToggleBookmark?: (rowid: number) => void }) {
+  const Icon = categoryMeta(category).icon;
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const virtualizer = useVirtualizer({ count: rows.length, getScrollElement: () => scrollRef.current, estimateSize: () => ROW_HEIGHT, overscan: 12 });
+  const grid = "48px minmax(185px, .8fr) minmax(240px, 1.2fr) minmax(120px, .55fr) minmax(185px, .9fr) 170px 34px";
+  if (!rows.length) return <div style={{ minHeight: 180, display: "grid", placeItems: "center", color: "var(--text-faint)", fontSize: 13 }}>검색·탭·기간 조건에 일치하는 레지스트리 항목 없음</div>;
+  return <div ref={scrollRef} style={{ flex: 1, minHeight: 0, overflow: "auto" }}>
+    <div style={{ minWidth: 1050 }}>
+      <div style={{ display: "grid", gridTemplateColumns: grid, gap: 12, minHeight: 34, alignItems: "center", padding: "0 12px", borderBottom: "1px solid var(--border)", color: "var(--text-faint)", fontSize: 10.5, fontWeight: 700 }}><span>상태</span><span>항목</span><span>값 / 명령</span><span>사용자</span><span>레지스트리 키</span><span>시간</span><span aria-label="북마크" /></div>
+      <div style={{ height: virtualizer.getTotalSize(), position: "relative" }}>{virtualizer.getVirtualItems().map((virtualRow) => {
+        const row = rows[virtualRow.index];
+        const bookmarked = bookmarkedRowids?.has(rowId(row)) ?? false;
+        const tone = statusTone(row.status);
+        const value = row.command || row.value;
+        return <div key={virtualRow.key} style={{ position: "absolute", top: 0, left: 0, width: "100%", height: ROW_HEIGHT, transform: `translateY(${virtualRow.start}px)`, display: "grid", gridTemplateColumns: "minmax(0, 1fr) 34px", gap: 12, alignItems: "center", padding: "0 12px", borderBottom: "1px solid var(--border-subtle)", borderLeft: bookmarked ? "3px solid var(--warning)" : "3px solid transparent", background: bookmarked ? "color-mix(in srgb, var(--warning) 12%, var(--bg-panel))" : "transparent" }}>
+          <div role="button" tabIndex={0} aria-label={`${row.name || "레지스트리 항목"} 상세 보기`} onClick={() => onSelect(row)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); onSelect(row); } }} style={{ minWidth: 0, height: "100%", display: "grid", gridTemplateColumns: "48px minmax(185px, .8fr) minmax(240px, 1.2fr) minmax(120px, .55fr) minmax(185px, .9fr) 170px", gap: 12, alignItems: "center", cursor: "pointer", outlineOffset: -3 }}>
+            <span><span style={{ display: "inline-flex", padding: "2px 6px", borderRadius: "var(--radius-sm)", background: tone.bg, color: tone.fg, border: `1px solid ${tone.border}`, fontSize: 10.5, fontWeight: 700 }}>{row.status || "정보"}</span></span>
+            <span style={{ minWidth: 0, display: "flex", alignItems: "center", gap: 6, overflow: "hidden" }}><Icon sx={{ fontSize: 15, flexShrink: 0, color: "var(--text-faint)" }} /><span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text)", fontSize: 12.5, fontWeight: 650 }}>{row.name || "값 이름 없음"}</span></span>
+            <span title={value || undefined} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: looksLikePath(value) ? "var(--accent)" : "var(--text-dim)", fontFamily: looksLikePath(value) ? "var(--mono)" : "var(--sans)", fontSize: 12 }}>{value || "값 없음"}</span>
+            <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text-dim)", fontSize: 12 }}>{row.user || "계정 정보 없음"}</span>
+            <span title={row.key_path || undefined} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text-faint)", fontFamily: "var(--mono)", fontSize: 11 }}>{row.key_path || "키 경로 없음"}</span>
+            <span style={{ color: row.timestamp ? "var(--text-time)" : "var(--text-faint)", fontSize: 11.5, fontVariantNumeric: "tabular-nums", whiteSpace: "nowrap" }}>{row.timestamp || "시간 정보 없음"}</span>
           </div>
-        ))}
-        {pageCount > 1 && (
-          <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8, marginTop: 10 }}>
-            <button onClick={() => setPage(safePage - 1)} disabled={safePage === 0} style={pgBtn(safePage === 0)}>‹ 이전</button>
-            <span style={{ fontSize: 11.5, color: "var(--text-dim)" }}>
-              {safePage + 1} / {pageCount} <span style={{ color: "var(--text-faint)" }}>({(safePage * PAGE + 1).toLocaleString()}–{Math.min((safePage + 1) * PAGE, filtered.length).toLocaleString()} / {filtered.length.toLocaleString()})</span>
-            </span>
-            <button onClick={() => setPage(safePage + 1)} disabled={safePage >= pageCount - 1} style={pgBtn(safePage >= pageCount - 1)}>다음 ›</button>
-          </div>
-        )}
-      </div>
-    </section>
-  );
-}
-
-const pgBtn = (disabled: boolean): React.CSSProperties => ({ fontSize: 11.5, padding: "3px 10px", background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", color: "var(--text-dim)", cursor: disabled ? "default" : "pointer", opacity: disabled ? 0.4 : 1 });
-
-function RfDetailModal({ row, onClose, isBookmarked, onToggleBookmark }: { row: Row; onClose: () => void; isBookmarked?: boolean; onToggleBookmark?: () => void }) {
-  const kind = row.detail === "Run" || row.detail === "RunOnce" || row.detail === "Policy Run" ? row.detail : "";
-  // Secondary fields. No explanation line — just what the registry actually holds.
-  const meta: [string, string][] = [
-    ["분류", row.category],
-    ["항목(값 이름)", row.name],
-    ["자동실행 위치", kind],
-    ["사용자", row.user && row.user !== "(시스템)" ? row.user : ""],
-  ];
-  return (
-    <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(1,4,9,0.6)", zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
-      <div onClick={(e) => e.stopPropagation()} style={{ width: 660, maxWidth: "100%", maxHeight: "82vh", overflow: "auto", background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "var(--radius-lg)", boxShadow: "var(--shadow-panel)" }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "14px 18px", borderBottom: "1px solid var(--border)", borderLeft: `3px solid ${statusColor(row.status)}` }}>
-          <span style={{ fontSize: 15, fontWeight: 700, wordBreak: "break-all" }}>{row.name}</span>
-          <Pill text={row.status} color={statusColor(row.status)} />
-          {onToggleBookmark && (
-            <button
-              onClick={onToggleBookmark}
-              title={isBookmarked ? "북마크 해제" : "북마크에 추가"}
-              style={{ marginLeft: "auto", display: "inline-flex", alignItems: "center", gap: 5, fontSize: 11.5, padding: "4px 10px", background: isBookmarked ? "var(--warning-subtle)" : "transparent", color: isBookmarked ? "var(--warning)" : "var(--text-dim)", border: `1px solid ${isBookmarked ? "var(--warning)" : "var(--border)"}`, borderRadius: "var(--radius-lg)", cursor: "pointer", fontWeight: 600 }}
-            >
-              {isBookmarked ? "★ 북마크됨" : "☆ 북마크"}
-            </button>
-          )}
-          <button onClick={onClose} style={{ marginLeft: onToggleBookmark ? 8 : "auto", background: "transparent", border: "none", color: "var(--text-faint)", fontSize: 18, cursor: "pointer" }}>×</button>
-        </div>
-        <div style={{ padding: "14px 18px 18px" }}>
-          {row.timestamp && (
-            <div style={{ fontSize: 13, color: "var(--text)", fontFamily: "var(--mono)", fontWeight: 600, marginBottom: 12 }}>
-              🕑 {row.timestamp} <span style={{ fontSize: 10.5, color: "var(--text-faint)", fontFamily: "var(--sans)", fontWeight: 400 }}>({row.subtype === "ShimCache" ? "파일 수정 시각" : "키 마지막 수정"})</span>
-            </div>
-          )}
-          {/* The raw registry key + value. */}
-          <div style={{ fontSize: 11, fontWeight: 700, color: "var(--text-faint)", marginBottom: 6 }}>🔑 레지스트리 키 · 값</div>
-          <div style={{ background: "var(--bg)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", padding: "12px 14px", marginBottom: 16, fontFamily: "var(--mono)" }}>
-            <EvRow label="키 경로" value={row.key_path} />
-            <EvRow label="값 이름" value={row.name} />
-            <EvRow label="값" value={row.value} highlight />
-            {row.command && <EvRow label="명령" value={row.command} highlight />}
-            <EvRow label="하이브" value={row.source} last />
-          </div>
-          {meta.filter(([, v]) => v).map(([k, v]) => (
-            <div key={k} style={{ display: "flex", gap: 12, padding: "7px 0", borderBottom: "1px solid var(--border-subtle)" }}>
-              <span style={{ flex: "0 0 108px", color: "var(--text-faint)", fontSize: 12 }}>{k}</span>
-              <span style={{ flex: 1, color: "var(--text)", fontSize: 12.5, wordBreak: "break-all" }}>{v}</span>
-            </div>
-          ))}
-        </div>
-      </div>
+          <Tooltip title={bookmarked ? "북마크 해제" : "북마크"}><span><IconButton aria-label={bookmarked ? "북마크 해제" : "북마크"} disabled={!onToggleBookmark} size="small" onClick={() => onToggleBookmark?.(rowId(row))} sx={{ color: bookmarked ? "var(--warning)" : "var(--text-faint)", borderRadius: "var(--radius-sm)" }}>{bookmarked ? <BookmarkIcon sx={{ fontSize: 17 }} /> : <BookmarkBorderOutlinedIcon sx={{ fontSize: 17 }} />}</IconButton></span></Tooltip>
+        </div>;
+      })}</div>
     </div>
-  );
-}
-
-function EvRow({ label, value, highlight, last }: { label: string; value: string; highlight?: boolean; last?: boolean }) {
-  return (
-    <div style={{ display: "flex", gap: 12, padding: "6px 0", borderBottom: last ? "none" : "1px solid var(--border-subtle)", alignItems: "baseline" }}>
-      <span style={{ flex: "0 0 70px", color: "var(--text-faint)", fontSize: 11, fontFamily: "var(--sans)" }}>{label}</span>
-      <span style={{ flex: 1, color: highlight ? "var(--accent)" : "var(--text)", fontSize: 13, fontWeight: highlight ? 700 : 500, wordBreak: "break-all", whiteSpace: "pre-wrap" }}>{value || "—"}</span>
-    </div>
-  );
-}
-
-function Tile({ label, value, tone }: { label: string; value: number; tone: "ok" | "warning" | "danger" | "neutral" }) {
-  const color = tone === "danger" ? "var(--danger)" : tone === "warning" ? "var(--warning)" : tone === "ok" ? "var(--success)" : "var(--accent)";
-  return (
-    <div style={{ minWidth: 110, padding: "10px 14px", background: "var(--bg-panel)", border: "1px solid var(--border)", borderLeft: `3px solid ${color}`, borderRadius: "var(--radius-md)" }}>
-      <div style={{ fontSize: 11, color: "var(--text-faint)" }}>{label}</div>
-      <div style={{ fontSize: 18, fontWeight: 800, color }}>{value.toLocaleString()}</div>
-    </div>
-  );
-}
-
-function Pill({ text, color }: { text: string; color: string }) {
-  return <span style={{ fontSize: 10.5, fontWeight: 700, color, border: `1px solid ${color}`, borderRadius: 4, padding: "0 6px", whiteSpace: "nowrap" }}>{text}</span>;
+  </div>;
 }

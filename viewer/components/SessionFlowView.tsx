@@ -1,9 +1,15 @@
 "use client";
 
 import { useMemo, useState } from "react";
+import BookmarkBorderOutlinedIcon from "@mui/icons-material/BookmarkBorderOutlined";
+import BookmarkOutlinedIcon from "@mui/icons-material/BookmarkOutlined";
+import CloseOutlinedIcon from "@mui/icons-material/CloseOutlined";
+import KeyboardArrowDownOutlinedIcon from "@mui/icons-material/KeyboardArrowDownOutlined";
+import KeyboardArrowRightOutlinedIcon from "@mui/icons-material/KeyboardArrowRightOutlined";
+import SearchOutlinedIcon from "@mui/icons-material/SearchOutlined";
 import type { CsvData, FetchLinkedRows } from "@/lib/types";
 import { getArtifactView } from "@/lib/artifactViews";
-import { inRange, EMPTY_TIME_RANGE, type TimeRange } from "@/lib/timeRange";
+import { formatEvidenceTimestamp, inRange, EMPTY_TIME_RANGE, type TimeRange } from "@/lib/timeRange";
 import RowDetailPanel from "./RowDetailPanel";
 
 // A gap longer than this between consecutive events of the same peer starts a
@@ -13,7 +19,7 @@ import RowDetailPanel from "./RowDetailPanel";
 const SESSION_GAP_MS = 10 * 60 * 1000;
 
 const DIRECTION_LABEL: Record<string, string> = { inbound: "인바운드", outbound: "아웃바운드" };
-const DIRECTION_COLOR: Record<string, string> = { inbound: "var(--warning)", outbound: "var(--accent)" };
+const DIRECTION_COLOR: Record<string, string> = { inbound: "#7387a5", outbound: "var(--accent)" };
 const RESULT_COLOR: Record<string, string> = { 성공: "var(--success)", 실패: "var(--danger)", 정보: "var(--text-faint)" };
 
 // Providers report the account differently — bare "Administrator" from
@@ -152,17 +158,6 @@ export default function SessionFlowView({
     });
   }, [allSessions, dirFilter, resultFilter, query, hostIpMap]);
 
-  const totals = useMemo(() => {
-    let inbound = 0, outbound = 0, success = 0, fail = 0;
-    for (const s of allSessions) {
-      if (s.direction === "inbound") inbound++;
-      else if (s.direction === "outbound") outbound++;
-      success += s.success;
-      fail += s.fail;
-    }
-    return { inbound, outbound, success, fail };
-  }, [allSessions]);
-
   function toggle(key: string) {
     setExpanded((prev) => {
       const next = new Set(prev);
@@ -174,8 +169,8 @@ export default function SessionFlowView({
 
   const dirTabs = [
     { label: "전체", value: undefined as string | undefined },
-    { label: `인바운드 ${totals.inbound}`, value: "inbound" },
-    { label: `아웃바운드 ${totals.outbound}`, value: "outbound" },
+    { label: "인바운드", value: "inbound" },
+    { label: "아웃바운드", value: "outbound" },
   ];
   const resultTabs: { label: string; value: ResultFilter; color?: string }[] = [
     { label: "모든 결과", value: "all" },
@@ -188,27 +183,23 @@ export default function SessionFlowView({
       {/* toolbar */}
       <div style={{ padding: "10px 14px", borderBottom: "1px solid var(--border)", background: "var(--bg-panel)", flexShrink: 0, display: "flex", flexDirection: "column", gap: 9 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
-          <strong style={{ fontSize: 13.5 }}>{isSmb ? "📁 SMB 연결 (네트워크 인증)" : "🖥️ 원격 데스크톱 세션 흐름"}</strong>
-          <span style={{ color: "var(--text-faint)", fontSize: 11.5 }}>
-            {sessions.length.toLocaleString()} / {allSessions.length.toLocaleString()}개 세션
-          </span>
-          <span style={{ marginLeft: "auto", display: "flex", gap: 10, fontSize: 11, color: "var(--text-faint)" }}>
-            <span style={{ color: "var(--success)" }}>● 성공 {totals.success.toLocaleString()}</span>
-            <span style={{ color: "var(--danger)" }}>● 실패 {totals.fail.toLocaleString()}</span>
-          </span>
+          <strong style={{ fontSize: 15, color: "var(--text)" }}>{isSmb ? "SMB 연결 이력" : "원격 접근 이력 (RDP)"}</strong>
         </div>
 
         <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
           {/* IP / account search */}
           <div style={{ position: "relative", flex: "1 1 220px", maxWidth: 340 }}>
-            <span style={{ position: "absolute", left: 10, top: "50%", transform: "translateY(-50%)", fontSize: 12, color: "var(--text-faint)", pointerEvents: "none" }}>🔍</span>
+            <SearchOutlinedIcon aria-hidden="true" sx={{ position: "absolute", left: 9, top: "50%", transform: "translateY(-50%)", fontSize: 17, color: "var(--text-faint)", pointerEvents: "none" }} />
             <input
               value={query}
               onChange={(e) => setQuery(e.target.value)}
               placeholder="IP 또는 계정 검색"
+              aria-label="IP 또는 계정 검색"
+              onFocus={(e) => { e.currentTarget.style.outline = "2px solid var(--accent)"; e.currentTarget.style.outlineOffset = "2px"; }}
+              onBlur={(e) => { e.currentTarget.style.outline = "none"; }}
               style={{
                 width: "100%",
-                padding: "6px 26px 6px 30px",
+                padding: "6px 32px 6px 30px",
                 fontSize: 12.5,
                 fontFamily: "var(--mono)",
                 background: "var(--bg-elevated)",
@@ -219,9 +210,7 @@ export default function SessionFlowView({
               }}
             />
             {query && (
-              <span onClick={() => setQuery("")} style={{ position: "absolute", right: 8, top: "50%", transform: "translateY(-50%)", cursor: "pointer", color: "var(--text-faint)", fontSize: 13 }}>
-                ✕
-              </span>
+              <button aria-label="검색어 지우기" onClick={() => setQuery("")} style={{ position: "absolute", right: 5, top: "50%", transform: "translateY(-50%)", display: "inline-flex", padding: 2, border: "none", background: "transparent", color: "var(--text-faint)", cursor: "pointer" }}><CloseOutlinedIcon sx={{ fontSize: 16 }} /></button>
             )}
           </div>
 
@@ -230,7 +219,9 @@ export default function SessionFlowView({
         </div>
       </div>
 
-      <div style={{ flex: 1, minHeight: 0, overflow: "auto", padding: 12, display: "flex", flexDirection: "column", gap: 8 }}>
+      <div style={{ flex: 1, minHeight: 0, overflow: "auto", padding: 12 }}>
+        <div style={{ border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", background: "var(--bg-panel)", overflow: "hidden" }}>
+        {sessions.length > 0 && <div style={{ display: "grid", gridTemplateColumns: "28px 78px minmax(150px,1.5fr) minmax(90px,.8fr) 236px 96px 54px", gap: 8, padding: "7px 10px", borderBottom: "1px solid var(--border)", color: "var(--text-faint)", fontSize: 10.5, fontWeight: 700 }}><span /><span>방향</span><span>종단점 / 호스트</span><span>계정</span><span>시작 / 종료</span><span>결과</span><span>이벤트</span></div>}
         {sessions.length === 0 && (
           <div style={{ color: "var(--text-faint)", textAlign: "center", padding: 24 }}>
             {allSessions.length === 0 ? "세션이 없습니다." : "조건에 맞는 세션이 없습니다."}
@@ -244,27 +235,27 @@ export default function SessionFlowView({
               key={s.key}
               style={{
                 flexShrink: 0,
-                border: "1px solid var(--border)",
+                borderTop: "1px solid var(--border-subtle)",
                 borderLeft: `3px solid ${dirColor}`,
-                borderRadius: "var(--radius-md)",
-                background: "var(--bg-panel)",
-                overflow: "hidden",
-                transition: "border-color .12s",
               }}
             >
-              <div
+              <button
+                type="button"
                 onClick={() => toggle(s.key)}
-                style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 12px", cursor: "pointer" }}
+                aria-expanded={open}
+                style={{ width: "100%", display: "grid", gridTemplateColumns: "28px 78px minmax(150px,1.5fr) minmax(90px,.8fr) 236px 96px 54px", alignItems: "center", gap: 8, padding: "9px 10px", cursor: "pointer", textAlign: "left", color: "var(--text)", border: "none", background: "transparent", borderLeft: "none", outlineOffset: -2 }}
                 onMouseEnter={(e) => (e.currentTarget.style.background = "var(--bg-hover)")}
                 onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+                onFocus={(e) => { e.currentTarget.style.outline = "2px solid var(--accent)"; }}
+                onBlur={(e) => { e.currentTarget.style.outline = "none"; }}
               >
-                <span style={{ fontSize: 10, color: "var(--text-faint)", width: 10 }}>{open ? "▾" : "▸"}</span>
+                {open ? <KeyboardArrowDownOutlinedIcon aria-hidden="true" sx={{ fontSize: 18, color: "var(--text-faint)" }} /> : <KeyboardArrowRightOutlinedIcon aria-hidden="true" sx={{ fontSize: 18, color: "var(--text-faint)" }} />}
                 <span
                   style={{
                     fontSize: 10.5,
                     fontWeight: 700,
                     padding: "2px 9px",
-                    borderRadius: 999,
+                    borderRadius: "var(--radius-sm)",
                     color: dirColor,
                     background: `color-mix(in srgb, ${dirColor} 14%, transparent)`,
                     border: `1px solid ${dirColor}`,
@@ -276,7 +267,7 @@ export default function SessionFlowView({
                 <span style={{ display: "inline-flex", alignItems: "baseline", gap: 6, minWidth: 120 }}>
                   {hostIpMap[s.remote_address] ? (
                     <>
-                      <span style={{ fontSize: 12.5, fontWeight: 700, color: "var(--accent)" }}>🖥️ {hostIpMap[s.remote_address].name}</span>
+                      <span style={{ fontSize: 12.5, fontWeight: 700, color: "var(--text)" }}>{hostIpMap[s.remote_address].name}</span>
                       <span style={{ fontFamily: "var(--mono)", fontSize: 11, color: "var(--text-faint)" }}>{s.remote_address}</span>
                     </>
                   ) : (
@@ -284,47 +275,56 @@ export default function SessionFlowView({
                   )}
                 </span>
                 {s.account && (
-                  <span style={{ fontSize: 11.5, fontWeight: 600, color: "var(--text)", padding: "1px 8px", borderRadius: 999, background: "var(--bg-elevated)", border: "1px solid var(--border-subtle)" }}>
-                    👤 {s.account}
-                  </span>
+                  <span style={{ fontSize: 11.5, fontWeight: 600, color: "var(--text)" }}>{s.account}</span>
                 )}
-                <span style={{ fontSize: 11.5, color: "var(--text-time)", fontFamily: "var(--mono)" }}>
-                  {s.start.slice(0, 19)} <span style={{ opacity: 0.6 }}>~ {s.end.slice(11, 19) || s.end}</span>
+                <span style={{ fontSize: 11.5, color: "var(--text-time)", fontFamily: "var(--mono)", whiteSpace: "nowrap" }}>
+                  {formatEvidenceTimestamp(s.start)} <span style={{ opacity: 0.6 }}>~ {formatEvidenceTimestamp(s.end)}</span>
                 </span>
-                <span style={{ marginLeft: "auto", display: "flex", gap: 6, alignItems: "center", fontSize: 10.5 }}>
+                <span style={{ display: "flex", gap: 4, alignItems: "center", fontSize: 10.5 }}>
                   {s.success > 0 && <Pill color="var(--success)">성공 {s.success}</Pill>}
                   {s.fail > 0 && <Pill color="var(--danger)">실패 {s.fail}</Pill>}
-                  <span style={{ color: "var(--text-faint)" }}>{s.events.length}건</span>
                 </span>
-              </div>
+                <span style={{ color: "var(--text-faint)", fontFamily: "var(--mono)", fontSize: 11 }}>{s.events.length}건</span>
+              </button>
               {open && (
-                <div style={{ borderTop: "1px solid var(--border)", padding: "4px 0", background: "color-mix(in srgb, var(--bg-elevated) 40%, transparent)" }}>
+                <div style={{ borderTop: "1px solid var(--border-subtle)", background: "color-mix(in srgb, var(--bg-elevated) 40%, transparent)" }}>
                   {s.events.map((ev, i) => {
                     const bm = (bookmarkedRowids?.has(ev.rowid) ?? false) && Number.isFinite(ev.rowid);
                     const bmBg = bm ? "color-mix(in srgb, var(--warning) 14%, transparent)" : "transparent";
                     return (
                     <div
                       key={i}
+                      role="button"
+                      tabIndex={0}
                       onClick={() => setSelected(ev.row)}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter" || event.key === " ") {
+                          event.preventDefault();
+                          setSelected(ev.row);
+                        }
+                      }}
                       style={{ display: "flex", alignItems: "center", gap: 10, padding: "5px 12px 5px 30px", cursor: "pointer", fontSize: 12, background: bmBg, boxShadow: bm ? "inset 3px 0 0 var(--warning)" : undefined }}
                       onMouseEnter={(e) => (e.currentTarget.style.background = "var(--bg-hover)")}
                       onMouseLeave={(e) => (e.currentTarget.style.background = bmBg)}
+                      onFocus={(e) => { e.currentTarget.style.outline = "2px solid var(--accent)"; e.currentTarget.style.outlineOffset = "-2px"; }}
+                      onBlur={(e) => { e.currentTarget.style.outline = "none"; }}
                     >
-                      <span style={{ fontFamily: "var(--mono)", fontSize: 11.5, color: "var(--text-time)", width: 168, flexShrink: 0 }}>{ev.timestamp}</span>
+                      <span style={{ fontFamily: "var(--mono)", fontSize: 11.5, color: "var(--text-time)", width: 236, flexShrink: 0 }}>{formatEvidenceTimestamp(ev.timestamp)}</span>
                       <span style={{ width: 8, height: 8, borderRadius: "50%", flexShrink: 0, background: RESULT_COLOR[ev.result] ?? "var(--text-faint)" }} />
                       <span style={{ flex: 1 }}>{ev.description}</span>
-                      {ev.account && ev.account !== s.account && <span style={{ color: "var(--text-dim)", fontSize: 11 }}>👤 {ev.account}</span>}
+                      {ev.account && ev.account !== s.account && <span style={{ color: "var(--text-dim)", fontSize: 11 }}>{ev.account}</span>}
                       {onToggleBookmark && Number.isFinite(ev.rowid) && (
-                        <span
+                        <button
                           onClick={(e) => {
                             e.stopPropagation();
                             onToggleBookmark(ev.rowid);
                           }}
                           title={bookmarkedRowids?.has(ev.rowid) ? "북마크 해제" : "북마크에 추가"}
-                          style={{ cursor: "pointer", color: bookmarkedRowids?.has(ev.rowid) ? "var(--warning)" : "var(--text-faint)" }}
+                          aria-label={bookmarkedRowids?.has(ev.rowid) ? "북마크 해제" : "북마크"}
+                          style={{ display: "inline-flex", padding: 1, border: "none", background: "transparent", cursor: "pointer", color: bookmarkedRowids?.has(ev.rowid) ? "var(--warning)" : "var(--text-faint)" }}
                         >
-                          {bookmarkedRowids?.has(ev.rowid) ? "★" : "☆"}
-                        </span>
+                          {bookmarkedRowids?.has(ev.rowid) ? <BookmarkOutlinedIcon sx={{ fontSize: 16 }} /> : <BookmarkBorderOutlinedIcon sx={{ fontSize: 16 }} />}
+                        </button>
                       )}
                     </div>
                     );
@@ -334,6 +334,7 @@ export default function SessionFlowView({
             </div>
           );
         })}
+        </div>
       </div>
 
       {selected && spec && (

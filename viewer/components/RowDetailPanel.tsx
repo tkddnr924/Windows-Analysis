@@ -1,8 +1,12 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import CheckIcon from "@mui/icons-material/Check";
+import ChevronRightOutlinedIcon from "@mui/icons-material/ChevronRightOutlined";
+import ContentCopyOutlinedIcon from "@mui/icons-material/ContentCopyOutlined";
 import { resolveArtifactView, getArtifactView } from "@/lib/artifactViews";
 import type { FetchLinkedRows } from "@/lib/types";
+import { useModalDialog } from "@/lib/useModalDialog";
 import ArtifactDetailView from "./ArtifactDetailView";
 
 interface RowDetailPanelProps {
@@ -13,10 +17,19 @@ interface RowDetailPanelProps {
   onClose: () => void;
   onNavigate: (targetFile: string, targetColumn: string, value: string) => void;
   onFetchLinkedRows?: FetchLinkedRows;
+  /** Host evidence directory for Browser Cache body recovery. */
+  hostDir?: string;
   /** Bookmark state + toggle for this row, bound by the parent. Omitted when
    * the host view has no bookmarking (then no bookmark control is shown). */
   isBookmarked?: boolean;
   onToggleBookmark?: () => void;
+  /** Render inside a persistent view column instead of as an overlay drawer. */
+  variant?: "drawer" | "docked";
+  /** Optional stable field-level bookmark contract. Used by MFT SI/FN times. */
+  onToggleFieldBookmark?: (field: string) => void;
+  isFieldBookmarked?: (field: string) => boolean;
+  /** Cross-artifact evidence links shown by the same shared detail surface. */
+  relatedEvidence?: { id: string; label: string; subtitle?: string; onOpen: () => void }[];
 }
 
 function tryPrettyJson(value: string): string | null {
@@ -42,38 +55,70 @@ function unescapeWhitespace(s: string): string {
 
 function RawFieldValue({ column, value, focused }: { column: string; value: string; focused: boolean }) {
   const [copied, setCopied] = useState(false);
+  const [copyError, setCopyError] = useState(false);
   const [beautified, setBeautified] = useState(true);
   const [unescaped, setUnescaped] = useState(false);
   const pretty = tryPrettyJson(value);
   const isJson = pretty !== null;
   const hasEscapes = /\\[rnt]/.test(value);
-  const baseText = isJson && beautified ? pretty! : value || "(empty)";
+  const baseText = isJson && beautified ? pretty! : value;
   const shownText = unescaped ? unescapeWhitespace(baseText) : baseText;
+  const isEmpty = !value;
 
-  function copy() {
-    navigator.clipboard.writeText(value).then(() => {
+  async function copy() {
+    try {
+      await navigator.clipboard.writeText(value);
       setCopied(true);
+      setCopyError(false);
       setTimeout(() => setCopied(false), 1200);
-    });
+    } catch {
+      setCopyError(true);
+      setTimeout(() => setCopyError(false), 2400);
+    }
   }
 
   return (
     <div
       style={{
+        display: "grid",
+        gridTemplateColumns: "minmax(118px, 32%) minmax(0, 1fr) auto",
+        alignItems: "start",
+        columnGap: 12,
         padding: "10px 16px",
         borderBottom: "1px solid var(--border-subtle)",
         background: focused ? "var(--accent-subtle)" : "transparent",
         borderLeft: `2px solid ${focused ? "var(--accent)" : "transparent"}`,
       }}
     >
-      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
-        <span style={{ color: "var(--accent)", fontWeight: 600, fontFamily: "var(--mono)", fontSize: 12 }}>{column}</span>
-        {isJson && (
+      <div style={{ paddingTop: 2, minWidth: 0 }}>
+        <div style={{ color: focused ? "var(--accent)" : "var(--text-dim)", fontWeight: 650, fontFamily: "var(--mono)", fontSize: 11.5, overflowWrap: "anywhere" }}>{column}</div>
+      </div>
+      <div style={{ minWidth: 0 }}>
+        {isEmpty ? (
+          <span style={{ fontSize: 12, color: "var(--text-faint)" }}>값 없음</span>
+        ) : (
+          <pre
+            style={{
+              margin: 0,
+              fontFamily: "var(--mono)",
+              fontSize: 12,
+              lineHeight: 1.48,
+              whiteSpace: "pre-wrap",
+              wordBreak: "break-all",
+              color: "var(--text)",
+            }}
+          >
+            {shownText}
+          </pre>
+        )}
+      </div>
+      {!isEmpty && (
+        <div style={{ display: "inline-flex", alignItems: "center", gap: 4, paddingTop: 0 }}>
+          {isJson && (
           <button
             onClick={() => setBeautified((b) => !b)}
             title={beautified ? "원본(압축) 보기" : "보기 좋게 정렬"}
             style={{
-              marginLeft: "auto",
               fontSize: 11,
               padding: "2px 8px",
               background: "var(--bg-elevated)",
@@ -91,7 +136,6 @@ function RawFieldValue({ column, value, focused }: { column: string; value: stri
             onClick={() => setUnescaped((u) => !u)}
             title={unescaped ? "이스케이프 원본(\\r \\n \\t) 보기" : "\\r \\n \\t 를 실제 줄바꿈·탭으로 치환"}
             style={{
-              marginLeft: isJson ? 0 : "auto",
               fontSize: 11,
               padding: "2px 8px",
               background: unescaped ? "var(--accent-subtle)" : "var(--bg-elevated)",
@@ -106,10 +150,15 @@ function RawFieldValue({ column, value, focused }: { column: string; value: stri
         )}
         <button
           onClick={copy}
+          title={copyError ? "복사 실패" : copied ? "복사됨" : "값 복사"}
+          aria-label={copyError ? `${column} 복사 실패` : copied ? `${column} 복사됨` : `${column} 값 복사`}
           style={{
-            marginLeft: isJson || hasEscapes ? 0 : "auto",
-            fontSize: 11,
-            padding: "2px 8px",
+            display: "inline-flex",
+            alignItems: "center",
+            justifyContent: "center",
+            width: 28,
+            height: 24,
+            padding: 0,
             background: "var(--bg-elevated)",
             color: "var(--text-dim)",
             border: "1px solid var(--border)",
@@ -117,33 +166,22 @@ function RawFieldValue({ column, value, focused }: { column: string; value: stri
             cursor: "pointer",
           }}
         >
-          {copied ? "복사됨" : "복사"}
+          {copied ? <CheckIcon sx={{ fontSize: 15, color: "var(--success)" }} /> : <ContentCopyOutlinedIcon sx={{ fontSize: 14, color: copyError ? "var(--danger)" : undefined }} />}
         </button>
-      </div>
-      <pre
-        style={{
-          margin: 0,
-          fontFamily: "var(--mono)",
-          fontSize: 12.5,
-          whiteSpace: "pre-wrap",
-          wordBreak: "break-all",
-          color: value ? "var(--text)" : "var(--text-faint)",
-        }}
-      >
-        {shownText}
-      </pre>
+        {copyError && <span role="status" style={{ color: "var(--danger)", fontSize: 10.5, whiteSpace: "nowrap" }}>복사 실패</span>}
+        </div>
+      )}
     </div>
   );
 }
 
-export default function RowDetailPanel({ row, columns, focusedColumn, fileBaseName, onClose, onNavigate, onFetchLinkedRows, isBookmarked, onToggleBookmark }: RowDetailPanelProps) {
-  // EventLog-derived overview rows (PowerShell/RDP/SMB correlations) carry only
-  // a `record_key` link to the raw event, not the event itself. To give ONE
-  // detail everywhere, when such a link exists we load the linked raw EventLog
-  // row and show the shared EventLog detail for it — so a PowerShell command
-  // and its source Security/PowerShell event render the exact same panel.
+export default function RowDetailPanel({ row, columns, focusedColumn, fileBaseName, onClose, onNavigate, onFetchLinkedRows, hostDir, isBookmarked, onToggleBookmark, variant = "drawer", onToggleFieldBookmark, isFieldBookmarked, relatedEvidence = [] }: RowDetailPanelProps) {
+  // EventLog-derived overview rows (PowerShell/RDP/SMB correlations) carry a
+  // legacy `<log>.evtx::<rowid>` key. Load that raw event so it always uses the
+  // shared EventLog detail. Other overview record keys (for example the
+  // source-qualified ExecutionHistory keys) remain in their own artifact view.
   const recordKey = row.record_key || "";
-  const canLink = Boolean(recordKey && onFetchLinkedRows);
+  const canLink = Boolean(recordKey && /\.evtx::\d+$/i.test(recordKey) && onFetchLinkedRows);
   const [linked, setLinked] = useState<{ row: Record<string, string>; columns: string[] } | null | undefined>(undefined);
 
   useEffect(() => {
@@ -167,19 +205,18 @@ export default function RowDetailPanel({ row, columns, focusedColumn, fileBaseNa
   const spec = effSpec;
   const linkLoading = canLink && linked === undefined;
   const [showRaw, setShowRaw] = useState(!resolveArtifactView(fileBaseName, columns));
-
-  useEffect(() => {
-    function onKeyDown(e: KeyboardEvent) {
-      if (e.key === "Escape") onClose();
-    }
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [onClose]);
+  const docked = variant === "docked";
+  const dialogRef = useModalDialog(onClose, !docked);
 
   return (
     <div
-      onClick={onClose}
-      style={{
+      onClick={docked ? undefined : onClose}
+      style={docked ? {
+        height: "100%",
+        minHeight: 0,
+        display: "flex",
+        background: "var(--bg-panel)",
+      } : {
         position: "fixed",
         inset: 0,
         background: "rgba(1,4,9,0.6)",
@@ -194,17 +231,22 @@ export default function RowDetailPanel({ row, columns, focusedColumn, fileBaseNa
         @keyframes slideIn { from { transform: translateX(24px); opacity: 0.6; } to { transform: translateX(0); opacity: 1; } }
       `}</style>
       <div
+        ref={dialogRef}
         onClick={(e) => e.stopPropagation()}
+        role={docked ? undefined : "dialog"}
+        aria-modal={docked ? undefined : true}
+        aria-label="증거 상세"
+        tabIndex={docked ? undefined : -1}
         style={{
-          width: 480,
-          maxWidth: "80vw",
+          width: docked ? "100%" : 480,
+          maxWidth: docked ? "none" : "80vw",
           height: "100%",
           background: "var(--bg-panel)",
-          borderLeft: "1px solid var(--border)",
+          borderLeft: docked ? "none" : "1px solid var(--border)",
           display: "flex",
           flexDirection: "column",
-          boxShadow: "var(--shadow-panel)",
-          animation: "slideIn 0.18s ease",
+          boxShadow: docked ? "none" : "var(--shadow-panel)",
+          animation: docked ? undefined : "slideIn 0.18s ease",
         }}
       >
         <div
@@ -217,23 +259,54 @@ export default function RowDetailPanel({ row, columns, focusedColumn, fileBaseNa
             background: "var(--bg-elevated)",
           }}
         >
-          <strong style={{ fontSize: 13 }}>{spec && !showRaw ? "주요 필드" : "전체 필드"}</strong>
+          <div style={{ minWidth: 0, fontSize: 14, fontWeight: 750, letterSpacing: "-0.01em" }}>증거 상세</div>
           {spec && (
-            <button
-              onClick={() => setShowRaw((v) => !v)}
+            <div
+              role="group"
+              aria-label="상세 정보 표시 범위"
               style={{
                 marginLeft: 10,
-                fontSize: 11,
-                padding: "3px 9px",
-                background: "transparent",
-                color: "var(--accent)",
-                border: "1px solid var(--accent)",
-                borderRadius: "var(--radius-lg)",
-                cursor: "pointer",
+                display: "inline-flex",
+                gap: 2,
+                padding: 2,
+                background: "var(--bg-input)",
+                border: "1px solid var(--border)",
+                borderRadius: "var(--radius-sm)",
               }}
             >
-              {showRaw ? "주요 필드 보기" : "전체 필드 보기"}
-            </button>
+              <button
+                onClick={() => setShowRaw(false)}
+                aria-pressed={!showRaw}
+                style={{
+                  fontSize: 11.5,
+                  padding: "4px 8px",
+                  background: !showRaw ? "var(--accent-subtle)" : "transparent",
+                  color: !showRaw ? "var(--accent)" : "var(--text-faint)",
+                  border: "none",
+                  borderRadius: 4,
+                  cursor: "pointer",
+                  fontWeight: !showRaw ? 700 : 550,
+                }}
+              >
+                주요 정보
+              </button>
+              <button
+                onClick={() => setShowRaw(true)}
+                aria-pressed={showRaw}
+                style={{
+                  fontSize: 11.5,
+                  padding: "4px 8px",
+                  background: showRaw ? "var(--accent-subtle)" : "transparent",
+                  color: showRaw ? "var(--accent)" : "var(--text-faint)",
+                  border: "none",
+                  borderRadius: 4,
+                  cursor: "pointer",
+                  fontWeight: showRaw ? 700 : 550,
+                }}
+              >
+                전체 필드
+              </button>
+            </div>
           )}
           {onToggleBookmark && (
             <button
@@ -245,20 +318,22 @@ export default function RowDetailPanel({ row, columns, focusedColumn, fileBaseNa
                 alignItems: "center",
                 gap: 5,
                 fontSize: 11.5,
-                padding: "4px 10px",
-                background: isBookmarked ? "var(--warning-subtle)" : "transparent",
-                color: isBookmarked ? "var(--warning)" : "var(--text-dim)",
-                border: `1px solid ${isBookmarked ? "var(--warning)" : "var(--border)"}`,
-                borderRadius: "var(--radius-lg)",
+                padding: "5px 10px",
+                background: isBookmarked ? "var(--accent-subtle)" : "transparent",
+                color: isBookmarked ? "var(--accent)" : "var(--text-dim)",
+                border: `1px solid ${isBookmarked ? "var(--accent)" : "var(--border)"}`,
+                borderRadius: "var(--radius-sm)",
                 cursor: "pointer",
                 fontWeight: 600,
               }}
             >
-              {isBookmarked ? "★ 북마크됨" : "☆ 북마크"}
+              {isBookmarked ? "북마크됨" : "북마크"}
             </button>
           )}
           <button
             onClick={onClose}
+            data-dialog-autofocus={!docked ? true : undefined}
+            aria-label={docked ? "선택 항목 닫기" : "상세 보기 닫기"}
             style={{
               marginLeft: onToggleBookmark ? 8 : "auto",
               background: "transparent",
@@ -276,11 +351,27 @@ export default function RowDetailPanel({ row, columns, focusedColumn, fileBaseNa
             ×
           </button>
         </div>
-        <div style={{ overflowY: "auto", flex: 1 }}>
+        <div data-detail-scroll-container style={{ overflowY: "auto", flex: 1 }}>
           {linkLoading ? (
             <div style={{ padding: 20, color: "var(--text-dim)", fontSize: 12.5 }}>원본 이벤트 로그를 불러오는 중...</div>
           ) : spec && !showRaw ? (
-            <ArtifactDetailView spec={spec} row={effRow} onNavigate={onNavigate} onFetchLinkedRows={onFetchLinkedRows} />
+            <>
+              <ArtifactDetailView spec={spec} row={effRow} onNavigate={onNavigate} onFetchLinkedRows={onFetchLinkedRows} hostDir={hostDir} onToggleFieldBookmark={onToggleFieldBookmark} isFieldBookmarked={isFieldBookmarked} />
+              {relatedEvidence.length > 0 && (
+                <section style={{ padding: "14px 16px 18px", borderBottom: "1px solid var(--border-subtle)" }}>
+                  <div className="dfir-section-label" style={{ marginBottom: 7 }}>교차 참조 증거</div>
+                  {relatedEvidence.map((evidence) => (
+                    <button key={evidence.id} type="button" onClick={evidence.onOpen} style={{ width: "100%", display: "grid", gridTemplateColumns: "minmax(0, 1fr) auto", alignItems: "center", gap: 8, padding: "7px 8px", textAlign: "left", background: "transparent", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", color: "var(--text)", cursor: "pointer" }}>
+                      <span style={{ minWidth: 0 }}>
+                        <span style={{ display: "block", fontSize: 12, fontWeight: 650, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{evidence.label}</span>
+                        {evidence.subtitle && <span style={{ display: "block", marginTop: 2, fontSize: 10.5, color: "var(--text-faint)", fontFamily: "var(--mono)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{evidence.subtitle}</span>}
+                      </span>
+                      <ChevronRightOutlinedIcon aria-hidden="true" sx={{ color: "var(--text-faint)", fontSize: 17 }} />
+                    </button>
+                  ))}
+                </section>
+              )}
+            </>
           ) : (
             effCols.map((col) => (
               <RawFieldValue key={col} column={col} value={effRow[col] ?? ""} focused={col === focusedColumn} />

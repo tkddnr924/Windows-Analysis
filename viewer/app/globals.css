@@ -1,25 +1,34 @@
+@font-face {
+  font-family: "Wanted Sans Variable";
+  src: url("/fonts/WantedSansVariable.woff2") format("woff2");
+  font-display: swap;
+  font-style: normal;
+  font-weight: 400 1000;
+}
+
 :root {
-  /* Layered surfaces (GitHub Dark-inspired) — each level one step lighter,
-     used for depth instead of hard borders everywhere. */
-  --bg: #161b22;
-  --bg-panel: #1c232d;
-  --bg-elevated: #262d38;
-  --bg-input: #161b22;
-  --bg-hover: rgba(177, 186, 196, 0.10);
-  --bg-selected: rgba(56, 139, 253, 0.18);
+  color-scheme: dark;
+  /* Dark neumorphic foundation: depth comes from paired light and shadow,
+     while evidence colour remains strictly semantic. */
+  --bg: #111923;
+  --bg-panel: #16212d;
+  --bg-elevated: #1a2735;
+  --bg-input: #101822;
+  --bg-hover: rgba(133, 174, 215, 0.09);
+  --bg-selected: rgba(70, 145, 224, 0.20);
 
-  --border: #3a424d;
-  --border-subtle: rgba(240, 246, 252, 0.10);
+  --border: rgba(154, 188, 222, 0.12);
+  --border-subtle: rgba(154, 188, 222, 0.08);
 
-  --text: #e6edf3;
-  --text-dim: #8b949e;
-  --text-faint: #6e7681;
+  --text: #eef5ff;
+  --text-dim: #a7b6c8;
+  --text-faint: #718198;
   /* Timestamps must stay readable — brighter than the faint/dim greys. */
   --text-time: #b9c2cc;
 
-  --accent: #58a6ff;
-  --accent-emphasis: #388bfd;
-  --accent-subtle: rgba(88, 166, 255, 0.12);
+  --accent: #67b2ff;
+  --accent-emphasis: #287fe8;
+  --accent-subtle: rgba(103, 178, 255, 0.14);
 
   --success: #3fb950;
   --success-subtle: rgba(63, 185, 80, 0.12);
@@ -28,15 +37,27 @@
   --danger: #f85149;
   --danger-subtle: rgba(248, 81, 73, 0.12);
 
-  --radius-sm: 4px;
-  --radius-md: 6px;
-  --radius-lg: 10px;
+  /* Semantic evidence states.  Do not use arbitrary per-view colours: each
+     colour has one meaning throughout the investigator workspace. */
+  --evidence-info: var(--accent);
+  --evidence-normal: var(--success);
+  --evidence-attention: var(--warning);
+  --evidence-critical: var(--danger);
+  --tag-neutral-bg: rgba(139, 148, 158, 0.12);
+  --tag-neutral-fg: #b9c2cc;
 
-  --shadow-panel: -8px 0 24px rgba(1, 4, 9, 0.5);
-  --shadow-card: 0 1px 3px rgba(1, 4, 9, 0.4);
+  --radius-sm: 6px;
+  --radius-md: 9px;
+  --radius-lg: 14px;
 
-  --mono: "Cascadia Code", "JetBrains Mono", Consolas, "SF Mono", Menlo, monospace;
-  --sans: -apple-system, "Segoe UI", Roboto, sans-serif;
+  --neu-light: rgba(103, 138, 174, 0.10);
+  --neu-shadow: rgba(4, 8, 13, 0.72);
+  --shadow-panel: 12px 12px 26px var(--neu-shadow), -8px -8px 20px var(--neu-light);
+  --shadow-card: 8px 8px 18px rgba(4, 8, 13, 0.52), -5px -5px 14px rgba(103, 138, 174, 0.07);
+  --shadow-inset: inset 4px 4px 9px rgba(3, 7, 12, 0.56), inset -3px -3px 8px rgba(103, 138, 174, 0.06);
+
+  --mono: "Wanted Sans Variable", sans-serif;
+  --sans: "Wanted Sans Variable", sans-serif;
 }
 
 * {
@@ -73,7 +94,342 @@ select {
 }
 
 button {
-  transition: background-color 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+  transition: background-color 0.14s ease, border-color 0.14s ease, color 0.14s ease, transform 0.14s ease;
+}
+
+button:not(:disabled):active {
+  transform: translateY(1px);
+}
+
+/* Keyboard focus must remain visible even in dense, custom-styled evidence
+   grids where individual components intentionally suppress browser outlines. */
+:focus-visible {
+  outline: 2px solid var(--accent) !important;
+  outline-offset: 2px;
+}
+
+[data-detail-scroll-container],
+.dfir-view {
+  overscroll-behavior: contain;
+}
+
+@keyframes parse-progress-shimmer {
+  from { background-position: 0 0; }
+  to { background-position: 36px 0; }
+}
+@keyframes parse-progress-dots {
+  0% { width: 0; }
+  25% { width: 1ch; }
+  50% { width: 2ch; }
+  75%, 100% { width: 3ch; }
+}
+
+.parse-progress__track {
+  height: 7px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--bg-elevated);
+}
+.parse-progress__fill {
+  position: relative;
+  height: 100%;
+  overflow: hidden;
+  border-radius: inherit;
+  transition: width .3s ease;
+}
+.parse-progress__fill::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: repeating-linear-gradient(
+    -45deg,
+    transparent 0,
+    transparent 9px,
+    rgba(255, 255, 255, .30) 9px,
+    rgba(255, 255, 255, .30) 17px,
+    transparent 17px,
+    transparent 26px
+  );
+  background-size: 36px 36px;
+  animation: parse-progress-shimmer .8s linear infinite;
+  will-change: background-position;
+}
+.parse-progress__dots {
+  display: inline-block;
+  width: 0;
+  overflow: hidden;
+  vertical-align: bottom;
+  animation: parse-progress-dots 1.2s steps(1, end) infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .parse-progress__fill::after,
+  .parse-progress__dots { animation: none; }
+}
+
+input, select {
+  outline: none;
+  border-color: transparent;
+  background: var(--bg-input);
+  box-shadow: var(--shadow-inset);
+}
+
+input:focus, select:focus {
+  border-color: var(--accent) !important;
+  box-shadow: 0 0 0 3px rgba(103, 178, 255, 0.14) !important;
+}
+
+/* Application-level composition shared by every feature view. Individual
+   screens keep their purpose-built data presentation, while their page
+   framing, hierarchy and interaction density stay the same. */
+.dfir-app {
+  background: transparent;
+}
+.dfir-workspace {
+  position: relative;
+  background: var(--bg);
+}
+.dfir-view {
+  position: relative;
+  isolation: isolate;
+}
+.dfir-view::before {
+  content: "";
+  position: absolute;
+  inset: 0 0 auto;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(103,178,255,.18), transparent);
+  pointer-events: none;
+}
+
+/* Account evidence and EventLog activity stay side-by-side in a wide analyst
+   workspace, then become one readable column before either surface clips. */
+.target-info-account-detail-grid {
+  display: grid;
+  grid-template-columns: minmax(350px, 5fr) minmax(480px, 7fr);
+  gap: 12px;
+  align-items: start;
+}
+.target-info-account-detail-scroll {
+  container-type: inline-size;
+}
+@media (max-width: 980px) {
+  .target-info-account-detail-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+@container (max-width: 860px) {
+  .target-info-account-detail-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+@media (max-width: 720px) {
+  .target-info-header {
+    align-items: flex-start !important;
+    flex-direction: column;
+    justify-content: center;
+    gap: 3px !important;
+    padding-top: 9px !important;
+    padding-bottom: 9px !important;
+  }
+  .target-info-header > span {
+    margin-left: 0 !important;
+    max-width: 100%;
+  }
+}
+.dfir-page-title {
+  font-size: 22px;
+  font-weight: 760;
+  letter-spacing: -0.035em;
+  color: var(--text);
+}
+.dfir-surface {
+  background: var(--bg-panel);
+  border: 1px solid rgba(154, 188, 222, 0.08);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-card);
+}
+.dfir-toolbar {
+  background: var(--bg-panel);
+  border-bottom: 0;
+  box-shadow: 0 8px 18px rgba(4, 8, 13, 0.26);
+}
+.dfir-sidebar {
+  background: var(--bg-panel) !important;
+  box-shadow: 9px 0 20px rgba(4, 8, 13, 0.38), inset -1px 0 rgba(131, 166, 203, .06);
+}
+.dfir-tabbar {
+  background: var(--bg-panel) !important;
+  box-shadow: 0 8px 18px rgba(4, 8, 13, 0.23);
+}
+
+/* Shared label language: artifact/source labels are neutral, investigation
+   signals use warning/critical only, and blue is reserved for navigation or
+   selected context. */
+.dfir-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 22px;
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  /* Evidence/status labels are compact rectangular labels, not pills. */
+  border-radius: 2px;
+  background: var(--tag-neutral-bg);
+  color: var(--tag-neutral-fg);
+  font-size: 11px;
+  font-weight: 650;
+  line-height: 1;
+  white-space: nowrap;
+}
+.dfir-tag--attention { color: var(--warning); background: var(--warning-subtle); border-color: color-mix(in srgb, var(--warning) 48%, transparent); }
+.dfir-tag--critical { color: var(--danger); background: var(--danger-subtle); border-color: color-mix(in srgb, var(--danger) 48%, transparent); }
+.dfir-tag--info { color: var(--accent); background: var(--accent-subtle); border-color: color-mix(in srgb, var(--accent) 48%, transparent); }
+.dfir-section-label {
+  font-size: 10.5px;
+  font-weight: 750;
+  color: var(--text-faint);
+  letter-spacing: 0.65px;
+  text-transform: uppercase;
+}
+
+/* Case entry: a compact case hub. The primary choice and the new-case action
+   are two equal, related work surfaces rather than disconnected columns. */
+.case-launcher {
+  width: min(1040px, 100%);
+  margin: 0 auto;
+  padding: clamp(56px, 9vh, 96px) 36px 72px;
+}
+.case-launcher__intro {
+  margin-bottom: 32px;
+}
+.case-launcher__intro p {
+  margin: 0 0 9px;
+  color: var(--accent);
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+}
+.case-launcher__intro h1,
+.case-launcher h2,
+.case-launcher h3 {
+  margin: 0;
+  color: var(--text);
+}
+.case-launcher__intro h1 {
+  font-size: clamp(34px, 3.2vw, 44px);
+  font-weight: 760;
+  letter-spacing: -.055em;
+  line-height: 1;
+}
+.case-launcher__content { display: grid; grid-template-columns: minmax(300px, .82fr) minmax(0, 1.35fr); gap: 22px; align-items: stretch; }
+.case-create {
+  display: flex;
+  flex-direction: column;
+  min-height: 248px;
+  padding: 28px;
+  border: 1px solid rgba(154, 188, 222, .08);
+  border-radius: var(--radius-lg);
+  background: var(--bg-panel);
+  box-shadow: var(--shadow-card);
+}
+.case-create h2,
+.case-list h2 { font-size: 19px; font-weight: 730; letter-spacing: -.03em; }
+.case-create__form { margin-top: auto; padding-top: 32px; }
+.case-create__form label { display: block; margin-bottom: 10px; color: var(--text-dim); font-size: 13px; font-weight: 650; }
+.case-create__form > div { display: grid; gap: 8px; }
+.case-create input {
+  width: 100%;
+  min-width: 0;
+  height: 46px;
+  padding: 0 11px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  background: var(--bg-input);
+  box-shadow: var(--shadow-inset);
+  color: var(--text);
+  font-size: 14px;
+}
+.case-create button,
+.case-row__actions button,
+.case-row__confirm button {
+  min-height: 42px;
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  font-size: 14px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+.case-create button {
+  width: 100%;
+  padding: 0 13px;
+  border: 1px solid rgba(103, 178, 255, .45);
+  background: var(--bg-panel);
+  color: var(--accent);
+  box-shadow: 4px 4px 9px rgba(4, 8, 13, .4), -2px -2px 6px rgba(103, 138, 174, .06);
+}
+.case-create button:not(:disabled):hover { background: var(--accent-subtle); }
+.case-create button:disabled { cursor: not-allowed; opacity: .45; }
+.case-launcher__error {
+  margin: 0 0 16px;
+  padding: 12px 14px;
+  border: 1px solid rgba(248,81,73,.7);
+  border-radius: var(--radius-md);
+  background: var(--danger-subtle);
+  color: #ffb4af;
+  font-size: 12.5px;
+  line-height: 1.55;
+}
+.case-list { min-width: 0; padding: 4px 0 0; }
+.case-list__header {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  min-height: 28px;
+  margin-bottom: 10px;
+  padding-bottom: 0;
+  border-bottom: 0;
+}
+.case-list__header span { color: var(--text-faint); font-family: var(--mono); font-size: 13px; }
+.case-list__items { overflow: visible; }
+.case-row {
+  display: flex;
+  align-items: center;
+  gap: 22px;
+  min-height: 92px;
+  padding: 18px 18px 18px 22px;
+  border: 1px solid rgba(154, 188, 222, .08);
+  border-radius: var(--radius-lg);
+  background: var(--bg-panel);
+  box-shadow: var(--shadow-card);
+  cursor: pointer;
+}
+.case-row + .case-row { margin-top: 12px; }
+.case-row:hover { background: var(--bg-elevated); border-color: rgba(103,178,255,.22); }
+.case-row__primary { min-width: 0; flex: 1; }
+.case-row__primary h3 { font-size: 18px; font-weight: 720; letter-spacing: -.02em; }
+.case-row__primary p { margin: 8px 0 0; color: var(--text-faint); font-family: var(--mono); font-size: 12px; }
+.case-row__primary p span::before { content: "/"; padding: 0 7px; color: var(--border); }
+.case-row__actions, .case-row__confirm { display: flex; align-items: center; gap: 8px; }
+.case-row__actions button { padding: 0 11px; border: 1px solid transparent; background: transparent; color: var(--text-dim); box-shadow: none; }
+.case-row__actions button:first-child { border-color: var(--accent); color: var(--accent); }
+.case-row__actions button:first-child:hover { background: var(--accent-subtle); }
+.case-row__actions .case-row__remove { border-color: transparent; color: var(--text-faint); }
+.case-row__actions .case-row__remove:hover { border-color: rgba(248,81,73,.45); color: #ff9c96; }
+.case-row__confirm { flex-wrap: wrap; justify-content: flex-end; }
+.case-row__confirm span { color: #ffaaa4; font-size: 12px; }
+.case-row__confirm button { padding: 0 11px; border: 1px solid var(--border); background: transparent; color: var(--text-dim); }
+.case-row__confirm .case-row__delete { border-color: var(--danger); color: #ffaaa4; }
+.case-list__empty { display: grid; min-height: 145px; place-items: center start; padding: 24px 2px; color: var(--text-faint); font-size: 13px; }
+@media (max-width: 680px) {
+  .case-launcher { padding: 42px 20px 56px; }
+  .case-launcher__intro { margin-bottom: 26px; }
+  .case-launcher__content { grid-template-columns: 1fr; }
+  .case-list, .case-create { min-height: auto; padding: 21px; }
+  .case-create__form { margin-top: 28px; padding-top: 0; }
+  .case-row { align-items: flex-start; flex-direction: column; gap: 14px; }
+  .case-row__actions, .case-row__confirm { width: 100%; justify-content: flex-start; }
 }
 
 ::-webkit-scrollbar {
@@ -108,4 +464,9 @@ button {
   border-top-color: var(--accent);
   border-radius: 50%;
   animation: wa-spin 0.7s linear infinite;
+}
+
+@media (max-width: 920px) {
+  .browser-insights-grid { grid-template-columns: minmax(0, 1fr) !important; }
+  .browser-insights-first { border-right: 0 !important; border-bottom: 1px solid var(--border); }
 }

@@ -1,245 +1,202 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { tagsForPath } from "@/lib/tagging";
-import type { CategoryEntry, Host } from "@/lib/types";
+import CircularProgress from "@mui/material/CircularProgress";
+import KeyboardArrowDownIcon from "@mui/icons-material/KeyboardArrowDown";
+import KeyboardArrowRightIcon from "@mui/icons-material/KeyboardArrowRight";
+import type { CategoryEntry, Host, ParseReport, ResultFileEntry } from "@/lib/types";
 
-type Row = Record<string, string>;
+type ResultGroup = { category: CategoryEntry; files: ResultFileEntry[] };
 
 interface Props {
   host: Host;
   categories: CategoryEntry[];
-  /** Open an overview table (by its table name, e.g. "Defender") as a tab. */
   onOpenTable: (name: string) => void;
   onOpenTimeline: () => void;
 }
 
-function basename(p: string): string {
-  const c = (p || "").replace(/[\\/]+$/, "");
-  const parts = c.split(/[\\/]/);
-  return parts[parts.length - 1] || p;
-}
+const OVERVIEW_LABELS: Record<string, string> = {
+  TargetInfo: "Target Info", MFT_Records: "파일 시스템 정보", RemoteDesktopHistory: "원격 접근 이력 (RDP)",
+  ExecutionHistory: "실행 이력", Defender: "Defender", RegistryFindings: "레지스트리 특이사항",
+  PowerShellHistory: "파워셸 실행 이력", SmbHistory: "SMB 접속 이력", ScheduledTasks: "작업 스케줄러",
+  RdpCache: "RDP Cache", BrowserActivity: "브라우저 활동",
+};
 
-function isUserAccount(sid: string): boolean {
-  const m = sid.match(/-(\d+)$/);
-  const rid = m ? Number(m[1]) : NaN;
-  return /^S-1-5-21-/.test(sid) && (rid === 500 || rid >= 1000);
+const ARTIFACT_OUTPUT: Record<string, { category: string; table?: string }> = {
+  UsnJrnl: { category: "FILESYSTEM" },
+  MFT: { category: "_OVERVIEW", table: "MFT_Records" },
+  BrowserHistory: { category: "BROWSER" },
+  BrowserCache: { category: "BROWSER" },
+};
+
+function outputForArtifact(name: string) { return ARTIFACT_OUTPUT[name] ?? { category: name.toUpperCase() }; }
+function formatRunTime(value: string | null): string { return value ? value.replace("T", " ").replace(/\.\d+Z?$/, "") : "기록 없음"; }
+
+function ComputerName({ files, host }: { files: ResultFileEntry[]; host: Host }) {
+  const [computer, setComputer] = useState(host.name || "호스트");
+
+  useEffect(() => {
+    const targetInfo = files.find((file) => file.tableName === "TargetInfo");
+    if (!targetInfo) { setComputer(host.name || "호스트"); return; }
+
+    let cancelled = false;
+    window.api.readResultFile(targetInfo.fullPath, targetInfo.tableName)
+      .then((data) => {
+        const name = data.rows.find((row) => row.category === "SystemInfo" && row.name === "ComputerName")?.value;
+        if (!cancelled) setComputer(name || host.name || "호스트");
+      })
+      .catch(() => { if (!cancelled) setComputer(host.name || "호스트"); });
+    return () => { cancelled = true; };
+  }, [files, host.id, host.name]);
+
+  return <h1 style={{ margin: 0, color: "var(--text)", fontSize: 29, lineHeight: 1.16, letterSpacing: "-0.045em", fontWeight: 760 }}>{computer}</h1>;
 }
 
 export default function HostDashboard({ host, categories, onOpenTable, onOpenTimeline }: Props) {
-  const [rows, setRows] = useState<Record<string, Row[]>>({});
+  const [groups, setGroups] = useState<ResultGroup[]>([]);
   const [loading, setLoading] = useState(true);
+  const [savedReport, setSavedReport] = useState<ParseReport | null>(null);
 
   useEffect(() => {
     let cancelled = false;
-    (async () => {
-      setLoading(true);
-      const ov = categories.find((c) => c.name === "_OVERVIEW");
-      const acc: Record<string, Row[]> = {};
-      if (ov) {
-        const files = await window.api.listResultFiles(ov.fullPath);
-        for (const name of ["TargetInfo", "Defender", "ExecutionHistory"]) {
-          const f = files.find((x) => x.name === name);
-          if (f) {
-            try {
-              const d = await window.api.readResultFile(f.fullPath, f.tableName);
-              acc[name] = d.rows;
-            } catch {
-              /* overview not built yet — leave empty */
-            }
-          }
-        }
+    window.api.parseReport(host.dir).then((report) => {
+      if (!cancelled) setSavedReport(report);
+    }).catch(() => {
+      if (!cancelled) setSavedReport(null);
+    });
+    return () => { cancelled = true; };
+  }, [host.dir]);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    Promise.all(categories.map(async (category) => {
+      try {
+        const files = await window.api.listResultFiles(category.fullPath);
+        return { category, files } satisfies ResultGroup;
+      } catch {
+        return { category, files: [] } satisfies ResultGroup;
       }
-      if (!cancelled) {
-        setRows(acc);
-        setLoading(false);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
+    })).then((nextGroups) => {
+      if (!cancelled) { setGroups(nextGroups); setLoading(false); }
+    });
+    return () => { cancelled = true; };
   }, [categories, host.id]);
 
-  const model = useMemo(() => {
-    const ti = rows.TargetInfo ?? [];
-    const def = rows.Defender ?? [];
-    const exec = rows.ExecutionHistory ?? [];
+  const report = useMemo(() => {
+    const groupByCategory = new Map(groups.map((group) => [group.category.name, group]));
+    const overview = groupByCategory.get("_OVERVIEW")?.files ?? [];
+    const artifacts = (host.artifactsRun ?? []).map((name) => {
+      const target = outputForArtifact(name);
+      const group = groupByCategory.get(target.category);
+      const files = target.table ? (group?.files.filter((file) => file.tableName === target.table) ?? []) : (group?.files ?? []);
+      const saved = savedReport?.artifacts.find((artifact) => artifact.name === name);
+      return { name, files, saved };
+    });
+    return {
+      artifacts,
+      overviewTables: overview.filter((file) => file.tableName !== "TargetInfo"),
+    };
+  }, [groups, host.artifactsRun, savedReport]);
 
-    const system: Record<string, string> = {};
-    for (const r of ti) if (r.category === "SystemInfo") system[r.name] = r.value;
-
-    const accounts = ti.filter((r) => r.category === "Account");
-    const users = accounts.filter((a) => isUserAccount(a.name));
-    const interfaces = ti.filter((r) => r.category === "NetworkInterface" && r.value);
-    const networks = ti.filter((r) => r.category === "Network");
-
-    const threats = def.filter((r) => r.section === "threat").sort((a, b) => (b.timestamp || "").localeCompare(a.timestamp || ""));
-    const tampering = def.filter((r) => r.section === "tampering").sort((a, b) => (b.timestamp || "").localeCompare(a.timestamp || ""));
-
-    const suspicious = exec
-      .filter((r) => tagsForPath(r.program_path).length > 0)
-      .sort((a, b) => (b.timestamp || "").localeCompare(a.timestamp || ""));
-
-    return { system, users, interfaces, networks, threats, tampering, suspicious, execTotal: exec.length };
-  }, [rows]);
-
-  const computer = model.system.ComputerName || host.name || "호스트";
-  const os = [model.system.ProductName, model.system.CurrentBuild && `Build ${model.system.CurrentBuild}`].filter(Boolean).join(" · ");
-
-  if (loading) {
-    return <Center>대시보드 불러오는 중…</Center>;
-  }
+  const overviewFiles = groups.find((group) => group.category.name === "_OVERVIEW")?.files ?? [];
+  if (loading) return <Loading />;
 
   return (
-    <div style={{ flex: 1, minHeight: 0, overflow: "auto", padding: "22px 26px" }}>
-      {/* Hero */}
-      <div style={{ display: "flex", alignItems: "baseline", gap: 12, marginBottom: 2 }}>
-        <span style={{ fontSize: 24, fontWeight: 800, color: "var(--text)" }}>🖥️ {computer}</span>
-        {os && <span style={{ fontSize: 13, color: "var(--text-dim)" }}>{os}</span>}
-      </div>
-      <div style={{ fontSize: 12, color: "var(--text-faint)", marginBottom: 18 }}>
-        {host.name} · 핵심 지표 요약 — 카드를 클릭하면 상세 화면으로 이동합니다.
-      </div>
+    <div className="dfir-view" style={{ flex: 1, minHeight: 0, overflow: "auto", padding: "22px 26px 28px" }}>
+      <header style={{ display: "flex", alignItems: "flex-end", justifyContent: "space-between", gap: 18, padding: "2px 0 15px", borderBottom: "1px solid var(--border)" }}>
+        <div>
+          <ComputerName files={overviewFiles} host={host} />
+          <div style={{ marginTop: 6, color: "var(--text-dim)", fontSize: 14 }}>
+            마지막 파싱 <span style={{ color: "var(--text-faint)" }}>{formatRunTime(host.lastRunAt)}</span>
+          </div>
+        </div>
+        <button onClick={onOpenTimeline} style={timelineButtonStyle}>통합 타임라인 보기</button>
+      </header>
 
-      {/* Stat tiles */}
-      <div style={{ display: "flex", flexWrap: "wrap", gap: 10, marginBottom: 22 }}>
-        <Stat label="탐지된 위협" value={model.threats.length} tone={model.threats.length ? "danger" : "ok"} onClick={() => onOpenTable("Defender")} />
-        <Stat label="의심 실행" value={model.suspicious.length} tone={model.suspicious.length ? "warning" : "ok"} onClick={() => onOpenTable("ExecutionHistory")} />
-        <Stat label="보호 변조" value={model.tampering.length} tone={model.tampering.length ? "warning" : "ok"} onClick={() => onOpenTable("Defender")} />
-        <Stat label="사용자 계정" value={model.users.length} tone="neutral" onClick={() => onOpenTable("TargetInfo")} />
-        <Stat label="네트워크 IP" value={model.interfaces.length} tone="neutral" onClick={() => onOpenTable("TargetInfo")} />
-        <Stat label="실행 이력" value={model.execTotal} tone="neutral" onClick={() => onOpenTable("ExecutionHistory")} />
-      </div>
-
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(340px, 1fr))", gap: 16, alignItems: "start" }}>
-        {/* Threats */}
-        <Card title="🦠 탐지된 위협" count={model.threats.length} accent="var(--danger)" onOpen={() => onOpenTable("Defender")}>
-          {model.threats.length === 0 ? (
-            <Empty>탐지된 위협 없음</Empty>
-          ) : (
-            model.threats.slice(0, 6).map((t, i) => (
-              <Line key={i} time={t.timestamp} title={t.title} sub={`${t.severity || ""}${t.action ? " · " + t.action : ""}`} tone="danger" />
-            ))
-          )}
-        </Card>
-
-        {/* Suspicious executions */}
-        <Card title="⚡ 의심 실행" count={model.suspicious.length} accent="var(--warning)" onOpen={() => onOpenTable("ExecutionHistory")}>
-          {model.suspicious.length === 0 ? (
-            <Empty>의심 경로 실행 없음</Empty>
-          ) : (
-            model.suspicious.slice(0, 6).map((r, i) => (
-              <Line key={i} time={r.timestamp} title={r.program_name || basename(r.program_path)} sub={r.program_path} tone="warning" mono />
-            ))
-          )}
-        </Card>
-
-        {/* Protection tampering */}
-        {model.tampering.length > 0 && (
-          <Card title="🛡️ 보호 상태 변조" count={model.tampering.length} accent="var(--warning)" onOpen={() => onOpenTable("Defender")}>
-            {model.tampering.slice(0, 6).map((t, i) => (
-              <Line key={i} time={t.timestamp} title={t.title} sub={t.detail} tone="warning" />
-            ))}
-          </Card>
-        )}
-
-        {/* Accounts */}
-        <Card title="👤 사용자 계정" count={model.users.length} onOpen={() => onOpenTable("TargetInfo")}>
-          {model.users.length === 0 ? (
-            <Empty>계정 정보 없음</Empty>
-          ) : (
-            model.users.slice(0, 8).map((a, i) => (
-              <Line key={i} title={a.username || basename(a.value)} sub={`RID ${a.rid}${a.last_login ? " · 최근 로그인 " + a.last_login : ""}`} />
-            ))
-          )}
-        </Card>
-
-        {/* Network */}
-        <Card title="🌐 네트워크" count={model.interfaces.length} onOpen={() => onOpenTable("TargetInfo")}>
-          {model.interfaces.length === 0 ? (
-            <Empty>네트워크 정보 없음</Empty>
-          ) : (
-            model.interfaces.slice(0, 8).map((n, i) => (
-              <Line key={i} title={n.value} sub={[n.gateway && `GW ${n.gateway}`, n.dns_server && `DNS ${n.dns_server}`].filter(Boolean).join(" · ")} mono />
-            ))
-          )}
-          {model.networks.length > 0 && (
-            <div style={{ marginTop: 6, fontSize: 11, color: "var(--text-faint)" }}>
-              연결 네트워크: {model.networks.map((n) => n.value).join(", ")}
+      <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 3fr) minmax(300px, 1fr)", gap: 14, marginTop: 14, alignItems: "start" }}>
+        <section style={panelStyle}>
+          <SectionHeader title="실행한 파서" />
+          {report.artifacts.length === 0 ? <Empty>실행한 파서 기록이 없습니다.</Empty> : (
+            <div>
+              {report.artifacts.map((artifact) => <ArtifactRow key={artifact.name} name={artifact.name} files={artifact.files} saved={artifact.saved} />)}
             </div>
           )}
-        </Card>
+        </section>
 
-        {/* System + timeline entry */}
-        <Card title="🖥️ 시스템" onOpen={() => onOpenTable("TargetInfo")}>
-          <KV k="컴퓨터 이름" v={model.system.ComputerName} />
-          <KV k="운영체제" v={model.system.ProductName} />
-          <KV k="빌드" v={model.system.CurrentBuild} />
-          <KV k="설치 시각" v={model.system.InstallDate} />
-          <KV k="표준 시간대" v={model.system.TimeZone} />
-          <KV k="마지막 종료" v={model.system.LastShutdownTime} />
-          <button onClick={onOpenTimeline} style={{ marginTop: 10, width: "100%", padding: "7px", background: "var(--accent-subtle)", color: "var(--accent)", border: "1px solid var(--accent)", borderRadius: "var(--radius-md)", cursor: "pointer", fontWeight: 600, fontSize: 12 }}>
-            🕑 통합 타임라인 열기
-          </button>
-        </Card>
+        <section style={panelStyle}>
+          <SectionHeader title="분석 결과 테이블" />
+          {report.overviewTables.length === 0 ? <Empty>생성된 분석 결과가 없습니다.</Empty> : (
+            <div>{report.overviewTables.map((table) => (
+              <div key={`${table.fileName}:${table.tableName}`} style={tableRowStyle}>
+                <span>{OVERVIEW_LABELS[table.tableName] ?? table.tableName}</span>
+                <span>{table.rowCount.toLocaleString()}건</span>
+              </div>
+            ))}</div>
+          )}
+        </section>
       </div>
     </div>
   );
 }
 
-function Center({ children }: { children: React.ReactNode }) {
-  return <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100%", color: "var(--text-dim)" }}>{children}</div>;
+function Loading() {
+  return <div role="status" aria-live="polite" style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 10, height: "100%", color: "var(--text-dim)", fontSize: 15 }}><CircularProgress size={20} thickness={4.5} aria-label="파싱 결과를 불러오는 중" sx={{ color: "var(--accent)" }} /><span>파싱 결과를 확인하는 중...</span></div>;
 }
 
-function Empty({ children }: { children: React.ReactNode }) {
-  return <div style={{ fontSize: 12, color: "var(--text-faint)", padding: "4px 0" }}>{children}</div>;
+function SectionHeader({ title }: { title: string }) {
+  return <div style={{ paddingBottom: 10, borderBottom: "1px solid var(--border-subtle)" }}><h2 style={{ margin: 0, color: "var(--text)", fontSize: 17, letterSpacing: "-0.025em" }}>{title}</h2></div>;
 }
 
-function Stat({ label, value, tone, onClick }: { label: string; value: number; tone: "ok" | "warning" | "danger" | "neutral"; onClick: () => void }) {
-  const color = tone === "danger" ? "var(--danger)" : tone === "warning" ? "var(--warning)" : tone === "ok" ? "var(--success)" : "var(--accent)";
+function ArtifactRow({ name, files, saved }: { name: string; files: ResultFileEntry[]; saved?: ParseReport["artifacts"][number] }) {
+  const [expanded, setExpanded] = useState(false);
+  const hasOutput = saved ? saved.status === "completed" : files.length > 0;
+  const savedInputs = saved?.inputs ?? [];
+  const hasStoredCounts = savedInputs.some((input) => typeof input.recordCount === "number");
   return (
-    <button onClick={onClick} style={{ minWidth: 120, textAlign: "left", padding: "10px 14px", background: "var(--bg-panel)", border: "1px solid var(--border)", borderLeft: `3px solid ${color}`, borderRadius: "var(--radius-md)", cursor: "pointer" }}>
-      <div style={{ fontSize: 11, color: "var(--text-faint)" }}>{label}</div>
-      <div style={{ fontSize: 20, fontWeight: 800, color }}>{value.toLocaleString()}</div>
-    </button>
-  );
-}
-
-function Card({ title, count, accent, onOpen, children }: { title: string; count?: number; accent?: string; onOpen?: () => void; children: React.ReactNode }) {
-  return (
-    <section style={{ background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "var(--radius-lg)", boxShadow: "var(--shadow-card)", overflow: "hidden" }}>
-      <div
-        onClick={onOpen}
-        style={{ display: "flex", alignItems: "center", gap: 8, padding: "11px 14px", borderBottom: "1px solid var(--border-subtle)", borderLeft: `3px solid ${accent ?? "var(--border)"}`, cursor: onOpen ? "pointer" : "default" }}
+    <div style={{ borderBottom: "1px solid var(--border-subtle)" }}>
+      <button
+        type="button"
+        onClick={() => setExpanded((value) => !value)}
+        aria-expanded={expanded}
+        style={artifactButtonStyle}
       >
-        <span style={{ fontSize: 13, fontWeight: 700, color: "var(--text)" }}>{title}</span>
-        {count !== undefined && <span style={{ fontSize: 12, color: "var(--text-faint)" }}>{count}</span>}
-        {onOpen && <span style={{ marginLeft: "auto", fontSize: 11, color: "var(--accent)" }}>열기 ›</span>}
-      </div>
-      <div style={{ padding: "8px 14px 12px" }}>{children}</div>
-    </section>
-  );
-}
-
-function Line({ time, title, sub, tone, mono }: { time?: string; title: string; sub?: string; tone?: "danger" | "warning"; mono?: boolean }) {
-  const dot = tone === "danger" ? "var(--danger)" : tone === "warning" ? "var(--warning)" : "var(--text-faint)";
-  return (
-    <div style={{ display: "flex", gap: 8, padding: "5px 0", borderBottom: "1px solid var(--border-subtle)", alignItems: "baseline" }}>
-      {tone && <span style={{ flex: "0 0 auto", width: 6, height: 6, borderRadius: 999, background: dot, alignSelf: "center" }} />}
-      <div style={{ flex: 1, minWidth: 0 }}>
-        <div style={{ fontSize: 12.5, color: "var(--text)", fontWeight: 600, fontFamily: mono ? "var(--mono)" : undefined, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{title}</div>
-        {sub && <div style={{ fontSize: 11, color: "var(--text-faint)", fontFamily: mono ? "var(--mono)" : undefined, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{sub}</div>}
-      </div>
-      {time && <span style={{ flex: "0 0 auto", fontSize: 10.5, color: "var(--text-faint)", fontFamily: "var(--mono)" }}>{time}</span>}
+        <span style={{ display: "flex", alignItems: "center", gap: 7 }}>
+          {expanded ? <KeyboardArrowDownIcon sx={{ fontSize: 19, color: "var(--text-faint)" }} /> : <KeyboardArrowRightIcon sx={{ fontSize: 19, color: "var(--text-faint)" }} />}
+          <span>{name}</span>
+        </span>
+        <StatusBadge hasOutput={hasOutput} />
+      </button>
+      {expanded && (
+        <div style={{ padding: "4px 12px 11px 28px", background: "rgba(7, 13, 20, 0.20)" }}>
+          <ArtifactDetails inputs={savedInputs} hasStoredCounts={hasStoredCounts} />
+        </div>
+      )}
     </div>
   );
 }
 
-function KV({ k, v }: { k: string; v?: string }) {
+function StatusBadge({ hasOutput }: { hasOutput: boolean }) {
+  return <span style={{ display: "inline-flex", alignItems: "center", gap: 6, padding: "4px 8px", border: `1px solid ${hasOutput ? "rgba(63, 185, 80, 0.32)" : "var(--border)"}`, borderRadius: 999, background: hasOutput ? "var(--success-subtle)" : "transparent", color: hasOutput ? "var(--success)" : "var(--text-faint)", fontSize: 12.5, fontWeight: 650 }}><span style={{ width: 5, height: 5, borderRadius: "50%", background: hasOutput ? "var(--success)" : "var(--text-faint)" }} />{hasOutput ? "결과 있음" : "출력 없음"}</span>;
+}
+
+function ArtifactDetails({ inputs, hasStoredCounts }: { inputs: ParseReport["artifacts"][number]["inputs"]; hasStoredCounts: boolean }) {
+  if (!hasStoredCounts) return <div style={{ padding: "6px 0", color: "var(--text-faint)", fontSize: 13 }}>파일별 추출 건수는 이 호스트를 다시 파싱한 뒤 표시됩니다.</div>;
+  if (inputs.length === 0) return <div style={{ padding: "6px 0", color: "var(--text-faint)", fontSize: 13 }}>파서가 읽은 증거 파일이 없습니다.</div>;
   return (
-    <div style={{ display: "flex", gap: 10, padding: "4px 0", borderBottom: "1px solid var(--border-subtle)", fontSize: 12.5 }}>
-      <span style={{ flex: "0 0 96px", color: "var(--text-faint)" }}>{k}</span>
-      <span style={{ flex: 1, color: "var(--text-dim)", wordBreak: "break-all" }}>{v || "—"}</span>
+    <div>
+      {inputs.map((input) => <DetailLine key={input.sourcePath ?? input.name} name={input.name} recordCount={input.recordCount ?? 0} recoveryLog={input.recoveryLog === true} />)}
     </div>
   );
 }
+
+function DetailLine({ name, recordCount, recoveryLog }: { name: string; recordCount: number; recoveryLog: boolean }) {
+  return <div style={{ display: "grid", gridTemplateColumns: "minmax(180px, 0.65fr) minmax(130px, 0.35fr)", gap: 16, padding: "7px 0", borderBottom: "1px solid var(--border-subtle)" }}><span style={{ color: "var(--text-dim)", fontFamily: "var(--mono)", fontSize: 12.5, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{name}</span><span style={{ color: recoveryLog ? "var(--text-faint)" : "var(--accent)", fontSize: 13, fontWeight: recoveryLog ? 500 : 650, textAlign: "right" }}>{recoveryLog ? "복구 로그 적용" : `${recordCount.toLocaleString()}건 추출`}</span></div>;
+}
+
+function Empty({ children }: { children: React.ReactNode }) { return <div style={{ padding: "20px 0 7px", color: "var(--text-faint)", fontSize: 14 }}>{children}</div>; }
+
+const panelStyle: React.CSSProperties = { background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", boxShadow: "var(--shadow-card)", padding: "16px 18px" };
+const timelineButtonStyle: React.CSSProperties = { padding: "9px 14px", background: "var(--accent-subtle)", color: "var(--accent)", border: "1px solid rgba(103, 178, 255, 0.58)", borderRadius: "var(--radius-sm)", cursor: "pointer", fontWeight: 650, fontSize: 14, whiteSpace: "nowrap" };
+const tableRowStyle: React.CSSProperties = { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 14, width: "100%", padding: "11px 1px", borderBottom: "1px solid var(--border-subtle)", color: "var(--text-dim)", fontSize: 14.5, fontWeight: 600 };
+const artifactButtonStyle: React.CSSProperties = { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 14, width: "100%", minHeight: 48, padding: "9px 2px", background: "transparent", border: 0, color: "var(--text)", cursor: "pointer", fontSize: 15, fontWeight: 650, textAlign: "left" };

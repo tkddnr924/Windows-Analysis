@@ -73,7 +73,7 @@ export default function DefenderView({ data, onNavigate, onFetchLinkedRows, book
   const [selected, setSelected] = useState<Row | null>(null);
 
   return (
-    <div style={{ flex: 1, minHeight: 0, overflow: "auto", padding: "20px 24px" }}>
+    <div className="dfir-view" style={{ flex: 1, minHeight: 0, overflow: "auto", padding: "28px 32px" }}>
       {/* Hero */}
       <div style={{ display: "flex", alignItems: "baseline", gap: 12, marginBottom: 4 }}>
         <span style={{ fontSize: 22, fontWeight: 700, color: "var(--text)" }}>🛡️ Windows Defender</span>
@@ -81,19 +81,6 @@ export default function DefenderView({ data, onNavigate, onFetchLinkedRows, book
       </div>
       <div style={{ fontSize: 12, color: "var(--text-faint)", marginBottom: 18 }}>
         이벤트 로그를 종합한 백신 활동 요약 · 항목을 클릭하면 상세 보기(→ 원본 이벤트로 이동·북마크)가 열립니다.
-      </div>
-
-      {/* Summary tiles */}
-      <div style={{ display: "flex", flexWrap: "wrap", gap: 10, marginBottom: 20 }}>
-        <Tile label="탐지된 위협" value={`${threats.length}건`} sub={unhandled ? `미조치 ${unhandled}건` : threats.length ? "모두 조치됨" : undefined} tone={unhandled ? "danger" : threats.length ? "warning" : "ok"} />
-        <Tile
-          label="실시간 보호"
-          value={rtState ? (rtState.on ? "정상 (복원됨)" : "해제됨") : "이벤트 없음"}
-          sub={rtState ? rtState.at : undefined}
-          tone={rtState ? (rtState.on ? "ok" : "danger") : "ok"}
-        />
-        <Tile label="검사 기록 삭제" value={historyCleared ? "있음" : "없음"} sub={historyCleared ? historyCleared.timestamp : undefined} tone={historyCleared ? "warning" : "ok"} />
-        <Tile label="마지막 검사" value={lastScan ? lastScan.title : "기록 없음"} sub={lastScan ? lastScan.timestamp : undefined} tone="ok" />
       </div>
 
       {!hasData && <div style={{ color: "var(--text-faint)", fontSize: 13 }}>Defender 이벤트 로그가 없습니다.</div>}
@@ -225,17 +212,6 @@ function Card({ title, count, accent, note, children }: { title: string; count?:
       </div>
       <div style={{ padding: "8px 16px 14px" }}>{children}</div>
     </section>
-  );
-}
-
-function Tile({ label, value, sub, tone }: { label: string; value: string; sub?: string; tone: "ok" | "warning" | "danger" }) {
-  const color = tone === "danger" ? "var(--danger)" : tone === "warning" ? "var(--warning)" : "var(--success)";
-  return (
-    <div style={{ minWidth: 150, maxWidth: 260, padding: "10px 14px", background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", borderLeft: `3px solid ${color}` }}>
-      <div style={{ fontSize: 11, color: "var(--text-faint)" }}>{label}</div>
-      <div style={{ fontSize: 16, fontWeight: 700, color, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{value}</div>
-      {sub && <div style={{ fontSize: 10.5, color: "var(--text-faint)", fontFamily: "var(--mono)", marginTop: 1 }}>{sub}</div>}
-    </div>
   );
 }
 

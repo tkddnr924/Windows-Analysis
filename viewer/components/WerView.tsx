@@ -2,6 +2,7 @@
 
 import { useMemo, useState } from "react";
 import type { CsvData } from "@/lib/types";
+import RowDetailPanel from "./RowDetailPanel";
 
 // Windows Error Reporting (Report.wer) detail view. The parser stores every
 // report field in one `report` JSON column (+ a few promoted scalars); this
@@ -95,7 +96,7 @@ export default function WerView({ data, bookmarkedRowids, onToggleBookmark }: Pr
   const pageRows = shown.slice(safePage * PAGE, (safePage + 1) * PAGE);
 
   return (
-    <div style={{ flex: 1, minHeight: 0, overflow: "auto", padding: "20px 24px" }}>
+    <div className="dfir-view" style={{ flex: 1, minHeight: 0, overflow: "auto", padding: "28px 32px" }}>
       <div style={{ display: "flex", alignItems: "baseline", gap: 12, marginBottom: 2 }}>
         <span style={{ fontSize: 22, fontWeight: 700, color: "var(--text)" }}>💥 Windows 오류 보고 (WER)</span>
         <span style={{ fontSize: 12.5, color: "var(--text-faint)" }}>{parsed.length.toLocaleString()}건</span>
@@ -183,9 +184,13 @@ export default function WerView({ data, bookmarkedRowids, onToggleBookmark }: Pr
       )}
 
       {detail && (
-        <WerDetailModal
-          p={detail}
+        <RowDetailPanel
+          row={detail.row}
+          columns={data.columns}
+          focusedColumn={null}
+          fileBaseName="WER_Reports"
           onClose={() => setDetail(null)}
+          onNavigate={() => {}}
           isBookmarked={onToggleBookmark ? (bookmarkedRowids?.has(detail.rowid) ?? false) : undefined}
           onToggleBookmark={onToggleBookmark && Number.isFinite(detail.rowid) ? () => onToggleBookmark(detail.rowid) : undefined}
         />
@@ -246,15 +251,16 @@ function WerDetailModal({ p, onClose, isBookmarked, onToggleBookmark }: { p: Par
     <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(1,4,9,0.6)", zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
       <div onClick={(e) => e.stopPropagation()} style={{ width: 720, maxWidth: "100%", maxHeight: "86vh", overflow: "auto", background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "var(--radius-lg)", boxShadow: "var(--shadow-panel)" }}>
         <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "14px 18px", borderBottom: "1px solid var(--border)", borderLeft: `3px solid ${tone}`, position: "sticky", top: 0, background: "var(--bg-panel)", zIndex: 1 }}>
-          <span style={{ fontSize: 15, fontWeight: 700, wordBreak: "break-all" }}>💥 {p.appName || "(이름 없음)"}</span>
+          <span className="dfir-section-label">증거 상세</span>
+          <span style={{ fontSize: 15, fontWeight: 700, wordBreak: "break-all" }}>{p.appName || "(이름 없음)"}</span>
           <Pill text={p.eventType || "?"} color={tone} />
           {onToggleBookmark && (
             <button
               onClick={onToggleBookmark}
               title={isBookmarked ? "북마크 해제" : "북마크에 추가"}
-              style={{ marginLeft: "auto", display: "inline-flex", alignItems: "center", gap: 5, fontSize: 11.5, padding: "4px 10px", background: isBookmarked ? "var(--warning-subtle)" : "transparent", color: isBookmarked ? "var(--warning)" : "var(--text-dim)", border: `1px solid ${isBookmarked ? "var(--warning)" : "var(--border)"}`, borderRadius: "var(--radius-lg)", cursor: "pointer", fontWeight: 600 }}
+              style={{ marginLeft: "auto", display: "inline-flex", alignItems: "center", gap: 5, fontSize: 11.5, padding: "4px 10px", background: isBookmarked ? "var(--accent-subtle)" : "transparent", color: isBookmarked ? "var(--accent)" : "var(--text-dim)", border: `1px solid ${isBookmarked ? "var(--accent)" : "var(--border)"}`, borderRadius: "var(--radius-lg)", cursor: "pointer", fontWeight: 600 }}
             >
-              {isBookmarked ? "★ 북마크됨" : "☆ 북마크"}
+              {isBookmarked ? "북마크됨" : "북마크"}
             </button>
           )}
           <button onClick={onClose} style={{ marginLeft: onToggleBookmark ? 8 : "auto", background: "transparent", border: "none", color: "var(--text-faint)", fontSize: 18, cursor: "pointer" }}>×</button>
@@ -262,7 +268,7 @@ function WerDetailModal({ p, onClose, isBookmarked, onToggleBookmark }: { p: Par
 
         <div style={{ padding: "14px 18px 18px" }}>
           {p.timestamp && (
-            <div style={{ fontSize: 13, color: "var(--text)", fontFamily: "var(--mono)", fontWeight: 600, marginBottom: 12 }}>🕑 {p.timestamp}</div>
+            <div style={{ fontSize: 13, color: "var(--text)", fontFamily: "var(--mono)", fontWeight: 600, marginBottom: 12 }}><span className="dfir-tag dfir-tag--info">기준 시간</span> {p.timestamp}</div>
           )}
 
           <MetaRows rows={summary} />

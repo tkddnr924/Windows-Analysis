@@ -1,9 +1,16 @@
 "use client";
 
-import { useState } from "react";
-import type { ArtifactViewSpec, FieldKind, FieldSpec, LinkSpec } from "@/lib/artifactViews";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import AccountCircleOutlinedIcon from "@mui/icons-material/AccountCircleOutlined";
+import BookmarkBorderOutlinedIcon from "@mui/icons-material/BookmarkBorderOutlined";
+import BookmarkOutlinedIcon from "@mui/icons-material/BookmarkOutlined";
+import CircularProgress from "@mui/material/CircularProgress";
+import ExpandLessOutlinedIcon from "@mui/icons-material/ExpandLessOutlined";
+import ExpandMoreOutlinedIcon from "@mui/icons-material/ExpandMoreOutlined";
+import OpenInFullOutlinedIcon from "@mui/icons-material/OpenInFullOutlined";
+import type { ArtifactViewSpec, DetailSectionSpec, FieldKind, FieldSpec, LinkSpec } from "@/lib/artifactViews";
 import { getArtifactView } from "@/lib/artifactViews";
-import type { FetchLinkedRows } from "@/lib/types";
+import type { CacheBodyPreview, FetchLinkedRows } from "@/lib/types";
 import { parsePrivileges, lookupPrivilege } from "@/lib/privileges";
 import TagList from "./TagList";
 import MiniTimeline from "./MiniTimeline";
@@ -53,6 +60,17 @@ function formatBytes(value: string): string {
   return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }
 
+function formatDurationMs(value: string): string {
+  const ms = Number(value);
+  if (!Number.isFinite(ms) || ms < 0) return value;
+  if (ms < 1000) return `${ms.toLocaleString()} ms`;
+  const seconds = ms / 1000;
+  if (seconds < 60) return `${seconds.toFixed(1)}초`;
+  const minutes = seconds / 60;
+  if (minutes < 60) return `${minutes.toFixed(1)}분`;
+  return `${(minutes / 60).toFixed(1)}시간`;
+}
+
 function prettyJsonOrNull(value: string): string | null {
   const trimmed = value.trim();
   if (!trimmed || (trimmed[0] !== "{" && trimmed[0] !== "[")) return null;
@@ -69,26 +87,26 @@ function prettyJsonOrNull(value: string): string | null {
 // content full-screen (CodeModal) — the detail panel's box is small, and a
 // PowerShell ScriptBlock can be hundreds of lines. Used for `json`/`code`
 // fields and for any plain field whose value turns out to be JSON.
-// Turn literal escape sequences ("\r\n", "\n", "\t") — which many EventData
-// blobs store as two-character text, not real whitespace — into actual line
-// breaks/tabs so multi-line content reads normally. Display-only.
-function unescapeWhitespace(s: string): string {
-  return s
-    .replace(/\\r\\n/g, "\n")
-    .replace(/\\n/g, "\n")
-    .replace(/\\r/g, "\n")
-    .replace(/\\t/g, "\t");
-}
-
 function CodeOrJsonBlock({ raw, expandTitle }: { raw: string; expandTitle?: string }) {
   const pretty = prettyJsonOrNull(raw);
   const [beautified, setBeautified] = useState(true);
   const [expanded, setExpanded] = useState(false);
-  const [unescaped, setUnescaped] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const [copyError, setCopyError] = useState(false);
   const isJson = pretty !== null;
-  const hasEscapes = /\\[rnt]/.test(raw);
-  const base = isJson && beautified ? (pretty as string) : raw;
-  const shown = unescaped ? unescapeWhitespace(base) : base;
+  const shown = isJson && beautified ? (pretty as string) : raw;
+
+  async function copy() {
+    try {
+      await navigator.clipboard.writeText(raw);
+      setCopied(true);
+      setCopyError(false);
+      window.setTimeout(() => setCopied(false), 1000);
+    } catch {
+      setCopyError(true);
+      window.setTimeout(() => setCopyError(false), 2400);
+    }
+  }
 
   const btnStyle: React.CSSProperties = {
     fontSize: 10,
@@ -112,19 +130,14 @@ function CodeOrJsonBlock({ raw, expandTitle }: { raw: string; expandTitle?: stri
             {beautified ? "{ } 원본" : "{ } 정렬"}
           </button>
         )}
-        {hasEscapes && (
-          <button
-            onClick={() => setUnescaped((u) => !u)}
-            title={unescaped ? "이스케이프 원본(\\r \\n \\t) 보기" : "\\r \\n \\t 를 실제 줄바꿈·탭으로 치환"}
-            style={{ ...btnStyle, background: unescaped ? "var(--accent-subtle)" : "var(--bg-elevated)", borderColor: unescaped ? "var(--accent)" : "var(--border)" }}
-          >
-            ↵ \n 치환
-          </button>
-        )}
-        <button onClick={() => setExpanded(true)} title="크게 보기" style={btnStyle}>
-          ⛶ 확장
+        <button onClick={copy} style={{ ...btnStyle, color: copyError ? "var(--danger)" : btnStyle.color }}>
+          {copyError ? "복사 실패" : copied ? "복사됨" : "복사"}
+        </button>
+        <button onClick={() => setExpanded(true)} title="크게 보기" style={{ ...btnStyle, display: "inline-flex", alignItems: "center", gap: 3 }}>
+          <OpenInFullOutlinedIcon aria-hidden="true" sx={{ fontSize: 12 }} /> 확장
         </button>
       </div>
+      {copyError && <div role="status" style={{ marginBottom: 4, color: "var(--danger)", fontSize: 10.5 }}>클립보드에 복사하지 못했습니다.</div>}
       {expanded && <CodeModal code={shown} title={expandTitle ?? "코드 보기"} onClose={() => setExpanded(false)} />}
       <pre
         style={{
@@ -151,12 +164,8 @@ function Badge({ text, color }: { text: string; color?: string }) {
   if (!text) return null;
   return (
     <span
+      className="dfir-tag"
       style={{
-        display: "inline-block",
-        padding: "3px 10px",
-        borderRadius: "var(--radius-lg)",
-        fontSize: 11,
-        fontWeight: 600,
         background: color ? `${color}22` : "var(--bg-elevated)",
         color: color ?? "var(--text-dim)",
         border: `1px solid ${color ? `${color}55` : "var(--border)"}`,
@@ -169,38 +178,228 @@ function Badge({ text, color }: { text: string; color?: string }) {
 
 function CopyButton({ value }: { value: string }) {
   const [copied, setCopied] = useState(false);
+  const [copyError, setCopyError] = useState(false);
   return (
     <button
-      onClick={(e) => {
+      onClick={async (e) => {
         e.stopPropagation();
-        navigator.clipboard.writeText(value).then(() => {
+        try {
+          await navigator.clipboard.writeText(value);
           setCopied(true);
-          setTimeout(() => setCopied(false), 1000);
-        });
+          setCopyError(false);
+          window.setTimeout(() => setCopied(false), 1000);
+        } catch {
+          setCopyError(true);
+          window.setTimeout(() => setCopyError(false), 2400);
+        }
       }}
+      title={copyError ? "복사 실패" : copied ? "복사됨" : "복사"}
+      aria-label={copyError ? "복사 실패" : copied ? "복사됨" : "값 복사"}
       style={{
         fontSize: 10,
         padding: "1px 6px",
         background: "var(--bg-elevated)",
-        color: "var(--text-faint)",
+        color: copyError ? "var(--danger)" : "var(--text-faint)",
         border: "1px solid var(--border)",
         borderRadius: "var(--radius-sm)",
         cursor: "pointer",
         flexShrink: 0,
       }}
     >
-      {copied ? "복사됨" : "복사"}
+      {copyError ? "복사 실패" : copied ? "복사됨" : "복사"}
     </button>
   );
 }
 
-function FieldRow({ field, row }: { field: FieldSpec; row: Record<string, string> }) {
+function AccountSidValue({ sid, onFetchLinkedRows }: { sid: string; onFetchLinkedRows?: FetchLinkedRows }) {
+  const [accountName, setAccountName] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!onFetchLinkedRows || !sid) {
+      setAccountName(null);
+      return;
+    }
+    let alive = true;
+    setAccountName(null);
+    // TargetInfo is built from SAM/ProfileList and stores Account records with
+    // the SID in `name` and the verified account name in `username`.
+    onFetchLinkedRows("TargetInfo", "name", sid)
+      .then((result) => {
+        if (!alive) return;
+        const account = result?.rows.find((candidate) => candidate.category === "Account" && candidate.username)?.username;
+        setAccountName(account || null);
+      })
+      .catch(() => {
+        if (alive) setAccountName(null);
+      });
+    return () => { alive = false; };
+  }, [sid, onFetchLinkedRows]);
+
+  return (
+    <div>
+      <div style={{ fontFamily: "var(--mono)", fontSize: 12, wordBreak: "break-all" }}>{sid}</div>
+      {accountName && (
+        <div style={{ marginTop: 6 }}>
+          <span className="dfir-tag dfir-tag--info">
+            <AccountCircleOutlinedIcon sx={{ fontSize: 14 }} aria-hidden />
+            {accountName}
+          </span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function AccountValue({ account }: { account: string }) {
+  return (
+    <span className="dfir-tag dfir-tag--info">
+      <AccountCircleOutlinedIcon sx={{ fontSize: 14 }} aria-hidden />
+      {account}
+    </span>
+  );
+}
+
+function parseByteSize(value: string): number | null {
+  const match = value.trim().match(/^([\d,.]+)\s*(bytes?|kb|mb|gb|tb)?$/i);
+  if (!match) return null;
+  const amount = Number(match[1].replace(/,/g, ""));
+  if (!Number.isFinite(amount) || amount < 0) return null;
+  const unit = (match[2] || "bytes").toLowerCase();
+  const multiplier = unit.startsWith("tb") ? 1024 ** 4 : unit.startsWith("gb") ? 1024 ** 3 : unit.startsWith("mb") ? 1024 ** 2 : unit.startsWith("kb") ? 1024 : 1;
+  return Math.round(amount * multiplier);
+}
+
+function ByteSizeValue({ value }: { value: string }) {
+  const bytes = parseByteSize(value);
+  const [unit, setUnit] = useState<"Bytes" | "KB" | "MB" | "GB">("Bytes");
+  if (bytes === null) return <span style={{ fontFamily: "var(--mono)", fontSize: 12 }}>{value}</span>;
+  const divisor = unit === "GB" ? 1024 ** 3 : unit === "MB" ? 1024 ** 2 : unit === "KB" ? 1024 : 1;
+  const display = unit === "Bytes" ? `${bytes.toLocaleString()} Bytes` : `${(bytes / divisor).toLocaleString(undefined, { maximumFractionDigits: 2 })} ${unit}`;
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+      <span style={{ fontFamily: "var(--mono)", fontSize: 12.5 }}>{display}</span>
+      <div role="group" aria-label="크기 단위" style={{ display: "inline-flex", gap: 2, padding: 2, background: "var(--bg-input)", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)" }}>
+        {(["Bytes", "KB", "MB", "GB"] as const).map((nextUnit) => (
+          <button key={nextUnit} type="button" onClick={() => setUnit(nextUnit)} aria-pressed={unit === nextUnit} style={{ padding: "3px 6px", border: "none", borderRadius: 3, cursor: "pointer", fontSize: 10.5, fontWeight: 650, background: unit === nextUnit ? "var(--accent-subtle)" : "transparent", color: unit === nextUnit ? "var(--accent)" : "var(--text-faint)" }}>
+            {nextUnit}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function decodeBase64Text(value: string): string {
+  try {
+    const binary = atob(value);
+    const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+    return new TextDecoder("utf-8").decode(bytes);
+  } catch {
+    return "";
+  }
+}
+
+const CACHE_TEXT_PREVIEW_B64_CAP = 192 * 1024;
+
+function cacheContentType(row: Record<string, string>): string {
+  if (row.mime) return row.mime;
+  const path = (row.url || "").split(/[?#]/)[0].toLowerCase();
+  if (path.endsWith(".js")) return "application/javascript";
+  if (path.endsWith(".css")) return "text/css";
+  if (path.endsWith(".json")) return "application/json";
+  if (path.endsWith(".html") || path.endsWith(".htm")) return "text/html";
+  if (path.endsWith(".svg")) return "image/svg+xml";
+  return "";
+}
+
+function CacheDataValue({ row, hostDir }: { row: Record<string, string>; hostDir?: string }) {
+  const [state, setState] = useState<"idle" | "loading" | "ready" | "unavailable">("idle");
+  const [body, setBody] = useState<CacheBodyPreview | null>(null);
+  const loadTokenRef = useRef(0);
+  const contentType = cacheContentType(row);
+  const cacheIdentity = `${hostDir ?? ""}\u0000${row.account ?? ""}\u0000${row.url ?? ""}\u0000${row.cache_key ?? ""}`;
+  const recoveryStateKnown = row.cache_body_recovered !== undefined;
+  const hasRecoveredBody = row.cache_body_recovered === "1";
+
+  // Decoding or JSON formatting a multi-megabyte body in the WebView used to
+  // monopolize the event loop after the IPC result arrived. The Rust command
+  // already returns a bounded base64 response; keep the visible text prefix
+  // smaller still, so opening it never has to paint an unbounded <pre>.
+  const textPreview = useMemo(() => {
+    if (!body || !(/^text\//i.test(contentType) || /json|javascript|xml|svg/i.test(contentType))) return "";
+    return decodeBase64Text(body.bodyB64.slice(0, CACHE_TEXT_PREVIEW_B64_CAP));
+  }, [body, contentType]);
+  const textPreviewTruncated = Boolean(body && (body.truncated || body.bodyB64.length > CACHE_TEXT_PREVIEW_B64_CAP));
+
+  useEffect(() => {
+    // Cache detail opens must not start disk I/O on their own. In addition to
+    // avoiding unnecessary work for normal cache metadata, this keeps a
+    // legacy overview (which has no recovery marker) responsive until the
+    // analyst deliberately requests its body.
+    loadTokenRef.current += 1;
+    setState("idle");
+    setBody(null);
+    return () => { loadTokenRef.current += 1; };
+  }, [cacheIdentity]);
+
+  function loadRecoveredBody() {
+    if (!hostDir || !row.account || !row.url) {
+      setState("unavailable");
+      return;
+    }
+    const loadToken = loadTokenRef.current + 1;
+    loadTokenRef.current = loadToken;
+    setState("loading");
+    setBody(null);
+    // `cache_entry_body` performs filesystem/SQLite work on a Rust blocking
+    // worker. The local guard keeps a later selection from receiving this
+    // response, while the drawer and the rest of the app stay interactive.
+    window.api.cacheEntryBody(hostDir, row.account, row.url, row.cache_key || "")
+      .then((response) => {
+        if (loadToken !== loadTokenRef.current) return;
+        if (!response.bodyB64) { setState("unavailable"); return; }
+        setBody(response);
+        setState("ready");
+      })
+      .catch(() => {
+        if (loadToken === loadTokenRef.current) setState("unavailable");
+      });
+  }
+
+  if (state === "loading") return <span style={{ display: "inline-flex", alignItems: "center", gap: 7, color: "var(--text-dim)", fontSize: 12 }}><CircularProgress size={14} thickness={4} sx={{ color: "var(--accent)" }} />복구 데이터 불러오는 중</span>;
+  if (state === "unavailable") return <span style={{ color: "var(--warning)", fontSize: 12.5, fontWeight: 650 }}>복구 데이터 확인 불가 · 원본 캐시를 다시 확인하세요</span>;
+  if (state === "idle") {
+    if (!hasRecoveredBody) {
+      if (recoveryStateKnown) return <span style={{ color: "var(--danger)", fontSize: 12.5, fontWeight: 650 }}>파싱 실패</span>;
+      return <span style={{ color: "var(--text-faint)", fontSize: 12 }}>이전 분석 데이터 · 재파싱 필요</span>;
+    }
+    if (!(row.cache_key || "").trim()) return <span style={{ color: "var(--text-faint)", fontSize: 12 }}>캐시 식별자 없음 · 재파싱 필요</span>;
+    return (
+      <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+        <button type="button" onClick={loadRecoveredBody} style={{ padding: "4px 8px", borderRadius: "var(--radius-sm)", border: "1px solid var(--border)", background: "var(--bg-elevated)", color: "var(--accent)", cursor: "pointer", fontSize: 11.5, fontWeight: 650 }}>복구 데이터 열기</button>
+      </div>
+    );
+  }
+  if (!body) return null;
+  if (/^image\//i.test(contentType) && !body.truncated) return <img src={`data:${contentType.split(";")[0]};base64,${body.bodyB64}`} alt="복구된 캐시 데이터" style={{ display: "block", maxWidth: "100%", maxHeight: 360, border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", background: "var(--bg-input)" }} />;
+  if (/^text\//i.test(contentType) || /json|javascript|xml|svg/i.test(contentType)) return <div><CodeOrJsonBlock raw={textPreview} expandTitle="캐시 데이터" />{textPreviewTruncated && <div style={{ marginTop: 6, color: "var(--text-faint)", fontSize: 11.5 }}>복구된 본문 {body.decodedSize.toLocaleString()} Bytes 중 성능 보호용 미리보기만 표시합니다.</div>}</div>;
+  const byteLength = parseByteSize(row.size_bytes || row.size || "");
+  return <span style={{ color: "var(--text-dim)", fontSize: 12.5 }}>바이너리 데이터 복구됨{byteLength !== null ? ` · ${byteLength.toLocaleString()} Bytes` : body.decodedSize ? ` · ${body.decodedSize.toLocaleString()} Bytes` : ""}{body.truncated ? " (미리보기 제한)" : ""}</span>;
+}
+
+function FieldRow({ field, row, onFetchLinkedRows, hostDir, onToggleFieldBookmark, isFieldBookmarked }: { field: FieldSpec; row: Record<string, string>; onFetchLinkedRows?: FetchLinkedRows; hostDir?: string; onToggleFieldBookmark?: (field: string) => void; isFieldBookmarked?: (field: string) => boolean }) {
   const raw = field.compute ? field.compute(row) ?? "" : row[field.key];
-  if (raw === undefined || raw === null || raw === "") return null;
+  if ((raw === undefined || raw === null || raw === "") && !field.showWhenEmpty) return null;
 
   const kind: FieldKind = field.kind ?? "text";
   const label = field.label ?? field.key;
-  const displayValue = field.valueLabels?.[raw] ?? raw;
+  const displayValue = raw ? field.valueLabels?.[raw] ?? raw : field.emptyLabel ?? "값 없음";
+  // Code/JSON fields provide their own adjacent copy + expand controls in
+  // CodeOrJsonBlock. Rendering the generic field copy control as well creates
+  // two identical actions for the same evidence value.
+  // Plain fields that happen to contain JSON also render CodeOrJsonBlock, so
+  // they must use its single copy control instead of adding FieldRow's copy.
+  const hasInlineCodeControls = kind === "code" || kind === "json" || kind === "cacheData" || prettyJsonOrNull(raw) !== null;
 
   let content: React.ReactNode;
   switch (kind) {
@@ -231,6 +430,21 @@ function FieldRow({ field, row }: { field: FieldSpec; row: Record<string, string
     case "privileges":
       content = <PrivilegeList raw={raw} />;
       break;
+    case "accountSid":
+      content = <AccountSidValue sid={raw} onFetchLinkedRows={onFetchLinkedRows} />;
+      break;
+    case "account":
+      content = <AccountValue account={raw} />;
+      break;
+    case "byteSize":
+      content = <ByteSizeValue value={raw} />;
+      break;
+    case "durationMs":
+      content = <span>{formatDurationMs(raw)}</span>;
+      break;
+    case "cacheData":
+      content = <CacheDataValue row={row} hostDir={hostDir} />;
+      break;
     default:
       // A plain text/path field can still hold a JSON blob (e.g. a registry
       // value, a serialized argument) — offer the same beautify toggle when
@@ -239,114 +453,257 @@ function FieldRow({ field, row }: { field: FieldSpec; row: Record<string, string
   }
 
   return (
-    <div style={{ padding: "7px 0", borderBottom: "1px solid var(--border-subtle)" }}>
+    <div style={{ minWidth: 0, maxWidth: "100%", padding: "7px 0", borderBottom: "1px solid var(--border-subtle)" }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 8 }}>
-        <span style={{ fontSize: 11, color: "var(--text-faint)" }}>{label}</span>
-        <CopyButton value={raw} />
+        <span style={{ minWidth: 0, fontSize: 11, color: "var(--text-faint)", overflowWrap: "anywhere" }}>{label}</span>
+        <span style={{ display: "inline-flex", alignItems: "center", gap: 4, flexShrink: 0 }}>
+          {!hasInlineCodeControls && raw && <CopyButton value={raw} />}
+          {field.bookmarkable && raw && onToggleFieldBookmark && (
+            <button
+              type="button"
+              onClick={() => onToggleFieldBookmark(field.key)}
+              aria-label={`${label} ${isFieldBookmarked?.(field.key) ? "북마크 해제" : "북마크"}`}
+              title={isFieldBookmarked?.(field.key) ? "이 시각 북마크 해제" : "이 시각 북마크"}
+              style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 24, height: 22, padding: 0, border: `1px solid ${isFieldBookmarked?.(field.key) ? "var(--warning)" : "var(--border)"}`, borderRadius: "var(--radius-sm)", background: isFieldBookmarked?.(field.key) ? "var(--warning-subtle)" : "var(--bg-elevated)", color: isFieldBookmarked?.(field.key) ? "var(--warning)" : "var(--text-faint)", cursor: "pointer" }}
+            >
+              {isFieldBookmarked?.(field.key) ? <BookmarkOutlinedIcon sx={{ fontSize: 14 }} /> : <BookmarkBorderOutlinedIcon sx={{ fontSize: 14 }} />}
+            </button>
+          )}
+        </span>
       </div>
-      <div style={{ marginTop: 3 }}>{content}</div>
+      <div style={{ minWidth: 0, maxWidth: "100%", marginTop: 3, overflowWrap: "anywhere", wordBreak: "break-word" }}>{content}</div>
     </div>
   );
 }
 
-const MAX_INLINE_LINKED_ROWS = 500;
+const LINKED_ROWS_PAGE_SIZE = 100;
+const EMBEDDED_ROWS_PAGE_SIZE = 5;
 
-// A detail-view link ("이 exe가 로드한 파일 보기" 등) shown as an inline
-// accordion: expanding it lazily pulls the matching rows from the target
-// table and lists them right here, instead of navigating to another tab.
-// Each linked row is summarized with the TARGET table's own title()/subtitle()
-// spec, so the labeling stays consistent with how that table renders itself.
-function LinkAccordion({
+function LinkedRowList({
   link,
-  value,
-  onFetchLinkedRows,
+  rows,
 }: {
   link: LinkSpec;
-  value: string;
-  onFetchLinkedRows: FetchLinkedRows;
+  rows: Record<string, string>[];
 }) {
-  const [expanded, setExpanded] = useState(false);
-  const [rows, setRows] = useState<Record<string, string>[] | null>(null);
-  const [notFound, setNotFound] = useState(false);
-  const [loading, setLoading] = useState(false);
   const targetSpec = getArtifactView(link.targetFile);
-
-  async function toggle() {
-    const next = !expanded;
-    setExpanded(next);
-    if (next && rows === null && !notFound) {
-      setLoading(true);
-      try {
-        const result = await onFetchLinkedRows(link.targetFile, link.targetColumn, value);
-        if (result) setRows(result.rows);
-        else setNotFound(true);
-      } finally {
-        setLoading(false);
-      }
-    }
-  }
-
-  const shown = rows ? rows.slice(0, MAX_INLINE_LINKED_ROWS) : [];
-
-  return (
-    <div style={{ border: "1px solid var(--border)", borderRadius: "var(--radius-md)", overflow: "hidden" }}>
-      <button
-        onClick={toggle}
+  return rows.map((record, index) => {
+    const isPrefetchReference = link.targetFile === "Prefetch_LoadedFiles";
+    const title = isPrefetchReference
+      ? record.loaded_filename || "(파일명 없음)"
+      : targetSpec ? targetSpec.title(record) : Object.values(record)[1] ?? "";
+    const subtitle = isPrefetchReference
+      ? record.file_reference || ""
+      : targetSpec?.subtitle?.(record) ?? "";
+    return (
+      <div
+        key={record.__rowid || `${title}-${index}`}
         style={{
-          width: "100%",
-          textAlign: "left",
-          display: "flex",
-          alignItems: "center",
-          gap: 8,
-          fontSize: 12,
           padding: "8px 10px",
-          background: "var(--accent-subtle)",
-          color: "var(--accent)",
-          border: "none",
-          cursor: "pointer",
-          fontWeight: 600,
+          borderTop: index === 0 ? "none" : "1px solid var(--border-subtle)",
+          fontSize: 12.5,
+          background: index % 2 ? "var(--bg-input)" : "transparent",
         }}
       >
+        <div style={{ color: "var(--text)", wordBreak: "break-all", lineHeight: 1.45 }}>{title}</div>
+        {subtitle && <div style={{ marginTop: 2, color: "var(--text-faint)", fontSize: 11.5, wordBreak: "break-all" }}>{subtitle}</div>}
+      </div>
+    );
+  });
+}
+
+function LinkPagination({
+  page,
+  pageSize,
+  rowCount,
+  onPageChange,
+}: {
+  page: number;
+  pageSize: number;
+  rowCount: number;
+  onPageChange: (page: number) => void;
+}) {
+  if (rowCount === 0) return null;
+  const totalPages = Math.max(1, Math.ceil(rowCount / pageSize));
+  const start = page * pageSize + 1;
+  const end = Math.min((page + 1) * pageSize, rowCount);
+  const buttonStyle: React.CSSProperties = {
+    padding: "3px 8px",
+    borderRadius: "var(--radius-sm)",
+    border: "1px solid var(--border)",
+    background: "var(--bg-elevated)",
+    color: "var(--text-dim)",
+    fontSize: 11,
+  };
+  return (
+    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, padding: "7px 10px", borderTop: "1px solid var(--border-subtle)", fontSize: 11.5, color: "var(--text-faint)" }}>
+      <span>{start.toLocaleString()}–{end.toLocaleString()} / {rowCount.toLocaleString()}개</span>
+      <span style={{ display: "inline-flex", gap: 4 }}>
+        <button type="button" aria-label="이전 페이지" disabled={page === 0} onClick={(event) => { event.preventDefault(); onPageChange(page - 1); }} style={{ ...buttonStyle, cursor: page === 0 ? "default" : "pointer", opacity: page === 0 ? 0.42 : 1 }}>이전</button>
+        <button type="button" aria-label="다음 페이지" disabled={page + 1 >= totalPages} onClick={(event) => { event.preventDefault(); onPageChange(page + 1); }} style={{ ...buttonStyle, cursor: page + 1 >= totalPages ? "default" : "pointer", opacity: page + 1 >= totalPages ? 0.42 : 1 }}>다음</button>
+      </span>
+    </div>
+  );
+}
+
+// Standard related-evidence links remain an accordion. They now use database
+// pages too, avoiding a full source-table materialisation when expanded.
+function LinkAccordion({ link, value, onFetchLinkedRows }: { link: LinkSpec; value: string; onFetchLinkedRows: FetchLinkedRows }) {
+  const [expanded, setExpanded] = useState(false);
+  const [rows, setRows] = useState<Record<string, string>[] | null>(null);
+  const [rowCount, setRowCount] = useState(0);
+  const [notFound, setNotFound] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [page, setPage] = useState(0);
+
+  useEffect(() => {
+    if (!expanded) return;
+    let active = true;
+    setLoading(true);
+    setNotFound(false);
+    onFetchLinkedRows(link.targetFile, link.targetColumn, value, { offset: page * LINKED_ROWS_PAGE_SIZE, limit: LINKED_ROWS_PAGE_SIZE })
+      .then((result) => {
+        if (!active) return;
+        if (!result) setNotFound(true);
+        else {
+          setRows(result.rows);
+          setRowCount(result.rowCount);
+        }
+      })
+      .catch(() => { if (active) setNotFound(true); })
+      .finally(() => { if (active) setLoading(false); });
+    return () => { active = false; };
+  }, [expanded, link, onFetchLinkedRows, page, value]);
+
+  return (
+    <div style={{ border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", overflow: "hidden" }}>
+      <button type="button" onClick={() => { setExpanded((current) => !current); setPage(0); }} style={{ width: "100%", textAlign: "left", display: "flex", alignItems: "center", gap: 8, fontSize: 12, padding: "8px 10px", background: "var(--accent-subtle)", color: "var(--accent)", border: "none", cursor: "pointer", fontWeight: 600 }}>
         <span style={{ fontSize: 9 }}>{expanded ? "▾" : "▸"}</span>
         <span style={{ flex: 1 }}>{link.label}</span>
-        {rows && <span style={{ color: "var(--text-faint)", fontWeight: 400 }}>{rows.length.toLocaleString()}</span>}
+        {rowCount > 0 && <span style={{ color: "var(--text-faint)", fontWeight: 400 }}>{rowCount.toLocaleString()}</span>}
       </button>
       {expanded && (
         <div style={{ borderTop: "1px solid var(--border)", maxHeight: 260, overflow: "auto" }}>
-          {loading && <div style={{ padding: "8px 10px", fontSize: 12, color: "var(--text-dim)" }}>불러오는 중...</div>}
-          {notFound && (
-            <div style={{ padding: "8px 10px", fontSize: 12, color: "var(--text-faint)" }}>원본 테이블을 찾을 수 없습니다.</div>
-          )}
-          {rows && rows.length === 0 && (
-            <div style={{ padding: "8px 10px", fontSize: 12, color: "var(--text-faint)" }}>연결된 항목이 없습니다.</div>
-          )}
-          {shown.map((r, i) => {
-            const title = targetSpec ? targetSpec.title(r) : Object.values(r)[1] ?? "";
-            const subtitle = targetSpec?.subtitle?.(r) ?? "";
-            return (
-              <div
-                key={i}
-                style={{
-                  padding: "6px 10px",
-                  borderTop: i === 0 ? "none" : "1px solid var(--border-subtle)",
-                  fontSize: 12,
-                }}
-              >
-                <div style={{ wordBreak: "break-all" }}>{title}</div>
-                {subtitle && (
-                  <div style={{ fontSize: 11, color: "var(--text-faint)", wordBreak: "break-all" }}>{subtitle}</div>
-                )}
-              </div>
-            );
-          })}
-          {rows && rows.length > MAX_INLINE_LINKED_ROWS && (
-            <div style={{ padding: "6px 10px", fontSize: 11, color: "var(--text-faint)", borderTop: "1px solid var(--border-subtle)" }}>
-              외 {(rows.length - MAX_INLINE_LINKED_ROWS).toLocaleString()}개 더 (표시 생략)
-            </div>
-          )}
+          {loading && <div style={{ padding: "10px", fontSize: 12, color: "var(--text-dim)" }}>불러오는 중...</div>}
+          {notFound && <div style={{ padding: "10px", fontSize: 12, color: "var(--text-faint)" }}>연결된 원본 테이블을 찾을 수 없습니다.</div>}
+          {!loading && rows?.length === 0 && <div style={{ padding: "10px", fontSize: 12, color: "var(--text-faint)" }}>연결된 항목이 없습니다.</div>}
+          {!loading && rows && <LinkedRowList link={link} rows={rows} />}
+          {!loading && rows && <LinkPagination page={page} pageSize={LINKED_ROWS_PAGE_SIZE} rowCount={rowCount} onPageChange={setPage} />}
         </div>
       )}
     </div>
+  );
+}
+
+function EmbeddedLinkRows({ link, value, onFetchLinkedRows }: { link: LinkSpec; value: string; onFetchLinkedRows: FetchLinkedRows }) {
+  const [queryInput, setQueryInput] = useState("");
+  const [query, setQuery] = useState("");
+  const [page, setPage] = useState(0);
+  const [rows, setRows] = useState<Record<string, string>[] | null>(null);
+  const [rowCount, setRowCount] = useState(0);
+  const [failed, setFailed] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const sectionRef = useRef<HTMLDivElement>(null);
+  const savedDrawerScrollTop = useRef<number | null>(null);
+
+  function changePage(nextPage: number) {
+    const drawerScroller = sectionRef.current?.closest<HTMLElement>("[data-detail-scroll-container]");
+    savedDrawerScrollTop.current = drawerScroller?.scrollTop ?? null;
+    setPage(nextPage);
+  }
+
+  // The database request changes the rows asynchronously. Restore the
+  // enclosing drawer's position after React commits those rows so changing a
+  // reference-file page never throws an analyst back to the evidence header.
+  useLayoutEffect(() => {
+    const savedTop = savedDrawerScrollTop.current;
+    if (savedTop === null) return;
+    const drawerScroller = sectionRef.current?.closest<HTMLElement>("[data-detail-scroll-container]");
+    if (!drawerScroller) return;
+    drawerScroller.scrollTop = savedTop;
+    const frame = requestAnimationFrame(() => { drawerScroller.scrollTop = savedTop; });
+    savedDrawerScrollTop.current = null;
+    return () => cancelAnimationFrame(frame);
+  }, [page, loading, rows]);
+
+  useEffect(() => {
+    let active = true;
+    setLoading(true);
+    setFailed(false);
+    onFetchLinkedRows(link.targetFile, link.targetColumn, value, { search: query, offset: page * EMBEDDED_ROWS_PAGE_SIZE, limit: EMBEDDED_ROWS_PAGE_SIZE })
+      .then((result) => {
+        if (!active) return;
+        if (!result) setFailed(true);
+        else {
+          setRows(result.rows);
+          setRowCount(result.rowCount);
+        }
+      })
+      .catch(() => { if (active) setFailed(true); })
+      .finally(() => { if (active) setLoading(false); });
+    return () => { active = false; };
+  }, [link, onFetchLinkedRows, page, query, value]);
+
+  function submitSearch(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setPage(0);
+    setQuery(queryInput.trim());
+  }
+
+  return (
+    <div ref={sectionRef} style={{ padding: "14px 16px", borderBottom: "1px solid var(--border-subtle)" }}>
+      <div className="dfir-section-label" style={{ marginBottom: 8 }}>{link.label}</div>
+      <form onSubmit={submitSearch} style={{ display: "flex", gap: 6, marginBottom: 8 }}>
+        <input value={queryInput} onChange={(event) => setQueryInput(event.target.value)} aria-label="참조 파일 검색" placeholder="파일명 또는 경로 검색" style={{ minWidth: 0, flex: 1, height: 30, padding: "0 9px", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", background: "var(--bg-input)", color: "var(--text)", fontSize: 12 }} />
+        <button type="submit" style={{ height: 30, padding: "0 10px", border: "1px solid var(--accent)", borderRadius: "var(--radius-sm)", background: "var(--accent-subtle)", color: "var(--accent)", fontSize: 12, cursor: "pointer" }}>검색</button>
+      </form>
+      <div style={{ border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", overflow: "hidden" }}>
+        <div aria-live="polite" style={{ maxHeight: 240, overflowY: "auto", overscrollBehavior: "contain" }}>
+          {loading && <div style={{ display: "flex", alignItems: "center", gap: 8, minHeight: 52, padding: "10px", color: "var(--text-dim)", fontSize: 12 }}><CircularProgress size={14} thickness={5} /> 참조 파일을 불러오는 중</div>}
+          {failed && <div style={{ minHeight: 52, padding: "10px", color: "var(--danger)", fontSize: 12 }}>참조 파일을 조회하지 못했습니다.</div>}
+          {!loading && !failed && rows?.length === 0 && <div style={{ minHeight: 52, padding: "10px", color: "var(--text-faint)", fontSize: 12 }}>{query ? "검색 결과가 없습니다." : "Prefetch에 기록된 참조 파일이 없습니다."}</div>}
+          {!loading && !failed && rows && <LinkedRowList link={link} rows={rows} />}
+        </div>
+        {!loading && !failed && rows && <LinkPagination page={page} pageSize={EMBEDDED_ROWS_PAGE_SIZE} rowCount={rowCount} onPageChange={changePage} />}
+      </div>
+    </div>
+  );
+}
+
+function DetailSection({ section, row, onFetchLinkedRows, hostDir, onToggleFieldBookmark, isFieldBookmarked }: { section: DetailSectionSpec; row: Record<string, string>; onFetchLinkedRows?: FetchLinkedRows; hostDir?: string; onToggleFieldBookmark?: (field: string) => void; isFieldBookmarked?: (field: string) => boolean }) {
+  const visibleFields = section.fields.filter((field) => field.showWhenEmpty || (field.compute ? field.compute(row) : row[field.key]));
+  const [expanded, setExpanded] = useState(section.collapsible?.defaultExpanded ?? true);
+  if (visibleFields.length === 0) return null;
+
+  const heading = typeof section.heading === "function" ? section.heading(row) : section.heading;
+  const summary = section.collapsible?.summary?.(row, visibleFields.length) ?? `${visibleFields.length}개 필드`;
+  if (!section.collapsible) {
+    return (
+      <div style={{ padding: "14px 16px", borderBottom: "1px solid var(--border-subtle)" }}>
+        <div className="dfir-section-label" style={{ marginBottom: 6 }}>{heading}</div>
+        {visibleFields.map((field) => <FieldRow key={field.key} field={field} row={row} onFetchLinkedRows={onFetchLinkedRows} hostDir={hostDir} onToggleFieldBookmark={onToggleFieldBookmark} isFieldBookmarked={isFieldBookmarked} />)}
+      </div>
+    );
+  }
+
+  return (
+    <section style={{ borderBottom: "1px solid var(--border-subtle)" }}>
+      <button
+        type="button"
+        aria-expanded={expanded}
+        onClick={() => setExpanded((current) => !current)}
+        style={{ width: "100%", display: "flex", alignItems: "center", gap: 8, padding: "12px 16px", background: "transparent", border: "none", color: "var(--text)", cursor: "pointer", textAlign: "left" }}
+      >
+        {expanded ? <ExpandLessOutlinedIcon sx={{ fontSize: 17, color: "var(--text-faint)" }} aria-hidden /> : <ExpandMoreOutlinedIcon sx={{ fontSize: 17, color: "var(--text-faint)" }} aria-hidden />}
+        <span className="dfir-section-label" style={{ flex: "0 0 auto" }}>{heading}</span>
+        <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", marginLeft: "auto", color: "var(--text-faint)", fontFamily: "var(--mono)", fontSize: 11.5 }}>{summary}</span>
+      </button>
+      {expanded && (
+        <div style={{ padding: "0 16px 12px" }}>
+          {visibleFields.map((field) => <FieldRow key={field.key} field={field} row={row} onFetchLinkedRows={onFetchLinkedRows} hostDir={hostDir} onToggleFieldBookmark={onToggleFieldBookmark} isFieldBookmarked={isFieldBookmarked} />)}
+        </div>
+      )}
+    </section>
   );
 }
 
@@ -355,9 +712,13 @@ interface ArtifactDetailViewProps {
   row: Record<string, string>;
   onNavigate: (targetFile: string, targetColumn: string, value: string) => void;
   onFetchLinkedRows?: FetchLinkedRows;
+  /** Host evidence directory, required only for on-demand Browser Cache bodies. */
+  hostDir?: string;
+  onToggleFieldBookmark?: (field: string) => void;
+  isFieldBookmarked?: (field: string) => boolean;
 }
 
-export default function ArtifactDetailView({ spec, row, onNavigate, onFetchLinkedRows }: ArtifactDetailViewProps) {
+export default function ArtifactDetailView({ spec, row, onNavigate, onFetchLinkedRows, hostDir, onToggleFieldBookmark, isFieldBookmarked }: ArtifactDetailViewProps) {
   const title = spec.title(row);
   const subtitle = spec.subtitle?.(row);
   const tags = spec.tags?.(row) ?? [];
@@ -367,22 +728,24 @@ export default function ArtifactDetailView({ spec, row, onNavigate, onFetchLinke
     .filter((p) => p.value);
 
   const activeLinks = (spec.links ?? []).filter((link) => row[link.key]);
+  const activeEmbeddedLinks = (spec.embeddedLinks ?? []).filter((link) => row[link.key]);
 
   // The record's time. Always surfaced when present — the primary timeline
   // field if the spec declares one, else a plain "timestamp"/"last_write".
   const timeValue = (spec.timelineField ? row[spec.timelineField] : "") || row.timestamp || row.last_write || "";
 
   return (
-    <div>
+    <div style={{ minWidth: 0, maxWidth: "100%" }}>
       <div style={{ padding: "18px 16px 14px", borderBottom: "1px solid var(--border-subtle)" }}>
-        <div style={{ fontSize: 16, fontWeight: 700, wordBreak: "break-word" }}>{title}</div>
-        {timeValue && (
-          <div style={{ fontSize: 13, color: "var(--text)", fontFamily: "var(--mono)", fontWeight: 600, marginTop: 5 }}>
-            🕑 {timeValue}
+        <div className="dfir-section-label" style={{ marginBottom: 7 }}>증거 개요</div>
+        <div style={{ minWidth: 0, maxWidth: "100%", fontSize: 16, fontWeight: 700, overflowWrap: "anywhere", wordBreak: "break-word" }}>{title}</div>
+        {timeValue && spec.overviewTime !== "hide" && (
+          <div style={{ fontSize: 12.5, color: "var(--text-dim)", fontFamily: "var(--mono)", fontWeight: 550, marginTop: 7 }}>
+            {timeValue}
           </div>
         )}
         {subtitle && (
-          <div style={{ fontSize: 12.5, color: "var(--text-dim)", marginTop: 3, wordBreak: "break-word" }}>
+          <div style={{ minWidth: 0, maxWidth: "100%", fontSize: 12.5, color: "var(--text-dim)", marginTop: 3, overflowWrap: "anywhere", wordBreak: "break-word" }}>
             {subtitle}
           </div>
         )}
@@ -394,11 +757,6 @@ export default function ArtifactDetailView({ spec, row, onNavigate, onFetchLinke
               const displayValue = b.valueLabels?.[value] ?? value;
               return <Badge key={b.key} text={displayValue} color={b.badgeColors?.[displayValue]} />;
             })}
-          </div>
-        )}
-        {tags.length > 0 && (
-          <div style={{ marginTop: 8 }}>
-            <TagList tags={tags} />
           </div>
         )}
         {activeLinks.length > 0 && (
@@ -431,45 +789,27 @@ export default function ArtifactDetailView({ spec, row, onNavigate, onFetchLinke
 
       {timelinePoints.length >= 2 && (
         <div style={{ padding: "14px 16px 10px", borderBottom: "1px solid var(--border-subtle)" }}>
-          <div
-            style={{
-              fontSize: 10.5,
-              fontWeight: 700,
-              color: "var(--text-faint)",
-              textTransform: "uppercase",
-              letterSpacing: 0.6,
-              marginBottom: 6,
-            }}
-          >
-            시간 흐름
-          </div>
+          <div className="dfir-section-label" style={{ marginBottom: 6 }}>{spec.timelineHeading ?? "시간 흐름"}</div>
           <MiniTimeline points={timelinePoints} />
         </div>
       )}
 
-      {spec.sections.map((section) => {
-        const visibleFields = section.fields.filter((f) => (f.compute ? f.compute(row) : row[f.key]));
-        if (visibleFields.length === 0) return null;
-        return (
-          <div key={section.heading} style={{ padding: "14px 16px", borderBottom: "1px solid var(--border-subtle)" }}>
-            <div
-              style={{
-                fontSize: 10.5,
-                fontWeight: 700,
-                color: "var(--text-faint)",
-                textTransform: "uppercase",
-                letterSpacing: 0.6,
-                marginBottom: 6,
-              }}
-            >
-              {section.heading}
-            </div>
-            {visibleFields.map((f) => (
-              <FieldRow key={f.key} field={f} row={row} />
-            ))}
-          </div>
-        );
-      })}
+      {spec.sections.map((section, index) => (
+        <DetailSection key={`${typeof section.heading === "string" ? section.heading : "computed"}-${index}`} section={section} row={row} onFetchLinkedRows={onFetchLinkedRows} hostDir={hostDir} onToggleFieldBookmark={onToggleFieldBookmark} isFieldBookmarked={isFieldBookmarked} />
+      ))}
+
+      {activeEmbeddedLinks.map((link) =>
+        onFetchLinkedRows ? (
+          <EmbeddedLinkRows key={link.key} link={link} value={row[link.key]} onFetchLinkedRows={onFetchLinkedRows} />
+        ) : null
+      )}
+
+      {tags.length > 0 && (
+        <div style={{ padding: "14px 16px 18px", borderBottom: "1px solid var(--border-subtle)" }}>
+          <div className="dfir-section-label" style={{ marginBottom: 7 }}>분석 주의</div>
+          <TagList tags={tags} />
+        </div>
+      )}
     </div>
   );
 }

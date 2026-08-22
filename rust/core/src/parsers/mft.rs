@@ -19,6 +19,7 @@ pub const MFT_FIELD_ORDER: &[&str] = &[
     "path", "file_name", "extension", "is_directory", "in_use", "file_size",
     "entry", "seq", "parent_entry",
     "si_created", "si_modified", "si_mft_modified", "si_accessed",
+    "owner_id", "security_id",
     "fn_created", "fn_modified", "fn_mft_modified", "fn_accessed",
     "_source_file",
 ];
@@ -35,11 +36,17 @@ const ROOT_ENTRY: u64 = 5;
 /// at 0 (or a stale value) even though the file has data. Reading them was why
 /// real files showed as 0 bytes. Named $DATA streams are alternate data streams
 /// and are skipped, so the size stays the file's own.
-fn extract(entry: &mft::MftEntry) -> (Option<FileNameAttr>, Option<[String; 4]>, Option<u64>) {
+struct StandardInfo {
+    timestamps: [String; 4],
+    owner_id: u32,
+    security_id: u32,
+}
+
+fn extract(entry: &mft::MftEntry) -> (Option<FileNameAttr>, Option<StandardInfo>, Option<u64>) {
     use mft::attribute::header::ResidentialHeader;
     use mft::attribute::MftAttributeType;
 
-    let mut si: Option<[String; 4]> = None;
+    let mut si: Option<StandardInfo> = None;
     let mut best: Option<FileNameAttr> = None;
     let mut best_prio: i32 = -1;
     let mut data_size: Option<u64> = None;
@@ -49,15 +56,18 @@ fn extract(entry: &mft::MftEntry) -> (Option<FileNameAttr>, Option<[String; 4]>,
             match &attr.header.residential_header {
                 ResidentialHeader::NonResident(nr) => data_size = Some(nr.file_size),
                 ResidentialHeader::Resident(r) => data_size = Some(r.data_size as u64),
-                _ => {}
             }
         }
         match attr.data {
             MftAttributeContent::AttrX10(s) => {
-                si = Some([
-                    fmt_kst_ft(s.created), fmt_kst_ft(s.modified),
-                    fmt_kst_ft(s.mft_modified), fmt_kst_ft(s.accessed),
-                ]);
+                si = Some(StandardInfo {
+                    timestamps: [
+                        fmt_kst_ft(s.created), fmt_kst_ft(s.modified),
+                        fmt_kst_ft(s.mft_modified), fmt_kst_ft(s.accessed),
+                    ],
+                    owner_id: s.owner_id,
+                    security_id: s.security_id,
+                });
             }
             MftAttributeContent::AttrX30(f) => {
                 let prio = match f.namespace {
@@ -142,7 +152,10 @@ pub fn parse_mft_stream(mft_path: &Path, out: &Path) -> Result<usize> {
             match name.rfind('.') { Some(d) if d > 0 => name[d + 1..].to_lowercase(), _ => String::new() }
         } else { String::new() };
 
-        let si = si.unwrap_or([String::new(), String::new(), String::new(), String::new()]);
+        let (si_times, owner_id, security_id) = match si {
+            Some(info) => (info.timestamps, Some(info.owner_id), Some(info.security_id)),
+            None => ([String::new(), String::new(), String::new(), String::new()], None, None),
+        };
         let mut row = Row::new();
         row.insert("path".into(), path);
         row.insert("file_name".into(), name);
@@ -153,10 +166,15 @@ pub fn parse_mft_stream(mft_path: &Path, out: &Path) -> Result<usize> {
         row.insert("entry".into(), e.to_string());
         row.insert("seq".into(), hdr.sequence.to_string());
         row.insert("parent_entry".into(), if parent == u64::MAX { "-1".into() } else { parent.to_string() });
-        row.insert("si_created".into(), si[0].clone());
-        row.insert("si_modified".into(), si[1].clone());
-        row.insert("si_mft_modified".into(), si[2].clone());
-        row.insert("si_accessed".into(), si[3].clone());
+        row.insert("si_created".into(), si_times[0].clone());
+        row.insert("si_modified".into(), si_times[1].clone());
+        row.insert("si_mft_modified".into(), si_times[2].clone());
+        row.insert("si_accessed".into(), si_times[3].clone());
+        // NTFS $STANDARD_INFORMATION owner/security IDs are numeric metadata,
+        // not account names. Preserve them verbatim; do not resolve them to a
+        // SID or a user account here.
+        row.insert("owner_id".into(), owner_id.map_or_else(String::new, |value| value.to_string()));
+        row.insert("security_id".into(), security_id.map_or_else(String::new, |value| value.to_string()));
         row.insert("fn_created".into(), fn_t[0].clone());
         row.insert("fn_modified".into(), fn_t[1].clone());
         row.insert("fn_mft_modified".into(), fn_t[2].clone());
@@ -165,4 +183,15 @@ pub fn parse_mft_stream(mft_path: &Path, out: &Path) -> Result<usize> {
         writer.push(row)?;
     }
     writer.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MFT_FIELD_ORDER;
+
+    #[test]
+    fn standard_information_ids_are_persisted_in_mft_schema() {
+        assert!(MFT_FIELD_ORDER.contains(&"owner_id"));
+        assert!(MFT_FIELD_ORDER.contains(&"security_id"));
+    }
 }

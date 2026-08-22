@@ -17,6 +17,7 @@ export default function TabBar({ tabs, activeKey, onActivate, onClose }: TabBarP
 
   return (
     <div
+      className="dfir-tabbar"
       style={{
         display: "flex",
         overflowX: "auto",
@@ -43,6 +44,7 @@ export default function TabBar({ tabs, activeKey, onActivate, onClose }: TabBarP
               borderRight: "1px solid var(--border-subtle)",
               background: isActive ? "var(--bg)" : "transparent",
               borderTop: isActive ? "2px solid var(--accent)" : "2px solid transparent",
+              boxShadow: isActive ? "inset 0 -1px 0 var(--bg)" : undefined,
               color: isActive ? "var(--text)" : "var(--text-dim)",
               fontSize: 12.5,
               fontWeight: isActive ? 600 : 400,
