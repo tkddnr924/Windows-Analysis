@@ -185,20 +185,6 @@ function terminalStatusLabel(status: string): string {
   return "취소";
 }
 
-function slowestRegistryPhase(report: ParseReport): { name: string; durationMs: number; hive: NonNullable<ParseReport["registryHives"]>[number] } | null {
-  const hive = report.registryHives?.reduce<NonNullable<ParseReport["registryHives"]>[number] | null>((slowest, candidate) => {
-    const candidateDuration = candidate.buildRecoveryMs + candidate.iterationAndSqliteWriteMs;
-    const slowestDuration = slowest ? slowest.buildRecoveryMs + slowest.iterationAndSqliteWriteMs : -1;
-    return candidateDuration > slowestDuration ? candidate : slowest;
-  }, null);
-  if (!hive) return null;
-  return {
-    name: hive.sourcePath.split(/[\\/]/).pop() || "Registry hive",
-    durationMs: hive.buildRecoveryMs + hive.iterationAndSqliteWriteMs,
-    hive,
-  };
-}
-
 function RunLogDetail({ host, report }: { host: Host; report: ParseReport }) {
   const [open, setOpen] = useState(false);
   const [text, setText] = useState<string | null>(null);
@@ -265,12 +251,6 @@ function RunOutcomeSummary({
   const errors = report?.errors?.filter(Boolean) ?? [];
   const briefErrors = errors.map((error) => error.length > 180 ? `${error.slice(0, 177)}…` : error);
   const retryMft = report?.status === "partial" && report.artifacts.some((artifact) => artifact.name === "MFT" && artifact.status === "failed");
-  const slowestRegistry = report ? slowestRegistryPhase(report) : null;
-  const publicationText = report
-    ? report.published
-      ? `공개 결과: ${report.publishedArtifacts?.length ? report.publishedArtifacts.join(", ") : "파일 공개 완료"}`
-      : "공개 결과: 없음"
-    : null;
   const summary = failed
     ? briefErrors.length
       ? `오류: ${briefErrors.join(" · ")}`
@@ -287,17 +267,8 @@ function RunOutcomeSummary({
   const summaryColor = failed ? "var(--danger)" : cancelled ? "var(--text-dim)" : "var(--warning)";
   return <details style={{ gridColumn: "1 / -1", margin: "0 0 2px", fontSize: 11.5, color: summaryColor }}>
     <summary style={{ cursor: "pointer", width: "fit-content" }}>{summary} · 상세</summary>
-    {report && <div style={{ marginTop: 5, color: "var(--text-dim)" }}>실행 상태: {terminalStatus === "partial" ? "부분 완료" : terminalStatus === "error" ? "오류" : terminalStatus} · {publicationText}</div>}
     <div style={{ display: "grid", gap: 3, marginTop: 6, padding: "7px 9px", color: "var(--text-dim)", borderLeft: `2px solid ${summaryColor}` }}>
       {slow && <span>총 소요: {formatDuration(duration)}</span>}
-      {report?.registryRecovery?.mode === "disabled" ? (
-        <span>레지스트리 복구 기능 미적용 · 삭제 셀 및 트랜잭션 로그는 이번 실행에 적용하지 않았습니다.</span>
-      ) : slowestRegistry ? (
-        <span>가장 긴 Registry hive: {slowestRegistry.name} · 복구/빌드 {formatDuration(slowestRegistry.hive.buildRecoveryMs / 1000)} · 레코드 순회·SQLite 기록 {formatDuration(slowestRegistry.hive.iterationAndSqliteWriteMs / 1000)} · 레코드 {slowestRegistry.hive.rowCount.toLocaleString()}건 · 트랜잭션 로그 {slowestRegistry.hive.recoveryLogCount.toLocaleString()}개 · 복구 레코드 {slowestRegistry.hive.recoveredRowCount.toLocaleString()}건</span>
-      ) : null}
-      {report?.registryRecovery?.mode === "disabled" && report.registryHives?.some((hive) => (hive.recoveryLogsDiscovered ?? 0) > 0) && (
-        <span>트랜잭션 로그 발견 · 미적용</span>
-      )}
       {mft?.status === "no_input" && <span>MFT: 원본 $MFT 파일 미수집 · 이번 실행에서는 결과를 만들지 않았습니다.</span>}
       {mft?.status === "failed" && <span>MFT: 파싱 실패 · MFT 결과는 공개되지 않았습니다.</span>}
       {briefErrors.map((error) => <span key={error}>오류: {error}</span>)}

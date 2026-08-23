@@ -60,6 +60,8 @@ function makeApi(): ElectronApi {
     listBookmarks: (caseDir) => invoke<Bookmark[]>("list_bookmarks", { caseDir }),
     toggleBookmark: (caseDir, entry: BookmarkInput) => invoke<Bookmark[]>("toggle_bookmark", { caseDir, entry }),
     updateBookmarkNote: (caseDir, id, note) => invoke<Bookmark[]>("update_bookmark_note", { caseDir, id, note }),
+    saveMasterTimeline: (hostDir, payload) => invoke<void>("save_master_timeline", { hostDir, payload }),
+    loadMasterTimeline: (hostDir) => invoke<string | null>("load_master_timeline", { hostDir }),
     pathReferences: (hostDir) => invoke<PathReference[]>("path_references", { hostDir }),
     cacheEntryBody: (hostDir, account, url, cacheKey) => invoke<CacheBodyPreview>("cache_entry_body", { hostDir, account, url, cacheKey }),
     aiConversations: (hostDir, query) => invoke<AiConversationPage>("ai_conversations", { hostDir, query }),

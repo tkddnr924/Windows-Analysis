@@ -424,6 +424,10 @@ export interface ElectronApi {
   onPipelineLog(callback: (entry: PipelineLogEntry) => void): () => void;
   /** hostDir = a host's direct cases/<hostId>/ folder. */
   listCategories(hostDir: string): Promise<CategoryEntry[]>;
+  // Persisted master-timeline cache. The payload is opaque JSON authored by the
+  // frontend ({ builtForRunAt, entries }); the backend just stores/returns it.
+  saveMasterTimeline(hostDir: string, payload: string): Promise<void>;
+  loadMasterTimeline(hostDir: string): Promise<string | null>;
   listResultFiles(categoryDir: string): Promise<ResultFileEntry[]>;
   /** Rebuilds only a legacy ExecutionHistory overview to add raw record links. */
   refreshExecutionHistoryOverview(hostDir: string): Promise<boolean>;

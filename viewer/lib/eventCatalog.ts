@@ -267,3 +267,30 @@ export function extractEventField(row: Record<string, string>, jsonKey: string):
   const value = data?.[jsonKey];
   return value === undefined || value === null || value === "" ? "" : String(value);
 }
+
+// Classic Windows PowerShell events (provider "PowerShell", EventID 400/500/
+// 600/800) do not expose their payload as JSON keys. Instead the whole detail
+// is a single tab-delimited text blob (carried in EventData's `#text`/`Data`
+// strings) of `Key=Value` lines separated by CR/LF, e.g.
+//   \tHostApplication=powershell.exe -NoProfile -File C:\...\a.ps1\r\n
+//   \tScriptName=C:\...\a.ps1\r\n\tEngineVersion=5.1...\r\n
+// This pulls one such field out so the analyst sees HostApplication/ScriptName/
+// CommandLine/etc. at a glance instead of scanning the raw JSON. Returns "" when
+// the key is absent (so the detail field simply hides for non-PowerShell events
+// and for the newer 4103/4104 records that use a different, JSON-keyed shape).
+export function extractPsClassicField(row: Record<string, string>, key: string): string {
+  const data = parseEventData(row.EventData);
+  if (!data) return "";
+  const parts: string[] = [];
+  const walk = (value: unknown) => {
+    if (typeof value === "string") parts.push(value);
+    else if (Array.isArray(value)) value.forEach(walk);
+    else if (value && typeof value === "object") Object.values(value).forEach(walk);
+  };
+  walk(data);
+  const blob = parts.join("\n");
+  // Value runs from `Key=` to the next CR/LF; a key is delimited by start,
+  // newline, or the leading tab that prefixes each classic-event line.
+  const match = blob.match(new RegExp(`(?:^|[\\r\\n\\t])${key}=([^\\r\\n]*)`));
+  return match ? match[1].trim() : "";
+}

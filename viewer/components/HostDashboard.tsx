@@ -227,19 +227,12 @@ function RunPublicationSummary({ report }: { report: ParseReport }) {
   const inputCount = report.artifacts.reduce((count, artifact) => count + artifact.inputs.length, 0);
   const outputCount = report.publishedOutputs?.length ?? 0;
   const registryRecoveryDisabled = report.registryRecovery?.mode === "disabled";
-  const discoveredRegistryLogs = report.registryHives?.reduce((count, hive) => count + (hive.recoveryLogsDiscovered ?? 0), 0) ?? 0;
-  const recoveryPolicy = registryRecoveryDisabled && (
-    <div style={{ marginTop: 3, color: "var(--text-faint)" }}>
-      레지스트리 복구 미적용{discoveredRegistryLogs > 0 ? ` · 트랜잭션 로그 ${discoveredRegistryLogs.toLocaleString()}개 발견 · 미적용` : ""}
-    </div>
-  );
   // Keep normal completion compact, but make the durable manifest's actual
   // evidence/result counts explicit. This prevents an in-progress category
   // refresh from being mistaken for a zero-input or zero-output parse.
   if (report.status === "ok") {
     return <section aria-label="최근 실행 공개 상태" style={{ marginTop: 14, padding: "8px 10px", borderLeft: "3px solid var(--success)", color: "var(--text-dim)", fontSize: 12.5 }}>
       <div>완료 · 입력 {inputCount.toLocaleString()}개 · 공개 결과 파일 {outputCount.toLocaleString()}개</div>
-      {recoveryPolicy}
     </section>;
   }
   const status = report.status === "partial" ? "부분 완료" : report.status === "error" ? "오류" : "취소됨";
@@ -248,7 +241,6 @@ function RunPublicationSummary({ report }: { report: ParseReport }) {
   const published = report.published && (report.publishedOutputs?.length ?? 0) > 0;
   return <section aria-label="최근 실행 공개 상태" style={{ marginTop: 14, padding: "8px 10px", borderLeft: `3px solid ${color}`, color: "var(--text-dim)", fontSize: 12.5 }}>
     <span>{status} · {!hasPublicationMetadata ? "기존 보고서의 공개 상태를 확인할 수 없습니다." : published ? `공개된 원본 결과 ${report.publishedArtifacts?.join(", ") || `${report.publishedOutputs?.length ?? 0}개 파일`}` : "이번 실행에서 공개된 결과 없음"}</span>
-    {recoveryPolicy}
   </section>;
 }
 
@@ -340,7 +332,7 @@ function ArtifactDetails({ inputs, hasStoredCounts, noInput, registryRecoveryDis
 
 function DetailLine({ name, recordCount, recoveryLog, registryRecoveryDisabled }: { name: string; recordCount: number; recoveryLog: boolean; registryRecoveryDisabled: boolean }) {
   const recoveryLabel = recoveryLog
-    ? registryRecoveryDisabled ? "트랜잭션 로그 발견 · 미적용" : "복구 로그 적용"
+    ? registryRecoveryDisabled ? "트랜잭션 로그" : "복구 로그 적용"
     : `${recordCount.toLocaleString()}건 추출`;
   return <div style={{ display: "grid", gridTemplateColumns: "minmax(180px, 0.65fr) minmax(130px, 0.35fr)", gap: 16, padding: "7px 0", borderBottom: "1px solid var(--border-subtle)" }}><span style={{ color: "var(--text-dim)", fontFamily: "var(--mono)", fontSize: 12.5, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{name}</span><span style={{ color: recoveryLog ? "var(--text-faint)" : "var(--accent)", fontSize: 13, fontWeight: recoveryLog ? 500 : 650, textAlign: "right" }}>{recoveryLabel}</span></div>;
 }

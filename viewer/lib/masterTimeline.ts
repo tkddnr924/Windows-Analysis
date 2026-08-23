@@ -33,12 +33,30 @@ const YIELD_EVERY = 8000;
 // drop their timelineField so they don't appear twice. EventLog is now one
 // table per source .evtx with an arbitrary name, resolved by columns after a
 // read.
-export async function buildMasterTimeline(categories: CategoryEntry[]): Promise<TimelineEntry[]> {
+// Thrown when the caller aborts an in-flight build (e.g. the analyst navigates
+// away from the timeline tab). Lets the caller distinguish a cancel from a real
+// failure and simply drop the partial result.
+export class TimelineBuildAborted extends Error {
+  constructor() {
+    super("timeline build aborted");
+    this.name = "TimelineBuildAborted";
+  }
+}
+
+export async function buildMasterTimeline(
+  categories: CategoryEntry[],
+  signal?: AbortSignal,
+): Promise<TimelineEntry[]> {
   const entries: TimelineEntry[] = [];
+  const throwIfAborted = () => {
+    if (signal?.aborted) throw new TimelineBuildAborted();
+  };
 
   for (const category of categories) {
+    throwIfAborted();
     const files = await window.api.listResultFiles(category.fullPath);
     for (const file of files) {
+      throwIfAborted();
       // A named spec is known up-front; an unnamed table (per-file EventLog)
       // needs its columns, so read it and resolve by column shape.
       let spec = resolveArtifactView(file.name);
@@ -70,10 +88,12 @@ export async function buildMasterTimeline(categories: CategoryEntry[]): Promise<
           });
         }
         // Big tables (EventLog can be ~700k rows) would otherwise block the
-        // renderer's single thread for seconds; yield so the UI stays live.
+        // renderer's single thread for seconds; yield so the UI stays live, and
+        // stop promptly if the analyst has already navigated away.
         if (++sinceYield >= YIELD_EVERY) {
           sinceYield = 0;
           await yieldToEventLoop();
+          throwIfAborted();
         }
       }
     }
@@ -83,6 +103,7 @@ export async function buildMasterTimeline(categories: CategoryEntry[]): Promise<
   // formatted YYYY-MM-DD hh:mm:ss.fff by the parser — lexicographic order
   // is chronological order. Rows without timestamps were excluded above.
   await yieldToEventLoop(); // let queued UI events through before the big sort
+  throwIfAborted(); // don't spend seconds sorting a result nobody is waiting for
   entries.sort((a, b) => (a.timestamp < b.timestamp ? 1 : a.timestamp > b.timestamp ? -1 : 0));
   return entries;
 }

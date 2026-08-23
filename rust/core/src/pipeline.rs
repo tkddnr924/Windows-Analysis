@@ -1580,12 +1580,16 @@ pub fn run_host_with_log_id(
         });
     }
 
-    // Skip the correlation stage entirely if the run was cancelled.
-    // Derived views are published only after every requested raw artifact
-    // completed. A partial raw run may still commit its completed source DBs,
-    // but must retain the prior overview rather than derive a new view from a
-    // mixture of current and failed artifact data.
-    if !cancelled() && !had_error {
+    // The correlation overview is built from the staging tree, which always
+    // holds the best-available picture: on a full run every succeeded artifact
+    // is freshly staged; on a scoped re-run the untouched categories are copied
+    // in from the last committed output. A single failed raw artifact (e.g. a
+    // dirty SRUDB.dat that libesedb cannot open) therefore must NOT suppress the
+    // overview — every integrated analysis tab is derived from it, so skipping
+    // it would blank the whole host analysis even when the other artifacts
+    // parsed cleanly. Only a cancel skips it, because a cancelled run may have
+    // stopped mid-artifact and left the staging tree incomplete.
+    if !cancelled() {
         emit(&format!("=== _OVERVIEW ==="));
         append_current_log_lifecycle("overview_started");
         let ov = out_dir.join("_OVERVIEW");
@@ -1658,14 +1662,21 @@ pub fn run_host_with_log_id(
                 ));
             }
         }
-    } else if cancelled() {
+        // Seal the freshly-built correlation tables so a partial run (some raw
+        // artifact failed) still publishes them through the per-file path. On a
+        // clean run they publish with the rest of the staging tree instead.
+        let overview_outputs: Vec<String> = report
+            .overview
+            .iter()
+            .map(|table| format!("_OVERVIEW/{}.sqlite", table.name))
+            .collect();
+        match seal_artifact_outputs(&out_dir, "_OVERVIEW", &overview_outputs) {
+            Ok(sealed) => sealed_outputs.extend(sealed),
+            Err(error) => emit(&format!("[!] _OVERVIEW seal failed: {error}")),
+        }
+    } else {
         emit(&format!("=== 취소됨 — 종합 분석 건너뜀 ==="));
         append_current_log_lifecycle("overview_finished status=cancelled");
-    } else {
-        emit(&format!("=== 일부 아티팩트 실패 — 종합 분석 유지 ==="));
-        append_current_log_lifecycle(
-            "overview_finished status=skipped reason=raw_artifact_failure",
-        );
     }
 
     let run_at = chrono::Local::now()
@@ -1703,13 +1714,12 @@ pub fn run_host_with_log_id(
         }
     }
     if status == "partial" {
-        let outputs: Vec<SealedArtifactOutput> = sealed_outputs
-            .into_iter()
-            // `_OVERVIEW` contains derived tables. The MFT raw table lives
-            // there today, but it is retained from the last committed view on
-            // a partial run rather than replacing the overview directory.
-            .filter(|output| !output.relative.starts_with("_OVERVIEW"))
-            .collect();
+        // Publish every sealed file, including the freshly-built `_OVERVIEW`
+        // correlation tables and the MFT raw table. A partial run still derives
+        // a valid overview from the artifacts that staged successfully, so the
+        // analysis tabs stay populated instead of blanking when one raw
+        // artifact (such as a dirty SRUM database) fails.
+        let outputs: Vec<SealedArtifactOutput> = sealed_outputs;
         if outputs.is_empty() {
             record_published_outputs(&mut report, &[]);
             append_current_log_lifecycle(

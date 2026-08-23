@@ -1,5 +1,5 @@
 import { tagsForBoolean, tagsForDangerType, tagsForEventLevel, tagsForNameMismatch, tagsForPath, type Tag } from "./tagging";
-import { lookupEventCatalog, parseEventData, extractEventField, tagsForSecurityEvent, EVENT_QUICK_FIELDS, LOGON_TYPE_LABELS } from "./eventCatalog";
+import { lookupEventCatalog, parseEventData, extractEventField, extractPsClassicField, tagsForSecurityEvent, EVENT_QUICK_FIELDS, LOGON_TYPE_LABELS } from "./eventCatalog";
 
 export type FieldKind = "text" | "path" | "code" | "hash" | "bytes" | "json" | "badge" | "privileges" | "accountSid" | "account" | "byteSize" | "durationMs" | "cacheData";
 
@@ -609,6 +609,7 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     sections: [{
       heading: (r) => `브라우저 ${r.kind === "download" ? "다운로드" : r.kind === "cache" ? "캐시" : "접근"}`,
       fields: [
+      { key: "title", label: "방문 Title", compute: (r) => r.title || "" },
       {
         key: "url_raw",
         label: "URL 원본",
@@ -1023,6 +1024,24 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
         // Firewall rule changes
         edField("RuleName", "방화벽 규칙"),
         edField("ApplicationPath", "대상 프로그램", { kind: "path" }),
+      ]},
+      // Classic Windows PowerShell events (400/403/500/600/800) pack their
+      // detail into a tab-delimited `Key=Value` text blob, so the JSON section
+      // below is unreadable at a glance. Surface the investigation-relevant
+      // fields here; each hides when absent, and the whole section disappears
+      // for any non-classic event (every field resolves empty).
+      { heading: "PowerShell 실행 정보 (파싱)", fields: [
+        { key: "_ps_host_application", label: "HostApplication", kind: "code", compute: (r) => extractPsClassicField(r, "HostApplication") },
+        { key: "_ps_script_name", label: "ScriptName", kind: "path", compute: (r) => extractPsClassicField(r, "ScriptName") },
+        { key: "_ps_command_line", label: "CommandLine", kind: "code", compute: (r) => extractPsClassicField(r, "CommandLine") },
+        { key: "_ps_user_id", label: "UserId (계정)", compute: (r) => extractPsClassicField(r, "UserId") },
+        { key: "_ps_host_name", label: "HostName", compute: (r) => extractPsClassicField(r, "HostName") },
+        { key: "_ps_host_version", label: "HostVersion", compute: (r) => extractPsClassicField(r, "HostVersion") },
+        { key: "_ps_engine_version", label: "EngineVersion", compute: (r) => extractPsClassicField(r, "EngineVersion") },
+        { key: "_ps_runspace_id", label: "RunspaceId", kind: "hash", compute: (r) => extractPsClassicField(r, "RunspaceId") },
+        { key: "_ps_pipeline_id", label: "PipelineId", compute: (r) => extractPsClassicField(r, "PipelineId") },
+        { key: "_ps_host_id", label: "HostId", kind: "hash", compute: (r) => extractPsClassicField(r, "HostId") },
+        { key: "_ps_sequence_number", label: "SequenceNumber", compute: (r) => extractPsClassicField(r, "SequenceNumber") },
       ]},
       { heading: "원본 (EventData)", fields: [{ key: "EventData", kind: "json" }] },
       { heading: "오류", fields: [{ key: "_error", kind: "code" }] },

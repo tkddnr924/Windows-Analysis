@@ -1225,6 +1225,10 @@ pub fn build_powershell_history(out_dir: &Path) -> Vec<Row> {
             let blob = strs.join("\n");
             let host = find_token(&blob, "HostApplication=");
             let command = find_token(&blob, "CommandLine=");
+            // Classic 800 events record the invoked .ps1 as ScriptName=; surface
+            // it as the row's script path so the PowerShell view shows it beside
+            // the host application instead of leaving the column empty.
+            let script_name = find_token(&blob, "ScriptName=");
             // Classic Windows PowerShell events frequently leave the outer
             // UserID empty while carrying the actual user in EventData.
             let event_user = find_token(&blob, "UserId=");
@@ -1258,7 +1262,7 @@ pub fn build_powershell_history(out_dir: &Path) -> Vec<Row> {
                 "명령 실행",
                 &event_id,
                 &provider,
-                "",
+                &script_name,
                 &rk,
             ));
         }

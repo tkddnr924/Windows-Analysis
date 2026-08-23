@@ -1124,6 +1124,27 @@ fn list_categories(host_dir: String) -> Vec<CategoryEntry> {
     out
 }
 
+// The master timeline is expensive to assemble (it scans every result table),
+// so the frontend builds it once and caches the result here. The cache is a
+// single JSON file at the host root — not a category directory, so it is
+// invisible to `list_categories` and survives the per-category publish of a
+// re-parse. Staleness is decided by the frontend via a `builtForRunAt` marker
+// embedded in the payload, so this side only reads and writes the blob.
+fn master_timeline_cache_path(host_dir: &str) -> PathBuf {
+    Path::new(host_dir).join("_master_timeline.cache.json")
+}
+
+#[tauri::command]
+fn save_master_timeline(host_dir: String, payload: String) -> Result<(), String> {
+    let path = master_timeline_cache_path(&host_dir);
+    std::fs::write(&path, payload).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn load_master_timeline(host_dir: String) -> Option<String> {
+    std::fs::read_to_string(master_timeline_cache_path(&host_dir)).ok()
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ResultFileEntry {
@@ -5813,6 +5834,8 @@ fn main() {
             run_host,
             cancel_pipeline,
             list_categories,
+            save_master_timeline,
+            load_master_timeline,
             list_result_files,
             refresh_execution_history_overview,
             account_directory,
