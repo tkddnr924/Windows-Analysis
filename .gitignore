@@ -20,3 +20,11 @@ viewer/src-tauri/binaries/
 .DS_Store
 __pycache__/
 *.tsbuildinfo
+
+# Font
+Fonts
+
+# etc
+.agents
+Agents.md
+skills-lock.json
