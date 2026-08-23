@@ -16,11 +16,25 @@ use crate::time::fmt_kst_ft;
 
 pub const MFT_TABLE: &str = "MFT_Records";
 pub const MFT_FIELD_ORDER: &[&str] = &[
-    "path", "file_name", "extension", "is_directory", "in_use", "file_size",
-    "entry", "seq", "parent_entry",
-    "si_created", "si_modified", "si_mft_modified", "si_accessed",
-    "owner_id", "security_id",
-    "fn_created", "fn_modified", "fn_mft_modified", "fn_accessed",
+    "path",
+    "file_name",
+    "extension",
+    "is_directory",
+    "in_use",
+    "file_size",
+    "entry",
+    "seq",
+    "parent_entry",
+    "si_created",
+    "si_modified",
+    "si_mft_modified",
+    "si_accessed",
+    "owner_id",
+    "security_id",
+    "fn_created",
+    "fn_modified",
+    "fn_mft_modified",
+    "fn_accessed",
     "_source_file",
 ];
 
@@ -62,8 +76,10 @@ fn extract(entry: &mft::MftEntry) -> (Option<FileNameAttr>, Option<StandardInfo>
             MftAttributeContent::AttrX10(s) => {
                 si = Some(StandardInfo {
                     timestamps: [
-                        fmt_kst_ft(s.created), fmt_kst_ft(s.modified),
-                        fmt_kst_ft(s.mft_modified), fmt_kst_ft(s.accessed),
+                        fmt_kst_ft(s.created),
+                        fmt_kst_ft(s.modified),
+                        fmt_kst_ft(s.mft_modified),
+                        fmt_kst_ft(s.accessed),
                     ],
                     owner_id: s.owner_id,
                     security_id: s.security_id,
@@ -75,7 +91,10 @@ fn extract(entry: &mft::MftEntry) -> (Option<FileNameAttr>, Option<StandardInfo>
                     FileNamespace::POSIX => 2,
                     FileNamespace::DOS => 1,
                 };
-                if prio > best_prio { best_prio = prio; best = Some(f); }
+                if prio > best_prio {
+                    best_prio = prio;
+                    best = Some(f);
+                }
             }
             _ => {}
         }
@@ -85,14 +104,34 @@ fn extract(entry: &mft::MftEntry) -> (Option<FileNameAttr>, Option<StandardInfo>
 
 /// Resolve a full path from parent references (memoized; identical algorithm to
 /// the Python parser). `index`: entry -> (name, parent).
-fn resolve(entry: u64, index: &HashMap<u64, (String, u64)>, cache: &mut HashMap<u64, String>, guard: &mut HashSet<u64>) -> String {
-    if let Some(p) = cache.get(&entry) { return p.clone(); }
-    let node = match index.get(&entry) { Some(n) => n, None => return "\\$Orphan".to_string() };
-    if guard.contains(&entry) { return "\\$Orphan".to_string(); }
+fn resolve(
+    entry: u64,
+    index: &HashMap<u64, (String, u64)>,
+    cache: &mut HashMap<u64, String>,
+    guard: &mut HashSet<u64>,
+) -> String {
+    if let Some(p) = cache.get(&entry) {
+        return p.clone();
+    }
+    let node = match index.get(&entry) {
+        Some(n) => n,
+        None => return "\\$Orphan".to_string(),
+    };
+    if guard.contains(&entry) {
+        return "\\$Orphan".to_string();
+    }
     guard.insert(entry);
     let (name, parent) = node;
-    let base = if *parent == entry { "\\$Orphan".to_string() } else { resolve(*parent, index, cache, guard) };
-    let full = if name.is_empty() { base } else { format!("{}\\{}", base, name) };
+    let base = if *parent == entry {
+        "\\$Orphan".to_string()
+    } else {
+        resolve(*parent, index, cache, guard)
+    };
+    let full = if name.is_empty() {
+        base
+    } else {
+        format!("{}\\{}", base, name)
+    };
     cache.insert(entry, full.clone());
     full
 }
@@ -103,8 +142,13 @@ pub fn parse_mft_stream(mft_path: &Path, out: &Path) -> Result<usize> {
     {
         let mut parser = MftParser::from_path(mft_path)?;
         for entry in parser.iter_entries() {
-            if crate::pipeline::cancelled() { break; }
-            let entry = match entry { Ok(e) => e, Err(_) => continue };
+            if crate::pipeline::cancelled() {
+                break;
+            }
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
             if let (Some(f), _, _) = extract(&entry) {
                 index.insert(entry.header.record_number, (f.name.clone(), f.parent.entry));
             }
@@ -119,19 +163,39 @@ pub fn parse_mft_stream(mft_path: &Path, out: &Path) -> Result<usize> {
     // pass 2: build + stream each row.
     let mut parser = MftParser::from_path(mft_path)?;
     for entry in parser.iter_entries() {
-        if crate::pipeline::cancelled() { break; }
-        let entry = match entry { Ok(e) => e, Err(_) => continue };
+        if crate::pipeline::cancelled() {
+            break;
+        }
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
         let hdr = &entry.header;
         let in_use = hdr.flags.bits() & 0x01 != 0;
         let is_dir = hdr.flags.bits() & 0x02 != 0;
         let (best, si, data_size) = extract(&entry);
-        if best.is_none() && si.is_none() { continue; }
+        if best.is_none() && si.is_none() {
+            continue;
+        }
 
         let (name, parent, fn_size, fn_t) = match &best {
-            Some(f) => (f.name.clone(), f.parent.entry, f.physical_size, [
-                fmt_kst_ft(f.created), fmt_kst_ft(f.modified), fmt_kst_ft(f.mft_modified), fmt_kst_ft(f.accessed),
-            ]),
-            None => (String::new(), u64::MAX, 0, [String::new(), String::new(), String::new(), String::new()]),
+            Some(f) => (
+                f.name.clone(),
+                f.parent.entry,
+                f.physical_size,
+                [
+                    fmt_kst_ft(f.created),
+                    fmt_kst_ft(f.modified),
+                    fmt_kst_ft(f.mft_modified),
+                    fmt_kst_ft(f.accessed),
+                ],
+            ),
+            None => (
+                String::new(),
+                u64::MAX,
+                0,
+                [String::new(), String::new(), String::new(), String::new()],
+            ),
         };
         // $DATA is authoritative; fall back to $FILE_NAME only when there's no
         // $DATA attribute at all (e.g. a directory, or a record whose data
@@ -144,17 +208,34 @@ pub fn parse_mft_stream(mft_path: &Path, out: &Path) -> Result<usize> {
         } else {
             let mut guard = HashSet::new();
             let parent_path = resolve(parent, &index, &mut cache, &mut guard);
-            let p = if name.is_empty() { parent_path } else { format!("{}\\{}", parent_path, name) };
-            if p.is_empty() { "\\".to_string() } else { p }
+            let p = if name.is_empty() {
+                parent_path
+            } else {
+                format!("{}\\{}", parent_path, name)
+            };
+            if p.is_empty() {
+                "\\".to_string()
+            } else {
+                p
+            }
         };
 
         let ext = if !is_dir {
-            match name.rfind('.') { Some(d) if d > 0 => name[d + 1..].to_lowercase(), _ => String::new() }
-        } else { String::new() };
+            match name.rfind('.') {
+                Some(d) if d > 0 => name[d + 1..].to_lowercase(),
+                _ => String::new(),
+            }
+        } else {
+            String::new()
+        };
 
         let (si_times, owner_id, security_id) = match si {
             Some(info) => (info.timestamps, Some(info.owner_id), Some(info.security_id)),
-            None => ([String::new(), String::new(), String::new(), String::new()], None, None),
+            None => (
+                [String::new(), String::new(), String::new(), String::new()],
+                None,
+                None,
+            ),
         };
         let mut row = Row::new();
         row.insert("path".into(), path);
@@ -162,10 +243,20 @@ pub fn parse_mft_stream(mft_path: &Path, out: &Path) -> Result<usize> {
         row.insert("extension".into(), ext);
         row.insert("is_directory".into(), if is_dir { "Y" } else { "N" }.into());
         row.insert("in_use".into(), if in_use { "Y" } else { "N" }.into());
-        row.insert("file_size".into(), if is_dir { "0".into() } else { size.to_string() });
+        row.insert(
+            "file_size".into(),
+            if is_dir { "0".into() } else { size.to_string() },
+        );
         row.insert("entry".into(), e.to_string());
         row.insert("seq".into(), hdr.sequence.to_string());
-        row.insert("parent_entry".into(), if parent == u64::MAX { "-1".into() } else { parent.to_string() });
+        row.insert(
+            "parent_entry".into(),
+            if parent == u64::MAX {
+                "-1".into()
+            } else {
+                parent.to_string()
+            },
+        );
         row.insert("si_created".into(), si_times[0].clone());
         row.insert("si_modified".into(), si_times[1].clone());
         row.insert("si_mft_modified".into(), si_times[2].clone());
@@ -173,8 +264,14 @@ pub fn parse_mft_stream(mft_path: &Path, out: &Path) -> Result<usize> {
         // NTFS $STANDARD_INFORMATION owner/security IDs are numeric metadata,
         // not account names. Preserve them verbatim; do not resolve them to a
         // SID or a user account here.
-        row.insert("owner_id".into(), owner_id.map_or_else(String::new, |value| value.to_string()));
-        row.insert("security_id".into(), security_id.map_or_else(String::new, |value| value.to_string()));
+        row.insert(
+            "owner_id".into(),
+            owner_id.map_or_else(String::new, |value| value.to_string()),
+        );
+        row.insert(
+            "security_id".into(),
+            security_id.map_or_else(String::new, |value| value.to_string()),
+        );
         row.insert("fn_created".into(), fn_t[0].clone());
         row.insert("fn_modified".into(), fn_t[1].clone());
         row.insert("fn_mft_modified".into(), fn_t[2].clone());

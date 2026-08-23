@@ -18,6 +18,7 @@ import { resolveArtifactView } from "@/lib/artifactViews";
 import { inRange, rangeActive, timeColumnFor, EMPTY_TIME_RANGE, type TimeRange } from "@/lib/timeRange";
 import RowDetailPanel from "./RowDetailPanel";
 import ColumnFilterControl from "./ColumnFilterControl";
+import type { AccountDirectory } from "@/lib/accountIdentity";
 
 const ROW_HEIGHT = 26;
 const DEFAULT_COLUMN_WIDTH = 220;
@@ -60,6 +61,7 @@ interface DataTableProps {
   onToggleBookmark?: (rowid: number) => void;
   /** Global incident-window filter from the sidebar; applied to this table's time column if it has one. */
   timeRange?: TimeRange;
+  accountDirectory?: AccountDirectory;
 }
 
 export default function DataTable({
@@ -72,6 +74,7 @@ export default function DataTable({
   bookmarkedRowids,
   onToggleBookmark,
   timeRange = EMPTY_TIME_RANGE,
+  accountDirectory,
 }: DataTableProps) {
   const [sorting, setSorting] = useState<SortingState>([]);
   const [columnFilters, setColumnFilters] = useState<ColumnFiltersState>([]);
@@ -446,29 +449,26 @@ export default function DataTable({
               const danger = tags.some((t) => t.severity === "danger");
               const rowid = Number((row.original as Record<string, unknown>).__rowid);
               const bookmarked = (bookmarkedRowids?.has(rowid) ?? false) && Number.isFinite(rowid);
-              // A bookmark is analyst context, not a warning. It gets the
-              // same blue semantic colour as the selected/navigation context;
-              // warning and red remain reserved for evidence signals.
-              const baseBg = bookmarked
-                ? "var(--accent-subtle)"
-                : tags.length > 0
-                  ? danger ? "var(--danger-subtle)" : "var(--warning-subtle)"
-                  : virtualRow.index % 2 === 0 ? "transparent" : "rgba(255,255,255,0.02)";
-              const boxShadow = bookmarked
-                ? "inset 3px 0 0 var(--accent), inset 0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent)"
-                : tags.length > 0
+              // A bookmark is analyst context.  It has its own neutral state;
+              // navigation blue and warning/red remain evidence semantics.
+              const baseBg = tags.length > 0
+                ? danger ? "var(--danger-subtle)" : "var(--warning-subtle)"
+                : virtualRow.index % 2 === 0 ? "transparent" : "rgba(255,255,255,0.02)";
+              const boxShadow = !bookmarked && tags.length > 0
                   ? `inset 3px 0 0 ${danger ? "var(--danger)" : "var(--warning)"}`
                   : undefined;
               return (
                 <tr
                   key={row.id}
+                  className={bookmarked ? `dfir-bookmarked-row${tags.length > 0 ? danger ? " dfir-bookmarked-row--danger" : " dfir-bookmarked-row--warning" : ""}` : undefined}
+                  aria-label={bookmarked ? "북마크됨" : undefined}
                   style={{
                     height: rowHeight,
                     background: baseBg,
                     boxShadow,
                   }}
-                  onMouseEnter={(e) => (e.currentTarget.style.background = "var(--bg-hover)")}
-                  onMouseLeave={(e) => (e.currentTarget.style.background = baseBg)}
+                  onMouseEnter={(e) => { if (!bookmarked) e.currentTarget.style.background = "var(--bg-hover)"; }}
+                  onMouseLeave={(e) => { if (!bookmarked) e.currentTarget.style.background = baseBg; }}
                 >
                   {row.getVisibleCells().map((cell) => {
                     const isDetailColumn = cell.column.id === DETAIL_COLUMN_ID;
@@ -557,6 +557,7 @@ export default function DataTable({
               onNavigate(targetFile, targetColumn, value);
             }}
             onFetchLinkedRows={onFetchLinkedRows}
+            accountDirectory={accountDirectory}
             isBookmarked={canBookmark ? bookmarkedRowids?.has(selRowid) ?? false : undefined}
             onToggleBookmark={canBookmark ? () => onToggleBookmark!(selRowid) : undefined}
           />

@@ -14,26 +14,43 @@ use serde_json::Value;
 use crate::sqlite::{Row, StreamWriter};
 use crate::time::fmt_kst;
 
-
 /// The IR-relevant .evtx to parse (exact filenames, case-insensitive), matching
 /// the Python parser's allowlist. "%4" is the on-disk escaping for "/".
 pub const ALLOWLIST: &[&str] = &[
-    "Security.evtx", "System.evtx", "Application.evtx",
-    "Microsoft-Windows-PowerShell%4Operational.evtx", "Windows PowerShell.evtx",
+    "Security.evtx",
+    "System.evtx",
+    "Application.evtx",
+    "Microsoft-Windows-PowerShell%4Operational.evtx",
+    "Windows PowerShell.evtx",
     "Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx",
     "Microsoft-Windows-TerminalServices-RemoteConnectionManager%4Operational.evtx",
     "Microsoft-Windows-TerminalServices-RDPClient%4Operational.evtx",
     "Microsoft-Windows-Windows Defender%4Operational.evtx",
     "Microsoft-Windows-TaskScheduler%4Operational.evtx",
-    "Microsoft-Windows-SMBServer%4Security.evtx", "Microsoft-Windows-SMBServer%4Audit.evtx",
-    "Microsoft-Windows-SmbClient%4Security.evtx", "Microsoft-Windows-Bits-Client%4Operational.evtx",
+    "Microsoft-Windows-SMBServer%4Security.evtx",
+    "Microsoft-Windows-SMBServer%4Audit.evtx",
+    "Microsoft-Windows-SmbClient%4Security.evtx",
+    "Microsoft-Windows-Bits-Client%4Operational.evtx",
     "Microsoft-Windows-Windows Firewall With Advanced Security%4Firewall.evtx",
 ];
 
 pub const EVENT_COLUMNS: &[&str] = &[
-    "timestamp", "Channel", "EventID", "LevelName", "Level", "Provider",
-    "Computer", "EventRecordID", "ProcessID", "ThreadID", "UserID",
-    "EventData", "_record_key", "_status", "_error", "_source_file",
+    "timestamp",
+    "Channel",
+    "EventID",
+    "LevelName",
+    "Level",
+    "Provider",
+    "Computer",
+    "EventRecordID",
+    "ProcessID",
+    "ThreadID",
+    "UserID",
+    "EventData",
+    "_record_key",
+    "_status",
+    "_error",
+    "_source_file",
 ];
 
 fn level_name(level: Option<&str>) -> String {
@@ -52,11 +69,27 @@ fn level_name(level: Option<&str>) -> String {
 /// ',' and ':'. serde_json's preserve_order keeps the evtx crate's key order.
 struct PyFmt;
 impl serde_json::ser::Formatter for PyFmt {
-    fn begin_array_value<W: ?Sized + std::io::Write>(&mut self, w: &mut W, first: bool) -> std::io::Result<()> {
-        if first { Ok(()) } else { w.write_all(b", ") }
+    fn begin_array_value<W: ?Sized + std::io::Write>(
+        &mut self,
+        w: &mut W,
+        first: bool,
+    ) -> std::io::Result<()> {
+        if first {
+            Ok(())
+        } else {
+            w.write_all(b", ")
+        }
     }
-    fn begin_object_key<W: ?Sized + std::io::Write>(&mut self, w: &mut W, first: bool) -> std::io::Result<()> {
-        if first { Ok(()) } else { w.write_all(b", ") }
+    fn begin_object_key<W: ?Sized + std::io::Write>(
+        &mut self,
+        w: &mut W,
+        first: bool,
+    ) -> std::io::Result<()> {
+        if first {
+            Ok(())
+        } else {
+            w.write_all(b", ")
+        }
     }
     fn begin_object_value<W: ?Sized + std::io::Write>(&mut self, w: &mut W) -> std::io::Result<()> {
         w.write_all(b": ")
@@ -74,7 +107,11 @@ fn get<'a>(v: &'a Value, path: &[&str]) -> Option<&'a Value> {
     for k in path {
         cur = cur.get(*k)?;
     }
-    if cur.is_null() { None } else { Some(cur) }
+    if cur.is_null() {
+        None
+    } else {
+        Some(cur)
+    }
 }
 /// Legacy events wrap a scalar as {"#attributes": ..., "#text": N}; unwrap it.
 fn scalar(v: Option<&Value>) -> Option<&Value> {
@@ -104,12 +141,17 @@ fn fmt_ts(system_time: Option<&Value>, record_ts: DateTime<Utc>) -> String {
 
 pub fn parse_evtx_stream(path: &Path, out: &Path, table: &str) -> Result<usize> {
     let src = path.to_string_lossy().to_string();
-    let fname = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    let fname = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
     let mut parser = EvtxParser::from_path(path)?;
     let mut writer = StreamWriter::create(out, table, EVENT_COLUMNS, EVENT_COLUMNS)?;
 
     for rec in parser.records_json_value() {
-        if crate::pipeline::cancelled() { break; }
+        if crate::pipeline::cancelled() {
+            break;
+        }
         match rec {
             Err(e) => {
                 let mut row = Row::new();
@@ -123,26 +165,60 @@ pub fn parse_evtx_stream(path: &Path, out: &Path, table: &str) -> Result<usize> 
                 let data = &r.data;
                 let system = get(data, &["Event", "System"]);
                 let sys = system.unwrap_or(&Value::Null);
-                let payload = get(data, &["Event", "EventData"]).or_else(|| get(data, &["Event", "UserData"]));
+                let payload = get(data, &["Event", "EventData"])
+                    .or_else(|| get(data, &["Event", "UserData"]));
 
                 let level = cell(scalar(sys.get("Level")));
                 let mut row = Row::new();
-                row.insert("timestamp".into(), fmt_ts(get(sys, &["TimeCreated", "#attributes", "SystemTime"]), r.timestamp));
-                if let Some(v) = cell(sys.get("Channel")) { row.insert("Channel".into(), v); }
-                if let Some(v) = cell(scalar(sys.get("EventID"))) { row.insert("EventID".into(), v); }
+                row.insert(
+                    "timestamp".into(),
+                    fmt_ts(
+                        get(sys, &["TimeCreated", "#attributes", "SystemTime"]),
+                        r.timestamp,
+                    ),
+                );
+                if let Some(v) = cell(sys.get("Channel")) {
+                    row.insert("Channel".into(), v);
+                }
+                if let Some(v) = cell(scalar(sys.get("EventID"))) {
+                    row.insert("EventID".into(), v);
+                }
                 row.insert("LevelName".into(), level_name(level.as_deref()));
-                if let Some(v) = level { row.insert("Level".into(), v); }
-                if let Some(v) = cell(get(sys, &["Provider", "#attributes", "Name"])) { row.insert("Provider".into(), v); }
-                if let Some(v) = cell(sys.get("Computer")) { row.insert("Computer".into(), v); }
+                if let Some(v) = level {
+                    row.insert("Level".into(), v);
+                }
+                if let Some(v) = cell(get(sys, &["Provider", "#attributes", "Name"])) {
+                    row.insert("Provider".into(), v);
+                }
+                if let Some(v) = cell(sys.get("Computer")) {
+                    row.insert("Computer".into(), v);
+                }
                 let erid = cell(sys.get("EventRecordID"));
-                if let Some(v) = &erid { row.insert("EventRecordID".into(), v.clone()); }
-                if let Some(v) = cell(get(sys, &["Execution", "#attributes", "ProcessID"])) { row.insert("ProcessID".into(), v); }
-                if let Some(v) = cell(get(sys, &["Execution", "#attributes", "ThreadID"])) { row.insert("ThreadID".into(), v); }
-                if let Some(v) = cell(get(sys, &["Security", "#attributes", "UserID"])) { row.insert("UserID".into(), v); }
-                row.insert("EventData".into(), match payload { Some(p) => py_json(p), None => String::new() });
+                if let Some(v) = &erid {
+                    row.insert("EventRecordID".into(), v.clone());
+                }
+                if let Some(v) = cell(get(sys, &["Execution", "#attributes", "ProcessID"])) {
+                    row.insert("ProcessID".into(), v);
+                }
+                if let Some(v) = cell(get(sys, &["Execution", "#attributes", "ThreadID"])) {
+                    row.insert("ThreadID".into(), v);
+                }
+                if let Some(v) = cell(get(sys, &["Security", "#attributes", "UserID"])) {
+                    row.insert("UserID".into(), v);
+                }
+                row.insert(
+                    "EventData".into(),
+                    match payload {
+                        Some(p) => py_json(p),
+                        None => String::new(),
+                    },
+                );
                 row.insert("_status".into(), "ok".into());
                 row.insert("_error".into(), String::new());
-                row.insert("_record_key".into(), format!("{}::{}", fname, erid.unwrap_or_default()));
+                row.insert(
+                    "_record_key".into(),
+                    format!("{}::{}", fname, erid.unwrap_or_default()),
+                );
                 row.insert("_source_file".into(), src.clone());
                 writer.push(row)?;
             }

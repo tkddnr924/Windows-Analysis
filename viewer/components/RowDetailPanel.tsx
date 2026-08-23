@@ -6,6 +6,7 @@ import ChevronRightOutlinedIcon from "@mui/icons-material/ChevronRightOutlined";
 import ContentCopyOutlinedIcon from "@mui/icons-material/ContentCopyOutlined";
 import { resolveArtifactView, getArtifactView } from "@/lib/artifactViews";
 import type { FetchLinkedRows } from "@/lib/types";
+import type { AccountDirectory } from "@/lib/accountIdentity";
 import { useModalDialog } from "@/lib/useModalDialog";
 import ArtifactDetailView from "./ArtifactDetailView";
 
@@ -19,6 +20,8 @@ interface RowDetailPanelProps {
   onFetchLinkedRows?: FetchLinkedRows;
   /** Host evidence directory for Browser Cache body recovery. */
   hostDir?: string;
+  /** Exact SID display mapping for this record's authoritative host. */
+  accountDirectory?: AccountDirectory;
   /** Bookmark state + toggle for this row, bound by the parent. Omitted when
    * the host view has no bookmarking (then no bookmark control is shown). */
   isBookmarked?: boolean;
@@ -175,7 +178,7 @@ function RawFieldValue({ column, value, focused }: { column: string; value: stri
   );
 }
 
-export default function RowDetailPanel({ row, columns, focusedColumn, fileBaseName, onClose, onNavigate, onFetchLinkedRows, hostDir, isBookmarked, onToggleBookmark, variant = "drawer", onToggleFieldBookmark, isFieldBookmarked, relatedEvidence = [] }: RowDetailPanelProps) {
+export default function RowDetailPanel({ row, columns, focusedColumn, fileBaseName, onClose, onNavigate, onFetchLinkedRows, hostDir, accountDirectory, isBookmarked, onToggleBookmark, variant = "drawer", onToggleFieldBookmark, isFieldBookmarked, relatedEvidence = [] }: RowDetailPanelProps) {
   // EventLog-derived overview rows (PowerShell/RDP/SMB correlations) carry a
   // legacy `<log>.evtx::<rowid>` key. Load that raw event so it always uses the
   // shared EventLog detail. Other overview record keys (for example the
@@ -310,6 +313,7 @@ export default function RowDetailPanel({ row, columns, focusedColumn, fileBaseNa
           )}
           {onToggleBookmark && (
             <button
+              className={isBookmarked ? "dfir-bookmark-control" : undefined}
               onClick={onToggleBookmark}
               title={isBookmarked ? "북마크 해제" : "북마크에 추가"}
               style={{
@@ -319,9 +323,9 @@ export default function RowDetailPanel({ row, columns, focusedColumn, fileBaseNa
                 gap: 5,
                 fontSize: 11.5,
                 padding: "5px 10px",
-                background: isBookmarked ? "var(--accent-subtle)" : "transparent",
-                color: isBookmarked ? "var(--accent)" : "var(--text-dim)",
-                border: `1px solid ${isBookmarked ? "var(--accent)" : "var(--border)"}`,
+                background: isBookmarked ? "var(--bookmark-subtle)" : "transparent",
+                color: isBookmarked ? "var(--bookmark)" : "var(--text-dim)",
+                border: `1px solid ${isBookmarked ? "var(--bookmark-border)" : "var(--border)"}`,
                 borderRadius: "var(--radius-sm)",
                 cursor: "pointer",
                 fontWeight: 600,
@@ -356,7 +360,7 @@ export default function RowDetailPanel({ row, columns, focusedColumn, fileBaseNa
             <div style={{ padding: 20, color: "var(--text-dim)", fontSize: 12.5 }}>원본 이벤트 로그를 불러오는 중...</div>
           ) : spec && !showRaw ? (
             <>
-              <ArtifactDetailView spec={spec} row={effRow} onNavigate={onNavigate} onFetchLinkedRows={onFetchLinkedRows} hostDir={hostDir} onToggleFieldBookmark={onToggleFieldBookmark} isFieldBookmarked={isFieldBookmarked} />
+              <ArtifactDetailView spec={spec} row={effRow} onNavigate={onNavigate} onFetchLinkedRows={onFetchLinkedRows} hostDir={hostDir} accountDirectory={accountDirectory} onToggleFieldBookmark={onToggleFieldBookmark} isFieldBookmarked={isFieldBookmarked} />
               {relatedEvidence.length > 0 && (
                 <section style={{ padding: "14px 16px 18px", borderBottom: "1px solid var(--border-subtle)" }}>
                   <div className="dfir-section-label" style={{ marginBottom: 7 }}>교차 참조 증거</div>

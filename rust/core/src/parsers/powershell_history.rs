@@ -12,7 +12,15 @@ use crate::sqlite::Row;
 pub const PS_TABLE: &str = "PowerShell_ConsoleHistory";
 pub const PS_FIELD_ORDER: &[&str] = &["line_number", "command", "user", "_source_file"];
 
-const SKIP: &[&str] = &["psreadline", "powershell", "windows", "microsoft", "roaming", "appdata", "local"];
+const SKIP: &[&str] = &[
+    "psreadline",
+    "powershell",
+    "windows",
+    "microsoft",
+    "roaming",
+    "appdata",
+    "local",
+];
 
 /// Best-effort account name: walk up the parents, skipping the known PSReadLine
 /// path segments, and take the first remaining folder name.
@@ -21,7 +29,9 @@ fn user_from_path(path: &Path) -> String {
         match parent.file_name() {
             Some(n) => {
                 let name = n.to_string_lossy().to_string();
-                if !SKIP.contains(&name.to_lowercase().as_str()) { return name; }
+                if !SKIP.contains(&name.to_lowercase().as_str()) {
+                    return name;
+                }
             }
             None => break, // reached the root (no file name component)
         }
@@ -32,10 +42,14 @@ fn user_from_path(path: &Path) -> String {
 /// Match Python `str.splitlines()` for the common line boundaries (\r\n, \r,
 /// \n): split into lines without a spurious trailing empty from a final EOL.
 fn splitlines(text: &str) -> Vec<String> {
-    if text.is_empty() { return Vec::new(); }
+    if text.is_empty() {
+        return Vec::new();
+    }
     let norm = text.replace("\r\n", "\n").replace('\r', "\n");
     let mut parts: Vec<&str> = norm.split('\n').collect();
-    if norm.ends_with('\n') { parts.pop(); }
+    if norm.ends_with('\n') {
+        parts.pop();
+    }
     parts.into_iter().map(|s| s.to_string()).collect()
 }
 
@@ -59,7 +73,9 @@ pub fn parse_console_history(paths: &[PathBuf]) -> Result<Vec<Row>> {
             }
         };
         for (i, line) in splitlines(&text).into_iter().enumerate() {
-            if line.is_empty() { continue; }
+            if line.is_empty() {
+                continue;
+            }
             let mut r = Row::new();
             r.insert("line_number".into(), (i + 1).to_string());
             r.insert("command".into(), line);

@@ -14,9 +14,20 @@ use crate::time::kst_offset;
 pub const TASK_TABLE: &str = "TaskScheduler_Tasks";
 pub const TASK_NAMESPACE: &str = "schemas.microsoft.com/windows/2004/02/mit/task";
 pub const TASK_FIELD_ORDER: &[&str] = &[
-    "timestamp", "task_name", "enabled", "hidden", "run_as", "run_level",
-    "actions", "trigger_types", "trigger_start", "author", "description",
-    "logon_type", "uri", "_source_file",
+    "timestamp",
+    "task_name",
+    "enabled",
+    "hidden",
+    "run_as",
+    "run_level",
+    "actions",
+    "trigger_types",
+    "trigger_start",
+    "author",
+    "description",
+    "logon_type",
+    "uri",
+    "_source_file",
 ];
 
 /// format_timestamp(value, source_tz=KST): honour an embedded offset/Z, else
@@ -28,40 +39,70 @@ fn fmt_task_time(s: &str) -> String {
     }
     let kst = kst_offset();
     if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
-        return dt.with_timezone(&kst).format("%Y-%m-%d %H:%M:%S%.3f").to_string();
+        return dt
+            .with_timezone(&kst)
+            .format("%Y-%m-%d %H:%M:%S%.3f")
+            .to_string();
     }
-    for fmt in ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S%.f"] {
+    for fmt in [
+        "%Y-%m-%dT%H:%M:%S%.f",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M:%S%.f",
+    ] {
         if let Ok(ndt) = NaiveDateTime::parse_from_str(s, fmt) {
-            let dt: DateTime<FixedOffset> = kst.from_local_datetime(&ndt).single().unwrap_or_else(|| DateTime::from_naive_utc_and_offset(ndt, kst));
-            return dt.with_timezone(&kst).format("%Y-%m-%d %H:%M:%S%.3f").to_string();
+            let dt: DateTime<FixedOffset> = kst
+                .from_local_datetime(&ndt)
+                .single()
+                .unwrap_or_else(|| DateTime::from_naive_utc_and_offset(ndt, kst));
+            return dt
+                .with_timezone(&kst)
+                .format("%Y-%m-%d %H:%M:%S%.3f")
+                .to_string();
         }
     }
     s.to_string() // unparseable -> str(value), like Python
 }
 
 fn leaf(uri: &str) -> String {
-    uri.trim_end_matches('\\').rsplit('\\').next().unwrap_or("").to_string()
+    uri.trim_end_matches('\\')
+        .rsplit('\\')
+        .next()
+        .unwrap_or("")
+        .to_string()
 }
 
 // First descendant (document order, self included) with this local tag name.
 fn find<'a>(node: roxmltree::Node<'a, 'a>, name: &str) -> Option<roxmltree::Node<'a, 'a>> {
-    node.descendants().find(|n| n.is_element() && n.tag_name().name() == name)
+    node.descendants()
+        .find(|n| n.is_element() && n.tag_name().name() == name)
 }
 fn text(node: roxmltree::Node, name: &str) -> String {
-    find(node, name).and_then(|n| n.text()).unwrap_or("").trim().to_string()
+    find(node, name)
+        .and_then(|n| n.text())
+        .unwrap_or("")
+        .trim()
+        .to_string()
 }
 
 /// Decode a task file to a UTF-8 string (task XML is usually UTF-16LE w/ BOM).
 fn read_text(raw: &[u8]) -> String {
     if raw.len() >= 2 && raw[0] == 0xFF && raw[1] == 0xFE {
-        let u: Vec<u16> = raw[2..].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        let u: Vec<u16> = raw[2..]
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
         String::from_utf16_lossy(&u)
     } else if raw.len() >= 2 && raw[0] == 0xFE && raw[1] == 0xFF {
-        let u: Vec<u16> = raw[2..].chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
+        let u: Vec<u16> = raw[2..]
+            .chunks_exact(2)
+            .map(|c| u16::from_be_bytes([c[0], c[1]]))
+            .collect();
         String::from_utf16_lossy(&u)
     } else {
         let s = String::from_utf8_lossy(raw);
-        s.strip_prefix('\u{feff}').map(|x| x.to_string()).unwrap_or_else(|| s.into_owned())
+        s.strip_prefix('\u{feff}')
+            .map(|x| x.to_string())
+            .unwrap_or_else(|| s.into_owned())
     }
 }
 
@@ -94,7 +135,14 @@ fn parse_task(path: &Path) -> Result<Row> {
 
     let (mut run_as, mut run_level, mut logon_type) = (String::new(), String::new(), String::new());
     if let Some(pr) = principals.and_then(|p| find(p, "Principal")) {
-        run_as = { let u = text(pr, "UserId"); if u.is_empty() { text(pr, "GroupId") } else { u } };
+        run_as = {
+            let u = text(pr, "UserId");
+            if u.is_empty() {
+                text(pr, "GroupId")
+            } else {
+                u
+            }
+        };
         run_level = text(pr, "RunLevel");
         logon_type = text(pr, "LogonType");
     }
@@ -122,12 +170,23 @@ fn parse_task(path: &Path) -> Result<Row> {
             trigger_types.push(trig.tag_name().name().to_string());
             if trigger_start.is_empty() {
                 let sb = text(trig, "StartBoundary");
-                if !sb.is_empty() { trigger_start = sb; }
+                if !sb.is_empty() {
+                    trigger_start = sb;
+                }
             }
         }
     }
 
-    let task_name = { let l = leaf(&uri); if l.is_empty() { path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default() } else { l } };
+    let task_name = {
+        let l = leaf(&uri);
+        if l.is_empty() {
+            path.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default()
+        } else {
+            l
+        }
+    };
 
     let mut row = Row::new();
     row.insert("timestamp".into(), fmt_task_time(&date));
@@ -136,7 +195,15 @@ fn parse_task(path: &Path) -> Result<Row> {
     row.insert("hidden".into(), hidden);
     row.insert("run_as".into(), run_as);
     row.insert("run_level".into(), run_level);
-    row.insert("actions".into(), action_parts.iter().filter(|p| !p.is_empty()).cloned().collect::<Vec<_>>().join(" | "));
+    row.insert(
+        "actions".into(),
+        action_parts
+            .iter()
+            .filter(|p| !p.is_empty())
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" | "),
+    );
     row.insert("trigger_types".into(), trigger_types.join(", "));
     row.insert("trigger_start".into(), fmt_task_time(&trigger_start));
     row.insert("author".into(), author);
@@ -148,38 +215,63 @@ fn parse_task(path: &Path) -> Result<Row> {
 }
 
 /// Walk `root`, parse every file whose content carries the task XML namespace.
-pub fn parse_tasks(root: &Path) -> Result<Vec<Row>> {
-    let paths: Vec<_> = WalkDir::new(root).into_iter().filter_map(|e| e.ok())
+/// Parse tasks and retain every file whose header identifies it as a task XML
+/// source. The source list is distinct from parsed rows because a valid task
+/// file can still produce zero usable fields.
+pub fn parse_tasks_with_sources(root: &Path) -> Result<(Vec<std::path::PathBuf>, Vec<Row>)> {
+    let paths: Vec<_> = WalkDir::new(root)
+        .into_iter()
+        .filter_map(|e| e.ok())
         .filter(|entry| entry.file_type().is_file())
         .map(|entry| entry.into_path())
         .collect();
     let utf8 = TASK_NAMESPACE.as_bytes().to_vec();
     let utf16: Vec<u8> = TASK_NAMESPACE.bytes().flat_map(|b| [b, 0]).collect();
-    Ok(paths.par_iter().filter_map(|path| {
-        // Read only the first 4 KB to test for the task namespace — never the
-        // whole file. A target can hold huge unrelated files (images, dumps);
-        // slurping each one just to check its header made discovery crawl.
-        let mut head = Vec::new();
-        match std::fs::File::open(path) {
-            Ok(f) => {
-                use std::io::Read;
-                if std::io::Read::take(f, 4096).read_to_end(&mut head).is_err() { return None; }
+    let parsed: Vec<_> = paths
+        .par_iter()
+        .filter_map(|path| {
+            // Read only the first 4 KB to test for the task namespace — never the
+            // whole file. A target can hold huge unrelated files (images, dumps);
+            // slurping each one just to check its header made discovery crawl.
+            let mut head = Vec::new();
+            match std::fs::File::open(path) {
+                Ok(f) => {
+                    use std::io::Read;
+                    if std::io::Read::take(f, 4096).read_to_end(&mut head).is_err() {
+                        return None;
+                    }
+                }
+                Err(_) => return None,
             }
-            Err(_) => return None,
-        }
-        let has = |needle: &[u8]| head.windows(needle.len()).any(|w| w == needle);
-        if !(has(&utf8) || has(&utf16)) { return None; }
-        match parse_task(path) {
-            Ok(r) => Some(r),
-            Err(e) => {
-                let mut row = Row::new();
-                row.insert("timestamp".into(), String::new());
-                row.insert("task_name".into(), path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default());
-                row.insert("_source_file".into(), path.to_string_lossy().to_string());
-                row.insert("_status".into(), "unreadable_file".into());
-                row.insert("_error".into(), e.to_string());
-                Some(row)
+            let has = |needle: &[u8]| head.windows(needle.len()).any(|w| w == needle);
+            if !(has(&utf8) || has(&utf16)) {
+                return None;
             }
-        }
-    }).collect())
+            match parse_task(path) {
+                Ok(r) => Some((path.clone(), r)),
+                Err(e) => {
+                    let mut row = Row::new();
+                    row.insert("timestamp".into(), String::new());
+                    row.insert(
+                        "task_name".into(),
+                        path.file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_default(),
+                    );
+                    row.insert("_source_file".into(), path.to_string_lossy().to_string());
+                    row.insert("_status".into(), "unreadable_file".into());
+                    row.insert("_error".into(), e.to_string());
+                    Some((path.clone(), row))
+                }
+            }
+        })
+        .collect();
+    let mut sources: Vec<_> = parsed.iter().map(|(path, _)| path.clone()).collect();
+    sources.sort();
+    let rows = parsed.into_iter().map(|(_, row)| row).collect();
+    Ok((sources, rows))
+}
+
+pub fn parse_tasks(root: &Path) -> Result<Vec<Row>> {
+    Ok(parse_tasks_with_sources(root)?.1)
 }

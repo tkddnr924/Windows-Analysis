@@ -45,7 +45,8 @@ pub fn fmt_kst_ft(dt: DateTime<Utc>) -> String {
     match Utc.timestamp_opt(secs, 0) {
         LocalResult::Single(base) => format!(
             "{}.{:03}",
-            base.with_timezone(&kst_offset()).format("%Y-%m-%d %H:%M:%S"),
+            base.with_timezone(&kst_offset())
+                .format("%Y-%m-%d %H:%M:%S"),
             ms
         ),
         _ => fmt_kst(dt),
@@ -63,14 +64,19 @@ pub fn fmt_filetime(ticks: i64) -> String {
     }
     let q = ticks / 10;
     let r = ticks % 10;
-    let micros_1601 = q + if r > 5 || (r == 5 && q % 2 != 0) { 1 } else { 0 };
+    let micros_1601 = q + if r > 5 || (r == 5 && q % 2 != 0) {
+        1
+    } else {
+        0
+    };
     let unix_micros = micros_1601 - EPOCH_1601_TO_1970_MICROS;
     let secs = unix_micros.div_euclid(1_000_000);
     let ms = unix_micros.rem_euclid(1_000_000) / 1000;
     match Utc.timestamp_opt(secs, 0) {
         LocalResult::Single(base) => format!(
             "{}.{:03}",
-            base.with_timezone(&kst_offset()).format("%Y-%m-%d %H:%M:%S"),
+            base.with_timezone(&kst_offset())
+                .format("%Y-%m-%d %H:%M:%S"),
             ms
         ),
         _ => String::new(),
@@ -92,7 +98,8 @@ pub fn fmt_ole(days: f64) -> String {
     match Utc.timestamp_opt(secs, 0) {
         LocalResult::Single(base) => format!(
             "{}.{:03}",
-            base.with_timezone(&kst_offset()).format("%Y-%m-%d %H:%M:%S"),
+            base.with_timezone(&kst_offset())
+                .format("%Y-%m-%d %H:%M:%S"),
             ms
         ),
         _ => String::new(),

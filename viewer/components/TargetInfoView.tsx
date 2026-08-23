@@ -17,6 +17,7 @@ import type { AccountEventPage, AccountEventQuery, CsvData, Bookmark } from "@/l
 import type { FetchLinkedRows } from "@/lib/types";
 import { toBound, type TimeRange } from "@/lib/timeRange";
 import RowDetailPanel from "./RowDetailPanel";
+import type { AccountDirectory } from "@/lib/accountIdentity";
 
 interface TargetInfoViewProps {
   data: CsvData;
@@ -32,6 +33,10 @@ interface TargetInfoViewProps {
   /** Per-timestamp bookmarking of account rows (생성/최근 로그인/비밀번호 …). */
   tableBookmarks?: Bookmark[];
   onToggleBookmark?: (rowid: number, field: string) => void;
+  /** Account EventLog rows come from a raw source table, not TargetInfo. */
+  eventBookmarks?: Bookmark[];
+  onToggleEventBookmark?: (fullPath: string, tableName: string, rowid: number) => void;
+  accountDirectory?: AccountDirectory;
 }
 
 // TargetInfo is a correlation of registry-derived system facts (OS build,
@@ -190,7 +195,7 @@ interface NetworkProfile {
   timestamp: string;
 }
 
-export default function TargetInfoView({ data, loadAccountEvents, timeRange, onNavigate, onFetchLinkedRows, tableBookmarks, onToggleBookmark }: TargetInfoViewProps) {
+export default function TargetInfoView({ data, loadAccountEvents, timeRange, onNavigate, onFetchLinkedRows, tableBookmarks, onToggleBookmark, eventBookmarks, onToggleEventBookmark, accountDirectory }: TargetInfoViewProps) {
   const bmRowids = useMemo(() => new Set((tableBookmarks ?? []).map((b) => b.rowid)), [tableBookmarks]);
   const [selectedAccount, setSelectedAccount] = useState<Account | null>(null);
   const [selectedInterface, setSelectedInterface] = useState<NetInterface | null>(null);
@@ -277,7 +282,7 @@ export default function TargetInfoView({ data, loadAccountEvents, timeRange, onN
   // Clicking an account opens a full page (not a modal) — account detail plus
   // the EventLog activity for its SID.
   if (selectedAccount) {
-    return <AccountDetailPage account={selectedAccount} onBack={() => setSelectedAccount(null)} loadEvents={loadAccountEvents} timeRange={timeRange} onNavigate={onNavigate} onFetchLinkedRows={onFetchLinkedRows} tableBookmarks={tableBookmarks} onToggleBookmark={onToggleBookmark} />;
+    return <AccountDetailPage account={selectedAccount} onBack={() => setSelectedAccount(null)} loadEvents={loadAccountEvents} timeRange={timeRange} onNavigate={onNavigate} onFetchLinkedRows={onFetchLinkedRows} tableBookmarks={tableBookmarks} onToggleBookmark={onToggleBookmark} eventBookmarks={eventBookmarks} onToggleEventBookmark={onToggleEventBookmark} accountDirectory={accountDirectory} />;
   }
 
   const accounts = [...users, ...services];
@@ -359,6 +364,7 @@ export default function TargetInfoView({ data, loadAccountEvents, timeRange, onN
           onClose={() => setSelectedInterface(null)}
           onNavigate={onNavigate ?? (() => {})}
           onFetchLinkedRows={onFetchLinkedRows}
+          accountDirectory={accountDirectory}
         />
       )}
       {selectedNetwork && (
@@ -370,6 +376,7 @@ export default function TargetInfoView({ data, loadAccountEvents, timeRange, onN
           onClose={() => setSelectedNetwork(null)}
           onNavigate={onNavigate ?? (() => {})}
           onFetchLinkedRows={onFetchLinkedRows}
+          accountDirectory={accountDirectory}
         />
       )}
     </div>
@@ -381,7 +388,7 @@ function AccountRegistry({ accounts, bookmarkedRowids, onSelect }: { accounts: A
   return (
     <div style={{ padding: "0 16px 14px", overflowX: "auto", overscrollBehaviorX: "contain" }}>
       {accounts.length === 0 ? <div style={{ color: "var(--text-faint)", fontSize: 13, paddingTop: 12 }}>계정이 없습니다.</div> : <>
-        <div style={{ ...accountGrid, minHeight: 32, alignItems: "center", borderBottom: "1px solid var(--border-subtle)", color: "var(--text-dim)", fontSize: 11.5, fontWeight: 650 }}>
+        <div style={{ ...accountGrid, minHeight: 32, paddingLeft: 12, alignItems: "center", borderBottom: "1px solid var(--border-subtle)", color: "var(--text-dim)", fontSize: 11.5, fontWeight: 650 }}>
           <span>계정</span><span>유형</span><span>프로필 경로</span><span>생성 시간</span><span>SID</span><span />
         </div>
         {accounts.map((a) => <AccountRow key={a.rowid} account={a} bookmarked={bookmarkedRowids.has(a.rowid)} onSelect={() => onSelect(a)} gridStyle={accountGrid} />)}
@@ -396,9 +403,11 @@ function AccountRow({ account, bookmarked, onSelect, gridStyle }: { account: Acc
       type="button"
       onClick={onSelect}
       title="자세히 보기"
-      style={{ ...gridStyle, width: "100%", alignItems: "center", textAlign: "left", minHeight: 52, padding: "7px 0", background: bookmarked ? "var(--accent-subtle)" : "transparent", border: "none", borderBottom: "1px solid var(--border-subtle)", borderLeft: bookmarked ? "3px solid var(--accent)" : "3px solid transparent", color: "inherit", cursor: "pointer", fontFamily: "inherit" }}
-      onMouseEnter={(e) => (e.currentTarget.style.background = "var(--bg-hover)")}
-      onMouseLeave={(e) => (e.currentTarget.style.background = bookmarked ? "var(--accent-subtle)" : "transparent")}
+      aria-label={`${account.username || "이름 없는 계정"} 계정 상세 보기${bookmarked ? ", 북마크됨" : ""}`}
+      className={bookmarked ? "dfir-bookmarked-row" : undefined}
+      style={{ ...gridStyle, width: "100%", alignItems: "center", textAlign: "left", minHeight: 52, padding: "7px 0 7px 12px", background: "transparent", border: "none", borderBottom: "1px solid var(--border-subtle)", color: "inherit", cursor: "pointer", fontFamily: "inherit" }}
+      onMouseEnter={(e) => { if (!bookmarked) e.currentTarget.style.background = "var(--bg-hover)"; }}
+      onMouseLeave={(e) => { if (!bookmarked) e.currentTarget.style.background = "transparent"; }}
     >
       <div style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0 }}>
         <span title={account.username} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 14, fontWeight: 700, color: "var(--text)" }}>{account.username || "(이름 없음)"}</span>
@@ -423,16 +432,17 @@ function AccountRow({ account, bookmarked, onSelect, gridStyle }: { account: Acc
 
 function DetailRow({ label, value, mono, bm }: { label: string; value: string; mono?: boolean; bm?: { active: boolean; onToggle: () => void } }) {
   return (
-    <div style={{ display: "flex", gap: 12, padding: "8px 10px", margin: "0 -10px", borderBottom: "1px solid var(--border-subtle)", borderLeft: bm?.active ? "3px solid var(--accent)" : "3px solid transparent", background: bm?.active ? "var(--accent-subtle)" : "transparent", alignItems: "center" }}>
+    <div className={bm?.active ? "dfir-bookmarked-row" : undefined} style={{ display: "flex", gap: 12, padding: "8px 10px", margin: "0 -10px", borderBottom: "1px solid var(--border-subtle)", borderLeft: "3px solid transparent", background: "transparent", alignItems: "center" }}>
       <span style={{ flex: "0 0 142px", color: "var(--text-dim)", fontSize: 12 }}>{label}</span>
       <span style={{ flex: 1, color: "var(--text)", fontSize: 12.5, wordBreak: "break-all", fontFamily: mono ? "var(--mono)" : "var(--sans)" }}>
         {value || "—"}
       </span>
       {bm && value && (
         <button
+          className={bm.active ? "dfir-bookmark-control" : undefined}
           onClick={bm.onToggle}
           title={bm.active ? "이 시각 북마크 해제" : "이 시각 북마크"}
-          style={{ flexShrink: 0, display: "inline-flex", alignItems: "center", justifyContent: "center", width: 25, height: 24, padding: 0, borderRadius: "var(--radius-sm)", cursor: "pointer", background: bm.active ? "var(--bg-elevated)" : "transparent", color: bm.active ? "var(--accent)" : "var(--text-dim)", border: `1px solid ${bm.active ? "var(--accent)" : "var(--border)"}` }}
+          style={{ flexShrink: 0, display: "inline-flex", alignItems: "center", justifyContent: "center", width: 25, height: 24, padding: 0, borderRadius: "var(--radius-sm)", cursor: "pointer", background: bm.active ? "var(--bookmark-row)" : "transparent", color: bm.active ? "var(--bookmark-control)" : "var(--text-dim)", border: `1px solid ${bm.active ? "var(--bookmark-outline)" : "var(--border)"}` }}
         >
           {bm.active ? <BookmarkIcon sx={{ fontSize: 15 }} /> : <BookmarkBorderOutlinedIcon sx={{ fontSize: 15 }} />}
         </button>
@@ -511,7 +521,7 @@ function eventSummary(row: Row): string {
   return parts.join(" · ");
 }
 
-function AccountDetailPage({ account, onBack, loadEvents, timeRange, onNavigate, onFetchLinkedRows, tableBookmarks, onToggleBookmark }: { account: Account; onBack: () => void; loadEvents?: (sid: string, username: string, query: Omit<AccountEventQuery, "sid" | "username">) => Promise<AccountEventPage>; timeRange: TimeRange; onNavigate?: (targetFile: string, targetColumn: string, value: string) => void; onFetchLinkedRows?: FetchLinkedRows; tableBookmarks?: Bookmark[]; onToggleBookmark?: (rowid: number, field: string) => void }) {
+function AccountDetailPage({ account, onBack, loadEvents, timeRange, onNavigate, onFetchLinkedRows, tableBookmarks, onToggleBookmark, eventBookmarks, onToggleEventBookmark, accountDirectory }: { account: Account; onBack: () => void; loadEvents?: (sid: string, username: string, query: Omit<AccountEventQuery, "sid" | "username">) => Promise<AccountEventPage>; timeRange: TimeRange; onNavigate?: (targetFile: string, targetColumn: string, value: string) => void; onFetchLinkedRows?: FetchLinkedRows; tableBookmarks?: Bookmark[]; onToggleBookmark?: (rowid: number, field: string) => void; eventBookmarks?: Bookmark[]; onToggleEventBookmark?: (fullPath: string, tableName: string, rowid: number) => void; accountDirectory?: AccountDirectory }) {
   const [events, setEvents] = useState<AccountEventPage | null>(null);
   const [eventsAccountKey, setEventsAccountKey] = useState("");
   const [loading, setLoading] = useState(false);
@@ -537,14 +547,29 @@ function AccountDetailPage({ account, onBack, loadEvents, timeRange, onNavigate,
     onToggleBookmark && Number.isFinite(account.rowid)
       ? { active: bmKeys.has(`${account.rowid}@${field}`), onToggle: () => onToggleBookmark(account.rowid, field) }
       : undefined;
+  const eventBookmarkKeys = useMemo(() => new Set((eventBookmarks ?? [])
+    .filter((bookmark) => !bookmark.field)
+    .map((bookmark) => `${bookmark.fullPath}\u0000${bookmark.tableName}\u0000${bookmark.rowid}`)), [eventBookmarks]);
+  const eventSource = (row: Row) => {
+    const fullPath = row._source_full_path || "";
+    const tableName = row._source_table_name || "";
+    const rowid = Number(row.__rowid);
+    return fullPath && tableName && Number.isFinite(rowid) ? { fullPath, tableName, rowid } : null;
+  };
+  const isEventBookmarked = (row: Row) => {
+    const source = eventSource(row);
+    return Boolean(source && eventBookmarkKeys.has(`${source.fullPath}\u0000${source.tableName}\u0000${source.rowid}`));
+  };
 
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
-      if (e.key === "Escape") onBack();
+      // RowDetailPanel owns Escape while a raw EventLog detail is open. Do
+      // not let the account page navigate away beneath the active drawer.
+      if (e.key === "Escape" && !selectedEvent) onBack();
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [onBack]);
+  }, [onBack, selectedEvent]);
 
   useEffect(() => {
     const timeout = window.setTimeout(() => {
@@ -683,13 +708,15 @@ function AccountDetailPage({ account, onBack, loadEvents, timeRange, onNavigate,
           {pagedEvents.map((r, i) => {
             const eid = r.EventID || "";
             const label = EVENT_LABELS[eid] || `Event ${eid}`;
+            const bookmarked = isEventBookmarked(r);
             return (
               <button
                 type="button"
                 key={`${r._record_key || r.EventRecordID || r.timestamp}|${i}`}
+                className={bookmarked ? "dfir-bookmarked-row" : undefined}
                 onClick={() => setSelectedEvent(r)}
-                onMouseEnter={(e) => (e.currentTarget.style.background = "var(--bg-hover)")}
-                onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+                onMouseEnter={(e) => { if (!bookmarked) e.currentTarget.style.background = "var(--bg-hover)"; }}
+                onMouseLeave={(e) => { if (!bookmarked) e.currentTarget.style.background = "transparent"; }}
                 style={{ display: "grid", gridTemplateColumns: "minmax(174px, 1.15fr) minmax(150px, 1fr) 70px minmax(160px, 1fr) 22px", width: "100%", alignItems: "center", columnGap: 10, minHeight: 42, padding: "6px 2px", background: "transparent", border: "none", borderBottom: i < pagedEvents.length - 1 ? "1px solid var(--border-subtle)" : "none", color: "inherit", cursor: "pointer", fontFamily: "inherit", textAlign: "left" }}
               >
                 <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 13.5, fontWeight: 650, color: "var(--text-time)", fontFamily: "var(--mono)" }}>{r.timestamp || "시간 정보 없음"}</span>
@@ -714,13 +741,24 @@ function AccountDetailPage({ account, onBack, loadEvents, timeRange, onNavigate,
 
       {selectedEvent && (
         <RowDetailPanel
-          row={selectedEvent}
-          columns={Object.keys(selectedEvent)}
+          // Source identity stays in account-query state for exact bookmark
+          // operations; it is transport metadata, not analyst-facing EventLog
+          // evidence and must not appear in the common full-fields panel.
+          row={Object.fromEntries(Object.entries(selectedEvent).filter(([key]) => key !== "_source_full_path" && key !== "_source_table_name" && key !== "__rowid"))}
+          columns={Object.keys(selectedEvent).filter((key) => key !== "_source_full_path" && key !== "_source_table_name" && key !== "__rowid")}
           focusedColumn={null}
           fileBaseName="EventLog_Events"
           onClose={() => setSelectedEvent(null)}
           onNavigate={onNavigate ?? (() => {})}
           onFetchLinkedRows={onFetchLinkedRows}
+          accountDirectory={accountDirectory}
+          isBookmarked={isEventBookmarked(selectedEvent)}
+          onToggleBookmark={(() => {
+            const source = eventSource(selectedEvent);
+            return source && onToggleEventBookmark
+              ? () => onToggleEventBookmark(source.fullPath, source.tableName, source.rowid)
+              : undefined;
+          })()}
         />
       )}
     </div>

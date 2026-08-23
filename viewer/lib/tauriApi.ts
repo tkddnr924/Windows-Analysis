@@ -7,8 +7,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type {
-  Bookmark, BookmarkInput, Case, CategoryEntry, CsvData, ElectronApi, Host,
-  ListCasesResult, CacheMeta, CacheBodyPreview, PathReference, PipelineLogEntry, PipelineResult, ResultFileEntry, ResultProvenance, ArtifactInputFile, ParseReport, RunHostOptions, SearchHit, AiConversation, AiConversationPage, BrowserActivityQuery, BrowserActivitySummary, BrowserActivityInsights, BrowserDomainStatsPage, AccountEventPage, AccountEventQuery, AccountEventSource, ResultRow,
+  AccountDirectoryEntry, Bookmark, BookmarkInput, Case, CategoryEntry, CsvData, ElectronApi, Host,
+  ListCasesResult, CacheMeta, CacheBodyPreview, PathReference, PipelineLogEntry, PipelineResult, ResultFileEntry, ResultProvenance, ArtifactInputFile, ParseReport, RunHostOptions, SearchCasePage, AiConversation, AiConversationPage, BrowserActivityQuery, BrowserActivitySummary, BrowserActivityInsights, BrowserDomainStatsPage, AccountEventPage, AccountEventQuery, AccountEventSource, ResultRow, MftRecordsPage, ParseLogPreview,
 } from "./types";
 
 function makeApi(): ElectronApi {
@@ -18,11 +18,12 @@ function makeApi(): ElectronApi {
     listCases: () => invoke<ListCasesResult>("list_cases"),
     createCase: (name) => invoke<Case>("create_case", { name }),
     createHost: (caseId, name, targetDir) => invoke<Host>("create_host", { caseId, name, targetDir }),
+    renameHost: (caseId, hostId, name) => invoke<Host>("rename_host", { caseId, hostId, name }),
     deleteCase: (caseId) => invoke<boolean>("delete_case", { caseId }),
     deleteHost: (caseId, hostId) => invoke<boolean>("delete_host", { caseId, hostId }),
     listArtifacts: () => invoke<string[]>("list_artifacts"),
     runHost: (options: RunHostOptions) => invoke<PipelineResult>("run_host", { options }),
-    cancelPipeline: () => invoke<boolean>("cancel_pipeline"),
+    cancelPipeline: (runId, cancelAll) => invoke<boolean>("cancel_pipeline", { runId: runId ?? null, cancelAll: cancelAll ?? false }),
     onPipelineLog: (callback: (entry: PipelineLogEntry) => void) => {
       let unlisten: (() => void) | null = null;
       let cancelled = false;
@@ -38,6 +39,8 @@ function makeApi(): ElectronApi {
     resultProvenance: (fullPath, tableName) => invoke<ResultProvenance[]>("result_provenance", { fullPath, tableName }),
     artifactInputFiles: (sourceFile) => invoke<ArtifactInputFile[]>("artifact_input_files", { sourceFile }),
     parseReport: (hostDir) => invoke<ParseReport | null>("parse_report", { hostDir }),
+    parseRunLog: (hostDir, runId) => invoke<ParseLogPreview>("parse_run_log", { hostDir, runId }),
+    accountDirectory: (hostDir) => invoke<AccountDirectoryEntry[]>("account_directory", { hostDir }),
     readResultFile: (fullPath, tableName) => invoke<CsvData>("read_result_file", { fullPath, tableName: tableName ?? null }),
     linkedResultRows: (fullPath, tableName, matchColumn, matchValue, search, offset, limit) => invoke("linked_result_rows", { fullPath, tableName, matchColumn, matchValue, search, offset, limit }),
     resultRow: (fullPath, tableName, rowid) => invoke<ResultRow>("result_row", { fullPath, tableName, rowid }),
@@ -50,9 +53,10 @@ function makeApi(): ElectronApi {
     mftChildren: (fullPath, parentEntry) => invoke<Record<string, string>[]>("mft_children", { fullPath, parentEntry }),
     mftSearch: (fullPath, query, limit) => invoke<Record<string, string>[]>("mft_search", { fullPath, query, limit }),
     mftRow: (fullPath, rowid) => invoke<Record<string, string> | null>("mft_row", { fullPath, rowid }),
+    mftRecordsPage: (fullPath, query, offset, limit) => invoke<MftRecordsPage>("mft_records_page", { fullPath, query, offset, limit }),
     listColumnValues: (fullPath, column, tableName) =>
       invoke<{ value: string; count: number }[]>("list_column_values", { fullPath, column, tableName: tableName ?? null }),
-    searchCase: (query, hosts) => invoke<SearchHit[]>("search_case", { query, hosts }),
+    searchCase: (query, hosts, offset, limit, range) => invoke<SearchCasePage>("search_case", { query, hosts, offset, limit, start: range?.start || null, end: range?.end || null }),
     listBookmarks: (caseDir) => invoke<Bookmark[]>("list_bookmarks", { caseDir }),
     toggleBookmark: (caseDir, entry: BookmarkInput) => invoke<Bookmark[]>("toggle_bookmark", { caseDir, entry }),
     updateBookmarkNote: (caseDir, id, note) => invoke<Bookmark[]>("update_bookmark_note", { caseDir, id, note }),

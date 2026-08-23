@@ -15,6 +15,7 @@ import RowDetailPanel from "./RowDetailPanel";
 import { tagsForPath, type Tag } from "@/lib/tagging";
 import { inRange, rangeActive, type TimeRange } from "@/lib/timeRange";
 import type { CsvData, FetchLinkedRows } from "@/lib/types";
+import { resolveAccountDisplay, type AccountDirectory } from "@/lib/accountIdentity";
 
 interface ExecutionHistoryViewProps {
   data: CsvData;
@@ -23,6 +24,7 @@ interface ExecutionHistoryViewProps {
   bookmarkedRowids?: Set<number>;
   onToggleBookmark?: (rowid: number) => void;
   timeRange: TimeRange;
+  accountDirectory?: AccountDirectory;
 }
 
 type Row = Record<string, string>;
@@ -63,6 +65,16 @@ function isWindowsSystemPath(path: string): boolean {
     || /\\device\\harddiskvolume\d+\\windows\\/.test(value)
     || /(^|\\)windows\\(system32|syswow64|winsxs)\\/.test(value);
 }
+
+function accountDisplayLabel(row: Row, accountDirectory?: AccountDirectory): string {
+  const raw = (row.user || "").trim();
+  const mapped = [row.account_name, row.username, row.user_name, row.profile_name]
+    .map((value) => (value || "").trim())
+    .find((value) => value && !/^S-\d+(?:-\d+)+$/i.test(value));
+  if (mapped) return mapped;
+  if (!raw) return "계정 정보 없음";
+  return resolveAccountDisplay(raw, accountDirectory);
+}
 function buildEntry(row: Row): Entry {
   const path = row.program_path || "";
   const name = row.program_name || basename(path) || "(이름 없음)";
@@ -86,16 +98,7 @@ function FilterButton({ active, children, onClick }: { active: boolean; children
 }
 
 const artifactTagStyle: React.CSSProperties = { flexShrink: 0, padding: "2px 6px", borderRadius: "var(--radius-sm)", color: "#fff", fontSize: 10.5, fontWeight: 700, lineHeight: 1.3 };
-const warningLabelStyle: React.CSSProperties = { flexShrink: 0, padding: "2px 6px", borderRadius: "var(--radius-sm)", color: "var(--warning)", background: "var(--warning-subtle)", border: "1px solid color-mix(in srgb, var(--warning) 42%, transparent)", fontSize: 10.5, fontWeight: 650, lineHeight: 1.3 };
-
-function EvidenceLabel({ entry }: { entry: Entry }) {
-  if (entry.unsigned) return <span style={warningLabelStyle}>게시자 정보 없음</span>;
-  if (entry.publisher) return <span style={{ color: "var(--text-dim)" }}>{entry.publisher}</span>;
-  if (entry.runCount) return <span style={{ color: "var(--text-dim)" }}>실행 {entry.runCount}회</span>;
-  return <span style={{ color: "var(--text-faint)" }}>추가 실행 정보 없음</span>;
-}
-
-export default function ExecutionHistoryView({ data, onNavigate, onFetchLinkedRows, bookmarkedRowids, onToggleBookmark, timeRange }: ExecutionHistoryViewProps) {
+export default function ExecutionHistoryView({ data, onNavigate, onFetchLinkedRows, bookmarkedRowids, onToggleBookmark, timeRange, accountDirectory }: ExecutionHistoryViewProps) {
   const [disabledSources, setDisabledSources] = useState<Set<string>>(new Set());
   const [onlyRisk, setOnlyRisk] = useState(false);
   const [onlyUnsigned, setOnlyUnsigned] = useState(false);
@@ -160,28 +163,27 @@ export default function ExecutionHistoryView({ data, onNavigate, onFetchLinkedRo
     </Popover>
 
     <div style={{ minHeight: 0, flex: 1, margin: "0 20px", display: "flex", flexDirection: "column", overflow: "hidden", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", background: "var(--bg-panel)", boxShadow: "var(--shadow-card)" }}>
-      <div style={{ display: "grid", gridTemplateColumns: "174px minmax(185px, .85fr) minmax(290px, 1.5fr) 104px 120px minmax(155px, .7fr) 34px", gap: 12, alignItems: "center", minHeight: 34, padding: "0 12px", borderBottom: "1px solid var(--border)", color: "var(--text-faint)", fontSize: 10.5, fontWeight: 700, letterSpacing: ".02em" }}><span>시간</span><span>실행 항목</span><span>경로</span><span>출처</span><span>계정</span><span>증거</span><span aria-label="북마크" /></div>
+      <div style={{ display: "grid", gridTemplateColumns: "174px minmax(205px, 1fr) minmax(330px, 1.7fr) 112px minmax(145px, .75fr) 34px", gap: 12, alignItems: "center", minHeight: 34, padding: "0 12px", borderBottom: "1px solid var(--border)", color: "var(--text-faint)", fontSize: 10.5, fontWeight: 700, letterSpacing: ".02em" }}><span>시간</span><span>실행 항목</span><span>경로</span><span>출처</span><span>계정</span><span aria-label="북마크" /></div>
       <div ref={scrollRef} style={{ flex: 1, minHeight: 0, overflow: "auto" }}>
         {filtered.length === 0 ? <div style={{ minHeight: 180, display: "grid", placeItems: "center", color: "var(--text-faint)", fontSize: 13 }}>{rangeActive(timeRange) && inGlobalRange.length === 0 ? "기간 필터 내 실행 이력 없음" : all.length === 0 ? "실행 이력 없음" : "검색·필터 조건에 일치하는 실행 이력 없음"}</div> : <div style={{ height: virtualizer.getTotalSize(), minWidth: 980, position: "relative" }}>{virtualizer.getVirtualItems().map((virtualRow) => {
           const entry = filtered[virtualRow.index];
           const bookmarked = bookmarkedRowids?.has(entry.rowid) ?? false;
           const selectedRow = selected?.rowid === entry.rowid && selected.source === entry.source;
-          return <div key={virtualRow.key} style={{ position: "absolute", top: 0, left: 0, width: "100%", height: ROW_HEIGHT, transform: `translateY(${virtualRow.start}px)`, display: "grid", gridTemplateColumns: "minmax(0, 1fr) 34px", gap: 12, alignItems: "center", padding: "0 12px", borderBottom: "1px solid var(--border-subtle)", borderLeft: bookmarked ? "3px solid var(--warning)" : "3px solid transparent", background: selectedRow ? "var(--bg-selected)" : bookmarked ? "color-mix(in srgb, var(--warning) 12%, var(--bg-panel))" : "transparent", color: "var(--text)" }} onMouseEnter={(event) => { if (!selectedRow) event.currentTarget.style.background = bookmarked ? "color-mix(in srgb, var(--warning) 17%, var(--bg-panel))" : "var(--bg-hover)"; }} onMouseLeave={(event) => { if (!selectedRow) event.currentTarget.style.background = bookmarked ? "color-mix(in srgb, var(--warning) 12%, var(--bg-panel))" : "transparent"; }}>
-            <div role="button" tabIndex={0} aria-label={`${entry.name} 상세 보기`} onClick={() => setSelected(entry)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); setSelected(entry); } }} style={{ minWidth: 0, height: "100%", display: "grid", gridTemplateColumns: "174px minmax(185px, .85fr) minmax(290px, 1.5fr) 104px 120px minmax(155px, .7fr)", gap: 12, alignItems: "center", cursor: "pointer", outlineOffset: -3 }}>
+          return <div key={virtualRow.key} className={bookmarked ? `dfir-bookmarked-row${selectedRow ? " dfir-bookmarked-row--selected" : ""}` : undefined} style={{ position: "absolute", top: 0, left: 0, width: "100%", height: ROW_HEIGHT, transform: `translateY(${virtualRow.start}px)`, display: "grid", gridTemplateColumns: "minmax(0, 1fr) 34px", gap: 12, alignItems: "center", padding: "0 12px", borderBottom: "1px solid var(--border-subtle)", borderLeft: "3px solid transparent", background: selectedRow ? "var(--bg-selected)" : "transparent", color: "var(--text)" }} onMouseEnter={(event) => { if (!selectedRow && !bookmarked) event.currentTarget.style.background = "var(--bg-hover)"; }} onMouseLeave={(event) => { if (!selectedRow && !bookmarked) event.currentTarget.style.background = "transparent"; }}>
+            <div role="button" tabIndex={0} aria-label={`${entry.name} 상세 보기`} onClick={() => setSelected(entry)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); setSelected(entry); } }} style={{ minWidth: 0, height: "100%", display: "grid", gridTemplateColumns: "174px minmax(205px, 1fr) minmax(330px, 1.7fr) 112px minmax(145px, .75fr)", gap: 12, alignItems: "center", cursor: "pointer", outlineOffset: -3 }}>
             <span style={{ color: "var(--text-time)", fontSize: 12.5, fontVariantNumeric: "tabular-nums", whiteSpace: "nowrap" }}>{entry.timestamp || "시간 정보 없음"}</span>
             <span style={{ minWidth: 0, display: "flex", alignItems: "center", gap: 6, overflow: "hidden" }}><span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 13, fontWeight: 650 }}>{entry.name}</span>{entry.tags.map((tag) => <span key={tag.label} title={tag.description} style={{ ...artifactTagStyle, background: tag.severity === "danger" ? "var(--danger)" : "var(--warning)" }}>{tag.label}</span>)}</span>
             <span title={entry.path || undefined} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text-dim)", fontSize: 12 }}>{entry.path || "경로 정보 없음"}</span>
             <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text-dim)", fontSize: 12 }}>{sourceLabel(entry.source)}</span>
-            <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: entry.user ? "var(--text-dim)" : "var(--text-faint)", fontSize: 12 }}>{entry.user || "계정 정보 없음"}</span>
-            <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 11.5 }}><EvidenceLabel entry={entry} /></span>
+            <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: accountDisplayLabel(entry.row, accountDirectory) === "계정 정보 없음" ? "var(--text-faint)" : "var(--text-dim)", fontSize: 12 }}>{accountDisplayLabel(entry.row, accountDirectory)}</span>
             </div>
-            <Tooltip title={bookmarked ? "북마크 해제" : "북마크"}><span><IconButton aria-label={bookmarked ? "북마크 해제" : "북마크"} disabled={!onToggleBookmark} size="small" onClick={() => onToggleBookmark?.(entry.rowid)} sx={{ color: bookmarked ? "var(--warning)" : "var(--text-faint)", borderRadius: "var(--radius-sm)" }}>{bookmarked ? <BookmarkIcon sx={{ fontSize: 17 }} /> : <BookmarkBorderOutlinedIcon sx={{ fontSize: 17 }} />}</IconButton></span></Tooltip>
+            <Tooltip title={bookmarked ? "북마크 해제" : "북마크"}><span><IconButton className={bookmarked ? "dfir-bookmark-control" : undefined} aria-label={bookmarked ? "북마크 해제" : "북마크"} disabled={!onToggleBookmark} size="small" onClick={() => onToggleBookmark?.(entry.rowid)} sx={{ color: bookmarked ? "var(--bookmark-control)" : "var(--text-faint)", borderRadius: "var(--radius-sm)" }}>{bookmarked ? <BookmarkIcon sx={{ fontSize: 17 }} /> : <BookmarkBorderOutlinedIcon sx={{ fontSize: 17 }} />}</IconButton></span></Tooltip>
           </div>;
         })}</div>}
       </div>
     </div>
     <div style={{ display: "flex", alignItems: "center", minHeight: 30, margin: "0 20px", color: "var(--text-faint)", fontSize: 11.5 }}>표시 {filtered.length.toLocaleString()}건 · {SORT_LABEL[sort]}</div>
 
-    {selected && <RowDetailPanel row={selected.row} columns={data.columns} focusedColumn={null} fileBaseName="ExecutionHistory" onClose={() => setSelected(null)} onNavigate={(fileName, column, value) => { setSelected(null); onNavigate(fileName, column, value); }} onFetchLinkedRows={onFetchLinkedRows} isBookmarked={onToggleBookmark && Number.isFinite(selected.rowid) ? bookmarkedRowids?.has(selected.rowid) ?? false : undefined} onToggleBookmark={onToggleBookmark && Number.isFinite(selected.rowid) ? () => onToggleBookmark(selected.rowid) : undefined} />}
+    {selected && <RowDetailPanel row={selected.row} columns={data.columns} focusedColumn={null} fileBaseName="ExecutionHistory" onClose={() => setSelected(null)} onNavigate={(fileName, column, value) => { setSelected(null); onNavigate(fileName, column, value); }} onFetchLinkedRows={onFetchLinkedRows} accountDirectory={accountDirectory} isBookmarked={onToggleBookmark && Number.isFinite(selected.rowid) ? bookmarkedRowids?.has(selected.rowid) ?? false : undefined} onToggleBookmark={onToggleBookmark && Number.isFinite(selected.rowid) ? () => onToggleBookmark(selected.rowid) : undefined} />}
   </div>;
 }

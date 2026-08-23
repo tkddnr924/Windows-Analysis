@@ -689,9 +689,14 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     // evidence fields below, while attention-only status appears once at the
     // bottom as a hoverable analysis tag.
     tags: tagsForRegistryFinding,
-    priorityColumns: ["category", "status", "name", "value", "detail", "user", "source"],
+    priorityColumns: ["category", "status", "name", "value", "timestamp", "detail", "user", "source"],
     sections: [{ heading: "상세", fields: [
       { key: "category", label: "분류" },
+      // Registry-derived findings inherit the source key's LastWrite time.
+      // ShimCache is different: its timestamp is the cache entry's FILETIME,
+      // not proof of a registry key write.
+      { key: "timestamp", label: "레지스트리 키 마지막 기록 시각", compute: (r) => r.subtype === "ShimCache" ? "" : r.timestamp },
+      { key: "timestamp", label: "ShimCache 캐시 항목 시각", compute: (r) => r.subtype === "ShimCache" ? r.timestamp : "" },
       { key: "value", label: "값" },
       { key: "command", label: "명령" },
       { key: "user", label: "사용자" },

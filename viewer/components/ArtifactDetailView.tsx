@@ -11,6 +11,7 @@ import OpenInFullOutlinedIcon from "@mui/icons-material/OpenInFullOutlined";
 import type { ArtifactViewSpec, DetailSectionSpec, FieldKind, FieldSpec, LinkSpec } from "@/lib/artifactViews";
 import { getArtifactView } from "@/lib/artifactViews";
 import type { CacheBodyPreview, FetchLinkedRows } from "@/lib/types";
+import { isExactSid, resolveAccountDisplay, type AccountDirectory } from "@/lib/accountIdentity";
 import { parsePrivileges, lookupPrivilege } from "@/lib/privileges";
 import TagList from "./TagList";
 import MiniTimeline from "./MiniTimeline";
@@ -211,34 +212,13 @@ function CopyButton({ value }: { value: string }) {
   );
 }
 
-function AccountSidValue({ sid, onFetchLinkedRows }: { sid: string; onFetchLinkedRows?: FetchLinkedRows }) {
-  const [accountName, setAccountName] = useState<string | null>(null);
-
-  useEffect(() => {
-    if (!onFetchLinkedRows || !sid) {
-      setAccountName(null);
-      return;
-    }
-    let alive = true;
-    setAccountName(null);
-    // TargetInfo is built from SAM/ProfileList and stores Account records with
-    // the SID in `name` and the verified account name in `username`.
-    onFetchLinkedRows("TargetInfo", "name", sid)
-      .then((result) => {
-        if (!alive) return;
-        const account = result?.rows.find((candidate) => candidate.category === "Account" && candidate.username)?.username;
-        setAccountName(account || null);
-      })
-      .catch(() => {
-        if (alive) setAccountName(null);
-      });
-    return () => { alive = false; };
-  }, [sid, onFetchLinkedRows]);
+function AccountSidValue({ sid, accountDirectory }: { sid: string; accountDirectory?: AccountDirectory }) {
+  const accountName = resolveAccountDisplay(sid, accountDirectory);
 
   return (
     <div>
       <div style={{ fontFamily: "var(--mono)", fontSize: 12, wordBreak: "break-all" }}>{sid}</div>
-      {accountName && (
+      {accountName !== sid && (
         <div style={{ marginTop: 6 }}>
           <span className="dfir-tag dfir-tag--info">
             <AccountCircleOutlinedIcon sx={{ fontSize: 14 }} aria-hidden />
@@ -250,11 +230,15 @@ function AccountSidValue({ sid, onFetchLinkedRows }: { sid: string; onFetchLinke
   );
 }
 
-function AccountValue({ account }: { account: string }) {
+function AccountValue({ account, accountDirectory }: { account: string; accountDirectory?: AccountDirectory }) {
+  const display = resolveAccountDisplay(account, accountDirectory);
   return (
-    <span className="dfir-tag dfir-tag--info">
-      <AccountCircleOutlinedIcon sx={{ fontSize: 14 }} aria-hidden />
-      {account}
+    <span>
+      <span className="dfir-tag dfir-tag--info">
+        <AccountCircleOutlinedIcon sx={{ fontSize: 14 }} aria-hidden />
+        {display}
+      </span>
+      {display !== account && isExactSid(account) && <span style={{ display: "block", marginTop: 5, color: "var(--text-faint)", fontFamily: "var(--mono)", fontSize: 11.5 }}>{account}</span>}
     </span>
   );
 }
@@ -387,7 +371,7 @@ function CacheDataValue({ row, hostDir }: { row: Record<string, string>; hostDir
   return <span style={{ color: "var(--text-dim)", fontSize: 12.5 }}>바이너리 데이터 복구됨{byteLength !== null ? ` · ${byteLength.toLocaleString()} Bytes` : body.decodedSize ? ` · ${body.decodedSize.toLocaleString()} Bytes` : ""}{body.truncated ? " (미리보기 제한)" : ""}</span>;
 }
 
-function FieldRow({ field, row, onFetchLinkedRows, hostDir, onToggleFieldBookmark, isFieldBookmarked }: { field: FieldSpec; row: Record<string, string>; onFetchLinkedRows?: FetchLinkedRows; hostDir?: string; onToggleFieldBookmark?: (field: string) => void; isFieldBookmarked?: (field: string) => boolean }) {
+function FieldRow({ field, row, onFetchLinkedRows, hostDir, accountDirectory, onToggleFieldBookmark, isFieldBookmarked }: { field: FieldSpec; row: Record<string, string>; onFetchLinkedRows?: FetchLinkedRows; hostDir?: string; accountDirectory?: AccountDirectory; onToggleFieldBookmark?: (field: string) => void; isFieldBookmarked?: (field: string) => boolean }) {
   const raw = field.compute ? field.compute(row) ?? "" : row[field.key];
   if ((raw === undefined || raw === null || raw === "") && !field.showWhenEmpty) return null;
 
@@ -431,10 +415,10 @@ function FieldRow({ field, row, onFetchLinkedRows, hostDir, onToggleFieldBookmar
       content = <PrivilegeList raw={raw} />;
       break;
     case "accountSid":
-      content = <AccountSidValue sid={raw} onFetchLinkedRows={onFetchLinkedRows} />;
+      content = <AccountSidValue sid={raw} accountDirectory={accountDirectory} />;
       break;
     case "account":
-      content = <AccountValue account={raw} />;
+      content = <AccountValue account={raw} accountDirectory={accountDirectory} />;
       break;
     case "byteSize":
       content = <ByteSizeValue value={raw} />;
@@ -461,10 +445,11 @@ function FieldRow({ field, row, onFetchLinkedRows, hostDir, onToggleFieldBookmar
           {field.bookmarkable && raw && onToggleFieldBookmark && (
             <button
               type="button"
+              className={isFieldBookmarked?.(field.key) ? "dfir-bookmark-control" : undefined}
               onClick={() => onToggleFieldBookmark(field.key)}
               aria-label={`${label} ${isFieldBookmarked?.(field.key) ? "북마크 해제" : "북마크"}`}
               title={isFieldBookmarked?.(field.key) ? "이 시각 북마크 해제" : "이 시각 북마크"}
-              style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 24, height: 22, padding: 0, border: `1px solid ${isFieldBookmarked?.(field.key) ? "var(--warning)" : "var(--border)"}`, borderRadius: "var(--radius-sm)", background: isFieldBookmarked?.(field.key) ? "var(--warning-subtle)" : "var(--bg-elevated)", color: isFieldBookmarked?.(field.key) ? "var(--warning)" : "var(--text-faint)", cursor: "pointer" }}
+              style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 24, height: 22, padding: 0, border: `1px solid ${isFieldBookmarked?.(field.key) ? "var(--bookmark-outline)" : "var(--border)"}`, borderRadius: "var(--radius-sm)", background: isFieldBookmarked?.(field.key) ? "var(--bookmark-row)" : "var(--bg-elevated)", color: isFieldBookmarked?.(field.key) ? "var(--bookmark-control)" : "var(--text-faint)", cursor: "pointer" }}
             >
               {isFieldBookmarked?.(field.key) ? <BookmarkOutlinedIcon sx={{ fontSize: 14 }} /> : <BookmarkBorderOutlinedIcon sx={{ fontSize: 14 }} />}
             </button>
@@ -670,7 +655,7 @@ function EmbeddedLinkRows({ link, value, onFetchLinkedRows }: { link: LinkSpec; 
   );
 }
 
-function DetailSection({ section, row, onFetchLinkedRows, hostDir, onToggleFieldBookmark, isFieldBookmarked }: { section: DetailSectionSpec; row: Record<string, string>; onFetchLinkedRows?: FetchLinkedRows; hostDir?: string; onToggleFieldBookmark?: (field: string) => void; isFieldBookmarked?: (field: string) => boolean }) {
+function DetailSection({ section, row, onFetchLinkedRows, hostDir, accountDirectory, onToggleFieldBookmark, isFieldBookmarked }: { section: DetailSectionSpec; row: Record<string, string>; onFetchLinkedRows?: FetchLinkedRows; hostDir?: string; accountDirectory?: AccountDirectory; onToggleFieldBookmark?: (field: string) => void; isFieldBookmarked?: (field: string) => boolean }) {
   const visibleFields = section.fields.filter((field) => field.showWhenEmpty || (field.compute ? field.compute(row) : row[field.key]));
   const [expanded, setExpanded] = useState(section.collapsible?.defaultExpanded ?? true);
   if (visibleFields.length === 0) return null;
@@ -681,7 +666,7 @@ function DetailSection({ section, row, onFetchLinkedRows, hostDir, onToggleField
     return (
       <div style={{ padding: "14px 16px", borderBottom: "1px solid var(--border-subtle)" }}>
         <div className="dfir-section-label" style={{ marginBottom: 6 }}>{heading}</div>
-        {visibleFields.map((field) => <FieldRow key={field.key} field={field} row={row} onFetchLinkedRows={onFetchLinkedRows} hostDir={hostDir} onToggleFieldBookmark={onToggleFieldBookmark} isFieldBookmarked={isFieldBookmarked} />)}
+        {visibleFields.map((field) => <FieldRow key={field.key} field={field} row={row} onFetchLinkedRows={onFetchLinkedRows} hostDir={hostDir} accountDirectory={accountDirectory} onToggleFieldBookmark={onToggleFieldBookmark} isFieldBookmarked={isFieldBookmarked} />)}
       </div>
     );
   }
@@ -700,7 +685,7 @@ function DetailSection({ section, row, onFetchLinkedRows, hostDir, onToggleField
       </button>
       {expanded && (
         <div style={{ padding: "0 16px 12px" }}>
-          {visibleFields.map((field) => <FieldRow key={field.key} field={field} row={row} onFetchLinkedRows={onFetchLinkedRows} hostDir={hostDir} onToggleFieldBookmark={onToggleFieldBookmark} isFieldBookmarked={isFieldBookmarked} />)}
+          {visibleFields.map((field) => <FieldRow key={field.key} field={field} row={row} onFetchLinkedRows={onFetchLinkedRows} hostDir={hostDir} accountDirectory={accountDirectory} onToggleFieldBookmark={onToggleFieldBookmark} isFieldBookmarked={isFieldBookmarked} />)}
         </div>
       )}
     </section>
@@ -714,11 +699,13 @@ interface ArtifactDetailViewProps {
   onFetchLinkedRows?: FetchLinkedRows;
   /** Host evidence directory, required only for on-demand Browser Cache bodies. */
   hostDir?: string;
+  /** Display-only exact SID directory for this record's authoritative host. */
+  accountDirectory?: AccountDirectory;
   onToggleFieldBookmark?: (field: string) => void;
   isFieldBookmarked?: (field: string) => boolean;
 }
 
-export default function ArtifactDetailView({ spec, row, onNavigate, onFetchLinkedRows, hostDir, onToggleFieldBookmark, isFieldBookmarked }: ArtifactDetailViewProps) {
+export default function ArtifactDetailView({ spec, row, onNavigate, onFetchLinkedRows, hostDir, accountDirectory, onToggleFieldBookmark, isFieldBookmarked }: ArtifactDetailViewProps) {
   const title = spec.title(row);
   const subtitle = spec.subtitle?.(row);
   const tags = spec.tags?.(row) ?? [];
@@ -795,7 +782,7 @@ export default function ArtifactDetailView({ spec, row, onNavigate, onFetchLinke
       )}
 
       {spec.sections.map((section, index) => (
-        <DetailSection key={`${typeof section.heading === "string" ? section.heading : "computed"}-${index}`} section={section} row={row} onFetchLinkedRows={onFetchLinkedRows} hostDir={hostDir} onToggleFieldBookmark={onToggleFieldBookmark} isFieldBookmarked={isFieldBookmarked} />
+        <DetailSection key={`${typeof section.heading === "string" ? section.heading : "computed"}-${index}`} section={section} row={row} onFetchLinkedRows={onFetchLinkedRows} hostDir={hostDir} accountDirectory={accountDirectory} onToggleFieldBookmark={onToggleFieldBookmark} isFieldBookmarked={isFieldBookmarked} />
       ))}
 
       {activeEmbeddedLinks.map((link) =>

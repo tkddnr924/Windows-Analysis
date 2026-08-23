@@ -17,6 +17,7 @@ import TerminalOutlinedIcon from "@mui/icons-material/TerminalOutlined";
 import DnsOutlinedIcon from "@mui/icons-material/DnsOutlined";
 import TaskOutlinedIcon from "@mui/icons-material/TaskOutlined";
 import LanguageOutlinedIcon from "@mui/icons-material/LanguageOutlined";
+import PhotoLibraryOutlinedIcon from "@mui/icons-material/PhotoLibraryOutlined";
 import type { Case, Host, CategoryEntry, ResultFileEntry } from "@/lib/types";
 import { EMPTY_TIME_RANGE, rangeActive, type TimeRange } from "@/lib/timeRange";
 import DateTimeInput from "./DateTimeInput";
@@ -100,12 +101,11 @@ const OVERVIEW_ORDER: string[] = [
   "RdpCache",
 ];
 
-// 종합 분석(_OVERVIEW) items are labeled in English; the rest of the UI stays
-// Korean. Every overview table gets an explicit English name here.
+// 종합 분석(_OVERVIEW) tables receive analyst-facing Korean display labels.
 const OVERVIEW_TABLE_NAMES: Record<string, string> = {
   TargetInfo: "호스트 정보",
   ExecutionHistory: "실행 이력",
-  Defender: "Defender",
+  Defender: "Microsoft Defender 활동",
   RegistryFindings: "레지스트리 특이사항",
   BrowserActivity: "브라우저 활동",
   RemoteDesktopHistory: "원격 접근 이력 (RDP)",
@@ -129,6 +129,10 @@ function OverviewTableIcon({ name }: { name: string }) {
     case "PowerShellHistory": return <TerminalOutlinedIcon {...props} />;
     case "SmbHistory": return <DnsOutlinedIcon {...props} />;
     case "ScheduledTasks": return <TaskOutlinedIcon {...props} />;
+    // Keep the navigation glyph identical to the RDP Cache view header; the
+    // remote session ledger itself uses the desktop glyph above.
+    case "RdpCache": return <PhotoLibraryOutlinedIcon {...props} />;
+    case "BrowserActivity": return <LanguageOutlinedIcon {...props} />;
     default: return <LanguageOutlinedIcon {...props} />;
   }
 }
@@ -441,6 +445,7 @@ export default function Sidebar({
   onNavigate,
 }: SidebarProps) {
   const [rawDataExpanded, setRawDataExpanded] = useState(false);
+  const hasTimeRange = rangeActive(timeRange);
   const overviewCategory = categories.find((c) => c.name === "_OVERVIEW");
   const rawCategories = categories.filter((c) => c.name !== "_OVERVIEW");
 
@@ -516,19 +521,13 @@ export default function Sidebar({
         </div>
         {(
           <div style={{ marginTop: 10 }}>
-            <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 5 }}>
-              <span style={{ fontSize: 10.5, fontWeight: 700, color: "var(--text-faint)", textTransform: "uppercase", letterSpacing: 0.6 }}>
+            <div className="sidebar-time-range-head" style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) 62px", alignItems: "center", minHeight: 24, gap: 6, marginBottom: 5 }}>
+              <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 10.5, fontWeight: 700, color: "var(--text-faint)", textTransform: "uppercase", letterSpacing: 0.6 }}>
                 기간 필터 (사고 시점)
               </span>
-              {rangeActive(timeRange) && (
-                <button
-                  onClick={() => onTimeRangeChange(EMPTY_TIME_RANGE)}
-                  title="기간 초기화"
-                  style={{ marginLeft: "auto", fontSize: 10.5, background: "transparent", border: "none", color: "var(--accent)", cursor: "pointer", fontWeight: 600 }}
-                >
-                  초기화 ×
-                </button>
-              )}
+              <span style={{ display: "flex", justifyContent: "flex-end", minWidth: 0 }}>
+                {hasTimeRange && <button type="button" onClick={() => onTimeRangeChange(EMPTY_TIME_RANGE)} title="기간 초기화" aria-label="기간 초기화" style={{ minWidth: 42, padding: 0, fontSize: 10.5, background: "transparent", border: "none", color: "var(--accent)", cursor: "pointer", fontWeight: 600 }}>초기화</button>}
+              </span>
             </div>
             <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
               <DateTimeInput
@@ -546,9 +545,7 @@ export default function Sidebar({
                 placeholder="종료 (YYYY-MM-DD HH:mm:ss)"
               />
             </div>
-            {rangeActive(timeRange) && (
-              <div style={{ marginTop: 5, fontSize: 10.5, color: "var(--accent)" }}>이 기간으로 모든 데이터를 거릅니다</div>
-            )}
+            <div aria-live={hasTimeRange ? "polite" : undefined} aria-hidden={!hasTimeRange} style={{ minHeight: 16, marginTop: 5, fontSize: 10.5, color: "var(--accent)" }}>{hasTimeRange ? "이 기간으로 모든 데이터를 거릅니다" : null}</div>
           </div>
         )}
       </div>
@@ -578,7 +575,7 @@ export default function Sidebar({
             />
             <PinnedNavRow
               icon={<BookmarkBorderIcon sx={{ fontSize: 19 }} />}
-              label="북마크"
+              label="분석 정보"
               count={bookmarkCount}
               selected={activeVirtualTab === "bookmarks"}
               onClick={onSelectBookmarks}

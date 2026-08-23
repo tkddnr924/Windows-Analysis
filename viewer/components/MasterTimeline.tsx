@@ -17,16 +17,14 @@ import TimelineOutlinedIcon from "@mui/icons-material/TimelineOutlined";
 import ViewListOutlinedIcon from "@mui/icons-material/ViewListOutlined";
 import { resolveArtifactView } from "@/lib/artifactViews";
 import RowDetailPanel from "./RowDetailPanel";
+import type { AccountDirectory } from "@/lib/accountIdentity";
 
 const ROW_HEIGHT = 52;
-// A bookmark is an analyst decision, not another weak status tint. On the
-// dark timeline it gets one pale evidence-paper surface so it is findable at
-// a glance without competing with red/yellow investigative severity.
-const BOOKMARK_ROW = "#f1e2bb";
-const BOOKMARK_ROW_HOVER = "#f8ebc9";
-const BOOKMARK_TEXT = "#202934";
-const BOOKMARK_MUTED_TEXT = "#111820";
-const BOOKMARK_ACCENT = "#ba7c00";
+// Bookmark context stays neutral, distinct from navigation blue and from
+// severity colours used by investigative evidence.
+const BOOKMARK_TEXT = "var(--text)";
+const BOOKMARK_MUTED_TEXT = "var(--text-dim)";
+const BOOKMARK_ACCENT = "var(--bookmark-control)";
 
 type ArtifactChipTone = {
   border: string;
@@ -245,9 +243,10 @@ interface MasterTimelineProps {
   onToggleBookmark: (entry: TimelineEntry) => void;
   /** Global incident-window filter from the sidebar. */
   globalTimeRange: TimeRange;
+  accountDirectory?: AccountDirectory;
 }
 
-export default function MasterTimeline({ entries, loading, onNavigate, onFetchLinkedRows, isBookmarked, onToggleBookmark, globalTimeRange }: MasterTimelineProps) {
+export default function MasterTimeline({ entries, loading, onNavigate, onFetchLinkedRows, isBookmarked, onToggleBookmark, globalTimeRange, accountDirectory }: MasterTimelineProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const [sortDir, setSortDir] = useState<"asc" | "desc">("asc");
   const [hiddenTables, setHiddenTables] = useState<Set<string>>(new Set());
@@ -676,9 +675,11 @@ export default function MasterTimeline({ entries, loading, onNavigate, onFetchLi
           const warningTag = entry.tags.find((t) => t.severity === "warning");
           const bookmarked = isBookmarked(entry);
           const chipTone = artifactChipTone(entry.category, entry.table);
+          const rowBackground = virtualRow.index % 2 === 0 ? "transparent" : "rgba(255,255,255,0.02)";
           return (
             <div
               key={virtualRow.key}
+              className={bookmarked ? "dfir-bookmarked-row" : undefined}
               onClick={() => setSelectedEntry(entry)}
               style={{
                 height: ROW_HEIGHT,
@@ -688,11 +689,10 @@ export default function MasterTimeline({ entries, loading, onNavigate, onFetchLi
                 padding: "0 14px",
                 borderBottom: "1px solid var(--border-subtle)",
                 cursor: "pointer",
-                background: bookmarked ? BOOKMARK_ROW : virtualRow.index % 2 === 0 ? "transparent" : "rgba(255,255,255,0.02)",
-                boxShadow: bookmarked ? `inset 4px 0 0 ${BOOKMARK_ACCENT}` : undefined,
+                background: rowBackground,
               }}
-              onMouseEnter={(e) => (e.currentTarget.style.background = bookmarked ? BOOKMARK_ROW_HOVER : "var(--bg-hover)")}
-              onMouseLeave={(e) => (e.currentTarget.style.background = bookmarked ? BOOKMARK_ROW : virtualRow.index % 2 === 0 ? "transparent" : "rgba(255,255,255,0.02)")}
+              onMouseEnter={(e) => { if (!bookmarked) e.currentTarget.style.background = "var(--bg-hover)"; }}
+              onMouseLeave={(e) => { if (!bookmarked) e.currentTarget.style.background = rowBackground; }}
             >
               <span style={{ flexShrink: 0, width: 178, fontFamily: "var(--mono)", fontSize: 12.5, color: bookmarked ? BOOKMARK_MUTED_TEXT : entry.timestamp ? "var(--text-time)" : "var(--text-faint)" }}>
                 {entry.timestamp || "(시간 정보 없음)"}
@@ -762,6 +762,7 @@ export default function MasterTimeline({ entries, loading, onNavigate, onFetchLi
               )}
               <button
                 type="button"
+                className={bookmarked ? "dfir-bookmark-control" : undefined}
                 onClick={(e) => {
                   e.stopPropagation();
                   onToggleBookmark(entry);
@@ -791,6 +792,7 @@ export default function MasterTimeline({ entries, loading, onNavigate, onFetchLi
             onNavigate(targetFile, targetColumn, value);
           }}
           onFetchLinkedRows={onFetchLinkedRows}
+          accountDirectory={accountDirectory}
           isBookmarked={isBookmarked(selectedEntry)}
           onToggleBookmark={() => onToggleBookmark(selectedEntry)}
         />

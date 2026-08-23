@@ -14,8 +14,8 @@
 
 mod shellbag;
 
-use std::collections::BTreeMap;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
@@ -235,6 +235,17 @@ fn table_names(conn: &Connection) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn checked_table_names(conn: &Connection) -> Result<Vec<String>, String> {
+    let mut stmt = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY rowid")
+        .map_err(|error| error.to_string())?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|error| error.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())
+}
+
 fn first_table(conn: &Connection) -> Option<String> {
     table_names(conn).into_iter().next()
 }
@@ -246,6 +257,135 @@ fn table_columns(conn: &Connection, table: &str) -> Vec<String> {
                 .map(|m| m.filter_map(|x| x.ok()).collect())
         })
         .unwrap_or_default()
+}
+
+// --- account identity directory ------------------------------------------
+
+/// A compact, display-only SID directory read from the already parsed
+/// TargetInfo overview.  This is deliberately not a second parser: when a
+/// host has no SAM/ProfileList result (or a partial one), the caller simply
+/// keeps the original SID visible.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AccountDirectoryEntry {
+    sid: String,
+    account_name: String,
+    source_artifact: String,
+}
+
+fn is_exact_sid(value: &str) -> bool {
+    let value = value.trim();
+    let mut parts = value.split('-');
+    matches!(parts.next(), Some(prefix) if prefix.eq_ignore_ascii_case("s"))
+        && parts.clone().next().is_some()
+        && parts.all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+fn built_in_account_name(sid: &str) -> Option<&'static str> {
+    match sid.to_ascii_uppercase().as_str() {
+        "S-1-5-18" => Some("LocalSystem"),
+        "S-1-5-19" => Some("LocalService"),
+        "S-1-5-20" => Some("NetworkService"),
+        _ => None,
+    }
+}
+
+fn account_source_priority(source: &str) -> u8 {
+    match source.trim().to_ascii_lowercase().as_str() {
+        // SAM supplies the account name directly. Prefer it when both SAM and
+        // ProfileList describe the same SID.
+        "sam" => 2,
+        "profilelist" => 1,
+        _ => 0,
+    }
+}
+
+fn account_directory_from_rows(
+    rows: impl IntoIterator<Item = (String, String, String)>,
+) -> Vec<AccountDirectoryEntry> {
+    let mut selected: BTreeMap<String, (String, String, String, u8)> = BTreeMap::new();
+
+    for (sid, account_name, source_artifact) in rows {
+        let sid = sid.trim().to_string();
+        let account_name = account_name.trim().to_string();
+        if !is_exact_sid(&sid) || account_name.is_empty() || account_name.eq_ignore_ascii_case(&sid)
+        {
+            continue;
+        }
+        let key = sid.to_ascii_lowercase();
+        let priority = account_source_priority(&source_artifact);
+        let should_replace = selected
+            .get(&key)
+            .map(|(_, _, _, previous_priority)| priority > *previous_priority)
+            .unwrap_or(true);
+        if should_replace {
+            selected.insert(key, (sid, account_name, source_artifact, priority));
+        }
+    }
+
+    // The parsed account rows are authoritative. Well-known local service
+    // identities are only a safe fallback when the overview does not include
+    // them; never guess a domain/account RID.
+    for sid in ["S-1-5-18", "S-1-5-19", "S-1-5-20"] {
+        selected.entry(sid.to_ascii_lowercase()).or_insert_with(|| {
+            (
+                sid.to_string(),
+                built_in_account_name(sid).unwrap_or_default().to_string(),
+                "WellKnown".to_string(),
+                0,
+            )
+        });
+    }
+
+    selected
+        .into_values()
+        .map(
+            |(sid, account_name, source_artifact, _)| AccountDirectoryEntry {
+                sid,
+                account_name,
+                source_artifact,
+            },
+        )
+        .collect()
+}
+
+#[tauri::command]
+fn account_directory(host_dir: String) -> Result<Vec<AccountDirectoryEntry>, String> {
+    let path = Path::new(&host_dir)
+        .join("_OVERVIEW")
+        .join("TargetInfo.sqlite");
+    if !path.is_file() {
+        return Ok(Vec::new());
+    }
+    let conn = open_ro(&path.to_string_lossy())?;
+    let tables = checked_table_names(&conn)?;
+    let Some(table) = tables.into_iter().find(|table| table == "TargetInfo") else {
+        return Ok(Vec::new());
+    };
+    let columns = table_columns(&conn, &table);
+    if !["category", "name", "username", "source_artifact"]
+        .iter()
+        .all(|required| columns.iter().any(|column| column == required))
+    {
+        return Ok(Vec::new());
+    }
+    let rows = query_rows(
+        &conn,
+        &format!(
+            "SELECT name, username, source_artifact FROM {} WHERE category = ?1",
+            q(&table)
+        ),
+        &[&"Account"],
+    )?;
+    Ok(account_directory_from_rows(rows.into_iter().map(|row| {
+        let get = |key: &str| {
+            row.get(key)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        };
+        (get("name"), get("username"), get("source_artifact"))
+    })))
 }
 
 const EMPTY_SQLITE_MAX_BYTES: u64 = 100;
@@ -299,21 +439,27 @@ fn create_host(case_id: String, name: String, target_dir: String) -> Result<Host
     Ok(gui_host(&case_id, &h, &cd))
 }
 
+#[tauri::command]
+fn rename_host(case_id: String, host_id: String, name: String) -> Result<Host, String> {
+    if !valid_id(&case_id) || !valid_id(&host_id) {
+        return Err("invalid case or host identifier".into());
+    }
+    let cd = cases_dir();
+    let host = case_store::rename_host(&case_id, &host_id, &name, &cd)
+        .map_err(|error| error.to_string())?;
+    Ok(gui_host(&case_id, &host, &cd))
+}
+
 fn valid_id(id: &str) -> bool {
     !id.is_empty() && id != "." && id != ".." && !id.contains(['/', '\\']) && !id.contains("..")
 }
 
 #[tauri::command]
 fn delete_case(case_id: String) -> bool {
-    if !valid_id(&case_id) {
-        return false;
-    }
-    let target = cases_dir().join(&case_id);
-    if target.exists() {
-        std::fs::remove_dir_all(&target).is_ok()
-    } else {
-        false
-    }
+    // CASE_* folders no longer exist. Refuse this legacy broad-delete command
+    // rather than risking removal of the direct host-store root.
+    let _ = case_id;
+    false
 }
 
 #[tauri::command]
@@ -321,7 +467,7 @@ fn delete_host(case_id: String, host_id: String) -> bool {
     if !valid_id(&case_id) || !valid_id(&host_id) {
         return false;
     }
-    let case_dir = cases_dir().join(&case_id);
+    let case_dir = case_store::case_dir(&cases_dir(), &case_id);
     delete_host_dir_and_bookmarks(&case_dir, &host_id)
 }
 
@@ -331,8 +477,8 @@ fn delete_host_dir_and_bookmarks(case_dir: &Path, host_id: &str) -> bool {
         return false;
     }
 
-    // Bookmarks are stored once per case while their source rows live under a
-    // host directory. Delete only the annotations tied to the removed host
+    // Bookmarks are stored once at the direct host-store root while their source
+    // rows live under a host directory. Delete only annotations tied to the removed host
     // after its output directory has been removed. `hostName` is deliberately
     // not used: several registered hosts can share a display name.
     let bookmarks = match read_bookmarks_path(&case_dir) {
@@ -369,12 +515,24 @@ fn list_artifacts() -> Vec<String> {
 struct RunHostOptions {
     case_id: String,
     host_id: String,
+    /// The renderer creates one immutable id before queueing a run. It is
+    /// deliberately restricted to the same path-safe alphabet as case/host
+    /// ids because it is also the name of the persistent run log.
+    #[serde(default)]
+    run_id: Option<String>,
     #[serde(default)]
     only: Option<Vec<String>>,
 }
 
 #[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
 struct PipelineLogEntry {
+    run_id: String,
+    host_id: String,
+    /// queued | running | complete | partial | error | cancelled. Regular stream
+    /// output is emitted with `running`, allowing every renderer to keep
+    /// independent per-run state rather than guessing from message order.
+    status: String,
     line: String,
     stream: String,
 }
@@ -382,12 +540,195 @@ struct PipelineLogEntry {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PipelineResult {
+    run_id: String,
+    host_id: String,
+    status: String,
     exit_code: Option<i32>,
 }
 
-/// Tracks the running parse child so cancel can kill it outright.
+/// Tracks the running parse child and its immutable host-side log so GUI
+/// supervision can record forced termination even after the child is gone.
+struct RunningPipeline {
+    child: std::process::Child,
+    log_path: PathBuf,
+}
+
+const MAX_HOST_PIPELINES: usize = 2;
+
+/// A bounded, keyed child supervisor. A run reserves a slot before spawning
+/// so concurrent commands can never exceed `MAX_HOST_PIPELINES`; cancellation
+/// can target an already-running child or a run that is still waiting.
 #[derive(Default)]
-struct PipelineState(std::sync::Mutex<Option<std::process::Child>>);
+struct PipelineScheduler {
+    running: HashMap<String, RunningPipeline>,
+    reserving: HashSet<String>,
+    queued: HashSet<String>,
+    cancelled: HashSet<String>,
+    host_ids: HashMap<String, String>,
+    case_ids: HashMap<String, String>,
+}
+
+#[derive(Default)]
+struct PipelineState(std::sync::Mutex<PipelineScheduler>);
+
+fn reserve_pipeline_slot(scheduler: &mut PipelineScheduler, run_id: &str, host_id: &str) -> bool {
+    if scheduler.running.len() + scheduler.reserving.len() >= MAX_HOST_PIPELINES {
+        return false;
+    }
+    // A host directory is the publish/report/status unit. Two children for the
+    // same host would race over its staging parent and latest parse report even
+    // though their run ids differ, so only distinct hosts may occupy slots.
+    let same_host_is_active = scheduler
+        .running
+        .keys()
+        .chain(scheduler.reserving.iter())
+        .any(|other_run_id| {
+            other_run_id != run_id
+                && scheduler
+                    .host_ids
+                    .get(other_run_id)
+                    .is_some_and(|other_host_id| other_host_id == host_id)
+        });
+    if same_host_is_active {
+        return false;
+    }
+    scheduler.queued.remove(run_id);
+    scheduler.reserving.insert(run_id.to_string());
+    true
+}
+
+fn append_supervisor_log(log_path: &Path, event: &str) {
+    pipeline::append_parse_log_event(log_path, &format!("[SUPERVISOR] {}", event));
+}
+
+fn record_child_exit(log_path: &Path, exit_code: Option<i32>) {
+    if exit_code == Some(0) {
+        return;
+    }
+    let outcome = exit_code
+        .map(|code| code.to_string())
+        .unwrap_or_else(|| "signal".to_string());
+    append_supervisor_log(
+        log_path,
+        &format!("child_exit status=nonzero exit_code={outcome}"),
+    );
+}
+
+/// The parser intentionally exits nonzero for a partial run so automation
+/// cannot mistake a source failure for success.  The durable report carries
+/// the finer terminal state; read only that tiny manifest here rather than
+/// inferring meaning from the child exit code.
+fn terminal_pipeline_status(host_dir: &Path, exit_code: Option<i32>) -> &'static str {
+    if exit_code == Some(0) {
+        return "complete";
+    }
+    let is_partial = std::fs::read_to_string(host_dir.join("parse_report.json"))
+        .ok()
+        .and_then(|payload| serde_json::from_str::<serde_json::Value>(&payload).ok())
+        .and_then(|report| {
+            report
+                .get("status")
+                .and_then(|status| status.as_str())
+                .map(str::to_owned)
+        })
+        .is_some_and(|status| status == "partial");
+    if is_partial {
+        "partial"
+    } else {
+        "error"
+    }
+}
+
+fn record_forced_gui_cancel(log_path: &Path, killed: bool) {
+    append_supervisor_log(
+        log_path,
+        if killed {
+            "termination status=forced reason=gui_cancel"
+        } else {
+            "termination status=unknown reason=gui_cancel_kill_failed"
+        },
+    );
+}
+
+fn emit_pipeline_event(
+    app: &AppHandle,
+    run_id: &str,
+    host_id: &str,
+    status: &str,
+    stream: &str,
+    line: impl Into<String>,
+) {
+    let _ = app.emit(
+        "pipeline-log",
+        PipelineLogEntry {
+            run_id: run_id.to_string(),
+            host_id: host_id.to_string(),
+            status: status.to_string(),
+            line: line.into(),
+            stream: stream.to_string(),
+        },
+    );
+}
+
+fn pipeline_result(
+    run_id: &str,
+    host_id: &str,
+    status: &str,
+    exit_code: Option<i32>,
+) -> PipelineResult {
+    PipelineResult {
+        run_id: run_id.to_string(),
+        host_id: host_id.to_string(),
+        status: status.to_string(),
+        exit_code,
+    }
+}
+
+/// GUI cancellation kills the worker deliberately, so the worker cannot write
+/// its own final manifest. Persist an explicit terminal record in the parent
+/// instead of leaving a prior successful report/status visible after reload.
+fn write_cancelled_terminal_state(case_id: &str, host_id: &str, run_id: &str) {
+    write_cancelled_terminal_state_at(&cases_dir(), case_id, host_id, run_id);
+}
+
+fn write_cancelled_terminal_state_at(cases: &Path, case_id: &str, host_id: &str, run_id: &str) {
+    if !valid_id(case_id) || !valid_id(host_id) || !valid_id(run_id) {
+        return;
+    }
+    let host_dir = case_store::host_dir(cases, case_id, host_id);
+    let run_at = case_store::now();
+    let report = serde_json::json!({
+        "runId": run_id,
+        "runAt": run_at,
+        "status": "cancelled",
+        "durationMs": 0,
+        "published": false,
+        "artifacts": [],
+        "overview": [],
+    });
+    let payload = match serde_json::to_vec_pretty(&report) {
+        Ok(payload) => payload,
+        Err(_) => return,
+    };
+    let run_manifest = pipeline::parse_run_log_path(&host_dir, run_id).with_extension("json");
+    if let Some(parent) = run_manifest.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(run_manifest, &payload);
+    let temporary = host_dir.join("parse_report.json.cancelled-staging");
+    if std::fs::write(&temporary, payload).is_ok() {
+        let _ = std::fs::rename(temporary, host_dir.join("parse_report.json"));
+    }
+    let _ = case_store::update_host_status(
+        case_id,
+        host_id,
+        cases,
+        &run_at,
+        "cancelled",
+        Vec::new(),
+        None,
+    );
+}
 
 #[tauri::command]
 async fn run_host(
@@ -398,17 +739,83 @@ async fn run_host(
     if !valid_id(&options.case_id) || !valid_id(&options.host_id) {
         return Err("invalid case or host identifier".into());
     }
-    {
-        let g = state.0.lock().unwrap();
-        if g.is_some() {
-            return Ok(PipelineResult {
-                exit_code: Some(-1),
-            });
-        } // already running
-    }
+    // A direct host path must exist before the scheduler records a run/log
+    // location. This also upgrades legacy CASE_* folders for CLI-style calls
+    // that start a parse without first opening the host list.
     let cd = cases_dir();
-    std::fs::create_dir_all(&cd).ok();
+    case_store::ensure_direct_host_store(&cd).map_err(|error| error.to_string())?;
+    let run_id = options.run_id.unwrap_or_else(pipeline::new_parse_run_id);
+    if !valid_id(&run_id) {
+        return Err("invalid pipeline run identifier".into());
+    }
+    {
+        let mut scheduler = state
+            .0
+            .lock()
+            .map_err(|_| "pipeline scheduler unavailable")?;
+        if scheduler.running.contains_key(&run_id)
+            || scheduler.reserving.contains(&run_id)
+            || scheduler.queued.contains(&run_id)
+        {
+            return Err("duplicate pipeline run identifier".into());
+        }
+        scheduler.queued.insert(run_id.clone());
+        scheduler
+            .host_ids
+            .insert(run_id.clone(), options.host_id.clone());
+        scheduler
+            .case_ids
+            .insert(run_id.clone(), options.case_id.clone());
+    }
+    emit_pipeline_event(
+        &app,
+        &run_id,
+        &options.host_id,
+        "queued",
+        "lifecycle",
+        "[LIFECYCLE] queued",
+    );
 
+    // Do not reject additional hosts. They wait for a bounded slot, while a
+    // cancellation can still remove them before any parser process is born.
+    loop {
+        let (cancelled, slot_acquired) = {
+            let mut scheduler = state
+                .0
+                .lock()
+                .map_err(|_| "pipeline scheduler unavailable")?;
+            if scheduler.cancelled.remove(&run_id) {
+                scheduler.queued.remove(&run_id);
+                scheduler.host_ids.remove(&run_id);
+                scheduler.case_ids.remove(&run_id);
+                (true, false)
+            } else if reserve_pipeline_slot(&mut scheduler, &run_id, &options.host_id) {
+                (false, true)
+            } else {
+                (false, false)
+            }
+        };
+        if cancelled {
+            emit_pipeline_event(
+                &app,
+                &run_id,
+                &options.host_id,
+                "cancelled",
+                "lifecycle",
+                "[LIFECYCLE] cancelled before start",
+            );
+            return Ok(pipeline_result(
+                &run_id,
+                &options.host_id,
+                "cancelled",
+                None,
+            ));
+        }
+        if slot_acquired {
+            break;
+        }
+        tokio_sleep(120).await;
+    }
     // Parsing runs in a CHILD PROCESS (this same executable, re-invoked with the
     // hidden --__parse flag) rather than a thread. A thread can't be killed in
     // Rust, so a cancel could only take effect at the pipeline's next poll —
@@ -419,39 +826,58 @@ async fn run_host(
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let mut args: Vec<String> = vec![
         PARSE_FLAG.to_string(),
-        options.case_id,
-        options.host_id,
+        options.case_id.clone(),
+        options.host_id.clone(),
         cd.to_string_lossy().to_string(),
     ];
     if let Some(only) = options.only.filter(|v| !v.is_empty()) {
         args.push(only.join(","));
     }
+    let host_dir = case_store::host_dir(&cd, &options.case_id, &options.host_id);
+    let log_path = pipeline::parse_run_log_path(&host_dir, &run_id);
+    args.push(format!("--run-log-id={run_id}"));
 
-    let mut child = Command::new(exe)
+    let mut child = match Command::new(exe)
         .args(&args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("failed to start parser process: {}", e))?;
+    {
+        Ok(child) => child,
+        Err(error) => {
+            if let Ok(mut scheduler) = state.0.lock() {
+                scheduler.reserving.remove(&run_id);
+                scheduler.host_ids.remove(&run_id);
+                scheduler.case_ids.remove(&run_id);
+            }
+            emit_pipeline_event(
+                &app,
+                &run_id,
+                &options.host_id,
+                "error",
+                "lifecycle",
+                format!("[LIFECYCLE] failed to start: {error}"),
+            );
+            return Err(format!("failed to start parser process: {error}"));
+        }
+    };
 
     // Stream the child's stdout/stderr as `pipeline-log` events.
+    let event_run_id = run_id.clone();
+    let event_host_id = options.host_id.clone();
     let pump =
         |app: &AppHandle, reader: Option<Box<dyn std::io::Read + Send>>, stream: &'static str| {
             if let Some(r) = reader {
                 let app = app.clone();
+                let run_id = event_run_id.clone();
+                let host_id = event_host_id.clone();
                 std::thread::spawn(move || {
                     use std::io::BufRead;
                     for line in std::io::BufReader::new(r).lines().map_while(Result::ok) {
                         if line.is_empty() {
                             continue;
                         }
-                        let _ = app.emit(
-                            "pipeline-log",
-                            PipelineLogEntry {
-                                line,
-                                stream: stream.to_string(),
-                            },
-                        );
+                        emit_pipeline_event(&app, &run_id, &host_id, "running", stream, line);
                     }
                 });
             }
@@ -473,27 +899,104 @@ async fn run_host(
         "stderr",
     );
 
-    *state.0.lock().unwrap() = Some(child);
+    // A targeted cancel can race process creation. If it did, terminate the
+    // newly-created child before publishing it as a running task.
+    let cancelled_before_start = {
+        let mut scheduler = state
+            .0
+            .lock()
+            .map_err(|_| "pipeline scheduler unavailable")?;
+        scheduler.reserving.remove(&run_id);
+        let cancelled = scheduler.cancelled.remove(&run_id);
+        if cancelled {
+            scheduler.host_ids.remove(&run_id);
+            scheduler.case_ids.remove(&run_id);
+        }
+        cancelled
+    };
+    if cancelled_before_start {
+        let killed = child.kill().is_ok();
+        let _ = child.wait();
+        record_forced_gui_cancel(&log_path, killed);
+        emit_pipeline_event(
+            &app,
+            &run_id,
+            &options.host_id,
+            "cancelled",
+            "lifecycle",
+            "[LIFECYCLE] cancelled before parser start",
+        );
+        return Ok(pipeline_result(
+            &run_id,
+            &options.host_id,
+            "cancelled",
+            None,
+        ));
+    }
+    {
+        let mut scheduler = state
+            .0
+            .lock()
+            .map_err(|_| "pipeline scheduler unavailable")?;
+        scheduler
+            .running
+            .insert(run_id.clone(), RunningPipeline { child, log_path });
+    }
+    emit_pipeline_event(
+        &app,
+        &run_id,
+        &options.host_id,
+        "running",
+        "lifecycle",
+        "[LIFECYCLE] running",
+    );
 
     // Poll for exit so cancel_pipeline can still reach the child while it runs.
     loop {
-        {
-            let mut g = state.0.lock().unwrap();
-            match g.as_mut() {
+        let exit = {
+            let mut scheduler = state
+                .0
+                .lock()
+                .map_err(|_| "pipeline scheduler unavailable")?;
+            match scheduler.running.get_mut(&run_id) {
+                Some(running) => running.child.try_wait().ok().flatten().map(|status| {
+                    let exit_code = status.code();
+                    let log_path = running.log_path.clone();
+                    (exit_code, log_path)
+                }),
+                // A cancel takes the entry out of the map after killing it.
                 None => {
-                    return Ok(PipelineResult {
-                        exit_code: Some(-1),
-                    })
-                } // cancelled
-                Some(ch) => {
-                    if let Ok(Some(status)) = ch.try_wait() {
-                        *g = None;
-                        return Ok(PipelineResult {
-                            exit_code: status.code(),
-                        });
-                    }
+                    return Ok(pipeline_result(
+                        &run_id,
+                        &options.host_id,
+                        "cancelled",
+                        None,
+                    ))
                 }
             }
+        };
+        if let Some((exit_code, log_path)) = exit {
+            if let Ok(mut scheduler) = state.0.lock() {
+                scheduler.running.remove(&run_id);
+                scheduler.host_ids.remove(&run_id);
+                scheduler.case_ids.remove(&run_id);
+            }
+            record_child_exit(&log_path, exit_code);
+            let terminal = terminal_pipeline_status(&host_dir, exit_code);
+            emit_pipeline_event(
+                &app,
+                &run_id,
+                &options.host_id,
+                terminal,
+                "lifecycle",
+                format!("[LIFECYCLE] {terminal}"),
+            );
+            return Ok(pipeline_result(
+                &run_id,
+                &options.host_id,
+                terminal,
+                exit_code,
+            ));
         }
         tokio_sleep(120).await;
     }
@@ -509,15 +1012,73 @@ async fn tokio_sleep(ms: u64) {
 }
 
 #[tauri::command]
-fn cancel_pipeline(state: tauri::State<'_, PipelineState>) -> bool {
-    let mut g = state.0.lock().unwrap();
-    if let Some(mut child) = g.take() {
-        let _ = child.kill();
-        let _ = child.wait();
-        true
+fn cancel_pipeline(
+    app: AppHandle,
+    state: tauri::State<'_, PipelineState>,
+    run_id: Option<String>,
+    #[allow(non_snake_case)] cancel_all: Option<bool>,
+) -> bool {
+    let mut scheduler = match state.0.lock() {
+        Ok(scheduler) => scheduler,
+        Err(_) => return false,
+    };
+    let target_all = cancel_all.unwrap_or(false) || run_id.is_none();
+    let target_ids: Vec<String> = if target_all {
+        scheduler
+            .queued
+            .iter()
+            .chain(scheduler.reserving.iter())
+            .chain(scheduler.running.keys())
+            .cloned()
+            .collect()
     } else {
-        false
+        run_id.into_iter().collect()
+    };
+    let mut changed = false;
+    let mut cancelled_contexts = Vec::<(String, String, String)>::new();
+    for id in target_ids.into_iter().collect::<HashSet<_>>() {
+        if scheduler.queued.remove(&id) || scheduler.reserving.remove(&id) {
+            scheduler.cancelled.insert(id.clone());
+            let host_id = scheduler.host_ids.get(&id).cloned().unwrap_or_default();
+            let case_id = scheduler.case_ids.get(&id).cloned().unwrap_or_default();
+            emit_pipeline_event(
+                &app,
+                &id,
+                &host_id,
+                "cancelled",
+                "lifecycle",
+                "[LIFECYCLE] cancelled while queued",
+            );
+            if !case_id.is_empty() && !host_id.is_empty() {
+                cancelled_contexts.push((id.clone(), case_id, host_id));
+            }
+            changed = true;
+        }
+        if let Some(mut running) = scheduler.running.remove(&id) {
+            let killed = running.child.kill().is_ok();
+            let _ = running.child.wait();
+            record_forced_gui_cancel(&running.log_path, killed);
+            let host_id = scheduler.host_ids.remove(&id).unwrap_or_default();
+            let case_id = scheduler.case_ids.remove(&id).unwrap_or_default();
+            emit_pipeline_event(
+                &app,
+                &id,
+                &host_id,
+                "cancelled",
+                "lifecycle",
+                "[LIFECYCLE] cancellation requested",
+            );
+            if !case_id.is_empty() && !host_id.is_empty() {
+                cancelled_contexts.push((id.clone(), case_id, host_id));
+            }
+            changed = true;
+        }
     }
+    drop(scheduler);
+    for (id, case_id, host_id) in cancelled_contexts {
+        write_cancelled_terminal_state(&case_id, &host_id, &id);
+    }
+    changed
 }
 
 // --- commands: result browsing (in-process sqlite) -------------------------
@@ -529,6 +1090,19 @@ struct CategoryEntry {
     full_path: String,
 }
 
+fn is_internal_pipeline_directory(name: &str) -> bool {
+    matches!(name, ".parse-staging" | "parse_logs")
+}
+
+fn has_internal_pipeline_path_component(path: &Path) -> bool {
+    path.components().any(|component| match component {
+        std::path::Component::Normal(name) => {
+            name.to_str().is_some_and(is_internal_pipeline_directory)
+        }
+        _ => false,
+    })
+}
+
 #[tauri::command]
 fn list_categories(host_dir: String) -> Vec<CategoryEntry> {
     let mut out = Vec::new();
@@ -536,6 +1110,9 @@ fn list_categories(host_dir: String) -> Vec<CategoryEntry> {
         for e in rd.flatten() {
             if e.path().is_dir() {
                 let name = e.file_name().to_string_lossy().to_string();
+                if is_internal_pipeline_directory(&name) {
+                    continue;
+                }
                 out.push(CategoryEntry {
                     full_path: e.path().to_string_lossy().to_string(),
                     name,
@@ -566,6 +1143,12 @@ fn find_result_files(dir: &Path, base: &Path, out: &mut Vec<ResultFileEntry>) {
     for e in rd.flatten() {
         let p = e.path();
         if p.is_dir() {
+            if e.file_name()
+                .to_str()
+                .is_some_and(is_internal_pipeline_directory)
+            {
+                continue;
+            }
             find_result_files(&p, base, out);
             continue;
         }
@@ -610,6 +1193,12 @@ fn find_result_files(dir: &Path, base: &Path, out: &mut Vec<ResultFileEntry>) {
 #[tauri::command]
 fn list_result_files(category_dir: String) -> Vec<ResultFileEntry> {
     let base = PathBuf::from(&category_dir);
+    // This command is also callable directly. Do not rely on the category
+    // list UI to hide staging/log directories: a supplied nested path must
+    // never expose work-in-progress SQLite files.
+    if has_internal_pipeline_path_component(&base) {
+        return Vec::new();
+    }
     let mut out = Vec::new();
     find_result_files(&base, &base, &mut out);
     out.sort_by(|a, b| {
@@ -754,6 +1343,36 @@ fn parse_report(host_dir: String) -> Option<Value> {
     std::fs::read_to_string(PathBuf::from(host_dir).join("parse_report.json"))
         .ok()
         .and_then(|raw| serde_json::from_str(&raw).ok())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ParseLogPreview {
+    text: String,
+    truncated: bool,
+}
+
+/// Return a bounded immutable parser-run log for the row-level diagnostic UI.
+/// The run id is strict so callers cannot turn this into a generic file read.
+#[tauri::command]
+fn parse_run_log(host_dir: String, run_id: String) -> Result<ParseLogPreview, String> {
+    if !valid_id(&run_id) {
+        return Err("invalid parser run identifier".to_string());
+    }
+    const MAX_BYTES: usize = 24 * 1024;
+    let path = pipeline::parse_run_log_path(Path::new(&host_dir), &run_id);
+    let file = std::fs::File::open(&path)
+        .map_err(|error| format!("실행 로그를 읽지 못했습니다: {error}"))?;
+    // Do not materialise an unbounded parser log in the GUI process. The one
+    // extra byte distinguishes an exact 24KiB log from a truncated preview.
+    let mut bytes = Vec::with_capacity(MAX_BYTES + 1);
+    file.take((MAX_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("실행 로그를 읽지 못했습니다: {error}"))?;
+    let truncated = bytes.len() > MAX_BYTES;
+    bytes.truncate(MAX_BYTES);
+    let text = String::from_utf8_lossy(&bytes).to_string();
+    Ok(ParseLogPreview { text, truncated })
 }
 
 #[derive(Serialize)]
@@ -1493,6 +2112,18 @@ fn account_event_page_blocking(
         let source = &sources[hit.source_index];
         if let Ok(mut row) = event_row_by_rowid(source, hit.rowid) {
             row.insert("_log".to_string(), Value::String(source.log_name.clone()));
+            // Account-detail rows are fetched from multiple raw EventLog
+            // SQLite files. Carry the exact source identity so RowDetailPanel
+            // bookmarking never writes an annotation against TargetInfo or an
+            // arbitrary same-rowid EventLog file.
+            row.insert(
+                "_source_full_path".to_string(),
+                Value::String(source.full_path.clone()),
+            );
+            row.insert(
+                "_source_table_name".to_string(),
+                Value::String(source.table_name.clone()),
+            );
             row.insert(
                 "_account_match".to_string(),
                 Value::String(hit.evidence.clone()),
@@ -2295,6 +2926,63 @@ fn mft_search(full_path: String, query: String, limit: i64) -> Vec<Map<String, V
     query_rows(&conn, &sql, &[&like, &limit]).unwrap_or_default()
 }
 
+/// A bounded, recursive MFT record page for the file-system ledger. Unlike
+/// the explorer's child lookup, this does not require expanding each folder;
+/// it still keeps the large MFT table in SQLite rather than materialising it
+/// in the webview.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MftRecordsPage {
+    rows: Vec<Map<String, Value>>,
+    total: i64,
+}
+
+#[tauri::command]
+fn mft_records_page(
+    full_path: String,
+    query: String,
+    offset: i64,
+    limit: i64,
+) -> Result<MftRecordsPage, String> {
+    let conn = open_ro(&full_path)?;
+    if !table_names(&conn).iter().any(|name| name == MFT_TABLE) {
+        return Err("MFT 레코드 테이블을 찾을 수 없습니다".to_string());
+    }
+    let limit = limit.clamp(1, 500);
+    let offset = offset.max(0);
+    let query = query.trim();
+    let (where_clause, search_value) = if query.is_empty() {
+        (String::new(), None)
+    } else {
+        (
+            " WHERE file_name LIKE ?1 OR path LIKE ?1".to_string(),
+            Some(format!("%{query}%")),
+        )
+    };
+    let count_sql = format!("SELECT COUNT(*) FROM {}{}", q(MFT_TABLE), where_clause);
+    let total = match search_value.as_ref() {
+        Some(value) => conn.query_row(&count_sql, [value], |row| row.get(0)),
+        None => conn.query_row(&count_sql, [], |row| row.get(0)),
+    }
+    .map_err(|error| format!("MFT 레코드 수를 읽지 못했습니다: {error}"))?;
+
+    let page_sql = format!(
+        "SELECT rowid AS __rowid, * FROM {}{} ORDER BY path COLLATE NOCASE, rowid LIMIT ?{} OFFSET ?{}",
+        q(MFT_TABLE),
+        where_clause,
+        if search_value.is_some() { 2 } else { 1 },
+        if search_value.is_some() { 3 } else { 2 },
+    );
+    let limit_text = limit.to_string();
+    let offset_text = offset.to_string();
+    let rows = match search_value.as_ref() {
+        Some(value) => query_rows(&conn, &page_sql, &[value, &limit_text, &offset_text]),
+        None => query_rows(&conn, &page_sql, &[&limit_text, &offset_text]),
+    }
+    .map_err(|error| format!("MFT 레코드 페이지를 읽지 못했습니다: {error}"))?;
+    Ok(MftRecordsPage { rows, total })
+}
+
 #[tauri::command]
 fn mft_row(full_path: String, rowid: i64) -> Option<Map<String, Value>> {
     let conn = open_ro(&full_path).ok()?;
@@ -2307,7 +2995,7 @@ fn mft_row(full_path: String, rowid: i64) -> Option<Map<String, Value>> {
         .and_then(|mut v| v.drain(..).next())
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct SearchHost {
     id: String,
     name: String,
@@ -2324,16 +3012,45 @@ struct SearchHit {
     full_path: String,
     rowid: i64,
     match_column: String,
-    columns: Vec<String>,
-    row: Map<String, Value>,
+    match_value: String,
+    timestamp: String,
+    record_key: String,
 }
 
-#[tauri::command]
-fn search_case(query: String, hosts: Vec<SearchHost>) -> Vec<SearchHit> {
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SearchCasePage {
+    hits: Vec<SearchHit>,
+    /// Offset cursor for the next page.  `None` means the scan was exhausted.
+    next_offset: Option<usize>,
+    /// A partial search remains useful, but the UI must not present it as a
+    /// complete empty result when a host SQLite source could not be read.
+    source_failures: Vec<String>,
+}
+
+fn search_case_blocking(
+    query: String,
+    hosts: Vec<SearchHost>,
+    offset: usize,
+    limit: usize,
+    start: Option<String>,
+    end: Option<String>,
+) -> SearchCasePage {
+    const MAX_PAGE_SIZE: usize = 100;
+    const MATCH_PREVIEW_CHARS: usize = 512;
     let query = query.trim().to_string();
     if query.len() < 2 {
-        return vec![];
+        return SearchCasePage {
+            hits: vec![],
+            next_offset: None,
+            source_failures: vec![],
+        };
     }
+    let page_size = limit.clamp(1, MAX_PAGE_SIZE);
+    let start = start.filter(|value| !value.trim().is_empty());
+    let end = end.filter(|value| !value.trim().is_empty());
+    let range_active = start.is_some() || end.is_some();
+    let scan_target = offset.saturating_add(page_size).saturating_add(1);
     let like = format!(
         "%{}%",
         query
@@ -2341,54 +3058,184 @@ fn search_case(query: String, hosts: Vec<SearchHost>) -> Vec<SearchHit> {
             .replace('%', "\\%")
             .replace('_', "\\_")
     );
-    let ql = query.to_lowercase();
-    const PER_TABLE: usize = 50;
-    const TOTAL: usize = 600;
-    let mut hits = Vec::new();
+    let mut hits = Vec::with_capacity(page_size);
+    let mut source_failures = Vec::new();
+    let mut skipped = 0usize;
+    let mut has_next = false;
+
     for host in &hosts {
         let mut files = Vec::new();
         collect_sqlite(Path::new(&host.dir), &mut files);
+        files.sort();
         for fp in files {
             let conn = match open_ro(&fp.to_string_lossy()) {
                 Ok(c) => c,
-                Err(_) => continue,
+                Err(_) => {
+                    source_failures.push(format!("{}: SQLite 파일", host.name));
+                    continue;
+                }
             };
             let file_name = fp
                 .file_stem()
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_default();
-            for table in table_names(&conn) {
+            let mut tables = match checked_table_names(&conn) {
+                Ok(tables) => tables,
+                Err(_) => {
+                    source_failures.push(format!("{}: {}", host.name, file_name));
+                    continue;
+                }
+            };
+            tables.sort();
+            for table in tables {
+                if has_next {
+                    // Once the requested page is complete, do not continue
+                    // evaluating a multi-column LIKE query just to discover
+                    // failures. A bounded availability probe still reports
+                    // inaccessible/invalid tables without scanning content.
+                    let health_sql = format!("SELECT 1 FROM {} LIMIT 1", q(&table));
+                    match conn.query_row(&health_sql, [], |_row| Ok(())) {
+                        // An empty table is still a healthy, searchable
+                        // source. `query_row` reports it as this sentinel.
+                        Ok(()) | Err(rusqlite::Error::QueryReturnedNoRows) => {}
+                        Err(_) => source_failures.push(format!("{}: {}", host.name, file_name)),
+                    }
+                    continue;
+                }
                 let cols = table_columns(&conn, &table);
                 if cols.is_empty() {
                     continue;
                 }
+                // Query only the stable rowid, the first matched field/value,
+                // and one candidate evidence time.  The full source row is
+                // fetched on an analyst's explicit detail action.
                 let where_ = cols
                     .iter()
                     .map(|c| format!("{} LIKE ?1 ESCAPE '\\'", q(c)))
                     .collect::<Vec<_>>()
                     .join(" OR ");
+                let match_column = cols
+                    .iter()
+                    .map(|c| {
+                        format!(
+                            "WHEN {} LIKE ?1 ESCAPE '\\' THEN '{}'",
+                            q(c),
+                            c.replace('\'', "''")
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let match_value = cols
+                    .iter()
+                    .map(|c| {
+                        format!(
+                            "WHEN {} LIKE ?1 ESCAPE '\\' THEN SUBSTR(CAST({} AS TEXT), 1, {})",
+                            q(c),
+                            q(c),
+                            MATCH_PREVIEW_CHARS,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let timestamp_column = [
+                    "timestamp",
+                    "time_created",
+                    "event_time",
+                    "last_write",
+                    "created_at",
+                    "modified_time",
+                ]
+                .iter()
+                .find(|candidate| {
+                    cols.iter()
+                        .any(|column| column.eq_ignore_ascii_case(candidate))
+                })
+                .and_then(|candidate| {
+                    cols.iter()
+                        .find(|column| column.eq_ignore_ascii_case(candidate))
+                });
+                let timestamp_expr = timestamp_column
+                    .map(|column| format!("CAST({} AS TEXT)", q(column)))
+                    .unwrap_or_else(|| "''".to_string());
+                // Overview tables retain a raw-evidence pointer. Carry only a
+                // bounded copy so the renderer can bookmark that exact source
+                // record without materialising the complete overview row.
+                let record_key_column = cols.iter().find(|column| {
+                    column.eq_ignore_ascii_case("record_key")
+                        || column.eq_ignore_ascii_case("_record_key")
+                });
+                let record_key_expr = record_key_column
+                    .map(|column| {
+                        format!(
+                            "SUBSTR(CAST({} AS TEXT), 1, {})",
+                            q(column),
+                            MATCH_PREVIEW_CHARS,
+                        )
+                    })
+                    .unwrap_or_else(|| "''".to_string());
+                if range_active && timestamp_column.is_none() {
+                    // A table without a usable evidence time cannot be placed
+                    // inside the incident window, so do not leak it into an
+                    // otherwise global time-filtered result page.
+                    continue;
+                }
+                let mut conditions = vec![format!("({})", where_)];
+                let mut params: Vec<&dyn rusqlite::ToSql> = vec![&like];
+                if let (Some(bound), Some(column)) = (start.as_ref(), timestamp_column) {
+                    conditions.push(format!(
+                        "CAST({} AS TEXT) >= ?{}",
+                        q(column),
+                        params.len() + 1
+                    ));
+                    params.push(bound);
+                }
+                if let (Some(bound), Some(column)) = (end.as_ref(), timestamp_column) {
+                    conditions.push(format!(
+                        "CAST({} AS TEXT) <= ?{}",
+                        q(column),
+                        params.len() + 1
+                    ));
+                    params.push(bound);
+                }
+                // Once this page has a continuation we still execute a tiny
+                // source-aware probe for every remaining table. That keeps
+                // unreadable/corrupt sources visible instead of hiding them
+                // behind an early pagination exit, without retaining their
+                // rows in memory.
+                let query_limit = if has_next { 1 } else { scan_target };
                 let sql = format!(
-                    "SELECT rowid AS __rowid, * FROM {} WHERE {} LIMIT {}",
+                    "SELECT rowid AS __rowid, CASE {} ELSE '' END AS __match_column, CASE {} ELSE '' END AS __match_value, {} AS __timestamp, {} AS __record_key FROM {} WHERE {} ORDER BY rowid LIMIT {}",
+                    match_column,
+                    match_value,
+                    timestamp_expr,
+                    record_key_expr,
                     q(&table),
-                    where_,
-                    PER_TABLE
+                    conditions.join(" AND "),
+                    query_limit,
                 );
-                let rows = match query_rows(&conn, &sql, &[&like]) {
-                    Ok(r) => r,
-                    Err(_) => continue,
+                let rows = match query_rows(&conn, &sql, &params) {
+                    Ok(rows) => rows,
+                    Err(_) => {
+                        source_failures.push(format!("{}: {}", host.name, file_name));
+                        continue;
+                    }
                 };
                 for row in rows {
-                    let match_column = cols
-                        .iter()
-                        .find(|c| {
-                            row.get(*c)
-                                .and_then(|v| v.as_str())
-                                .map(|s| s.to_lowercase().contains(&ql))
-                                .unwrap_or(false)
-                        })
-                        .cloned()
-                        .unwrap_or_default();
-                    let rowid = row.get("__rowid").and_then(|v| v.as_i64()).unwrap_or(0);
+                    if has_next {
+                        continue;
+                    }
+                    if skipped < offset {
+                        skipped += 1;
+                        continue;
+                    }
+                    if hits.len() >= page_size {
+                        has_next = true;
+                        break;
+                    }
+                    let rowid = row
+                        .get("__rowid")
+                        .and_then(|value| value.as_i64())
+                        .unwrap_or(0);
                     hits.push(SearchHit {
                         host_id: host.id.clone(),
                         host_name: host.name.clone(),
@@ -2396,18 +3243,55 @@ fn search_case(query: String, hosts: Vec<SearchHost>) -> Vec<SearchHit> {
                         table_name: table.clone(),
                         full_path: fp.to_string_lossy().to_string(),
                         rowid,
-                        match_column,
-                        columns: cols.clone(),
-                        row,
+                        match_column: row
+                            .get("__match_column")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        match_value: row
+                            .get("__match_value")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        timestamp: row
+                            .get("__timestamp")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        record_key: row
+                            .get("__record_key")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
                     });
-                    if hits.len() >= TOTAL {
-                        return hits;
-                    }
                 }
             }
         }
     }
-    hits
+    source_failures.sort();
+    source_failures.dedup();
+    let next_offset = has_next.then_some(offset.saturating_add(hits.len()));
+    SearchCasePage {
+        hits,
+        next_offset,
+        source_failures,
+    }
+}
+
+#[tauri::command]
+async fn search_case(
+    query: String,
+    hosts: Vec<SearchHost>,
+    offset: usize,
+    limit: usize,
+    start: Option<String>,
+    end: Option<String>,
+) -> Result<SearchCasePage, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        search_case_blocking(query, hosts, offset, limit, start, end)
+    })
+    .await
+    .map_err(|_| "케이스 검색 작업을 완료하지 못했습니다.".to_string())
 }
 
 // --- commands: browser cache bodies ----------------------------------------
@@ -2803,7 +3687,8 @@ fn ai_conversations_blocking(
             let (url, account, observation_time, body_b64) = match row {
                 Ok(row) => row,
                 Err(_) => {
-                    source_failures.push(format!("{source_name}: AI 대화 행 일부를 읽을 수 없습니다"));
+                    source_failures
+                        .push(format!("{source_name}: AI 대화 행 일부를 읽을 수 없습니다"));
                     // A malformed row is source-local. Preserve results from
                     // prior rows and other profiles, but do not silently skip
                     // the read error as if the cache had no conversation.
@@ -2899,7 +3784,10 @@ fn ai_conversations_blocking(
 /// but can still be CPU and disk intensive across several browser profiles,
 /// so it must never run on the command path that serves the interactive view.
 #[tauri::command]
-async fn ai_conversations(host_dir: String, query: AiConversationQuery) -> Result<AiConversationPage, String> {
+async fn ai_conversations(
+    host_dir: String,
+    query: AiConversationQuery,
+) -> Result<AiConversationPage, String> {
     tauri::async_runtime::spawn_blocking(move || ai_conversations_blocking(host_dir, query))
         .await
         .map_err(|error| format!("AI 대화 작업이 중단되었습니다: {error}"))?
@@ -3141,8 +4029,7 @@ fn normalize_bookmark_path(path: &Path) -> PathBuf {
 }
 
 fn bookmark_path_is_within(full_path: &str, directory: &Path) -> bool {
-    normalize_bookmark_path(Path::new(full_path))
-        .starts_with(normalize_bookmark_path(directory))
+    normalize_bookmark_path(Path::new(full_path)).starts_with(normalize_bookmark_path(directory))
 }
 
 fn bookmark_belongs_to_host(bookmark: &Value, host_id: &str, host_dir: &Path) -> bool {
@@ -3163,7 +4050,11 @@ fn bookmark_belongs_to_host(bookmark: &Value, host_id: &str, host_dir: &Path) ->
 }
 
 fn bookmark_targets_missing_host(bookmark: &Value, case_dir: &Path) -> bool {
-    if let Some(host_id) = bookmark.get("hostId").and_then(Value::as_str).filter(|id| !id.is_empty()) {
+    if let Some(host_id) = bookmark
+        .get("hostId")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+    {
         return !case_dir.join(host_id).join("host.json").is_file();
     }
 
@@ -3227,8 +4118,8 @@ fn write_bookmarks_path(case_dir: &Path, bookmarks: &[Value]) -> Result<(), Stri
             .unwrap_or_default()
             .as_nanos()
     ));
-    if let Err(error) = std::fs::write(&temporary, serialized)
-        .and_then(|()| std::fs::rename(&temporary, &target))
+    if let Err(error) =
+        std::fs::write(&temporary, serialized).and_then(|()| std::fs::rename(&temporary, &target))
     {
         let _ = std::fs::remove_file(temporary);
         return Err(format!("북마크 저장에 실패했습니다: {error}"));
@@ -3382,19 +4273,45 @@ fn run_as_parse_worker() -> Option<i32> {
         return None;
     }
     let (case_id, host_id, cases_dir) = (&args[2], &args[3], std::path::PathBuf::from(&args[4]));
-    let only = args.get(5).filter(|s| !s.is_empty()).map(|s| {
-        s.split(',')
-            .map(|x| x.to_string())
-            .collect::<std::collections::HashSet<String>>()
-    });
+    let (only, run_log_id) = parse_worker_options(&args[5..]);
     // Sink stays unset, so pipeline prints progress to stdout for the parent.
-    match pipeline::run_host(case_id, host_id, &cases_dir, only) {
+    match pipeline::run_host_with_log_id(case_id, host_id, &cases_dir, only, run_log_id.as_deref())
+    {
         Ok(()) => Some(0),
         Err(e) => {
+            if let Some(run_id) = run_log_id.as_deref() {
+                let host_dir = case_store::host_dir(&cases_dir, case_id, host_id);
+                pipeline::append_parse_log_event(
+                    &pipeline::parse_run_log_path(&host_dir, run_id),
+                    &format!("[WORKER] run_finished status=failed error={e}"),
+                );
+            }
             eprintln!("[!] {}", e);
             Some(1)
         }
     }
+}
+
+fn parse_worker_options(
+    arguments: &[String],
+) -> (Option<std::collections::HashSet<String>>, Option<String>) {
+    let mut only = None;
+    let mut run_log_id = None;
+    for argument in arguments {
+        if let Some(value) = argument.strip_prefix("--run-log-id=") {
+            if !value.is_empty() {
+                run_log_id = Some(value.to_string());
+            }
+        } else if !argument.is_empty() && only.is_none() {
+            only = Some(
+                argument
+                    .split(',')
+                    .map(|value| value.to_string())
+                    .collect::<std::collections::HashSet<String>>(),
+            );
+        }
+    }
+    (only, run_log_id)
 }
 
 #[cfg(test)]
@@ -3476,7 +4393,8 @@ mod bookmark_tests {
                 "note": "legacy note",
                 "taggedAt": "2026-01-01T00:00:00.000Z",
             })],
-        ).unwrap();
+        )
+        .unwrap();
 
         let first = toggle_bookmark(case_dir.clone(), entry("BrowserActivity")).unwrap();
         assert_eq!(first.len(), 2);
@@ -3523,7 +4441,8 @@ mod bookmark_tests {
             Some(""),
         );
 
-        let after_browser_toggle = toggle_bookmark(case_dir.clone(), entry("BrowserActivity")).unwrap();
+        let after_browser_toggle =
+            toggle_bookmark(case_dir.clone(), entry("BrowserActivity")).unwrap();
         assert_eq!(after_browser_toggle.len(), 2);
         assert_eq!(
             after_browser_toggle
@@ -3571,16 +4490,32 @@ mod bookmark_tests {
             &[
                 // Modern annotation: host identity is enough even when the
                 // source file itself has already gone away.
-                bookmark("removed-by-id", "/missing/source.sqlite", Some("removed-host")),
+                bookmark(
+                    "removed-by-id",
+                    "/missing/source.sqlite",
+                    Some("removed-host"),
+                ),
                 // Legacy annotation: match its normalised source directory.
                 bookmark("removed-by-path", removed_path, None),
-                bookmark("retained-by-id", retained_path.clone(), Some("retained-host")),
+                bookmark(
+                    "retained-by-id",
+                    retained_path.clone(),
+                    Some("retained-host"),
+                ),
                 // Host identity wins over a stale/misrecorded source path.
-                bookmark("retained-conflicting-path", case_dir.join("removed-host").join("old.sqlite").to_string_lossy(), Some("retained-host")),
+                bookmark(
+                    "retained-conflicting-path",
+                    case_dir
+                        .join("removed-host")
+                        .join("old.sqlite")
+                        .to_string_lossy(),
+                    Some("retained-host"),
+                ),
                 bookmark("retained-legacy", retained_path, None),
                 bookmark("outside-legacy", outside_path, None),
             ],
-        ).unwrap();
+        )
+        .unwrap();
 
         assert!(delete_host_dir_and_bookmarks(&case_dir, "removed-host"));
         assert!(!case_dir.join("removed-host").exists());
@@ -3589,7 +4524,15 @@ mod bookmark_tests {
             .iter()
             .filter_map(|value| value.get("id").and_then(Value::as_str).map(str::to_owned))
             .collect();
-        assert_eq!(ids, ["retained-by-id", "retained-conflicting-path", "retained-legacy", "outside-legacy"]);
+        assert_eq!(
+            ids,
+            [
+                "retained-by-id",
+                "retained-conflicting-path",
+                "retained-legacy",
+                "outside-legacy"
+            ]
+        );
 
         let _ = std::fs::remove_dir_all(case_dir);
     }
@@ -3619,16 +4562,25 @@ mod bookmark_tests {
         write_bookmarks_path(
             &case_dir,
             &[
-                bookmark("retained-by-id", retained_path.clone(), Some("retained-host")),
+                bookmark(
+                    "retained-by-id",
+                    retained_path.clone(),
+                    Some("retained-host"),
+                ),
                 // Do not infer a missing source row as a deleted host. The
                 // host still exists, so this remains the analyst's bookmark.
                 bookmark("retained-legacy", retained_path, None),
-                bookmark("stale-by-id", "/missing/source.sqlite", Some("removed-host")),
+                bookmark(
+                    "stale-by-id",
+                    "/missing/source.sqlite",
+                    Some("removed-host"),
+                ),
                 bookmark("stale-legacy", stale_path, None),
                 // Source paths outside this case are not safe to attribute.
                 bookmark("outside-legacy", outside_path, None),
             ],
-        ).unwrap();
+        )
+        .unwrap();
 
         let listed = list_bookmarks(case_dir.to_string_lossy().to_string()).unwrap();
         let ids: Vec<String> = listed
@@ -3794,6 +4746,11 @@ mod account_event_tests {
             map_text(&page.rows[0], "timestamp"),
             "2024-02-01 10:00:00.000"
         );
+        assert_eq!(
+            map_text(&page.rows[0], "_source_full_path"),
+            second.to_string_lossy()
+        );
+        assert_eq!(map_text(&page.rows[0], "_source_table_name"), "Events");
         assert_eq!(page.source_count, 3);
         assert_eq!(page.sources_read, 2);
         assert_eq!(
@@ -3943,6 +4900,110 @@ mod account_event_tests {
             scans_after_first_page + 3
         );
 
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(test)]
+mod search_case_tests {
+    use super::*;
+
+    #[test]
+    fn search_case_pages_bounded_preview_and_reports_failed_source() {
+        let root = std::env::temp_dir().join(format!(
+            "windows-analysis-search-page-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let db_path = root.join("results.sqlite");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE Findings (timestamp TEXT, detail TEXT, record_key TEXT);\
+             CREATE TABLE TrailingEmpty (value TEXT);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO Findings VALUES (?1, ?2, ?3)",
+            rusqlite::params![
+                "2026-01-01 00:00:00.000",
+                "needle first",
+                "RawFindings::Findings::41"
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO Findings VALUES (?1, ?2, ?3)",
+            rusqlite::params![
+                "2026-01-02 00:00:00.000",
+                "needle second",
+                "RawFindings::Findings::42"
+            ],
+        )
+        .unwrap();
+        let long_detail = format!("verylong{}", "x".repeat(4_096));
+        conn.execute(
+            "INSERT INTO Findings VALUES (?1, ?2, ?3)",
+            rusqlite::params![
+                "2026-01-03 00:00:00.000",
+                long_detail,
+                format!("RawFindings::Findings::{}", "r".repeat(4_096))
+            ],
+        )
+        .unwrap();
+        drop(conn);
+        std::fs::write(root.join("unreadable.sqlite"), vec![0_u8; 128]).unwrap();
+        let hosts = vec![SearchHost {
+            id: "host-1".to_string(),
+            name: "HOST-1".to_string(),
+            dir: root.to_string_lossy().to_string(),
+        }];
+
+        let first = search_case_blocking("needle".to_string(), hosts.clone(), 0, 1, None, None);
+        assert_eq!(
+            first.hits.len(),
+            1,
+            "source failures: {:?}",
+            first.source_failures
+        );
+        assert_eq!(first.hits[0].match_column, "detail");
+        assert_eq!(first.hits[0].match_value, "needle first");
+        assert_eq!(first.hits[0].timestamp, "2026-01-01 00:00:00.000");
+        assert_eq!(first.hits[0].record_key, "RawFindings::Findings::41");
+        assert_eq!(first.next_offset, Some(1));
+        // A continuation must not hide later unreadable sources.
+        assert!(!first.source_failures.is_empty());
+        // A later empty table is a valid source, not a health-check failure.
+        assert!(!first
+            .source_failures
+            .iter()
+            .any(|failure| failure == "HOST-1: results"));
+
+        let second = search_case_blocking("needle".to_string(), hosts.clone(), 1, 1, None, None);
+        assert_eq!(second.hits.len(), 1);
+        assert_eq!(second.hits[0].match_value, "needle second");
+        assert_eq!(second.next_offset, None);
+        assert!(!second.source_failures.is_empty());
+
+        let ranged = search_case_blocking(
+            "needle".to_string(),
+            hosts.clone(),
+            0,
+            10,
+            Some("2026-01-02 00:00:00.000".to_string()),
+            Some("2026-01-02 23:59:59.999".to_string()),
+        );
+        assert_eq!(ranged.hits.len(), 1);
+        assert_eq!(ranged.hits[0].match_value, "needle second");
+
+        let bounded_preview =
+            search_case_blocking("verylong".to_string(), hosts, 0, 10, None, None);
+        assert_eq!(bounded_preview.hits.len(), 1);
+        assert_eq!(bounded_preview.hits[0].match_value.chars().count(), 512);
+        assert_eq!(bounded_preview.hits[0].record_key.chars().count(), 512);
         let _ = std::fs::remove_dir_all(root);
     }
 }
@@ -4133,8 +5194,14 @@ mod browser_activity_tests {
 
         let page = ai_conversations_blocking(
             root.to_string_lossy().to_string(),
-            AiConversationQuery { start: None, end: None, offset: 0, limit: 10 },
-        ).unwrap();
+            AiConversationQuery {
+                start: None,
+                end: None,
+                offset: 0,
+                limit: 10,
+            },
+        )
+        .unwrap();
         assert!(page.conversations.is_empty());
         assert_eq!(page.source_count, 1);
         assert_eq!(page.sources_read, 1);
@@ -4439,6 +5506,286 @@ mod browser_activity_tests {
     }
 }
 
+#[cfg(test)]
+mod pipeline_log_supervision_tests {
+    use super::*;
+
+    fn temporary_log_path(label: &str) -> PathBuf {
+        let directory = std::env::temp_dir().join(format!(
+            "windows-analysis-supervisor-log-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        ));
+        directory.join("parse_logs").join("run.txt")
+    }
+
+    #[test]
+    fn supervisor_log_marks_nonzero_exit_and_forced_cancel() {
+        let log_path = temporary_log_path("exit-cancel");
+        record_child_exit(&log_path, Some(17));
+        record_forced_gui_cancel(&log_path, true);
+        let text = std::fs::read_to_string(&log_path).unwrap();
+        assert!(text.contains("child_exit status=nonzero exit_code=17"));
+        assert!(text.contains("termination status=forced reason=gui_cancel"));
+        assert!(!text.contains("status=cancelled"));
+        let root = log_path.parent().and_then(Path::parent).unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn nonzero_partial_report_is_not_reported_as_terminal_error() {
+        let root = std::env::temp_dir().join(format!(
+            "windows-analysis-partial-status-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("parse_report.json"), r#"{"status":"partial"}"#).unwrap();
+        assert_eq!(terminal_pipeline_status(&root, Some(1)), "partial");
+        assert_eq!(terminal_pipeline_status(&root, Some(0)), "complete");
+        assert_eq!(terminal_pipeline_status(&root, Some(2)), "partial");
+        std::fs::write(root.join("parse_report.json"), r#"{"status":"error"}"#).unwrap();
+        assert_eq!(terminal_pipeline_status(&root, Some(1)), "error");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn forced_cancel_replaces_prior_terminal_state_with_durable_cancelled_manifest() {
+        let root = std::env::temp_dir().join(format!(
+            "windows-analysis-cancelled-manifest-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        ));
+        let case = case_store::create_case("case", "2026-08-23 01:02:03", &root).unwrap();
+        let host =
+            case_store::create_host(&case.id, "host", "/evidence", "2026-08-23 01:02:03", &root)
+                .unwrap();
+        let host_dir = case_store::host_dir(&root, &case.id, &host.id);
+        std::fs::write(
+            host_dir.join("parse_report.json"),
+            r#"{"status":"ok","published":true}"#,
+        )
+        .unwrap();
+
+        write_cancelled_terminal_state_at(&root, &case.id, &host.id, "cancelled-run");
+
+        let report: Value =
+            serde_json::from_slice(&std::fs::read(host_dir.join("parse_report.json")).unwrap())
+                .unwrap();
+        assert_eq!(report["status"], "cancelled");
+        assert_eq!(report["published"], false);
+        assert!(pipeline::parse_run_log_path(&host_dir, "cancelled-run")
+            .with_extension("json")
+            .is_file());
+        assert_eq!(
+            case_store::load_host(&case.id, &host.id, &root)
+                .unwrap()
+                .last_run_status
+                .as_deref(),
+            Some("cancelled")
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn parse_run_log_reads_only_bounded_preview() {
+        let root = std::env::temp_dir().join(format!(
+            "windows-analysis-log-preview-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        ));
+        let path = pipeline::parse_run_log_path(&root, "bounded-log");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, vec![b'x'; 25 * 1024]).unwrap();
+        let preview = parse_run_log(
+            root.to_string_lossy().to_string(),
+            "bounded-log".to_string(),
+        )
+        .unwrap();
+        assert!(preview.truncated);
+        assert_eq!(preview.text.len(), 24 * 1024);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn parse_worker_options_accepts_log_id_with_or_without_artifact_scope() {
+        let no_scope = vec!["--run-log-id=run-no-scope".to_string()];
+        let (only, run_id) = parse_worker_options(&no_scope);
+        assert!(only.is_none());
+        assert_eq!(run_id.as_deref(), Some("run-no-scope"));
+
+        let scoped = vec![
+            "Registry,EventLog".to_string(),
+            "--run-log-id=run-scoped".to_string(),
+        ];
+        let (only, run_id) = parse_worker_options(&scoped);
+        let only = only.expect("artifact scope");
+        assert!(only.contains("Registry"));
+        assert!(only.contains("EventLog"));
+        assert_eq!(run_id.as_deref(), Some("run-scoped"));
+    }
+
+    #[test]
+    fn scheduler_reserves_only_two_hosts_and_cancelled_queue_never_gets_a_slot() {
+        let mut scheduler = PipelineScheduler::default();
+        for (run_id, host_id) in [
+            ("run-a", "host-a"),
+            ("run-b", "host-b"),
+            ("run-c", "host-c"),
+        ] {
+            scheduler.queued.insert(run_id.to_string());
+            scheduler
+                .host_ids
+                .insert(run_id.to_string(), host_id.to_string());
+        }
+        assert!(reserve_pipeline_slot(&mut scheduler, "run-a", "host-a"));
+        assert!(reserve_pipeline_slot(&mut scheduler, "run-b", "host-b"));
+        assert!(!reserve_pipeline_slot(&mut scheduler, "run-c", "host-c"));
+        assert_eq!(scheduler.reserving.len(), MAX_HOST_PIPELINES);
+        assert!(scheduler.queued.contains("run-c"));
+
+        // A queued cancellation removes the item before a freed slot can be
+        // reserved, so it cannot later start after a UI navigation.
+        assert!(scheduler.queued.remove("run-c"));
+        scheduler.cancelled.insert("run-c".to_string());
+        scheduler.reserving.remove("run-a");
+        assert!(!scheduler.queued.contains("run-c"));
+        assert!(scheduler.cancelled.contains("run-c"));
+    }
+
+    #[test]
+    fn scheduler_serializes_same_host_even_when_a_second_global_slot_is_free() {
+        let mut scheduler = PipelineScheduler::default();
+        for (run_id, host_id) in [
+            ("run-a", "host-a"),
+            ("run-a-again", "host-a"),
+            ("run-b", "host-b"),
+        ] {
+            scheduler.queued.insert(run_id.to_string());
+            scheduler
+                .host_ids
+                .insert(run_id.to_string(), host_id.to_string());
+        }
+        assert!(reserve_pipeline_slot(&mut scheduler, "run-a", "host-a"));
+        assert!(!reserve_pipeline_slot(
+            &mut scheduler,
+            "run-a-again",
+            "host-a"
+        ));
+        assert!(reserve_pipeline_slot(&mut scheduler, "run-b", "host-b"));
+        assert_eq!(scheduler.reserving.len(), MAX_HOST_PIPELINES);
+    }
+
+    #[test]
+    fn internal_pipeline_directories_are_never_exposed_as_categories() {
+        assert!(is_internal_pipeline_directory(".parse-staging"));
+        assert!(is_internal_pipeline_directory("parse_logs"));
+        assert!(!is_internal_pipeline_directory("REGISTRY"));
+    }
+
+    #[test]
+    fn direct_result_file_request_rejects_internal_pipeline_path() {
+        let root = std::env::temp_dir().join(format!(
+            "windows-analysis-internal-category-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        ));
+        let internal = root.join("host").join(".parse-staging").join("run-1");
+        std::fs::create_dir_all(&internal).unwrap();
+        assert!(has_internal_pipeline_path_component(&internal));
+        assert!(list_result_files(internal.to_string_lossy().to_string()).is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(test)]
+mod account_directory_tests {
+    use super::*;
+
+    #[test]
+    fn account_directory_prefers_sam_over_profilelist_and_keeps_only_exact_sids() {
+        let directory = account_directory_from_rows(vec![
+            (
+                "S-1-5-21-100-200-300-1001".to_string(),
+                "profile-alice".to_string(),
+                "ProfileList".to_string(),
+            ),
+            (
+                "S-1-5-21-100-200-300-1001".to_string(),
+                "SAM-ALICE".to_string(),
+                "SAM".to_string(),
+            ),
+            (
+                "not-a-sid".to_string(),
+                "must-not-appear".to_string(),
+                "SAM".to_string(),
+            ),
+            (
+                "S-1-5-21-100-200-300-1002".to_string(),
+                "".to_string(),
+                "SAM".to_string(),
+            ),
+        ]);
+
+        let alice = directory
+            .iter()
+            .find(|entry| entry.sid == "S-1-5-21-100-200-300-1001")
+            .expect("SAM entry");
+        assert_eq!(alice.account_name, "SAM-ALICE");
+        assert_eq!(alice.source_artifact, "SAM");
+        assert!(!directory
+            .iter()
+            .any(|entry| entry.account_name == "must-not-appear"));
+        assert!(!directory.iter().any(|entry| entry.sid.ends_with("-1002")));
+    }
+
+    #[test]
+    fn account_directory_has_only_safe_well_known_fallbacks() {
+        let directory = account_directory_from_rows(Vec::<(String, String, String)>::new());
+        assert_eq!(
+            directory
+                .iter()
+                .find(|entry| entry.sid == "S-1-5-18")
+                .map(|entry| entry.account_name.as_str()),
+            Some("LocalSystem")
+        );
+        assert!(!directory
+            .iter()
+            .any(|entry| entry.sid == "S-1-5-21-9-9-9-500"));
+        assert!(is_exact_sid("S-1-5-21-9-9-9-500"));
+        assert!(!is_exact_sid("S-1-5-21-9-user"));
+    }
+    #[test]
+    fn account_directory_uses_profilelist_when_sam_is_absent() {
+        let directory = account_directory_from_rows(vec![(
+            "S-1-5-21-42-43-44-1004".to_string(),
+            "profile-only-user".to_string(),
+            "ProfileList".to_string(),
+        )]);
+        let entry = directory
+            .iter()
+            .find(|entry| entry.sid == "S-1-5-21-42-43-44-1004")
+            .expect("ProfileList entry");
+        assert_eq!(entry.account_name, "profile-only-user");
+        assert_eq!(entry.source_artifact, "ProfileList");
+    }
+}
+
 fn main() {
     if let Some(code) = run_as_parse_worker() {
         std::process::exit(code);
@@ -4459,6 +5806,7 @@ fn main() {
             list_cases,
             create_case,
             create_host,
+            rename_host,
             delete_case,
             delete_host,
             list_artifacts,
@@ -4467,15 +5815,18 @@ fn main() {
             list_categories,
             list_result_files,
             refresh_execution_history_overview,
+            account_directory,
             result_provenance,
             artifact_input_files,
             parse_report,
+            parse_run_log,
             read_result_file,
             linked_result_rows,
             result_row,
             list_column_values,
             mft_children,
             mft_search,
+            mft_records_page,
             mft_row,
             search_case,
             list_bookmarks,

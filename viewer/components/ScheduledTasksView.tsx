@@ -4,10 +4,13 @@ import { useEffect, useMemo, useState, type CSSProperties } from "react";
 import BookmarkBorderOutlinedIcon from "@mui/icons-material/BookmarkBorderOutlined";
 import BookmarkOutlinedIcon from "@mui/icons-material/BookmarkOutlined";
 import CloseOutlinedIcon from "@mui/icons-material/CloseOutlined";
+import NavigateBeforeOutlinedIcon from "@mui/icons-material/NavigateBeforeOutlined";
+import NavigateNextOutlinedIcon from "@mui/icons-material/NavigateNextOutlined";
 import RowDetailPanel from "./RowDetailPanel";
 import { inRange, rangeActive, EMPTY_TIME_RANGE, type TimeRange } from "@/lib/timeRange";
 import { tagsForPath, type Tag } from "@/lib/tagging";
 import type { CsvData, FetchLinkedRows } from "@/lib/types";
+import type { AccountDirectory } from "@/lib/accountIdentity";
 
 const TABLE = "ScheduledTasks";
 const PAGE = 12;
@@ -19,6 +22,7 @@ interface Props {
   bookmarkedRowids?: Set<number>;
   onToggleBookmark?: (rowid: number) => void;
   timeRange?: TimeRange;
+  accountDirectory?: AccountDirectory;
 }
 
 type Row = Record<string, string>;
@@ -95,7 +99,7 @@ function cellStyle(extra?: CSSProperties): CSSProperties {
   return { minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", ...extra };
 }
 
-export default function ScheduledTasksView({ data, onNavigate, onFetchLinkedRows, bookmarkedRowids, onToggleBookmark, timeRange = EMPTY_TIME_RANGE }: Props) {
+export default function ScheduledTasksView({ data, onNavigate, onFetchLinkedRows, bookmarkedRowids, onToggleBookmark, timeRange = EMPTY_TIME_RANGE, accountDirectory }: Props) {
   const [filter, setFilter] = useState<FilterKey>("user");
   const [search, setSearch] = useState("");
   const [page, setPage] = useState(0);
@@ -128,6 +132,8 @@ export default function ScheduledTasksView({ data, onNavigate, onFetchLinkedRows
   const pageCount = Math.max(1, Math.ceil(filtered.length / PAGE));
   const safePage = Math.min(page, pageCount - 1);
   const pageRows = filtered.slice(safePage * PAGE, (safePage + 1) * PAGE);
+  const pageStart = filtered.length ? safePage * PAGE + 1 : 0;
+  const pageEnd = Math.min((safePage + 1) * PAGE, filtered.length);
 
   return (
     <div className="dfir-view" style={{ flex: 1, minHeight: 0, minWidth: 0, display: "flex", flexDirection: "column", background: "var(--bg)" }}>
@@ -162,7 +168,7 @@ export default function ScheduledTasksView({ data, onNavigate, onFetchLinkedRows
             const bookmarked = bookmarkedRowids?.has(entry.rowid) ?? false;
             const canBookmark = onToggleBookmark && Number.isFinite(entry.rowid);
             return (
-              <div key={Number.isFinite(entry.rowid) ? entry.rowid : entry.name} style={{ display: "grid", gridTemplateColumns: "minmax(180px, 1.25fr) minmax(260px, 2fr) minmax(145px, .9fr) minmax(130px, .85fr) minmax(130px, .75fr) 145px 34px", gap: 14, alignItems: "center", minHeight: 55, padding: "0 20px", borderBottom: "1px solid var(--border-subtle)", borderLeft: `3px solid ${bookmarked ? "var(--accent)" : "transparent"}`, background: bookmarked ? "var(--accent-subtle)" : "transparent" }}>
+              <div key={Number.isFinite(entry.rowid) ? entry.rowid : entry.name} className={bookmarked ? "dfir-bookmarked-row" : undefined} style={{ display: "grid", gridTemplateColumns: "minmax(180px, 1.25fr) minmax(260px, 2fr) minmax(145px, .9fr) minmax(130px, .85fr) minmax(130px, .75fr) 145px 34px", gap: 14, alignItems: "center", minHeight: 55, padding: "0 20px", borderBottom: "1px solid var(--border-subtle)", borderLeft: "3px solid transparent", background: "transparent" }}>
                 <button type="button" onClick={() => setSelected(entry)} aria-label={`${entry.name} 상세 보기`} style={{ gridColumn: "1 / 7", display: "grid", gridTemplateColumns: "minmax(180px, 1.25fr) minmax(260px, 2fr) minmax(145px, .9fr) minmax(130px, .85fr) minmax(130px, .75fr) 145px", gap: 14, alignItems: "center", minWidth: 0, width: "100%", padding: "9px 0", border: 0, background: "transparent", color: "inherit", textAlign: "left", cursor: "pointer" }}>
                   <span title={entry.name} style={cellStyle({ color: "var(--text)", fontSize: 12.5, fontWeight: 650 })}>{entry.name}</span>
                   <span title={entry.actions || "동작 정보 없음"} style={cellStyle({ color: entry.actions ? "var(--text-dim)" : "var(--text-faint)", fontSize: 11.5, fontFamily: "var(--mono)" })}>{entry.actions || "동작 정보 없음"}</span>
@@ -171,7 +177,7 @@ export default function ScheduledTasksView({ data, onNavigate, onFetchLinkedRows
                   <span style={cellStyle()}>{taskState(entry)}</span>
                   <time style={cellStyle({ color: "var(--text-faint)", fontSize: 10.5, fontFamily: "var(--mono)" })}>{entry.row.timestamp || "시간 정보 없음"}</time>
                 </button>
-                {canBookmark && <button type="button" onClick={() => onToggleBookmark(entry.rowid)} aria-label={bookmarked ? "북마크 해제" : "북마크"} title={bookmarked ? "북마크 해제" : "북마크"} style={{ justifySelf: "end", width: 28, height: 28, display: "grid", placeItems: "center", border: 0, background: "transparent", color: bookmarked ? "var(--accent)" : "var(--text-faint)", cursor: "pointer" }}>{bookmarked ? <BookmarkOutlinedIcon sx={{ fontSize: 18 }} /> : <BookmarkBorderOutlinedIcon sx={{ fontSize: 18 }} />}</button>}
+                {canBookmark && <button type="button" className={bookmarked ? "dfir-bookmark-control" : undefined} onClick={() => onToggleBookmark(entry.rowid)} aria-label={bookmarked ? "북마크 해제" : "북마크"} title={bookmarked ? "북마크 해제" : "북마크"} style={{ justifySelf: "end", width: 28, height: 28, display: "grid", placeItems: "center", border: 0, background: "transparent", color: bookmarked ? "var(--bookmark-control)" : "var(--text-faint)", cursor: "pointer" }}>{bookmarked ? <BookmarkOutlinedIcon sx={{ fontSize: 18 }} /> : <BookmarkBorderOutlinedIcon sx={{ fontSize: 18 }} />}</button>}
               </div>
             );
           })}
@@ -179,16 +185,17 @@ export default function ScheduledTasksView({ data, onNavigate, onFetchLinkedRows
         </div>
       </section>
 
-      <footer style={{ flexShrink: 0, display: "flex", alignItems: "center", minHeight: 42, padding: "0 20px", borderTop: "1px solid var(--border)", color: "var(--text-faint)", fontSize: 11.5 }}>
-        <span>표시 {filtered.length.toLocaleString()} / {counts.total.toLocaleString()}건</span>
-        {pageCount > 1 && <div style={{ display: "flex", alignItems: "center", gap: 8, marginLeft: "auto" }}>
-          <button type="button" onClick={() => setPage(safePage - 1)} disabled={safePage === 0} style={pageButton(safePage === 0)}>이전</button>
-          <span>{safePage + 1} / {pageCount}</span>
-          <button type="button" onClick={() => setPage(safePage + 1)} disabled={safePage >= pageCount - 1} style={pageButton(safePage >= pageCount - 1)}>다음</button>
-        </div>}
+      <footer className="scheduler-footer" style={{ flexShrink: 0, display: "grid", gridTemplateColumns: "minmax(0, 1fr) auto minmax(0, 1fr)", alignItems: "center", minHeight: 46, gap: 12, padding: "0 20px", borderTop: "1px solid var(--border)", color: "var(--text-faint)", fontSize: 11.5 }}>
+        <span title={filtered.length ? `표시 ${pageStart.toLocaleString()}–${pageEnd.toLocaleString()} / ${filtered.length.toLocaleString()}건` : "표시할 작업 없음"} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{filtered.length ? `표시 ${pageStart.toLocaleString()}–${pageEnd.toLocaleString()} / ${filtered.length.toLocaleString()}건` : "표시할 작업 없음"}{filtered.length !== counts.total && <span style={{ marginLeft: 7, color: "var(--text-faint)" }}>전체 {counts.total.toLocaleString()}건</span>}</span>
+        {pageCount > 1 && <nav aria-label="작업 스케줄러 페이지" aria-live="polite" style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8, whiteSpace: "nowrap" }}>
+          <button type="button" aria-label="이전 페이지" title="이전 페이지" onClick={() => setPage(safePage - 1)} disabled={safePage === 0} style={{ ...pageButton(safePage === 0), display: "inline-grid", placeItems: "center", width: 28, padding: 0 }}><NavigateBeforeOutlinedIcon sx={{ fontSize: 17 }} /></button>
+          <span style={{ minWidth: 174, color: "var(--text-dim)", textAlign: "center" }}>{safePage + 1} / {pageCount}쪽 · ({pageStart.toLocaleString()}–{pageEnd.toLocaleString()} / {filtered.length.toLocaleString()})</span>
+          <button type="button" aria-label="다음 페이지" title="다음 페이지" onClick={() => setPage(safePage + 1)} disabled={safePage >= pageCount - 1} style={{ ...pageButton(safePage >= pageCount - 1), display: "inline-grid", placeItems: "center", width: 28, padding: 0 }}><NavigateNextOutlinedIcon sx={{ fontSize: 17 }} /></button>
+        </nav>}
+        <span className="scheduler-footer-spacer" aria-hidden="true" />
       </footer>
 
-      {selected && <RowDetailPanel row={selected.row} columns={data.columns} focusedColumn={null} fileBaseName={TABLE} onClose={() => setSelected(null)} onNavigate={(file, column, value) => { setSelected(null); onNavigate(file, column, value); }} onFetchLinkedRows={onFetchLinkedRows} isBookmarked={Number.isFinite(selected.rowid) ? bookmarkedRowids?.has(selected.rowid) ?? false : undefined} onToggleBookmark={onToggleBookmark && Number.isFinite(selected.rowid) ? () => onToggleBookmark(selected.rowid) : undefined} />}
+      {selected && <RowDetailPanel row={selected.row} columns={data.columns} focusedColumn={null} fileBaseName={TABLE} onClose={() => setSelected(null)} onNavigate={(file, column, value) => { setSelected(null); onNavigate(file, column, value); }} onFetchLinkedRows={onFetchLinkedRows} accountDirectory={accountDirectory} isBookmarked={Number.isFinite(selected.rowid) ? bookmarkedRowids?.has(selected.rowid) ?? false : undefined} onToggleBookmark={onToggleBookmark && Number.isFinite(selected.rowid) ? () => onToggleBookmark(selected.rowid) : undefined} />}
     </div>
   );
 }

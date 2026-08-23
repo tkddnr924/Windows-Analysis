@@ -19,23 +19,52 @@ use crate::time::fmt_filetime;
 pub const EXEC_TABLE: &str = "Prefetch_Execution";
 pub const LOADED_TABLE: &str = "Prefetch_LoadedFiles";
 pub const EXEC_FIELD_ORDER: &[&str] = &[
-    "last_run_time", "run_time_2", "run_time_3", "run_time_4",
-    "run_time_5", "run_time_6", "run_time_7", "run_time_8",
-    "executable_filename", "prefetch_hash", "run_count", "format_version",
-    "volume_device_path", "volume_serial_number", "volume_creation_time",
-    "_status", "_error", "_source_file",
+    "last_run_time",
+    "run_time_2",
+    "run_time_3",
+    "run_time_4",
+    "run_time_5",
+    "run_time_6",
+    "run_time_7",
+    "run_time_8",
+    "executable_filename",
+    "prefetch_hash",
+    "run_count",
+    "format_version",
+    "volume_device_path",
+    "volume_serial_number",
+    "volume_creation_time",
+    "_status",
+    "_error",
+    "_source_file",
 ];
 pub const LOADED_FIELD_ORDER: &[&str] = &[
-    "executable_filename", "prefetch_hash", "loaded_filename", "file_reference", "_source_file",
+    "executable_filename",
+    "prefetch_hash",
+    "loaded_filename",
+    "file_reference",
+    "_source_file",
 ];
 
 const RUN_TIME_COLS: &[&str] = &[
-    "last_run_time", "run_time_2", "run_time_3", "run_time_4",
-    "run_time_5", "run_time_6", "run_time_7", "run_time_8",
+    "last_run_time",
+    "run_time_2",
+    "run_time_3",
+    "run_time_4",
+    "run_time_5",
+    "run_time_6",
+    "run_time_7",
+    "run_time_8",
 ];
 
 /// FILETIME (100 ns since 1601) -> KST display; "" for 0/unset.
-fn fmt(ft: i64) -> String { if ft == 0 { String::new() } else { fmt_filetime(ft) } }
+fn fmt(ft: i64) -> String {
+    if ft == 0 {
+        String::new()
+    } else {
+        fmt_filetime(ft)
+    }
+}
 
 fn parse_one(path: &Path, exec_rows: &mut Vec<Row>, loaded_rows: &mut Vec<Row>) -> Result<()> {
     let source = path.to_string_lossy().to_string();
@@ -48,21 +77,32 @@ fn parse_one(path: &Path, exec_rows: &mut Vec<Row>, loaded_rows: &mut Vec<Row>) 
     // executable-name field), formatted as 8 uppercase hex — matches pyscca's
     // get_prefetch_hash().
     let prefetch_hash = if scca.len() >= 80 {
-        format!("{:08X}", u32::from_le_bytes([scca[76], scca[77], scca[78], scca[79]]))
-    } else { String::new() };
+        format!(
+            "{:08X}",
+            u32::from_le_bytes([scca[76], scca[77], scca[78], scca[79]])
+        )
+    } else {
+        String::new()
+    };
 
     let executable = info.executable.clone();
     let mut times = info.last_run_times.clone();
     times.resize(8, 0);
 
     let mut row = Row::new();
-    for (i, col) in RUN_TIME_COLS.iter().enumerate() { row.insert((*col).to_string(), fmt(times[i])); }
+    for (i, col) in RUN_TIME_COLS.iter().enumerate() {
+        row.insert((*col).to_string(), fmt(times[i]));
+    }
     row.insert("executable_filename".into(), executable.clone());
     row.insert("prefetch_hash".into(), prefetch_hash.clone());
     row.insert("run_count".into(), info.run_count.to_string());
     row.insert("format_version".into(), info.version.to_string());
     let (dev, serial, vct) = match info.volumes.first() {
-        Some(v) => (v.device_path.clone(), format!("{:08X}", v.serial), fmt(v.creation_time)),
+        Some(v) => (
+            v.device_path.clone(),
+            format!("{:08X}", v.serial),
+            fmt(v.creation_time),
+        ),
         None => (String::new(), String::new(), String::new()),
     };
     row.insert("volume_device_path".into(), dev);

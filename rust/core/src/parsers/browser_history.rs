@@ -12,7 +12,9 @@ use crate::sqlite::Row;
 
 fn hex_lower(b: &[u8]) -> String {
     let mut s = String::with_capacity(b.len() * 2);
-    for x in b { s.push_str(&format!("{:02x}", x)); }
+    for x in b {
+        s.push_str(&format!("{:02x}", x));
+    }
     s
 }
 /// None -> SQL NULL (matches Python None); others -> text cell.

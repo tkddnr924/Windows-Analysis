@@ -51,7 +51,10 @@ pub fn write_table(
         .map(|c| format!("\"{}\" TEXT", c))
         .collect::<Vec<_>>()
         .join(", ");
-    conn.execute(&format!("CREATE TABLE \"{}\" ({})", table_name, cols_sql), [])?;
+    conn.execute(
+        &format!("CREATE TABLE \"{}\" ({})", table_name, cols_sql),
+        [],
+    )?;
 
     let placeholders = vec!["?"; columns.len()].join(", ");
     let quoted = columns
@@ -71,7 +74,10 @@ pub fn write_table(
             // Absent column -> SQL NULL (matches Python's None -> NULL); a key
             // present with "" stays an empty TEXT. MFT/registry insert every
             // column, so they are unaffected.
-            let vals: Vec<Option<&str>> = columns.iter().map(|c| r.get(c).map(|s| s.as_str())).collect();
+            let vals: Vec<Option<&str>> = columns
+                .iter()
+                .map(|c| r.get(c).map(|s| s.as_str()))
+                .collect();
             stmt.execute(rusqlite::params_from_iter(vals.into_iter()))?;
         }
     }
@@ -99,24 +105,47 @@ pub fn write_table_cols(
         return Ok(());
     }
     let mut keys: BTreeMap<String, ()> = BTreeMap::new();
-    for c in all_columns { keys.insert(c.clone(), ()); }
+    for c in all_columns {
+        keys.insert(c.clone(), ());
+    }
     let mut columns: Vec<String> = Vec::new();
     for p in preferred_order {
-        if keys.contains_key(*p) { columns.push((*p).to_string()); }
+        if keys.contains_key(*p) {
+            columns.push((*p).to_string());
+        }
     }
     for k in keys.keys() {
-        if !columns.iter().any(|c| c == k) { columns.push(k.clone()); }
+        if !columns.iter().any(|c| c == k) {
+            columns.push(k.clone());
+        }
     }
-    let cols_sql = columns.iter().map(|c| format!("\"{}\" TEXT", c)).collect::<Vec<_>>().join(", ");
-    conn.execute(&format!("CREATE TABLE \"{}\" ({})", table_name, cols_sql), [])?;
+    let cols_sql = columns
+        .iter()
+        .map(|c| format!("\"{}\" TEXT", c))
+        .collect::<Vec<_>>()
+        .join(", ");
+    conn.execute(
+        &format!("CREATE TABLE \"{}\" ({})", table_name, cols_sql),
+        [],
+    )?;
     let placeholders = vec!["?"; columns.len()].join(", ");
-    let quoted = columns.iter().map(|c| format!("\"{}\"", c)).collect::<Vec<_>>().join(", ");
-    let insert_sql = format!("INSERT INTO \"{}\" ({}) VALUES ({})", table_name, quoted, placeholders);
+    let quoted = columns
+        .iter()
+        .map(|c| format!("\"{}\"", c))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let insert_sql = format!(
+        "INSERT INTO \"{}\" ({}) VALUES ({})",
+        table_name, quoted, placeholders
+    );
     let tx = conn.transaction()?;
     {
         let mut stmt = tx.prepare(&insert_sql)?;
         for r in rows {
-            let vals: Vec<Option<&str>> = columns.iter().map(|c| r.get(c).map(|s| s.as_str())).collect();
+            let vals: Vec<Option<&str>> = columns
+                .iter()
+                .map(|c| r.get(c).map(|s| s.as_str()))
+                .collect();
             stmt.execute(rusqlite::params_from_iter(vals.into_iter()))?;
         }
     }
@@ -141,40 +170,86 @@ pub struct StreamWriter {
 impl StreamWriter {
     /// `universe` = every column the table can contain; `preferred` = leading
     /// order (present ones first, remaining sorted) — same rule as write_table.
-    pub fn create(db_path: &Path, table_name: &str, universe: &[&str], preferred: &[&str]) -> Result<Self> {
-        if let Some(parent) = db_path.parent() { std::fs::create_dir_all(parent)?; }
+    pub fn create(
+        db_path: &Path,
+        table_name: &str,
+        universe: &[&str],
+        preferred: &[&str],
+    ) -> Result<Self> {
+        if let Some(parent) = db_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         let conn = Connection::open(db_path)?;
         conn.execute(&format!("DROP TABLE IF EXISTS \"{}\"", table_name), [])?;
         conn.pragma_update(None, "journal_mode", "OFF").ok();
         conn.pragma_update(None, "synchronous", "OFF").ok();
 
         let mut keys: BTreeMap<String, ()> = BTreeMap::new();
-        for c in universe { keys.insert((*c).to_string(), ()); }
+        for c in universe {
+            keys.insert((*c).to_string(), ());
+        }
         let mut columns: Vec<String> = Vec::new();
-        for p in preferred { if keys.contains_key(*p) { columns.push((*p).to_string()); } }
-        for k in keys.keys() { if !columns.iter().any(|c| c == k) { columns.push(k.clone()); } }
+        for p in preferred {
+            if keys.contains_key(*p) {
+                columns.push((*p).to_string());
+            }
+        }
+        for k in keys.keys() {
+            if !columns.iter().any(|c| c == k) {
+                columns.push(k.clone());
+            }
+        }
 
-        let cols_sql = columns.iter().map(|c| format!("\"{}\" TEXT", c)).collect::<Vec<_>>().join(", ");
-        conn.execute(&format!("CREATE TABLE \"{}\" ({})", table_name, cols_sql), [])?;
+        let cols_sql = columns
+            .iter()
+            .map(|c| format!("\"{}\" TEXT", c))
+            .collect::<Vec<_>>()
+            .join(", ");
+        conn.execute(
+            &format!("CREATE TABLE \"{}\" ({})", table_name, cols_sql),
+            [],
+        )?;
         let placeholders = vec!["?"; columns.len()].join(", ");
-        let quoted = columns.iter().map(|c| format!("\"{}\"", c)).collect::<Vec<_>>().join(", ");
-        let insert_sql = format!("INSERT INTO \"{}\" ({}) VALUES ({})", table_name, quoted, placeholders);
-        Ok(Self { conn, columns, insert_sql, buf: Vec::new(), batch: 50_000, total: 0 })
+        let quoted = columns
+            .iter()
+            .map(|c| format!("\"{}\"", c))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let insert_sql = format!(
+            "INSERT INTO \"{}\" ({}) VALUES ({})",
+            table_name, quoted, placeholders
+        );
+        Ok(Self {
+            conn,
+            columns,
+            insert_sql,
+            buf: Vec::new(),
+            batch: 50_000,
+            total: 0,
+        })
     }
 
     pub fn push(&mut self, row: Row) -> Result<()> {
         self.buf.push(row);
-        if self.buf.len() >= self.batch { self.flush()?; }
+        if self.buf.len() >= self.batch {
+            self.flush()?;
+        }
         Ok(())
     }
 
     fn flush(&mut self) -> Result<()> {
-        if self.buf.is_empty() { return Ok(()); }
+        if self.buf.is_empty() {
+            return Ok(());
+        }
         let tx = self.conn.transaction()?;
         {
             let mut stmt = tx.prepare(&self.insert_sql)?;
             for r in &self.buf {
-                let vals: Vec<Option<&str>> = self.columns.iter().map(|c| r.get(c).map(|s| s.as_str())).collect();
+                let vals: Vec<Option<&str>> = self
+                    .columns
+                    .iter()
+                    .map(|c| r.get(c).map(|s| s.as_str()))
+                    .collect();
                 stmt.execute(rusqlite::params_from_iter(vals.into_iter()))?;
             }
         }

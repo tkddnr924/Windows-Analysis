@@ -152,10 +152,11 @@ export default function WerView({ data, bookmarkedRowids, onToggleBookmark }: Pr
           return (
             <div
               key={i}
+              className={bm ? "dfir-bookmarked-row" : undefined}
               onClick={() => setDetail(p)}
-              onMouseEnter={(e) => (e.currentTarget.style.background = "var(--bg-hover)")}
-              onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
-              style={{ padding: "9px 12px", borderBottom: i < pageRows.length - 1 ? "1px solid var(--border-subtle)" : "none", cursor: "pointer", boxShadow: bm ? "inset 3px 0 0 var(--warning)" : undefined }}
+              onMouseEnter={(e) => { if (!bm) e.currentTarget.style.background = "var(--bg-hover)"; }}
+              onMouseLeave={(e) => { if (!bm) e.currentTarget.style.background = "transparent"; }}
+              style={{ padding: "9px 12px", borderBottom: i < pageRows.length - 1 ? "1px solid var(--border-subtle)" : "none", cursor: "pointer" }}
               title="클릭하면 WER 상세 보기"
             >
               <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
@@ -256,9 +257,10 @@ function WerDetailModal({ p, onClose, isBookmarked, onToggleBookmark }: { p: Par
           <Pill text={p.eventType || "?"} color={tone} />
           {onToggleBookmark && (
             <button
+              className={isBookmarked ? "dfir-bookmark-control" : undefined}
               onClick={onToggleBookmark}
               title={isBookmarked ? "북마크 해제" : "북마크에 추가"}
-              style={{ marginLeft: "auto", display: "inline-flex", alignItems: "center", gap: 5, fontSize: 11.5, padding: "4px 10px", background: isBookmarked ? "var(--accent-subtle)" : "transparent", color: isBookmarked ? "var(--accent)" : "var(--text-dim)", border: `1px solid ${isBookmarked ? "var(--accent)" : "var(--border)"}`, borderRadius: "var(--radius-lg)", cursor: "pointer", fontWeight: 600 }}
+              style={{ marginLeft: "auto", display: "inline-flex", alignItems: "center", gap: 5, fontSize: 11.5, padding: "4px 10px", background: isBookmarked ? "var(--bookmark-row)" : "transparent", color: isBookmarked ? "var(--bookmark-control)" : "var(--text-dim)", border: `1px solid ${isBookmarked ? "var(--bookmark-outline)" : "var(--border)"}`, borderRadius: "var(--radius-lg)", cursor: "pointer", fontWeight: 600 }}
             >
               {isBookmarked ? "북마크됨" : "북마크"}
             </button>

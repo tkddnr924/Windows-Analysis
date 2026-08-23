@@ -60,14 +60,13 @@ export interface BrowserActivitySummary {
   total: number;
 }
 
-/** One collected machine within a case: a target folder + its parsed output.
- * This is the browsable unit — artifacts, timeline, and bookmarks all live at
- * the host level. */
+/** One collected machine: a target folder + its parsed output. This is the
+ * browsable unit — artifacts live under the direct host folder. */
 export interface Host {
   id: string;
   name: string;
   targetDir: string;
-  /** cases/<caseId>/<hostId>/ — holds one .sqlite per artifact output + bookmarks.json. */
+  /** cases/<hostId>/ — holds this host's parsed output. */
   dir: string;
   createdAt: string;
   lastRunAt: string | null;
@@ -77,13 +76,13 @@ export interface Host {
   lastRunDurationSecs?: number | null;
 }
 
-/** An incident. Groups the hosts (machines) involved so an analyst can pivot
- * between them within one investigation. */
+/** Compatibility collection for the direct host store. The app exposes one
+ * root collection; it does not create a per-case directory. */
 export interface Case {
   id: string;
   name: string;
   createdAt: string;
-  /** cases/<caseId>/ */
+  /** cases/ (root host store) */
   dir: string;
   hosts: Host[];
 }
@@ -123,7 +122,19 @@ export interface ArtifactInputFile {
 
 export interface ParseReportArtifact {
   name: string;
-  status: "completed" | "failed" | "cancelled" | "running";
+  status: "completed" | "failed" | "cancelled" | "running" | "no_input";
+  /** The parser explicitly ran a source-discovery pass for this artifact. */
+  inputDiscoveryChecked?: boolean;
+  /** At least one source file was found, even if it yielded zero records. */
+  evidenceDiscovered?: boolean;
+  /** Files sealed in isolated staging after this parser completed. */
+  outputs?: string[];
+  /** Files from this artifact actually published to the live host result. */
+  publishedOutputs?: string[];
+  /** Publication is intentionally separate from parser completion. */
+  publicationStatus?: "published" | "withheld" | "not_published" | string;
+  /** Structured parser or panic failure for this artifact only. */
+  error?: string;
   inputs: ParseReportInput[];
 }
 
@@ -139,12 +150,59 @@ export interface ParseReportInput {
 }
 
 export interface ParseReport {
+  runId?: string;
   runAt: string;
+  /** Terminal lifecycle of this parser attempt; absent in pre-manifest reports. */
+  status?: "ok" | "error" | "cancelled" | string;
+  durationMs?: number;
+  /** True only when this run made one or more outputs visible live. */
+  published?: boolean;
+  errors?: string[];
+  registryHives?: ParseReportRegistryHive[];
+  /** Recovery policy used by this run; disabled means live hive records only. */
+  registryRecovery?: ParseReportRegistryRecovery;
+  /** Parser stages that completed; this does not imply their results were published. */
+  completedArtifacts?: string[];
+  /** Artifact names with at least one output published by this run. */
+  publishedArtifacts?: string[];
+  /** Exact host-relative files published by this run. */
+  publishedOutputs?: string[];
   artifacts: ParseReportArtifact[];
   overview: { name: string; rowCount: number }[];
 }
 
-/** An analyst annotation on one row, persisted in cases/<id>/bookmarks.json. */
+export interface ParseReportRegistryHive {
+  sourcePath: string;
+  status: "completed" | "failed" | string;
+  rowCount: number;
+  /** Sibling LOG1/LOG2 files found beside the hive, whether or not applied. */
+  recoveryLogsDiscovered?: number;
+  /** Transaction logs actually applied during parsing. */
+  recoveryLogCount: number;
+  /** False for temporary live-only Registry parsing. */
+  recoveryEnabled?: boolean;
+  recoveredRowCount: number;
+  /** Time queued behind the process-wide Registry deleted-recovery cap. */
+  recoveryPermitWaitMs?: number;
+  buildRecoveryMs: number;
+  iterationAndSqliteWriteMs: number;
+  error?: string;
+}
+
+export interface ParseReportRegistryRecovery {
+  mode: "enabled" | "disabled" | string;
+  deletedCellRecoveryApplied: boolean;
+  transactionLogsApplied: boolean;
+}
+
+/** A deliberately bounded preview of one immutable parser-run log. */
+export interface ParseLogPreview {
+  text: string;
+  truncated: boolean;
+}
+
+/** An analyst annotation on one row, persisted in the direct host-store root
+ * `cases/bookmarks.json`. */
 export interface Bookmark {
   id: string;
   fullPath: string;
@@ -156,8 +214,8 @@ export interface Bookmark {
    * Created/Modified/...), which one this bookmark marks — so the same row can
    * be bookmarked on each time independently. Absent for whole-row bookmarks. */
   field?: string;
-  /** Which host in the case this bookmark's row belongs to (bookmarks are
-   * case-level and shared across hosts). Optional for backward compatibility
+  /** Which direct host this bookmark's row belongs to (bookmarks are shared
+   * across registered hosts). Optional for backward compatibility
    * with bookmarks saved before host attribution existed. */
   hostId?: string;
   hostName?: string;
@@ -176,6 +234,11 @@ export interface BookmarkInput {
 export interface ResultRow {
   columns: string[];
   row: Record<string, string> | null;
+}
+
+export interface MftRecordsPage {
+  rows: Record<string, string>[];
+  total: number;
 }
 
 export interface TimelineEntry {
@@ -211,8 +274,12 @@ export interface ColumnFilterValue {
 }
 
 export interface PipelineLogEntry {
+  /** Immutable parser invocation id. Events from concurrent hosts never share state. */
+  runId: string;
+  hostId: string;
+  status: "queued" | "running" | "complete" | "partial" | "error" | "cancelled";
   line: string;
-  stream: "stdout" | "stderr";
+  stream: "stdout" | "stderr" | "lifecycle";
 }
 
 /** error is set when the pipeline itself failed to run — kept separate from
@@ -225,11 +292,18 @@ export interface ListCasesResult {
 export interface RunHostOptions {
   caseId: string;
   hostId: string;
+  /** Path-safe immutable invocation id, generated before it enters the queue. */
+  runId?: string;
   /** Artifact names to run — omit to run all. */
   only?: string[];
 }
 
 export interface PipelineResult {
+  runId: string;
+  hostId: string;
+  /** `partial` means completed artifacts were committed but one or more
+   * sources/artifacts failed; see the immutable parse report for detail. */
+  status: "complete" | "partial" | "error" | "cancelled";
   exitCode: number | null;
 }
 
@@ -324,6 +398,14 @@ export interface AccountEventSourceFailure {
   reason: string;
 }
 
+/** A display-only exact SID-to-account mapping from the parsed TargetInfo
+ * overview for one authoritative host directory. */
+export interface AccountDirectoryEntry {
+  sid: string;
+  accountName: string;
+  sourceArtifact: string;
+}
+
 export interface ElectronApi {
   /** Resize the single desktop window to fit the current application stage. */
   setWindowLayout(layout: "setup" | "analysis"): Promise<void>;
@@ -331,13 +413,16 @@ export interface ElectronApi {
   listCases(): Promise<ListCasesResult>;
   createCase(name: string): Promise<Case>;
   createHost(caseId: string, name: string, targetDir: string): Promise<Host>;
+  /** Changes display metadata only; evidence and result paths remain immutable. */
+  renameHost(caseId: string, hostId: string, name: string): Promise<Host>;
   deleteCase(caseId: string): Promise<boolean>;
   deleteHost(caseId: string, hostId: string): Promise<boolean>;
   listArtifacts(): Promise<string[]>;
   runHost(options: RunHostOptions): Promise<PipelineResult>;
-  cancelPipeline(): Promise<boolean>;
+  /** Omit runId only for the explicit cancel-all action. */
+  cancelPipeline(runId?: string, cancelAll?: boolean): Promise<boolean>;
   onPipelineLog(callback: (entry: PipelineLogEntry) => void): () => void;
-  /** hostDir = a host's cases/<caseId>/<hostId>/ folder. */
+  /** hostDir = a host's direct cases/<hostId>/ folder. */
   listCategories(hostDir: string): Promise<CategoryEntry[]>;
   listResultFiles(categoryDir: string): Promise<ResultFileEntry[]>;
   /** Rebuilds only a legacy ExecutionHistory overview to add raw record links. */
@@ -345,6 +430,10 @@ export interface ElectronApi {
   resultProvenance(fullPath: string, tableName: string): Promise<ResultProvenance[]>;
   artifactInputFiles(sourceFile: string): Promise<ArtifactInputFile[]>;
   parseReport(hostDir: string): Promise<ParseReport | null>;
+  /** Reads a bounded immutable run log; never scans or reparses evidence. */
+  parseRunLog(hostDir: string, runId: string): Promise<ParseLogPreview>;
+  /** Reads the existing TargetInfo account map. It never reparses evidence. */
+  accountDirectory(hostDir: string): Promise<AccountDirectoryEntry[]>;
   readResultFile(fullPath: string, tableName?: string): Promise<CsvData>;
   linkedResultRows(fullPath: string, tableName: string, matchColumn: string, matchValue: string, search: string, offset: number, limit: number): Promise<LinkedRowsPage>;
   resultRow(fullPath: string, tableName: string, rowid: number): Promise<ResultRow>;
@@ -357,8 +446,9 @@ export interface ElectronApi {
   mftChildren(fullPath: string, parentEntry: number): Promise<Record<string, string>[]>;
   mftSearch(fullPath: string, query: string, limit: number): Promise<Record<string, string>[]>;
   mftRow(fullPath: string, rowid: number): Promise<Record<string, string> | null>;
+  mftRecordsPage(fullPath: string, query: string, offset: number, limit: number): Promise<MftRecordsPage>;
   listColumnValues(fullPath: string, column: string, tableName?: string): Promise<{ value: string; count: number }[]>;
-  searchCase(query: string, hosts: { id: string; name: string; dir: string }[]): Promise<SearchHit[]>;
+  searchCase(query: string, hosts: { id: string; name: string; dir: string }[], offset: number, limit: number, range?: { start?: string; end?: string }): Promise<SearchCasePage>;
   listBookmarks(hostDir: string): Promise<Bookmark[]>;
   toggleBookmark(hostDir: string, entry: BookmarkInput): Promise<Bookmark[]>;
   updateBookmarkNote(hostDir: string, id: string, note: string): Promise<Bookmark[]>;
@@ -386,6 +476,23 @@ export interface SearchHit {
   rowid: number;
   /** The first column whose value contained the query (for a labelled preview). */
   matchColumn: string;
-  columns: string[];
-  row: Record<string, string>;
+  /** Bounded preview of the first matching value; the exact source row is
+   * queried only after the analyst opens its detail panel. */
+  matchValue: string;
+  /** Candidate evidence time selected by the query without serialising the
+   * complete SQLite row. Empty when the artifact provides no time. */
+  timestamp: string;
+  /** Bounded source-evidence pointer retained by overview rows. When present,
+   * a bookmark must be stored against this raw record rather than the derived
+   * overview row. Empty when the searched table has no source pointer. */
+  recordKey: string;
+}
+
+export interface SearchCasePage {
+  hits: SearchHit[];
+  /** Offset cursor for requesting the next exact page; null means exhausted. */
+  nextOffset: number | null;
+  /** Sources that could not be searched. Results remain partial rather than
+   * being silently presented as a complete empty search. */
+  sourceFailures: string[];
 }

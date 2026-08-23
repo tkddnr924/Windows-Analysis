@@ -1875,6 +1875,7 @@ dependencies = [
  "encoding_rs",
  "evtx",
  "flate2",
+ "libc",
  "libesedb",
  "lnk",
  "mft",

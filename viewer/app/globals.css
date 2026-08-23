@@ -25,10 +25,24 @@
   --text-faint: #718198;
   /* Timestamps must stay readable — brighter than the faint/dim greys. */
   --text-time: #b9c2cc;
+  /* A registered analysis host is an identity, not an evidence severity. */
+  --host-registered-text: #c8d3df;
 
   --accent: #67b2ff;
   --accent-emphasis: #287fe8;
   --accent-subtle: rgba(103, 178, 255, 0.14);
+
+  /* Analyst bookmarks are a neutral silver context state, deliberately
+     separate from navigation blue and warning/danger evidence colours. */
+  --bookmark-row: rgba(198, 207, 218, 0.10);
+  --bookmark-rail: #e0e6ee;
+  --bookmark-control: #d7dfe8;
+  --bookmark-outline: rgba(198, 207, 218, 0.48);
+  /* Compatibility aliases keep inline detail treatments consistent while
+     rows migrate to the common class. */
+  --bookmark: var(--bookmark-control);
+  --bookmark-border: var(--bookmark-outline);
+  --bookmark-subtle: var(--bookmark-row);
 
   --success: #3fb950;
   --success-subtle: rgba(63, 185, 80, 0.12);
@@ -111,6 +125,37 @@ button:not(:disabled):active {
 [data-detail-scroll-container],
 .dfir-view {
   overscroll-behavior: contain;
+}
+
+/* A bookmark is analyst context, never navigation selection or severity.
+   Apply this one-level treatment to the actual row surface, not to artifact
+   chips, so the evidence's own status colour remains legible. */
+.dfir-bookmarked-row {
+  /* Bookmark context is a restrained neutral-slate row tint plus a fixed
+     rail. Selection and evidence modifiers below retain their own meaning. */
+  background: var(--bookmark-row) !important;
+  box-shadow: inset 4px 0 0 var(--bookmark-rail);
+}
+
+.dfir-bookmarked-row:hover {
+  background: rgba(198, 207, 218, 0.15) !important;
+}
+
+.dfir-bookmarked-row--warning {
+  background: var(--warning-subtle) !important;
+}
+
+.dfir-bookmarked-row--danger {
+  background: var(--danger-subtle) !important;
+}
+
+.dfir-bookmarked-row--selected,
+.dfir-bookmarked-row--selected:hover {
+  background: var(--bg-selected) !important;
+}
+
+.dfir-bookmark-control {
+  color: var(--bookmark-control) !important;
 }
 
 @keyframes parse-progress-shimmer {
@@ -222,6 +267,91 @@ input:focus, select:focus {
     grid-template-columns: minmax(0, 1fr);
   }
 }
+
+/* Host registration stays a ledger at wide widths.  At the actual workspace
+   width left after the app sidebar, the data groups into one readable summary
+   with a persistent action cluster instead of overflowing horizontally. */
+.host-ledger-heading {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: grid;
+  grid-template-columns: minmax(0, .85fr) minmax(0, 1.6fr) minmax(150px, .9fr) auto;
+  gap: 12px;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-panel);
+  color: var(--text-faint);
+  font-size: 10.5px;
+  font-weight: 700;
+}
+.host-ledger-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+  min-width: 0;
+  padding: 7px 14px;
+}
+.host-ledger-main {
+  display: grid;
+  grid-template-columns: minmax(0, .85fr) minmax(0, 1.6fr) minmax(150px, .9fr);
+  gap: 12px;
+  align-items: center;
+  min-width: 0;
+}
+.host-ledger-identity {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 7px;
+}
+.host-ledger-path {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-dim);
+  font-family: var(--mono);
+  font-size: 11.5px;
+}
+.host-ledger-last-run {
+  min-width: 0;
+  color: var(--text-faint);
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+.host-ledger-actions {
+  display: grid;
+  grid-template-columns: minmax(72px, 1fr) minmax(72px, 1fr) 1px 28px 28px;
+  gap: 6px;
+  align-items: center;
+  min-width: 248px;
+}
+.host-ledger-actions > button { min-width: 0; }
+.host-ledger-action-placeholder { min-width: 0; min-height: 28px; }
+.host-ledger-action-divider { align-self: stretch; background: var(--border); }
+.host-ledger-confirm {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  grid-column: 1 / -1;
+  min-width: 248px;
+}
+@container (max-width: 1119px) {
+  .host-ledger-heading { display: none; }
+  .host-ledger-toolbar { flex-wrap: wrap; }
+  .host-ledger-search { order: 3; width: 100% !important; margin-left: 0 !important; }
+  .host-ledger-row { grid-template-columns: minmax(0, 1fr) auto; min-height: 52px; }
+  .host-ledger-main { grid-template-columns: minmax(0, 1fr); gap: 3px; }
+  .host-ledger-identity { min-height: 24px; }
+  .host-ledger-path, .host-ledger-last-run { padding-left: 0; }
+}
+@container (max-width: 759px) {
+  .host-ledger-row { grid-template-columns: minmax(0, 1fr); gap: 8px; }
+  .host-ledger-actions { min-width: 0; width: min(100%, 248px); }
+  .host-ledger-confirm { width: 100%; min-width: 0; justify-content: space-between; }
+}
 @media (max-width: 720px) {
   .target-info-header {
     align-items: flex-start !important;
@@ -235,6 +365,27 @@ input:focus, select:focus {
     margin-left: 0 !important;
     max-width: 100%;
   }
+}
+
+@media (max-width: 640px) {
+  .scheduler-footer {
+    grid-template-columns: 1fr !important;
+    justify-items: center;
+    gap: 6px !important;
+    padding-top: 8px !important;
+    padding-bottom: 8px !important;
+  }
+  .scheduler-footer > span:first-child { text-align: center; }
+  .scheduler-footer-spacer { display: none; }
+}
+
+@media (max-width: 960px) {
+  .mft-content--list {
+    grid-template-columns: minmax(0, 1fr) !important;
+    grid-template-rows: minmax(250px, 1fr) minmax(280px, .8fr);
+  }
+  .mft-content--list > aside { border-right: 0 !important; }
+  .mft-content--list > section { border-top: 1px solid var(--border); }
 }
 .dfir-page-title {
   font-size: 22px;
@@ -469,4 +620,39 @@ input:focus, select:focus {
 @media (max-width: 920px) {
   .browser-insights-grid { grid-template-columns: minmax(0, 1fr) !important; }
   .browser-insights-first { border-right: 0 !important; border-bottom: 1px solid var(--border); }
+}
+
+@media (max-width: 960px) {
+  .ps-session-header { display: none !important; }
+  .ps-session-summary {
+    grid-template-columns: 28px minmax(0, 1fr) auto !important;
+    grid-template-areas:
+      "toggle process account"
+      "toggle range range"
+      "toggle meta meta";
+    row-gap: 5px !important;
+    align-items: start !important;
+  }
+  .ps-session-toggle { grid-area: toggle; padding-top: 2px; }
+  .ps-session-process { grid-area: process; }
+  .ps-session-account { grid-area: account; max-width: 180px; text-align: right; }
+  .ps-session-range { grid-area: range; }
+  .ps-session-meta { grid-area: meta; }
+}
+
+@media (max-width: 720px) {
+  .ps-session-ledger { border-left: 0 !important; border-right: 0 !important; border-radius: 0 !important; }
+  .ps-session-records { border-left: 3px solid var(--border-subtle); }
+  .ps-session-child-header { display: none !important; }
+  .ps-session-event { padding: 9px 12px 9px 13px !important; }
+  .ps-session-child {
+    grid-template-columns: minmax(0, 1fr) auto !important;
+    grid-template-areas:
+      "time type"
+      "content content";
+    row-gap: 4px !important;
+  }
+  .ps-session-child-time { grid-area: time; }
+  .ps-session-child-type { grid-area: type; text-align: right; }
+  .ps-session-child-content { grid-area: content; }
 }

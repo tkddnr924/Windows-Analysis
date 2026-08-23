@@ -10,6 +10,7 @@ import type { CsvData, FetchLinkedRows } from "@/lib/types";
 import { getArtifactView } from "@/lib/artifactViews";
 import { inRange, EMPTY_TIME_RANGE, type TimeRange } from "@/lib/timeRange";
 import RowDetailPanel from "./RowDetailPanel";
+import { resolveAccountDisplay, type AccountDirectory } from "@/lib/accountIdentity";
 
 const TABLE = "SmbHistory";
 const RESULT_COLOR: Record<string, string> = {
@@ -59,6 +60,7 @@ interface Props {
   bookmarkedRowids?: Set<number>;
   onToggleBookmark?: (rowid: number) => void;
   timeRange?: TimeRange;
+  accountDirectory?: AccountDirectory;
 }
 
 type ResultFilter = "all" | "fail" | "success";
@@ -75,6 +77,7 @@ export default function SmbHistoryView({
   bookmarkedRowids,
   onToggleBookmark,
   timeRange = EMPTY_TIME_RANGE,
+  accountDirectory,
 }: Props) {
   const [query, setQuery] = useState("");
   const [resultFilter, setResultFilter] = useState<ResultFilter>("all");
@@ -189,7 +192,7 @@ export default function SmbHistoryView({
               >
                 {open ? <KeyboardArrowDownOutlinedIcon aria-hidden="true" sx={{ fontSize: 18, color: "var(--text-faint)" }} /> : <KeyboardArrowRightOutlinedIcon aria-hidden="true" sx={{ fontSize: 18, color: "var(--text-faint)" }} />}
                 <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontFamily: "var(--mono)", fontSize: 13, fontWeight: 700 }}>{peer.ip}</span>
-                <span title={peer.accounts.join(", ") || "계정 정보 없음"} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: peer.accounts.length ? "var(--text-dim)" : "var(--text-faint)", fontSize: 11.5 }}>{peer.accounts.length ? peer.accounts.join(", ") : "계정 정보 없음"}</span>
+                <span title={peer.accounts.map((account) => resolveAccountDisplay(account, accountDirectory)).join(", ") || "계정 정보 없음"} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: peer.accounts.length ? "var(--text-dim)" : "var(--text-faint)", fontSize: 11.5 }}>{peer.accounts.length ? peer.accounts.map((account) => resolveAccountDisplay(account, accountDirectory)).join(", ") : "계정 정보 없음"}</span>
                 <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text-time)", fontFamily: "var(--mono)", fontSize: 10.5 }}>{timeSpan(peer.first, peer.last)}</span>
                 <span style={{ display: "inline-flex", alignItems: "center", gap: 5, minWidth: 0, fontSize: 10.5 }}>
                   {peer.success > 0 && <ResultPill color="var(--success)">성공 {peer.success.toLocaleString()}</ResultPill>}
@@ -204,17 +207,17 @@ export default function SmbHistoryView({
                 {peer.events.map((event, index) => {
                   const rowid = Number((event as Record<string, unknown>).__rowid);
                   const bookmarked = Number.isFinite(rowid) && (bookmarkedRowids?.has(rowid) ?? false);
-                  const rowBackground = bookmarked ? "color-mix(in srgb, var(--accent) 14%, transparent)" : "transparent";
+                  const rowBackground = "transparent";
                   const resultColor = RESULT_COLOR[event.result ?? ""] ?? "var(--text-faint)";
-                  return <div key={`${rowid}-${event.timestamp}-${index}`} style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) 32px", gap: 8, alignItems: "center", minHeight: 36, padding: "6px 12px 6px 44px", background: rowBackground, boxShadow: bookmarked ? "inset 3px 0 0 var(--accent)" : undefined }} onMouseEnter={(mouseEvent) => { mouseEvent.currentTarget.style.background = "var(--bg-hover)"; }} onMouseLeave={(mouseEvent) => { mouseEvent.currentTarget.style.background = rowBackground; }}>
+                  return <div key={`${rowid}-${event.timestamp}-${index}`} className={bookmarked ? "dfir-bookmarked-row" : undefined} style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) 32px", gap: 8, alignItems: "center", minHeight: 36, padding: "6px 12px 6px 44px", background: rowBackground }} onMouseEnter={(mouseEvent) => { if (!bookmarked) mouseEvent.currentTarget.style.background = "var(--bg-hover)"; }} onMouseLeave={(mouseEvent) => { if (!bookmarked) mouseEvent.currentTarget.style.background = rowBackground; }}>
                     <div role="button" tabIndex={0} onClick={() => setSelected(event as Record<string, string>)} onKeyDown={(keyboardEvent) => { if (keyboardEvent.key === "Enter" || keyboardEvent.key === " ") { keyboardEvent.preventDefault(); setSelected(event as Record<string, string>); } }} style={{ display: "grid", gridTemplateColumns: "170px 80px minmax(130px, .6fr) minmax(250px, 1.45fr) 68px", gap: 8, alignItems: "center", minWidth: 0, color: "var(--text)", cursor: "pointer", outlineOffset: 2 }}>
                       <span style={{ color: "var(--text-time)", fontFamily: "var(--mono)", fontSize: 11.5, whiteSpace: "nowrap" }}>{event.timestamp || "시간 정보 없음"}</span>
                       <span style={{ color: resultColor, fontSize: 11.5, fontWeight: 700 }}>{event.result || "정보"}</span>
-                      <span title={bareAccount(event.account ?? "") || "계정 정보 없음"} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: event.account ? "var(--text-dim)" : "var(--text-faint)", fontSize: 11.5 }}>{bareAccount(event.account ?? "") || "계정 정보 없음"}</span>
+                      <span title={resolveAccountDisplay(bareAccount(event.account ?? ""), accountDirectory) || "계정 정보 없음"} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: event.account ? "var(--text-dim)" : "var(--text-faint)", fontSize: 11.5 }}>{resolveAccountDisplay(bareAccount(event.account ?? ""), accountDirectory) || "계정 정보 없음"}</span>
                       <span title={event.description || "상세 정보 없음"} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text-dim)", fontSize: 11.5 }}>{event.description || "상세 정보 없음"}</span>
                       <span style={{ color: "var(--text-faint)", fontFamily: "var(--mono)", fontSize: 10.5 }}>{event.event_id || "—"}</span>
                     </div>
-                    {onToggleBookmark && Number.isFinite(rowid) && <button type="button" onClick={() => onToggleBookmark(rowid)} aria-label={bookmarked ? "북마크 해제" : "북마크 추가"} title={bookmarked ? "북마크 해제" : "북마크 추가"} style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 26, height: 26, padding: 0, border: "none", background: "transparent", color: bookmarked ? "var(--accent)" : "var(--text-faint)", cursor: "pointer" }}>{bookmarked ? <BookmarkOutlinedIcon sx={{ fontSize: 16 }} /> : <BookmarkBorderOutlinedIcon sx={{ fontSize: 16 }} />}</button>}
+                    {onToggleBookmark && Number.isFinite(rowid) && <button type="button" className={bookmarked ? "dfir-bookmark-control" : undefined} onClick={() => onToggleBookmark(rowid)} aria-label={bookmarked ? "북마크 해제" : "북마크 추가"} title={bookmarked ? "북마크 해제" : "북마크 추가"} style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 26, height: 26, padding: 0, border: "none", background: "transparent", color: bookmarked ? "var(--bookmark-control)" : "var(--text-faint)", cursor: "pointer" }}>{bookmarked ? <BookmarkOutlinedIcon sx={{ fontSize: 16 }} /> : <BookmarkBorderOutlinedIcon sx={{ fontSize: 16 }} />}</button>}
                   </div>;
                 })}
               </div>}
@@ -223,7 +226,7 @@ export default function SmbHistoryView({
         </div>
       </main>
 
-      {selected && spec && <RowDetailPanel row={selected} columns={data.columns} focusedColumn={null} fileBaseName={TABLE} onClose={() => setSelected(null)} onNavigate={(targetFile, targetColumn, value) => { setSelected(null); onNavigate(targetFile, targetColumn, value); }} onFetchLinkedRows={onFetchLinkedRows} isBookmarked={onToggleBookmark ? bookmarkedRowids?.has(Number((selected as Record<string, unknown>).__rowid)) ?? false : undefined} onToggleBookmark={onToggleBookmark ? () => onToggleBookmark(Number((selected as Record<string, unknown>).__rowid)) : undefined} />}
+      {selected && spec && <RowDetailPanel row={selected} columns={data.columns} focusedColumn={null} fileBaseName={TABLE} onClose={() => setSelected(null)} onNavigate={(targetFile, targetColumn, value) => { setSelected(null); onNavigate(targetFile, targetColumn, value); }} onFetchLinkedRows={onFetchLinkedRows} accountDirectory={accountDirectory} isBookmarked={onToggleBookmark ? bookmarkedRowids?.has(Number((selected as Record<string, unknown>).__rowid)) ?? false : undefined} onToggleBookmark={onToggleBookmark ? () => onToggleBookmark(Number((selected as Record<string, unknown>).__rowid)) : undefined} />}
     </div>
   );
 }

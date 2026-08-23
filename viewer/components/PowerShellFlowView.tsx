@@ -9,6 +9,7 @@ import KeyboardArrowRightOutlinedIcon from "@mui/icons-material/KeyboardArrowRig
 import type { CsvData, FetchLinkedRows } from "@/lib/types";
 import { formatEvidenceTimestamp, inRange, EMPTY_TIME_RANGE, type TimeRange } from "@/lib/timeRange";
 import RowDetailPanel from "./RowDetailPanel";
+import { resolveAccountDisplay, type AccountDirectory } from "@/lib/accountIdentity";
 
 const TABLE_NAME = "PowerShellHistory";
 const SESSION_GAP_MS = 30 * 60 * 1000;
@@ -52,6 +53,15 @@ function eventEvidence(event: PsEvent): { label: string; value: string } {
   if (event.command) return { label: "명령", value: firstLine(event.command) };
   if (event.hostApplication) return { label: "HostApplication", value: firstLine(event.hostApplication) };
   return { label: "기록", value: "표시할 실행 문자열이 없습니다." };
+}
+
+function sessionRecordSummary(events: PsEvent[]): string {
+  const parts = [
+    [events.filter((event) => Boolean(event.command)).length, "명령"],
+    [events.filter((event) => Boolean(event.scriptBlock)).length, "스크립트 블록"],
+    [events.filter((event) => Boolean(event.hostApplication)).length, "HostApplication"],
+  ] as const;
+  return parts.filter(([count]) => count > 0).map(([count, label]) => `${label} ${count}`).join(" · ") || "실행 문자열 기록 없음";
 }
 
 function clusterSessions(data: CsvData, timeRange: TimeRange): PsSession[] {
@@ -107,6 +117,7 @@ interface PowerShellFlowViewProps {
   bookmarkedRowids?: Set<number>;
   onToggleBookmark?: (rowid: number) => void;
   timeRange?: TimeRange;
+  accountDirectory?: AccountDirectory;
 }
 
 const FILTERS: { label: string; value?: PsKind }[] = [
@@ -117,7 +128,7 @@ const FILTERS: { label: string; value?: PsKind }[] = [
 ];
 
 export default function PowerShellFlowView({
-  data, onNavigate, onFetchLinkedRows, bookmarkedRowids, onToggleBookmark, timeRange = EMPTY_TIME_RANGE,
+  data, onNavigate, onFetchLinkedRows, bookmarkedRowids, onToggleBookmark, timeRange = EMPTY_TIME_RANGE, accountDirectory,
 }: PowerShellFlowViewProps) {
   const [kindFilter, setKindFilter] = useState<PsKind | undefined>();
   const [query, setQuery] = useState("");
@@ -153,7 +164,7 @@ export default function PowerShellFlowView({
       <header style={{ flexShrink: 0, padding: "12px 16px 10px", borderBottom: "1px solid var(--border)", background: "var(--bg-panel)" }}>
         <div style={{ display: "flex", alignItems: "center", gap: 9, minHeight: 25, flexWrap: "wrap" }}>
           <strong style={{ fontSize: 15, color: "var(--text)" }}>파워셸 실행 이력</strong>
-          <span style={{ color: "var(--text-faint)", fontSize: 12, fontFamily: "var(--mono)" }}>{sessions.length.toLocaleString()}개 세션 · {eventCount.toLocaleString()}건</span>
+          <span style={{ color: "var(--text-faint)", fontSize: 12, fontFamily: "var(--mono)" }}>세션 {sessions.length.toLocaleString()} · 원본 기록 {eventCount.toLocaleString()}</span>
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 9, flexWrap: "wrap" }}>
           <div style={{ position: "relative", flex: "1 1 260px", maxWidth: 430 }}>
@@ -170,34 +181,33 @@ export default function PowerShellFlowView({
       </header>
 
       <main style={{ flex: 1, minHeight: 0, overflow: "auto", padding: 12 }}>
-        <div style={{ minWidth: 730, border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", overflow: "hidden", background: "var(--bg-panel)" }}>
-          {sessions.length > 0 && <div style={{ display: "grid", gridTemplateColumns: "32px minmax(150px, .72fr) minmax(110px, .46fr) minmax(210px, 1.4fr) 164px 54px", gap: 8, alignItems: "center", padding: "8px 12px", borderBottom: "1px solid var(--border)", color: "var(--text-faint)", fontSize: 10.5, fontWeight: 700 }}><span /><span>실행 프로세스</span><span>계정</span><span>명령 / 스크립트</span><span>시간</span><span style={{ textAlign: "right" }}>이벤트</span></div>}
+        <div className="ps-session-ledger" style={{ minWidth: 0, border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", overflow: "hidden", background: "var(--bg-panel)" }}>
+          {sessions.length > 0 && <div className="ps-session-header" style={{ display: "grid", gridTemplateColumns: "32px minmax(150px, .72fr) minmax(110px, .46fr) minmax(190px, 1fr) minmax(210px, .9fr)", gap: 8, alignItems: "center", padding: "8px 12px", borderBottom: "1px solid var(--border)", color: "var(--text-faint)", fontSize: 10.5, fontWeight: 700 }}><span>세션 요약</span><span>프로세스 / PID</span><span>계정</span><span>관찰 구간</span><span>원본 기록 구성</span></div>}
           {sessions.length === 0 ? <div style={{ padding: 28, textAlign: "center", color: "var(--text-faint)", fontSize: 12.5 }}>{allSessions.length === 0 ? "기간 내 파워셸 실행 이력이 없습니다." : "검색 또는 필터 조건에 맞는 실행 이력이 없습니다."}</div> : sessions.map((session) => {
             const open = expanded.has(session.key);
-            const summary = eventEvidence(session.events[0]);
+            const recordSummary = sessionRecordSummary(session.events);
+            const recordsId = `powershell-session-records-${session.key}`;
             return <section key={session.key} style={{ borderTop: "1px solid var(--border-subtle)" }}>
-              <button type="button" onClick={() => toggle(session.key)} aria-expanded={open} style={{ width: "100%", display: "grid", gridTemplateColumns: "32px minmax(150px, .72fr) minmax(110px, .46fr) minmax(210px, 1.4fr) 164px 54px", gap: 8, alignItems: "center", padding: "10px 12px", color: "var(--text)", border: "none", background: "transparent", cursor: "pointer", textAlign: "left", outlineOffset: -2 }} onMouseEnter={(event) => { event.currentTarget.style.background = "var(--bg-hover)"; }} onMouseLeave={(event) => { event.currentTarget.style.background = "transparent"; }}>
-                {open ? <KeyboardArrowDownOutlinedIcon aria-hidden="true" sx={{ fontSize: 18, color: "var(--text-faint)" }} /> : <KeyboardArrowRightOutlinedIcon aria-hidden="true" sx={{ fontSize: 18, color: "var(--text-faint)" }} />}
-                <span style={{ minWidth: 0 }}><span style={{ display: "block", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontFamily: "var(--mono)", fontSize: 12.5, fontWeight: 700 }}>{session.process || "powershell.exe"}</span>{session.processId && <span style={{ display: "block", marginTop: 2, color: "var(--text-faint)", fontSize: 10.5, fontFamily: "var(--mono)" }}>PID {session.processId}</span>}</span>
-                <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: session.account ? "var(--text)" : "var(--text-faint)", fontSize: 12 }}>{session.account || "계정 정보 없음"}</span>
-                <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text-dim)", fontFamily: "var(--mono)", fontSize: 11.5 }}><span style={{ marginRight: 7, color: summary.label === "HostApplication" ? "var(--accent)" : "var(--text-faint)", fontFamily: "inherit", fontSize: 10.5 }}>{summary.label}</span>{summary.value}</span>
-                <span style={{ color: "var(--text-time)", fontFamily: "var(--mono)", fontSize: 10.5, lineHeight: 1.4, whiteSpace: "nowrap" }}>{formatEvidenceTimestamp(session.start)}<br />{formatEvidenceTimestamp(session.end)}</span>
-                <span style={{ display: "block", textAlign: "right", color: "var(--text-faint)", fontFamily: "var(--mono)", fontSize: 10.5 }}>{session.events.length}건</span>
+              <button type="button" className="ps-session-summary" onClick={() => toggle(session.key)} aria-expanded={open} aria-controls={recordsId} aria-label={`${session.process || "powershell.exe"} ${session.processId ? `PID ${session.processId} ` : ""}세션의 원본 기록 ${session.events.length}건 ${open ? "접기" : "펼치기"}`} style={{ width: "100%", display: "grid", gridTemplateColumns: "32px minmax(150px, .72fr) minmax(110px, .46fr) minmax(190px, 1fr) minmax(210px, .9fr)", gap: 8, alignItems: "center", padding: "10px 12px", color: "var(--text)", border: "none", background: "transparent", cursor: "pointer", textAlign: "left", outlineOffset: -2 }} onMouseEnter={(event) => { event.currentTarget.style.background = "var(--bg-hover)"; }} onMouseLeave={(event) => { event.currentTarget.style.background = "transparent"; }}>
+                <span className="ps-session-toggle">{open ? <KeyboardArrowDownOutlinedIcon aria-hidden="true" sx={{ fontSize: 18, color: "var(--text-faint)" }} /> : <KeyboardArrowRightOutlinedIcon aria-hidden="true" sx={{ fontSize: 18, color: "var(--text-faint)" }} />}</span>
+                <span className="ps-session-process" style={{ minWidth: 0 }}><span style={{ display: "block", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontFamily: "var(--mono)", fontSize: 12.5, fontWeight: 700 }}>{session.process || "powershell.exe"}</span>{session.processId && <span style={{ display: "block", marginTop: 2, color: "var(--text-faint)", fontSize: 10.5, fontFamily: "var(--mono)" }}>PID {session.processId}</span>}</span>
+                <span className="ps-session-account" style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: session.account ? "var(--text)" : "var(--text-faint)", fontSize: 12 }}>{resolveAccountDisplay(session.account, accountDirectory) || "계정 정보 없음"}</span>
+                <span className="ps-session-range" style={{ color: "var(--text-time)", fontFamily: "var(--mono)", fontSize: 10.5, lineHeight: 1.5, whiteSpace: "nowrap" }}>{formatEvidenceTimestamp(session.start)} <span style={{ color: "var(--text-faint)" }}>→</span> {formatEvidenceTimestamp(session.end)}</span>
+                <span className="ps-session-meta" style={{ minWidth: 0, color: "var(--text-dim)", fontFamily: "var(--mono)", fontSize: 11, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{session.events.length}건 · {recordSummary}</span>
               </button>
-              {open && <div style={{ borderTop: "1px solid var(--border-subtle)", background: "color-mix(in srgb, var(--bg-elevated) 34%, transparent)" }}>
-                <div style={{ display: "grid", gridTemplateColumns: "160px 104px minmax(190px, 1fr) minmax(220px, .9fr) 32px", gap: 8, padding: "6px 12px 6px 44px", borderBottom: "1px solid var(--border-subtle)", color: "var(--text-faint)", fontSize: 10, fontWeight: 700 }}><span>시간</span><span>기록 유형</span><span>명령 / 스크립트</span><span>HostApplication</span><span /></div>
+              {open && <div id={recordsId} role="region" aria-label={`원본 기록 ${session.events.length}건`} className="ps-session-records" style={{ borderTop: "1px solid var(--border-subtle)", background: "color-mix(in srgb, var(--bg-elevated) 34%, transparent)" }}>
+                <div className="ps-session-child-header" style={{ display: "grid", gridTemplateColumns: "160px 104px minmax(0, 1fr) 32px", gap: 8, padding: "7px 12px 7px 56px", borderBottom: "1px solid var(--border-subtle)", color: "var(--text-faint)", fontSize: 10, fontWeight: 700 }}><span>시간</span><span>기록 유형</span><span>원본 기록</span><span /></div>
                 {session.events.map((event) => {
                   const evidence = eventEvidence(event);
                   const bookmarked = Number.isFinite(event.rowid) && (bookmarkedRowids?.has(event.rowid) ?? false);
-                  const rowBackground = bookmarked ? "color-mix(in srgb, var(--warning) 14%, transparent)" : "transparent";
-                  return <div key={`${event.rowid}-${event.timestamp}`} style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) 32px", gap: 8, alignItems: "center", minHeight: 35, padding: "6px 12px 6px 44px", background: rowBackground, boxShadow: bookmarked ? "inset 3px 0 0 var(--warning)" : undefined }} onMouseEnter={(mouseEvent) => { mouseEvent.currentTarget.style.background = "var(--bg-hover)"; }} onMouseLeave={(mouseEvent) => { mouseEvent.currentTarget.style.background = rowBackground; }}>
-                    <div role="button" tabIndex={0} onClick={() => setSelected(event.row)} onKeyDown={(keyboardEvent) => { if (keyboardEvent.key === "Enter" || keyboardEvent.key === " ") { keyboardEvent.preventDefault(); setSelected(event.row); } }} style={{ display: "grid", gridTemplateColumns: "160px 104px minmax(190px, 1fr) minmax(220px, .9fr)", gap: 8, alignItems: "center", minWidth: 0, color: "var(--text)", cursor: "pointer", outlineOffset: 2 }}>
-                      <span style={{ color: "var(--text-time)", fontFamily: "var(--mono)", fontSize: 11.5, whiteSpace: "nowrap" }}>{formatEvidenceTimestamp(event.timestamp)}</span>
-                      <span style={{ color: "var(--text-dim)", fontSize: 11.5 }}>{event.kind || "기타"}</span>
-                      <span title={evidence.value} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: evidence.label === "HostApplication" ? "var(--accent)" : "var(--text-dim)", fontFamily: "var(--mono)", fontSize: 11.5 }}><span style={{ color: "var(--text-faint)", fontFamily: "inherit", marginRight: 7 }}>{evidence.label}</span>{evidence.value}</span>
-                      <span title={event.hostApplication || "HostApplication 기록 없음"} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: event.hostApplication ? "var(--accent)" : "var(--text-faint)", fontFamily: "var(--mono)", fontSize: 11.5 }}>{event.hostApplication || "—"}</span>
-                    </div>
-                    {onToggleBookmark && Number.isFinite(event.rowid) && <button type="button" onClick={() => onToggleBookmark(event.rowid)} aria-label={bookmarked ? "북마크 해제" : "북마크 추가"} title={bookmarked ? "북마크 해제" : "북마크 추가"} style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 26, height: 26, padding: 0, border: "none", background: "transparent", color: bookmarked ? "var(--warning)" : "var(--text-faint)", cursor: "pointer" }}>{bookmarked ? <BookmarkOutlinedIcon sx={{ fontSize: 16 }} /> : <BookmarkBorderOutlinedIcon sx={{ fontSize: 16 }} />}</button>}
+                  const hostApplicationSecondary = evidence.label !== "HostApplication" ? firstLine(event.hostApplication, 180) : "";
+                  return <div key={`${event.rowid}-${event.timestamp}`} className={bookmarked ? "dfir-bookmarked-row ps-session-event" : "ps-session-event"} style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) 32px", gap: 8, alignItems: "center", minHeight: 40, padding: "7px 12px 7px 56px", background: "transparent" }} onMouseEnter={(mouseEvent) => { if (!bookmarked) mouseEvent.currentTarget.style.background = "var(--bg-hover)"; }} onMouseLeave={(mouseEvent) => { if (!bookmarked) mouseEvent.currentTarget.style.background = "transparent"; }}>
+                    <button type="button" className="ps-session-child" onClick={() => setSelected(event.row)} aria-label={`${formatEvidenceTimestamp(event.timestamp)} ${event.kind || evidence.label} 상세 보기`} style={{ display: "grid", gridTemplateColumns: "160px 104px minmax(0, 1fr)", gap: 8, alignItems: "center", minWidth: 0, padding: 0, color: "var(--text)", cursor: "pointer", border: "none", background: "transparent", textAlign: "left", outlineOffset: 2 }}>
+                      <span className="ps-session-child-time" style={{ color: "var(--text-time)", fontFamily: "var(--mono)", fontSize: 11.5, whiteSpace: "nowrap" }}>{formatEvidenceTimestamp(event.timestamp)}</span>
+                      <span className="ps-session-child-type" style={{ color: "var(--text-dim)", fontSize: 11.5 }}>{event.kind || evidence.label}</span>
+                      <span className="ps-session-child-content" style={{ minWidth: 0, display: "grid", gap: 3 }}><span title={evidence.value} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: evidence.label === "HostApplication" ? "var(--accent)" : "var(--text-dim)", fontFamily: "var(--mono)", fontSize: 11.5 }}>{evidence.value}</span>{hostApplicationSecondary && <span title={event.hostApplication} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text-faint)", fontFamily: "var(--mono)", fontSize: 10.5 }}>HostApplication · {hostApplicationSecondary}</span>}</span>
+                    </button>
+                    {onToggleBookmark && Number.isFinite(event.rowid) && <button type="button" className={bookmarked ? "dfir-bookmark-control" : undefined} onClick={() => onToggleBookmark(event.rowid)} aria-label={bookmarked ? "북마크 해제" : "북마크 추가"} title={bookmarked ? "북마크 해제" : "북마크 추가"} style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 26, height: 26, padding: 0, border: "none", background: "transparent", color: bookmarked ? "var(--bookmark-control)" : "var(--text-faint)", cursor: "pointer" }}>{bookmarked ? <BookmarkOutlinedIcon sx={{ fontSize: 16 }} /> : <BookmarkBorderOutlinedIcon sx={{ fontSize: 16 }} />}</button>}
                   </div>;
                 })}
               </div>}
@@ -205,7 +215,7 @@ export default function PowerShellFlowView({
           })}
         </div>
       </main>
-      {selected && <RowDetailPanel row={selected} columns={data.columns} focusedColumn={null} fileBaseName={TABLE_NAME} onClose={() => setSelected(null)} onNavigate={(targetFile, targetColumn, value) => { setSelected(null); onNavigate(targetFile, targetColumn, value); }} onFetchLinkedRows={onFetchLinkedRows} isBookmarked={onToggleBookmark ? bookmarkedRowids?.has(Number((selected as Record<string, unknown>).__rowid)) ?? false : undefined} onToggleBookmark={onToggleBookmark ? () => onToggleBookmark(Number((selected as Record<string, unknown>).__rowid)) : undefined} />}
+      {selected && <RowDetailPanel row={selected} columns={data.columns} focusedColumn={null} fileBaseName={TABLE_NAME} onClose={() => setSelected(null)} onNavigate={(targetFile, targetColumn, value) => { setSelected(null); onNavigate(targetFile, targetColumn, value); }} onFetchLinkedRows={onFetchLinkedRows} accountDirectory={accountDirectory} isBookmarked={onToggleBookmark ? bookmarkedRowids?.has(Number((selected as Record<string, unknown>).__rowid)) ?? false : undefined} onToggleBookmark={onToggleBookmark ? () => onToggleBookmark(Number((selected as Record<string, unknown>).__rowid)) : undefined} />}
     </div>
   );
 }

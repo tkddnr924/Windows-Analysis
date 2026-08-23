@@ -18,9 +18,22 @@ pub const RDP_TABLE: &str = "RdpBitmapCache";
 pub const CONTENT_MARKER: &str = "RDP8bmp";
 const MAGIC: &[u8] = b"RDP8bmp\x00";
 pub const RDP_FIELD_ORDER: &[&str] = &[
-    "kind", "account", "source_file", "fragment_index", "tile_count", "cols", "rows",
-    "tile_index", "count", "width", "height", "key", "image",
-    "_source_file", "_status", "_error",
+    "kind",
+    "account",
+    "source_file",
+    "fragment_index",
+    "tile_count",
+    "cols",
+    "rows",
+    "tile_index",
+    "count",
+    "width",
+    "height",
+    "key",
+    "image",
+    "_source_file",
+    "_status",
+    "_error",
 ];
 
 /// The account an RDP cache file belongs to — the path segment right after the
@@ -28,18 +41,25 @@ pub const RDP_FIELD_ORDER: &[&str] = &[
 /// Collected data isn't always laid out that way, so when no account can be
 /// derived from the path this returns "unknown" rather than an empty string.
 fn account_of(path: &std::path::Path) -> String {
-    let parts: Vec<String> = path.components().map(|c| c.as_os_str().to_string_lossy().to_string()).collect();
+    let parts: Vec<String> = path
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().to_string())
+        .collect();
     for (i, p) in parts.iter().enumerate() {
         if p.eq_ignore_ascii_case("RDP_CACHE") && i + 1 < parts.len() {
             let a = parts[i + 1].trim();
-            if !a.is_empty() && !a.eq_ignore_ascii_case("Cache") { return a.to_string(); }
+            if !a.is_empty() && !a.eq_ignore_ascii_case("Cache") {
+                return a.to_string();
+            }
         }
     }
     // Fallback: the folder above a "Cache" directory.
     for (i, p) in parts.iter().enumerate() {
         if p.eq_ignore_ascii_case("Cache") && i >= 1 {
             let a = parts[i - 1].trim();
-            if !a.is_empty() { return a.to_string(); }
+            if !a.is_empty() {
+                return a.to_string();
+            }
         }
     }
     "unknown".to_string()
@@ -52,11 +72,19 @@ const BG: [u8; 3] = [16, 20, 26];
 const MIN_FRAGMENT: usize = 2;
 const MAX_EDGE_SHARE: usize = 8;
 
-struct Tile { i: usize, w: usize, h: usize, key: String, rgb: Vec<u8> }
+struct Tile {
+    i: usize,
+    w: usize,
+    h: usize,
+    key: String,
+    rgb: Vec<u8>,
+}
 
 fn hex_lower(b: &[u8]) -> String {
     let mut s = String::with_capacity(b.len() * 2);
-    for x in b { s.push_str(&format!("{:02x}", x)); }
+    for x in b {
+        s.push_str(&format!("{:02x}", x));
+    }
     s
 }
 
@@ -75,30 +103,46 @@ fn png_b64(width: usize, height: usize, rgb: &[u8]) -> String {
 fn bgra_to_rgb(bgra: &[u8], count: usize) -> Vec<u8> {
     let mut rgb = vec![0u8; count * 3];
     for i in 0..count {
-        rgb[i * 3] = bgra[i * 4 + 2];     // R
+        rgb[i * 3] = bgra[i * 4 + 2]; // R
         rgb[i * 3 + 1] = bgra[i * 4 + 1]; // G
-        rgb[i * 3 + 2] = bgra[i * 4];     // B
+        rgb[i * 3 + 2] = bgra[i * 4]; // B
     }
     rgb
 }
 
 fn decode_file(path: &Path) -> (Vec<Tile>, Vec<Row>) {
-    let src = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    let src = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
     let full = path.to_string_lossy().to_string();
     let mut tiles = Vec::new();
     let mut corrupt = Vec::new();
-    let data = match std::fs::read(path) { Ok(d) => d, Err(e) => {
-        let mut r = Row::new();
-        r.insert("kind".into(), "tile".into()); r.insert("source_file".into(), src);
-        r.insert("_source_file".into(), full); r.insert("_status".into(), "unreadable_file".into());
-        r.insert("_error".into(), e.to_string());
-        return (tiles, vec![r]);
-    }};
+    let data = match std::fs::read(path) {
+        Ok(d) => d,
+        Err(e) => {
+            let mut r = Row::new();
+            r.insert("kind".into(), "tile".into());
+            r.insert("source_file".into(), src);
+            r.insert("_source_file".into(), full);
+            r.insert("_status".into(), "unreadable_file".into());
+            r.insert("_error".into(), e.to_string());
+            return (tiles, vec![r]);
+        }
+    };
     if data.len() < 8 || &data[..8] != MAGIC {
         let mut r = Row::new();
-        r.insert("kind".into(), "tile".into()); r.insert("source_file".into(), src);
-        r.insert("_source_file".into(), full); r.insert("_status".into(), "unreadable_file".into());
-        r.insert("_error".into(), format!("not an RDP8bmp cache (magic={:?})", &data[..data.len().min(8)]));
+        r.insert("kind".into(), "tile".into());
+        r.insert("source_file".into(), src);
+        r.insert("_source_file".into(), full);
+        r.insert("_status".into(), "unreadable_file".into());
+        r.insert(
+            "_error".into(),
+            format!(
+                "not an RDP8bmp cache (magic={:?})",
+                &data[..data.len().min(8)]
+            ),
+        );
         return (tiles, vec![r]);
     }
     let n = data.len();
@@ -112,14 +156,28 @@ fn decode_file(path: &Path) -> (Vec<Tile>, Vec<Row>) {
         let px_len = width * height * 4;
         if width == 0 || height == 0 || width > MAX_DIM || height > MAX_DIM || px_off + px_len > n {
             let mut r = Row::new();
-            r.insert("kind".into(), "tile".into()); r.insert("source_file".into(), src.clone());
-            r.insert("tile_index".into(), idx.to_string()); r.insert("_source_file".into(), full.clone());
+            r.insert("kind".into(), "tile".into());
+            r.insert("source_file".into(), src.clone());
+            r.insert("tile_index".into(), idx.to_string());
+            r.insert("_source_file".into(), full.clone());
             r.insert("_status".into(), "corrupted".into());
-            r.insert("_error".into(), format!("tile {}: declared {}x{} at offset {} runs past end", idx, width, height, off));
+            r.insert(
+                "_error".into(),
+                format!(
+                    "tile {}: declared {}x{} at offset {} runs past end",
+                    idx, width, height, off
+                ),
+            );
             corrupt.push(r);
             break;
         }
-        tiles.push(Tile { i: idx, w: width, h: height, key: hex_lower(key), rgb: bgra_to_rgb(&data[px_off..px_off + px_len], width * height) });
+        tiles.push(Tile {
+            i: idx,
+            w: width,
+            h: height,
+            key: hex_lower(key),
+            rgb: bgra_to_rgb(&data[px_off..px_off + px_len], width * height),
+        });
         off = px_off + px_len;
         idx += 1;
     }
@@ -135,12 +193,16 @@ fn blit(canvas: &mut [u8], stride: usize, cx: usize, cy: usize, t: &Tile) {
 }
 fn bg_canvas(w: usize, h: usize) -> Vec<u8> {
     let mut c = vec![0u8; w * h * 3];
-    for i in 0..w * h { c[i * 3..i * 3 + 3].copy_from_slice(&BG); }
+    for i in 0..w * h {
+        c[i * 3..i * 3 + 3].copy_from_slice(&BG);
+    }
     c
 }
 
 fn mosaic_row(src: &str, full: &str, tiles: &[Tile]) -> Option<Row> {
-    if tiles.is_empty() { return None; }
+    if tiles.is_empty() {
+        return None;
+    }
     let cols = MOSAIC_COLS.min(tiles.len());
     let rows_n = (tiles.len() + cols - 1) / cols;
     let (mw, mh) = (cols * TILE, rows_n * TILE);
@@ -149,11 +211,14 @@ fn mosaic_row(src: &str, full: &str, tiles: &[Tile]) -> Option<Row> {
         blit(&mut canvas, mw * 3, (i % cols) * TILE, (i / cols) * TILE, t);
     }
     let mut r = Row::new();
-    r.insert("kind".into(), "mosaic".into()); r.insert("source_file".into(), src.into());
+    r.insert("kind".into(), "mosaic".into());
+    r.insert("source_file".into(), src.into());
     r.insert("tile_count".into(), tiles.len().to_string());
-    r.insert("width".into(), mw.to_string()); r.insert("height".into(), mh.to_string());
+    r.insert("width".into(), mw.to_string());
+    r.insert("height".into(), mh.to_string());
     r.insert("image".into(), png_b64(mw, mh, &canvas));
-    r.insert("_source_file".into(), full.into()); r.insert("_status".into(), "ok".into());
+    r.insert("_source_file".into(), full.into());
+    r.insert("_status".into(), "ok".into());
     Some(r)
 }
 
@@ -166,7 +231,9 @@ fn col_bytes(t: &Tile, x: usize) -> Vec<u8> {
     out
 }
 fn uniform(edge: &[u8]) -> bool {
-    if edge.len() < 3 { return true; }
+    if edge.len() < 3 {
+        return true;
+    }
     edge.chunks_exact(3).all(|px| px == &edge[0..3])
 }
 
@@ -180,8 +247,12 @@ fn stitch(tiles: &[Tile]) -> (Vec<Vec<usize>>, HashMap<usize, (i32, i32)>) {
         let r = col_bytes(t, t.w - 1);
         let top = t.rgb[0..t.w * 3].to_vec();
         let bot = t.rgb[(t.h - 1) * t.w * 3..t.h * t.w * 3].to_vec();
-        if !uniform(&l) { left_idx.entry((t.h, l.clone())).or_default().push(t.i); }
-        if !uniform(&top) { top_idx.entry((t.w, top.clone())).or_default().push(t.i); }
+        if !uniform(&l) {
+            left_idx.entry((t.h, l.clone())).or_default().push(t.i);
+        }
+        if !uniform(&top) {
+            top_idx.entry((t.w, top.clone())).or_default().push(t.i);
+        }
         edge.insert(t.i, (l, r, top, bot));
     }
     let mut right_of: HashMap<usize, usize> = HashMap::new();
@@ -191,13 +262,17 @@ fn stitch(tiles: &[Tile]) -> (Vec<Vec<usize>>, HashMap<usize, (i32, i32)>) {
         if !uniform(r) {
             if let Some(grp) = left_idx.get(&(t.h, r.clone())) {
                 let cand: Vec<usize> = grp.iter().copied().filter(|&x| x != t.i).collect();
-                if !cand.is_empty() && grp.len() <= MAX_EDGE_SHARE { right_of.insert(t.i, cand[0]); }
+                if !cand.is_empty() && grp.len() <= MAX_EDGE_SHARE {
+                    right_of.insert(t.i, cand[0]);
+                }
             }
         }
         if !uniform(b) {
             if let Some(grp) = top_idx.get(&(t.w, b.clone())) {
                 let cand: Vec<usize> = grp.iter().copied().filter(|&x| x != t.i).collect();
-                if !cand.is_empty() && grp.len() <= MAX_EDGE_SHARE { down_of.insert(t.i, cand[0]); }
+                if !cand.is_empty() && grp.len() <= MAX_EDGE_SHARE {
+                    down_of.insert(t.i, cand[0]);
+                }
             }
         }
     }
@@ -207,15 +282,21 @@ fn stitch(tiles: &[Tile]) -> (Vec<Vec<usize>>, HashMap<usize, (i32, i32)>) {
     let mut left_of: HashMap<usize, usize> = HashMap::new();
     let mut up_of: HashMap<usize, usize> = HashMap::new();
     for t in tiles {
-        if let Some(&r) = right_of.get(&t.i) { left_of.insert(r, t.i); }
-        if let Some(&d) = down_of.get(&t.i) { up_of.insert(d, t.i); }
+        if let Some(&r) = right_of.get(&t.i) {
+            left_of.insert(r, t.i);
+        }
+        if let Some(&d) = down_of.get(&t.i) {
+            up_of.insert(d, t.i);
+        }
     }
 
     let mut pos: HashMap<usize, (i32, i32)> = HashMap::new();
     let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
     let mut comps: Vec<Vec<usize>> = Vec::new();
     for t in tiles {
-        if seen.contains(&t.i) { continue; }
+        if seen.contains(&t.i) {
+            continue;
+        }
         pos.insert(t.i, (0, 0));
         seen.insert(t.i);
         let mut members = vec![t.i];
@@ -232,9 +313,13 @@ fn stitch(tiles: &[Tile]) -> (Vec<Vec<usize>>, HashMap<usize, (i32, i32)>) {
                 (up_of.get(&cur).copied(), (0, -1)),
             ] {
                 let Some(nid) = nid else { continue };
-                if seen.contains(&nid) { continue; }
+                if seen.contains(&nid) {
+                    continue;
+                }
                 let cell = (cx + dx, cy + dy);
-                if occupied.contains_key(&cell) { continue; }
+                if occupied.contains_key(&cell) {
+                    continue;
+                }
                 seen.insert(nid);
                 pos.insert(nid, cell);
                 occupied.insert(cell, nid);
@@ -248,18 +333,30 @@ fn stitch(tiles: &[Tile]) -> (Vec<Vec<usize>>, HashMap<usize, (i32, i32)>) {
     (comps, pos)
 }
 
-fn fragment_image(members: &[usize], pos: &HashMap<usize, (i32, i32)>, byid: &HashMap<usize, &Tile>) -> (usize, usize, usize, usize, Vec<u8>) {
+fn fragment_image(
+    members: &[usize],
+    pos: &HashMap<usize, (i32, i32)>,
+    byid: &HashMap<usize, &Tile>,
+) -> (usize, usize, usize, usize, Vec<u8>) {
     let xs: Vec<i32> = members.iter().map(|m| pos[m].0).collect();
     let ys: Vec<i32> = members.iter().map(|m| pos[m].1).collect();
     let (minx, miny) = (*xs.iter().min().unwrap(), *ys.iter().min().unwrap());
     let cols = (*xs.iter().max().unwrap() - minx + 1) as usize;
     let rows = (*ys.iter().max().unwrap() - miny + 1) as usize;
-    if cols > 200 || rows > 200 { return (0, 0, 0, 0, Vec::new()); } // cap at ~12800x12800 px to prevent OOM
+    if cols > 200 || rows > 200 {
+        return (0, 0, 0, 0, Vec::new());
+    } // cap at ~12800x12800 px to prevent OOM
     let (w, h) = (cols * TILE, rows * TILE);
     let mut canvas = bg_canvas(w, h);
     for m in members {
         let (px, py) = pos[m];
-        blit(&mut canvas, w * 3, (px - minx) as usize * TILE, (py - miny) as usize * TILE, byid[m]);
+        blit(
+            &mut canvas,
+            w * 3,
+            (px - minx) as usize * TILE,
+            (py - miny) as usize * TILE,
+            byid[m],
+        );
     }
     (cols, rows, w, h, canvas)
 }
@@ -274,15 +371,21 @@ fn tile_rows(src: &str, full: &str, tiles: &[Tile]) -> Vec<Row> {
         if members.len() >= MIN_FRAGMENT {
             frag_no += 1;
             let (cols, rowsn, w, h, rgb) = fragment_image(members, &pos, &byid);
-            if w == 0 || h == 0 { continue; } // skipped due to OOM protection
+            if w == 0 || h == 0 {
+                continue;
+            } // skipped due to OOM protection
             let mut r = Row::new();
-            r.insert("kind".into(), "fragment".into()); r.insert("source_file".into(), src.into());
+            r.insert("kind".into(), "fragment".into());
+            r.insert("source_file".into(), src.into());
             r.insert("fragment_index".into(), frag_no.to_string());
             r.insert("tile_count".into(), members.len().to_string());
-            r.insert("cols".into(), cols.to_string()); r.insert("rows".into(), rowsn.to_string());
-            r.insert("width".into(), w.to_string()); r.insert("height".into(), h.to_string());
+            r.insert("cols".into(), cols.to_string());
+            r.insert("rows".into(), rowsn.to_string());
+            r.insert("width".into(), w.to_string());
+            r.insert("height".into(), h.to_string());
             r.insert("image".into(), png_b64(w, h, &rgb));
-            r.insert("_source_file".into(), full.into()); r.insert("_status".into(), "ok".into());
+            r.insert("_source_file".into(), full.into());
+            r.insert("_status".into(), "ok".into());
             rows.push(r);
         } else {
             singles.push(members[0]);
@@ -295,32 +398,60 @@ fn tile_rows(src: &str, full: &str, tiles: &[Tile]) -> Vec<Row> {
         let t = byid[&sid];
         match uniq.get_mut(&t.rgb) {
             Some(e) => e.1 += 1,
-            None => { order.push(t.rgb.clone()); uniq.insert(t.rgb.clone(), (sid, 1)); }
+            None => {
+                order.push(t.rgb.clone());
+                uniq.insert(t.rgb.clone(), (sid, 1));
+            }
         }
     }
-    let mut items: Vec<(Vec<u8>, usize, usize)> = order.into_iter().map(|rgb| { let (id, c) = uniq[&rgb]; (rgb, id, c) }).collect();
+    let mut items: Vec<(Vec<u8>, usize, usize)> = order
+        .into_iter()
+        .map(|rgb| {
+            let (id, c) = uniq[&rgb];
+            (rgb, id, c)
+        })
+        .collect();
     items.sort_by(|a, b| b.2.cmp(&a.2)); // stable, count desc
     for (_, id, count) in items {
         let t = byid[&id];
         let mut r = Row::new();
-        r.insert("kind".into(), "tile".into()); r.insert("source_file".into(), src.into());
-        r.insert("count".into(), count.to_string()); r.insert("tile_index".into(), t.i.to_string());
-        r.insert("width".into(), t.w.to_string()); r.insert("height".into(), t.h.to_string());
-        r.insert("key".into(), t.key.clone()); r.insert("image".into(), png_b64(t.w, t.h, &t.rgb));
-        r.insert("_source_file".into(), full.into()); r.insert("_status".into(), "ok".into());
+        r.insert("kind".into(), "tile".into());
+        r.insert("source_file".into(), src.into());
+        r.insert("count".into(), count.to_string());
+        r.insert("tile_index".into(), t.i.to_string());
+        r.insert("width".into(), t.w.to_string());
+        r.insert("height".into(), t.h.to_string());
+        r.insert("key".into(), t.key.clone());
+        r.insert("image".into(), png_b64(t.w, t.h, &t.rgb));
+        r.insert("_source_file".into(), full.into());
+        r.insert("_status".into(), "ok".into());
         rows.push(r);
     }
     rows
 }
 
-pub fn parse_rdpcache(root: &Path) -> Result<Vec<Row>> {
+/// Cache files carrying the RDP bitmap signature are evidence inputs even when
+/// tile decoding yields no rows (for example, a valid but empty/corrupt cache).
+pub fn parse_rdpcache_with_sources(root: &Path) -> Result<(Vec<std::path::PathBuf>, Vec<Row>)> {
     let mut rows = Vec::new();
-    for entry in walkdir::WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
-        if !entry.file_type().is_file() { continue; }
+    let mut sources = Vec::new();
+    for entry in walkdir::WalkDir::new(root)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
         // located by content marker (like the Python find_files_by_content)
-        let raw = match std::fs::read(entry.path()) { Ok(d) => d, Err(_) => continue };
+        let raw = match std::fs::read(entry.path()) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
         let head = &raw[..raw.len().min(4096)];
-        if !head.windows(MAGIC.len()).any(|w| w == MAGIC) { continue; }
+        if !head.windows(MAGIC.len()).any(|w| w == MAGIC) {
+            continue;
+        }
+        sources.push(entry.path().to_path_buf());
         let (tiles, corrupt) = decode_file(entry.path());
         let src = entry.file_name().to_string_lossy().to_string();
         let full = entry.path().to_string_lossy().to_string();
@@ -328,11 +459,20 @@ pub fn parse_rdpcache(root: &Path) -> Result<Vec<Row>> {
         // Collect this file's rows, then stamp the account on every one so the
         // viewer can group/tag RDP cache by the user it was captured under.
         let mut file_rows: Vec<Row> = Vec::new();
-        if let Some(m) = mosaic_row(&src, &full, &tiles) { file_rows.push(m); }
+        if let Some(m) = mosaic_row(&src, &full, &tiles) {
+            file_rows.push(m);
+        }
         file_rows.extend(tile_rows(&src, &full, &tiles));
         file_rows.extend(corrupt);
-        for r in &mut file_rows { r.insert("account".into(), account.clone()); }
+        for r in &mut file_rows {
+            r.insert("account".into(), account.clone());
+        }
         rows.extend(file_rows);
     }
-    Ok(rows)
+    sources.sort();
+    Ok((sources, rows))
+}
+
+pub fn parse_rdpcache(root: &Path) -> Result<Vec<Row>> {
+    Ok(parse_rdpcache_with_sources(root)?.1)
 }

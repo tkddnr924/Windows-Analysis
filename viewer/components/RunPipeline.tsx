@@ -1,12 +1,13 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useId, useMemo, useState } from "react";
 import AddIcon from "@mui/icons-material/Add";
 import CancelOutlinedIcon from "@mui/icons-material/CancelOutlined";
 import DeleteOutlineIcon from "@mui/icons-material/DeleteOutlineOutlined";
 import DeselectIcon from "@mui/icons-material/Deselect";
 import DnsOutlinedIcon from "@mui/icons-material/DnsOutlined";
 import ErrorOutlineIcon from "@mui/icons-material/ErrorOutlineOutlined";
+import EditOutlinedIcon from "@mui/icons-material/EditOutlined";
 import ExpandLessIcon from "@mui/icons-material/ExpandLess";
 import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
 import FolderOpenOutlinedIcon from "@mui/icons-material/FolderOpenOutlined";
@@ -15,9 +16,15 @@ import PlayArrowIcon from "@mui/icons-material/PlayArrow";
 import SelectAllIcon from "@mui/icons-material/SelectAll";
 import TaskAltIcon from "@mui/icons-material/TaskAlt";
 import TimerOutlinedIcon from "@mui/icons-material/TimerOutlined";
+import NavigateBeforeOutlinedIcon from "@mui/icons-material/NavigateBeforeOutlined";
+import NavigateNextOutlinedIcon from "@mui/icons-material/NavigateNextOutlined";
 import VisibilityOutlinedIcon from "@mui/icons-material/VisibilityOutlined";
-import type { Case, Host } from "@/lib/types";
-import type { PipelineRun } from "@/lib/usePipelineRun";
+import CircularProgress from "@mui/material/CircularProgress";
+import type { Case, Host, ParseReport } from "@/lib/types";
+import { isHostReportSyncPending, selectVisibleHostReport, shouldLoadHostReport, type HostReportCacheEntry } from "@/lib/hostReportCache";
+import type { PipelineRun, PipelineRunItem } from "@/lib/usePipelineRun";
+import { formatEvidenceTimestamp } from "@/lib/timeRange";
+import { useModalDialog } from "@/lib/useModalDialog";
 
 interface RunPipelineProps {
   activeCase: Case;
@@ -58,19 +65,18 @@ const dangerButtonStyle: React.CSSProperties = {
   whiteSpace: "nowrap",
 };
 
-const successButtonStyle: React.CSSProperties = {
+const neutralButtonStyle: React.CSSProperties = {
   display: "inline-flex",
   alignItems: "center",
   justifyContent: "center",
   gap: 5,
   padding: "7px 16px",
-  background: "var(--success-subtle)",
-  color: "var(--success)",
-  border: "1px solid var(--success)",
+  background: "var(--bg-elevated)",
+  color: "var(--text)",
+  border: "1px solid var(--border)",
   borderRadius: "var(--radius-md)",
   cursor: "pointer",
   fontSize: 12.5,
-  fontWeight: 600,
   whiteSpace: "nowrap",
 };
 
@@ -87,6 +93,13 @@ const linkButtonStyle: React.CSSProperties = {
   fontWeight: 600,
 };
 
+const HOSTS_PER_PAGE = 25;
+const SLOW_RUN_SECONDS = 60;
+
+function errorMessage(error: unknown, fallback: string): string {
+  return error instanceof Error && error.message ? error.message : fallback;
+}
+
 // "45초" / "3분 12초" / "1시간 4분" from a duration in seconds.
 function formatDuration(secs: number): string {
   const s = Math.max(0, Math.round(secs));
@@ -97,10 +110,18 @@ function formatDuration(secs: number): string {
 }
 
 function StatusPill({ status }: { status: string | null }) {
-  if (status === "ok")
+  if (status === "running")
+    return <span style={statusPillStyle("var(--accent)", "var(--accent-subtle)")}><CircularProgress size={11} thickness={5} />실행 중</span>;
+  if (status === "queued")
+    return <span style={statusPillStyle("var(--text-dim)", "var(--bg-elevated)")}><TimerOutlinedIcon sx={{ fontSize: 13 }} />대기 중</span>;
+  if (status === "ok" || status === "complete")
     return <span style={statusPillStyle("var(--success)", "var(--success-subtle)")}><TaskAltIcon sx={{ fontSize: 13 }} />완료</span>;
   if (status === "error")
     return <span style={statusPillStyle("var(--danger)", "var(--danger-subtle)")}><ErrorOutlineIcon sx={{ fontSize: 13 }} />오류</span>;
+  if (status === "partial")
+    return <span style={statusPillStyle("var(--warning)", "var(--warning-subtle)")}><ErrorOutlineIcon sx={{ fontSize: 13 }} />부분 완료</span>;
+  if (status === "cancelled")
+    return <span style={statusPillStyle("var(--text-dim)", "var(--bg-elevated)")}><CancelOutlinedIcon sx={{ fontSize: 13 }} />취소됨</span>;
   return <span style={statusPillStyle("var(--text-faint)", "var(--bg-elevated)")}><TimerOutlinedIcon sx={{ fontSize: 13 }} />미실행</span>;
 }
 
@@ -144,46 +165,311 @@ function InlineParseProgress({
   );
 }
 
+function activeRunForHost(runs: PipelineRunItem[], hostId: string): PipelineRunItem | undefined {
+  // A re-run may be queued after an active invocation of the same host. Show
+  // the actually running invocation first; never let a later queued entry
+  // erase progress that is already arriving from the parser.
+  return [...runs].reverse().find((run) => run.hostId === hostId && run.status === "running")
+    ?? [...runs].reverse().find((run) => run.hostId === hostId && run.status === "queued");
+}
+
+function terminalRunForHost(runs: PipelineRunItem[], hostId: string): PipelineRunItem | undefined {
+  return [...runs].reverse().find((run) => run.hostId === hostId
+    && (run.status === "complete" || run.status === "partial" || run.status === "error" || run.status === "cancelled"));
+}
+
+function terminalStatusLabel(status: string): string {
+  if (status === "ok" || status === "complete") return "완료";
+  if (status === "partial") return "부분 완료";
+  if (status === "error") return "오류";
+  return "취소";
+}
+
+function slowestRegistryPhase(report: ParseReport): { name: string; durationMs: number; hive: NonNullable<ParseReport["registryHives"]>[number] } | null {
+  const hive = report.registryHives?.reduce<NonNullable<ParseReport["registryHives"]>[number] | null>((slowest, candidate) => {
+    const candidateDuration = candidate.buildRecoveryMs + candidate.iterationAndSqliteWriteMs;
+    const slowestDuration = slowest ? slowest.buildRecoveryMs + slowest.iterationAndSqliteWriteMs : -1;
+    return candidateDuration > slowestDuration ? candidate : slowest;
+  }, null);
+  if (!hive) return null;
+  return {
+    name: hive.sourcePath.split(/[\\/]/).pop() || "Registry hive",
+    durationMs: hive.buildRecoveryMs + hive.iterationAndSqliteWriteMs,
+    hive,
+  };
+}
+
+function RunLogDetail({ host, report }: { host: Host; report: ParseReport }) {
+  const [open, setOpen] = useState(false);
+  const [text, setText] = useState<string | null>(null);
+  const [truncated, setTruncated] = useState(false);
+  const [loaded, setLoaded] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">("idle");
+
+  if (!report.runId) return null;
+  const load = async () => {
+    setOpen(true);
+    setLoaded(false);
+    setError(null);
+    try {
+      const preview = await window.api.parseRunLog(host.dir, report.runId!);
+      setText(preview.text);
+      setTruncated(preview.truncated);
+      setLoaded(true);
+    } catch (cause) {
+      setError(errorMessage(cause, "실행 로그를 불러오지 못했습니다."));
+    }
+  };
+  const copy = async () => {
+    if (!text) return;
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopyState("copied");
+    } catch {
+      setCopyState("failed");
+    }
+  };
+
+  return <div style={{ display: "grid", gap: 5, marginTop: 2 }}>
+    <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+      <button type="button" aria-label={`${host.name} 실행 로그 ${open ? "닫기" : "보기"}`} onClick={open ? () => setOpen(false) : load} style={{ ...neutralButtonStyle, width: "fit-content", padding: "4px 8px", fontSize: 11.5 }}>{open ? "실행 로그 닫기" : "실행 로그 보기"}</button>
+      {open && text && <button type="button" onClick={copy} style={{ ...neutralButtonStyle, width: "fit-content", padding: "4px 8px", fontSize: 11.5 }}>로그 복사</button>}
+    </div>
+    {copyState === "copied" && <span role="status">로그를 복사했습니다.</span>}
+    {copyState === "failed" && <span role="alert">로그 복사에 실패했습니다.</span>}
+    {open && !loaded && !error && <span role="status">로그를 불러오는 중…</span>}
+    {error && <span role="alert" style={{ color: "var(--danger)" }}>{error} <button type="button" onClick={load} style={linkButtonStyle}>다시 시도</button></span>}
+    {open && loaded && <pre aria-label={`${host.name} 실행 로그 내용`} style={{ maxHeight: 168, overflow: "auto", margin: 0, padding: "7px 8px", background: "var(--bg-input)", border: "1px solid var(--border-subtle)", color: "var(--text-dim)", fontFamily: "var(--mono)", fontSize: 11, whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{text || "기록된 로그 행이 없습니다."}{truncated ? "\n\n… 앞부분 24KB만 표시합니다." : ""}</pre>}
+  </div>;
+}
+
+function RunOutcomeSummary({
+  host,
+  report,
+  onRetryMft,
+}: {
+  host: Host;
+  report?: ParseReport;
+  onRetryMft?: () => void;
+}) {
+  const duration = host.lastRunDurationSecs ?? 0;
+  const terminalStatus = report?.status ?? host.lastRunStatus;
+  const failed = terminalStatus === "error";
+  const partial = terminalStatus === "partial";
+  const cancelled = terminalStatus === "cancelled";
+  const mft = report?.artifacts.find((artifact) => artifact.name === "MFT");
+  const mftNoInput = mft?.status === "no_input";
+  const slow = duration >= SLOW_RUN_SECONDS;
+  if (!failed && !partial && !cancelled && !slow && !mftNoInput) return null;
+  const errors = report?.errors?.filter(Boolean) ?? [];
+  const briefErrors = errors.map((error) => error.length > 180 ? `${error.slice(0, 177)}…` : error);
+  const retryMft = report?.status === "partial" && report.artifacts.some((artifact) => artifact.name === "MFT" && artifact.status === "failed");
+  const slowestRegistry = report ? slowestRegistryPhase(report) : null;
+  const publicationText = report
+    ? report.published
+      ? `공개 결과: ${report.publishedArtifacts?.length ? report.publishedArtifacts.join(", ") : "파일 공개 완료"}`
+      : "공개 결과: 없음"
+    : null;
+  const summary = failed
+    ? briefErrors.length
+      ? `오류: ${briefErrors.join(" · ")}`
+      : "최근 실행이 오류로 종료됨"
+    : partial
+      ? briefErrors.length
+        ? `부분 완료: ${briefErrors.join(" · ")}`
+        : "일부 아티팩트가 실패함"
+      : cancelled
+        ? "실행 취소됨"
+        : mftNoInput
+          ? "MFT 원본 미수집"
+          : `긴 실행: ${formatDuration(duration)}`;
+  const summaryColor = failed ? "var(--danger)" : cancelled ? "var(--text-dim)" : "var(--warning)";
+  return <details style={{ gridColumn: "1 / -1", margin: "0 0 2px", fontSize: 11.5, color: summaryColor }}>
+    <summary style={{ cursor: "pointer", width: "fit-content" }}>{summary} · 상세</summary>
+    {report && <div style={{ marginTop: 5, color: "var(--text-dim)" }}>실행 상태: {terminalStatus === "partial" ? "부분 완료" : terminalStatus === "error" ? "오류" : terminalStatus} · {publicationText}</div>}
+    <div style={{ display: "grid", gap: 3, marginTop: 6, padding: "7px 9px", color: "var(--text-dim)", borderLeft: `2px solid ${summaryColor}` }}>
+      {slow && <span>총 소요: {formatDuration(duration)}</span>}
+      {report?.registryRecovery?.mode === "disabled" ? (
+        <span>레지스트리 복구 기능 미적용 · 삭제 셀 및 트랜잭션 로그는 이번 실행에 적용하지 않았습니다.</span>
+      ) : slowestRegistry ? (
+        <span>가장 긴 Registry hive: {slowestRegistry.name} · 복구/빌드 {formatDuration(slowestRegistry.hive.buildRecoveryMs / 1000)} · 레코드 순회·SQLite 기록 {formatDuration(slowestRegistry.hive.iterationAndSqliteWriteMs / 1000)} · 레코드 {slowestRegistry.hive.rowCount.toLocaleString()}건 · 트랜잭션 로그 {slowestRegistry.hive.recoveryLogCount.toLocaleString()}개 · 복구 레코드 {slowestRegistry.hive.recoveredRowCount.toLocaleString()}건</span>
+      ) : null}
+      {report?.registryRecovery?.mode === "disabled" && report.registryHives?.some((hive) => (hive.recoveryLogsDiscovered ?? 0) > 0) && (
+        <span>트랜잭션 로그 발견 · 미적용</span>
+      )}
+      {mft?.status === "no_input" && <span>MFT: 원본 $MFT 파일 미수집 · 이번 실행에서는 결과를 만들지 않았습니다.</span>}
+      {mft?.status === "failed" && <span>MFT: 파싱 실패 · MFT 결과는 공개되지 않았습니다.</span>}
+      {briefErrors.map((error) => <span key={error}>오류: {error}</span>)}
+      {report && <RunLogDetail host={host} report={report} />}
+      {retryMft && onRetryMft && <button type="button" onClick={onRetryMft} style={{ ...neutralButtonStyle, width: "fit-content", padding: "4px 8px", fontSize: 11.5 }}>MFT만 재시도</button>}
+      {!report && <span>세부 보고서를 불러오는 중이거나 이전 실행에는 구조화된 보고서가 없습니다.</span>}
+    </div>
+  </details>;
+}
+
+function RenameHostDialog({
+  value,
+  saving,
+  error,
+  onChange,
+  onClose,
+  onSave,
+}: {
+  value: string;
+  saving: boolean;
+  error: string | null;
+  onChange: (value: string) => void;
+  onClose: () => void;
+  onSave: () => void;
+}) {
+  const titleId = useId();
+  const dialogRef = useModalDialog(onClose);
+  return <div onClick={onClose} style={{ position: "fixed", inset: 0, zIndex: 1400, display: "grid", placeItems: "center", padding: 18, background: "rgba(0, 0, 0, 0.46)" }}>
+    <div ref={dialogRef} role="dialog" aria-modal="true" aria-labelledby={titleId} tabIndex={-1} onClick={(event) => event.stopPropagation()} className="dfir-surface" style={{ width: "min(420px, 100%)", padding: 18 }}>
+      <form onSubmit={(event) => { event.preventDefault(); onSave(); }}>
+      <h2 id={titleId} style={{ margin: "0 0 6px", fontSize: 15 }}>호스트 이름 변경</h2>
+      <p style={{ margin: "0 0 14px", color: "var(--text-dim)", fontSize: 12.5 }}>표시 이름만 바뀝니다. 수집 원본, 결과, 북마크 경로는 변경되지 않습니다.</p>
+      <label style={{ display: "grid", gap: 6, fontSize: 12, color: "var(--text-dim)" }}>호스트 이름
+        <input data-dialog-autofocus value={value} onChange={(event) => onChange(event.target.value)} disabled={saving} style={{ padding: "8px 10px", background: "var(--bg-input)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", color: "var(--text)" }} />
+      </label>
+      {error && <div role="alert" style={{ marginTop: 9, color: "var(--danger)", fontSize: 12 }}>{error}</div>}
+        <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 16 }}>
+          <button type="button" onClick={onClose} disabled={saving} style={{ ...linkButtonStyle, marginLeft: 0 }}>취소</button>
+          <button type="submit" disabled={saving || !value.trim()} style={{ ...primaryButtonStyle, opacity: saving || !value.trim() ? .5 : 1 }}>{saving ? "저장 중" : "변경"}</button>
+        </div>
+      </form>
+    </div>
+  </div>;
+}
+
 export default function RunPipeline({ activeCase, onChanged, onOpenHost, run }: RunPipelineProps) {
   const hosts = activeCase.hosts;
 
   const [newHostName, setNewHostName] = useState("");
   const [newHostTarget, setNewHostTarget] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
+  const [formError, setFormError] = useState<string | null>(null);
 
   const [artifacts, setArtifacts] = useState<string[]>([]);
+  const [artifactLoading, setArtifactLoading] = useState(true);
+  const [artifactLoadAttempt, setArtifactLoadAttempt] = useState(0);
   const [selectedArtifacts, setSelectedArtifacts] = useState<Set<string>>(new Set());
-  const [artifactListExpanded, setArtifactListExpanded] = useState(false);
+  const [artifactControlsExpanded, setArtifactControlsExpanded] = useState(false);
+  const [artifactError, setArtifactError] = useState<string | null>(null);
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
   const [deleting, setDeleting] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [hostQuery, setHostQuery] = useState("");
+  const [hostPage, setHostPage] = useState(0);
+  const [renameHost, setRenameHost] = useState<Host | null>(null);
+  const [renameName, setRenameName] = useState("");
+  const [renaming, setRenaming] = useState(false);
+  const [renameError, setRenameError] = useState<string | null>(null);
+  const [reportsByHost, setReportsByHost] = useState<Record<string, HostReportCacheEntry<ParseReport>>>({});
 
   // The parse state (runningHostId, logs, progress, …) lives in the `run` hook
   // hoisted to Home so it survives navigating away mid-parse.
-  const { runningHostId, currentArtifact, totalSteps, completedSteps, percent, stepLabel, runComplete, completedHostId, failedArtifacts } = run;
+  const { runningHostId, currentArtifact, runs } = run;
+  const hasActiveRuns = runs.some((entry) => entry.status === "queued" || entry.status === "running");
+  const runsByHost = useMemo(() => new Map(hosts.map((host) => [host.id, activeRunForHost(runs, host.id)])), [hosts, runs]);
+  const terminalRunsByHost = useMemo(() => new Map(hosts.map((host) => [host.id, terminalRunForHost(runs, host.id)])), [hosts, runs]);
 
   useEffect(() => {
+    let cancelled = false;
+    setArtifactLoading(true);
+    setArtifactError(null);
     window.api.listArtifacts().then((names) => {
+      if (cancelled) return;
       setArtifacts(names);
       setSelectedArtifacts(new Set(names));
+      setArtifactLoading(false);
+    }).catch((error) => {
+      if (!cancelled) {
+        setArtifactError(errorMessage(error, "아티팩트 목록을 불러오지 못했습니다."));
+        setArtifactLoading(false);
+      }
     });
-  }, []);
+    return () => { cancelled = true; };
+  }, [artifactLoadAttempt]);
+
+  const filteredHosts = hosts.filter((host) => {
+    const query = hostQuery.trim().toLocaleLowerCase();
+    return !query || host.name.toLocaleLowerCase().includes(query) || host.targetDir.toLocaleLowerCase().includes(query);
+  });
+  const pageCount = Math.max(1, Math.ceil(filteredHosts.length / HOSTS_PER_PAGE));
+  const pageStart = hostPage * HOSTS_PER_PAGE;
+  const visibleHosts = filteredHosts.slice(pageStart, pageStart + HOSTS_PER_PAGE);
+  const visibleHostRunStamp = visibleHosts.map((host) => {
+    const active = activeRunForHost(runs, host.id);
+    return `${host.id}:${host.lastRunAt ?? ""}:${active?.runId ?? ""}`;
+  }).join("|");
+
+  useEffect(() => {
+    setHostPage((page) => Math.min(page, pageCount - 1));
+  }, [pageCount]);
+
+  useEffect(() => {
+    let cancelled = false;
+    // The small immutable manifest, not the historical host status alone,
+    // tells us whether this exact run made a coherent result visible. A host
+    // may start a new run while an old-manifest request is in flight; cache
+    // each response against the host's persisted terminal timestamp so that
+    // old unpublished state cannot survive the next terminal refresh.
+    // Do not read the prior terminal manifest while this host has a queued or
+    // running worker. Its old publication flag is not evidence about the
+    // current attempt and would be cached before the terminal host refresh.
+    const reportHosts = visibleHosts.filter((host) => !!host.lastRunAt && !activeRunForHost(runs, host.id));
+    const stale = reportHosts.filter((host) => shouldLoadHostReport(
+      reportsByHost[host.id],
+      host.lastRunAt,
+      Boolean(activeRunForHost(runs, host.id)),
+      reportsByHost[host.id]?.report?.runId,
+      terminalRunForHost(runs, host.id)?.runId,
+    ));
+    if (!stale.length) return () => { cancelled = true; };
+    void Promise.all(stale.map(async (host) => {
+      let report: ParseReport | null = null;
+      try {
+        report = await window.api.parseReport(host.dir);
+      } catch {
+        // A legacy/unreadable manifest is distinct from a parse failure. Keep
+        // the host lifecycle state, but mark this exact timestamp as fetched.
+      }
+      return [host.id, { hostRunAt: host.lastRunAt!, report }] as const;
+    }))
+      .then((entries) => {
+        if (cancelled) return;
+        setReportsByHost((previous) => ({ ...previous, ...Object.fromEntries(entries) }));
+      })
+      .catch(() => undefined);
+    return () => { cancelled = true; };
+  }, [reportsByHost, runs, visibleHostRunStamp]);
 
   async function pickTarget() {
-    const dir = await window.api.pickFolder();
-    if (!dir) return;
-    setNewHostTarget(dir);
-    const suggestedName = folderName(dir);
-    if (suggestedName) setNewHostName(suggestedName);
+    setFormError(null);
+    try {
+      const dir = await window.api.pickFolder();
+      if (!dir) return;
+      setNewHostTarget(dir);
+      const suggestedName = folderName(dir);
+      if (suggestedName) setNewHostName(suggestedName);
+    } catch (error) {
+      setFormError(errorMessage(error, "수집 데이터 폴더를 선택하지 못했습니다."));
+    }
   }
 
   async function handleAddHost() {
     if (!newHostName.trim() || !newHostTarget) return;
     setCreating(true);
+    setFormError(null);
     try {
       await window.api.createHost(activeCase.id, newHostName.trim(), newHostTarget);
       setNewHostName("");
       setNewHostTarget(null);
       onChanged();
+    } catch (error) {
+      setFormError(errorMessage(error, "호스트를 등록하지 못했습니다."));
     } finally {
       setCreating(false);
     }
@@ -201,29 +487,94 @@ export default function RunPipeline({ activeCase, onChanged, onOpenHost, run }: 
   function handleRun(hostId: string) {
     const host = hosts.find((h) => h.id === hostId);
     const only = selectedArtifacts.size === artifacts.length ? undefined : Array.from(selectedArtifacts);
+    setReportsByHost((previous) => {
+      const next = { ...previous };
+      delete next[hostId];
+      return next;
+    });
     // run.start awaits the child process and refreshes the case list (Home's
     // onDone) on completion — so the host list here updates without onChanged.
     run.start({ caseId: activeCase.id, hostId, hostName: host?.name ?? "", only, totalArtifacts: artifacts.length });
   }
 
-  function handleCancel() {
-    run.cancel();
+  function handleRetryMft(hostId: string) {
+    const host = hosts.find((item) => item.id === hostId);
+    if (!host) return;
+    setReportsByHost((previous) => {
+      const next = { ...previous };
+      delete next[hostId];
+      return next;
+    });
+    run.start({
+      caseId: activeCase.id,
+      hostId,
+      hostName: host.name,
+      only: ["MFT"],
+      totalArtifacts: 1,
+    });
   }
 
-  // Parse every host in the case, one after another (run.start resolves when a
-  // host finishes). The global progress bar tracks whichever host is running.
+  function handleCancel() {
+    // This is the sole whole-queue cancellation path.  It derives from the
+    // hoisted run state, so returning to this screen cannot lose the control.
+    if (hasActiveRuns) void window.api.cancelPipeline(undefined, true);
+  }
+
+  function handleCancelRun(runId: string) {
+    void run.cancel(runId);
+  }
+
+  function openRename(host: Host) {
+    setRenameHost(host);
+    setRenameName(host.name);
+    setRenameError(null);
+  }
+
+  async function handleRenameHost() {
+    if (!renameHost) return;
+    const nextName = renameName.trim();
+    if (!nextName) {
+      setRenameError("호스트 이름을 입력하세요.");
+      return;
+    }
+    if (hosts.some((host) => host.id !== renameHost.id && host.name.localeCompare(nextName, undefined, { sensitivity: "accent" }) === 0)) {
+      setRenameError("같은 이름의 호스트가 이미 등록되어 있습니다.");
+      return;
+    }
+    setRenaming(true);
+    setRenameError(null);
+    try {
+      await window.api.renameHost(activeCase.id, renameHost.id, nextName);
+      setRenameHost(null);
+      onChanged();
+    } catch (error) {
+      setRenameError(errorMessage(error, "호스트 이름을 변경하지 못했습니다."));
+    } finally {
+      setRenaming(false);
+    }
+  }
+
+  // Submit all runs. The backend owns the max-2 scheduling and the immutable
+  // run ids, so this component cannot advance a hidden local queue on unmount.
   async function handleRunAll() {
     const only = selectedArtifacts.size === artifacts.length ? undefined : Array.from(selectedArtifacts);
-    for (const h of hosts) {
-      await run.start({ caseId: activeCase.id, hostId: h.id, hostName: h.name, only, totalArtifacts: artifacts.length });
-    }
+    await Promise.all(hosts.map((h) => run.start({
+      caseId: activeCase.id,
+      hostId: h.id,
+      hostName: h.name,
+      only,
+      totalArtifacts: artifacts.length,
+    })));
   }
 
   async function handleDelete(hostId: string) {
     setDeleting(true);
+    setActionError(null);
     try {
       await window.api.deleteHost(activeCase.id, hostId);
       onChanged();
+    } catch (error) {
+      setActionError(errorMessage(error, "호스트를 삭제하지 못했습니다."));
     } finally {
       setDeleting(false);
       setConfirmDeleteId(null);
@@ -231,30 +582,32 @@ export default function RunPipeline({ activeCase, onChanged, onOpenHost, run }: 
   }
 
   return (
-    <div className="dfir-view" style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", padding: "42px 32px 28px", gap: 22, overflow: "hidden", maxWidth: 1120, margin: "0 auto", width: "100%" }}>
-      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-        <span className="dfir-page-title">호스트 등록</span>
-        <span className="dfir-tag" style={{ display: "inline-flex", alignItems: "center", gap: 4 }}><DnsOutlinedIcon sx={{ fontSize: 14 }} />등록된 호스트 {hosts.length}개</span>
-      </div>
+    <div className="dfir-view" style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", padding: "18px 20px", gap: 12, overflow: "hidden", width: "100%" }}>
+      <header style={{ display: "flex", alignItems: "center", gap: 9, minHeight: 30, flexShrink: 0 }}>
+        <strong className="dfir-page-title" style={{ fontSize: 17 }}>호스트 등록</strong>
+    <span style={{ color: "var(--text-faint)", fontSize: 12 }}>등록된 호스트의 증거 원본과 파싱 상태를 관리합니다.</span>
+        <span style={{ display: "inline-flex", alignItems: "center", gap: 4, marginLeft: "auto", color: "var(--text-dim)", fontSize: 12 }}><DnsOutlinedIcon sx={{ fontSize: 16 }} />{hosts.length.toLocaleString()}개 등록됨</span>
+      </header>
 
       {/* add host */}
-      <section className="dfir-surface" style={{ padding: 22 }}>
-        <div className="dfir-section-label" style={{ marginBottom: 7 }}>EVIDENCE SOURCE</div>
-        <h3 style={{ margin: "0 0 14px", fontSize: 16 }}>새 호스트 추가</h3>
+      <section className="dfir-surface" aria-labelledby="add-host-title" style={{ padding: "13px 14px", flexShrink: 0 }}>
+        <h2 id="add-host-title" style={{ margin: "0 0 10px", fontSize: 13.5 }}>새 호스트 추가</h2>
         <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
           <input
+            aria-label="호스트 이름"
             placeholder="호스트 이름 (예: WEB-01)"
             value={newHostName}
             onChange={(e) => setNewHostName(e.target.value)}
             style={{ padding: "7px 10px", background: "var(--bg-input)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", color: "var(--text)", minWidth: 180 }}
           />
-          <button onClick={pickTarget} style={{ display: "inline-flex", alignItems: "center", gap: 5, padding: "7px 12px", background: "var(--bg-elevated)", color: "var(--text)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", cursor: "pointer" }}>
+          <button type="button" onClick={pickTarget} style={{ display: "inline-flex", alignItems: "center", gap: 5, padding: "7px 12px", background: "var(--bg-elevated)", color: "var(--text)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", cursor: "pointer" }}>
             <FolderOpenOutlinedIcon sx={{ fontSize: 16 }} />수집 데이터 폴더
           </button>
           <span style={{ fontSize: 12, color: "var(--text-dim)", maxWidth: 340, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={newHostTarget ?? ""}>
             {newHostTarget ?? "선택 안 됨"}
           </span>
           <button
+            type="button"
             onClick={handleAddHost}
             disabled={creating || !newHostName.trim() || !newHostTarget}
             style={{ ...primaryButtonStyle, marginLeft: "auto", opacity: creating || !newHostName.trim() || !newHostTarget ? 0.5 : 1 }}
@@ -262,124 +615,124 @@ export default function RunPipeline({ activeCase, onChanged, onOpenHost, run }: 
             <AddIcon sx={{ fontSize: 16 }} />호스트 추가
           </button>
         </div>
+        {formError && <div role="alert" style={{ marginTop: 9, color: "var(--danger)", fontSize: 12 }}>{formError}</div>}
       </section>
 
       {/* artifact selection */}
-      {artifacts.length > 0 && (
-        <section className="dfir-surface" style={{ padding: 22 }}>
-          <div style={{ fontSize: 13, marginBottom: 10, display: "flex", alignItems: "center" }}>
-            <span style={{ fontWeight: 700 }}>실행할 아티팩트</span>
-            <span className="dfir-tag" style={{ marginLeft: 4, display: "inline-flex", alignItems: "center", gap: 4 }}><MemoryOutlinedIcon sx={{ fontSize: 14 }} />{selectedArtifacts.size}/{artifacts.length}</span>
-            <button onClick={() => setSelectedArtifacts(new Set(artifacts))} disabled={!!runningHostId} style={linkButtonStyle}><SelectAllIcon sx={{ fontSize: 14 }} />전체 선택</button>
-            <button onClick={() => setSelectedArtifacts(new Set())} disabled={!!runningHostId} style={linkButtonStyle}><DeselectIcon sx={{ fontSize: 14 }} />전체 해제</button>
-            <button onClick={() => setArtifactListExpanded((expanded) => !expanded)} style={linkButtonStyle}>
-              {artifactListExpanded ? <ExpandLessIcon sx={{ fontSize: 15 }} /> : <ExpandMoreIcon sx={{ fontSize: 15 }} />}{artifactListExpanded ? "접기" : "펼치기"}
-            </button>
+      <section className="dfir-surface" aria-labelledby="artifact-select-title" style={{ padding: "12px 14px", flexShrink: 0 }}>
+        <div style={{ fontSize: 13, display: "flex", alignItems: "center" }}>
+          <span id="artifact-select-title" style={{ fontWeight: 700 }}>실행할 아티팩트</span>
+          {!artifactLoading && <span className="dfir-tag" style={{ marginLeft: 4, display: "inline-flex", alignItems: "center", gap: 4 }}><MemoryOutlinedIcon sx={{ fontSize: 14 }} />{selectedArtifacts.size}/{artifacts.length}</span>}
+          {artifactLoading ? <span role="status" style={{ display: "inline-flex", alignItems: "center", gap: 6, marginLeft: 8, color: "var(--text-faint)", fontSize: 11.5 }}><CircularProgress size={13} thickness={5} />아티팩트 목록 확인 중</span> : <button type="button" onClick={() => setArtifactControlsExpanded((expanded) => !expanded)} aria-expanded={artifactControlsExpanded} aria-controls="artifact-selection-options" style={{ ...linkButtonStyle, marginLeft: "auto" }}>{artifactControlsExpanded ? <ExpandLessIcon sx={{ fontSize: 15 }} /> : <ExpandMoreIcon sx={{ fontSize: 15 }} />}{artifactControlsExpanded ? "접기" : "선택 변경"}</button>}
+        </div>
+        {artifactControlsExpanded && artifacts.length > 0 && <>
+          <div style={{ fontSize: 13, marginTop: 10, marginBottom: 10, display: "flex", alignItems: "center" }}>
+            <button type="button" onClick={() => setSelectedArtifacts(new Set(artifacts))} disabled={hasActiveRuns} style={linkButtonStyle}><SelectAllIcon sx={{ fontSize: 14 }} />전체 선택</button>
+            <button type="button" onClick={() => setSelectedArtifacts(new Set())} disabled={hasActiveRuns} style={linkButtonStyle}><DeselectIcon sx={{ fontSize: 14 }} />전체 해제</button>
           </div>
-          {artifactListExpanded && (
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(130px, 1fr))", gap: 8 }}>
-              {artifacts.map((name) => {
-                const isCurrent = currentArtifact === name;
-                const checked = selectedArtifacts.has(name);
-                return (
-                  <button
-                    key={name}
-                    type="button"
-                    aria-pressed={checked}
-                    onClick={() => toggleArtifact(name)}
-                    disabled={!!runningHostId}
-                    style={{ display: "flex", alignItems: "center", minWidth: 0, padding: "7px 12px", border: `1px solid ${isCurrent || checked ? "color-mix(in srgb, var(--accent) 58%, var(--border))" : "var(--border-subtle)"}`, borderRadius: "var(--radius-md)", fontSize: 12.5, cursor: runningHostId ? "default" : "pointer", background: isCurrent ? "color-mix(in srgb, var(--accent) 20%, var(--bg-elevated))" : checked ? "var(--accent-subtle)" : "color-mix(in srgb, var(--bg-input) 72%, var(--bg))", color: checked ? "var(--accent)" : "var(--text-faint)", fontWeight: checked ? 650 : 500, textAlign: "left", opacity: runningHostId && !isCurrent ? 0.62 : 1 }}
-                  >
-                    {name}
-                  </button>
-                );
-              })}
-            </div>
-          )}
-        </section>
-      )}
-
-      {/* host list */}
-      <section style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0 }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 10, margin: "0 0 10px" }}>
-          <h3 style={{ margin: 0, fontSize: 13.5 }}>호스트 목록</h3>
-          {hosts.length > 1 && (
-            <button
-              onClick={handleRunAll}
-              disabled={!!runningHostId || selectedArtifacts.size === 0}
-              title="이 케이스의 모든 호스트를 순서대로 파싱"
-              style={{ ...primaryButtonStyle, padding: "5px 12px", fontSize: 12, opacity: !!runningHostId || selectedArtifacts.size === 0 ? 0.5 : 1 }}
-            >
-              <PlayArrowIcon sx={{ fontSize: 15 }} />전체 파싱 ({hosts.length})
-            </button>
-          )}
-        </div>
-        <div style={{ display: "flex", flexDirection: "column", gap: 10, overflow: "auto", flex: 1, minHeight: 0, paddingRight: 4 }}>
-          {hosts.length === 0 && (
-            <div style={{ padding: 24, textAlign: "center", color: "var(--text-faint)", border: "1px dashed var(--border)", borderRadius: "var(--radius-lg)" }}>
-              등록된 호스트가 없습니다. 위에서 호스트를 추가하세요.
-            </div>
-          )}
-          {hosts.map((h) => (
-            <div key={h.id} className="dfir-surface" style={{ overflow: "hidden" }}>
-            <div style={{ display: "flex", alignItems: "center", gap: 14, padding: "16px 18px" }}>
-              <div style={{ flex: 1, minWidth: 0 }}>
-                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                  <span style={{ fontWeight: 700, fontSize: 13.5 }}>{h.name}</span>
-                  <StatusPill status={h.lastRunStatus} />
-                  {(h.lastRunStatus === "ok" || h.lastRunStatus === "error") && h.lastRunDurationSecs != null && (
-                    <span
-                      title="마지막 파싱 소요 시간"
-                      style={{ fontSize: 11, fontWeight: 600, color: "var(--accent)", background: "var(--accent-subtle, var(--bg-elevated))", padding: "2px 8px", borderRadius: "var(--radius-lg)" }}
-                    >
-                      {formatDuration(h.lastRunDurationSecs)} 소요
-                    </span>
-                  )}
-                </div>
-                <div style={{ fontSize: 11.5, color: "var(--text-faint)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", marginTop: 3 }} title={h.targetDir}>
-                  {h.targetDir}
-                </div>
-                {h.lastRunAt && <div style={{ fontSize: 11.5, color: "var(--text-faint)", marginTop: 2 }}>마지막 실행: {h.lastRunAt}</div>}
-              </div>
-              {confirmDeleteId === h.id ? (
-                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                  <span style={{ fontSize: 12, color: "var(--danger)" }}>분석 결과와 해당 호스트의 북마크가 삭제됩니다.</span>
-                  <button onClick={() => handleDelete(h.id)} disabled={deleting} style={{ ...dangerButtonStyle, opacity: deleting ? 0.5 : 1 }}><DeleteOutlineIcon sx={{ fontSize: 15 }} />삭제</button>
-                  <button onClick={() => setConfirmDeleteId(null)} disabled={deleting} style={{ display: "inline-flex", alignItems: "center", gap: 5, padding: "7px 12px", background: "var(--bg-elevated)", color: "var(--text)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", cursor: "pointer", fontSize: 12.5 }}><CancelOutlinedIcon sx={{ fontSize: 15 }} />취소</button>
-                </div>
-              ) : (
-                <>
-                  {runningHostId === h.id ? (
-                    <button onClick={handleCancel} style={dangerButtonStyle}><CancelOutlinedIcon sx={{ fontSize: 15 }} />취소</button>
-                  ) : (
-                    <button onClick={() => handleRun(h.id)} disabled={!!runningHostId || selectedArtifacts.size === 0} style={{ ...primaryButtonStyle, opacity: !!runningHostId || selectedArtifacts.size === 0 ? 0.5 : 1 }}>
-                      <PlayArrowIcon sx={{ fontSize: 16 }} />파싱
-                    </button>
-                  )}
-                  {(h.lastRunStatus === "ok" || h.lastRunStatus === "error") && (
-                    <button onClick={() => onOpenHost(h)} style={successButtonStyle}><VisibilityOutlinedIcon sx={{ fontSize: 16 }} />결과 보기</button>
-                  )}
-                  <button onClick={() => setConfirmDeleteId(h.id)} disabled={!!runningHostId} title="호스트 삭제 (분석 결과만, 원본 수집 데이터는 유지)" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", padding: "7px 10px", background: "transparent", color: "var(--text-faint)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", cursor: runningHostId ? "default" : "pointer", fontSize: 12.5, opacity: runningHostId ? 0.4 : 1 }}><DeleteOutlineIcon sx={{ fontSize: 16 }} /></button>
-                </>
-              )}
-            </div>
-            {runningHostId === h.id && (
-              <InlineParseProgress
-                stepLabel={stepLabel}
-                percent={percent}
-                completedSteps={completedSteps}
-                totalSteps={totalSteps}
-              />
-            )}
-            {runComplete && completedHostId === h.id && failedArtifacts.length > 0 && (
-              <div style={{ padding: "8px 18px 16px", color: "var(--danger)", fontSize: 12.5, fontWeight: 650 }}>
-                파싱 실패: {failedArtifacts.join(", ")}
-              </div>
-            )}
-            </div>
-          ))}
-        </div>
+          <div id="artifact-selection-options" style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(130px, 1fr))", gap: 8, maxHeight: 260, overflow: "auto", paddingRight: 4 }}>{artifacts.map((name) => {
+            const isCurrent = currentArtifact === name;
+            const checked = selectedArtifacts.has(name);
+            return <button key={name} type="button" aria-pressed={checked} onClick={() => toggleArtifact(name)} disabled={hasActiveRuns} style={{ display: "flex", alignItems: "center", minWidth: 0, padding: "7px 12px", border: `1px solid ${isCurrent || checked ? "color-mix(in srgb, var(--accent) 58%, var(--border))" : "var(--border-subtle)"}`, borderRadius: "var(--radius-md)", fontSize: 12.5, cursor: hasActiveRuns ? "default" : "pointer", background: isCurrent ? "color-mix(in srgb, var(--accent) 20%, var(--bg-elevated))" : checked ? "var(--accent-subtle)" : "color-mix(in srgb, var(--bg-input) 72%, var(--bg))", color: checked ? "var(--accent)" : "var(--text-faint)", fontWeight: checked ? 650 : 500, textAlign: "left", opacity: hasActiveRuns && !isCurrent ? .62 : 1 }}>{name}</button>;
+          })}</div>
+        </>}
+        {!artifactLoading && !artifactError && artifacts.length === 0 && <div role="status" style={{ marginTop: 8, color: "var(--warning)", fontSize: 12 }}>실행 가능한 아티팩트가 없습니다. 파싱을 시작할 수 없습니다.</div>}
+        {artifactError && <div role="alert" style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 9, color: "var(--danger)", fontSize: 12 }}>{artifactError}<button type="button" onClick={() => setArtifactLoadAttempt((attempt) => attempt + 1)} style={{ ...linkButtonStyle, marginLeft: 0 }}>다시 시도</button></div>}
       </section>
+
+      {/* Host ledger is intentionally the only independently scrolling region. */}
+      <section className="dfir-surface host-ledger-surface" aria-labelledby="host-ledger-title" style={{ flex: "1 1 0", minHeight: 0, display: "flex", flexDirection: "column", overflow: "hidden", containerType: "inline-size" }}>
+        <div className="host-ledger-toolbar" style={{ display: "flex", alignItems: "center", gap: 9, padding: "11px 14px", borderBottom: "1px solid var(--border)", flexShrink: 0 }}>
+          <h2 id="host-ledger-title" style={{ margin: 0, fontSize: 13.5 }}>등록 호스트</h2>
+          <span style={{ color: "var(--text-faint)", fontSize: 11.5 }}>{filteredHosts.length.toLocaleString()}개 표시</span>
+          {runs.some((entry) => entry.status === "queued" || entry.status === "running") && <span aria-live="polite" style={{ display: "inline-flex", alignItems: "center", gap: 5, color: "var(--text-dim)", fontSize: 11.5, whiteSpace: "nowrap" }}><CircularProgress size={13} thickness={5} />{runs.filter((entry) => entry.status === "running").length}개 실행 · {runs.filter((entry) => entry.status === "queued").length}개 대기</span>}
+          <input className="host-ledger-search" aria-label="호스트 또는 증거 경로 검색" value={hostQuery} onChange={(event) => { setHostQuery(event.target.value); setHostPage(0); }} placeholder="호스트·증거 경로 검색" style={{ width: 230, marginLeft: "auto", padding: "6px 9px", background: "var(--bg-input)", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", color: "var(--text)", fontSize: 12 }} />
+          {hasActiveRuns ? <button type="button" onClick={handleCancel} style={{ ...dangerButtonStyle, padding: "5px 10px", fontSize: 12 }}><CancelOutlinedIcon sx={{ fontSize: 15 }} />전체 실행·대기 항목 중지</button> : hosts.length > 1 && <button type="button" onClick={handleRunAll} disabled={selectedArtifacts.size === 0} style={{ ...primaryButtonStyle, padding: "5px 10px", fontSize: 12, opacity: selectedArtifacts.size === 0 ? 0.5 : 1 }}><PlayArrowIcon sx={{ fontSize: 15 }} />전체 파싱</button>}
+        </div>
+        {actionError && <div role="alert" style={{ padding: "8px 14px", borderBottom: "1px solid color-mix(in srgb, var(--danger) 45%, var(--border))", background: "color-mix(in srgb, var(--danger) 7%, var(--bg-panel))", color: "var(--danger)", fontSize: 12 }}>{actionError}</div>}
+        <div style={{ flex: 1, minHeight: 0, overflow: "auto" }}>
+          <div>
+            <div className="host-ledger-heading" aria-hidden="true"><span>호스트 · 상태</span><span>증거 경로</span><span>마지막 실행</span><span>작업</span></div>
+            {hosts.length === 0 && <div role="status" style={{ padding: 28, textAlign: "center", color: "var(--text-faint)", fontSize: 12.5 }}>등록된 호스트가 없습니다. 위에서 증거 폴더를 선택해 추가하세요.</div>}
+            {hosts.length > 0 && visibleHosts.length === 0 && <div role="status" style={{ padding: 28, textAlign: "center", color: "var(--text-faint)", fontSize: 12.5 }}>검색 조건과 일치하는 호스트가 없습니다.</div>}
+            {visibleHosts.map((host) => {
+              const activeRun = runsByHost.get(host.id);
+              const terminalRun = terminalRunsByHost.get(host.id);
+              const cached = reportsByHost[host.id];
+              const report = selectVisibleHostReport(cached, host.lastRunAt, Boolean(activeRun), terminalRun?.runId);
+              const reportSyncPending = isHostReportSyncPending(cached, host.lastRunAt, Boolean(activeRun), terminalRun?.runId);
+              return <HostLedgerRow key={host.id} host={host} report={report} reportSyncPending={reportSyncPending} activeRun={activeRun} terminalRun={terminalRun} hasActiveRuns={hasActiveRuns} selectedArtifacts={selectedArtifacts.size} confirmDeleteId={confirmDeleteId} deleting={deleting} onRun={handleRun} onRetryMft={handleRetryMft} onCancel={handleCancelRun} onOpenHost={onOpenHost} onConfirmDelete={setConfirmDeleteId} onDelete={handleDelete} onRename={openRename} />;
+            })}
+          </div>
+        </div>
+        {filteredHosts.length > HOSTS_PER_PAGE && <nav aria-label="호스트 목록 페이지" style={{ display: "flex", justifyContent: "flex-end", alignItems: "center", gap: 7, padding: "8px 14px", borderTop: "1px solid var(--border)", flexShrink: 0 }}><span style={{ marginRight: 4, color: "var(--text-faint)", fontSize: 11.5 }}>{pageStart + 1}–{Math.min(pageStart + HOSTS_PER_PAGE, filteredHosts.length)} / {filteredHosts.length}</span><button type="button" aria-label="이전 호스트 페이지" onClick={() => setHostPage((page) => Math.max(0, page - 1))} disabled={hostPage === 0} style={{ ...linkButtonStyle, marginLeft: 0, opacity: hostPage === 0 ? .35 : 1 }}><NavigateBeforeOutlinedIcon sx={{ fontSize: 17 }} /></button><span style={{ color: "var(--text-dim)", fontSize: 11.5 }}>{hostPage + 1} / {pageCount}</span><button type="button" aria-label="다음 호스트 페이지" onClick={() => setHostPage((page) => Math.min(pageCount - 1, page + 1))} disabled={hostPage >= pageCount - 1} style={{ ...linkButtonStyle, marginLeft: 0, opacity: hostPage >= pageCount - 1 ? .35 : 1 }}><NavigateNextOutlinedIcon sx={{ fontSize: 17 }} /></button></nav>}
+      </section>
+      {renameHost && <RenameHostDialog value={renameName} saving={renaming} error={renameError} onChange={setRenameName} onClose={() => { if (!renaming) setRenameHost(null); }} onSave={() => void handleRenameHost()} />}
     </div>
   );
+}
+
+function HostLedgerRow({
+  host, report, reportSyncPending, activeRun, terminalRun, hasActiveRuns, selectedArtifacts, confirmDeleteId, deleting,
+  onRun, onRetryMft, onCancel, onOpenHost, onConfirmDelete, onDelete, onRename,
+}: {
+  host: Host;
+  report?: ParseReport | null;
+  reportSyncPending: boolean;
+  activeRun?: PipelineRunItem;
+  /** Last in-session terminal update fills the small refresh gap only. */
+  terminalRun?: PipelineRunItem;
+  hasActiveRuns: boolean;
+  selectedArtifacts: number;
+  confirmDeleteId: string | null;
+  deleting: boolean;
+  onRun: (hostId: string) => void;
+  onRetryMft: (hostId: string) => void;
+  onCancel: (runId: string) => void;
+  onOpenHost: (host: Host) => void;
+  onConfirmDelete: (hostId: string | null) => void;
+  onDelete: (hostId: string) => void;
+  onRename: (host: Host) => void;
+}) {
+  // A partial/error attempt may preserve earlier files, but it must not offer
+  // an unqualified "결과" action as if this attempt published a coherent view.
+  const hasResult = report?.status === "ok" && (report.published === true || report.published === undefined);
+  const hasPublishedRaw = report?.status === "partial" && report.published === true && (report.publishedOutputs?.length ?? 0) > 0;
+  const isQueued = activeRun?.status === "queued";
+  const confirmingDelete = confirmDeleteId === host.id;
+  const terminalStatus = terminalRun?.status === "complete" ? "ok" : terminalRun?.status;
+  const displayStatus = activeRun?.status ?? terminalStatus ?? host.lastRunStatus;
+  const progressLabel = isQueued
+    ? "대기 중"
+    : activeRun?.currentArtifact === "_OVERVIEW"
+      ? "종합 분석 생성 중…"
+      : activeRun?.currentArtifact ? `${activeRun.currentArtifact} 파싱 중…` : "준비 중…";
+  const percent = !activeRun || isQueued || activeRun.totalSteps <= 0
+    ? 0
+    : Math.min(99, Math.round((activeRun.completedSteps / activeRun.totalSteps) * 100));
+  return <article className="host-ledger-row" style={{ borderBottom: "1px solid var(--border-subtle)", background: activeRun ? "color-mix(in srgb, var(--accent) 5%, transparent)" : "transparent" }}>
+    <div className="host-ledger-main">
+      <div className="host-ledger-identity"><strong style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text)", fontSize: 12.5 }}>{host.name}</strong><StatusPill status={displayStatus ?? null} /></div>
+      <span className="host-ledger-path" title={host.targetDir}>{host.targetDir}</span>
+      <div className="host-ledger-last-run">{host.lastRunAt ? <>
+        <time style={{ fontFamily: "var(--mono)", color: "var(--text-dim)" }}>{formatEvidenceTimestamp(host.lastRunAt)}</time>
+        {host.lastRunDurationSecs != null && <div>{formatDuration(host.lastRunDurationSecs)} 소요</div>}
+        {reportSyncPending && <div role="status" aria-live="polite" style={{ display: "inline-flex", alignItems: "center", gap: 5, color: "var(--text-faint)" }}><CircularProgress size={12} thickness={5} aria-hidden="true" />이번 실행 보고서 동기화 중</div>}
+        {report && <div style={{ color: report.published === false ? "var(--warning)" : "var(--text-faint)" }}>{report.published === undefined ? "기존 보고서 · 공개 상태 미기록" : report.published ? "이번 실행 결과 공개됨" : "이번 실행 공개 결과 없음"}</div>}
+      </> : terminalStatus ? <span style={{ color: "var(--text-faint)" }}>방금 {terminalStatusLabel(terminalStatus)} · 저장 정보 갱신 중</span> : "실행 기록 없음"}</div>
+    </div>
+    {confirmingDelete ? <div className="host-ledger-confirm"><span style={{ color: "var(--danger)", fontSize: 11.5 }}>분석 결과와 이 호스트 북마크를 삭제합니다.</span><div style={{ display: "flex", gap: 7 }}><button type="button" onClick={() => onDelete(host.id)} disabled={deleting} style={{ ...dangerButtonStyle, padding: "5px 9px", fontSize: 11.5, opacity: deleting ? .5 : 1 }}><DeleteOutlineIcon sx={{ fontSize: 14 }} />삭제</button><button type="button" onClick={() => onConfirmDelete(null)} disabled={deleting} style={{ ...linkButtonStyle, marginLeft: 0 }}>취소</button></div></div> : <div className="host-ledger-actions">
+        {activeRun ? <button type="button" onClick={() => onCancel(activeRun.runId)} style={{ ...dangerButtonStyle, padding: "5px 9px", fontSize: 11.5 }}><CancelOutlinedIcon sx={{ fontSize: 14 }} />{isQueued ? "대기 취소" : "취소"}</button> : <button type="button" onClick={() => onRun(host.id)} disabled={hasActiveRuns || selectedArtifacts === 0} style={{ ...primaryButtonStyle, padding: "5px 9px", fontSize: 11.5, opacity: hasActiveRuns || selectedArtifacts === 0 ? .5 : 1 }}><PlayArrowIcon sx={{ fontSize: 14 }} />파싱</button>}
+        {hasResult ? <button type="button" onClick={() => onOpenHost(host)} style={{ ...neutralButtonStyle, padding: "5px 9px", fontSize: 11.5 }}><VisibilityOutlinedIcon sx={{ fontSize: 14 }} />결과</button> : hasPublishedRaw ? <button type="button" onClick={() => onOpenHost(host)} style={{ ...neutralButtonStyle, padding: "5px 9px", fontSize: 11.5 }}><VisibilityOutlinedIcon sx={{ fontSize: 14 }} />공개된 원본 결과 보기</button> : <span aria-hidden="true" className="host-ledger-action-placeholder" />}
+        <span aria-hidden="true" className="host-ledger-action-divider" />
+        <button type="button" onClick={() => onRename(host)} disabled={!!activeRun} aria-label={`${host.name} 이름 변경`} title="호스트 표시 이름 변경" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 28, height: 28, padding: 0, background: "transparent", color: "var(--text-faint)", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", cursor: activeRun ? "default" : "pointer", opacity: activeRun ? .4 : 1 }}><EditOutlinedIcon sx={{ fontSize: 16 }} /></button>
+        <button type="button" onClick={() => onConfirmDelete(host.id)} disabled={!!activeRun} aria-label={`${host.name} 삭제`} title="호스트 삭제 (원본 수집 데이터는 유지)" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 28, height: 28, padding: 0, background: "transparent", color: "var(--text-faint)", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", cursor: activeRun ? "default" : "pointer", opacity: activeRun ? .4 : 1 }}><DeleteOutlineIcon sx={{ fontSize: 16 }} /></button>
+      </div>}
+    {/* A host-level fallback status can belong to the previous run. Do not
+        surface it until the exact terminal manifest has passed the same
+        cache/run-id gate as the publication controls above. */}
+    {report && !activeRun && !reportSyncPending && <RunOutcomeSummary host={host} report={report} onRetryMft={() => onRetryMft(host.id)} />}
+    {activeRun && !isQueued && <div style={{ gridColumn: "1 / -1" }}><InlineParseProgress stepLabel={progressLabel} percent={percent} completedSteps={activeRun.completedSteps} totalSteps={activeRun.totalSteps} /></div>}
+    {activeRun?.failedArtifacts.length ? <div role="alert" style={{ padding: "7px 14px 11px", color: "var(--danger)", fontSize: 12 }}>파싱 실패: {activeRun.failedArtifacts.join(", ")}</div> : null}
+  </article>;
 }

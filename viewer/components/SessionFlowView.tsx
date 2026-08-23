@@ -11,6 +11,7 @@ import type { CsvData, FetchLinkedRows } from "@/lib/types";
 import { getArtifactView } from "@/lib/artifactViews";
 import { formatEvidenceTimestamp, inRange, EMPTY_TIME_RANGE, type TimeRange } from "@/lib/timeRange";
 import RowDetailPanel from "./RowDetailPanel";
+import { resolveAccountDisplay, type AccountDirectory } from "@/lib/accountIdentity";
 
 // A gap longer than this between consecutive events of the same peer starts a
 // new session. RDP sessions cluster their connect/logon/reconnect/disconnect
@@ -21,6 +22,8 @@ const SESSION_GAP_MS = 10 * 60 * 1000;
 const DIRECTION_LABEL: Record<string, string> = { inbound: "인바운드", outbound: "아웃바운드" };
 const DIRECTION_COLOR: Record<string, string> = { inbound: "#7387a5", outbound: "var(--accent)" };
 const RESULT_COLOR: Record<string, string> = { 성공: "var(--success)", 실패: "var(--danger)", 정보: "var(--text-faint)" };
+const SESSION_LEDGER_GRID = "28px 88px minmax(210px, 1.35fr) minmax(170px, .8fr) 400px 132px 62px";
+const SESSION_LEDGER_MIN_WIDTH = 1160;
 
 // Providers report the account differently — bare "Administrator" from
 // TerminalServices, "HOST\Administrator" from Security-Auditing. Strip any
@@ -82,8 +85,12 @@ function clusterSessions(data: CsvData, timeRange: TimeRange): Session[] {
   for (const e of events) {
     const t = tsMs(e.timestamp);
     const addrConflict = Boolean(e.remote_address && cur?.remote_address && e.remote_address !== cur.remote_address);
+    // A peer can produce adjacent sessions for different principals. Do not
+    // inherit the first account across a later account (or blank-account)
+    // event just because it shares the same IP and falls within the gap.
+    const accountConflict = e.account.toLocaleLowerCase() !== (cur?.account ?? "").toLocaleLowerCase();
     const isNew =
-      !cur || cur.direction !== e.direction || addrConflict || (Number.isFinite(t) && Number.isFinite(lastMs) && t - lastMs > SESSION_GAP_MS);
+      !cur || cur.direction !== e.direction || addrConflict || accountConflict || (Number.isFinite(t) && Number.isFinite(lastMs) && t - lastMs > SESSION_GAP_MS);
 
     if (isNew || !cur) {
       cur = {
@@ -123,6 +130,7 @@ interface SessionFlowViewProps {
   bookmarkedRowids?: Set<number>;
   onToggleBookmark?: (rowid: number) => void;
   timeRange?: TimeRange;
+  accountDirectory?: AccountDirectory;
 }
 
 type ResultFilter = "all" | "success" | "fail";
@@ -136,6 +144,7 @@ export default function SessionFlowView({
   bookmarkedRowids,
   onToggleBookmark,
   timeRange = EMPTY_TIME_RANGE,
+  accountDirectory,
 }: SessionFlowViewProps) {
   const [dirFilter, setDirFilter] = useState<string | undefined>(undefined);
   const [resultFilter, setResultFilter] = useState<ResultFilter>("all");
@@ -183,7 +192,7 @@ export default function SessionFlowView({
       {/* toolbar */}
       <div style={{ padding: "10px 14px", borderBottom: "1px solid var(--border)", background: "var(--bg-panel)", flexShrink: 0, display: "flex", flexDirection: "column", gap: 9 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
-          <strong style={{ fontSize: 15, color: "var(--text)" }}>{isSmb ? "SMB 연결 이력" : "원격 접근 이력 (RDP)"}</strong>
+          <strong style={{ fontSize: 17, color: "var(--text)" }}>{isSmb ? "SMB 연결 이력" : "원격 접근 이력 (RDP)"}</strong>
         </div>
 
         <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
@@ -199,8 +208,9 @@ export default function SessionFlowView({
               onBlur={(e) => { e.currentTarget.style.outline = "none"; }}
               style={{
                 width: "100%",
-                padding: "6px 32px 6px 30px",
-                fontSize: 12.5,
+                minHeight: 34,
+                padding: "7px 32px 7px 30px",
+                fontSize: 13,
                 fontFamily: "var(--mono)",
                 background: "var(--bg-elevated)",
                 border: "1px solid var(--border)",
@@ -220,8 +230,9 @@ export default function SessionFlowView({
       </div>
 
       <div style={{ flex: 1, minHeight: 0, overflow: "auto", padding: 12 }}>
-        <div style={{ border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", background: "var(--bg-panel)", overflow: "hidden" }}>
-        {sessions.length > 0 && <div style={{ display: "grid", gridTemplateColumns: "28px 78px minmax(150px,1.5fr) minmax(90px,.8fr) 236px 96px 54px", gap: 8, padding: "7px 10px", borderBottom: "1px solid var(--border)", color: "var(--text-faint)", fontSize: 10.5, fontWeight: 700 }}><span /><span>방향</span><span>종단점 / 호스트</span><span>계정</span><span>시작 / 종료</span><span>결과</span><span>이벤트</span></div>}
+        <div style={{ border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", background: "var(--bg-panel)", overflowX: "auto", overflowY: "hidden" }}>
+        <div style={{ minWidth: SESSION_LEDGER_MIN_WIDTH }}>
+        {sessions.length > 0 && <div style={{ minWidth: SESSION_LEDGER_MIN_WIDTH, display: "grid", gridTemplateColumns: SESSION_LEDGER_GRID, gap: 8, padding: "8px 10px", borderBottom: "1px solid var(--border)", color: "var(--text-faint)", fontSize: 11.5, fontWeight: 700 }}><span /><span>방향</span><span>종단점 / 호스트</span><span>계정</span><span>시작 / 종료</span><span>결과</span><span>이벤트</span></div>}
         {sessions.length === 0 && (
           <div style={{ color: "var(--text-faint)", textAlign: "center", padding: 24 }}>
             {allSessions.length === 0 ? "세션이 없습니다." : "조건에 맞는 세션이 없습니다."}
@@ -230,20 +241,21 @@ export default function SessionFlowView({
         {sessions.map((s) => {
           const open = expanded.has(s.key);
           const dirColor = DIRECTION_COLOR[s.direction] ?? "var(--border)";
+          const registeredHost = hostIpMap[s.remote_address];
           return (
             <div
               key={s.key}
               style={{
                 flexShrink: 0,
                 borderTop: "1px solid var(--border-subtle)",
-                borderLeft: `3px solid ${dirColor}`,
+                boxShadow: `inset 3px 0 0 ${dirColor}`,
               }}
             >
               <button
                 type="button"
                 onClick={() => toggle(s.key)}
                 aria-expanded={open}
-                style={{ width: "100%", display: "grid", gridTemplateColumns: "28px 78px minmax(150px,1.5fr) minmax(90px,.8fr) 236px 96px 54px", alignItems: "center", gap: 8, padding: "9px 10px", cursor: "pointer", textAlign: "left", color: "var(--text)", border: "none", background: "transparent", borderLeft: "none", outlineOffset: -2 }}
+                style={{ width: "100%", minWidth: SESSION_LEDGER_MIN_WIDTH, display: "grid", gridTemplateColumns: SESSION_LEDGER_GRID, alignItems: "center", gap: 8, padding: "10px", cursor: "pointer", textAlign: "left", color: "var(--text)", border: "none", background: "transparent", borderLeft: "none", outlineOffset: -2 }}
                 onMouseEnter={(e) => (e.currentTarget.style.background = "var(--bg-hover)")}
                 onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
                 onFocus={(e) => { e.currentTarget.style.outline = "2px solid var(--accent)"; }}
@@ -252,7 +264,7 @@ export default function SessionFlowView({
                 {open ? <KeyboardArrowDownOutlinedIcon aria-hidden="true" sx={{ fontSize: 18, color: "var(--text-faint)" }} /> : <KeyboardArrowRightOutlinedIcon aria-hidden="true" sx={{ fontSize: 18, color: "var(--text-faint)" }} />}
                 <span
                   style={{
-                    fontSize: 10.5,
+                    fontSize: 12,
                     fontWeight: 700,
                     padding: "2px 9px",
                     borderRadius: "var(--radius-sm)",
@@ -264,64 +276,58 @@ export default function SessionFlowView({
                 >
                   {DIRECTION_LABEL[s.direction] ?? s.direction}
                 </span>
-                <span style={{ display: "inline-flex", alignItems: "baseline", gap: 6, minWidth: 120 }}>
-                  {hostIpMap[s.remote_address] ? (
+                <span title={registeredHost ? `등록 호스트: ${registeredHost.name} (${s.remote_address})` : s.remote_address || "주소 없음"} aria-label={registeredHost ? `등록된 분석 호스트 ${registeredHost.name}, IP ${s.remote_address}` : `외부 종단점 ${s.remote_address || "주소 없음"}`} style={{ display: "inline-flex", alignItems: "baseline", gap: 7, minWidth: 0, overflow: "hidden" }}>
+                  {registeredHost ? (
                     <>
-                      <span style={{ fontSize: 12.5, fontWeight: 700, color: "var(--text)" }}>{hostIpMap[s.remote_address].name}</span>
-                      <span style={{ fontFamily: "var(--mono)", fontSize: 11, color: "var(--text-faint)" }}>{s.remote_address}</span>
+                      <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 15, fontWeight: 700, color: "var(--host-registered-text)" }}>{registeredHost.name}</span>
+                      <span style={{ flexShrink: 0, fontFamily: "var(--mono)", fontSize: 12.5, color: "var(--text-faint)" }}>{s.remote_address}</span>
                     </>
                   ) : (
-                    <span style={{ fontFamily: "var(--mono)", fontSize: 13.5, fontWeight: 600 }}>{s.remote_address || "(주소 없음)"}</span>
+                    <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontFamily: "var(--mono)", fontSize: 15, fontWeight: 600 }}>{s.remote_address || "(주소 없음)"}</span>
                   )}
                 </span>
-                {s.account && (
-                  <span style={{ fontSize: 11.5, fontWeight: 600, color: "var(--text)" }}>{s.account}</span>
-                )}
-                <span style={{ fontSize: 11.5, color: "var(--text-time)", fontFamily: "var(--mono)", whiteSpace: "nowrap" }}>
+                <span title={resolveAccountDisplay(s.account, accountDirectory) || "계정 정보 없음"} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 12.5, fontWeight: 600, color: s.account ? "var(--text)" : "var(--text-faint)" }}>{resolveAccountDisplay(s.account, accountDirectory) || "계정 정보 없음"}</span>
+                <span style={{ fontSize: 12.5, color: "var(--text-time)", fontFamily: "var(--mono)", whiteSpace: "nowrap" }}>
                   {formatEvidenceTimestamp(s.start)} <span style={{ opacity: 0.6 }}>~ {formatEvidenceTimestamp(s.end)}</span>
                 </span>
-                <span style={{ display: "flex", gap: 4, alignItems: "center", fontSize: 10.5 }}>
+                <span style={{ display: "flex", gap: 4, alignItems: "center", fontSize: 12.5 }}>
                   {s.success > 0 && <Pill color="var(--success)">성공 {s.success}</Pill>}
                   {s.fail > 0 && <Pill color="var(--danger)">실패 {s.fail}</Pill>}
                 </span>
-                <span style={{ color: "var(--text-faint)", fontFamily: "var(--mono)", fontSize: 11 }}>{s.events.length}건</span>
+                <span style={{ color: "var(--text-faint)", fontFamily: "var(--mono)", fontSize: 12.5 }}>{s.events.length}건</span>
               </button>
               {open && (
                 <div style={{ borderTop: "1px solid var(--border-subtle)", background: "color-mix(in srgb, var(--bg-elevated) 40%, transparent)" }}>
                   {s.events.map((ev, i) => {
                     const bm = (bookmarkedRowids?.has(ev.rowid) ?? false) && Number.isFinite(ev.rowid);
-                    const bmBg = bm ? "color-mix(in srgb, var(--warning) 14%, transparent)" : "transparent";
+                    const bmBg = "transparent";
                     return (
                     <div
                       key={i}
-                      role="button"
-                      tabIndex={0}
-                      onClick={() => setSelected(ev.row)}
-                      onKeyDown={(event) => {
-                        if (event.key === "Enter" || event.key === " ") {
-                          event.preventDefault();
-                          setSelected(ev.row);
-                        }
-                      }}
-                      style={{ display: "flex", alignItems: "center", gap: 10, padding: "5px 12px 5px 30px", cursor: "pointer", fontSize: 12, background: bmBg, boxShadow: bm ? "inset 3px 0 0 var(--warning)" : undefined }}
-                      onMouseEnter={(e) => (e.currentTarget.style.background = "var(--bg-hover)")}
-                      onMouseLeave={(e) => (e.currentTarget.style.background = bmBg)}
-                      onFocus={(e) => { e.currentTarget.style.outline = "2px solid var(--accent)"; e.currentTarget.style.outlineOffset = "-2px"; }}
-                      onBlur={(e) => { e.currentTarget.style.outline = "none"; }}
+                      className={bm ? "dfir-bookmarked-row" : undefined}
+                      style={{ display: "flex", alignItems: "center", gap: 10, minHeight: 40, padding: "8px 12px 8px 30px", fontSize: 13.5, background: bmBg }}
+                      onMouseEnter={(e) => { if (!bm) e.currentTarget.style.background = "var(--bg-hover)"; }}
+                      onMouseLeave={(e) => { if (!bm) e.currentTarget.style.background = bmBg; }}
                     >
-                      <span style={{ fontFamily: "var(--mono)", fontSize: 11.5, color: "var(--text-time)", width: 236, flexShrink: 0 }}>{formatEvidenceTimestamp(ev.timestamp)}</span>
-                      <span style={{ width: 8, height: 8, borderRadius: "50%", flexShrink: 0, background: RESULT_COLOR[ev.result] ?? "var(--text-faint)" }} />
-                      <span style={{ flex: 1 }}>{ev.description}</span>
-                      {ev.account && ev.account !== s.account && <span style={{ color: "var(--text-dim)", fontSize: 11 }}>{ev.account}</span>}
+                      <button
+                        type="button"
+                        onClick={() => setSelected(ev.row)}
+                        aria-label={`${formatEvidenceTimestamp(ev.timestamp)} ${ev.description || "원본 이벤트"} 상세 보기`}
+                        style={{ display: "flex", alignItems: "center", gap: 10, flex: 1, minWidth: 0, padding: 0, border: "none", background: "transparent", color: "var(--text)", cursor: "pointer", textAlign: "left", fontSize: "inherit", outlineOffset: 2 }}
+                      >
+                        <span style={{ fontFamily: "var(--mono)", fontSize: 12.5, color: "var(--text-time)", width: 276, flexShrink: 0 }}>{formatEvidenceTimestamp(ev.timestamp)}</span>
+                        <span aria-hidden="true" style={{ width: 8, height: 8, borderRadius: "50%", flexShrink: 0, background: RESULT_COLOR[ev.result] ?? "var(--text-faint)" }} />
+                        <span title={ev.description} style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{ev.description}</span>
+                        {ev.account && ev.account !== s.account && <span style={{ flexShrink: 0, color: "var(--text-dim)", fontSize: 12.5 }}>{resolveAccountDisplay(ev.account, accountDirectory)}</span>}
+                      </button>
                       {onToggleBookmark && Number.isFinite(ev.rowid) && (
                         <button
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            onToggleBookmark(ev.rowid);
-                          }}
+                          type="button"
+                          onClick={() => onToggleBookmark(ev.rowid)}
                           title={bookmarkedRowids?.has(ev.rowid) ? "북마크 해제" : "북마크에 추가"}
                           aria-label={bookmarkedRowids?.has(ev.rowid) ? "북마크 해제" : "북마크"}
-                          style={{ display: "inline-flex", padding: 1, border: "none", background: "transparent", cursor: "pointer", color: bookmarkedRowids?.has(ev.rowid) ? "var(--warning)" : "var(--text-faint)" }}
+                          className={bookmarkedRowids?.has(ev.rowid) ? "dfir-bookmark-control" : undefined}
+                          style={{ display: "inline-flex", padding: 1, border: "none", background: "transparent", cursor: "pointer", color: bookmarkedRowids?.has(ev.rowid) ? "var(--bookmark-control)" : "var(--text-faint)" }}
                         >
                           {bookmarkedRowids?.has(ev.rowid) ? <BookmarkOutlinedIcon sx={{ fontSize: 16 }} /> : <BookmarkBorderOutlinedIcon sx={{ fontSize: 16 }} />}
                         </button>
@@ -334,6 +340,7 @@ export default function SessionFlowView({
             </div>
           );
         })}
+        </div>
         </div>
       </div>
 
@@ -349,6 +356,7 @@ export default function SessionFlowView({
             onNavigate(targetFile, targetColumn, value);
           }}
           onFetchLinkedRows={onFetchLinkedRows}
+          accountDirectory={accountDirectory}
           isBookmarked={onToggleBookmark ? bookmarkedRowids?.has(Number((selected as Record<string, unknown>).__rowid)) ?? false : undefined}
           onToggleBookmark={onToggleBookmark ? () => onToggleBookmark(Number((selected as Record<string, unknown>).__rowid)) : undefined}
         />
@@ -359,7 +367,7 @@ export default function SessionFlowView({
 
 function Pill({ color, children }: { color: string; children: React.ReactNode }) {
   return (
-    <span style={{ color, fontWeight: 700, padding: "1px 7px", borderRadius: 999, background: `color-mix(in srgb, ${color} 15%, transparent)` }}>
+    <span style={{ color, fontSize: 12, fontWeight: 700, padding: "2px 7px", borderRadius: "var(--radius-sm)", background: `color-mix(in srgb, ${color} 15%, transparent)` }}>
       {children}
     </span>
   );
@@ -376,7 +384,8 @@ function FilterChips<T>({ options, value, onChange }: { options: { label: string
             key={String(o.value)}
             onClick={() => onChange(o.value)}
             style={{
-              fontSize: 11.5,
+              minHeight: 32,
+              fontSize: 12.5,
               padding: "4px 10px",
               background: active ? `color-mix(in srgb, ${accent} 18%, transparent)` : "transparent",
               color: active ? accent : "var(--text-dim)",

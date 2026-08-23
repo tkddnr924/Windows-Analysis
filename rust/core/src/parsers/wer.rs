@@ -16,18 +16,40 @@ use crate::time::fmt_filetime;
 
 pub const WER_TABLE: &str = "WER_Reports";
 pub const WER_FIELD_ORDER: &[&str] = &[
-    "timestamp", "EventType", "AppName", "AppPath", "TargetAppId",
-    "ReportIdentifier", "report", "_source_file",
+    "timestamp",
+    "EventType",
+    "AppName",
+    "AppPath",
+    "TargetAppId",
+    "ReportIdentifier",
+    "report",
+    "_source_file",
 ];
 
 // json.dumps(x, ensure_ascii=False): compact with a space after ',' and ':'.
 struct PyFmt;
 impl serde_json::ser::Formatter for PyFmt {
-    fn begin_array_value<W: ?Sized + std::io::Write>(&mut self, w: &mut W, first: bool) -> std::io::Result<()> {
-        if first { Ok(()) } else { w.write_all(b", ") }
+    fn begin_array_value<W: ?Sized + std::io::Write>(
+        &mut self,
+        w: &mut W,
+        first: bool,
+    ) -> std::io::Result<()> {
+        if first {
+            Ok(())
+        } else {
+            w.write_all(b", ")
+        }
     }
-    fn begin_object_key<W: ?Sized + std::io::Write>(&mut self, w: &mut W, first: bool) -> std::io::Result<()> {
-        if first { Ok(()) } else { w.write_all(b", ") }
+    fn begin_object_key<W: ?Sized + std::io::Write>(
+        &mut self,
+        w: &mut W,
+        first: bool,
+    ) -> std::io::Result<()> {
+        if first {
+            Ok(())
+        } else {
+            w.write_all(b", ")
+        }
     }
     fn begin_object_value<W: ?Sized + std::io::Write>(&mut self, w: &mut W) -> std::io::Result<()> {
         w.write_all(b": ")
@@ -41,39 +63,58 @@ fn py_json(v: &Value) -> String {
 }
 
 fn key_valid(k: &str) -> bool {
-    !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '[' || c == ']')
+    !k.is_empty()
+        && k.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '[' || c == ']')
 }
 fn ident_ok(s: &str) -> bool {
-    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
 }
 /// Matches the Python _INDEX_RE: family[idx] or family[idx].sub (whole key).
 fn parse_index(key: &str) -> Option<(String, usize, Option<String>)> {
     let lb = key.find('[')?;
     let family = &key[..lb];
-    if !ident_ok(family) { return None; }
+    if !ident_ok(family) {
+        return None;
+    }
     let after = &key[lb + 1..];
     let rb = after.find(']')?;
     let idx_str = &after[..rb];
-    if idx_str.is_empty() || !idx_str.chars().all(|c| c.is_ascii_digit()) { return None; }
+    if idx_str.is_empty() || !idx_str.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
     let idx: usize = idx_str.parse().ok()?;
     let rest = &after[rb + 1..];
     let sub = if rest.is_empty() {
         None
     } else if let Some(s) = rest.strip_prefix('.') {
-        if ident_ok(s) { Some(s.to_string()) } else { return None; }
+        if ident_ok(s) {
+            Some(s.to_string())
+        } else {
+            return None;
+        }
     } else {
         return None;
     };
     Some((family, idx, sub).into_tuple())
 }
-trait IntoTuple { fn into_tuple(self) -> (String, usize, Option<String>); }
+trait IntoTuple {
+    fn into_tuple(self) -> (String, usize, Option<String>);
+}
 impl IntoTuple for (&str, usize, Option<String>) {
-    fn into_tuple(self) -> (String, usize, Option<String>) { (self.0.to_string(), self.1, self.2) }
+    fn into_tuple(self) -> (String, usize, Option<String>) {
+        (self.0.to_string(), self.1, self.2)
+    }
 }
 
 fn decode(data: &[u8]) -> String {
     let s = if data.len() >= 2 && data[0] == 0xFF && data[1] == 0xFE {
-        let u: Vec<u16> = data[2..].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        let u: Vec<u16> = data[2..]
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
         String::from_utf16_lossy(&u)
     } else {
         String::from_utf8_lossy(data).into_owned()
@@ -99,38 +140,63 @@ fn parse_report(path: &Path) -> Row {
     // families in first-seen order, each a sorted-by-index map of Value.
     let mut scalars: Map<String, Value> = Map::new();
     let mut fam_order: Vec<String> = Vec::new();
-    let mut families: std::collections::HashMap<String, std::collections::BTreeMap<usize, Value>> = std::collections::HashMap::new();
+    let mut families: std::collections::HashMap<String, std::collections::BTreeMap<usize, Value>> =
+        std::collections::HashMap::new();
 
     for line in text.lines() {
         let Some(eq) = line.find('=') else { continue };
         let key = line[..eq].trim();
-        if !key_valid(key) { continue; }
+        if !key_valid(key) {
+            continue;
+        }
         let value = line[eq + 1..].trim().to_string();
         if let Some((fam, idx, sub)) = parse_index(key) {
-            if !families.contains_key(&fam) { fam_order.push(fam.clone()); }
+            if !families.contains_key(&fam) {
+                fam_order.push(fam.clone());
+            }
             let bucket = families.entry(fam).or_default();
             match sub {
                 Some(sk) => {
-                    let slot = bucket.entry(idx).or_insert_with(|| Value::Object(Map::new()));
-                    if !slot.is_object() { *slot = Value::Object(Map::new()); }
-                    if let Value::Object(m) = slot { m.insert(sk, Value::String(value)); }
+                    let slot = bucket
+                        .entry(idx)
+                        .or_insert_with(|| Value::Object(Map::new()));
+                    if !slot.is_object() {
+                        *slot = Value::Object(Map::new());
+                    }
+                    if let Value::Object(m) = slot {
+                        m.insert(sk, Value::String(value));
+                    }
                 }
-                None => { bucket.insert(idx, Value::String(value)); }
+                None => {
+                    bucket.insert(idx, Value::String(value));
+                }
             }
         } else {
             scalars.insert(key.to_string(), Value::String(value));
         }
     }
 
-    let timestamp = match scalars.get("EventTime").and_then(|v| v.as_str()).and_then(|s| s.parse::<i64>().ok()) {
+    let timestamp = match scalars
+        .get("EventTime")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<i64>().ok())
+    {
         Some(t) if t > 0 => fmt_filetime(t),
         _ => String::new(),
     };
-    let get = |k: &str| scalars.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let get = |k: &str| {
+        scalars
+            .get(k)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
 
     // full = scalars (in order) then families (first-seen order) as arrays.
     let mut full: Map<String, Value> = Map::new();
-    for (k, v) in &scalars { full.insert(k.clone(), v.clone()); }
+    for (k, v) in &scalars {
+        full.insert(k.clone(), v.clone());
+    }
     for fam in &fam_order {
         let bucket = &families[fam];
         let arr: Vec<Value> = bucket.values().cloned().collect();
@@ -149,13 +215,32 @@ fn parse_report(path: &Path) -> Row {
     r
 }
 
-pub fn parse_wer(root: &Path) -> Result<Vec<Row>> {
-    let paths: Vec<_> = WalkDir::new(root).into_iter().filter_map(|e| e.ok())
-        .filter(|entry| entry.file_type().is_file()
-            && entry.path().extension().map(|e| e.eq_ignore_ascii_case("wer")).unwrap_or(false))
+pub fn wer_sources(root: &Path) -> Vec<std::path::PathBuf> {
+    let mut paths: Vec<_> = WalkDir::new(root)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|entry| {
+            entry.file_type().is_file()
+                && entry
+                    .path()
+                    .extension()
+                    .map(|e| e.eq_ignore_ascii_case("wer"))
+                    .unwrap_or(false)
+        })
         .map(|entry| entry.into_path())
         .collect();
+    paths.sort();
+    paths
+}
+
+pub fn parse_wer_with_sources(root: &Path) -> Result<(Vec<std::path::PathBuf>, Vec<Row>)> {
+    let paths = wer_sources(root);
     // Reports are independent. Parallel decoding/parsing leaves every report
     // represented, while indexed parallel collection keeps discovery order.
-    Ok(paths.par_iter().map(|path| parse_report(path)).collect())
+    let rows = paths.par_iter().map(|path| parse_report(path)).collect();
+    Ok((paths, rows))
+}
+
+pub fn parse_wer(root: &Path) -> Result<Vec<Row>> {
+    Ok(parse_wer_with_sources(root)?.1)
 }

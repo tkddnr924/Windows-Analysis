@@ -1,23 +1,34 @@
 "use client";
-
 import { useEffect, useMemo, useRef, useState } from "react";
-import { inRange, rangeActive, EMPTY_TIME_RANGE, type TimeRange } from "@/lib/timeRange";
+import useMediaQuery from "@mui/material/useMediaQuery";
+import CircularProgress from "@mui/material/CircularProgress";
+import ZoomInOutlinedIcon from "@mui/icons-material/ZoomInOutlined";
+import ZoomOutOutlinedIcon from "@mui/icons-material/ZoomOutOutlined";
+import CenterFocusStrongOutlinedIcon from "@mui/icons-material/CenterFocusStrongOutlined";
+import RefreshOutlinedIcon from "@mui/icons-material/RefreshOutlined";
+import OpenInNewOutlinedIcon from "@mui/icons-material/OpenInNewOutlined";
+import { graphEdgesForScope } from "@/lib/hostGraphScope";
+import {
+  EMPTY_TIME_RANGE,
+  formatEvidenceTimestamp,
+  inRange,
+  rangeActive,
+  type TimeRange,
+} from "@/lib/timeRange";
 
 export interface HostNode {
   name: string;
   ips: string[];
 }
 export type PeerKind = "host" | "external" | "local" | "loopback";
-
-// One RDP connection event, pre-classified but not aggregated. The view
-// applies the time-range filter and aggregates these into edges on the client.
+export type ConnDirection = "inbound" | "outbound" | "unknown";
 export interface ConnRecord {
   host: string;
   peer: string;
   peerLabel: string;
   peerKind: PeerKind;
   peerIsHost: boolean;
-  direction: "inbound" | "outbound";
+  direction: ConnDirection;
   timestamp: string;
   account: string;
   result: string;
@@ -25,15 +36,15 @@ export interface ConnRecord {
 export interface HostGraph {
   hosts: HostNode[];
   records: ConnRecord[];
+  rdpSourceFailures?: string[];
+  networkMappingFailures?: string[];
 }
-
-interface ConnEdge {
+interface Edge {
+  key: string;
   host: string;
   peer: string;
-  peerLabel: string;
-  peerKind: PeerKind;
-  peerIsHost: boolean;
-  direction: "inbound" | "outbound";
+  direction: ConnDirection;
+  rows: ConnRecord[];
   count: number;
   first: string;
   last: string;
@@ -41,821 +52,1326 @@ interface ConnEdge {
   success: number;
   fail: number;
 }
-
+interface Node {
+  key: string;
+  label: string;
+  registered: boolean;
+  x: number;
+  y: number;
+}
 interface Props {
   graph: HostGraph | null;
   loading: boolean;
   timeRange?: TimeRange;
+  focusHostName?: string | null;
   onRefresh?: () => void;
-  /** Open a registered host for browsing (from the side panel). */
-  onOpenHost?: (hostName: string) => void;
+  onOpenHost?: (name: string) => void;
 }
-
-type DirFilter = "all" | "inbound" | "outbound";
-type ResultFilter = "success" | "all" | "fail";
-
-const VB_W = 1000;
-const VB_H = 640;
-type XY = { x: number; y: number };
-
-const KIND_COLOR: Record<PeerKind, string> = {
-  host: "var(--accent)",
-  local: "var(--warning)",
-  loopback: "#a78bfa",
-  external: "var(--text-faint)",
-};
-const KIND_LABEL: Record<PeerKind, string> = {
-  host: "등록 호스트",
-  local: "LOCAL (콘솔/AD 경유 가능성)",
-  loopback: "로컬 루프백 (원격/터널링 도구 등)",
-  external: "외부 IP (확인됨)",
-};
-
-export interface LayoutParams {
-  repulsion: number; // node-to-node push — larger = more spread
-  linkDist: number; // rest length of connection springs
-  gravity: number; // pull toward centre — smaller = looser
-}
-export const DEFAULT_LAYOUT: LayoutParams = { repulsion: 17000, linkDist: 215, gravity: 0.01 };
-
-// A tiny deterministic force-directed layout (repulsion + edge springs +
-// centering), run for a fixed number of iterations. Keyed on the node set so
-// positions stay put when only the time filter (edge weights) changes.
-function computeLayout(ids: string[], adj: [string, string][], hosts: Set<string>, params: LayoutParams): Record<string, XY> {
-  const N = ids.length;
-  const cx = VB_W / 2;
-  const cy = VB_H / 2;
-  const pos: Record<string, XY> = {};
-  const R = Math.min(340, 70 + N * 8);
-  ids.forEach((id, i) => {
-    const a = (2 * Math.PI * i) / Math.max(1, N);
-    const j = ((i * 2654435761) % 1000) / 1000 - 0.5; // deterministic jitter
-    pos[id] = { x: cx + Math.cos(a) * R + j * 24, y: cy + Math.sin(a) * (R * 0.72) + j * 24 };
+const DEFAULT_GRAPH = { width: 960, height: 560 };
+const PEER = 16, FOCUS = 22, LIMIT = 12, ALL_LIMIT = 30;
+const NODE_LABEL_WIDTH = 124;
+const NODE_LABEL_BOTTOM = 36;
+const graphLabelWidth = (width: number) =>
+  Math.max(1, Math.min(NODE_LABEL_WIDTH, Math.max(1, width - 16)));
+const graphLabelHalf = (width: number) => graphLabelWidth(width) / 2;
+const key = (v: string) => v.toLocaleLowerCase();
+const dir = (v: ConnDirection) =>
+  v === "inbound"
+    ? "인바운드"
+    : v === "outbound"
+    ? "아웃바운드"
+    : "방향 정보 없음";
+function edges(rows: ConnRecord[]): Edge[] {
+  const map = new Map<string, ConnRecord[]>();
+  rows.forEach((r) => {
+    const k = `${r.host}\u0000${r.peer}\u0000${r.direction}`;
+    map.set(k, [...(map.get(k) ?? []), r]);
   });
-  if (N <= 1) return pos;
-
-  const REP = params.repulsion;
-  const SPRING_LEN = params.linkDist;
-  const SPRING_K = 0.04;
-  const CENTER_K = params.gravity;
-  const iters = N > 120 ? 160 : 340;
-  let temp = 34;
-  const cool = Math.pow(1.2 / temp, 1 / iters);
-
-  for (let it = 0; it < iters; it++) {
-    const disp: Record<string, XY> = {};
-    for (const id of ids) disp[id] = { x: 0, y: 0 };
-    // repulsion (O(N^2), fine for the small node counts here)
-    for (let i = 0; i < N; i++) {
-      for (let k = i + 1; k < N; k++) {
-        const A = pos[ids[i]];
-        const B = pos[ids[k]];
-        let dx = A.x - B.x;
-        let dy = A.y - B.y;
-        let d2 = dx * dx + dy * dy;
-        if (d2 < 0.01) {
-          dx = (i - k) * 0.1 + 0.1;
-          dy = 0.1;
-          d2 = dx * dx + dy * dy;
-        }
-        const f = REP / d2;
-        const d = Math.sqrt(d2);
-        const fx = (dx / d) * f;
-        const fy = (dy / d) * f;
-        disp[ids[i]].x += fx;
-        disp[ids[i]].y += fy;
-        disp[ids[k]].x -= fx;
-        disp[ids[k]].y -= fy;
-      }
-    }
-    // springs along adjacency
-    for (const [a, b] of adj) {
-      const A = pos[a];
-      const B = pos[b];
-      if (!A || !B) continue;
-      const dx = B.x - A.x;
-      const dy = B.y - A.y;
-      const d = Math.max(1, Math.hypot(dx, dy));
-      const f = SPRING_K * (d - SPRING_LEN);
-      const fx = (dx / d) * f;
-      const fy = (dy / d) * f;
-      disp[a].x += fx;
-      disp[a].y += fy;
-      disp[b].x -= fx;
-      disp[b].y -= fy;
-    }
-    // centering (hosts pulled a touch harder so they settle in the middle)
-    for (const id of ids) {
-      const pull = CENTER_K * (hosts.has(id) ? 1.6 : 1);
-      disp[id].x += (cx - pos[id].x) * pull;
-      disp[id].y += (cy - pos[id].y) * pull;
-    }
-    for (const id of ids) {
-      const dx = disp[id].x;
-      const dy = disp[id].y;
-      const d = Math.max(0.01, Math.hypot(dx, dy));
-      pos[id].x += (dx / d) * Math.min(d, temp);
-      pos[id].y += (dy / d) * Math.min(d, temp);
-      // generous bounds — the view auto-fits, so let nodes spread out
-      pos[id].x = Math.max(-600, Math.min(VB_W + 600, pos[id].x));
-      pos[id].y = Math.max(-600, Math.min(VB_H + 600, pos[id].y));
-    }
-    temp *= cool;
-  }
-  return pos;
-}
-
-// Fit every node's bounding box into the viewBox with padding, so however far
-// the layout spreads, it opens fully visible.
-function fitView(pos: Record<string, XY>, ids: string[]): { tx: number; ty: number; k: number } {
-  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-  for (const id of ids) {
-    const p = pos[id];
-    if (!p) continue;
-    minX = Math.min(minX, p.x);
-    maxX = Math.max(maxX, p.x);
-    minY = Math.min(minY, p.y);
-    maxY = Math.max(maxY, p.y);
-  }
-  if (!Number.isFinite(minX)) return { tx: 0, ty: 0, k: 1 };
-  const pad = 80;
-  const spanX = maxX - minX + pad * 2;
-  const spanY = maxY - minY + pad * 2;
-  const k = Math.max(0.3, Math.min(2, Math.min(VB_W / spanX, VB_H / spanY)));
-  const cx = (minX + maxX) / 2;
-  const cy = (minY + maxY) / 2;
-  return { tx: VB_W / 2 - k * cx, ty: VB_H / 2 - k * cy, k };
-}
-
-export default function HostConnectionView({ graph, loading, timeRange = EMPTY_TIME_RANGE, onRefresh, onOpenHost }: Props) {
-  const [pos, setPos] = useState<Record<string, XY>>({});
-  const [view, setView] = useState({ tx: 0, ty: 0, k: 1 });
-  const [selected, setSelected] = useState<string | null>(null);
-  const [hoverNode, setHoverNode] = useState<string | null>(null);
-  const [hoverEdge, setHoverEdge] = useState<ConnEdge | null>(null);
-  const [mouse, setMouse] = useState<XY>({ x: 0, y: 0 });
-  // view controls
-  const [hostsOnly, setHostsOnly] = useState(false); // show only registered hosts (hide external IPs)
-  const [excludeLocal, setExcludeLocal] = useState(false); // hide the LOCAL node
-  const [excludeLoopback, setExcludeLoopback] = useState(false); // hide loopback (HOST/127.0.0.1) nodes
-  const [dirFilter, setDirFilter] = useState<DirFilter>("all");
-  // RDP logs many events per session (logon=성공, logoff/disconnect=정보, failed=실패);
-  // default to successful connections so the graph reflects real access, not noise.
-  const [resultFilter, setResultFilter] = useState<ResultFilter>("success");
-  const [search, setSearch] = useState("");
-  const [showSettings, setShowSettings] = useState(false);
-  const [layout, setLayout] = useState<LayoutParams>(DEFAULT_LAYOUT);
-
-  const svgRef = useRef<SVGSVGElement | null>(null);
-  const gRef = useRef<SVGGElement | null>(null);
-  const prevIdsKey = useRef<string>("");
-  const drag = useRef<{ mode: "node" | "pan" | null; id?: string; moved: boolean; sx: number; sy: number; last?: XY }>({ mode: null, moved: false, sx: 0, sy: 0 });
-
-  const rangeOn = rangeActive(timeRange);
-
-  // Stable topology (all nodes + adjacency + total weight) — independent of the
-  // time filter, so the layout doesn't reshuffle when the window changes.
-  const topo = useMemo(() => {
-    const meta: Record<string, { label: string; kind: PeerKind; isHost: boolean; ips: string[] }> = {};
-    const weight: Record<string, number> = {};
-    if (!graph) return { ids: [] as string[], adj: [] as [string, string][], meta, weight, hosts: new Set<string>() };
-    for (const h of graph.hosts) meta[h.name] = { label: h.name, kind: "host", isHost: true, ips: h.ips };
-    const adjSet = new Set<string>();
-    for (const r of graph.records) {
-      if (!meta[r.peer]) meta[r.peer] = { label: r.peerLabel, kind: r.peerKind, isHost: false, ips: [] };
-      weight[r.host] = (weight[r.host] || 0) + 1;
-      weight[r.peer] = (weight[r.peer] || 0) + 1;
-      const [a, b] = r.host < r.peer ? [r.host, r.peer] : [r.peer, r.host];
-      adjSet.add(`${a} ${b}`);
-    }
-    const ids = Object.keys(meta);
-    const adj = [...adjSet].map((s) => s.split(" ") as [string, string]);
-    return { ids, adj, meta, weight, hosts: new Set(graph.hosts.map((h) => h.name)) };
-  }, [graph]);
-
-  const idsKey = useMemo(() => [...topo.ids].sort().join("|"), [topo.ids]);
-
-  // Recompute the layout when the node set changes OR the user tunes the
-  // spacing sliders. On a topology change we re-fit and clear the selection;
-  // on a slider tweak we keep the current view so the spreading is visible.
-  useEffect(() => {
-    if (topo.ids.length === 0) return;
-    const next = computeLayout(topo.ids, topo.adj, topo.hosts, layout);
-    setPos(next);
-    if (prevIdsKey.current !== idsKey) {
-      prevIdsKey.current = idsKey;
-      setSelected(null);
-      setView(fitView(next, topo.ids));
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [idsKey, layout]);
-
-  // Filter by incident window, then aggregate to directed edges.
-  const { edges, totalRecords, shownRecords } = useMemo(() => {
-    if (!graph) return { edges: [] as ConnEdge[], totalRecords: 0, shownRecords: 0 };
-    const recs = graph.records.filter((r) => !rangeOn || inRange(r.timestamp, timeRange));
-    const em = new Map<string, ConnEdge & { accountsSet: Set<string> }>();
-    for (const r of recs) {
-      const key = `${r.host}|${r.peer}|${r.direction}`;
-      let e = em.get(key);
-      if (!e) {
-        e = { host: r.host, peer: r.peer, peerLabel: r.peerLabel, peerKind: r.peerKind, peerIsHost: r.peerIsHost, direction: r.direction, count: 0, first: r.timestamp, last: r.timestamp, accounts: [], accountsSet: new Set(), success: 0, fail: 0 };
-        em.set(key, e);
-      }
-      e.count += 1;
-      if (r.timestamp) {
-        if (!e.first || r.timestamp < e.first) e.first = r.timestamp;
-        if (!e.last || r.timestamp > e.last) e.last = r.timestamp;
-      }
-      if (r.account) e.accountsSet.add(r.account);
-      if (r.result === "성공") e.success += 1;
-      else if (r.result === "실패") e.fail += 1;
-    }
-    const edges = [...em.values()].map(({ accountsSet, ...e }) => ({ ...e, accounts: [...accountsSet] }));
-    return { edges, totalRecords: graph.records.length, shownRecords: recs.length };
-  }, [graph, rangeOn, timeRange]);
-
-  // Apply the view filters (direction + node-kind exclusions) to get the edges
-  // actually drawn; the time filter already shaped `edges`.
-  const visibleEdges = useMemo(
-    () =>
-      edges.filter((e) => {
-        if (dirFilter !== "all" && e.direction !== dirFilter) return false;
-        if (hostsOnly && !e.peerIsHost) return false;
-        if (excludeLocal && e.peerKind === "local") return false;
-        if (excludeLoopback && e.peerKind === "loopback") return false;
-        if (resultFilter === "success" && e.success === 0) return false; // no successful connection
-        if (resultFilter === "fail" && e.fail === 0) return false; // no failed attempt
-        return true;
-      }),
-    [edges, dirFilter, hostsOnly, excludeLocal, excludeLoopback, resultFilter]
+  return [...map.entries()].map(([key, rows]) => {
+    const d = rows.map((r) => r.timestamp).filter(Boolean).sort();
+    return {
+      key,
+      host: rows[0].host,
+      peer: rows[0].peerLabel,
+      direction: rows[0].direction,
+      rows,
+      count: rows.length,
+      first: d[0] ?? "",
+      last: d.at(-1) ?? "",
+      accounts: [...new Set(rows.map((r) => r.account).filter(Boolean))],
+      success: rows.filter((r) => r.result === "성공").length,
+      fail: rows.filter((r) => r.result === "실패").length,
+    };
+  }).sort((a, b) =>
+    b.fail - a.fail || b.count - a.count ||
+    (b.last || "").localeCompare(a.last || "")
   );
-
-  // The connection strength an edge represents under the current result filter:
-  // successful connections by default (real access), failed attempts under 실패.
-  const edgeWeight = (e: ConnEdge) => (resultFilter === "fail" ? e.fail : e.success || e.count);
-
-  // Nodes to render: registered hosts always; external nodes only when they
-  // still have a visible edge (and only if externals aren't hidden).
-  const visibleNodes = useMemo(() => {
-    const s = new Set<string>();
-    for (const h of graph?.hosts ?? []) s.add(h.name);
-    if (!hostsOnly) for (const e of visibleEdges) s.add(e.peer);
-    for (const e of visibleEdges) s.add(e.host);
-    return s;
-  }, [visibleEdges, graph, hostsOnly]);
-
-  const searchSet = useMemo(() => {
-    const q = search.trim().toLowerCase();
-    if (!q) return null;
-    return new Set([...visibleNodes].filter((id) => (topo.meta[id]?.label ?? id).toLowerCase().includes(q)));
-  }, [search, visibleNodes, topo.meta]);
-
-  const liveNodes = useMemo(() => {
-    const s = new Set<string>();
-    for (const e of visibleEdges) {
-      s.add(e.host);
-      s.add(e.peer);
-    }
-    return s;
-  }, [visibleEdges]);
-
-  // neighbours of the hovered/selected node — used for highlight/dim
-  const focusId = hoverNode ?? selected;
-  const neighbours = useMemo(() => {
-    if (!focusId) return null;
-    const s = new Set<string>([focusId]);
-    for (const e of visibleEdges) {
-      if (e.host === focusId) s.add(e.peer);
-      if (e.peer === focusId) s.add(e.host);
-    }
-    return s;
-  }, [focusId, visibleEdges]);
-
-  // If a filter hides the currently selected node, drop the side panel.
-  useEffect(() => {
-    if (selected && !visibleNodes.has(selected)) setSelected(null);
-  }, [visibleNodes, selected]);
-
-  if (loading) return <Center>케이스의 호스트 연결 관계를 모으는 중…</Center>;
-  if (!graph || graph.hosts.length === 0) return <Center>등록된 호스트가 없습니다.</Center>;
-
-  const radiusOf = (id: string) => {
-    const w = topo.weight[id] || 1;
-    const base = 5 + Math.sqrt(w) * 1.1;
-    return Math.max(topo.hosts.has(id) ? 11 : 6, Math.min(base, 20));
-  };
-
-  // ---- coordinate helpers (screen → svg/group space) ----
-  const toGraph = (cx: number, cy: number): XY => {
-    const g = gRef.current;
-    const svg = svgRef.current;
-    if (!g || !svg) return { x: 0, y: 0 };
-    const pt = svg.createSVGPoint();
-    pt.x = cx;
-    pt.y = cy;
-    const m = g.getScreenCTM();
-    if (!m) return { x: 0, y: 0 };
-    const p = pt.matrixTransform(m.inverse());
-    return { x: p.x, y: p.y };
-  };
-  const toVB = (cx: number, cy: number): XY => {
-    const svg = svgRef.current;
-    if (!svg) return { x: 0, y: 0 };
-    const pt = svg.createSVGPoint();
-    pt.x = cx;
-    pt.y = cy;
-    const m = svg.getScreenCTM();
-    if (!m) return { x: 0, y: 0 };
-    const p = pt.matrixTransform(m.inverse());
-    return { x: p.x, y: p.y };
-  };
-
-  const onDownNode = (e: React.PointerEvent, id: string) => {
-    e.stopPropagation();
-    svgRef.current?.setPointerCapture(e.pointerId);
-    drag.current = { mode: "node", id, moved: false, sx: e.clientX, sy: e.clientY };
-  };
-  const onDownBg = (e: React.PointerEvent) => {
-    svgRef.current?.setPointerCapture(e.pointerId);
-    drag.current = { mode: "pan", moved: false, sx: e.clientX, sy: e.clientY, last: toVB(e.clientX, e.clientY) };
-  };
-  const onMove = (e: React.PointerEvent) => {
-    setMouse({ x: e.clientX, y: e.clientY });
-    const d = drag.current;
-    if (!d.mode) return;
-    if (d.mode === "node" && d.id) {
-      if (!d.moved && Math.hypot(e.clientX - d.sx, e.clientY - d.sy) < 4) return;
-      d.moved = true;
-      const p = toGraph(e.clientX, e.clientY);
-      setPos((prev) => ({ ...prev, [d.id!]: p }));
-    } else if (d.mode === "pan" && d.last) {
-      const c = toVB(e.clientX, e.clientY);
-      const l = d.last;
-      setView((v) => ({ ...v, tx: v.tx + (c.x - l.x), ty: v.ty + (c.y - l.y) }));
-      d.last = c;
-      if (Math.hypot(e.clientX - d.sx, e.clientY - d.sy) > 4) d.moved = true;
-    }
-  };
-  const onUp = () => {
-    const d = drag.current;
-    if (d.mode === "node" && !d.moved && d.id) setSelected((s) => (s === d.id ? null : d.id!));
-    if (d.mode === "pan" && !d.moved) setSelected(null);
-    drag.current = { mode: null, moved: false, sx: 0, sy: 0 };
-  };
-  const onWheel = (e: React.WheelEvent) => {
-    e.preventDefault();
-    const c = toVB(e.clientX, e.clientY);
-    setView((v) => {
-      const k = Math.max(0.3, Math.min(3.5, v.k * (e.deltaY < 0 ? 1.12 : 1 / 1.12)));
-      return { k, tx: c.x - (k / v.k) * (c.x - v.tx), ty: c.y - (k / v.k) * (c.y - v.ty) };
+}
+function catalog(hosts: HostNode[], es: Edge[]) {
+  const known = new Set(hosts.map((h) => key(h.name))),
+    m = new Map<string, { key: string; label: string; registered: boolean }>();
+  hosts.forEach((h) =>
+    m.set(key(h.name), { key: key(h.name), label: h.name, registered: true })
+  );
+  es.forEach((e) => {
+    m.set(key(e.host), {
+      key: key(e.host),
+      label: e.host,
+      registered: known.has(key(e.host)),
     });
+    const k = key(e.peer);
+    m.set(k, {
+      key: k,
+      label: e.peer,
+      registered: m.get(k)?.registered ?? known.has(k),
+    });
+  });
+  return [...m.values()].sort((a, b) =>
+    Number(b.registered) - Number(a.registered) ||
+    a.label.localeCompare(b.label, "ko")
+  );
+}
+function pickFocus(
+  ns: ReturnType<typeof catalog>,
+  es: Edge[],
+  wanted?: string | null,
+) {
+  const registered = ns.filter((node) => node.registered);
+  const requested = wanted && key(wanted);
+  if (requested && registered.some((n) => n.key === requested)) return requested;
+  const score = new Map<string, number>();
+  es.forEach((e) =>
+    [key(e.host), key(e.peer)].forEach((k) =>
+      score.set(k, (score.get(k) ?? 0) + e.count + e.fail * 5)
+    )
+  );
+  return (registered.length ? registered : ns).sort((a, b) =>
+    (score.get(b.key) ?? 0) - (score.get(a.key) ?? 0) ||
+    a.label.localeCompare(b.label, "ko")
+  )[0]?.key ?? null;
+}
+/**
+ * The inspector must describe the same subset that is drawn.  In the
+ * host-focused view a case can have relations for another registered host;
+ * showing those in the list while drawing the selected host made the graph
+ * look broken (and, more importantly, mixed two different investigations).
+ */
+function layout(
+  hosts: HostNode[],
+  es: Edge[],
+  focus: string | null,
+  all: boolean,
+  viewport = DEFAULT_GRAPH,
+) {
+  // The model always follows the actual measured viewport.  A graph that is
+  // wider or taller than its overflow-hidden pane makes nodes unreachable on
+  // compact windows, so do not impose a virtual canvas minimum here.
+  const w = Math.max(1, viewport.width);
+  const h = Math.max(1, viewport.height);
+  const labelHalf = graphLabelHalf(w);
+  const insetX = Math.min(
+    w / 2,
+    Math.max(labelHalf + 4, Math.min(68, Math.max(26, w * .1))),
+  );
+  const insetY = Math.min(66, Math.max(30, h * .12));
+  const ns = catalog(hosts, es);
+  if (all) {
+    const shown = es.slice(0, ALL_LIMIT), used = catalog(hosts, shown);
+    const cols = Math.max(
+      3,
+      Math.min(6, Math.floor((w - 120) / 145) || 3),
+    );
+    const rows = Math.max(1, Math.ceil(used.length / cols));
+    const xGap = cols > 1 ? Math.max(0, (w - insetX * 2) / (cols - 1)) : 0;
+    const yGap = rows > 1 ? Math.max(0, (h - insetY * 2) / (rows - 1)) : 0;
+    return {
+      nodes: used.map((n, i) => ({
+        ...n,
+        x: cols === 1 ? w / 2 : insetX + (i % cols) * xGap,
+        y: rows === 1 ? h / 2 : insetY + Math.floor(i / cols) * yGap,
+      })),
+      shown,
+      hidden: es.length - shown.length,
+      w,
+      h,
+      focus: null,
+    };
+  }
+  const f = ns.find((n) => n.key === focus) ?? ns[0];
+  if (!f) {
+    return { nodes: [], shown: [], hidden: 0, w, h, focus: null };
+  }
+  const rel = es.filter((e) => key(e.host) === f.key || key(e.peer) === f.key),
+    shown = rel.slice(0, LIMIT),
+    groups: {
+      in: { key: string; label: string; registered: boolean }[];
+      out: { key: string; label: string; registered: boolean }[];
+      unknown: { key: string; label: string; registered: boolean }[];
+    } = { in: [], out: [], unknown: [] };
+  const seen = new Set<string>();
+  shown.forEach((e) => {
+    const other = key(e.host) === f.key ? key(e.peer) : key(e.host);
+    if (seen.has(other)) return;
+    seen.add(other);
+    const n = ns.find((n) => n.key === other);
+    if (!n) return;
+    const rels = shown.filter((x) =>
+      key(x.host) === other || key(x.peer) === other
+    );
+    const ds = new Set(rels.map((x) => {
+      if (x.direction === "unknown") return "unknown";
+      const owner = key(x.host) === f.key;
+      return (owner && x.direction === "outbound") ||
+          (!owner && x.direction === "inbound")
+        ? "out"
+        : "in";
+    }));
+    groups[ds.size === 1 ? [...ds][0] : "unknown"].push(n);
+  });
+  const side = Math.max(groups.in.length, groups.out.length);
+  const cy = Math.round(h / 2);
+  const lanePitch = Math.max(0, Math.min(118, (h - insetY * 2) / Math.max(1, side - 1)));
+  const nodes: Node[] = [{ ...f, x: w / 2, y: cy }];
+  const put = (xs: typeof groups.in, x: number, y: number) =>
+    xs.forEach((n, i) =>
+      nodes.push({ ...n, x, y: y - (xs.length - 1) * lanePitch / 2 + i * lanePitch })
+    );
+  put(groups.in, Math.max(insetX, w * .18), cy);
+  put(groups.out, Math.min(w - insetX, w * .82), cy);
+  put(groups.unknown, w / 2, Math.min(h - insetY, cy + side * lanePitch / 2 + 86));
+  return {
+    nodes,
+    shown,
+    hidden: rel.length - shown.length,
+    w,
+    h,
+    focus: f.key,
   };
-  const resetView = () => {
-    const next = computeLayout(topo.ids, topo.adj, topo.hosts, layout);
-    setPos(next);
-    setView(fitView(next, topo.ids));
-  };
-
-  const selMeta = selected ? topo.meta[selected] : null;
-  const selEdges = selected ? visibleEdges.filter((e) => e.host === selected || e.peer === selected) : [];
-  const hostCount = graph.hosts.length;
-  const externalCount = topo.ids.length - hostCount;
-  const hasLocalNode = topo.ids.some((id) => topo.meta[id]?.kind === "local");
-  const hasLoopbackNode = topo.ids.some((id) => topo.meta[id]?.kind === "loopback");
-
-  return (
-    <div className="dfir-view" style={{ flex: 1, minHeight: 0, overflow: "auto", padding: "28px 32px" }}>
-      <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 12 }}>
-        <div>
-          <div style={{ fontSize: 22, fontWeight: 700, marginBottom: 2 }}>🔗 호스트 연결</div>
-          <div style={{ fontSize: 12, color: "var(--text-faint)" }}>
-            노드를 클릭하면 상세가 옆에 뜹니다. 드래그로 이동, 빈 공간 드래그로 화면 이동, 휠로 확대/축소.
-          </div>
-        </div>
-        <div style={{ display: "flex", gap: 8, flexShrink: 0 }}>
-          <button
-            onClick={() => setShowSettings((v) => !v)}
-            title="노드 간격/거리 조절"
-            style={{ ...btn, borderColor: showSettings ? "var(--accent)" : "var(--border)", background: showSettings ? "var(--accent-subtle)" : "var(--bg-elevated)", color: showSettings ? "var(--accent)" : "var(--text-dim)" }}
-          >
-            ⚙ 레이아웃
-          </button>
-          <button onClick={resetView} title="레이아웃 다시 계산 + 화면 맞춤" style={btn}>
-            ⤢ 정렬
-          </button>
-          <button onClick={onRefresh} title="다른 호스트를 파싱한 뒤 눌러 새로고침" style={btn}>
-            ⟳ 새로고침
-          </button>
-        </div>
-      </div>
-
-      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center", margin: "12px 0" }}>
-        {rangeOn && <span style={chip("var(--accent)")}>기간 필터 적용됨 · {shownRecords.toLocaleString()} / {totalRecords.toLocaleString()}건</span>}
-        {topo.meta["LOCAL"]?.kind === "local" && <span style={chip("var(--warning)")}>🏢 LOCAL 세션 존재 — 콘솔/AD 서버(도메인 컨트롤러) 경유 가능성</span>}
-      </div>
-
-      {/* controls: node-kind toggles, direction filter, search, counts */}
-      <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center", marginBottom: 12 }}>
-        <ToggleBtn active={hostsOnly} onClick={() => setHostsOnly((v) => !v)} title="외부 IP를 숨기고 등록된 호스트만 표시">
-          등록 호스트
-        </ToggleBtn>
-        {!hostsOnly && hasLocalNode && (
-          <ToggleBtn active={excludeLocal} onClick={() => setExcludeLocal((v) => !v)} title="LOCAL 노드를 숨김">
-            Local 제외
-          </ToggleBtn>
-        )}
-        {!hostsOnly && hasLoopbackNode && (
-          <ToggleBtn active={excludeLoopback} onClick={() => setExcludeLoopback((v) => !v)} title="로컬호스트(HOST/127.0.0.1) 노드를 숨김">
-            로컬호스트 제외
-          </ToggleBtn>
-        )}
-
-        <div style={{ display: "inline-flex", background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", padding: 2, gap: 2 }}>
-          {([["all", "전체"], ["inbound", "인바운드"], ["outbound", "아웃바운드"]] as [DirFilter, string][]).map(([v, label]) => {
-            const active = dirFilter === v;
-            return (
-              <button key={v} onClick={() => setDirFilter(v)} style={{ fontSize: 11.5, padding: "4px 11px", border: "none", borderRadius: "var(--radius-sm)", cursor: "pointer", fontWeight: active ? 700 : 500, background: active ? "var(--accent-subtle)" : "transparent", color: active ? "var(--accent)" : "var(--text-dim)" }}>
-                {label}
-              </button>
-            );
-          })}
-        </div>
-
-        {/* result filter — the graph is success-based by default */}
-        <div style={{ display: "inline-flex", background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", padding: 2, gap: 2 }}>
-          {([["success", "성공한 접속", "var(--success)"], ["all", "전체", "var(--accent)"], ["fail", "실패 시도", "var(--danger)"]] as [ResultFilter, string, string][]).map(([v, label, c]) => {
-            const active = resultFilter === v;
-            return (
-              <button key={v} onClick={() => setResultFilter(v)} title={v === "success" ? "성공한 접속만 표시" : v === "fail" ? "실패한 접속 시도만 표시" : "성공·실패·정보 모두"} style={{ fontSize: 11.5, padding: "4px 11px", border: "none", borderRadius: "var(--radius-sm)", cursor: "pointer", fontWeight: active ? 700 : 500, background: active ? `color-mix(in srgb, ${c} 18%, transparent)` : "transparent", color: active ? c : "var(--text-dim)" }}>
-                {label}
-              </button>
-            );
-          })}
-        </div>
-
-        <div style={{ position: "relative", flex: "0 1 240px", minWidth: 160 }}>
-          <span style={{ position: "absolute", left: 9, top: "50%", transform: "translateY(-50%)", fontSize: 12, color: "var(--text-faint)", pointerEvents: "none" }}>🔍</span>
-          <input
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            placeholder="IP · 호스트명 검색"
-            style={{ width: "100%", padding: "6px 24px 6px 28px", fontSize: 12.5, fontFamily: "var(--mono)", background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", color: "var(--text)", outline: "none" }}
-          />
-          {search && (
-            <span onClick={() => setSearch("")} style={{ position: "absolute", right: 8, top: "50%", transform: "translateY(-50%)", cursor: "pointer", color: "var(--text-faint)", fontSize: 13 }}>✕</span>
-          )}
-        </div>
-
-        <span style={{ marginLeft: "auto", fontSize: 11.5, color: "var(--text-faint)" }}>
-          호스트 {hostCount}{!hostsOnly && externalCount > 0 ? ` · 외부 IP ${externalCount}` : ""} · 연결 {visibleEdges.length}
-        </span>
-      </div>
-
-      {/* legend */}
-      <div style={{ display: "flex", gap: 16, marginBottom: 12, fontSize: 11.5, color: "var(--text-dim)", flexWrap: "wrap" }}>
-        <Legend color={KIND_COLOR.host} label="등록 호스트" />
-        <Legend color={KIND_COLOR.external} label="외부 IP" />
-        <Legend color={KIND_COLOR.local} label="LOCAL" />
-        <Legend color={KIND_COLOR.loopback} label="루프백" />
-        <span style={{ color: "var(--warning)" }}>→ 인바운드 (외부 → 이 호스트, 접속당함)</span>
-        <span>→ 아웃바운드 (이 호스트 → 외부, 접속함)</span>
-      </div>
-
-      <div style={{ position: "relative", border: "1px solid var(--border)", borderRadius: "var(--radius-lg)", background: "var(--bg-panel)", overflow: "hidden" }}>
-        <svg
-          ref={svgRef}
-          viewBox={`0 0 ${VB_W} ${VB_H}`}
-          width="100%"
-          style={{ display: "block", height: 560, touchAction: "none", cursor: drag.current.mode === "pan" ? "grabbing" : "grab" }}
-          onPointerDown={onDownBg}
-          onPointerMove={onMove}
-          onPointerUp={onUp}
-          onPointerLeave={onUp}
-          onWheel={onWheel}
-        >
-          <defs>
-            <marker id="ar-in" markerWidth="6" markerHeight="6" refX="4.6" refY="3" orient="auto" markerUnits="strokeWidth">
-              <path d="M1,0.6 L4.4,3 L1,5.4" fill="none" stroke="var(--warning)" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" />
-            </marker>
-            <marker id="ar-out" markerWidth="6" markerHeight="6" refX="4.6" refY="3" orient="auto" markerUnits="strokeWidth">
-              <path d="M1,0.6 L4.4,3 L1,5.4" fill="none" stroke="var(--text-faint)" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" />
-            </marker>
-            <marker id="ar-hi" markerWidth="6" markerHeight="6" refX="4.6" refY="3" orient="auto" markerUnits="strokeWidth">
-              <path d="M1,0.6 L4.4,3 L1,5.4" fill="none" stroke="var(--accent)" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
-            </marker>
-          </defs>
-
-          <g ref={gRef} transform={`translate(${view.tx} ${view.ty}) scale(${view.k})`}>
-            {/* edges */}
-            {visibleEdges.map((e, i) => {
-              const A = pos[e.host];
-              const B = pos[e.peer];
-              if (!A || !B) return null;
-              const src = e.direction === "inbound" ? B : A;
-              const dst = e.direction === "inbound" ? A : B;
-              const dx = dst.x - src.x;
-              const dy = dst.y - src.y;
-              const len = Math.max(1, Math.hypot(dx, dy));
-              const ux = dx / len;
-              const uy = dy / len;
-              const rS = radiusOf(e.direction === "inbound" ? e.peer : e.host);
-              const rD = radiusOf(e.direction === "inbound" ? e.host : e.peer);
-              const sx = src.x + ux * rS;
-              const sy = src.y + uy * rS;
-              const ex = dst.x - ux * (rD + 5);
-              const ey = dst.y - uy * (rD + 5);
-              // curve them apart so inbound/outbound between a pair don't overlap
-              const off = (e.direction === "inbound" ? 1 : -1) * 16;
-              const mx = (sx + ex) / 2 - uy * off;
-              const my = (sy + ey) / 2 + ux * off;
-              const active = hoverEdge === e || (neighbours != null && neighbours.has(e.host) && neighbours.has(e.peer));
-              const dim = (neighbours != null || hoverEdge != null) && !active;
-              const inbound = e.direction === "inbound";
-              return (
-                <path
-                  key={i}
-                  d={`M ${sx} ${sy} Q ${mx} ${my} ${ex} ${ey}`}
-                  fill="none"
-                  stroke={active ? "var(--accent)" : inbound ? "var(--warning)" : "var(--text-faint)"}
-                  strokeWidth={(active ? 2.6 : Math.min(1 + Math.log10(edgeWeight(e) + 1), 3)) / view.k}
-                  strokeOpacity={dim ? 0.1 : active ? 1 : 0.5}
-                  markerEnd={active ? "url(#ar-hi)" : inbound ? "url(#ar-in)" : "url(#ar-out)"}
-                  style={{ cursor: "pointer" }}
-                  onPointerEnter={() => setHoverEdge(e)}
-                  onPointerLeave={() => setHoverEdge(null)}
-                />
-              );
-            })}
-
-            {/* nodes */}
-            {topo.ids.map((id) => {
-              const p = pos[id];
-              if (!p || !visibleNodes.has(id)) return null;
-              const m = topo.meta[id];
-              const r = radiusOf(id);
-              const color = KIND_COLOR[m.kind];
-              const isSel = selected === id;
-              const searchDim = searchSet != null && !searchSet.has(id);
-              const focusDim = neighbours != null && !neighbours.has(id);
-              const filterDim = rangeOn && !liveNodes.has(id);
-              const op = searchDim ? 0.12 : focusDim ? 0.2 : filterDim ? 0.32 : 1;
-              const showLabel = (searchSet != null && searchSet.has(id)) || visibleNodes.size <= 45 || isSel || hoverNode === id || (neighbours != null && neighbours.has(id));
-              return (
-                <g
-                  key={id}
-                  transform={`translate(${p.x} ${p.y})`}
-                  opacity={op}
-                  style={{ cursor: "pointer" }}
-                  onPointerDown={(ev) => onDownNode(ev, id)}
-                  onPointerEnter={() => setHoverNode(id)}
-                  onPointerLeave={() => setHoverNode(null)}
-                >
-                  <circle
-                    r={r}
-                    fill={color}
-                    fillOpacity={m.kind === "host" ? 0.9 : 0.32}
-                    stroke={isSel ? "var(--accent)" : color}
-                    strokeWidth={(isSel ? 3.2 : 1.4) / view.k}
-                  />
-                  {m.kind === "host" && (
-                    <text textAnchor="middle" dy={r / 3} fontSize={Math.min(r, 15) / view.k} style={{ pointerEvents: "none" }}>
-                      🖥️
-                    </text>
-                  )}
-                  {showLabel && (
-                    <text
-                      textAnchor="middle"
-                      y={r + 12 / view.k}
-                      fontSize={11 / view.k}
-                      fontWeight={m.kind === "host" ? 700 : 500}
-                      fill={m.kind === "host" ? "var(--text)" : "var(--text-dim)"}
-                      style={{ pointerEvents: "none", paintOrder: "stroke" }}
-                      stroke="var(--bg-panel)"
-                      strokeWidth={3 / view.k}
-                    >
-                      {m.label}
-                    </text>
-                  )}
-                </g>
-              );
-            })}
-          </g>
-        </svg>
-
-        {visibleEdges.length === 0 && (
-          <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", color: "var(--text-faint)", fontSize: 12.5, pointerEvents: "none" }}>
-            {totalRecords > 0 && (rangeOn || dirFilter !== "all" || resultFilter !== "all" || hostsOnly || excludeLocal || excludeLoopback) ? "조건에 맞는 RDP 연결이 없습니다." : "RDP 접속 기록이 없습니다."}
-          </div>
-        )}
-
-        {/* adjustable layout panel */}
-        {showSettings && (
-          <div style={settingsPanel}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
-              <span style={{ fontSize: 12.5, fontWeight: 700 }}>⚙ 레이아웃 조절</span>
-              <button onClick={() => setShowSettings(false)} style={{ ...btn, padding: "1px 7px" }}>✕</button>
-            </div>
-            <Slider label="노드 간격" hint="멀리 ↔ 가까이" value={layout.repulsion} min={5000} max={45000} step={1000} onChange={(v) => setLayout((p) => ({ ...p, repulsion: v }))} />
-            <Slider label="연결 거리" hint="선으로 이어진 노드 간" value={layout.linkDist} min={90} max={420} step={5} onChange={(v) => setLayout((p) => ({ ...p, linkDist: v }))} />
-            <Slider label="중심 쏠림" hint="흩어짐 ↔ 모임" value={layout.gravity} min={0.004} max={0.05} step={0.002} format={(v) => v.toFixed(3)} onChange={(v) => setLayout((p) => ({ ...p, gravity: v }))} />
-            <button onClick={() => setLayout(DEFAULT_LAYOUT)} style={{ ...btn, width: "100%", marginTop: 8, justifyContent: "center" }}>
-              기본값으로
-            </button>
-            <div style={{ fontSize: 10, color: "var(--text-faint)", marginTop: 6, lineHeight: 1.4 }}>
-              조절 후 배치가 흩어지면 <b>⤢ 정렬</b>로 화면을 다시 맞출 수 있어요.
-            </div>
-          </div>
-        )}
-
-        {/* edge tooltip follows the cursor */}
-        {hoverEdge && drag.current.mode == null && (
-          <FloatingTip mouse={mouse} edge={hoverEdge} />
-        )}
-
-        {/* click-to-inspect side panel */}
-        {selMeta && (
-          <div style={panel}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
-              <div style={{ fontSize: 14, fontWeight: 700, fontFamily: "var(--mono)", wordBreak: "break-all" }}>
-                {selMeta.kind === "host" ? "🖥️ " : selMeta.kind === "local" ? "🏢 " : selMeta.kind === "loopback" ? "🔁 " : ""}
-                {selMeta.label}
-              </div>
-              <button onClick={() => setSelected(null)} style={{ ...btn, padding: "2px 8px" }}>
-                ✕
-              </button>
-            </div>
-            <div style={{ fontSize: 11, color: KIND_COLOR[selMeta.kind], marginTop: 2 }}>{KIND_LABEL[selMeta.kind]}</div>
-            {selMeta.ips.length > 0 && <div style={{ fontSize: 11, color: "var(--text-faint)", marginTop: 4, fontFamily: "var(--mono)" }}>IP: {selMeta.ips.join(", ")}</div>}
-            {selMeta.kind === "host" && onOpenHost && (
-              <button onClick={() => onOpenHost(selMeta.label)} style={{ ...btn, width: "100%", marginTop: 8, justifyContent: "center", color: "var(--accent)", borderColor: "var(--accent)", background: "var(--accent-subtle)" }}>
-                이 호스트 열기 →
-              </button>
-            )}
-            <div style={{ fontSize: 11.5, color: "var(--text-dim)", margin: "8px 0 4px" }}>
-              성공 {selEdges.reduce((s, e) => s + e.success, 0).toLocaleString()} · 실패 {selEdges.reduce((s, e) => s + e.fail, 0).toLocaleString()} · 인바운드 {selEdges.filter((e) => e.direction === "inbound").length} / 아웃바운드 {selEdges.filter((e) => e.direction === "outbound").length}건
-            </div>
-            <div style={{ overflow: "auto", flex: 1, marginTop: 4, display: "flex", flexDirection: "column", gap: 6 }}>
-              {selEdges.length === 0 && <div style={{ fontSize: 11.5, color: "var(--text-faint)" }}>이 기간에 연결이 없습니다.</div>}
-              {[...selEdges].sort((a, b) => (b.last || "").localeCompare(a.last || "")).map((e, i) => {
-                const other = e.host === selected ? e.peerLabel : e.host;
-                const arrow = e.direction === "inbound" ? (e.host === selected ? "← " : "→ ") : e.host === selected ? "→ " : "← ";
-                return (
-                  <div key={i} style={{ padding: "7px 9px", border: "1px solid var(--border-subtle)", borderRadius: "var(--radius-md)", borderLeft: `3px solid ${e.direction === "inbound" ? "var(--warning)" : "var(--text-faint)"}` }}>
-                    <div style={{ fontSize: 11.5, fontWeight: 600, fontFamily: "var(--mono)" }}>
-                      <span style={{ color: e.direction === "inbound" ? "var(--warning)" : "var(--text-dim)" }}>{e.direction === "inbound" ? "인바운드 " : "아웃바운드 "}</span>
-                      {arrow}
-                      {other}
-                    </div>
-                    <div style={{ fontSize: 10.5, color: "var(--text-faint)", marginTop: 2 }}>
-                      성공 {e.success} · 실패 {e.fail}{e.count ? ` · ${e.count.toLocaleString()} 이벤트` : ""}
-                    </div>
-                    <div style={{ fontSize: 10, color: "var(--text-faint)", fontFamily: "var(--mono)", marginTop: 2 }}>
-                      {e.first?.slice(0, 16)} ~ {e.last?.slice(0, 16)}
-                    </div>
-                    {e.accounts.length > 0 && <div style={{ fontSize: 10, color: "var(--text-faint)", marginTop: 2 }}>👤 {e.accounts.join(", ")}</div>}
-                  </div>
-                );
-              })}
-            </div>
-          </div>
-        )}
-      </div>
-
-      <div style={{ fontSize: 11, color: "var(--text-faint)", marginTop: 8 }}>
-        선 굵기 = 접속 횟수(기본: 성공한 접속 기준). LOCAL = 콘솔/AD 경유 가능성, 루프백(HOST/127.0.0.1) = 원격/터널링 도구 가능성. 전역 기간 필터가 이 뷰에도 적용됩니다.
-      </div>
-    </div>
-  );
 }
-
-function FloatingTip({ mouse, edge }: { mouse: XY; edge: ConnEdge }) {
-  const w = typeof window !== "undefined" ? window.innerWidth : 1200;
-  const h = typeof window !== "undefined" ? window.innerHeight : 800;
+function Button(
+  { children, ...p }:
+    & { children: React.ReactNode }
+    & React.ButtonHTMLAttributes<HTMLButtonElement>,
+) {
   return (
-    <div
-      style={{
-        position: "fixed",
-        left: Math.min(mouse.x + 16, w - 320),
-        top: Math.min(mouse.y + 16, h - 120),
-        zIndex: 50,
-        pointerEvents: "none",
-        maxWidth: 300,
-        padding: "8px 11px",
-        background: "var(--bg-elevated)",
-        border: "1px solid var(--accent)",
-        borderRadius: "var(--radius-md)",
-        boxShadow: "0 6px 24px rgba(0,0,0,.35)",
-        fontSize: 12,
-      }}
-    >
-      <div style={{ fontWeight: 700, fontFamily: "var(--mono)" }}>
-        {edge.direction === "inbound" ? `${edge.peerLabel} → ${edge.host}` : `${edge.host} → ${edge.peerLabel}`}
-      </div>
-      <div style={{ color: "var(--text-dim)", marginTop: 3 }}>
-        {edge.direction === "inbound" ? "인바운드" : "아웃바운드"} · 성공 {edge.success} · 실패 {edge.fail}{edge.count ? ` · ${edge.count.toLocaleString()} 이벤트` : ""}
-      </div>
-      <div style={{ color: "var(--text-faint)", marginTop: 3, fontFamily: "var(--mono)", fontSize: 11 }}>
-        {edge.first?.slice(0, 19)} ~ {edge.last?.slice(0, 19)}
-      </div>
-    </div>
-  );
-}
-
-const btn: React.CSSProperties = {
-  flexShrink: 0,
-  padding: "7px 12px",
-  fontSize: 12,
-  fontWeight: 600,
-  borderRadius: "var(--radius-md)",
-  cursor: "pointer",
-  border: "1px solid var(--border)",
-  background: "var(--bg-elevated)",
-  color: "var(--text-dim)",
-};
-
-const panel: React.CSSProperties = {
-  position: "absolute",
-  top: 10,
-  right: 10,
-  bottom: 10,
-  width: 290,
-  display: "flex",
-  flexDirection: "column",
-  padding: "12px 14px",
-  background: "color-mix(in srgb, var(--bg-elevated) 92%, transparent)",
-  backdropFilter: "blur(3px)",
-  border: "1px solid var(--border)",
-  borderRadius: "var(--radius-lg)",
-  boxShadow: "0 8px 30px rgba(0,0,0,.3)",
-};
-
-const settingsPanel: React.CSSProperties = {
-  position: "absolute",
-  top: 10,
-  left: 10,
-  width: 232,
-  padding: "11px 13px",
-  background: "color-mix(in srgb, var(--bg-elevated) 94%, transparent)",
-  backdropFilter: "blur(3px)",
-  border: "1px solid var(--border)",
-  borderRadius: "var(--radius-lg)",
-  boxShadow: "0 8px 30px rgba(0,0,0,.3)",
-  zIndex: 6,
-};
-
-const chip = (color: string): React.CSSProperties => ({
-  display: "inline-flex",
-  alignItems: "center",
-  padding: "4px 10px",
-  fontSize: 11.5,
-  borderRadius: 999,
-  border: `1px solid ${color}`,
-  background: `color-mix(in srgb, ${color} 12%, transparent)`,
-  color: "var(--text-dim)",
-});
-
-function Slider({ label, hint, value, min, max, step, onChange, format }: { label: string; hint?: string; value: number; min: number; max: number; step: number; onChange: (v: number) => void; format?: (v: number) => string }) {
-  return (
-    <div style={{ marginBottom: 9 }}>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", fontSize: 11.5, marginBottom: 2 }}>
-        <span style={{ fontWeight: 600 }}>{label}</span>
-        <span style={{ fontFamily: "var(--mono)", fontSize: 10.5, color: "var(--text-faint)" }}>{format ? format(value) : Math.round(value)}</span>
-      </div>
-      <input
-        type="range"
-        min={min}
-        max={max}
-        step={step}
-        value={value}
-        onChange={(e) => onChange(Number(e.target.value))}
-        style={{ width: "100%", accentColor: "var(--accent)", cursor: "pointer" }}
-      />
-      {hint && <div style={{ fontSize: 9.5, color: "var(--text-faint)", marginTop: 1 }}>{hint}</div>}
-    </div>
-  );
-}
-
-function ToggleBtn({ active, onClick, title, children }: { active: boolean; onClick: () => void; title?: string; children: React.ReactNode }) {
-  return (
-    <button
-      onClick={onClick}
-      title={title}
-      style={{ ...btn, borderColor: active ? "var(--accent)" : "var(--border)", background: active ? "var(--accent-subtle)" : "var(--bg-elevated)", color: active ? "var(--accent)" : "var(--text-dim)" }}
-    >
-      {active ? "☑" : "☐"} {children}
+    <button type="button" {...p} style={{ ...button, ...p.style }}>
+      {children}
     </button>
   );
 }
-
-function Center({ children }: { children: React.ReactNode }) {
-  return <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100%", color: "var(--text-dim)" }}>{children}</div>;
-}
-function Legend({ color, label }: { color: string; label: string }) {
+export default function HostConnectionView(
+  {
+    graph,
+    loading,
+    timeRange = EMPTY_TIME_RANGE,
+    focusHostName,
+    onRefresh,
+    onOpenHost,
+  }: Props,
+) {
+  const [search, setSearch] = useState(""),
+    [direction, setDirection] = useState<"all" | ConnDirection>("all"),
+    [result, setResult] = useState<"all" | "success" | "fail">("all"),
+    [includeLocal, setIncludeLocal] = useState(false),
+    [includeLoopback, setIncludeLoopback] = useState(false),
+    [scope, setScope] = useState<"host" | "overall">("host"),
+    [focus, setFocus] = useState<string | null>(null),
+    [selected, setSelected] = useState<string | null>(null);
+  const compactLayout = useMediaQuery("(max-width: 1000px)");
+  const range = rangeActive(timeRange),
+    rows = graph?.records ?? [],
+    scoped = useMemo(
+      () =>
+        rows.filter((r) =>
+          (!range || Boolean(r.timestamp) && inRange(r.timestamp, timeRange)) &&
+          (includeLocal || r.peerKind !== "local") &&
+          (includeLoopback || r.peerKind !== "loopback") &&
+          (direction === "all" || r.direction === direction) &&
+          (result === "all" ||
+            (result === "success"
+              ? r.result === "성공"
+              : r.result === "실패")) &&
+          (!search.trim() ||
+            [r.host, r.peer, r.peerLabel, r.account, r.result].some((v) =>
+              v.toLocaleLowerCase().includes(search.trim().toLocaleLowerCase())
+            ))
+        ),
+      [
+        rows,
+        range,
+        timeRange,
+        includeLocal,
+        includeLoopback,
+        direction,
+        result,
+        search,
+      ],
+    );
+  const es = useMemo(() => edges(scoped), [scoped]),
+    ns = useMemo(() => catalog(graph?.hosts ?? [], es), [graph?.hosts, es]),
+    registeredNodes = useMemo(() => ns.filter((node) => node.registered), [ns]),
+    defaultFocus = useMemo(() => pickFocus(ns, es, focusHostName), [
+      ns,
+      es,
+      focusHostName,
+    ]),
+    activeFocus = focus && registeredNodes.some((n) => n.key === focus)
+      ? focus
+      : defaultFocus,
+    visibleEdges = useMemo(
+      () => graphEdgesForScope(es, activeFocus, scope === "overall"),
+      [es, activeFocus, scope],
+    ),
+    focusHostLabel = registeredNodes.find((node) => node.key === activeFocus)
+      ?.label ?? null,
+    edge = visibleEdges.find((e) => e.key === selected) ?? null,
+    noTime = range ? rows.filter((r) => !r.timestamp).length : 0;
+  if (loading) {
+    return (
+      <Center>
+        <CircularProgress size={18} />원격 접근 관계를 불러오는 중입니다.
+      </Center>
+    );
+  }
+  if (!graph) {
+    return (
+      <Center>
+        원격 접근 관계를 불러오지 못했습니다.{" "}
+        {onRefresh && <Button onClick={onRefresh}>다시 불러오기</Button>}
+      </Center>
+    );
+  }
+  const selectNode = (node: Node) => {
+    if (node.registered) {
+      setFocus(node.key);
+      setSelected(null);
+      setScope("host");
+      return;
+    }
+    const related = es.find((edge) =>
+      key(edge.host) === node.key || key(edge.peer) === node.key
+    );
+    if (related) setSelected(related.key);
+  };
   return (
-    <span style={{ display: "inline-flex", alignItems: "center", gap: 5 }}>
-      <span style={{ width: 12, height: 12, borderRadius: "50%", background: color, opacity: 0.85 }} />
-      {label}
-    </span>
+    <main
+      className="dfir-view"
+      style={{
+        flex: 1,
+        minHeight: 0,
+        overflow: "auto",
+        padding: "18px 20px",
+        display: "flex",
+        flexDirection: "column",
+      }}
+    >
+      <section style={surface}>
+        <header style={head}>
+          <strong>원격 접근 관계 (RDP)</strong>
+          <span>
+            {scoped.length.toLocaleString()}개 이벤트 ·{" "}
+            {es.length.toLocaleString()}개 관계
+          </span>
+          <span>{range ? "전역 기간 필터 적용" : "전체 기간"}</span>
+          {graph.rdpSourceFailures?.length
+            ? (
+              <span style={warning}>
+                일부 RDP 원본 미확인 {graph.rdpSourceFailures.length}건
+              </span>
+            )
+            : null}
+          {graph.networkMappingFailures?.length
+            ? (
+              <span>
+                네트워크 매핑 미확인 {graph.networkMappingFailures.length}건
+              </span>
+            )
+            : null}
+          {onRefresh && (
+            <Button onClick={onRefresh} style={{ marginLeft: "auto" }}>
+              <RefreshOutlinedIcon sx={{ fontSize: 15 }} />새로고침
+            </Button>
+          )}
+        </header>
+        <div style={toolbar}>
+          <Button
+            aria-pressed={includeLocal}
+            onClick={() => setIncludeLocal((v) => !v)}
+          >
+            로컬 {includeLocal ? "포함" : "제외"}
+          </Button>
+          <Button
+            aria-pressed={includeLoopback}
+            onClick={() => setIncludeLoopback((v) => !v)}
+          >
+            루프백 {includeLoopback ? "포함" : "제외"}
+          </Button>
+          <select
+            aria-label="방향 필터"
+            value={direction}
+            onChange={(e) => setDirection(e.target.value as typeof direction)}
+            style={field}
+          >
+            <option value="all">방향 전체</option>
+            <option value="inbound">인바운드</option>
+            <option value="outbound">아웃바운드</option>
+            <option value="unknown">방향 정보 없음</option>
+          </select>
+          <select
+            aria-label="결과 필터"
+            value={result}
+            onChange={(e) => setResult(e.target.value as typeof result)}
+            style={field}
+          >
+            <option value="all">결과 전체</option>
+            <option value="success">성공</option>
+            <option value="fail">실패</option>
+          </select>
+          <div role="group" aria-label="관계 그래프 범위" style={{ display: "inline-flex" }}>
+            <Button aria-pressed={scope === "host"} onClick={() => setScope("host")} style={{ borderRadius: "var(--radius-sm) 0 0 var(--radius-sm)", borderColor: scope === "host" ? "var(--accent)" : "var(--border)", background: scope === "host" ? "var(--accent-subtle)" : "transparent", color: scope === "host" ? "var(--accent)" : "var(--text-dim)" }}>
+              호스트별 관계
+            </Button>
+            <Button aria-pressed={scope === "overall"} onClick={() => setScope("overall")} style={{ marginLeft: -1, borderRadius: "0 var(--radius-sm) var(--radius-sm) 0", borderColor: scope === "overall" ? "var(--accent)" : "var(--border)", background: scope === "overall" ? "var(--accent-subtle)" : "transparent", color: scope === "overall" ? "var(--accent)" : "var(--text-dim)" }}>
+              관계 개요
+            </Button>
+          </div>
+          <select
+            aria-label="등록 호스트 중심 선택"
+            value={activeFocus ?? ""}
+            onChange={(e) => {
+              setFocus(e.target.value);
+              setSelected(null);
+              setScope("host");
+            }}
+            style={field}
+          >
+            <option value="">등록 호스트 선택</option>
+            {registeredNodes.map((n) => <option key={n.key} value={n.key}>{n.label}
+            </option>)}
+          </select>
+          <input
+            aria-label="호스트, 상대, 계정 검색"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            placeholder="호스트 · 상대 · 계정 검색"
+            style={{
+              ...field,
+              marginLeft: "auto",
+              minWidth: 210,
+              flex: "1 1 230px",
+            }}
+          />
+        </div>
+        <div
+          style={{
+            display: "grid",
+            gridTemplateColumns: compactLayout
+              ? "minmax(0,1fr)"
+              : "minmax(0,1fr) minmax(286px,340px)",
+            gridTemplateRows: compactLayout ? "minmax(280px, 1fr) auto" : undefined,
+            minHeight: 0,
+            // A percentage height beneath an auto-sized grid can briefly be
+            // zero during the desktop shell's view transition. Give the graph
+            // row a real flex basis, so its ResizeObserver never receives an
+            // unusable canvas and a selected, isolated host remains visible.
+            minBlockSize: 460,
+            flex: "1 1 460px",
+          }}
+        >
+          <GraphPane
+            hosts={graph.hosts}
+            edges={visibleEdges}
+            focus={activeFocus}
+            overall={scope === "overall"}
+            selected={selected}
+            onNode={selectNode}
+            hasRows={rows.length > 0}
+            showNoTime={range && noTime > 0}
+            noTime={noTime}
+          />
+          <aside
+            style={{
+              padding: 14,
+              borderLeft: compactLayout ? undefined : "1px solid var(--border)",
+              borderTop: compactLayout ? "1px solid var(--border)" : undefined,
+              overflow: "auto",
+            }}
+          >
+            {edge
+              ? (
+                <Inspector
+                  edge={edge}
+                  onOpenHost={onOpenHost}
+                  hosts={new Set(graph.hosts.map((h) => h.name))}
+                />
+              )
+              : <List
+                edges={visibleEdges}
+                focusHostName={scope === "host" ? focusHostLabel : null}
+                onSelect={setSelected}
+              />}
+          </aside>
+        </div>
+      </section>
+    </main>
   );
 }
+type ForcePoint = Node & {
+  vx: number;
+  vy: number;
+  pinned: boolean;
+  anchorX: number;
+  anchorY: number;
+};
+type GraphDrag =
+  | { kind: "pan"; x: number; y: number; px: number; py: number; moved: boolean }
+  | { kind: "node"; key: string; x: number; y: number; moved: boolean }
+  | null;
+
+function GraphPane(
+  {
+    hosts,
+    edges: allEdges,
+    focus,
+    overall,
+    selected,
+    onNode,
+    hasRows,
+    showNoTime,
+    noTime,
+  }: {
+    hosts: HostNode[];
+    edges: Edge[];
+    focus: string | null;
+    overall: boolean;
+    selected: string | null;
+    onNode: (node: Node) => void;
+    hasRows: boolean;
+    showNoTime: boolean;
+    noTime: number;
+  },
+) {
+  const viewportRef = useRef<HTMLElement>(null);
+  const [viewport, setViewport] = useState(DEFAULT_GRAPH);
+  useEffect(() => {
+    const element = viewportRef.current;
+    if (!element) return;
+    const measure = () => {
+      const rect = element.getBoundingClientRect();
+      // Ignore the transient zero-size observation while a responsive layout
+      // is being mounted.  Once it has a real size, use it verbatim rather
+      // than growing the virtual graph beyond the visible pane.
+      if (rect.width <= 0 || rect.height <= 0) return;
+      setViewport((current) => {
+        const next = {
+          width: Math.max(1, Math.floor(rect.width)),
+          height: Math.max(1, Math.floor(rect.height)),
+        };
+        return current.width === next.width && current.height === next.height
+          ? current
+          : next;
+      });
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
+  const value = useMemo(
+    () => layout(hosts, allEdges, focus, overall, viewport),
+    [hosts, allEdges, focus, overall, viewport],
+  );
+  const hasGraph = allEdges.length > 0 || (!overall && Boolean(focus));
+  return (
+    <section
+      ref={viewportRef}
+      aria-label="RDP 관계 그래프"
+      style={{
+        minWidth: 0,
+        minHeight: 460,
+        height: "100%",
+        position: "relative",
+        overflow: "hidden",
+        background: "var(--bg-app)",
+      }}
+    >
+      {hasGraph
+        ? <ForceGraph value={value} selected={selected} onNode={onNode} />
+        : (
+          <Center>
+            {hasRows
+              ? "현재 필터 조건에 맞는 RDP 관계가 없습니다."
+              : "확인된 RDP 접속 기록이 없습니다."}
+          </Center>
+        )}
+      {(overall || showNoTime || (!overall && value.nodes.length === 1)) && (
+        <div style={noticeOverlay}>
+          {overall && (
+            <div style={notice}>
+              {`관계 개요 · 상위 ${value.shown.length.toLocaleString()} / 전체 ${allEdges.length.toLocaleString()} 관계 (실패 수 · 이벤트 수 · 최근 시각 순)`}
+            </div>
+          )}
+          {showNoTime && (
+            <div style={notice}>
+              시간 정보가 없는 이벤트 {noTime.toLocaleString()}개는 기간 범위에서 제외했습니다.
+            </div>
+          )}
+          {!overall && value.nodes.length === 1 && (
+            <div style={notice}>선택한 등록 호스트와 직접 연결된 RDP 관계가 없습니다.</div>
+          )}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function seedFor(value: string) {
+  return [...value].reduce((hash, char) => ((hash * 31) + char.charCodeAt(0)) >>> 0, 7);
+}
+
+function ForceGraph(
+  { value, selected, onNode }: {
+    value: ReturnType<typeof layout>;
+    selected: string | null;
+    onNode: (node: Node) => void;
+  },
+) {
+  const [z, setZ] = useState(1);
+  const [pan, setPan] = useState({ x: 0, y: 0 });
+  const [revision, setRevision] = useState(0);
+  const [points, setPoints] = useState<ForcePoint[]>([]);
+  const pointsRef = useRef<ForcePoint[]>([]);
+  const drag = useRef<GraphDrag>(null);
+  const suppressNodeClick = useRef(new Set<string>());
+  const userTransform = useRef(false);
+  const raf = useRef<number | null>(null);
+  const viewportRef = useRef<HTMLDivElement>(null);
+  const previous = useRef<{
+    model: string;
+    revision: number;
+    width: number;
+    height: number;
+  } | null>(null);
+  const nodeRadius = (point: ForcePoint) => point.key === value.focus ? FOCUS : PEER;
+  const limits = (point: ForcePoint) => {
+    const radius = nodeRadius(point);
+    const labelHalf = graphLabelHalf(value.w);
+    const side = Math.min(
+      value.w / 2,
+      Math.max(radius + 8, labelHalf + 4, value.w * .1),
+    );
+    const top = Math.min(58, Math.max(radius + 10, value.h * .12));
+    const bottom = Math.min(
+      radius + NODE_LABEL_BOTTOM,
+      Math.max(radius + 10, value.h * .12),
+    );
+    return {
+      minX: Math.min(value.w / 2, side),
+      maxX: Math.max(Math.min(value.w / 2, side), value.w - side),
+      minY: Math.min(value.h / 2, top),
+      maxY: Math.max(Math.min(value.h / 2, top), value.h - bottom),
+    };
+  };
+  const constrain = (point: ForcePoint, x: number, y: number) => {
+    const bound = limits(point);
+    return {
+      x: Math.max(bound.minX, Math.min(bound.maxX, x)),
+      y: Math.max(bound.minY, Math.min(bound.maxY, y)),
+    };
+  };
+  const commit = (next: ForcePoint[]) => {
+    pointsRef.current = next;
+    setPoints(next.map((point) => ({ ...point })));
+  };
+  const applyFit = (visible: ForcePoint[]) => {
+    if (!visible.length) {
+      setZ(1);
+      setPan({ x: 0, y: 0 });
+      return;
+    }
+    const labelHalf = graphLabelHalf(value.w);
+    const minX = Math.min(...visible.map((point) => point.x - labelHalf));
+    const maxX = Math.max(...visible.map((point) => point.x + labelHalf));
+    const minY = Math.min(...visible.map((point) => point.y - nodeRadius(point) - 18));
+    const maxY = Math.max(...visible.map((point) => point.y + nodeRadius(point) + NODE_LABEL_BOTTOM));
+    const width = Math.max(1, maxX - minX);
+    const height = Math.max(1, maxY - minY);
+    const scale = Math.max(
+      .35,
+      Math.min(1.8, Math.min(Math.max(1, value.w - 32) / width, Math.max(1, value.h - 48) / height)),
+    );
+    setZ(scale);
+    setPan({
+      x: (value.w - width * scale) / 2 - minX * scale,
+      y: (value.h - height * scale) / 2 - minY * scale,
+    });
+  };
+
+  useEffect(() => {
+    if (raf.current) cancelAnimationFrame(raf.current);
+    const centerX = value.w / 2;
+    const centerY = value.h / 2;
+    const model = `${value.focus ?? ""}|${value.nodes.map((node) => node.key).sort().join("|")}|${value.shown.map((edge) => edge.key).sort().join("|")}`;
+    const prior = previous.current;
+    const preserve = prior?.model === model && prior.revision === revision;
+    if (!preserve) userTransform.current = false;
+    const shouldAutoFit = !userTransform.current;
+    const priorPoints = new Map(pointsRef.current.map((point) => [point.key, point]));
+    const initial = value.nodes.map((node) => {
+      const hash = seedFor(`${node.key}:${revision}`);
+      const jitterX = ((hash % 1000) / 1000 - .5) * 72;
+      const jitterY = (((hash >>> 10) % 1000) / 1000 - .5) * 96;
+      const point: ForcePoint = {
+        ...node,
+        x: node.key === value.focus ? centerX : node.x + jitterX,
+        y: node.key === value.focus ? centerY : node.y + jitterY,
+        vx: 0,
+        vy: 0,
+        pinned: node.key === value.focus,
+        anchorX: node.x,
+        anchorY: node.y,
+      };
+      const previousPoint = priorPoints.get(node.key);
+      if (preserve && previousPoint && prior) {
+        point.x = previousPoint.x / prior.width * value.w;
+        point.y = previousPoint.y / prior.height * value.h;
+        point.pinned = previousPoint.pinned || node.key === value.focus;
+      }
+      const position = constrain(point, point.x, point.y);
+      point.x = position.x;
+      point.y = position.y;
+      return point;
+    });
+    previous.current = { model, revision, width: value.w, height: value.h };
+    pointsRef.current = initial;
+    setPoints(initial);
+    if (shouldAutoFit) applyFit(initial);
+    let ticks = 0;
+    const overview = value.focus === null;
+    const run = () => {
+      const next = pointsRef.current.map((point) => ({ ...point }));
+      const byKey = new Map(next.map((point) => [point.key, point]));
+      for (let i = 0; i < next.length; i++) {
+        const point = next[i];
+        if (point.pinned) continue;
+        const direction = value.shown.find((edge) => key(edge.host) === point.key || key(edge.peer) === point.key)?.direction;
+        const targetX = overview
+          ? point.anchorX
+          : direction === "inbound"
+          ? value.w * .18
+          : direction === "outbound"
+          ? value.w * .82
+          : centerX;
+        const targetY = overview
+          ? point.anchorY
+          : direction === "unknown"
+          ? value.h * .76
+          : centerY;
+        point.vx += (targetX - point.x) * (overview ? .015 : .01);
+        point.vy += (targetY - point.y) * (overview ? .015 : .01);
+      }
+      for (let i = 0; i < next.length; i++) for (let j = i + 1; j < next.length; j++) {
+        const a = next[i], b = next[j];
+        const dx = b.x - a.x, dy = b.y - a.y, distance = Math.hypot(dx, dy) || 1;
+        const minimum = nodeRadius(a) + nodeRadius(b) + 42;
+        const repel = Math.max(0, minimum * minimum / distance - 10) * .032;
+        const ux = dx / distance, uy = dy / distance;
+        if (!a.pinned) { a.vx -= ux * repel; a.vy -= uy * repel; }
+        if (!b.pinned) { b.vx += ux * repel; b.vy += uy * repel; }
+      }
+      value.shown.forEach((edge) => {
+        const a = byKey.get(key(edge.host)), b = byKey.get(key(edge.peer));
+        if (!a || !b) return;
+        const dx = b.x - a.x, dy = b.y - a.y, distance = Math.hypot(dx, dy) || 1;
+        const desiredDistance = Math.max(180, Math.min(440, value.w * (overview ? .34 : .42)));
+        const pull = (distance - desiredDistance) * (overview ? .006 : .012);
+        const ux = dx / distance, uy = dy / distance;
+        if (!a.pinned) { a.vx += ux * pull; a.vy += uy * pull; }
+        if (!b.pinned) { b.vx -= ux * pull; b.vy -= uy * pull; }
+      });
+      next.forEach((point) => {
+        if (point.pinned) return;
+        point.vx *= .78;
+        point.vy *= .78;
+        const position = constrain(point, point.x + point.vx, point.y + point.vy);
+        point.x = position.x;
+        point.y = position.y;
+      });
+      pointsRef.current = next;
+      ticks++;
+      if (ticks % 3 === 0 || ticks >= 210) setPoints(next.map((point) => ({ ...point })));
+      if (ticks < 210) raf.current = requestAnimationFrame(run);
+      else if (shouldAutoFit && !userTransform.current) applyFit(next);
+    };
+    raf.current = requestAnimationFrame(run);
+    return () => { if (raf.current) cancelAnimationFrame(raf.current); };
+  }, [value, revision]);
+
+  // Effects run after paint. More importantly, a shell resize can invalidate
+  // the current simulation before its next animation frame. Render the model
+  // positions until the simulation has a complete matching point set instead
+  // of leaving a data-backed graph blank in that interval.
+  const renderPoints = points.length === value.nodes.length &&
+      points.every((point) => value.nodes.some((node) => node.key === point.key))
+    ? points
+    : value.nodes.map((node) => ({
+      ...node,
+      vx: 0,
+      vy: 0,
+      pinned: node.key === value.focus,
+      anchorX: node.x,
+      anchorY: node.y,
+    }));
+  const renderByKey = useMemo(
+    () => new Map(renderPoints.map((point) => [point.key, point])),
+    [renderPoints],
+  );
+  const fitView = () => {
+    userTransform.current = true;
+    applyFit(pointsRef.current);
+  };
+  const reflow = () => {
+    userTransform.current = false;
+    setRevision((current) => current + 1);
+  };
+  const endDrag = () => {
+    const state = drag.current;
+    if (state?.kind === "node" && state.moved) {
+      suppressNodeClick.current.add(state.key);
+      userTransform.current = true;
+    }
+    if (state?.kind === "pan" && state.moved) {
+      userTransform.current = true;
+    }
+    drag.current = null;
+    // `drag` is a ref so a terminal pointer event otherwise would not repaint
+    // the grab cursor after a cancelled/captured interaction.
+    setPan((current) => ({ ...current }));
+  };
+  const graphPoint = (event: React.PointerEvent) => {
+    const bounds = viewportRef.current?.getBoundingClientRect();
+    if (!bounds) return { x: 0, y: 0 };
+    return { x: (event.clientX - bounds.left - pan.x) / z, y: (event.clientY - bounds.top - pan.y) / z };
+  };
+  return (
+    <div
+      ref={viewportRef}
+      style={{ position: "relative", width: "100%", height: "100%", minHeight: 0, overflow: "hidden" }}
+      onPointerMove={(e) => {
+        const state = drag.current;
+        if (!state) return;
+        if (state.kind === "pan") {
+          if (Math.hypot(e.clientX - state.x, e.clientY - state.y) > 4) state.moved = true;
+          setPan({
+            x: state.px + e.clientX - state.x,
+            y: state.py + e.clientY - state.y,
+          });
+        } else {
+          const position = graphPoint(e);
+          const point = pointsRef.current.find((item) => item.key === state.key);
+          if (!point) return;
+          if (Math.hypot(e.clientX - state.x, e.clientY - state.y) > 4) state.moved = true;
+          const next = constrain(point, position.x, position.y);
+          point.x = next.x;
+          point.y = next.y;
+          point.vx = 0; point.vy = 0; point.pinned = true;
+          commit(pointsRef.current);
+        }
+      }}
+      onPointerUp={endDrag}
+      onPointerCancel={endDrag}
+      onLostPointerCapture={endDrag}
+      onWheel={(e) => { if (!e.ctrlKey && !e.metaKey) return; e.preventDefault(); userTransform.current = true; setZ((value) => Math.max(.35, Math.min(1.8, value + (e.deltaY < 0 ? .1 : -.1)))); }}
+    >
+      <div
+        style={{
+          position: "absolute",
+          top: 8,
+          right: 8,
+          zIndex: 3,
+          display: "flex",
+          justifyContent: "flex-end",
+          gap: 4,
+          padding: 8,
+          pointerEvents: "none",
+        }}
+      >
+        <span style={{ display: "inline-flex", gap: 4, pointerEvents: "auto" }}>
+          <Button
+            aria-label="축소"
+            title="축소"
+            onClick={() => {
+              userTransform.current = true;
+              setZ((v) => Math.max(.35, v - .1));
+            }}
+          >
+            <ZoomOutOutlinedIcon sx={{ fontSize: 16 }} />
+          </Button>
+          <Button
+            aria-label="확대"
+            title="확대"
+            onClick={() => {
+              userTransform.current = true;
+              setZ((v) => Math.min(1.8, v + .1));
+            }}
+          >
+            <ZoomInOutlinedIcon sx={{ fontSize: 16 }} />
+          </Button>
+          <Button
+            aria-label="화면 맞춤 및 위치 초기화"
+            title="화면 맞춤"
+            onClick={fitView}
+          >
+            <CenterFocusStrongOutlinedIcon sx={{ fontSize: 16 }} />
+          </Button>
+          <Button aria-label="자동 배치 다시 계산" title="재배치" onClick={reflow}>재배치</Button>
+        </span>
+      </div>
+      <div
+        aria-label="그래프 노드 구분"
+        style={{
+          position: "absolute",
+          zIndex: 3,
+          top: 10,
+          left: 12,
+          display: "flex",
+          gap: 10,
+          color: "var(--text-faint)",
+          fontSize: 10.5,
+          pointerEvents: "none",
+        }}
+      >
+        <span style={{ display: "inline-flex", alignItems: "center", gap: 4 }}><span aria-hidden="true" style={{ width: 12, height: 12, border: "1px solid var(--text-dim)", borderRadius: "50%", boxShadow: "inset 0 0 0 2px var(--bg-app), inset 0 0 0 3px var(--text-dim)" }} />등록 호스트</span>
+        <span style={{ display: "inline-flex", alignItems: "center", gap: 4 }}><span aria-hidden="true" style={{ width: 12, height: 12, border: "1px solid var(--text-faint)", borderRadius: "50%" }} />RDP 상대</span>
+      </div>
+      <div
+        style={{
+          position: "absolute",
+          inset: 0,
+          width: value.w,
+          height: value.h,
+          transform: `translate(${pan.x}px,${pan.y}px) scale(${z})`,
+          transformOrigin: "0 0",
+          cursor: drag.current?.kind === "pan" ? "grabbing" : "grab",
+        }}
+        onPointerDown={(e) => {
+          if ((e.target as Element).closest("button")) return;
+          drag.current = { kind: "pan", x: e.clientX, y: e.clientY, px: pan.x, py: pan.y, moved: false };
+          e.currentTarget.setPointerCapture(e.pointerId);
+        }}
+      >
+        <svg
+          aria-hidden="true"
+          width={value.w}
+          height={value.h}
+          style={{ position: "absolute", inset: 0, overflow: "visible" }}
+        >
+          <defs>
+            <marker
+              id="rdp-arrow"
+              markerWidth="8"
+              markerHeight="8"
+              refX="6"
+              refY="3"
+              orient="auto"
+            >
+              <path d="M0,0 L0,6 L7,3 z" fill="var(--text-dim)" />
+            </marker>
+          </defs>
+          {value.shown.map((e) => {
+            const a = renderByKey.get(key(e.host)), b = renderByKey.get(key(e.peer));
+            if (!a || !b) return null;
+            const from = e.direction === "inbound" ? b : a,
+              to = e.direction === "inbound" ? a : b,
+              d = Math.hypot(to.x - from.x, to.y - from.y) || 1,
+              ux = (to.x - from.x) / d,
+              uy = (to.y - from.y) / d,
+              fromRadius = nodeRadius(from),
+              toRadius = nodeRadius(to);
+            return (
+              <line
+                key={e.key}
+                x1={from.x + ux * (fromRadius + 4)}
+                y1={from.y + uy * (fromRadius + 4)}
+                x2={to.x - ux * (toRadius + 6)}
+                y2={to.y - uy * (toRadius + 6)}
+                stroke={selected === e.key ? "var(--accent)" : "var(--text-dim)"}
+                strokeWidth={selected === e.key ? 2.5 : 1.4}
+                strokeDasharray={e.direction === "unknown" ? "5 5" : undefined}
+                markerEnd={e.direction === "unknown"
+                  ? undefined
+                  : "url(#rdp-arrow)"}
+              />
+            );
+          })}
+        </svg>
+        {renderPoints.map((n) => {
+          const r = nodeRadius(n);
+          return (
+            <div
+              key={n.key}
+              style={{
+                position: "absolute",
+                left: n.x,
+                top: n.y,
+                transform: "translate(-50%,-50%)",
+                width: graphLabelWidth(value.w),
+                textAlign: "center",
+                pointerEvents: "none",
+              }}
+            >
+              <button
+                type="button"
+                aria-label={`${
+                  n.registered ? "등록 호스트" : "RDP 상대"
+                } ${n.label} 선택`}
+                title={n.label}
+                onPointerDown={(event) => {
+                  event.stopPropagation();
+                  drag.current = { kind: "node", key: n.key, x: event.clientX, y: event.clientY, moved: false };
+                  event.currentTarget.setPointerCapture(event.pointerId);
+                }}
+                onPointerUp={endDrag}
+                onPointerCancel={endDrag}
+                onLostPointerCapture={endDrag}
+                onClick={() => {
+                  if (suppressNodeClick.current.delete(n.key)) return;
+                  onNode(n);
+                }}
+                style={{
+                  width: r * 2,
+                  height: r * 2,
+                  borderRadius: "50%",
+                  border: `2px solid ${
+                    n.key === value.focus
+                      ? "var(--accent)"
+                      : n.registered
+                      ? "var(--text-dim)"
+                      : "var(--border)"
+                  }`,
+                  background: n.key === value.focus
+                    ? "var(--accent-subtle)"
+                    : "var(--bg-elevated)",
+                  boxShadow: n.key === value.focus
+                    ? "0 0 0 3px var(--accent-subtle)"
+                    : n.registered
+                    ? "inset 0 0 0 3px var(--bg-elevated), inset 0 0 0 4px var(--text-dim)"
+                    : "none",
+                  cursor: "pointer",
+                  pointerEvents: "auto",
+                }}>
+                {n.registered && <span aria-hidden="true" style={{ display: "block", width: 4, height: 4, margin: "auto", borderRadius: "50%", background: "var(--text-dim)" }} />}
+              </button>
+              <span
+                title={n.label}
+                style={{
+                  display: "block",
+                  marginTop: 4,
+                  whiteSpace: "nowrap",
+                  overflow: "hidden",
+                  textOverflow: "ellipsis",
+                  fontSize: 11,
+                  fontWeight: n.registered ? 700 : 550,
+                  color: "var(--text)",
+                }}
+              >
+                {n.label}
+              </span>
+            </div>
+          );
+        })}
+      </div>
+      <p
+        style={{
+          position: "absolute",
+          left: 12,
+          bottom: 6,
+          margin: 0,
+          color: "var(--text-faint)",
+          fontSize: 10.5,
+          pointerEvents: "none",
+        }}
+      >
+        자동 배치 · 노드 거리는 분석 순서나 위험도를 뜻하지 않습니다.
+      </p>
+    </div>
+  );
+}
+function List(
+  {
+    edges,
+    focusHostName,
+    onSelect,
+  }: {
+    edges: Edge[];
+    focusHostName: string | null;
+    onSelect: (k: string) => void;
+  },
+) {
+  return (
+    <div>
+      <strong>관계 목록</strong>
+      <p style={muted}>
+        {focusHostName
+          ? `${focusHostName} 기준 필터 적용 관계 ${edges.length.toLocaleString()}개`
+          : `모든 필터 적용 관계 ${edges.length.toLocaleString()}개`}
+      </p>
+      {edges.length === 0 && focusHostName && (
+        <p style={muted}>
+          선택한 등록 호스트와 직접 연결된 RDP 관계가 없습니다. 다른 호스트의 관계는
+          관계 개요에서 확인할 수 있습니다.
+        </p>
+      )}
+      {edges.map((e) => (
+        <button
+          key={e.key}
+          type="button"
+          onClick={() => onSelect(e.key)}
+          style={listRow}
+        >
+          <span style={{ minWidth: 0 }}>
+            <span style={ellipsis}>
+              {e.host} · {dir(e.direction)} · {e.peer}
+            </span>
+            <span style={small}>
+              {e.last ? formatEvidenceTimestamp(e.last) : "시간 정보 없음"}
+            </span>
+          </span>
+          <span>{e.count}건</span>
+        </button>
+      ))}
+    </div>
+  );
+}
+function Inspector(
+  { edge, onOpenHost, hosts }: {
+    edge: Edge;
+    onOpenHost?: (name: string) => void;
+    hosts: Set<string>;
+  },
+) {
+  const [page, setPage] = useState(0);
+  useEffect(() => setPage(0), [edge.key]);
+  const size = 20,
+    total = Math.max(1, Math.ceil(edge.rows.length / size)),
+    current = Math.min(page, total - 1),
+    rows = edge.rows.slice(current * size, current * size + size),
+    names = [edge.host, edge.peer].filter((v, i, a) =>
+      a.indexOf(v) === i && hosts.has(v)
+    );
+  return (
+    <div>
+      <strong>선택한 관계</strong>
+      <p style={{ color: "var(--text-dim)", fontSize: 12 }}>
+        {edge.host} · {dir(edge.direction)} · {edge.peer}
+      </p>
+      <dl style={facts}>
+        <dt>이벤트</dt>
+        <dd>{edge.count.toLocaleString()}개</dd>
+        <dt>시간 범위</dt>
+        <dd>
+          {edge.first
+            ? `${formatEvidenceTimestamp(edge.first)} ~ ${
+              formatEvidenceTimestamp(edge.last)
+            }`
+            : "시간 정보 없음"}
+        </dd>
+        <dt>결과</dt>
+        <dd>성공 {edge.success}개 · 실패 {edge.fail}개</dd>
+        <dt>계정</dt>
+        <dd>{edge.accounts.join(", ") || "계정 정보 없음"}</dd>
+      </dl>
+      {names.map((n) =>
+        onOpenHost && (
+          <Button key={n} onClick={() => onOpenHost(n)}>
+            <OpenInNewOutlinedIcon sx={{ fontSize: 15 }} />
+            {n} 열기
+          </Button>
+        )
+      )}
+      <div style={{ marginTop: 12 }}>
+        {rows.map((r, i) => (
+          <div key={`${r.timestamp}-${i}`} style={listRow}>
+            <span>
+              {r.account || "계정 정보 없음"}
+              <span style={small}>
+                {r.timestamp
+                  ? formatEvidenceTimestamp(r.timestamp)
+                  : "시간 정보 없음"}
+              </span>
+            </span>
+            <span
+              style={{
+                color: r.result === "실패"
+                  ? "var(--danger)"
+                  : r.result === "성공"
+                  ? "var(--success)"
+                  : "var(--text-faint)",
+              }}
+            >
+              {r.result || "정보 없음"}
+            </span>
+          </div>
+        ))}
+        {edge.rows.length > size && (
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "flex-end",
+              gap: 6,
+              paddingTop: 10,
+              fontSize: 11.5,
+              color: "var(--text-faint)",
+            }}
+          >
+            <span>
+              {current * size + 1}–{Math.min(
+                (current + 1) * size,
+                edge.rows.length,
+              )} / {edge.rows.length}
+            </span>
+            <Button
+              disabled={current === 0}
+              onClick={() => setPage((p) => Math.max(0, p - 1))}
+            >
+              이전
+            </Button>
+            <Button
+              disabled={current >= total - 1}
+              onClick={() => setPage((p) => Math.min(total - 1, p + 1))}
+            >
+              다음
+            </Button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+function Center({ children }: { children: React.ReactNode }) {
+  return (
+    <div
+      style={{
+        minHeight: 220,
+        display: "grid",
+        placeItems: "center",
+        gap: 8,
+        color: "var(--text-dim)",
+        fontSize: 12,
+      }}
+    >
+      {children}
+    </div>
+  );
+}
+const surface: React.CSSProperties = {
+  flex: "1 0 auto",
+  minHeight: "min(520px, max(0px, calc(100dvh - 160px)))",
+  display: "flex",
+  flexDirection: "column",
+  border: "1px solid var(--border)",
+  borderRadius: "var(--radius-lg)",
+  background: "var(--bg-panel)",
+  boxShadow: "var(--shadow-panel)",
+  overflow: "hidden",
+};
+const head: React.CSSProperties = {
+  display: "flex",
+  alignItems: "center",
+  gap: 10,
+  flexWrap: "wrap",
+  padding: "12px 14px",
+  borderBottom: "1px solid var(--border)",
+  color: "var(--text-faint)",
+  fontSize: 11.5,
+};
+const toolbar: React.CSSProperties = {
+  display: "flex",
+  alignItems: "center",
+  gap: 7,
+  flexWrap: "wrap",
+  padding: "10px 14px",
+  borderBottom: "1px solid var(--border-subtle)",
+};
+const button: React.CSSProperties = {
+  display: "inline-flex",
+  alignItems: "center",
+  justifyContent: "center",
+  gap: 4,
+  minHeight: 29,
+  padding: "3px 8px",
+  border: "1px solid var(--border)",
+  borderRadius: "var(--radius-sm)",
+  background: "transparent",
+  color: "var(--text-dim)",
+  cursor: "pointer",
+  fontSize: 11.5,
+};
+const field: React.CSSProperties = {
+  minHeight: 30,
+  padding: "4px 8px",
+  border: "1px solid var(--border)",
+  borderRadius: "var(--radius-sm)",
+  background: "var(--bg-elevated)",
+  color: "var(--text)",
+  fontSize: 12,
+};
+const warning: React.CSSProperties = { color: "var(--warning)" };
+const notice: React.CSSProperties = {
+  padding: "7px 12px",
+  borderTop: "1px solid var(--border)",
+  color: "var(--text-faint)",
+  fontSize: 11.5,
+};
+const noticeOverlay: React.CSSProperties = {
+  position: "absolute",
+  zIndex: 4,
+  left: 0,
+  right: 0,
+  bottom: 28,
+  background: "var(--bg-panel)",
+  borderTop: "1px solid var(--border)",
+  pointerEvents: "none",
+};
+const muted: React.CSSProperties = {
+  margin: "4px 0 10px",
+  color: "var(--text-faint)",
+  fontSize: 11.5,
+};
+const ellipsis: React.CSSProperties = {
+  display: "block",
+  overflow: "hidden",
+  whiteSpace: "nowrap",
+  textOverflow: "ellipsis",
+};
+const small: React.CSSProperties = {
+  display: "block",
+  marginTop: 2,
+  color: "var(--text-faint)",
+  fontFamily: "var(--mono)",
+  fontSize: 10.5,
+};
+const listRow: React.CSSProperties = {
+  display: "grid",
+  gridTemplateColumns: "minmax(0,1fr) auto",
+  gap: 8,
+  width: "100%",
+  padding: "8px 0",
+  border: 0,
+  borderBottom: "1px solid var(--border-subtle)",
+  background: "transparent",
+  color: "var(--text-dim)",
+  textAlign: "left",
+  fontSize: 11.5,
+  cursor: "pointer",
+};
+const facts: React.CSSProperties = {
+  display: "grid",
+  gridTemplateColumns: "76px minmax(0,1fr)",
+  gap: "7px 8px",
+  padding: "10px 0",
+  borderTop: "1px solid var(--border-subtle)",
+  borderBottom: "1px solid var(--border-subtle)",
+  fontSize: 11.5,
+};
