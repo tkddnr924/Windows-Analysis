@@ -11,6 +11,12 @@ import HourglassEmptyOutlinedIcon from "@mui/icons-material/HourglassEmptyOutlin
 import type { FetchLinkedRows, TimelineEntry } from "@/lib/types";
 import { inRange, rangeActive as globalRangeActive, type TimeRange } from "@/lib/timeRange";
 import ReportProblemOutlinedIcon from "@mui/icons-material/ReportProblemOutlined";
+import TaskOutlinedIcon from "@mui/icons-material/TaskOutlined";
+import BoltOutlinedIcon from "@mui/icons-material/BoltOutlined";
+import LanguageOutlinedIcon from "@mui/icons-material/LanguageOutlined";
+import DescriptionOutlinedIcon from "@mui/icons-material/DescriptionOutlined";
+import EventNoteOutlinedIcon from "@mui/icons-material/EventNoteOutlined";
+import TimelineOutlinedIcon2 from "@mui/icons-material/TimelineOutlined";
 import SortOutlinedIcon from "@mui/icons-material/SortOutlined";
 import TimelineOutlinedIcon from "@mui/icons-material/TimelineOutlined";
 import ViewListOutlinedIcon from "@mui/icons-material/ViewListOutlined";
@@ -18,6 +24,7 @@ import { resolveArtifactView } from "@/lib/artifactViews";
 import RowDetailPanel from "./RowDetailPanel";
 import type { AccountDirectory } from "@/lib/accountIdentity";
 import PaginationControls from "@/components/PaginationControls";
+import { HeaderSearchInput, SortDropdown, ViewHeader } from "@/components/FilterControls";
 
 const ROW_HEIGHT = 52;
 const PAGE_SIZE = 10;
@@ -37,27 +44,27 @@ type ArtifactChipTone = {
 // owns the warning/danger palette, so a purple JumpList chip never implies a
 // finding and an amber TaskScheduler chip never implies an alert.
 const ARTIFACT_CHIP_TONES: Record<string, ArtifactChipTone> = {
-  AMCACHE: { border: "#0f9f8b", background: "rgba(15, 159, 139, 0.14)", color: "#65d7c6" },
-  EVENTLOG: { border: "#6176d8", background: "rgba(97, 118, 216, 0.14)", color: "#aebdff" },
-  JUMPLIST: { border: "#b7619b", background: "rgba(183, 97, 155, 0.14)", color: "#f0add7" },
-  PREFETCH: { border: "#bd762e", background: "rgba(189, 118, 46, 0.14)", color: "#f3bd7b" },
-  REGISTRY: { border: "#8a6ad3", background: "rgba(138, 106, 211, 0.14)", color: "#c9b8ff" },
-  SRUM: { border: "#198eb5", background: "rgba(25, 142, 181, 0.14)", color: "#75d4f4" },
-  WER: { border: "#c55d67", background: "rgba(197, 93, 103, 0.14)", color: "#ffabb2" },
-  TASKSCHEDULER: { border: "#ad8a30", background: "rgba(173, 138, 48, 0.14)", color: "#eacb75" },
-  POWERSHELL: { border: "#7065c7", background: "rgba(112, 101, 199, 0.14)", color: "#b7b0ff" },
-  RDPCACHE: { border: "#418cc7", background: "rgba(65, 140, 199, 0.14)", color: "#8fcaff" },
+  AMCACHE: { border: "#65d7c6", background: "rgba(15, 159, 139, 0.14)", color: "#65d7c6" },
+  EVENTLOG: { border: "#aebdff", background: "rgba(97, 118, 216, 0.14)", color: "#aebdff" },
+  JUMPLIST: { border: "#f0add7", background: "rgba(183, 97, 155, 0.14)", color: "#f0add7" },
+  PREFETCH: { border: "#f3bd7b", background: "rgba(189, 118, 46, 0.14)", color: "#f3bd7b" },
+  REGISTRY: { border: "#c9b8ff", background: "rgba(138, 106, 211, 0.14)", color: "#c9b8ff" },
+  SRUM: { border: "#75d4f4", background: "rgba(25, 142, 181, 0.14)", color: "#75d4f4" },
+  WER: { border: "#ffabb2", background: "rgba(197, 93, 103, 0.14)", color: "#ffabb2" },
+  TASKSCHEDULER: { border: "#eacb75", background: "rgba(173, 138, 48, 0.14)", color: "#eacb75" },
+  POWERSHELL: { border: "#b7b0ff", background: "rgba(112, 101, 199, 0.14)", color: "#b7b0ff" },
+  RDPCACHE: { border: "#8fcaff", background: "rgba(65, 140, 199, 0.14)", color: "#8fcaff" },
   // Browser evidence is deliberately plum, away from the blue execution
   // history colour used in the same dense timeline.
-  BROWSER: { border: "#a56cc4", background: "rgba(165, 108, 196, 0.15)", color: "#e1b8f2" },
-  FILESYSTEM: { border: "#419e72", background: "rgba(65, 158, 114, 0.14)", color: "#8cdbad" },
-  EXECUTIONHISTORY: { border: "#4c8cbe", background: "rgba(76, 140, 190, 0.14)", color: "#9fd2fb" },
-  TARGETINFO: { border: "#67839e", background: "rgba(103, 131, 158, 0.14)", color: "#b4c9dc" },
-  MFTEXPLORER: { border: "#3c987a", background: "rgba(60, 152, 122, 0.14)", color: "#91d9bd" },
-  REMOTEDESKTOP: { border: "#538abd", background: "rgba(83, 138, 189, 0.14)", color: "#a2d0fb" },
-  REGISTRYFINDINGS: { border: "#9671c9", background: "rgba(150, 113, 201, 0.14)", color: "#cfb8f7" },
-  SMBHISTORY: { border: "#258f9a", background: "rgba(37, 143, 154, 0.14)", color: "#88dce2" },
-  DEFENDER: { border: "#b56456", background: "rgba(181, 100, 86, 0.14)", color: "#f0ada0" },
+  BROWSER: { border: "#e1b8f2", background: "rgba(165, 108, 196, 0.15)", color: "#e1b8f2" },
+  FILESYSTEM: { border: "#8cdbad", background: "rgba(65, 158, 114, 0.14)", color: "#8cdbad" },
+  EXECUTIONHISTORY: { border: "#9fd2fb", background: "rgba(76, 140, 190, 0.14)", color: "#9fd2fb" },
+  TARGETINFO: { border: "#b4c9dc", background: "rgba(103, 131, 158, 0.14)", color: "#b4c9dc" },
+  MFTEXPLORER: { border: "#91d9bd", background: "rgba(60, 152, 122, 0.14)", color: "#91d9bd" },
+  REMOTEDESKTOP: { border: "#a2d0fb", background: "rgba(83, 138, 189, 0.14)", color: "#a2d0fb" },
+  REGISTRYFINDINGS: { border: "#cfb8f7", background: "rgba(150, 113, 201, 0.14)", color: "#cfb8f7" },
+  SMBHISTORY: { border: "#88dce2", background: "rgba(37, 143, 154, 0.14)", color: "#88dce2" },
+  DEFENDER: { border: "#f0ada0", background: "rgba(181, 100, 86, 0.14)", color: "#f0ada0" },
 };
 
 const DEFAULT_ARTIFACT_CHIP_TONE: ArtifactChipTone = {
@@ -125,13 +132,32 @@ function artifactDisplayName(category: string, table: string): string {
 // session must render the current definition. This keeps Fast Refresh useful
 // for timeline wording/layout changes without rebuilding evidence rows or
 // resetting the analyst's filters and scroll position.
-function currentTimelinePresentation(entry: TimelineEntry): { summary: string; subtitle: string } {
+function currentTimelinePresentation(entry: TimelineEntry): { summary: string; subtitle: string; note: string } {
   const spec = resolveArtifactView(entry.table, entry.columns);
-  if (!spec) return { summary: entry.summary, subtitle: entry.subtitle };
-  return {
-    summary: (spec.timelineTitle ?? spec.title)(entry.row),
-    subtitle: (spec.timelineSubtitle ?? spec.subtitle)?.(entry.row) ?? "",
-  };
+  if (!spec) return { summary: entry.summary, subtitle: entry.subtitle, note: "" };
+  let summary = (spec.timelineTitle ?? spec.title)(entry.row);
+  let note = "";
+  // EventLog 카탈로그 설명("Event N · 설명")은 실행 이력의 도구 설명과 같은
+  // 배지로 분리해 보여준다.
+  if (/event/i.test(`${entry.category} ${entry.table}`)) {
+    const match = /^Event (\S+) · (.+)$/.exec(summary);
+    if (match) {
+      summary = `Event ${match[1]}`;
+      note = match[2];
+    }
+  }
+  return { summary, subtitle: (spec.timelineSubtitle ?? spec.subtitle)?.(entry.row) ?? "", note };
+}
+
+// 카드 타일 아이콘 — 아티팩트 정체성을 색+아이콘으로 드러낸다.
+function timelineTileIcon(category: string, table: string) {
+  const key = `${category} ${table}`;
+  if (/sched/i.test(key)) return TaskOutlinedIcon;
+  if (/exec/i.test(key)) return BoltOutlinedIcon;
+  if (/browser/i.test(key)) return LanguageOutlinedIcon;
+  if (/jump/i.test(key)) return DescriptionOutlinedIcon;
+  if (/event/i.test(key)) return EventNoteOutlinedIcon;
+  return TimelineOutlinedIcon2;
 }
 
 const EXECUTION_SOURCE_LABELS: Record<string, string> = {
@@ -190,32 +216,25 @@ function ArtifactFilterCheckbox({
           alignItems: "center",
           gap: 8,
           minHeight: 32,
-          padding: depth ? "4px 7px 4px 16px" : "5px 6px 5px 9px",
-          border: "1px solid var(--border-subtle)",
+          padding: depth ? "4px 7px 4px 8px" : "4px 7px 4px 9px",
           borderRadius: "var(--radius-sm)",
-          background: checked || indeterminate ? "var(--bg-panel)" : "var(--bg-input)",
-          boxShadow: checked || indeterminate ? `inset 2px 0 0 ${tone.border}` : "none",
+          background: "transparent",
           color: checked || indeterminate ? "var(--text)" : "var(--text-faint)",
           width: "100%",
+          minWidth: 0,
           cursor: "pointer",
           userSelect: "none",
+          transition: "background .12s ease",
           ...style,
         }}
+        onMouseEnter={(event) => { event.currentTarget.style.background = "var(--bg-hover)"; }}
+        onMouseLeave={(event) => { event.currentTarget.style.background = "transparent"; }}
       >
-        {depth ? (
-          <span
-            aria-hidden="true"
-            style={{
-              width: 8,
-              height: 8,
-              borderBottom: "2px solid var(--border-subtle)",
-              borderLeft: "2px solid var(--border-subtle)",
-              marginLeft: -6,
-              marginRight: 3,
-            }}
-          />
-        ) : null}
-        <span style={{ minWidth: 0, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: depth ? 11.5 : 12.5, fontWeight: depth ? 550 : 650 }}>
+        <span
+          aria-hidden="true"
+          style={{ width: 9, height: 9, flexShrink: 0, borderRadius: "50%", background: checked || indeterminate ? tone.border : "transparent", border: `2px solid ${tone.border}`, opacity: checked || indeterminate ? 1 : 0.45, boxSizing: "border-box" }}
+        />
+        <span style={{ minWidth: 0, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: depth ? 12 : 12.5, fontWeight: depth ? 550 : 650 }}>
           {label}
         </span>
       <Checkbox
@@ -256,6 +275,7 @@ export default function MasterTimeline({ entries, loading, onNavigate, onFetchLi
   const [showArtifactMenu, setShowArtifactMenu] = useState(false);
   const [selectedEntry, setSelectedEntry] = useState<TimelineEntry | null>(null);
   const [onlySuspicious, setOnlySuspicious] = useState(false);
+  const [search, setSearch] = useState("");
   const allRows = entries ?? [];
 
   // EventLog is a single analyst-facing artifact even though it is stored as
@@ -402,11 +422,17 @@ export default function MasterTimeline({ entries, loading, onNavigate, onFetchLi
   }
 
   const globalActive = globalRangeActive(globalTimeRange);
+  useEffect(() => setPage(0), [search, onlySuspicious, hiddenTables]);
   const rows = useMemo(() => {
+    const needle = search.trim().toLowerCase();
     const filtered = allRows.filter((e) => {
       if (isEntryHidden(e)) return false;
       if (onlySuspicious && e.tags.length === 0) return false;
       if (globalActive && !inRange(e.timestamp, globalTimeRange)) return false;
+      if (needle) {
+        const haystack = [e.table, e.category, ...Object.values(e.row)].join("\u0000").toLowerCase();
+        if (!haystack.includes(needle)) return false;
+      }
       return true;
     });
     // Timestamps are pre-formatted YYYY-MM-DD hh:mm:ss.fff, so string compare
@@ -420,7 +446,7 @@ export default function MasterTimeline({ entries, loading, onNavigate, onFetchLi
       return sortDir === "asc" ? cmp : -cmp;
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [allRows, sortDir, hiddenTables, hiddenExecutionSources, hiddenBrowserKinds, globalActive, globalTimeRange, onlySuspicious]);
+  }, [allRows, sortDir, hiddenTables, hiddenExecutionSources, hiddenBrowserKinds, globalActive, globalTimeRange, onlySuspicious, search]);
 
   // 페이지 단위 표시(10건). 필터·정렬이 바뀌면 첫 페이지로 돌아간다.
   const pageCount = Math.max(1, Math.ceil(rows.length / PAGE_SIZE));
@@ -462,13 +488,9 @@ export default function MasterTimeline({ entries, loading, onNavigate, onFetchLi
 
   return (
     <div className="dfir-view" style={{ display: "flex", flexDirection: "column", flex: 1, minHeight: 0, minWidth: 0 }}>
-      <header style={{ display: "flex", alignItems: "center", gap: 8, minHeight: 54, padding: "0 16px", borderBottom: "1px solid var(--border)", background: "var(--bg-panel)", flexShrink: 0 }}>
-        <TimelineOutlinedIcon sx={{ fontSize: 20, color: "var(--accent)" }} />
-        <h1 style={{ margin: 0, fontSize: 16, letterSpacing: "-0.02em" }}>통합 타임라인</h1>
-        <div style={{ display: "flex", alignItems: "center", gap: 6, marginLeft: "auto" }}>
-          <button className="nm-btn" onClick={() => setSortDir((direction) => direction === "asc" ? "desc" : "asc")} title="정렬 순서 변경" style={toolbarButtonStyle}>
-            <SortOutlinedIcon sx={{ fontSize: 16 }} />{sortDir === "asc" ? "오래된 순" : "최근 순"}
-          </button>
+      <ViewHeader icon={TimelineOutlinedIcon} title="통합 타임라인" meta={`${rows.length.toLocaleString()}건`}>
+          <HeaderSearchInput value={search} onChange={setSearch} placeholder="이름 · 경로 · 내용 검색" ariaLabel="통합 타임라인 검색" width={300} />
+          <SortDropdown value={sortDir} onChange={(next) => setSortDir(next as "asc" | "desc")} />
           <button className="nm-btn" onClick={() => setOnlySuspicious((value) => !value)} title="의심 태그가 붙은 항목만 표시" aria-pressed={onlySuspicious} style={{ ...toolbarButtonStyle, background: onlySuspicious ? "var(--danger-subtle)" : "var(--bg-elevated)", color: onlySuspicious ? "var(--danger)" : "var(--text-dim)", borderColor: onlySuspicious ? "var(--danger)" : "var(--border)" }}>
             <ReportProblemOutlinedIcon sx={{ fontSize: 16 }} />의심 항목
           </button>
@@ -479,7 +501,7 @@ export default function MasterTimeline({ entries, loading, onNavigate, onFetchLi
             {showArtifactMenu && (
               <>
                 <div onClick={() => setShowArtifactMenu(false)} style={{ position: "fixed", inset: 0, zIndex: 40 }} />
-                <div style={{ position: "absolute", top: "calc(100% + 6px)", right: 0, zIndex: 41, width: 290, maxHeight: 380, overflowY: "auto", background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", boxShadow: "var(--shadow-panel)", padding: 8 }}>
+                <div style={{ position: "absolute", top: "calc(100% + 6px)", right: 0, zIndex: 41, width: 400, maxHeight: 420, overflowY: "auto", overflowX: "hidden", background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", boxShadow: "var(--shadow-panel)", padding: 8 }}>
                   <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "3px 4px 8px", borderBottom: "1px solid var(--border-subtle)" }}>
                     <span style={{ fontSize: 12, fontWeight: 700, color: "var(--text-dim)" }}>표시할 아티팩트</span>
                     <div style={{ display: "flex", alignItems: "center", gap: 8, marginLeft: "auto" }}>
@@ -487,7 +509,7 @@ export default function MasterTimeline({ entries, loading, onNavigate, onFetchLi
                       <button type="button" onClick={hideAllArtifacts} style={{ fontSize: 11.5, background: "transparent", border: "none", color: "var(--text-dim)", cursor: "pointer", fontWeight: 650 }}>전체 해제</button>
                     </div>
                   </div>
-                  <div style={{ display: "grid", gap: 5, paddingTop: 8 }}>
+                  <div style={{ display: "grid", gap: 2, paddingTop: 7 }}>
                     {artifactControls.map(({ label, category, tables }) => {
                       const tone = artifactChipTone(category, tables[0]);
                       const isExecutionHistory = tables.length === 1 && tables[0] === "ExecutionHistory";
@@ -503,13 +525,8 @@ export default function MasterTimeline({ entries, loading, onNavigate, onFetchLi
                               key={label}
                               style={{
                                 display: "grid",
-                                gap: 4,
-                                padding: "4px 4px 4px 4px",
-                                border: "1px solid var(--border)",
-                                borderRadius: "var(--radius-sm)",
-                                background: "var(--bg-input)",
-                                boxShadow: "inset 0 0 0 1px var(--border-subtle), 0 0 0 1px rgba(0, 0, 0, 0.12)",
-                              }}
+                                gap: 2,
+                                }}
                             >
                               <ArtifactFilterCheckbox
                                 key={`${label}-parent`}
@@ -530,14 +547,8 @@ export default function MasterTimeline({ entries, loading, onNavigate, onFetchLi
                                     setHiddenBrowserKinds(new Set());
                                   }
                                 }}
-                                style={{
-                                  paddingLeft: 10,
-                                  borderRadius: "var(--radius-sm)",
-                                  border: "1px solid var(--border)",
-                                  boxShadow: checked || indeterminate ? `inset 2px 0 0 ${tone.border}` : "inset 0 0 0 1px var(--border-subtle)",
-                                }}
                               />
-                              <div style={{ display: "grid", gap: 4, paddingLeft: 12, paddingBottom: 4, borderLeft: "2px solid var(--border)", marginLeft: 2 }}>
+                              <div style={{ display: "grid", gap: 2, minWidth: 0, margin: "0 2px 4px 12px", paddingLeft: 8, borderLeft: `2px solid color-mix(in srgb, ${tone.border} 45%, var(--border))` }}>
                                 {browserKinds.map(([kind, count]) => (
                                   <ArtifactFilterCheckbox
                                     key={kind}
@@ -546,13 +557,6 @@ export default function MasterTimeline({ entries, loading, onNavigate, onFetchLi
                                     tone={tone}
                                     depth={1}
                                     onChange={() => toggleBrowserKind(kind)}
-                                    style={{
-                                      borderLeft: "none",
-                                      borderRadius: "var(--radius-sm)",
-                                      border: "1px solid var(--border-subtle)",
-                                      paddingLeft: 10,
-                                      marginLeft: 0,
-                                    }}
                                   />
                                 ))}
                               </div>
@@ -565,18 +569,7 @@ export default function MasterTimeline({ entries, loading, onNavigate, onFetchLi
                           const checked = visibleCount > 0 && visibleCount === tables.length;
                           const indeterminate = visibleCount > 0 && visibleCount < tables.length;
                           return (
-                            <div
-                              key={label}
-                              style={{
-                                display: "grid",
-                                gap: 4,
-                                padding: "4px 0 0 0",
-                                border: "1px solid var(--border)",
-                                borderRadius: "var(--radius-sm)",
-                                background: "var(--bg-input)",
-                                boxShadow: "inset 0 0 0 1px var(--border-subtle)",
-                              }}
-                            >
+                            <div key={label} style={{ display: "grid", gap: 2, minWidth: 0 }}>
                               <ArtifactFilterCheckbox
                                 key={`${label}-parent`}
                                 label={`${label} (${tables.reduce((acc, table) => acc + (artifactTableCounts.get(table) ?? 0), 0)})`}
@@ -584,13 +577,8 @@ export default function MasterTimeline({ entries, loading, onNavigate, onFetchLi
                                 indeterminate={indeterminate}
                                 tone={tone}
                                 onChange={() => toggleTables(tables)}
-                                style={{
-                                  paddingLeft: 10,
-                                  border: "1px solid var(--border)",
-                                  boxShadow: checked || indeterminate ? `inset 2px 0 0 ${tone.border}` : "inset 0 0 0 1px var(--border-subtle)",
-                                }}
                               />
-                              <div style={{ display: "grid", gap: 4, padding: "2px 0 4px 10px", borderLeft: "2px solid var(--border)", marginLeft: 2 }}>
+                              <div style={{ display: "grid", gap: 2, minWidth: 0, margin: "0 2px 4px 12px", paddingLeft: 8, borderLeft: `2px solid color-mix(in srgb, ${tone.border} 45%, var(--border))` }}>
                                 {tables
                                   .map((table) => ({ table, count: artifactTableCounts.get(table) ?? 0 }))
                                   .sort((a, b) => a.table.localeCompare(b.table))
@@ -602,8 +590,7 @@ export default function MasterTimeline({ entries, loading, onNavigate, onFetchLi
                                       tone={tone}
                                       depth={1}
                                       onChange={() => toggleTables([table])}
-                                      style={{ border: "1px solid var(--border-subtle)", borderRadius: "var(--radius-sm)", marginLeft: 0, paddingLeft: 10 }}
-                                    />
+                                                                          />
                                   ))}
                               </div>
                             </div>
@@ -624,12 +611,6 @@ export default function MasterTimeline({ entries, loading, onNavigate, onFetchLi
                             indeterminate={indeterminate}
                             tone={tone}
                             onChange={toggleExecutionGroup}
-                            style={{
-                              paddingLeft: 10,
-                              borderRadius: "var(--radius-sm)",
-                              border: "1px solid var(--border)",
-                              boxShadow: checked || indeterminate ? `inset 2px 0 0 ${tone.border}` : "inset 0 0 0 1px var(--border-subtle)",
-                            }}
                           />
                           <div style={{ display: "grid", gap: 4, borderLeft: "2px solid var(--border)", marginLeft: 2, paddingLeft: 8, paddingBottom: 2 }}>
                             {executionSources.map((source) => (
@@ -657,8 +638,8 @@ export default function MasterTimeline({ entries, loading, onNavigate, onFetchLi
               </>
             )}
           </div>
-        </div>
-      </header>
+        
+      </ViewHeader>
 
       {rows.length === 0 ? (
         <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", color: "var(--text-faint)", gap: 8 }}>
@@ -667,7 +648,7 @@ export default function MasterTimeline({ entries, loading, onNavigate, onFetchLi
         </div>
       ) : (
       <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
-      <div style={{ flex: 1, minHeight: 0, overflow: "auto" }}>
+      <div style={{ flex: 1, minHeight: 0, overflow: "auto", padding: "12px 14px 4px" }}>
         {pageRows.map((entry, indexInPage) => {
           const absoluteIndex = safePage * PAGE_SIZE + indexInPage;
           const presentation = currentTimelinePresentation(entry);
@@ -675,35 +656,38 @@ export default function MasterTimeline({ entries, loading, onNavigate, onFetchLi
           const warningTag = entry.tags.find((t) => t.severity === "warning");
           const bookmarked = isBookmarked(entry);
           const chipTone = artifactChipTone(entry.category, entry.table);
-          const rowBackground = absoluteIndex % 2 === 0 ? "transparent" : "rgba(255,255,255,0.02)";
+          const TileIcon = timelineTileIcon(entry.category, entry.table);
           return (
             <div
               key={`${entry.fullPath}:${entry.rowid}:${absoluteIndex}`}
               className={bookmarked ? "dfir-bookmarked-row" : undefined}
               onClick={() => setSelectedEntry(entry)}
               style={{
-                height: ROW_HEIGHT,
+                minHeight: 62,
+                marginBottom: 8,
                 display: "flex",
                 alignItems: "center",
-                gap: 10,
-                padding: "0 14px",
-                borderBottom: "1px solid var(--border-subtle)",
+                gap: 12,
+                padding: "9px 14px",
+                border: "1px solid var(--border)",
+                borderRadius: "var(--radius-md)",
+                background: "var(--bg-panel)",
                 cursor: "pointer",
-                background: rowBackground,
+                transition: "background .15s ease, border-color .15s ease",
               }}
               onMouseEnter={(e) => { if (!bookmarked) e.currentTarget.style.background = "var(--bg-hover)"; }}
-              onMouseLeave={(e) => { if (!bookmarked) e.currentTarget.style.background = rowBackground; }}
+              onMouseLeave={(e) => { if (!bookmarked) e.currentTarget.style.background = "var(--bg-panel)"; }}
             >
-              <span style={{ flexShrink: 0, width: 178, fontFamily: "var(--mono)", fontSize: 12.5, color: bookmarked ? BOOKMARK_MUTED_TEXT : entry.timestamp ? "var(--text-time)" : "var(--text-faint)" }}>
-                {entry.timestamp || "(시간 정보 없음)"}
+              <span aria-hidden="true" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 34, height: 34, flexShrink: 0, borderRadius: "var(--radius-sm)", background: `color-mix(in srgb, ${chipTone.border} 15%, transparent)` }}>
+                <TileIcon sx={{ fontSize: 17, color: chipTone.border }} />
               </span>
               <span
                 style={{
                   flexShrink: 0,
-                  width: 144,
-                  fontSize: 11,
-                  fontWeight: 650,
-                  padding: "3px 7px",
+                  maxWidth: 170,
+                  fontSize: 11.5,
+                  fontWeight: 700,
+                  padding: "1px 8px",
                   border: `1px solid ${chipTone.border}`,
                   borderRadius: "var(--radius-sm)",
                   // 라벨은 아웃라인 스타일 — 아티팩트 정체성은 테두리·글자
@@ -719,8 +703,9 @@ export default function MasterTimeline({ entries, loading, onNavigate, onFetchLi
                 {artifactDisplayName(entry.category, entry.table)}
               </span>
               <span style={{ flex: 1, minWidth: 0, overflow: "hidden" }}>
-                <div style={{ fontSize: 13.5, fontWeight: 650, color: bookmarked ? BOOKMARK_TEXT : undefined, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                  {presentation.summary}
+                <div style={{ display: "flex", alignItems: "center", gap: 7, minWidth: 0 }}>
+                  <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 13.5, fontWeight: 650, color: bookmarked ? BOOKMARK_TEXT : undefined }}>{presentation.summary}</span>
+                  {presentation.note && <span title={presentation.note} style={{ flexShrink: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "#5bc8c0", border: "1px solid #5bc8c0", borderRadius: "var(--radius-sm)", padding: "1px 7px", fontSize: 11, fontWeight: 650 }}>{presentation.note}</span>}
                 </div>
                 {presentation.subtitle && (
                   <div
@@ -735,6 +720,9 @@ export default function MasterTimeline({ entries, loading, onNavigate, onFetchLi
                     {presentation.subtitle}
                   </div>
                 )}
+              </span>
+              <span style={{ flexShrink: 0, width: 172, textAlign: "right", fontFamily: "var(--mono)", fontSize: 12.5, color: bookmarked ? BOOKMARK_MUTED_TEXT : entry.timestamp ? "var(--text-time)" : "var(--text-faint)", whiteSpace: "nowrap" }}>
+                {entry.timestamp || "(시간 정보 없음)"}
               </span>
               {(dangerTag || warningTag) && (
                 <Tooltip

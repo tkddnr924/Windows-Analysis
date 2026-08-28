@@ -1,4 +1,6 @@
 "use client";
+import { FilterDropdown, HeaderSearchInput, SelectDropdown, ViewHeader } from "@/components/FilterControls";
+import AccountTreeOutlinedIcon2 from "@mui/icons-material/AccountTreeOutlined";
 import { useEffect, useMemo, useRef, useState } from "react";
 import useMediaQuery from "@mui/material/useMediaQuery";
 import CircularProgress from "@mui/material/CircularProgress";
@@ -278,6 +280,7 @@ export default function HostConnectionView(
     [scope, setScope] = useState<"host" | "overall">("host"),
     [focus, setFocus] = useState<string | null>(null),
     [selected, setSelected] = useState<string | null>(null);
+  const [visibilityOpen, setVisibilityOpen] = useState(false);
   const compactLayout = useMediaQuery("(max-width: 1000px)");
   const range = rangeActive(timeRange),
     rows = graph?.records ?? [],
@@ -361,108 +364,76 @@ export default function HostConnectionView(
         flex: 1,
         minHeight: 0,
         overflow: "auto",
-        padding: "18px 20px",
         display: "flex",
         flexDirection: "column",
       }}
     >
       <section style={surface}>
-        <header style={head}>
-          <strong>원격 접근 관계 (RDP)</strong>
-          <span>
-            {scoped.length.toLocaleString()}개 이벤트 ·{" "}
-            {es.length.toLocaleString()}개 관계
-          </span>
-          <span>{range ? "전역 기간 필터 적용" : "전체 기간"}</span>
-          {graph.rdpSourceFailures?.length
-            ? (
-              <span style={warning}>
-                일부 RDP 원본 미확인 {graph.rdpSourceFailures.length}건
-              </span>
-            )
-            : null}
-          {graph.networkMappingFailures?.length
-            ? (
-              <span>
-                네트워크 매핑 미확인 {graph.networkMappingFailures.length}건
-              </span>
-            )
-            : null}
-          {onRefresh && (
-            <Button onClick={onRefresh} style={{ marginLeft: "auto" }}>
-              <RefreshOutlinedIcon sx={{ fontSize: 15 }} />새로고침
-            </Button>
-          )}
-        </header>
-        <div style={toolbar}>
-          <Button
-            aria-pressed={includeLocal}
-            onClick={() => setIncludeLocal((v) => !v)}
-          >
-            로컬 {includeLocal ? "포함" : "제외"}
-          </Button>
-          <Button
-            aria-pressed={includeLoopback}
-            onClick={() => setIncludeLoopback((v) => !v)}
-          >
-            루프백 {includeLoopback ? "포함" : "제외"}
-          </Button>
-          <select
-            aria-label="방향 필터"
+        <ViewHeader
+          icon={AccountTreeOutlinedIcon2}
+          title="원격 접근 관계 (RDP)"
+          meta={<>{scoped.length.toLocaleString()}개 이벤트 · {es.length.toLocaleString()}개 관계{graph.rdpSourceFailures?.length ? <span style={{ ...warning, marginLeft: 8 }}>일부 RDP 원본 미확인 {graph.rdpSourceFailures.length}건</span> : null}{graph.networkMappingFailures?.length ? <span style={{ marginLeft: 8 }}>네트워크 매핑 미확인 {graph.networkMappingFailures.length}건</span> : null}</>}
+          right={<>
+            <span style={{ color: "var(--text-faint)", fontSize: 11.5 }}>{range ? "전역 기간 필터 적용" : "전체 기간"}</span>
+            <div role="group" aria-label="관계 그래프 범위" style={{ display: "inline-flex", gap: 4 }}>
+              <Button aria-pressed={scope === "host"} onClick={() => setScope("host")} style={{ borderRadius: "var(--radius-md)", minHeight: 30, padding: "3px 11px", borderColor: scope === "host" ? "var(--accent)" : "var(--border)", background: scope === "host" ? "var(--accent-subtle)" : "transparent", color: scope === "host" ? "var(--accent)" : "var(--text-dim)", fontWeight: scope === "host" ? 650 : 500 }}>
+                호스트별 관계
+              </Button>
+              <Button aria-pressed={scope === "overall"} onClick={() => setScope("overall")} style={{ borderRadius: "var(--radius-md)", minHeight: 30, padding: "3px 11px", borderColor: scope === "overall" ? "var(--accent)" : "var(--border)", background: scope === "overall" ? "var(--accent-subtle)" : "transparent", color: scope === "overall" ? "var(--accent)" : "var(--text-dim)", fontWeight: scope === "overall" ? 650 : 500 }}>
+                관계 개요
+              </Button>
+            </div>
+            {onRefresh && (
+              <Button onClick={onRefresh}>
+                <RefreshOutlinedIcon sx={{ fontSize: 15 }} />새로고침
+              </Button>
+            )}
+          </>}
+        >
+          <HeaderSearchInput value={search} onChange={setSearch} placeholder="호스트 · 상대 · 계정 검색" ariaLabel="호스트, 상대, 계정 검색" width={300} />
+          <SelectDropdown
+            label="방향"
+            options={[
+              { value: "all", label: "전체" },
+              { value: "inbound", label: "인바운드", color: "#f2a86f" },
+              { value: "outbound", label: "아웃바운드", color: "#9b7ef8" },
+              { value: "unknown", label: "방향 정보 없음" },
+            ]}
             value={direction}
-            onChange={(e) => setDirection(e.target.value as typeof direction)}
-            style={field}
-          >
-            <option value="all">방향 전체</option>
-            <option value="inbound">인바운드</option>
-            <option value="outbound">아웃바운드</option>
-            <option value="unknown">방향 정보 없음</option>
-          </select>
-          <select
-            aria-label="결과 필터"
-            value={result}
-            onChange={(e) => setResult(e.target.value as typeof result)}
-            style={field}
-          >
-            <option value="all">결과 전체</option>
-            <option value="success">성공</option>
-            <option value="fail">실패</option>
-          </select>
-          <div role="group" aria-label="관계 그래프 범위" style={{ display: "inline-flex" }}>
-            <Button aria-pressed={scope === "host"} onClick={() => setScope("host")} style={{ borderRadius: "var(--radius-sm) 0 0 var(--radius-sm)", borderColor: scope === "host" ? "var(--accent)" : "var(--border)", background: scope === "host" ? "var(--accent-subtle)" : "transparent", color: scope === "host" ? "var(--accent)" : "var(--text-dim)" }}>
-              호스트별 관계
-            </Button>
-            <Button aria-pressed={scope === "overall"} onClick={() => setScope("overall")} style={{ marginLeft: -1, borderRadius: "0 var(--radius-sm) var(--radius-sm) 0", borderColor: scope === "overall" ? "var(--accent)" : "var(--border)", background: scope === "overall" ? "var(--accent-subtle)" : "transparent", color: scope === "overall" ? "var(--accent)" : "var(--text-dim)" }}>
-              관계 개요
-            </Button>
-          </div>
-          <select
-            aria-label="등록 호스트 중심 선택"
-            value={activeFocus ?? ""}
-            onChange={(e) => {
-              setFocus(e.target.value);
-              setSelected(null);
-              setScope("host");
-            }}
-            style={field}
-          >
-            <option value="">등록 호스트 선택</option>
-            {registeredNodes.map((n) => <option key={n.key} value={n.key}>{n.label}
-            </option>)}
-          </select>
-          <input
-            aria-label="호스트, 상대, 계정 검색"
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            placeholder="호스트 · 상대 · 계정 검색"
-            style={{
-              ...field,
-              marginLeft: "auto",
-              minWidth: 210,
-              flex: "1 1 230px",
-            }}
+            onChange={(next) => setDirection(next as typeof direction)}
           />
-        </div>
+          <SelectDropdown
+            label="결과"
+            options={[
+              { value: "all", label: "전체" },
+              { value: "success", label: "성공", color: "var(--success)" },
+              { value: "fail", label: "실패", color: "var(--danger)" },
+            ]}
+            value={result}
+            onChange={(next) => setResult(next as typeof result)}
+          />
+          <FilterDropdown label="표시 조건" valueLabel={!includeLocal || !includeLoopback ? "· 적용 중" : undefined} active={!includeLocal || !includeLoopback} minWidth={200} open={visibilityOpen} onToggle={setVisibilityOpen}>
+            {[
+              { label: "로컬 포함", checked: includeLocal, toggle: () => setIncludeLocal((v) => !v) },
+              { label: "루프백 포함", checked: includeLoopback, toggle: () => setIncludeLoopback((v) => !v) },
+            ].map((condition) => (
+              <button key={condition.label} type="button" aria-pressed={condition.checked} onClick={condition.toggle} style={{ width: "100%", display: "flex", alignItems: "center", gap: 7, minHeight: 32, padding: "4px 9px", background: "transparent", border: "none", borderRadius: "var(--radius-sm)", color: condition.checked ? "var(--text)" : "var(--text-faint)", cursor: "pointer", fontSize: 12.5, fontWeight: condition.checked ? 650 : 500, textAlign: "left" }}
+                onMouseEnter={(event) => { event.currentTarget.style.background = "var(--bg-hover)"; }}
+                onMouseLeave={(event) => { event.currentTarget.style.background = "transparent"; }}>
+                <span aria-hidden="true" style={{ color: condition.checked ? "var(--accent)" : "var(--text-faint)", fontSize: 13 }}>{condition.checked ? "☑" : "☐"}</span>
+                {condition.label}
+              </button>
+            ))}
+          </FilterDropdown>
+          <SelectDropdown
+            label="기준 호스트"
+            options={[{ value: "", label: "선택 안 함" }, ...registeredNodes.map((n) => ({ value: n.key, label: n.label }))]}
+            value={activeFocus ?? ""}
+            defaultValue=""
+            onChange={(next) => { setFocus(next); setSelected(null); setScope("host"); }}
+          />
+        </ViewHeader>
+
         <div
           style={{
             display: "grid",
@@ -597,7 +568,7 @@ function GraphPane(
       }}
     >
       {hasGraph
-        ? <ForceGraph value={value} selected={selected} onNode={onNode} />
+        ? <ForceGraph value={value} selected={selected} flowFocus={overall ? null : focus} onNode={onNode} />
         : (
           <Center>
             {hasRows
@@ -631,9 +602,11 @@ function seedFor(value: string) {
 }
 
 function ForceGraph(
-  { value, selected, onNode }: {
+  { value, selected, flowFocus, onNode }: {
     value: ReturnType<typeof layout>;
     selected: string | null;
+    /** 호스트별 관계 모드의 기준 호스트 — 이 노드 기준으로 들어옴/나감 색을 정한다. */
+    flowFocus: string | null;
     onNode: (node: Node) => void;
   },
 ) {
@@ -968,22 +941,56 @@ function ForceGraph(
           style={{ position: "absolute", inset: 0, overflow: "visible" }}
         >
           <defs>
-            <marker
-              id="rdp-arrow"
-              markerWidth="8"
-              markerHeight="8"
-              refX="6"
-              refY="3"
-              orient="auto"
-            >
+            {/* 방향별 색: 인바운드 오렌지 / 아웃바운드 퍼플 — 세션 뷰와 동일. */}
+            <marker id="rdp-arrow" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
               <path d="M0,0 L0,6 L7,3 z" fill="var(--text-dim)" />
             </marker>
+            <marker id="rdp-arrow-inbound" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+              <path d="M0,0 L0,6 L7,3 z" fill="#f2a86f" />
+            </marker>
+            <marker id="rdp-arrow-outbound" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+              <path d="M0,0 L0,6 L7,3 z" fill="#9b7ef8" />
+            </marker>
+            <marker id="rdp-arrow-selected" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+              <path d="M0,0 L0,6 L7,3 z" fill="var(--accent)" />
+            </marker>
+            {/* 양방향 관계(서로 오간 기록)는 청록 + 양쪽 화살촉으로 구분. */}
+            <marker id="rdp-arrow-bidi" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+              <path d="M0,0 L0,6 L7,3 z" fill="#5bc8c0" />
+            </marker>
+            <marker id="rdp-arrow-bidi-start" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto-start-reverse">
+              <path d="M0,0 L0,6 L7,3 z" fill="#5bc8c0" />
+            </marker>
           </defs>
-          {value.shown.map((e) => {
+          {(() => {
+            // 같은 두 노드 사이에 반대 방향 흐름이 모두 있으면 양방향으로 그린다.
+            const flowPairs = new Map<string, Set<string>>();
+            for (const e of value.shown) {
+              if (e.direction === "unknown") continue;
+              const source = e.direction === "inbound" ? key(e.peer) : key(e.host);
+              const target = e.direction === "inbound" ? key(e.host) : key(e.peer);
+              const pairKey = [source, target].sort().join("|");
+              const set = flowPairs.get(pairKey) ?? new Set<string>();
+              set.add(`${source}>${target}`);
+              flowPairs.set(pairKey, set);
+            }
+            return value.shown.map((e) => {
             const a = renderByKey.get(key(e.host)), b = renderByKey.get(key(e.peer));
             if (!a || !b) return null;
             const from = e.direction === "inbound" ? b : a,
               to = e.direction === "inbound" ? a : b,
+              // 색은 화살표(실제 흐름) 기준: 기준 호스트로 들어오면 오렌지,
+              // 나가면 퍼플. 기준이 없으면(관계 개요) 기록된 방향을 쓴다.
+              arrowTargetKey = e.direction === "inbound" ? key(e.host) : key(e.peer),
+              arrowSourceKey = e.direction === "inbound" ? key(e.peer) : key(e.host),
+              pairBidirectional = e.direction !== "unknown" && (flowPairs.get([arrowSourceKey, arrowTargetKey].sort().join("|"))?.size ?? 0) > 1,
+              edgeTone = e.direction === "unknown"
+                ? "unknown"
+                : pairBidirectional
+                  ? "bidi"
+                  : flowFocus
+                    ? (arrowTargetKey === flowFocus ? "in" : arrowSourceKey === flowFocus ? "out" : e.direction === "inbound" ? "in" : "out")
+                    : e.direction === "inbound" ? "in" : "out",
               d = Math.hypot(to.x - from.x, to.y - from.y) || 1,
               ux = (to.x - from.x) / d,
               uy = (to.y - from.y) / d,
@@ -996,15 +1003,26 @@ function ForceGraph(
                 y1={from.y + uy * (fromRadius + 4)}
                 x2={to.x - ux * (toRadius + 6)}
                 y2={to.y - uy * (toRadius + 6)}
-                stroke={selected === e.key ? "var(--accent)" : "var(--text-dim)"}
+                stroke={selected === e.key ? "var(--accent)" : edgeTone === "bidi" ? "#5bc8c0" : edgeTone === "in" ? "#f2a86f" : edgeTone === "out" ? "#9b7ef8" : "var(--text-dim)"}
+                strokeOpacity={1}
                 strokeWidth={selected === e.key ? 2.5 : 1.4}
                 strokeDasharray={e.direction === "unknown" ? "5 5" : undefined}
+                markerStart={edgeTone === "bidi" && selected !== e.key ? "url(#rdp-arrow-bidi-start)" : undefined}
                 markerEnd={e.direction === "unknown"
                   ? undefined
-                  : "url(#rdp-arrow)"}
+                  : selected === e.key
+                    ? "url(#rdp-arrow-selected)"
+                    : edgeTone === "bidi"
+                      ? "url(#rdp-arrow-bidi)"
+                      : edgeTone === "in"
+                        ? "url(#rdp-arrow-inbound)"
+                        : edgeTone === "out"
+                          ? "url(#rdp-arrow-outbound)"
+                          : "url(#rdp-arrow)"}
               />
             );
-          })}
+            });
+          })()}
         </svg>
         {renderPoints.map((n) => {
           const r = nodeRadius(n);
@@ -1109,6 +1127,13 @@ function List(
     onSelect: (k: string) => void;
   },
 ) {
+  // 관계 목록도 다른 목록과 동일하게 10건씩 페이지로 나눈다.
+  const [page, setPage] = useState(0);
+  useEffect(() => setPage(0), [edges]);
+  const PAGE = 10;
+  const pageCount = Math.max(1, Math.ceil(edges.length / PAGE));
+  const safePage = Math.min(page, pageCount - 1);
+  const pageEdges = edges.slice(safePage * PAGE, (safePage + 1) * PAGE);
   return (
     <div>
       <strong>관계 목록</strong>
@@ -1123,7 +1148,7 @@ function List(
           관계 개요에서 확인할 수 있습니다.
         </p>
       )}
-      {edges.map((e) => (
+      {pageEdges.map((e) => (
         <button
           key={e.key}
           type="button"
@@ -1141,6 +1166,11 @@ function List(
           <span>{e.count}건</span>
         </button>
       ))}
+      {edges.length > 0 && (
+        <div style={{ display: "flex", justifyContent: "center", marginTop: 8 }}>
+          <PaginationControls ariaLabel="관계 목록 페이지" page={safePage} pageCount={pageCount} onChange={setPage} summary={`(${(safePage * PAGE + 1).toLocaleString()}–${Math.min((safePage + 1) * PAGE, edges.length).toLocaleString()} / ${edges.length.toLocaleString()})`} />
+        </div>
+      )}
     </div>
   );
 }
@@ -1260,10 +1290,6 @@ const surface: React.CSSProperties = {
   minHeight: "min(520px, max(0px, calc(100dvh - 160px)))",
   display: "flex",
   flexDirection: "column",
-  border: "1px solid var(--border)",
-  borderRadius: "var(--radius-lg)",
-  background: "var(--bg-panel)",
-  boxShadow: "var(--shadow-panel)",
   overflow: "hidden",
 };
 const head: React.CSSProperties = {

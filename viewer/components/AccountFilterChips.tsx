@@ -52,11 +52,14 @@ export default function AccountFilterChips({
           <div role="group" aria-label={ariaLabel} style={{ position: "absolute", top: "calc(100% + 6px)", [align]: 0, zIndex: 41, minWidth: 235, maxHeight: 320, overflowY: "auto", background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", boxShadow: "var(--shadow-panel)", padding: 6 }}>
             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, padding: "4px 8px 7px", borderBottom: "1px solid var(--border-subtle)" }}>
               <span style={{ fontSize: 12, fontWeight: 700, color: "var(--text)" }}>계정 표시</span>
-              {filtering && (
-                <button type="button" onClick={onReset} style={{ background: "transparent", border: "none", color: "var(--accent)", cursor: "pointer", fontSize: 11.5, fontWeight: 600, padding: 0 }}>
+              <span style={{ display: "inline-flex", gap: 9 }}>
+                <button type="button" onClick={onReset} disabled={!filtering} style={{ background: "transparent", border: "none", color: filtering ? "var(--accent)" : "var(--text-faint)", cursor: filtering ? "pointer" : "default", fontSize: 11.5, fontWeight: 600, padding: 0 }}>
                   전체 선택
                 </button>
-              )}
+                <button type="button" onClick={() => accounts.filter((account) => !hidden.has(account)).forEach(onToggle)} disabled={hidden.size === accounts.length} style={{ background: "transparent", border: "none", color: hidden.size === accounts.length ? "var(--text-faint)" : "var(--accent)", cursor: hidden.size === accounts.length ? "default" : "pointer", fontSize: 11.5, fontWeight: 600, padding: 0 }}>
+                  전체 해제
+                </button>
+              </span>
             </div>
             {accounts.map((account) => {
               const checked = !hidden.has(account);

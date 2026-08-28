@@ -184,16 +184,21 @@ function terminalStatusLabel(status: string): string {
   return "취소";
 }
 
-function RunLogDetail({ host, report }: { host: Host; report: ParseReport }) {
+function RunLogDetail({ host, report, autoOpen = false }: { host: Host; report: ParseReport; autoOpen?: boolean }) {
   const [open, setOpen] = useState(false);
   const [text, setText] = useState<string | null>(null);
   const [truncated, setTruncated] = useState(false);
   const [loaded, setLoaded] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">("idle");
+  // 부모 패널이 열리며 마운트되는 경우엔 클릭 한 번으로 바로 로그를 보여준다.
+  useEffect(() => {
+    if (autoOpen && report.runId) void load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   if (!report.runId) return null;
-  const load = async () => {
+  async function load() {
     setOpen(true);
     setLoaded(false);
     setError(null);
@@ -205,7 +210,7 @@ function RunLogDetail({ host, report }: { host: Host; report: ParseReport }) {
     } catch (cause) {
       setError(errorMessage(cause, "실행 로그를 불러오지 못했습니다."));
     }
-  };
+  }
   const copy = async () => {
     if (!text) return;
     try {
@@ -218,14 +223,14 @@ function RunLogDetail({ host, report }: { host: Host; report: ParseReport }) {
 
   return <div style={{ display: "grid", gap: 5, marginTop: 2 }}>
     <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
-      <button className="nm-btn" type="button" aria-label={`${host.name} 실행 로그 ${open ? "닫기" : "보기"}`} onClick={open ? () => setOpen(false) : load} style={{ ...neutralButtonStyle, width: "fit-content", padding: "4px 8px", fontSize: 11.5 }}>{open ? "실행 로그 닫기" : "실행 로그 보기"}</button>
+      {!autoOpen && <button className="nm-btn" type="button" aria-label={`${host.name} 실행 로그 ${open ? "닫기" : "보기"}`} onClick={open ? () => setOpen(false) : () => void load()} style={{ ...neutralButtonStyle, width: "fit-content", padding: "4px 8px", fontSize: 11.5 }}>{open ? "실행 로그 닫기" : "실행 로그 보기"}</button>}
       {open && text && <button className="nm-btn" type="button" onClick={copy} style={{ ...neutralButtonStyle, width: "fit-content", padding: "4px 8px", fontSize: 11.5 }}>로그 복사</button>}
     </div>
     {copyState === "copied" && <span role="status">로그를 복사했습니다.</span>}
     {copyState === "failed" && <span role="alert">로그 복사에 실패했습니다.</span>}
     {open && !loaded && !error && <span role="status">로그를 불러오는 중…</span>}
-    {error && <span role="alert" style={{ color: "var(--danger)" }}>{error} <button type="button" onClick={load} style={linkButtonStyle}>다시 시도</button></span>}
-    {open && loaded && <pre aria-label={`${host.name} 실행 로그 내용`} style={{ maxHeight: 168, overflow: "auto", margin: 0, padding: "7px 8px", background: "var(--bg-input)", border: "1px solid var(--border-subtle)", color: "var(--text-dim)", fontFamily: "var(--mono)", fontSize: 11, whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{text || "기록된 로그 행이 없습니다."}{truncated ? "\n\n… 앞부분 24KB만 표시합니다." : ""}</pre>}
+    {error && <span role="alert" style={{ color: "var(--danger)" }}>{error} <button type="button" onClick={() => void load()} style={linkButtonStyle}>다시 시도</button></span>}
+    {open && loaded && <pre aria-label={`${host.name} 실행 로그 내용`} style={{ maxHeight: 168, overflow: "auto", margin: 0, padding: "8px 10px", background: "var(--bg-input)", border: "1px solid var(--border-subtle)", borderRadius: "var(--radius-sm)", color: "var(--text-dim)", fontFamily: "var(--mono)", fontSize: 11, whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{text || "기록된 로그 행이 없습니다."}{truncated ? "\n\n… 앞부분 24KB만 표시합니다." : ""}</pre>}
   </div>;
 }
 
@@ -246,19 +251,27 @@ function RunOutcomeSummary({
   const mft = report?.artifacts.find((artifact) => artifact.name === "MFT");
   // 정상 완료 실행도 로그를 볼 수 있어야 한다 — 항상 렌더.
   const retryMft = report?.status === "partial" && report.artifacts.some((artifact) => artifact.name === "MFT" && artifact.status === "failed");
-  const summaryColor = failed ? "var(--danger)" : cancelled ? "var(--text-dim)" : "var(--warning)";
+  const summaryColor = failed ? "var(--danger)" : partial ? "var(--warning)" : cancelled ? "var(--text-dim)" : "var(--success)";
   // 오류 원문은 여기에 표기하지 않는다 — 세부 내용은 실행 로그로 확인한다.
-  return <details style={{ gridColumn: "1 / -1", margin: "0 0 2px", fontSize: 11.5, color: summaryColor }}>
-    <summary style={{ cursor: "pointer", width: "fit-content" }}>로그 보기</summary>
-    <div style={{ display: "grid", gap: 3, marginTop: 6, padding: "7px 9px", color: "var(--text-dim)", borderLeft: `2px solid ${summaryColor}` }}>
-      <span>총 소요: {formatDuration(duration)}</span>
+  return <RunOutcomeSummaryBody summaryColor={summaryColor} duration={duration} mft={mft} host={host} report={report} retryMft={retryMft} onRetryMft={onRetryMft} />;
+}
+
+function RunOutcomeSummaryBody({ summaryColor, duration, mft, host, report, retryMft, onRetryMft }: { summaryColor: string; duration: number; mft?: { status: string }; host: Host; report?: ParseReport; retryMft: boolean; onRetryMft?: () => void }) {
+  const [open, setOpen] = useState(false);
+  return <div style={{ margin: "2px 0 0", fontSize: 12 }}>
+    <button type="button" className="nm-btn" aria-expanded={open} onClick={() => setOpen((value) => !value)} style={{ cursor: "pointer", width: "fit-content", display: "inline-flex", alignItems: "center", gap: 7, padding: "3px 11px", minHeight: 26, background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", color: "var(--text-dim)", fontSize: 11.5, fontWeight: 600, whiteSpace: "nowrap" }}>
+      <span aria-hidden="true" style={{ width: 7, height: 7, borderRadius: "50%", background: summaryColor }} />
+      실행 로그
+      <span style={{ color: "var(--text-faint)", fontWeight: 500 }}>총 소요 {formatDuration(duration)}</span>
+    </button>
+    {open && <div style={{ display: "grid", gap: 6, marginTop: 8, padding: "10px 12px", color: "var(--text-dim)", border: "1px solid var(--border)", borderLeft: `3px solid ${summaryColor}`, borderRadius: "var(--radius-md)", background: "var(--bg)" }}>
       {mft?.status === "no_input" && <span>MFT: 원본 $MFT 파일 미수집 · 이번 실행에서는 결과를 만들지 않았습니다.</span>}
       {mft?.status === "failed" && <span>MFT: 파싱 실패 · MFT 결과는 공개되지 않았습니다.</span>}
-      {report && <RunLogDetail host={host} report={report} />}
+      {report && <RunLogDetail host={host} report={report} autoOpen />}
       {retryMft && onRetryMft && <button className="nm-btn" type="button" onClick={onRetryMft} style={{ ...neutralButtonStyle, width: "fit-content", padding: "4px 8px", fontSize: 11.5 }}>MFT만 재시도</button>}
       {!report && <span>세부 보고서를 불러오는 중이거나 이전 실행에는 구조화된 보고서가 없습니다.</span>}
-    </div>
-  </details>;
+    </div>}
+  </div>;
 }
 
 function RenameHostDialog({
@@ -594,18 +607,17 @@ export default function RunPipeline({ activeCase, onChanged, onOpenHost, run }: 
       </section>
 
       {/* Host ledger is intentionally the only independently scrolling region. */}
-      <section className="dfir-surface host-ledger-surface" aria-labelledby="host-ledger-title" style={{ flex: "1 1 0", minHeight: 0, display: "flex", flexDirection: "column", overflow: "hidden", containerType: "inline-size" }}>
-        <div className="host-ledger-toolbar" style={{ display: "flex", alignItems: "center", gap: 9, padding: "11px 14px", borderBottom: "1px solid var(--border)", flexShrink: 0 }}>
+      <section aria-labelledby="host-ledger-title" style={{ flex: "1 1 0", minHeight: 0, display: "flex", flexDirection: "column", overflow: "hidden", containerType: "inline-size" }}>
+        <div className="host-ledger-toolbar" style={{ display: "flex", alignItems: "center", gap: 9, padding: "10px 2px", flexShrink: 0 }}>
           <h2 id="host-ledger-title" style={{ margin: 0, fontSize: 13.5 }}>등록 호스트</h2>
           <span style={{ color: "var(--text-faint)", fontSize: 11.5 }}>{filteredHosts.length.toLocaleString()}개 표시</span>
           {runs.some((entry) => entry.status === "queued" || entry.status === "running") && <span aria-live="polite" style={{ display: "inline-flex", alignItems: "center", gap: 5, color: "var(--text-dim)", fontSize: 11.5, whiteSpace: "nowrap" }}><CircularProgress size={13} thickness={5} />{runs.filter((entry) => entry.status === "running").length}개 실행 · {runs.filter((entry) => entry.status === "queued").length}개 대기</span>}
           <input className="host-ledger-search" aria-label="호스트 또는 증거 경로 검색" value={hostQuery} onChange={(event) => { setHostQuery(event.target.value); setHostPage(0); }} placeholder="호스트·증거 경로 검색" style={{ width: 230, marginLeft: "auto", padding: "6px 9px", background: "var(--bg-input)", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", color: "var(--text)", fontSize: 12 }} />
           {hasActiveRuns ? <button className="nm-btn" type="button" onClick={handleCancel} style={{ ...dangerButtonStyle, padding: "5px 10px", fontSize: 12 }}><CancelOutlinedIcon sx={{ fontSize: 15 }} />전체 실행·대기 항목 중지</button> : hosts.length > 1 && <button className="nm-btn" type="button" onClick={handleRunAll} disabled={selectedArtifacts.size === 0} style={{ ...primaryButtonStyle, padding: "5px 10px", fontSize: 12, opacity: selectedArtifacts.size === 0 ? 0.5 : 1 }}><PlayArrowIcon sx={{ fontSize: 15 }} />전체 파싱</button>}
         </div>
-        {actionError && <div role="alert" style={{ padding: "8px 14px", borderBottom: "1px solid color-mix(in srgb, var(--danger) 45%, var(--border))", background: "color-mix(in srgb, var(--danger) 7%, var(--bg-panel))", color: "var(--danger)", fontSize: 12 }}>{actionError}</div>}
-        <div style={{ flex: 1, minHeight: 0, overflow: "auto" }}>
+        {actionError && <div role="alert" style={{ margin: "0 0 8px", padding: "8px 12px", border: "1px solid color-mix(in srgb, var(--danger) 45%, var(--border))", borderRadius: "var(--radius-md)", background: "color-mix(in srgb, var(--danger) 7%, var(--bg-panel))", color: "var(--danger)", fontSize: 12 }}>{actionError}</div>}
+        <div style={{ flex: 1, minHeight: 0, overflow: "auto", padding: "2px 2px 4px" }}>
           <div>
-            <div className="host-ledger-heading" aria-hidden="true"><span>호스트 · 상태</span><span>증거 경로</span><span>마지막 실행</span><span>작업</span></div>
             {hosts.length === 0 && <div role="status" style={{ padding: 28, textAlign: "center", color: "var(--text-faint)", fontSize: 12.5 }}>등록된 호스트가 없습니다. 위에서 증거 폴더를 선택해 추가하세요.</div>}
             {hosts.length > 0 && visibleHosts.length === 0 && <div role="status" style={{ padding: 28, textAlign: "center", color: "var(--text-faint)", fontSize: 12.5 }}>검색 조건과 일치하는 호스트가 없습니다.</div>}
             {visibleHosts.map((host) => {
@@ -618,7 +630,7 @@ export default function RunPipeline({ activeCase, onChanged, onOpenHost, run }: 
             })}
           </div>
         </div>
-        {filteredHosts.length > HOSTS_PER_PAGE && <div style={{ display: "flex", justifyContent: "flex-end", padding: "8px 14px", borderTop: "1px solid var(--border)", flexShrink: 0 }}><PaginationControls ariaLabel="호스트 목록 페이지" page={hostPage} pageCount={pageCount} onChange={setHostPage} summary={`(${(pageStart + 1).toLocaleString()}–${Math.min(pageStart + HOSTS_PER_PAGE, filteredHosts.length).toLocaleString()} / ${filteredHosts.length.toLocaleString()})`} /></div>}
+        {filteredHosts.length > HOSTS_PER_PAGE && <div style={{ display: "flex", justifyContent: "flex-end", padding: "8px 2px", flexShrink: 0 }}><PaginationControls ariaLabel="호스트 목록 페이지" page={hostPage} pageCount={pageCount} onChange={setHostPage} summary={`(${(pageStart + 1).toLocaleString()}–${Math.min(pageStart + HOSTS_PER_PAGE, filteredHosts.length).toLocaleString()} / ${filteredHosts.length.toLocaleString()})`} /></div>}
       </section>
       {renameHost && <RenameHostDialog value={renameName} saving={renaming} error={renameError} onChange={setRenameName} onClose={() => { if (!renaming) setRenameHost(null); }} onSave={() => void handleRenameHost()} />}
     </div>
@@ -670,27 +682,40 @@ function HostLedgerRow({
   const percent = !activeRun || isQueued || activeRun.totalSteps <= 0
     ? 0
     : Math.min(99, Math.round((activeRun.completedSteps / activeRun.totalSteps) * 100));
-  return <article className="host-ledger-row" style={{ borderBottom: "1px solid var(--border-subtle)", background: activeRun ? "color-mix(in srgb, var(--accent) 5%, transparent)" : "transparent" }}>
-    <div className="host-ledger-main">
-      <div className="host-ledger-identity"><strong style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text)", fontSize: 12.5 }}>{host.name}</strong><StatusPill status={displayStatus ?? null} /></div>
-      <span className="host-ledger-path" title={host.targetDir}>{host.targetDir}</span>
-      <div className="host-ledger-last-run">{host.lastRunAt ? <>
-        <time style={{ fontFamily: "var(--mono)", color: "var(--text-dim)" }}>{formatEvidenceTimestamp(host.lastRunAt)}</time>
-        {reportSyncPending && <div role="status" aria-live="polite" style={{ display: "inline-flex", alignItems: "center", gap: 5, color: "var(--text-faint)" }}><CircularProgress size={12} thickness={5} aria-hidden="true" />이번 실행 보고서 동기화 중</div>}
-      </> : terminalStatus ? <span style={{ color: "var(--text-faint)" }}>방금 {terminalStatusLabel(terminalStatus)} · 저장 정보 갱신 중</span> : "실행 기록 없음"}</div>
+  // 카드 타일 색 = 실행 상태 신호.
+  const tileColor = activeRun ? "var(--accent)" : displayStatus === "ok" ? "var(--success)" : displayStatus === "error" ? "var(--danger)" : displayStatus ? "var(--warning)" : "var(--text-dim)";
+  return <article style={{ display: "flex", alignItems: "center", gap: 14, marginBottom: 8, padding: "11px 14px", border: `1px solid ${activeRun ? "color-mix(in srgb, var(--accent) 45%, var(--border))" : "var(--border)"}`, borderRadius: "var(--radius-md)", background: activeRun ? "color-mix(in srgb, var(--accent) 5%, var(--bg-panel))" : "var(--bg-panel)", transition: "border-color .18s ease" }}>
+    <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", alignItems: "stretch", gap: 6 }}>
+    <div style={{ display: "flex", alignItems: "center", gap: 12, minWidth: 0 }}>
+      <span aria-hidden="true" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 34, height: 34, flexShrink: 0, borderRadius: "var(--radius-sm)", background: `color-mix(in srgb, ${tileColor} 15%, transparent)` }}>
+        <DnsOutlinedIcon sx={{ fontSize: 17, color: tileColor }} />
+      </span>
+      <div style={{ flex: 1, minWidth: 0, display: "grid", gap: 3 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
+          <strong style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text)", fontSize: 13.5 }}>{host.name}</strong>
+          <StatusPill status={displayStatus ?? null} />
+        </div>
+        <span title={host.targetDir} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text-dim)", fontSize: 12, fontFamily: "var(--mono)" }}>{host.targetDir}</span>
+      </div>
+      <div style={{ flexShrink: 0, display: "flex", alignItems: "center", gap: 8, fontSize: 12 }}>
+        {host.lastRunAt ? (
+          reportSyncPending && <span role="status" aria-live="polite" style={{ display: "inline-flex", alignItems: "center", gap: 5, color: "var(--text-faint)" }}><CircularProgress size={12} thickness={5} aria-hidden="true" />이번 실행 보고서 동기화 중</span>
+        ) : terminalStatus ? <span style={{ color: "var(--text-faint)" }}>방금 {terminalStatusLabel(terminalStatus)} · 저장 정보 갱신 중</span> : <span style={{ color: "var(--text-faint)" }}>실행 기록 없음</span>}
+      </div>
     </div>
-    {confirmingDelete ? <div className="host-ledger-confirm"><span style={{ color: "var(--danger)", fontSize: 11.5 }}>분석 결과와 이 호스트 북마크를 삭제합니다.</span><div style={{ display: "flex", gap: 7 }}><button className="nm-btn" type="button" onClick={() => onDelete(host.id)} disabled={deleting} style={{ ...dangerButtonStyle, padding: "5px 9px", fontSize: 11.5, opacity: deleting ? .5 : 1 }}><DeleteOutlineIcon sx={{ fontSize: 14 }} />삭제</button><button type="button" onClick={() => onConfirmDelete(null)} disabled={deleting} style={{ ...linkButtonStyle, marginLeft: 0 }}>취소</button></div></div> : <div className="host-ledger-actions">
-        {canOpenResult ? <button className="nm-btn" type="button" onClick={() => onOpenHost(host)} style={{ ...neutralButtonStyle, padding: "5px 9px", fontSize: 11.5 }}><VisibilityOutlinedIcon sx={{ fontSize: 14 }} />결과 보기</button> : <span aria-hidden="true" className="host-ledger-action-placeholder" />}
-        {activeRun ? <button className="nm-btn" type="button" onClick={() => onCancel(activeRun.runId)} style={{ ...dangerButtonStyle, padding: "5px 9px", fontSize: 11.5 }}><CancelOutlinedIcon sx={{ fontSize: 14 }} />{isQueued ? "대기 취소" : "취소"}</button> : <button className="nm-btn" type="button" onClick={() => onRun(host.id)} disabled={hasActiveRuns || selectedArtifacts === 0} style={{ ...primaryButtonStyle, padding: "5px 9px", fontSize: 11.5, opacity: hasActiveRuns || selectedArtifacts === 0 ? .5 : 1 }}><PlayArrowIcon sx={{ fontSize: 14 }} />파싱</button>}
-        <span aria-hidden="true" className="host-ledger-action-divider" />
-        <button type="button" onClick={() => onRename(host)} disabled={!!activeRun} aria-label={`${host.name} 이름 변경`} title="호스트 표시 이름 변경" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 28, height: 28, padding: 0, background: "transparent", color: "var(--text-faint)", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", cursor: activeRun ? "default" : "pointer", opacity: activeRun ? .4 : 1 }}><EditOutlinedIcon sx={{ fontSize: 16 }} /></button>
-        <button type="button" onClick={() => onConfirmDelete(host.id)} disabled={!!activeRun} aria-label={`${host.name} 삭제`} title="호스트 삭제 (원본 수집 데이터는 유지)" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 28, height: 28, padding: 0, background: "transparent", color: "var(--text-faint)", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", cursor: activeRun ? "default" : "pointer", opacity: activeRun ? .4 : 1 }}><DeleteOutlineIcon sx={{ fontSize: 16 }} /></button>
-      </div>}
     {/* A host-level fallback status can belong to the previous run. Do not
         surface it until the exact terminal manifest has passed the same
         cache/run-id gate as the publication controls above. */}
     {report && !activeRun && !reportSyncPending && <RunOutcomeSummary host={host} report={report} onRetryMft={() => onRetryMft(host.id)} />}
     {activeRun && !isQueued && <div style={{ gridColumn: "1 / -1" }}><InlineParseProgress stepLabel={progressLabel} percent={percent} completedSteps={activeRun.completedSteps} totalSteps={activeRun.totalSteps} /></div>}
     {activeRun?.failedArtifacts.length ? <div role="alert" style={{ gridColumn: "1 / -1", padding: "0 0 6px", color: "var(--danger)", fontSize: 12 }}>파싱 실패: {activeRun.failedArtifacts.join(", ")}</div> : null}
+    </div>
+    {confirmingDelete ? <div className="host-ledger-confirm"><span style={{ color: "var(--danger)", fontSize: 11.5 }}>분석 결과와 이 호스트 북마크를 삭제합니다.</span><div style={{ display: "flex", gap: 7 }}><button className="nm-btn" type="button" onClick={() => onDelete(host.id)} disabled={deleting} style={{ ...dangerButtonStyle, padding: "5px 9px", fontSize: 11.5, opacity: deleting ? .5 : 1 }}><DeleteOutlineIcon sx={{ fontSize: 14 }} />삭제</button><button type="button" onClick={() => onConfirmDelete(null)} disabled={deleting} style={{ ...linkButtonStyle, marginLeft: 0 }}>취소</button></div></div> : <div className="host-ledger-actions">
+        {canOpenResult ? <button className="nm-btn" type="button" onClick={() => onOpenHost(host)} style={{ ...neutralButtonStyle, padding: "8px 14px", fontSize: 12.5 }}><VisibilityOutlinedIcon sx={{ fontSize: 16 }} />결과 보기</button> : <span aria-hidden="true" className="host-ledger-action-placeholder" />}
+        {activeRun ? <button className="nm-btn" type="button" onClick={() => onCancel(activeRun.runId)} style={{ ...dangerButtonStyle, padding: "8px 14px", fontSize: 12.5 }}><CancelOutlinedIcon sx={{ fontSize: 16 }} />{isQueued ? "대기 취소" : "취소"}</button> : <button className="nm-btn" type="button" onClick={() => onRun(host.id)} disabled={hasActiveRuns || selectedArtifacts === 0} style={{ ...primaryButtonStyle, padding: "8px 14px", fontSize: 12.5, opacity: hasActiveRuns || selectedArtifacts === 0 ? .5 : 1 }}><PlayArrowIcon sx={{ fontSize: 16 }} />파싱</button>}
+        <span aria-hidden="true" className="host-ledger-action-divider" />
+        <button type="button" onClick={() => onRename(host)} disabled={!!activeRun} aria-label={`${host.name} 이름 변경`} title="호스트 표시 이름 변경" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 34, height: 34, padding: 0, background: "transparent", color: "var(--text-faint)", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", cursor: activeRun ? "default" : "pointer", opacity: activeRun ? .4 : 1 }}><EditOutlinedIcon sx={{ fontSize: 18 }} /></button>
+        <button type="button" onClick={() => onConfirmDelete(host.id)} disabled={!!activeRun} aria-label={`${host.name} 삭제`} title="호스트 삭제 (원본 수집 데이터는 유지)" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 34, height: 34, padding: 0, background: "transparent", color: "var(--text-faint)", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", cursor: activeRun ? "default" : "pointer", opacity: activeRun ? .4 : 1 }}><DeleteOutlineIcon sx={{ fontSize: 18 }} /></button>
+      </div>}
   </article>;
 }

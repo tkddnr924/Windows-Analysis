@@ -117,13 +117,13 @@ function CodeOrJsonBlock({ raw, expandTitle }: { raw: string; expandTitle?: stri
     alignItems: "center",
     justifyContent: "center",
     gap: 4,
-    minHeight: 28,
+    minHeight: 25,
     fontSize: 11.5,
-    padding: "3px 10px",
-    background: "var(--bg-elevated)",
+    padding: "2px 9px",
+    background: "transparent",
     color: "var(--accent)",
     border: "1px solid var(--border)",
-    borderRadius: "var(--radius-md)",
+    borderRadius: "var(--radius-sm)",
     cursor: "pointer",
   };
 
@@ -131,7 +131,7 @@ function CodeOrJsonBlock({ raw, expandTitle }: { raw: string; expandTitle?: stri
     <div>
       <div style={{ display: "flex", justifyContent: "flex-end", gap: 6, marginBottom: 4 }}>
         {isJson && (
-          <button className="nm-btn"
+          <button
             onClick={() => setBeautified((b) => !b)}
             title={beautified ? "원본(압축) 보기" : "보기 좋게 정렬"}
             style={btnStyle}
@@ -139,10 +139,10 @@ function CodeOrJsonBlock({ raw, expandTitle }: { raw: string; expandTitle?: stri
             {"{ }"}
           </button>
         )}
-        <button className="nm-btn" onClick={copy} title={copyError ? "복사 실패" : copied ? "복사됨" : "복사"} aria-label={copyError ? "복사 실패" : copied ? "복사됨" : "값 복사"} style={{ ...btnStyle, width: 32, padding: 0, color: copyError ? "var(--danger)" : "var(--text-dim)" }}>
+        <button onClick={copy} title={copyError ? "복사 실패" : copied ? "복사됨" : "복사"} aria-label={copyError ? "복사 실패" : copied ? "복사됨" : "값 복사"} style={{ ...btnStyle, width: 28, padding: 0, color: copyError ? "var(--danger)" : "var(--text-dim)" }}>
           {copied ? <CheckIcon sx={{ fontSize: 16, color: "var(--success)" }} /> : <ContentCopyOutlinedIcon sx={{ fontSize: 15 }} />}
         </button>
-        <button className="nm-btn" onClick={() => setExpanded(true)} title="크게 보기" aria-label="크게 보기" style={{ ...btnStyle, width: 32, padding: 0, color: "var(--text-dim)" }}>
+        <button onClick={() => setExpanded(true)} title="크게 보기" aria-label="크게 보기" style={{ ...btnStyle, width: 28, padding: 0, color: "var(--text-dim)" }}>
           <OpenInFullOutlinedIcon aria-hidden="true" sx={{ fontSize: 15 }} />
         </button>
       </div>
@@ -202,25 +202,27 @@ function CopyButton({ value }: { value: string }) {
           window.setTimeout(() => setCopyError(false), 2400);
         }
       }}
-      className="nm-btn"
       title={copyError ? "복사 실패" : copied ? "복사됨" : "복사"}
       aria-label={copyError ? "복사 실패" : copied ? "복사됨" : "값 복사"}
       style={{
         display: "inline-flex",
         alignItems: "center",
         justifyContent: "center",
-        width: 32,
-        height: 28,
+        width: 34,
+        height: 32,
         padding: 0,
-        background: "var(--bg-elevated)",
-        color: copyError ? "var(--danger)" : "var(--text-dim)",
-        border: "1px solid var(--border)",
-        borderRadius: "var(--radius-md)",
+        background: "transparent",
+        color: copyError ? "var(--danger)" : "var(--text-faint)",
+        border: "none",
+        borderRadius: "var(--radius-sm)",
         cursor: "pointer",
         flexShrink: 0,
+        transition: "background .12s ease, color .12s ease",
       }}
+      onMouseEnter={(event) => { event.currentTarget.style.background = "var(--bg-elevated)"; event.currentTarget.style.color = "var(--text)"; }}
+      onMouseLeave={(event) => { event.currentTarget.style.background = "transparent"; event.currentTarget.style.color = copyError ? "var(--danger)" : "var(--text-faint)"; }}
     >
-      {copied ? <CheckIcon sx={{ fontSize: 16, color: "var(--success)" }} /> : <ContentCopyOutlinedIcon sx={{ fontSize: 15 }} />}
+      {copied ? <CheckIcon sx={{ fontSize: 19, color: "var(--success)" }} /> : <ContentCopyOutlinedIcon sx={{ fontSize: 18 }} />}
     </button>
   );
 }
@@ -450,9 +452,12 @@ function FieldRow({ field, row, onFetchLinkedRows, hostDir, accountDirectory, on
   }
 
   return (
-    <div style={{ minWidth: 0, maxWidth: "100%", padding: "7px 0", borderBottom: "1px solid var(--border-subtle)" }}>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 8 }}>
-        <span style={{ minWidth: 0, fontSize: 11, color: "var(--text-faint)", overflowWrap: "anywhere" }}>{label}</span>
+    <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0, maxWidth: "100%", padding: "8px 11px", marginBottom: 6, background: "var(--bg-elevated)", border: "1px solid color-mix(in srgb, var(--text-faint) 38%, transparent)", borderRadius: "var(--radius-sm)" }}>
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{ minWidth: 0, fontSize: 11.5, fontWeight: 650, color: "var(--text-faint)", overflowWrap: "anywhere" }}>{label}</div>
+        <div style={{ minWidth: 0, maxWidth: "100%", marginTop: 3, overflowWrap: "anywhere", wordBreak: "break-word" }}>{content}</div>
+      </div>
+      {((!hasInlineCodeControls && raw) || (field.bookmarkable && raw && onToggleFieldBookmark)) && (
         <span style={{ display: "inline-flex", alignItems: "center", gap: 4, flexShrink: 0 }}>
           {!hasInlineCodeControls && raw && <CopyButton value={raw} />}
           {field.bookmarkable && raw && onToggleFieldBookmark && (
@@ -468,8 +473,7 @@ function FieldRow({ field, row, onFetchLinkedRows, hostDir, accountDirectory, on
             </button>
           )}
         </span>
-      </div>
-      <div style={{ minWidth: 0, maxWidth: "100%", marginTop: 3, overflowWrap: "anywhere", wordBreak: "break-word" }}>{content}</div>
+      )}
     </div>
   );
 }
@@ -734,28 +738,22 @@ export default function ArtifactDetailView({ spec, row, onNavigate, onFetchLinke
   return (
     <div style={{ minWidth: 0, maxWidth: "100%" }}>
       <div style={{ padding: "18px 16px 14px", borderBottom: "1px solid var(--border-subtle)" }}>
-        <div className="dfir-section-label" style={{ marginBottom: 7 }}>증거 개요</div>
-        <div style={{ minWidth: 0, maxWidth: "100%", fontSize: 16, fontWeight: 700, overflowWrap: "anywhere", wordBreak: "break-word" }}>{title}</div>
-        {timeValue && spec.overviewTime !== "hide" && (
-          <div style={{ fontSize: 12.5, color: "var(--text-dim)", fontFamily: "var(--mono)", fontWeight: 550, marginTop: 7 }}>
-            {timeValue}
-          </div>
-        )}
-        {subtitle && (
-          <div style={{ minWidth: 0, maxWidth: "100%", fontSize: 12.5, color: "var(--text-dim)", marginTop: 3, overflowWrap: "anywhere", wordBreak: "break-word" }}>
-            {subtitle}
-          </div>
-        )}
-        {spec.badges && (
-          <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 8 }}>
-            {spec.badges.map((b) => {
-              const value = b.compute ? b.compute(row) ?? "" : row[b.key];
-              if (!value) return null;
-              const displayValue = b.valueLabels?.[value] ?? value;
-              return <Badge key={b.key} text={displayValue} color={b.badgeColors?.[displayValue]} />;
-            })}
-          </div>
-        )}
+        <div className="dfir-section-label" style={{ marginBottom: 8 }}>증거 개요</div>
+        <div style={{ padding: "12px 14px", background: "var(--bg-elevated)", border: "1px solid color-mix(in srgb, var(--text-faint) 38%, transparent)", borderRadius: "var(--radius-md)" }}>
+          <div style={{ minWidth: 0, maxWidth: "100%", fontSize: 16, fontWeight: 700, overflowWrap: "anywhere", wordBreak: "break-word" }}>{title}</div>
+          {timeValue && spec.overviewTime !== "hide" && (
+            <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12.5, color: "var(--text-time)", fontFamily: "var(--mono)", fontWeight: 550, marginTop: 7 }}>
+              {timeValue}
+              <CopyButton value={timeValue} />
+            </div>
+          )}
+          {subtitle && !(timeValue && spec.overviewTime !== "hide") && (
+            <div style={{ display: "inline-flex", alignItems: "center", gap: 6, minWidth: 0, maxWidth: "100%", fontSize: 12.5, color: "var(--text-time)", fontFamily: "var(--mono)", fontWeight: 550, marginTop: 7, overflowWrap: "anywhere", wordBreak: "break-word" }}>
+              <span style={{ minWidth: 0 }}>{subtitle}</span>
+              <CopyButton value={subtitle} />
+            </div>
+          )}
+        </div>
         {activeLinks.length > 0 && (
           <div style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 10 }}>
             {activeLinks.map((link) =>

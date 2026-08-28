@@ -442,14 +442,14 @@ export interface ElectronApi {
   resultRow(fullPath: string, tableName: string, rowid: number): Promise<ResultRow>;
   browserActivitySummary(fullPath: string, tableName: string, query: BrowserActivityQuery): Promise<BrowserActivitySummary>;
   browserActivityInsights(fullPath: string, tableName: string, account: string | undefined, start: string | undefined, end: string | undefined): Promise<BrowserActivityInsights>;
-  browserActivityDomains(fullPath: string, tableName: string, account: string | undefined, start: string | undefined, end: string | undefined, offset: number, limit: number): Promise<BrowserDomainStatsPage>;
+  browserActivityDomains(fullPath: string, tableName: string, account: string | undefined, start: string | undefined, end: string | undefined, offset: number, limit: number, ascending?: boolean): Promise<BrowserDomainStatsPage>;
   browserActivityPage(fullPath: string, tableName: string, query: BrowserActivityQuery): Promise<CsvData>;
   accountEventPage(sources: AccountEventSource[], query: AccountEventQuery): Promise<AccountEventPage>;
   aiReferrals(fullPath: string, tableName: string, start: string | undefined, end: string | undefined, offset: number, limit: number): Promise<CsvData>;
   mftChildren(fullPath: string, parentEntry: number): Promise<Record<string, string>[]>;
   mftSearch(fullPath: string, query: string, limit: number): Promise<Record<string, string>[]>;
   mftRow(fullPath: string, rowid: number): Promise<Record<string, string> | null>;
-  mftRecordsPage(fullPath: string, query: string, offset: number, limit: number): Promise<MftRecordsPage>;
+  mftRecordsPage(fullPath: string, query: string, offset: number, limit: number, options?: { sortKey?: string; sortDesc?: boolean; filesOnly?: boolean; namePattern?: string; timeKey?: string; timeStart?: string; timeEnd?: string }): Promise<MftRecordsPage>;
   listColumnValues(fullPath: string, column: string, tableName?: string): Promise<{ value: string; count: number }[]>;
   searchCase(query: string, hosts: { id: string; name: string; dir: string }[], offset: number, limit: number, range?: { start?: string; end?: string }): Promise<SearchCasePage>;
   listBookmarks(hostDir: string): Promise<Bookmark[]>;

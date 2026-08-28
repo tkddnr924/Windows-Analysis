@@ -1,4 +1,7 @@
 "use client";
+import { lookupEventCatalog } from "@/lib/eventCatalog";
+import EventNoteOutlinedIcon from "@mui/icons-material/EventNoteOutlined";
+import { ViewHeader } from "@/components/FilterControls";
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import ArrowBackOutlinedIcon from "@mui/icons-material/ArrowBackOutlined";
@@ -13,6 +16,8 @@ import ManageAccountsOutlinedIcon from "@mui/icons-material/ManageAccountsOutlin
 import PersonOutlineIcon from "@mui/icons-material/PersonOutlineOutlined";
 import SettingsOutlinedIcon from "@mui/icons-material/SettingsOutlined";
 import WarningAmberOutlinedIcon from "@mui/icons-material/WarningAmberOutlined";
+import WifiOutlinedIcon from "@mui/icons-material/WifiOutlined";
+import InfoOutlinedIcon from "@mui/icons-material/InfoOutlined";
 import type { AccountEventPage, AccountEventQuery, CsvData, Bookmark } from "@/lib/types";
 import type { FetchLinkedRows } from "@/lib/types";
 import { toBound, type TimeRange } from "@/lib/timeRange";
@@ -145,20 +150,6 @@ function KeyVal({ label, children }: { label: string; children: React.ReactNode 
   );
 }
 
-function SectionHeading({ title, count, leading }: { title: string; count?: number; leading?: React.ReactNode }) {
-  return (
-    <div style={{ display: "flex", alignItems: "center", gap: 8, minHeight: 44, padding: "0 16px", borderBottom: "1px solid var(--border)", fontWeight: 750, fontSize: 15, color: "var(--text)" }}>
-      {leading}
-      <span>{title}</span>
-      {count !== undefined && <span style={{ color: "var(--text-dim)", fontWeight: 600, fontSize: 12 }}>{count.toLocaleString()}건</span>}
-    </div>
-  );
-}
-
-function HostSurface({ children }: { children: React.ReactNode }) {
-  return <section style={{ background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", boxShadow: "var(--shadow-card)", overflow: "hidden" }}>{children}</section>;
-}
-
 function DetailSurface({ title, count, trailing, children }: { title: string; count?: number; trailing?: React.ReactNode; children: React.ReactNode }) {
   return (
     <section style={{ background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", boxShadow: "var(--shadow-card)", overflow: "hidden" }}>
@@ -195,6 +186,10 @@ interface NetworkProfile {
 export default function TargetInfoView({ data, loadAccountEvents, timeRange, onNavigate, onFetchLinkedRows, tableBookmarks, onToggleBookmark, eventBookmarks, onToggleEventBookmark, accountDirectory }: TargetInfoViewProps) {
   const bmRowids = useMemo(() => new Set((tableBookmarks ?? []).map((b) => b.rowid)), [tableBookmarks]);
   const [selectedAccount, setSelectedAccount] = useState<Account | null>(null);
+  // 좌측 범주 내비게이션(25%)에서 고른 섹션을 우측(75%)에 표시한다.
+  const [section, setSection] = useState<"accounts" | "system" | "interfaces" | "networks">("accounts");
+  // 시스템 값 카드 클릭 → 즉시 복사, 잠깐 "복사됨" 표시.
+  const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [selectedInterface, setSelectedInterface] = useState<NetInterface | null>(null);
   const [selectedNetwork, setSelectedNetwork] = useState<NetworkProfile | null>(null);
   const { system, users, services, networks, interfaces, computerName, osSummary } = useMemo(() => {
@@ -284,73 +279,123 @@ export default function TargetInfoView({ data, loadAccountEvents, timeRange, onN
 
   const accounts = [...users, ...services];
 
+  const sections = [
+    { key: "accounts" as const, label: "계정 정보", icon: ManageAccountsOutlinedIcon },
+    { key: "system" as const, label: "시스템", icon: DesktopWindowsOutlinedIcon },
+    { key: "interfaces" as const, label: "네트워크 어댑터", icon: LanOutlinedIcon },
+    { key: "networks" as const, label: "연결한 네트워크", icon: WifiOutlinedIcon },
+  ];
+
   return (
-    <div className="dfir-view" style={{ flex: 1, minWidth: 0, minHeight: 0, display: "flex", flexDirection: "column", overflow: "hidden" }}>
-      <header className="target-info-header" style={{ flexShrink: 0, minHeight: 56, display: "flex", alignItems: "center", gap: 12, padding: "0 24px", background: "var(--bg)", borderBottom: "1px solid var(--border)", zIndex: 2 }}>
-        <h1 style={{ margin: 0, minWidth: 0, color: "var(--text)", fontSize: 20, lineHeight: 1.2, fontWeight: 760, letterSpacing: "-0.02em", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>호스트 정보 <span style={{ color: "var(--text-faint)", padding: "0 3px" }}>|</span> {computerName}</h1>
-        {osSummary && <span style={{ marginLeft: "auto", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text-dim)", fontSize: 13 }}>{osSummary}</span>}
-      </header>
+    <div className="dfir-view" style={{ flex: 1, minWidth: 0, minHeight: 0, display: "flex", flexDirection: "column", overflow: "hidden", background: "var(--bg)" }}>
+      <ViewHeader icon={InfoOutlinedIcon} title={<>호스트 정보 <span aria-hidden="true" style={{ color: "var(--text-faint)", padding: "0 2px" }}>|</span> {computerName}</>} right={osSummary ? <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text-dim)", fontSize: 12.5 }}>{osSummary}</span> : undefined} />
 
-      <div style={{ flex: 1, minHeight: 0, overflowY: "auto", overflowX: "hidden", overscrollBehavior: "contain", padding: "14px 24px 32px" }}>
-        <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
-        <HostSurface>
-          <SectionHeading title="계정 정보" count={accounts.length} leading={<ManageAccountsOutlinedIcon sx={{ fontSize: 19, color: "var(--accent)" }} />} />
-          <AccountRegistry accounts={accounts} bookmarkedRowids={bmRowids} onSelect={setSelectedAccount} />
-        </HostSurface>
+      <div style={{ flex: 1, minHeight: 0, display: "grid", gridTemplateColumns: "minmax(210px, 25%) minmax(0, 1fr)", overflow: "hidden" }}>
+        <nav aria-label="호스트 정보 범주" style={{ minHeight: 0, overflow: "auto", padding: 10, borderRight: "1px solid var(--border)" }}>
+          <div style={{ padding: "4px 8px 8px", color: "var(--text-faint)", fontSize: 11.5, fontWeight: 700 }}>호스트 범주</div>
+          {sections.map(({ key, label, icon: Icon }) => {
+            const active = section === key;
+            return (
+              <button key={key} type="button" onClick={() => setSection(key)} className={active ? "nm-btn" : undefined} style={{ width: "100%", minHeight: 36, marginBottom: 2, padding: "0 10px", display: "flex", alignItems: "center", justifyContent: "flex-start", gap: 8, border: active ? "1px solid color-mix(in srgb, var(--accent) 45%, var(--border))" : "1px solid transparent", borderRadius: "var(--radius-md)", background: active ? "var(--accent-subtle)" : "transparent", color: active ? "var(--text)" : "var(--text-dim)", cursor: "pointer", textAlign: "left" }}>
+                <Icon sx={{ fontSize: 16, flexShrink: 0, color: active ? "var(--accent)" : "inherit" }} />
+                <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 12.5, fontWeight: active ? 700 : 550 }}>{label}</span>
+              </button>
+            );
+          })}
+        </nav>
 
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(390px, 1fr))", gap: 14, alignItems: "start" }}>
-          <HostSurface>
-            <SectionHeading title="시스템" leading={<DesktopWindowsOutlinedIcon sx={{ fontSize: 19, color: "var(--accent)" }} />} />
-            <div style={{ padding: "0 16px 14px", display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(225px, 1fr))", columnGap: 20 }}>
-              {orderedSystem.length === 0 && <div style={{ color: "var(--text-faint)", fontSize: 13, paddingTop: 12 }}>시스템 정보가 없습니다.</div>}
-              {orderedSystem.map((k) => <KeyVal key={k} label={SYSTEM_LABELS[k] ?? k}>{system.get(k)?.value}</KeyVal>)}
-            </div>
-          </HostSurface>
+        <section style={{ minWidth: 0, minHeight: 0, overflow: "auto", overscrollBehavior: "contain", padding: 14 }}>
+          {section === "accounts" && <AccountRegistry accounts={accounts} bookmarkedRowids={bmRowids} onSelect={setSelectedAccount} />}
 
-          <HostSurface>
-            <SectionHeading title="네트워크 어댑터" count={interfaces.length} leading={<LanOutlinedIcon sx={{ fontSize: 19, color: "var(--accent)" }} />} />
-            <div style={{ margin: "0 16px 14px", display: "flex", flexDirection: "column", borderTop: "1px solid var(--border)" }}>
-              {interfaces.length === 0 && <div style={{ color: "var(--text-faint)", fontSize: 13, paddingTop: 12 }}>IP 구성 정보가 없습니다.</div>}
-              {interfaces.map((n) => (
+          {section === "system" && (
+            orderedSystem.length === 0 ? (
+              <div style={{ color: "var(--text-faint)", fontSize: 13 }}>시스템 정보가 없습니다.</div>
+            ) : (
+              <div style={{ display: "grid", gridTemplateColumns: "1fr", gap: 8, alignContent: "start" }}>
+                {orderedSystem.map((k) => {
+                  const value = system.get(k)?.value || "";
+                  // 시각·빌드류 값은 모노스페이스로.
+                  const mono = /Time|Date|Build/i.test(k) || /^\d{4}-\d{2}-\d{2}/.test(value);
+                  const copied = copiedKey === k;
+                  return (
+                    <button
+                      key={k}
+                      type="button"
+                      title="클릭하면 값을 복사합니다"
+                      aria-label={`${SYSTEM_LABELS[k] ?? k} 값 복사`}
+                      onClick={() => {
+                        if (!value) return;
+                        navigator.clipboard?.writeText(value).then(() => {
+                          setCopiedKey(k);
+                          setTimeout(() => setCopiedKey((current) => (current === k ? null : current)), 1200);
+                        });
+                      }}
+                      style={{ border: `1px solid ${copied ? "color-mix(in srgb, var(--success) 55%, var(--border))" : "var(--border)"}`, borderRadius: "var(--radius-md)", background: "var(--bg-panel)", padding: "10px 14px", display: "flex", alignItems: "center", gap: 12, color: "inherit", cursor: value ? "pointer" : "default", textAlign: "left", fontFamily: "inherit", transition: "background .15s ease, border-color .15s ease" }}
+                      onMouseEnter={(e) => { e.currentTarget.style.background = "var(--bg-hover)"; }}
+                      onMouseLeave={(e) => { e.currentTarget.style.background = "var(--bg-panel)"; }}
+                    >
+                      <span style={{ width: 150, flexShrink: 0, color: "var(--text-faint)", fontSize: 11.5, fontWeight: 700, letterSpacing: 0.3 }}>{SYSTEM_LABELS[k] ?? k}</span>
+                      <span style={{ flex: 1, minWidth: 0, color: value ? "var(--text)" : "var(--text-faint)", fontSize: 14, fontWeight: 650, fontFamily: mono ? "var(--mono)" : undefined, wordBreak: "break-all" }}>{value || "정보 없음"}</span>
+                      {copied && <span style={{ flexShrink: 0, color: "var(--success)", fontSize: 11.5, fontWeight: 700 }}>복사됨</span>}
+                    </button>
+                  );
+                })}
+              </div>
+            )
+          )}
+
+          {section === "interfaces" && (
+            interfaces.length === 0 ? <div style={{ color: "var(--text-faint)", fontSize: 13 }}>IP 구성 정보가 없습니다.</div> : interfaces.map((n) => {
+              const active = selectedInterface?.guid === n.guid && selectedInterface?.ip === n.ip;
+              const detailLine = [n.gateway && `게이트웨이 ${n.gateway}`, n.dns && `DNS ${n.dns}`, n.domain && `도메인 ${n.domain}`].filter(Boolean).join(" · ");
+              return (
                 <button
                   type="button"
                   key={`${n.ip}|${n.guid}`}
                   onClick={() => { setSelectedNetwork(null); setSelectedInterface(n); }}
-                  style={{ borderRadius: "var(--radius-sm)", display: "flex", alignItems: "center", minHeight: 40, padding: "0 12px", background: selectedInterface?.guid === n.guid && selectedInterface?.ip === n.ip ? "var(--bg-selected)" : "transparent", border: "none", borderBottom: "1px solid var(--border-subtle)", color: "var(--text)", cursor: "pointer", fontFamily: "inherit", textAlign: "left" }}
-                  onMouseEnter={(e) => (e.currentTarget.style.background = "var(--bg-hover)")}
-                  onMouseLeave={(e) => (e.currentTarget.style.background = selectedInterface?.guid === n.guid && selectedInterface?.ip === n.ip ? "var(--bg-selected)" : "transparent")}
+                  aria-label={`${n.ip} 어댑터 상세 보기`}
+                  style={{ borderRadius: "var(--radius-md)", width: "100%", display: "flex", alignItems: "center", gap: 12, minHeight: 58, marginBottom: 8, padding: "9px 14px", border: `1px solid ${active ? "var(--accent)" : "var(--border)"}`, background: active ? "var(--bg-selected)" : "var(--bg-panel)", color: "var(--text)", cursor: "pointer", textAlign: "left", fontFamily: "inherit", transition: "background .15s ease, border-color .15s ease" }}
+                  onMouseEnter={(e) => { if (!active) e.currentTarget.style.background = "var(--bg-hover)"; }}
+                  onMouseLeave={(e) => { e.currentTarget.style.background = active ? "var(--bg-selected)" : "var(--bg-panel)"; }}
                 >
-                  <span style={{ fontFamily: "var(--mono)", fontSize: 14, fontWeight: 750 }}>{n.ip}</span>
-                  <ChevronRightOutlinedIcon sx={{ marginLeft: "auto", fontSize: 18, color: "var(--text-faint)" }} />
+                  <span aria-hidden="true" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 34, height: 34, flexShrink: 0, borderRadius: "var(--radius-sm)", background: "var(--accent-subtle)" }}>
+                    <LanOutlinedIcon sx={{ fontSize: 17, color: "var(--accent)" }} />
+                  </span>
+                  <span style={{ flex: 1, minWidth: 0, display: "grid", gap: 3 }}>
+                    <span style={{ fontFamily: "var(--mono)", fontSize: 13.5, fontWeight: 700 }}>{n.ip}</span>
+                    {detailLine && <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text-dim)", fontSize: 12 }}>{detailLine}</span>}
+                  </span>
+                  <ChevronRightOutlinedIcon sx={{ fontSize: 18, color: "var(--text-faint)", flexShrink: 0 }} />
                 </button>
-              ))}
-            </div>
-          </HostSurface>
-        </div>
+              );
+            })
+          )}
 
-        <HostSurface>
-          <SectionHeading title="연결한 네트워크" count={networks.length} leading={<LanOutlinedIcon sx={{ fontSize: 19, color: "var(--accent)" }} />} />
-          {networks.length === 0 && <div style={{ color: "var(--text-faint)", fontSize: 13, padding: "12px 16px" }}>연결 기록이 없습니다.</div>}
-          <div style={{ padding: "0 16px 14px", display: "flex", flexDirection: "column" }}>
-            {networks.map((n) => (
-              <button
-                type="button"
-                key={`${n.name}|${n.timestamp}`}
-                title={`${n.name} 상세 보기`}
-                aria-label={`${n.name} 네트워크 프로필 상세 보기`}
-                onClick={() => { setSelectedInterface(null); setSelectedNetwork(n); }}
-                style={{ borderRadius: "var(--radius-sm)", display: "grid", gridTemplateColumns: "minmax(0, 1fr) auto 24px", width: "100%", gap: 16, alignItems: "center", minHeight: 40, padding: "0 2px", background: selectedNetwork?.name === n.name && selectedNetwork?.timestamp === n.timestamp ? "var(--bg-selected)" : "transparent", border: "none", borderBottom: "1px solid var(--border-subtle)", color: "inherit", cursor: "pointer", fontFamily: "inherit", textAlign: "left" }}
-                onMouseEnter={(e) => (e.currentTarget.style.background = "var(--bg-hover)")}
-                onMouseLeave={(e) => (e.currentTarget.style.background = selectedNetwork?.name === n.name && selectedNetwork?.timestamp === n.timestamp ? "var(--bg-selected)" : "transparent")}
-              >
-                <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text)", fontSize: 13 }}>{n.name}</span>
-                <span style={{ color: "var(--text-time)", fontSize: 12, whiteSpace: "nowrap", fontFamily: "var(--mono)" }}>{n.timestamp || "—"}</span>
-                <ChevronRightOutlinedIcon sx={{ fontSize: 18, color: "var(--text-faint)" }} />
-              </button>
-            ))}
-          </div>
-        </HostSurface>
-        </div>
+          {section === "networks" && (
+            networks.length === 0 ? <div style={{ color: "var(--text-faint)", fontSize: 13 }}>연결 기록이 없습니다.</div> : networks.map((n) => {
+              const active = selectedNetwork?.name === n.name && selectedNetwork?.timestamp === n.timestamp;
+              return (
+                <button
+                  type="button"
+                  key={`${n.name}|${n.timestamp}`}
+                  title={`${n.name} 상세 보기`}
+                  aria-label={`${n.name} 네트워크 프로필 상세 보기`}
+                  onClick={() => { setSelectedInterface(null); setSelectedNetwork(n); }}
+                  style={{ borderRadius: "var(--radius-md)", width: "100%", display: "flex", alignItems: "center", gap: 12, minHeight: 52, marginBottom: 8, padding: "8px 14px", border: `1px solid ${active ? "var(--accent)" : "var(--border)"}`, background: active ? "var(--bg-selected)" : "var(--bg-panel)", color: "var(--text)", cursor: "pointer", textAlign: "left", fontFamily: "inherit", transition: "background .15s ease, border-color .15s ease" }}
+                  onMouseEnter={(e) => { if (!active) e.currentTarget.style.background = "var(--bg-hover)"; }}
+                  onMouseLeave={(e) => { e.currentTarget.style.background = active ? "var(--bg-selected)" : "var(--bg-panel)"; }}
+                >
+                  <span aria-hidden="true" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 34, height: 34, flexShrink: 0, borderRadius: "var(--radius-sm)", background: "color-mix(in srgb, var(--text-dim) 14%, transparent)" }}>
+                    <WifiOutlinedIcon sx={{ fontSize: 17, color: "var(--text-dim)" }} />
+                  </span>
+                  <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 13, fontWeight: 600 }}>{n.name}</span>
+                  <span style={{ flexShrink: 0, color: n.timestamp ? "var(--text-time)" : "var(--text-faint)", fontSize: 12, whiteSpace: "nowrap", fontFamily: "var(--mono)" }}>{n.timestamp || "시간 정보 없음"}</span>
+                  <ChevronRightOutlinedIcon sx={{ fontSize: 18, color: "var(--text-faint)", flexShrink: 0 }} />
+                </button>
+              );
+            })
+          )}
+        </section>
       </div>
       {selectedInterface && (
         <RowDetailPanel
@@ -381,20 +426,20 @@ export default function TargetInfoView({ data, loadAccountEvents, timeRange, onN
 }
 
 function AccountRegistry({ accounts, bookmarkedRowids, onSelect }: { accounts: Account[]; bookmarkedRowids: Set<number>; onSelect: (account: Account) => void }) {
-  const accountGrid: React.CSSProperties = { display: "grid", minWidth: 820, gridTemplateColumns: "minmax(150px, 1.1fr) 92px minmax(190px, 2fr) minmax(166px, 1fr) minmax(210px, 1.55fr) 24px", gap: 10 };
   return (
-    <div style={{ padding: "0 16px 14px", overflowX: "auto", overscrollBehaviorX: "contain" }}>
-      {accounts.length === 0 ? <div style={{ color: "var(--text-faint)", fontSize: 13, paddingTop: 12 }}>계정이 없습니다.</div> : <>
-        <div style={{ ...accountGrid, minHeight: 32, paddingLeft: 12, alignItems: "center", borderBottom: "1px solid var(--border-subtle)", color: "var(--text-dim)", fontSize: 11.5, fontWeight: 650 }}>
-          <span>계정</span><span>유형</span><span>프로필 경로</span><span>생성 시간</span><span>SID</span><span />
-        </div>
-        {accounts.map((a) => <AccountRow key={a.rowid} account={a} bookmarked={bookmarkedRowids.has(a.rowid)} onSelect={() => onSelect(a)} gridStyle={accountGrid} />)}
-      </>}
+    <div>
+      {accounts.length === 0 ? (
+        <div style={{ color: "var(--text-faint)", fontSize: 13 }}>계정이 없습니다.</div>
+      ) : (
+        accounts.map((a) => <AccountRow key={a.rowid} account={a} bookmarked={bookmarkedRowids.has(a.rowid)} onSelect={() => onSelect(a)} />)
+      )}
     </div>
   );
 }
 
-function AccountRow({ account, bookmarked, onSelect, gridStyle }: { account: Account; bookmarked?: boolean; onSelect: () => void; gridStyle: React.CSSProperties }) {
+function AccountRow({ account, bookmarked, onSelect }: { account: Account; bookmarked?: boolean; onSelect: () => void }) {
+  // 타일 색: 사용자 계정=블루, 시스템 계정=중립, 숨김(특수) 계정=옐로 경고.
+  const tileColor = account.specialAccount.startsWith("예") ? "var(--warning)" : account.isUser ? "var(--accent)" : "var(--text-dim)";
   return (
     <button
       type="button"
@@ -402,27 +447,25 @@ function AccountRow({ account, bookmarked, onSelect, gridStyle }: { account: Acc
       title="자세히 보기"
       aria-label={`${account.username || "이름 없는 계정"} 계정 상세 보기${bookmarked ? ", 북마크됨" : ""}`}
       className={bookmarked ? "dfir-bookmarked-row" : undefined}
-      style={{ borderRadius: "var(--radius-sm)", ...gridStyle, width: "100%", alignItems: "center", textAlign: "left", minHeight: 52, padding: "7px 0 7px 12px", background: "transparent", border: "none", borderBottom: "1px solid var(--border-subtle)", color: "inherit", cursor: "pointer", fontFamily: "inherit" }}
+      style={{ borderRadius: "var(--radius-md)", width: "100%", display: "flex", alignItems: "center", gap: 12, minHeight: 62, marginBottom: 8, padding: "10px 14px", border: "1px solid var(--border)", background: "var(--bg-panel)", color: "inherit", cursor: "pointer", textAlign: "left", fontFamily: "inherit", transition: "background .15s ease, border-color .15s ease" }}
       onMouseEnter={(e) => { if (!bookmarked) e.currentTarget.style.background = "var(--bg-hover)"; }}
-      onMouseLeave={(e) => { if (!bookmarked) e.currentTarget.style.background = "transparent"; }}
+      onMouseLeave={(e) => { if (!bookmarked) e.currentTarget.style.background = "var(--bg-panel)"; }}
     >
-      <div style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0 }}>
-        <span title={account.username} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 14, fontWeight: 700, color: "var(--text)" }}>{account.username || "(이름 없음)"}</span>
-        {account.disabled === "예" && (
-          <span style={{ flexShrink: 0, display: "inline-flex", alignItems: "center", minHeight: 20, lineHeight: 1, whiteSpace: "nowrap", fontSize: 10, color: "var(--text-faint)", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", padding: "2px 6px" }}>비활성</span>
-        )}
-        {account.specialAccount.startsWith("예") && (
-          <span title={account.specialAccount} style={{ flexShrink: 0, display: "inline-flex", alignItems: "center", minHeight: 20, lineHeight: 1, whiteSpace: "nowrap", fontSize: 10, color: "var(--warning)", border: "1px solid var(--warning)", borderRadius: "var(--radius-sm)", padding: "2px 6px" }}>숨김</span>
-        )}
-      </div>
-      <span style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", gap: 4, width: "fit-content", minHeight: 23, padding: "1px 6px", borderRadius: "var(--radius-sm)", background: account.isUser ? "var(--accent-subtle)" : "var(--tag-neutral-bg)", border: `1px solid ${account.isUser ? "var(--accent)" : "var(--border)"}`, color: account.isUser ? "var(--accent)" : "var(--tag-neutral-fg)", fontSize: 10.5, fontWeight: 700 }}>
-        {account.isUser ? <PersonOutlineIcon sx={{ fontSize: 14 }} /> : <SettingsOutlinedIcon sx={{ fontSize: 14 }} />}
-        {account.isUser ? "사용자" : "시스템"}
+      <span aria-hidden="true" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 34, height: 34, flexShrink: 0, borderRadius: "var(--radius-sm)", background: `color-mix(in srgb, ${tileColor} 15%, transparent)` }}>
+        {account.isUser ? <PersonOutlineIcon sx={{ fontSize: 17, color: tileColor }} /> : <SettingsOutlinedIcon sx={{ fontSize: 17, color: tileColor }} />}
       </span>
-      <span title={account.path || undefined} style={{ minWidth: 0, color: "var(--text)", fontSize: 12.5, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{account.path || "—"}</span>
-      <span style={{ minWidth: 0, color: "var(--text-dim)", fontSize: 11.5, fontFamily: "var(--mono)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{account.created || "—"}</span>
-      <span title={account.sid} style={{ minWidth: 0, color: "var(--text-dim)", fontSize: 12, fontFamily: "var(--mono)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{account.sid}</span>
-      <ChevronRightOutlinedIcon sx={{ fontSize: 17, color: "var(--text-faint)" }} />
+      <span style={{ flex: 1, minWidth: 0, display: "grid", gap: 3 }}>
+        <span style={{ display: "flex", alignItems: "center", gap: 7, minWidth: 0 }}>
+          <span title={account.username} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 13.5, fontWeight: 700, color: "var(--text)" }}>{account.username || "(이름 없음)"}</span>
+          <span style={{ flexShrink: 0, fontSize: 11.5, fontWeight: 700, color: account.isUser ? "var(--accent)" : "var(--text-dim)", border: `1px solid ${account.isUser ? "var(--accent)" : "var(--border)"}`, borderRadius: "var(--radius-sm)", padding: "1px 8px", whiteSpace: "nowrap" }}>{account.isUser ? "사용자" : "시스템"}</span>
+          {account.disabled === "예" && <span style={{ flexShrink: 0, fontSize: 11.5, fontWeight: 700, color: "var(--text-faint)", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", padding: "1px 8px", whiteSpace: "nowrap" }}>비활성</span>}
+          {account.specialAccount.startsWith("예") && <span title={account.specialAccount} style={{ flexShrink: 0, fontSize: 11.5, fontWeight: 700, color: "var(--warning)", border: "1px solid var(--warning)", borderRadius: "var(--radius-sm)", padding: "1px 8px", whiteSpace: "nowrap" }}>숨김</span>}
+        </span>
+        <span title={account.path || undefined} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: account.path ? "var(--text-dim)" : "var(--text-faint)", fontSize: 12, fontFamily: "var(--mono)" }}>{account.path || "프로필 경로 없음"}</span>
+      </span>
+      <span title={account.sid} style={{ width: 330, flexShrink: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text-dim)", fontSize: 12, fontFamily: "var(--mono)" }}>{account.sid}</span>
+      <span style={{ width: 172, flexShrink: 0, textAlign: "right", color: account.created ? "var(--text-time)" : "var(--text-faint)", fontSize: 12, fontFamily: "var(--mono)", whiteSpace: "nowrap" }}>{account.created || "생성 시간 없음"}</span>
+      <ChevronRightOutlinedIcon sx={{ fontSize: 18, color: "var(--text-faint)", flexShrink: 0 }} />
     </button>
   );
 }
@@ -651,13 +694,21 @@ function AccountDetailPage({ account, onBack, loadEvents, timeRange, onNavigate,
 
   return (
     <div className="dfir-view" style={{ flex: 1, minWidth: 0, minHeight: 0, display: "flex", flexDirection: "column", overflow: "hidden" }}>
-      <header style={{ flexShrink: 0, minHeight: 56, display: "flex", alignItems: "center", gap: 10, padding: "0 24px", background: "var(--bg)", borderBottom: "1px solid var(--border)", zIndex: 2 }}>
-        <button onClick={onBack} title="호스트 정보로 돌아가기" aria-label="호스트 정보로 돌아가기" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 28, height: 28, background: "transparent", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", color: "var(--accent)", cursor: "pointer", padding: 0 }}>
+      <header style={{ flexShrink: 0, display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", padding: "12px 16px 10px", minHeight: 24, background: "var(--bg-panel)", borderBottom: "1px solid var(--border)", zIndex: 2 }}>
+        <button className="nm-btn" onClick={onBack} title="호스트 정보로 돌아가기" aria-label="호스트 정보로 돌아가기" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 31, height: 31, background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", color: "var(--accent)", cursor: "pointer", padding: 0, marginRight: 2 }}>
           <ArrowBackOutlinedIcon sx={{ fontSize: 17 }} />
         </button>
-        <h1 style={{ margin: 0, color: "var(--text)", fontSize: 20, lineHeight: 1.2, fontWeight: 760, letterSpacing: "-0.02em" }}>계정 상세 <span style={{ color: "var(--text-faint)", padding: "0 3px" }}>|</span> {account.username || "(이름 없음)"}</h1>
-        {account.fullName && account.fullName !== account.username && <span style={{ color: "var(--text-dim)", fontSize: 13 }}>{account.fullName}</span>}
-        {account.disabled === "예" && <span style={{ marginLeft: "auto", flexShrink: 0, display: "inline-flex", alignItems: "center", minHeight: 22, padding: "1px 7px", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", color: "var(--text-dim)", fontSize: 11, whiteSpace: "nowrap" }}>비활성</span>}
+        <ManageAccountsOutlinedIcon sx={{ fontSize: 18, color: "var(--accent)" }} aria-hidden="true" />
+        <strong style={{ fontSize: 15, color: "var(--text)", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>계정 상세 <span aria-hidden="true" style={{ color: "var(--text-faint)", padding: "0 2px" }}>|</span> {account.username || "(이름 없음)"}</strong>
+        {account.fullName && account.fullName !== account.username && <span style={{ color: "var(--text-faint)", fontSize: 12 }}>{account.fullName}</span>}
+        <span style={{ marginLeft: "auto", display: "inline-flex", alignItems: "center", gap: 6 }}>
+          {account.disabled === "예"
+            ? <span style={{ flexShrink: 0, fontSize: 11.5, fontWeight: 700, padding: "1px 8px", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", color: "var(--text-faint)", whiteSpace: "nowrap" }}>비활성</span>
+            : account.disabled === "아니오"
+              ? <span style={{ flexShrink: 0, fontSize: 11.5, fontWeight: 700, padding: "1px 8px", border: "1px solid var(--success)", borderRadius: "var(--radius-sm)", color: "var(--success)", whiteSpace: "nowrap" }}>활성</span>
+              : null}
+          {account.specialAccount.startsWith("예") && <span title={account.specialAccount} style={{ flexShrink: 0, fontSize: 11.5, fontWeight: 700, padding: "1px 8px", border: "1px solid var(--warning)", borderRadius: "var(--radius-sm)", color: "var(--warning)", whiteSpace: "nowrap" }}>숨김 계정</span>}
+        </span>
       </header>
       <div className="target-info-account-detail-scroll" style={{ flex: 1, minHeight: 0, overflowY: "auto", overflowX: "hidden", overscrollBehavior: "contain", padding: "14px 24px 32px" }}>
       {hijack && (
@@ -704,7 +755,8 @@ function AccountDetailPage({ account, onBack, loadEvents, timeRange, onNavigate,
           {loadEvents && visibleEvents && evCount > 0 && <div style={{ overflowX: "auto", pointerEvents: refreshing ? "none" : "auto", opacity: refreshing ? 0.65 : 1 }}><div style={{ minWidth: 660 }}>
           {pagedEvents.map((r, i) => {
             const eid = r.EventID || "";
-            const label = EVENT_LABELS[eid] || `Event ${eid}`;
+            const catalogNote = lookupEventCatalog(r.Provider, eid)?.label || (EVENT_LABELS[eid] && EVENT_LABELS[eid] !== `Event ${eid}` ? EVENT_LABELS[eid] : "");
+            const summary = eventSummary(r);
             const bookmarked = isEventBookmarked(r);
             return (
               <button
@@ -714,13 +766,20 @@ function AccountDetailPage({ account, onBack, loadEvents, timeRange, onNavigate,
                 onClick={() => setSelectedEvent(r)}
                 onMouseEnter={(e) => { if (!bookmarked) e.currentTarget.style.background = "var(--bg-hover)"; }}
                 onMouseLeave={(e) => { if (!bookmarked) e.currentTarget.style.background = "transparent"; }}
-                style={{ borderRadius: "var(--radius-sm)", display: "grid", gridTemplateColumns: "minmax(174px, 1.15fr) minmax(150px, 1fr) 70px minmax(160px, 1fr) 22px", width: "100%", alignItems: "center", columnGap: 10, minHeight: 42, padding: "6px 2px", background: "transparent", border: "none", borderBottom: i < pagedEvents.length - 1 ? "1px solid var(--border-subtle)" : "none", color: "inherit", cursor: "pointer", fontFamily: "inherit", textAlign: "left" }}
+                style={{ borderRadius: "var(--radius-sm)", display: "flex", alignItems: "center", gap: 10, width: "100%", minHeight: 50, padding: "7px 4px", background: "transparent", border: "none", borderBottom: i < pagedEvents.length - 1 ? "1px solid var(--border-subtle)" : "none", color: "inherit", cursor: "pointer", fontFamily: "inherit", textAlign: "left", transition: "background .15s ease" }}
               >
-                <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 13.5, fontWeight: 650, color: "var(--text-time)", fontFamily: "var(--mono)" }}>{r.timestamp || "시간 정보 없음"}</span>
-                <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 13, fontWeight: 700, color: "var(--text)" }}>{label}</span>
-                <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 11.5, color: "var(--text-faint)", fontFamily: "var(--mono)" }}>{eid || "—"}</span>
-                <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 12, color: "var(--text-dim)" }}>{r.Provider || r._log || "—"}</span>
-                <ChevronRightOutlinedIcon sx={{ fontSize: 17, color: "var(--text-faint)" }} />
+                <span aria-hidden="true" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 30, height: 30, flexShrink: 0, borderRadius: "var(--radius-sm)", background: "rgba(174, 189, 255, 0.14)" }}>
+                  <EventNoteOutlinedIcon sx={{ fontSize: 16, color: "#aebdff" }} />
+                </span>
+                <span style={{ flex: 1, minWidth: 0, display: "grid", gap: 2 }}>
+                  <span style={{ display: "flex", alignItems: "center", gap: 7, minWidth: 0 }}>
+                    <span style={{ flexShrink: 0, fontSize: 13, fontWeight: 700, color: "var(--text)" }}>Event {eid || "—"}</span>
+                    {catalogNote && <span title={catalogNote} style={{ flexShrink: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "#5bc8c0", border: "1px solid #5bc8c0", borderRadius: "var(--radius-sm)", padding: "1px 7px", fontSize: 11, fontWeight: 650 }}>{catalogNote}</span>}
+                  </span>
+                  <span title={summary || undefined} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 11.5, color: "var(--text-faint)" }}>{[r.Provider || r._log, summary].filter(Boolean).join(" · ") || "—"}</span>
+                </span>
+                <span style={{ flexShrink: 0, width: 172, textAlign: "right", fontSize: 12.5, fontWeight: 600, color: r.timestamp ? "var(--text-time)" : "var(--text-faint)", fontFamily: "var(--mono)", whiteSpace: "nowrap" }}>{r.timestamp || "시간 정보 없음"}</span>
+                <ChevronRightOutlinedIcon sx={{ fontSize: 17, color: "var(--text-faint)", flexShrink: 0 }} />
               </button>
             );
           })}

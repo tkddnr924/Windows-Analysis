@@ -3,6 +3,9 @@
 import { useEffect, useState } from "react";
 import CheckIcon from "@mui/icons-material/Check";
 import ChevronRightOutlinedIcon from "@mui/icons-material/ChevronRightOutlined";
+import DescriptionOutlinedIcon from "@mui/icons-material/DescriptionOutlined";
+import FolderOpenOutlinedIcon from "@mui/icons-material/FolderOpenOutlined";
+import LinkOutlinedIcon from "@mui/icons-material/LinkOutlined";
 import ContentCopyOutlinedIcon from "@mui/icons-material/ContentCopyOutlined";
 import { resolveArtifactView, getArtifactView } from "@/lib/artifactViews";
 import type { FetchLinkedRows } from "@/lib/types";
@@ -281,30 +284,33 @@ export default function RowDetailPanel({ row, columns, focusedColumn, fileBaseNa
               }}
             >
               <button
-                className="nm-btn"
+                className={!showRaw ? "nm-btn" : undefined}
                 onClick={() => setShowRaw(false)}
                 aria-pressed={!showRaw}
                 style={{
                   fontSize: 11.5,
-                  padding: "4px 10px",
-                  background: !showRaw ? "var(--accent-subtle)" : "var(--bg-elevated)",
+                  minHeight: 26,
+                  padding: "3px 11px",
+                  background: !showRaw ? "var(--accent-subtle)" : "transparent",
                   color: !showRaw ? "var(--accent)" : "var(--text-faint)",
                   border: "none",
                   borderRadius: "var(--radius-sm)",
                   cursor: "pointer",
                   fontWeight: !showRaw ? 700 : 550,
+                  whiteSpace: "nowrap",
                 }}
               >
                 주요 정보
               </button>
               <button
-                className="nm-btn"
+                className={showRaw ? "nm-btn" : undefined}
                 onClick={() => setShowRaw(true)}
                 aria-pressed={showRaw}
                 style={{
                   fontSize: 11.5,
-                  padding: "4px 10px",
-                  background: showRaw ? "var(--accent-subtle)" : "var(--bg-elevated)",
+                  minHeight: 26,
+                  padding: "3px 11px",
+                  background: showRaw ? "var(--accent-subtle)" : "transparent",
                   color: showRaw ? "var(--accent)" : "var(--text-faint)",
                   border: "none",
                   borderRadius: "var(--radius-sm)",
@@ -369,15 +375,29 @@ export default function RowDetailPanel({ row, columns, focusedColumn, fileBaseNa
               {relatedEvidence.length > 0 && (
                 <section style={{ padding: "14px 16px 18px", borderBottom: "1px solid var(--border-subtle)" }}>
                   <div className="dfir-section-label" style={{ marginBottom: 7 }}>교차 참조 증거</div>
-                  {relatedEvidence.map((evidence) => (
-                    <button key={evidence.id} type="button" onClick={evidence.onOpen} style={{ width: "100%", display: "grid", gridTemplateColumns: "minmax(0, 1fr) auto", alignItems: "center", gap: 8, padding: "7px 8px", textAlign: "left", background: "transparent", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", color: "var(--text)", cursor: "pointer" }}>
-                      <span style={{ minWidth: 0 }}>
-                        <span style={{ display: "block", fontSize: 12, fontWeight: 650, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{evidence.label}</span>
-                        {evidence.subtitle && <span style={{ display: "block", marginTop: 2, fontSize: 10.5, color: "var(--text-faint)", fontFamily: "var(--mono)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{evidence.subtitle}</span>}
-                      </span>
-                      <ChevronRightOutlinedIcon aria-hidden="true" sx={{ color: "var(--text-faint)", fontSize: 17 }} />
-                    </button>
-                  ))}
+                  {relatedEvidence.map((evidence) => {
+                    // "Jumplist · Administrator" → 아티팩트 배지 + 계정으로 분해해 표시.
+                    const [kind, ...accountParts] = evidence.label.split(" · ");
+                    const account = accountParts.join(" · ");
+                    const RefIcon = /jumplist/i.test(kind) ? DescriptionOutlinedIcon : /shellbag/i.test(kind) ? FolderOpenOutlinedIcon : LinkOutlinedIcon;
+                    return (
+                      <button key={evidence.id} type="button" onClick={evidence.onOpen} style={{ width: "100%", display: "flex", alignItems: "center", gap: 10, minHeight: 50, marginBottom: 6, padding: "8px 10px", textAlign: "left", background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", color: "var(--text)", cursor: "pointer", transition: "background .15s ease" }}
+                        onMouseEnter={(event) => { event.currentTarget.style.background = "var(--bg-hover)"; }}
+                        onMouseLeave={(event) => { event.currentTarget.style.background = "var(--bg-elevated)"; }}>
+                        <span aria-hidden="true" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 30, height: 30, flexShrink: 0, borderRadius: "var(--radius-sm)", background: "var(--accent-subtle)" }}>
+                          <RefIcon sx={{ fontSize: 16, color: "var(--accent)" }} />
+                        </span>
+                        <span style={{ flex: 1, minWidth: 0, display: "grid", gap: 3 }}>
+                          <span style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0 }}>
+                            <span style={{ flexShrink: 0, fontSize: 11, fontWeight: 700, color: "var(--accent)", border: "1px solid var(--accent)", borderRadius: "var(--radius-sm)", padding: "0 7px", whiteSpace: "nowrap" }}>{kind}</span>
+                            {account && <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 12.5, fontWeight: 650 }}>{account}</span>}
+                          </span>
+                          {evidence.subtitle && <span style={{ minWidth: 0, fontSize: 11.5, color: "var(--text-faint)", fontFamily: "var(--mono)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{evidence.subtitle}</span>}
+                        </span>
+                        <ChevronRightOutlinedIcon aria-hidden="true" sx={{ color: "var(--text-faint)", fontSize: 17, flexShrink: 0 }} />
+                      </button>
+                    );
+                  })}
                 </section>
               )}
             </>

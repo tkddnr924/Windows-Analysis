@@ -1,10 +1,12 @@
 "use client";
+import CategoryOutlinedIcon from "@mui/icons-material/CategoryOutlined";
 
 import { useMemo, useState } from "react";
 import type { CsvData } from "@/lib/types";
 import { EMPTY_TIME_RANGE, inRange, rangeActive, type TimeRange } from "@/lib/timeRange";
 import RowDetailPanel from "./RowDetailPanel";
 import PaginationControls from "@/components/PaginationControls";
+import { HeaderSearchInput, SelectDropdown, SortDropdown, ViewHeader } from "@/components/FilterControls";
 import ReportProblemOutlinedIcon from "@mui/icons-material/ReportProblemOutlined";
 import SearchIcon from "@mui/icons-material/Search";
 import SortOutlinedIcon from "@mui/icons-material/SortOutlined";
@@ -49,6 +51,26 @@ function safeParse(s: string): Record<string, unknown> {
 function basename(p: string): string {
   return p ? p.replace(/\//g, "\\").split("\\").filter(Boolean).pop() || p : "";
 }
+// AppName/AppPath 키가 없는 보고서(업데이트 실패·진단·스토어 앱 등)는
+// Sig 배열의 "Application Name" 항목이나 TargetAppId 끝 조각에서 이름을 찾는다.
+function sigAppName(report: Record<string, unknown>): string {
+  if (!Array.isArray(report.Sig)) return "";
+  let fallback = "";
+  for (const item of report.Sig) {
+    if (!item || typeof item !== "object") continue;
+    const o = item as Record<string, unknown>;
+    const name = str(o.Name);
+    const value = str(o.Value);
+    if (!value) continue;
+    if (/application\s*name|응용\s*프로그램\s*이름/i.test(name)) return basename(value);
+    if (!fallback && /\.(exe|dll|sys)$/i.test(value)) fallback = basename(value);
+  }
+  return fallback;
+}
+function targetAppIdName(targetAppId: string): string {
+  const tail = targetAppId.split("!").filter(Boolean).pop() || "";
+  return /[\\/.]/.test(tail) ? basename(tail) : "";
+}
 function str(v: unknown): string {
   return v === undefined || v === null ? "" : String(v);
 }
@@ -76,7 +98,13 @@ export default function WerView({ data, bookmarkedRowids, onToggleBookmark, time
           row,
           rowid: Number((row as unknown as Record<string, unknown>).__rowid),
           report,
-          appName: row.AppName || str(report.AppName) || basename(appPath),
+          appName:
+            row.AppName ||
+            str(report.AppName) ||
+            basename(appPath) ||
+            sigAppName(report) ||
+            targetAppIdName(str(report.TargetAppId) || row.TargetAppId || "") ||
+            str(report.OriginalFilename),
           appPath,
           eventType: row.EventType || str(report.EventType),
           friendly: str(report.FriendlyEventName),
@@ -121,86 +149,56 @@ export default function WerView({ data, bookmarkedRowids, onToggleBookmark, time
   const pageRows = shown.slice(safePage * PAGE, (safePage + 1) * PAGE);
 
   return (
-    <div className="dfir-view" style={{ flex: 1, minHeight: 0, overflow: "auto", padding: "28px 32px" }}>
-      <div style={{ display: "flex", alignItems: "baseline", gap: 12, marginBottom: 2 }}>
-        <span style={{ display: "inline-flex", alignItems: "center", gap: 9, fontSize: 22, fontWeight: 700, color: "var(--text)" }}><ReportProblemOutlinedIcon sx={{ fontSize: 24, color: "var(--text-dim)" }} /> Windows 오류 보고 (WER)</span>
-        <span style={{ fontSize: 12.5, color: "var(--text-faint)" }}>{ranged.length.toLocaleString()}건</span>
-      </div>
-      <div style={{ display: "flex", alignItems: "center", gap: 8, margin: "12px 0" }}>
-      <div style={{ position: "relative", flex: "0 1 420px" }}>
-        <SearchIcon sx={{ position: "absolute", left: 9, top: "50%", transform: "translateY(-50%)", fontSize: 16, color: "var(--text-faint)", pointerEvents: "none" }} />
-        <input
-          value={search}
-          onChange={(e) => {
-            setSearch(e.target.value);
-            setPage(0);
-          }}
-          placeholder="앱 이름 · 경로 · 이벤트 유형 검색"
-          style={{ width: "100%", padding: "7px 26px 7px 30px", fontSize: 12.5, fontFamily: "var(--mono)", background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", color: "var(--text)", outline: "none" }}
-        />
-        {search && (
-          <span onClick={() => setSearch("")} style={{ position: "absolute", right: 8, top: "50%", transform: "translateY(-50%)", cursor: "pointer", color: "var(--text-faint)", fontSize: 13 }}>
-            ✕
-          </span>
-        )}
-      </div>
-      <button className="nm-btn" onClick={() => { setSortDir((direction) => (direction === "asc" ? "desc" : "asc")); setPage(0); }} title="정렬 순서 변경" style={{ display: "inline-flex", alignItems: "center", gap: 5, padding: "6px 11px", fontSize: 12, background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", color: "var(--text-dim)", cursor: "pointer", whiteSpace: "nowrap", fontWeight: 600 }}>
-        <SortOutlinedIcon sx={{ fontSize: 16 }} />{sortDir === "asc" ? "오래된 순" : "최근 순"}
-      </button>
-      </div>
+    <div className="dfir-view" style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", background: "var(--bg)", overflow: "hidden" }}>
+      <ViewHeader icon={ReportProblemOutlinedIcon} title="Windows 오류 보고 (WER)" meta={`${ranged.length.toLocaleString()}건`} right={<span style={{ color: "var(--text-faint)", fontSize: 11.5 }}>{rangeOn ? "전역 기간 필터 적용" : "전체 기간"}</span>}>
+          <HeaderSearchInput value={search} onChange={(value) => { setSearch(value); setPage(0); }} placeholder="앱 이름 · 경로 · 이벤트 유형 검색" width={300} />
+          <SortDropdown value={sortDir} onChange={(next) => { setSortDir(next as "asc" | "desc"); setPage(0); }} />
+          {types.length > 1 && (
+            <SelectDropdown
+              icon={<CategoryOutlinedIcon sx={{ fontSize: 15 }} />}
+              label="유형"
+              options={["전체", ...types].map((t) => ({ value: t, label: t, count: t === "전체" ? ranged.length : ranged.filter((p) => p.eventType === t).length }))}
+              value={typeFilter}
+              onChange={(next) => { setTypeFilter(next); setPage(0); }}
+            />
+          )}
+        
+      </ViewHeader>
 
-      {types.length > 1 && (
-        <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 14 }}>
-          {["전체", ...types].map((t) => {
-            const active = typeFilter === t;
-            const count = t === "전체" ? ranged.length : ranged.filter((p) => p.eventType === t).length;
-            return (
-              <button
-                key={t}
-                onClick={() => {
-                  setTypeFilter(t);
-                  setPage(0);
-                }}
-                style={{ fontSize: 12.5, padding: "4px 12px", borderRadius: 999, cursor: "pointer", whiteSpace: "nowrap", background: active ? "var(--accent-subtle)" : "transparent", color: active ? "var(--accent)" : "var(--text-dim)", border: `1px solid ${active ? "var(--accent)" : "var(--border)"}` }}
-              >
-                {t} <span style={{ color: "var(--text-faint)" }}>{count.toLocaleString()}</span>
-              </button>
-            );
-          })}
-        </div>
-      )}
-
-      {parsed.length === 0 && <div style={{ color: "var(--text-faint)", fontSize: 13 }}>WER 보고서가 없습니다.</div>}
-
-      <div style={{ background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "var(--radius-lg)", boxShadow: "var(--shadow-card)", overflow: "hidden" }}>
+      <main style={{ flex: 1, minHeight: 0, overflow: "auto", padding: 14 }}>
+        {parsed.length === 0 && <div style={{ padding: 30, textAlign: "center", color: "var(--text-faint)", fontSize: 13 }}>WER 보고서가 없습니다.</div>}
         {pageRows.map((p, i) => {
           const bm = (bookmarkedRowids?.has(p.rowid) ?? false) && Number.isFinite(p.rowid);
+          const tone = typeTone(p.eventType);
           return (
             <div
               key={i}
               className={bm ? "dfir-bookmarked-row" : undefined}
               onClick={() => setDetail(p)}
               onMouseEnter={(e) => { if (!bm) e.currentTarget.style.background = "var(--bg-hover)"; }}
-              onMouseLeave={(e) => { if (!bm) e.currentTarget.style.background = "transparent"; }}
-              style={{ borderRadius: "var(--radius-sm)", padding: "9px 12px", borderBottom: i < pageRows.length - 1 ? "1px solid var(--border-subtle)" : "none", cursor: "pointer" }}
+              onMouseLeave={(e) => { if (!bm) e.currentTarget.style.background = "var(--bg-panel)"; }}
+              style={{ borderRadius: "var(--radius-md)", display: "flex", alignItems: "center", gap: 12, minHeight: 62, marginBottom: 8, padding: "10px 14px", border: "1px solid var(--border)", background: "var(--bg-panel)", cursor: "pointer", transition: "background .15s ease, border-color .15s ease" }}
               title="클릭하면 WER 상세 보기"
             >
-              <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-                <span style={{ fontSize: 14, fontWeight: 600, color: "var(--text)" }}>{p.appName || "(이름 없음)"}</span>
-                <Pill text={p.eventType || "?"} color={typeTone(p.eventType)} />
-                {p.friendly && <span style={{ fontSize: 12, color: "var(--text-faint)" }}>{p.friendly}</span>}
-              </div>
-              {p.appPath && (
-                <div style={{ fontSize: 12.5, color: "var(--text-dim)", fontFamily: "var(--mono)", marginTop: 3, wordBreak: "break-all" }}>{p.appPath}</div>
-              )}
-              {p.timestamp && <div style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 12, color: "var(--text-time)", fontFamily: "var(--mono)", marginTop: 2 }}><AccessTimeIcon sx={{ fontSize: 13.5 }} /> {p.timestamp}</div>}
+              <span aria-hidden="true" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 34, height: 34, flexShrink: 0, borderRadius: "var(--radius-sm)", background: `color-mix(in srgb, ${tone} 15%, transparent)` }}>
+                <ReportProblemOutlinedIcon sx={{ fontSize: 17, color: tone }} />
+              </span>
+              <span style={{ flex: 1, minWidth: 0, display: "grid", gap: 3 }}>
+                <span style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
+                  <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 13.5, fontWeight: 700, color: "var(--text)" }}>{p.appName || p.friendly || p.eventType || "(이름 없음)"}</span>
+                  <Pill text={p.eventType || "?"} color={tone} />
+                  {p.friendly && <span style={{ flexShrink: 0, fontSize: 12, color: "var(--text-faint)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 260 }}>{p.friendly}</span>}
+                </span>
+                <span title={p.appPath || undefined} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 12, color: p.appPath ? "var(--text-dim)" : "var(--text-faint)", fontFamily: "var(--mono)" }}>{p.appPath || "경로 정보 없음"}</span>
+              </span>
+              <span style={{ flexShrink: 0, width: 172, textAlign: "right", fontSize: 12.5, color: p.timestamp ? "var(--text-time)" : "var(--text-faint)", fontFamily: "var(--mono)", whiteSpace: "nowrap" }}>{p.timestamp || "시간 정보 없음"}</span>
             </div>
           );
         })}
-      </div>
+      </main>
 
       {shown.length > 0 && (
-        <div style={{ marginTop: 12 }}>
+        <div style={{ flexShrink: 0, display: "flex", justifyContent: "center", padding: "6px 0 10px", borderTop: "1px solid var(--border-subtle)" }}>
           <PaginationControls ariaLabel="WER 페이지" page={safePage} pageCount={pageCount} onChange={setPage} summary={`(${(safePage * PAGE + 1).toLocaleString()}–${Math.min((safePage + 1) * PAGE, shown.length).toLocaleString()} / ${shown.length.toLocaleString()})`} />
         </div>
       )}
@@ -273,7 +271,7 @@ function WerDetailModal({ p, onClose, isBookmarked, onToggleBookmark }: { p: Par
       <div onClick={(e) => e.stopPropagation()} style={{ width: 720, maxWidth: "100%", maxHeight: "86vh", overflow: "auto", background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "var(--radius-lg)", boxShadow: "var(--shadow-panel)" }}>
         <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "14px 18px", borderBottom: "1px solid var(--border)", borderLeft: `3px solid ${tone}`, position: "sticky", top: 0, background: "var(--bg-panel)", zIndex: 1 }}>
           <span className="dfir-section-label">증거 상세</span>
-          <span style={{ fontSize: 15, fontWeight: 700, wordBreak: "break-all" }}>{p.appName || "(이름 없음)"}</span>
+          <span style={{ fontSize: 15, fontWeight: 700, wordBreak: "break-all" }}>{p.appName || p.friendly || p.eventType || "(이름 없음)"}</span>
           <Pill text={p.eventType || "?"} color={tone} />
           {onToggleBookmark && (
             <button

@@ -1,4 +1,5 @@
 "use client";
+import SortIcon2 from "@mui/icons-material/SortOutlined";
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import BookmarkBorderIcon from "@mui/icons-material/BookmarkBorder";
@@ -24,6 +25,7 @@ import type { AiConversation, BrowserActivityInsights, BrowserActivitySummary, B
 import { EMPTY_TIME_RANGE, toBound, type TimeRange } from "@/lib/timeRange";
 import RowDetailPanel from "./RowDetailPanel";
 import PaginationControls from "@/components/PaginationControls";
+import { FilterDropdown, HeaderSearchInput, SelectDropdown, ViewHeader } from "@/components/FilterControls";
 
 type Row = Record<string, string>;
 type AiMessage = { role: string; text: string; time?: string };
@@ -151,10 +153,29 @@ function parseAiJson(value: unknown): { title: string; createdAt: string; update
   return { title, createdAt, updatedAt, messages };
 }
 
-function ProviderMark({ provider }: { provider: string }) {
-  // These are neutral MUI category marks, not provider brand assets or logos.
+// 공유 링크의 utm_source 값으로 어떤 AI 서비스에서 온 링크인지 판별한다.
+function referralProvider(url: string | undefined): string {
+  if (!url) return "";
+  const match = /[?&#]utm_source=([^&#]+)/i.exec(url);
+  if (!match) return "";
+  const source = decodeURIComponent(match[1]).toLowerCase();
+  if (source.includes("chatgpt") || source.includes("openai")) return "ChatGPT";
+  if (source.includes("notebook")) return "NotebookLM";
+  if (source.includes("gemini") || source.includes("bard")) return "Gemini";
+  if (source.includes("claude")) return "Claude";
+  if (source.includes("copilot")) return "Copilot";
+  if (source.includes("perplexity")) return "Perplexity";
+  return source;
+}
+
+// These are neutral MUI category marks, not provider brand assets or logos.
+function providerIcon(provider: string) {
   const normalized = provider.toLowerCase();
-  const Icon = normalized === "chatgpt" ? PsychologyOutlinedIcon : normalized === "gemini" ? AutoAwesomeOutlinedIcon : normalized === "claude" ? TextsmsOutlinedIcon : SmartToyOutlinedIcon;
+  return normalized === "chatgpt" ? PsychologyOutlinedIcon : normalized === "gemini" ? AutoAwesomeOutlinedIcon : normalized === "claude" ? TextsmsOutlinedIcon : SmartToyOutlinedIcon;
+}
+
+function ProviderMark({ provider }: { provider: string }) {
+  const Icon = providerIcon(provider);
   return <span title={`${provider || "AI"} 대화`} style={{ display: "inline-flex", alignItems: "center", gap: 5, minWidth: 0, color: "var(--accent)", fontSize: 11.5, fontWeight: 700 }}><Icon sx={{ fontSize: 16, flexShrink: 0 }} /><span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{provider || "AI"}</span></span>;
 }
 
@@ -191,6 +212,15 @@ export default function BrowserHistoryView({ dbPath, tableName, hostDir = "", ti
   const [allAccounts, setAllAccounts] = useState<string[]>([]);
   const [domainStatsOpen, setDomainStatsOpen] = useState(false);
   const [domainStatsPage, setDomainStatsPage] = useState(0);
+  const [domainSortAsc, setDomainSortAsc] = useState(false);
+  // 전체 다운로드 팝업 — 전체 도메인 보기와 같은 모달 패턴.
+  const [downloadsOpen, setDownloadsOpen] = useState(false);
+  const [kindsOpen, setKindsOpen] = useState(false);
+  const [downloadsOpener, setDownloadsOpener] = useState<HTMLElement | null>(null);
+  const [downloadsPage, setDownloadsPage] = useState(0);
+  const [downloadsData, setDownloadsData] = useState<{ rows: Row[]; rowCount: number }>({ rows: [], rowCount: 0 });
+  // 우측 하단 큰 카드의 탭 — 날짜 기록 / AI 대화 내역.
+  const [mainTab, setMainTab] = useState<"records" | "ai">("records");
   const [domainStats, setDomainStats] = useState<BrowserDomainStatsPage>({ domains: [], total: 0 });
   const [domainStatsOpener, setDomainStatsOpener] = useState<HTMLElement | null>(null);
   const [detail, setDetail] = useState<Row | null>(null);
@@ -244,10 +274,11 @@ export default function BrowserHistoryView({ dbPath, tableName, hostDir = "", ti
       toBound(timeRange.end, "end") || undefined,
       domainStatsPage * DOMAIN_PAGE_SIZE,
       DOMAIN_PAGE_SIZE,
+      domainSortAsc,
     ).then((result) => { if (active) { setDomainStats(result); setLoadErrors((errors) => ({ ...errors, domains: undefined })); } })
       .catch(() => { if (active) setLoadErrors((errors) => ({ ...errors, domains: "전체 도메인 통계를 불러오지 못했습니다. 다시 시도하세요." })); });
     return () => { active = false; };
-  }, [domainStatsOpen, dbPath, tableName, account, timeRange, domainStatsPage, reloadNonce]);
+  }, [domainStatsOpen, dbPath, tableName, account, timeRange, domainStatsPage, domainSortAsc, reloadNonce]);
   useEffect(() => {
     let active = true;
     window.api.browserActivitySummary(dbPath, tableName, { kinds: ["visit", "download", "cache"], offset: 0, limit: 1 })
@@ -284,6 +315,14 @@ export default function BrowserHistoryView({ dbPath, tableName, hostDir = "", ti
     return () => { active = false; };
   }, [dbPath, tableName, timeRange, aiReferralPage, reloadNonce]);
   useEffect(() => setAiReferralPage(0), [dbPath, tableName, timeRange]);
+  useEffect(() => {
+    if (!downloadsOpen) return;
+    let active = true;
+    window.api.browserActivityPage(dbPath, tableName, { account, kinds: ["download"], start: toBound(timeRange.start, "start") || undefined, end: toBound(timeRange.end, "end") || undefined, offset: downloadsPage * PAGE_SIZE, limit: PAGE_SIZE })
+      .then((result) => { if (active) setDownloadsData({ rows: result.rows, rowCount: result.rowCount }); })
+      .catch(() => { if (active) setLoadErrors((errors) => ({ ...errors, downloadsModal: "다운로드 목록을 불러오지 못했습니다. 다시 시도하세요." })); });
+    return () => { active = false; };
+  }, [downloadsOpen, dbPath, tableName, account, timeRange, downloadsPage, reloadNonce]);
 
   const accounts = useMemo(() => ["(전체)", ...allAccounts.filter(Boolean)], [allAccounts]);
   const activeDay = effectiveDay;
@@ -310,6 +349,19 @@ export default function BrowserHistoryView({ dbPath, tableName, hostDir = "", ti
     try { parsed = parseAiJson(JSON.parse(conversation.rawJson)); } catch { /* Raw JSON remains readable in the modal. */ }
     return { ...conversation, messages: parsed.messages, raw: conversation.rawJson, title: conversation.title || parsed.title, createdAt: conversation.createdAt || parsed.createdAt, updatedAt: conversation.updatedAt || parsed.updatedAt };
   }), [aiConversations]);
+  const closeDownloads = () => {
+    const opener = downloadsOpener;
+    setDownloadsOpen(false);
+    setDownloadsOpener(null);
+    requestAnimationFrame(() => opener?.focus());
+  };
+  const openDownloads = (opener: HTMLElement) => {
+    setDetail(null);
+    opener.focus();
+    setDownloadsOpener(opener);
+    setDownloadsPage(0);
+    setDownloadsOpen(true);
+  };
   const closeDomainStats = () => {
     const opener = domainStatsOpener;
     setDomainStatsOpen(false);
@@ -348,98 +400,232 @@ export default function BrowserHistoryView({ dbPath, tableName, hostDir = "", ti
   // drawer remains a standard modal. Its fixed backdrop does not participate
   // in this view's flex layout, so opening it never shifts the browser ledger.
   return <div className="dfir-view" style={{ flex: 1, minHeight: 0, display: "flex", overflow: "hidden" }}>
-    <main style={{ flex: "1 1 auto", minWidth: 0, minHeight: 0, overflow: "auto", padding: "24px 28px" }}>
-    <header style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 14, flexWrap: "wrap" }}><LanguageOutlinedIcon sx={{ fontSize: 23, color: "var(--accent)" }} /><h1 style={{ margin: 0, fontSize: 21, letterSpacing: "-0.025em" }}>브라우저 활동</h1><span style={{ fontSize: 12, color: "var(--text-faint)" }}>방문 · 다운로드 · 캐시 기록</span>{loadErrorMessages.length > 0 && <span role="alert" style={{ display: "inline-flex", alignItems: "center", gap: 7, marginLeft: "auto", minWidth: 0, color: "var(--warning)", fontSize: 11.5 }}><span>{loadErrorMessages.join(" ")}</span><button className="nm-btn" type="button" onClick={() => { setLoadErrors({}); setReloadNonce((value) => value + 1); }} style={{ flexShrink: 0, padding: "3px 7px", borderRadius: "var(--radius-sm)", border: "1px solid var(--border)", background: "var(--bg-elevated)", color: "var(--text-dim)", cursor: "pointer", fontSize: 11 }}>다시 시도</button></span>}</header>
-    <section aria-label="브라우저 활동 필터" style={{ display: "flex", gap: 6, flexWrap: "wrap", paddingBottom: 14, borderBottom: "1px solid var(--border)" }}>
-      {accounts.map((value) => <button className="nm-btn" key={value} onClick={() => { setShowAllPeriod(false); setAccount(value); setSelectedDay(""); setMonth(null); }} style={controlButton(account === value)}>{value !== "(전체)" && <PersonOutlineIcon sx={{ fontSize: 15 }} />}{value}</button>)}
-      <span aria-hidden="true" style={{ width: 1, alignSelf: "stretch", background: "var(--border)", margin: "0 2px" }} />
-      {kindChoices.map(({ key, label, Icon }) => { const selected = kinds.has(key); return <button className="nm-btn" key={key} onClick={() => { setShowAllPeriod(false); setKinds((previous) => { const next = new Set(previous); if (next.has(key)) next.delete(key); else next.add(key); return next.size ? next : previous; }); }} style={controlButton(selected)} aria-pressed={selected}><Icon sx={{ fontSize: 15 }} />{label}</button>; })}
-    </section>
+    <main style={{ flex: "1 1 auto", minWidth: 0, minHeight: 0, display: "flex", flexDirection: "column", overflow: "hidden", background: "var(--bg)" }}>
+    <ViewHeader icon={LanguageOutlinedIcon} title="브라우저 활동" meta="방문 · 다운로드 · 캐시 기록" right={loadErrorMessages.length > 0 ? <span role="alert" style={{ display: "inline-flex", alignItems: "center", gap: 7, minWidth: 0, color: "var(--warning)", fontSize: 11.5 }}><span>{loadErrorMessages.join(" ")}</span><button className="nm-btn" type="button" onClick={() => { setLoadErrors({}); setReloadNonce((value) => value + 1); }} style={{ flexShrink: 0, padding: "3px 7px", borderRadius: "var(--radius-sm)", border: "1px solid var(--border)", background: "var(--bg-elevated)", color: "var(--text-dim)", cursor: "pointer", fontSize: 11 }}>다시 시도</button></span> : undefined}>
+        <HeaderSearchInput value={search} onChange={setSearch} placeholder="도메인 · URL · 제목 검색" ariaLabel="브라우저 기록 검색" width={300} />
+        <SelectDropdown
+          icon={<PersonOutlineIcon sx={{ fontSize: 15 }} />}
+          label="계정"
+          options={accounts.map((value) => ({ value, label: value }))}
+          value={account}
+          defaultValue="(전체)"
+          onChange={(next) => { setShowAllPeriod(false); setAccount(next); setSelectedDay(""); setMonth(null); }}
+        />
+        <FilterDropdown icon={<Inventory2OutlinedIcon sx={{ fontSize: 15 }} />} label="종류" valueLabel={kinds.size === 3 ? undefined : `· ${kindChoices.filter(({ key }) => kinds.has(key)).map(({ label }) => label).join("·")}`} active={kinds.size !== 3} minWidth={190} open={kindsOpen} onToggle={setKindsOpen}>
+          {kindChoices.map(({ key, label, Icon }) => {
+            const selected = kinds.has(key);
+            return (
+              <button key={key} type="button" aria-pressed={selected} onClick={() => { setShowAllPeriod(false); setKinds((previous) => { const next = new Set(previous); if (next.has(key)) next.delete(key); else next.add(key); return next.size ? next : previous; }); }} style={{ width: "100%", display: "flex", alignItems: "center", gap: 7, minHeight: 32, padding: "4px 9px", background: "transparent", border: "none", borderRadius: "var(--radius-sm)", color: selected ? "var(--text)" : "var(--text-faint)", cursor: "pointer", fontSize: 12.5, fontWeight: selected ? 650 : 500, textAlign: "left" }}
+                onMouseEnter={(event) => { event.currentTarget.style.background = "var(--bg-hover)"; }}
+                onMouseLeave={(event) => { event.currentTarget.style.background = "transparent"; }}>
+                <span aria-hidden="true" style={{ color: selected ? "var(--accent)" : "var(--text-faint)", fontSize: 13 }}>{selected ? "☑" : "☐"}</span>
+                <Icon sx={{ fontSize: 15 }} />
+                {label}
+              </button>
+            );
+          })}
+        </FilterDropdown>
+      
+      </ViewHeader>
 
-    <section style={{ display: "grid", gridTemplateColumns: "minmax(248px, 292px) minmax(0, 1fr)", alignItems: "start", marginTop: 16, background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", boxShadow: "var(--shadow-card)", overflow: "hidden" }}>
-      <section aria-label="기간 기반 브라우저 분석" className="browser-insights-grid" style={{ gridColumn: "1 / -1", display: "grid", gridTemplateColumns: "minmax(0, 1fr) minmax(0, 1fr)", borderBottom: "1px solid var(--border)" }}>
-        <div className="browser-insights-first" style={{ minWidth: 0, padding: "13px 14px", borderRight: "1px solid var(--border)" }}>
-          <div style={{ display: "flex", alignItems: "baseline", gap: 8, minWidth: 0, marginBottom: 8 }}><span style={{ fontSize: 13.5, fontWeight: 700 }}>방문 도메인 통계</span><span style={{ fontSize: 11, color: "var(--text-faint)" }}>상위 8개 · 방문 {insights.visitTotal.toLocaleString()}회</span><button className="nm-btn" onClick={(event) => openDomainStats(event.currentTarget)} style={{ marginLeft: "auto", ...pageButton(false), minHeight: 26, padding: "2px 7px" }}>전체 도메인 보기</button></div>
-          <div style={{ fontSize: 10.5, color: "var(--text-faint)", paddingBottom: 6, borderBottom: "1px solid var(--border-subtle)" }}>선택 계정 · 기간 필터 기준</div>
-          {insights.topVisitedDomains.length === 0 ? <div style={{ padding: "14px 0 2px", color: "var(--text-faint)", fontSize: 12 }}>기간 필터 내 방문 도메인이 없습니다.</div> : insights.topVisitedDomains.map((item) => <div key={item.domain} title={item.domain} style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) auto", gap: 10, alignItems: "center", minHeight: 38, padding: "6px 0", borderBottom: "1px solid var(--border-subtle)" }}><span style={{ minWidth: 0, color: "var(--text)", fontSize: 12, fontWeight: 650, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{item.domain}</span><span style={{ color: "var(--text-dim)", fontFamily: "var(--mono)", fontSize: 11, whiteSpace: "nowrap" }}>{item.visitCount.toLocaleString()}회</span></div>)}
-        </div>
-        <div style={{ minWidth: 0, padding: "13px 14px" }}>
-          <div style={{ display: "flex", alignItems: "baseline", gap: 8, minWidth: 0, marginBottom: 8 }}><span style={{ fontSize: 13.5, fontWeight: 700 }}>다운로드 이력</span><span style={{ fontSize: 11, color: "var(--text-faint)" }}>최근 8건 · 전체 {insights.downloadTotal.toLocaleString()}건</span><button className="nm-btn" onClick={() => { setKinds(new Set(["download"])); setShowAllPeriod(true); setSelectedDay(""); }} style={{ marginLeft: "auto", ...pageButton(false), minHeight: 26, padding: "2px 7px" }}>전체 다운로드</button></div>
-          <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) 164px", gap: 10, paddingBottom: 6, borderBottom: "1px solid var(--border-subtle)", fontSize: 10.5, color: "var(--text-faint)" }}><span>파일</span><span>시각</span></div>
-          {insights.downloads.length === 0 ? <div style={{ padding: "14px 0 2px", color: "var(--text-faint)", fontSize: 12 }}>기간 필터 내 다운로드 기록이 없습니다.</div> : insights.downloads.map((row) => <button key={String(row.__rowid)} onClick={(event) => openDetail(row, event.currentTarget)} title={row.title || "다운로드 상세 보기"} style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) 164px", gap: 10, alignItems: "center", width: "100%", minHeight: 38, padding: "6px 0", border: "none", borderBottom: "1px solid var(--border-subtle)", background: "transparent", color: "inherit", cursor: "pointer", textAlign: "left" }}><span style={{ minWidth: 0, display: "flex", alignItems: "center", gap: 6 }}><DownloadOutlinedIcon sx={{ flexShrink: 0, fontSize: 15, color: "var(--warning)" }} /><span title={row.title} style={{ minWidth: 0, color: "var(--text)", fontSize: 12, fontWeight: 650, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{row.title || "파일 이름 없음"}</span>{row.size && <span style={{ flexShrink: 0, color: "var(--text-faint)", fontFamily: "var(--mono)", fontSize: 10.5 }}>{row.size}</span>}</span><time style={{ color: row.timestamp ? "var(--text-time)" : "var(--text-faint)", fontFamily: "var(--mono)", fontSize: 10.5, whiteSpace: "nowrap" }}>{formatAiPayloadTime(row.timestamp) || "시간 정보 없음"}</time></button>)}
-        </div>
-      </section>
-      <aside aria-label="활동 날짜 선택" style={{ padding: 14, borderRight: "1px solid var(--border)" }}>
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}><div style={{ display: "flex", gap: 3 }}><button className="nm-btn" onClick={() => setMonth({ y: calendarMonth.y - 1, m: calendarMonth.m })} title="이전 해" aria-label="이전 해" style={navigationButton}><FirstPageIcon sx={{ fontSize: 16 }} /></button><button className="nm-btn" onClick={() => setMonth(shiftMonth(calendarMonth, -1))} title="이전 달" aria-label="이전 달" style={navigationButton}><ChevronLeftIcon sx={{ fontSize: 17 }} /></button></div><button className="nm-btn" onClick={() => activeDay && chooseDay(activeDay)} title="가장 최근 활동일" style={{ display: "inline-flex", alignItems: "center", gap: 5, fontSize: 13.5, fontWeight: 700, background: "transparent", border: "none", color: "var(--text)", cursor: "pointer" }}><CalendarMonthOutlinedIcon sx={{ fontSize: 16, color: "var(--accent)" }} />{calendarMonth.y}년 {calendarMonth.m}월</button><div style={{ display: "flex", gap: 3 }}><button className="nm-btn" onClick={() => setMonth(shiftMonth(calendarMonth, 1))} title="다음 달" aria-label="다음 달" style={navigationButton}><ChevronRightIcon sx={{ fontSize: 17 }} /></button><button className="nm-btn" onClick={() => setMonth({ y: calendarMonth.y + 1, m: calendarMonth.m })} title="다음 해" aria-label="다음 해" style={navigationButton}><LastPageIcon sx={{ fontSize: 16 }} /></button></div></div>
-        <div style={{ display: "flex", alignItems: "center", gap: 4, marginBottom: 10 }}><button className="nm-btn" onClick={() => previousDay && chooseDay(previousDay)} disabled={!previousDay} style={{ ...pageButton(!previousDay), flex: 1, padding: "3px 4px" }}><ChevronLeftIcon sx={{ fontSize: 15 }} />이전 활동일</button><button className="nm-btn" onClick={() => activeDay && chooseDay(activeDay)} title="최근 활동일" style={{ ...pageButton(!activeDay), padding: "3px 7px" }}>최근</button><button className="nm-btn" onClick={() => nextDay && chooseDay(nextDay)} disabled={!nextDay} style={{ ...pageButton(!nextDay), flex: 1, padding: "3px 4px" }}>다음 활동일<ChevronRightIcon sx={{ fontSize: 15 }} /></button></div>
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 2, textAlign: "center" }}>{DOW.map((day, index) => <div key={day} style={{ fontSize: 10.5, color: index === 0 ? "var(--danger)" : index === 6 ? "var(--accent)" : "var(--text-faint)", padding: "2px 0" }}>{day}</div>)}{calendarGrid(calendarMonth.y, calendarMonth.m).map((cell, index) => {
-          if (!cell) return <div key={index} />;
-          const day = `${calendarMonth.y}-${pad(calendarMonth.m)}-${pad(cell)}`;
-          const count = dayCounts.get(day) ?? 0;
-          const selected = day === activeDay;
-          return <button key={index} onClick={() => count > 0 && chooseDay(day)} disabled={count === 0} title={count ? `${day} · ${count.toLocaleString()}건` : ""} style={{ aspectRatio: "1", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", fontSize: 12, borderRadius: "var(--radius-sm)", border: "1px solid transparent", cursor: count ? "pointer" : "default", background: selected ? "var(--accent)" : count ? "var(--accent-subtle)" : "transparent", color: selected ? "#fff" : count ? "var(--accent)" : "var(--text-faint)", fontWeight: count ? 700 : 400 }}>{cell}{count > 0 && <span style={{ fontSize: 8, opacity: 0.8 }}>{count}</span>}</button>;
-        })}</div><div style={{ fontSize: 11, color: "var(--text-faint)", marginTop: 10 }}>활동 기록이 있는 날짜 {dayCounts.size}일</div>
-      </aside>
-      <section aria-label="선택한 날짜의 브라우저 기록" style={{ minWidth: 0, padding: 14 }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8, flexWrap: "wrap" }}><span style={{ fontSize: 13.5, fontWeight: 700 }}>{showAllPeriod ? `기간 내 다운로드 · ${data.rowCount.toLocaleString()}건` : activeDay ? `${activeDay} · ${data.rowCount.toLocaleString()}건` : "활동 기록 없음"}</span><div style={{ marginLeft: "auto", position: "relative" }}><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="도메인 · URL · 제목 검색" aria-label="선택한 날짜의 브라우저 기록 검색" style={{ width: 280, maxWidth: "70vw", minHeight: 30, padding: "5px 28px 5px 10px", background: "var(--bg-input)", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", color: "var(--text)", fontSize: 12 }} />{search && <button onClick={() => setSearch("")} title="검색어 지우기" aria-label="검색어 지우기" style={{ position: "absolute", right: 4, top: "50%", transform: "translateY(-50%)", display: "inline-flex", background: "transparent", border: "none", color: "var(--text-faint)", cursor: "pointer" }}><CloseIcon sx={{ fontSize: 15 }} /></button>}</div></div>
-        {cacheRecoveryMarkerNeedsReparse && <div role="status" style={{ marginBottom: 8, padding: "7px 9px", border: "1px solid var(--border-subtle)", borderRadius: "var(--radius-sm)", color: "var(--text-dim)", background: "var(--bg-elevated)", fontSize: 11.5 }}>현재 브라우저 개요에는 복구 본문 상태가 없습니다. 재파싱 후 복구된 캐시 아이콘이 표시됩니다.</div>}
-        <div style={{ borderTop: "1px solid var(--border)", overflow: "hidden" }}><div style={{ display: "grid", gridTemplateColumns: ACTIVITY_LEDGER_COLUMNS, gap: 10, padding: "8px 12px", borderBottom: "1px solid var(--border)", fontSize: 10.5, color: "var(--text-faint)", fontWeight: 700 }}><span>시각</span><span>기록</span><span>계정</span><span aria-label="북마크" /></div>{data.rowCount === 0 && <div style={{ padding: 20, color: "var(--text-faint)", fontSize: 12.5 }}>{search.trim() ? `“${search.trim()}” 검색 결과가 없습니다.` : activeDay ? "선택한 날짜의 기록이 없습니다." : "기간 필터 내 데이터 없음"}</div>}{data.rows.map((row, index, rows) => <ActivityRow key={`${row.__rowid}-${index}`} row={row} final={index === rows.length - 1} bookmarked={bookmarkedRowids?.has(rowidOf(row)) ?? false} onOpen={(opener) => openDetail(row, opener)} onToggleBookmark={onToggleBookmark && Number.isFinite(rowidOf(row)) ? () => onToggleBookmark(rowidOf(row)) : undefined} />)}</div>
-        {pageCount > 1 && <div style={{ marginTop: 10 }}><PaginationControls ariaLabel="브라우저 활동 페이지" page={safePage} pageCount={pageCount} onChange={setPage} summary={`(${(safePage * PAGE_SIZE + 1).toLocaleString()}–${Math.min((safePage + 1) * PAGE_SIZE, data.rowCount).toLocaleString()} / ${data.rowCount.toLocaleString()})`} /></div>}
-      </section>
-    <div aria-label="AI 대화 내역" style={{ gridColumn: "1 / -1", minWidth: 0, borderTop: "1px solid var(--border)", background: "var(--bg-panel)" }}>
-      <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "12px 14px", borderBottom: "1px solid var(--border)", flexWrap: "wrap" }}><SmartToyOutlinedIcon sx={{ fontSize: 18, color: "var(--accent)" }} /><span style={{ fontSize: 14, fontWeight: 700 }}>AI 대화 내역</span><span style={{ fontSize: 11.5, color: "var(--text-faint)" }}>대화 {aiTotal.toLocaleString()}건 · 공유 링크 {aiReferralTotal.toLocaleString()}건</span>{aiSourceFailures.length > 0 && <span role="status" title={aiSourceFailures.join("\n")} style={{ marginLeft: "auto", color: "var(--warning)", fontSize: 11.5 }}>캐시 원본 {aiSourceFailures.length.toLocaleString()}개를 읽지 못했습니다</span>}</div>
-      {aiAllSourcesUnreadable ? <div role="alert" style={{ display: "flex", alignItems: "center", gap: 10, padding: 18, color: "var(--warning)", fontSize: 12.5 }}>AI 대화 캐시 원본을 읽지 못했습니다.<button className="nm-btn" type="button" onClick={() => setReloadNonce((value) => value + 1)} style={{ padding: "3px 7px", borderRadius: "var(--radius-sm)", border: "1px solid var(--border)", background: "var(--bg-elevated)", color: "var(--text-dim)", cursor: "pointer", fontSize: 11 }}>다시 시도</button></div> : aiTotal === 0 && aiReferralTotal === 0 ? <div style={{ padding: 18, color: "var(--text-faint)", fontSize: 12.5 }}>기간 필터 내 데이터 없음</div> : <>
-        <div role="tablist" aria-label="AI 대화 데이터 유형" style={{ display: "flex", gap: 4, padding: "8px 14px", borderBottom: "1px solid var(--border-subtle)" }}>
-          <button className="nm-btn" role="tab" aria-selected={aiPanel === "conversations"} onClick={() => setAiPanel("conversations")} style={controlButton(aiPanel === "conversations")}><SmartToyOutlinedIcon sx={{ fontSize: 15 }} />대화 {aiTotal.toLocaleString()}건</button>
-          <button className="nm-btn" role="tab" aria-selected={aiPanel === "referrals"} onClick={() => setAiPanel("referrals")} style={controlButton(aiPanel === "referrals")}><LinkIcon sx={{ fontSize: 15 }} />공유 링크 {aiReferralTotal.toLocaleString()}건</button>
-        </div>
-        {aiPanel === "conversations" ? <div role="tabpanel" aria-label="AI 대화 목록"><div style={{ display: "grid", gridTemplateColumns: "minmax(124px, .55fr) minmax(0, 1.7fr) minmax(96px, .4fr) 164px 52px", gap: 10, padding: "8px 14px", borderBottom: "1px solid var(--border-subtle)", fontSize: 10.5, fontWeight: 700, color: "var(--text-faint)" }}><span>서비스</span><span>대화 제목</span><span>계정</span><span>캐시 관찰 시각</span><span style={{ textAlign: "right" }}>메시지</span></div>{aiTotal === 0 ? <div style={{ padding: 16, color: "var(--text-faint)", fontSize: 12 }}>기간 필터 내 대화 데이터 없음</div> : conversations.map((conversation, index) => <button key={`${conversation.url}-${index}`} onClick={(event) => openAiConversation(conversation, event.currentTarget)} title="대화 내용 보기" style={{ display: "grid", gridTemplateColumns: "minmax(124px, .55fr) minmax(0, 1.7fr) minmax(96px, .4fr) 164px 52px", gap: 10, alignItems: "center", width: "100%", minHeight: 44, padding: "8px 14px", background: "transparent", border: "none", borderBottom: "1px solid var(--border-subtle)", color: "inherit", cursor: "pointer", textAlign: "left" }}><ProviderMark provider={conversation.provider} /><span title={conversation.title || conversation.url} style={{ minWidth: 0, fontSize: 12.5, fontWeight: 650, color: "var(--text)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{conversation.title || "제목 없음"}</span><span title={conversation.account} style={{ minWidth: 0, fontSize: 11, color: "var(--text-dim)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{conversation.account || "—"}</span><time style={{ minWidth: 0, fontSize: 10.5, color: "var(--text-time)", fontFamily: "var(--mono)", whiteSpace: "nowrap" }}>{formatAiPayloadTime(conversation.date) || "시간 정보 없음"}</time><span style={{ textAlign: "right", whiteSpace: "nowrap", fontSize: 11, color: "var(--text-dim)" }}>{conversation.messages.length || "—"}</span></button>)}<div style={{ padding: "0 14px 12px" }}><SimplePager page={aiPage} total={aiTotal} onPage={setAiPage} /></div></div> : <div role="tabpanel" aria-label="AI 공유 링크 목록"><div style={{ display: "grid", gridTemplateColumns: "164px minmax(0, 1fr)", gap: 10, padding: "8px 14px", borderBottom: "1px solid var(--border-subtle)", fontSize: 10.5, fontWeight: 700, color: "var(--text-faint)" }}><span>시각</span><span>공유 링크</span></div>{aiReferralTotal === 0 ? <div style={{ padding: 16, color: "var(--text-faint)", fontSize: 12 }}>기간 필터 내 공유 링크 없음</div> : aiReferrals.map((row) => <button key={String(row.__rowid)} onClick={(event) => openDetail(row, event.currentTarget)} title={row.url || row.title} style={{ display: "grid", gridTemplateColumns: "164px minmax(0, 1fr)", gap: 10, alignItems: "center", width: "100%", padding: "8px 14px", background: "transparent", border: "none", borderBottom: "1px solid var(--border-subtle)", color: "inherit", cursor: "pointer", textAlign: "left" }}><span style={{ fontSize: 10.5, color: "var(--text-time)", fontFamily: "var(--mono)", whiteSpace: "nowrap" }}>{formatAiPayloadTime(row.timestamp) || "시간 정보 없음"}</span><span style={{ minWidth: 0, display: "grid", gridTemplateRows: "18px 16px", rowGap: 2 }}><span title={row.title || row.url} style={{ minWidth: 0, fontSize: 12, color: "var(--text)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{row.title || row.url || "제목 없음"}</span><span title={row.url} style={{ minWidth: 0, fontSize: 10.5, color: "var(--accent)", fontFamily: "var(--mono)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{row.url || "주소 정보 없음"}</span></span></button>)}<div style={{ padding: "0 14px 12px" }}><SimplePager page={aiReferralPage} total={aiReferralTotal} onPage={setAiReferralPage} /></div></div>}
-      </>}
+    {/* 스크롤 없이 한 화면에 들어오는 대시보드 — 각 카드가 내부 스크롤을 가진다. */}
+    <div style={{ flex: 1, minHeight: 0, display: "grid", gap: 10, padding: 14, gridTemplateColumns: "minmax(280px, 25%) minmax(0, 1fr)", overflow: "hidden" }}>
+      <div style={{ minHeight: 0, display: "flex", flexDirection: "column", gap: 10, overflow: "hidden" }}>
+        <aside aria-label="활동 날짜 선택" style={{ flexShrink: 0, padding: 12, border: "1px solid var(--border)", borderRadius: "var(--radius-md)", background: "var(--bg-panel)" }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}><div style={{ display: "flex", gap: 3 }}><button className="nm-btn" onClick={() => setMonth({ y: calendarMonth.y - 1, m: calendarMonth.m })} title="이전 해" aria-label="이전 해" style={navigationButton}><FirstPageIcon sx={{ fontSize: 16 }} /></button><button className="nm-btn" onClick={() => setMonth(shiftMonth(calendarMonth, -1))} title="이전 달" aria-label="이전 달" style={navigationButton}><ChevronLeftIcon sx={{ fontSize: 17 }} /></button></div><button className="nm-btn" onClick={() => activeDay && chooseDay(activeDay)} title="가장 최근 활동일" style={{ display: "inline-flex", alignItems: "center", gap: 7, minHeight: 32, padding: "5px 14px", fontSize: 13.5, fontWeight: 700, background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", color: "var(--text)", cursor: "pointer", whiteSpace: "nowrap" }}><CalendarMonthOutlinedIcon sx={{ fontSize: 16, color: "var(--accent)" }} />{calendarMonth.y}년 {calendarMonth.m}월</button><div style={{ display: "flex", gap: 3 }}><button className="nm-btn" onClick={() => setMonth(shiftMonth(calendarMonth, 1))} title="다음 달" aria-label="다음 달" style={navigationButton}><ChevronRightIcon sx={{ fontSize: 17 }} /></button><button className="nm-btn" onClick={() => setMonth({ y: calendarMonth.y + 1, m: calendarMonth.m })} title="다음 해" aria-label="다음 해" style={navigationButton}><LastPageIcon sx={{ fontSize: 16 }} /></button></div></div>
+          <div style={{ display: "flex", alignItems: "center", gap: 4, marginBottom: 10 }}><button className="nm-btn" onClick={() => previousDay && chooseDay(previousDay)} disabled={!previousDay} style={{ ...pageButton(!previousDay), flex: 1, padding: "3px 4px" }}><ChevronLeftIcon sx={{ fontSize: 15 }} />이전 활동일</button><button className="nm-btn" onClick={() => activeDay && chooseDay(activeDay)} title="최근 활동일" style={{ ...pageButton(!activeDay), padding: "3px 7px" }}>최근</button><button className="nm-btn" onClick={() => nextDay && chooseDay(nextDay)} disabled={!nextDay} style={{ ...pageButton(!nextDay), flex: 1, padding: "3px 4px" }}>다음 활동일<ChevronRightIcon sx={{ fontSize: 15 }} /></button></div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 2, textAlign: "center" }}>{DOW.map((day, index) => <div key={day} style={{ fontSize: 10.5, color: index === 0 ? "var(--danger)" : index === 6 ? "var(--accent)" : "var(--text-faint)", padding: "2px 0" }}>{day}</div>)}{calendarGrid(calendarMonth.y, calendarMonth.m).map((cell, index) => {
+            if (!cell) return <div key={index} />;
+            const day = `${calendarMonth.y}-${pad(calendarMonth.m)}-${pad(cell)}`;
+            const count = dayCounts.get(day) ?? 0;
+            const selected = day === activeDay;
+            return <button key={index} onClick={() => count > 0 && chooseDay(day)} disabled={count === 0} title={count ? `${day} · ${count.toLocaleString()}건` : ""} style={{ aspectRatio: "1", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", fontSize: 12, borderRadius: "var(--radius-sm)", border: "1px solid transparent", cursor: count ? "pointer" : "default", background: selected ? "var(--accent)" : count ? "var(--accent-subtle)" : "transparent", color: selected ? "#fff" : count ? "var(--accent)" : "var(--text-faint)", fontWeight: count ? 700 : 400 }}>{cell}{count > 0 && <span style={{ fontSize: 8, opacity: 0.8 }}>{count}</span>}</button>;
+          })}</div>
+          <div style={{ fontSize: 11, color: "var(--text-faint)", marginTop: 9 }}>활동 기록이 있는 날짜 {dayCounts.size}일</div>
+        </aside>
+
+        <section aria-label="방문 도메인 통계" style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", background: "var(--bg-panel)", overflow: "hidden" }}>
+          <div style={{ flexShrink: 0, display: "flex", alignItems: "center", gap: 8, minWidth: 0, padding: "11px 12px 9px", borderBottom: "1px solid var(--border-subtle)" }}><span style={{ fontSize: 13, fontWeight: 700 }}>방문 도메인 통계</span><span style={{ fontSize: 11, color: "var(--text-faint)" }}>방문 {insights.visitTotal.toLocaleString()}회</span><button className="nm-btn" onClick={(event) => openDomainStats(event.currentTarget)} style={{ marginLeft: "auto", ...pageButton(false), minHeight: 26, padding: "2px 7px" }}>전체 보기</button></div>
+          <div style={{ flex: 1, minHeight: 0, overflow: "auto", padding: "2px 12px 8px" }}>
+            {insights.topVisitedDomains.length === 0 ? <div style={{ padding: "12px 0 2px", color: "var(--text-faint)", fontSize: 12 }}>기간 필터 내 방문 도메인이 없습니다.</div> : insights.topVisitedDomains.map((item) => <div key={item.domain} title={item.domain} style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) auto", gap: 10, alignItems: "center", minHeight: 36, padding: "5px 0", borderBottom: "1px solid var(--border-subtle)" }}><span style={{ minWidth: 0, color: "var(--text)", fontSize: 12, fontWeight: 650, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{item.domain}</span><span style={{ color: "var(--text-dim)", fontFamily: "var(--mono)", fontSize: 11, whiteSpace: "nowrap" }}>{item.visitCount.toLocaleString()}회</span></div>)}
+          </div>
+        </section>
+
+        <section aria-label="다운로드 이력" style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", background: "var(--bg-panel)", overflow: "hidden" }}>
+          <div style={{ flexShrink: 0, display: "flex", alignItems: "center", gap: 8, minWidth: 0, padding: "11px 12px 9px", borderBottom: "1px solid var(--border-subtle)" }}><span style={{ fontSize: 13, fontWeight: 700 }}>다운로드 이력</span><span style={{ fontSize: 11, color: "var(--text-faint)" }}>최근 {insights.downloads.length}건 · 전체 {insights.downloadTotal.toLocaleString()}건</span><button className="nm-btn" onClick={(event) => openDownloads(event.currentTarget)} style={{ marginLeft: "auto", ...pageButton(false), minHeight: 26, padding: "2px 7px" }}>전체 다운로드</button></div>
+          <div style={{ flex: 1, minHeight: 0, overflow: "auto", padding: "0 12px" }}>
+            {insights.downloads.length === 0 ? <div style={{ padding: "12px 0", color: "var(--text-faint)", fontSize: 12 }}>기간 필터 내 다운로드 기록이 없습니다.</div> : insights.downloads.map((row) => <button key={String(row.__rowid)} onClick={(event) => openDetail(row, event.currentTarget)} title={row.title || "다운로드 상세 보기"} style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) auto", gap: 10, alignItems: "center", width: "100%", minHeight: 36, padding: "5px 0", border: "none", borderBottom: "1px solid var(--border-subtle)", background: "transparent", color: "inherit", cursor: "pointer", textAlign: "left" }}><span style={{ minWidth: 0, display: "flex", alignItems: "center", gap: 6 }}><DownloadOutlinedIcon sx={{ flexShrink: 0, fontSize: 15, color: "var(--warning)" }} /><span title={row.title} style={{ minWidth: 0, color: "var(--text)", fontSize: 12, fontWeight: 650, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{row.title || "파일 이름 없음"}</span>{row.size && <span style={{ flexShrink: 0, color: "var(--text-faint)", fontFamily: "var(--mono)", fontSize: 10.5 }}>{row.size}</span>}</span><time style={{ color: row.timestamp ? "var(--text-time)" : "var(--text-faint)", fontFamily: "var(--mono)", fontSize: 10.5, whiteSpace: "nowrap", textAlign: "right" }}>{formatAiPayloadTime(row.timestamp) || "시간 정보 없음"}</time></button>)}
+          </div>
+        </section>
+
+      </div>
+
+      <div style={{ minHeight: 0, display: "flex", flexDirection: "column", gap: 10, overflow: "hidden" }}>
+        <section aria-label="브라우저 기록과 AI 대화" style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+          <div role="tablist" aria-label="기록 유형" style={{ flexShrink: 0, display: "flex", alignItems: "center", gap: 6, padding: "2px 2px 9px", flexWrap: "wrap" }}>
+            <button className="nm-btn" role="tab" aria-selected={mainTab === "records"} onClick={() => setMainTab("records")} style={controlButton(mainTab === "records")}><LanguageOutlinedIcon sx={{ fontSize: 15 }} />브라우저 기록 {data.rowCount.toLocaleString()}건</button>
+            <button className="nm-btn" role="tab" aria-selected={mainTab === "ai"} onClick={() => setMainTab("ai")} style={controlButton(mainTab === "ai")}><SmartToyOutlinedIcon sx={{ fontSize: 15 }} />AI 대화 {aiTotal.toLocaleString()} · 링크 {aiReferralTotal.toLocaleString()}</button>
+            {mainTab === "records" && <span style={{ marginLeft: "auto", fontSize: 12, color: "var(--text-dim)", fontWeight: 650 }}>{showAllPeriod ? "기간 내 다운로드" : activeDay || "활동 기록 없음"}</span>}
+            {mainTab === "ai" && aiSourceFailures.length > 0 && <span role="status" title={aiSourceFailures.join("\n")} style={{ marginLeft: "auto", color: "var(--warning)", fontSize: 11.5 }}>캐시 원본 {aiSourceFailures.length.toLocaleString()}개를 읽지 못했습니다</span>}
+          </div>
+
+          {mainTab === "records" ? <>
+            {cacheRecoveryMarkerNeedsReparse && <div role="status" style={{ flexShrink: 0, margin: "8px 12px 0", padding: "7px 9px", border: "1px solid var(--border-subtle)", borderRadius: "var(--radius-sm)", color: "var(--text-dim)", background: "var(--bg-elevated)", fontSize: 11.5 }}>현재 브라우저 개요에는 복구 본문 상태가 없습니다. 재파싱 후 복구된 캐시 아이콘이 표시됩니다.</div>}
+            <div style={{ flex: 1, minHeight: 0, overflow: "auto", padding: "2px 2px 0" }}>
+              {data.rowCount === 0 && <div style={{ padding: 20, color: "var(--text-faint)", fontSize: 12.5 }}>{search.trim() ? `“${search.trim()}” 검색 결과가 없습니다.` : activeDay ? "선택한 날짜의 기록이 없습니다." : "기간 필터 내 데이터 없음"}</div>}
+              {data.rows.map((row, index, rows) => <ActivityRow key={`${row.__rowid}-${index}`} row={row} final={index === rows.length - 1} bookmarked={bookmarkedRowids?.has(rowidOf(row)) ?? false} onOpen={(opener) => openDetail(row, opener)} onToggleBookmark={onToggleBookmark && Number.isFinite(rowidOf(row)) ? () => onToggleBookmark(rowidOf(row)) : undefined} />)}
+            </div>
+            <div style={{ flexShrink: 0, display: "flex", justifyContent: "center", padding: "8px 2px 2px" }}>
+              <PaginationControls ariaLabel="브라우저 활동 페이지" page={safePage} pageCount={pageCount} onChange={setPage} summary={`(${data.rowCount === 0 ? 0 : (safePage * PAGE_SIZE + 1).toLocaleString()}–${Math.min((safePage + 1) * PAGE_SIZE, data.rowCount).toLocaleString()} / ${data.rowCount.toLocaleString()})`} />
+            </div>
+          </> : <div style={{ flex: 1, minHeight: 0, overflow: "auto" }}>
+            {aiAllSourcesUnreadable ? <div role="alert" style={{ display: "flex", alignItems: "center", gap: 10, padding: 18, color: "var(--warning)", fontSize: 12.5 }}>AI 대화 캐시 원본을 읽지 못했습니다.<button className="nm-btn" type="button" onClick={() => setReloadNonce((value) => value + 1)} style={{ padding: "3px 7px", borderRadius: "var(--radius-sm)", border: "1px solid var(--border)", background: "var(--bg-elevated)", color: "var(--text-dim)", cursor: "pointer", fontSize: 11 }}>다시 시도</button></div> : aiTotal === 0 && aiReferralTotal === 0 ? <div style={{ padding: 18, color: "var(--text-faint)", fontSize: 12.5 }}>기간 필터 내 데이터 없음</div> : <>
+              <div role="tablist" aria-label="AI 대화 데이터 유형" style={{ display: "flex", gap: 4, padding: "8px 12px", borderBottom: "1px solid var(--border-subtle)" }}>
+                <button className="nm-btn" role="tab" aria-selected={aiPanel === "conversations"} onClick={() => setAiPanel("conversations")} style={controlButton(aiPanel === "conversations")}><SmartToyOutlinedIcon sx={{ fontSize: 15 }} />대화 {aiTotal.toLocaleString()}건</button>
+                <button className="nm-btn" role="tab" aria-selected={aiPanel === "referrals"} onClick={() => setAiPanel("referrals")} style={controlButton(aiPanel === "referrals")}><LinkIcon sx={{ fontSize: 15 }} />공유 링크 {aiReferralTotal.toLocaleString()}건</button>
+              </div>
+              {aiPanel === "conversations" ? <div role="tabpanel" aria-label="AI 대화 목록" style={{ padding: 12 }}>
+                {aiTotal === 0 ? <div style={{ padding: 16, textAlign: "center", color: "var(--text-faint)", fontSize: 12.5 }}>기간 필터 내 대화 데이터 없음</div> : conversations.map((conversation, index) => {
+                  const ProviderIcon = providerIcon(conversation.provider);
+                  return (
+                    <button key={`${conversation.url}-${index}`} type="button" onClick={(event) => openAiConversation(conversation, event.currentTarget)} title="대화 내용 보기"
+                      onMouseEnter={(event) => { event.currentTarget.style.background = "var(--bg-hover)"; }}
+                      onMouseLeave={(event) => { event.currentTarget.style.background = "var(--bg-panel)"; }}
+                      style={{ width: "100%", display: "flex", alignItems: "center", gap: 12, minHeight: 58, marginBottom: 8, padding: "8px 12px", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", background: "var(--bg-panel)", color: "inherit", cursor: "pointer", textAlign: "left", transition: "background .15s ease" }}>
+                      <span aria-hidden="true" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 32, height: 32, flexShrink: 0, borderRadius: "var(--radius-sm)", background: "color-mix(in srgb, var(--accent) 15%, transparent)" }}>
+                        <ProviderIcon sx={{ fontSize: 16, color: "var(--accent)" }} />
+                      </span>
+                      <span style={{ flex: 1, minWidth: 0, display: "grid", gap: 2 }}>
+                        <span style={{ display: "flex", alignItems: "center", gap: 7, minWidth: 0 }}>
+                          <span title={conversation.title || conversation.url} style={{ minWidth: 0, fontSize: 13, fontWeight: 700, color: "var(--text)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{conversation.title || "제목 없음"}</span>
+                          <span style={{ flexShrink: 0, display: "inline-flex", alignItems: "center", gap: 4, fontSize: 11.5, fontWeight: 700, color: "var(--accent)", border: "1px solid var(--accent)", borderRadius: "var(--radius-sm)", padding: "1px 8px", whiteSpace: "nowrap" }}>{conversation.provider || "AI"}</span>
+                          {conversation.messages.length > 0 && <span style={{ flexShrink: 0, fontSize: 11, color: "var(--text-faint)", fontFamily: "var(--mono)" }}>메시지 {conversation.messages.length.toLocaleString()}개</span>}
+                        </span>
+                        <span title={conversation.url} style={{ minWidth: 0, fontSize: 11.5, color: "var(--accent)", fontFamily: "var(--mono)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{conversation.url || "주소 정보 없음"}</span>
+                      </span>
+                      <span title={conversation.account} style={{ flexShrink: 0, maxWidth: 120, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 12, color: conversation.account ? "var(--text-dim)" : "var(--text-faint)" }}>{conversation.account || "계정 정보 없음"}</span>
+                      <time style={{ flexShrink: 0, fontSize: 12, color: "var(--text-time)", fontFamily: "var(--mono)", whiteSpace: "nowrap" }}>{formatAiPayloadTime(conversation.date) || "시간 정보 없음"}</time>
+                    </button>
+                  );
+                })}
+                {aiTotal > 0 && <PaginationControls ariaLabel="AI 대화 페이지" page={aiPage} pageCount={Math.max(1, Math.ceil(aiTotal / AI_PAGE_SIZE))} onChange={setAiPage} summary={`(${(aiPage * AI_PAGE_SIZE + 1).toLocaleString()}–${Math.min((aiPage + 1) * AI_PAGE_SIZE, aiTotal).toLocaleString()} / ${aiTotal.toLocaleString()})`} />}
+              </div> : <div role="tabpanel" aria-label="AI 공유 링크 목록" style={{ padding: 12 }}>
+                {aiReferralTotal === 0 ? <div style={{ padding: 16, textAlign: "center", color: "var(--text-faint)", fontSize: 12.5 }}>기간 필터 내 공유 링크 없음</div> : aiReferrals.map((row, index) => {
+                  const provider = referralProvider(row.url);
+                  const ReferralIcon = provider ? providerIcon(provider) : LinkIcon;
+                  const referralBookmarked = bookmarkedRowids?.has(rowidOf(row)) ?? false;
+                  return (
+                  <button key={`${String(row.__rowid)}-${index}`} type="button" className={referralBookmarked ? "dfir-bookmarked-row" : undefined} onClick={(event) => openDetail(row, event.currentTarget)} title={row.url || row.title}
+                    onMouseEnter={(event) => { if (!referralBookmarked) event.currentTarget.style.background = "var(--bg-hover)"; }}
+                    onMouseLeave={(event) => { if (!referralBookmarked) event.currentTarget.style.background = "var(--bg-panel)"; }}
+                    style={{ width: "100%", display: "flex", alignItems: "center", gap: 12, minHeight: 58, marginBottom: 8, padding: "8px 12px", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", background: "var(--bg-panel)", color: "inherit", cursor: "pointer", textAlign: "left", transition: "background .15s ease" }}>
+                    <span aria-hidden="true" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 32, height: 32, flexShrink: 0, borderRadius: "var(--radius-sm)", background: "color-mix(in srgb, var(--accent) 15%, transparent)" }}>
+                      <ReferralIcon sx={{ fontSize: 16, color: "var(--accent)" }} />
+                    </span>
+                    <span style={{ flex: 1, minWidth: 0, display: "grid", gap: 2 }}>
+                      <span style={{ display: "flex", alignItems: "center", gap: 7, minWidth: 0 }}>
+                        <span title={row.title || row.url} style={{ minWidth: 0, fontSize: 13, fontWeight: 700, color: "var(--text)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{row.title || row.url || "제목 없음"}</span>
+                        {provider && <span style={{ flexShrink: 0, display: "inline-flex", alignItems: "center", fontSize: 11.5, fontWeight: 700, color: "var(--accent)", border: "1px solid var(--accent)", borderRadius: "var(--radius-sm)", padding: "1px 8px", whiteSpace: "nowrap" }}>{provider}</span>}
+                      </span>
+                      <span title={row.url} style={{ minWidth: 0, fontSize: 11.5, color: "var(--accent)", fontFamily: "var(--mono)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{row.url || "주소 정보 없음"}</span>
+                    </span>
+                    <time style={{ flexShrink: 0, fontSize: 12, color: "var(--text-time)", fontFamily: "var(--mono)", whiteSpace: "nowrap" }}>{formatAiPayloadTime(row.timestamp) || "시간 정보 없음"}</time>
+                  </button>
+                  );
+                })}
+                {aiReferralTotal > 0 && <PaginationControls ariaLabel="AI 공유 링크 페이지" page={aiReferralPage} pageCount={Math.max(1, Math.ceil(aiReferralTotal / AI_PAGE_SIZE))} onChange={setAiReferralPage} summary={`(${(aiReferralPage * AI_PAGE_SIZE + 1).toLocaleString()}–${Math.min((aiReferralPage + 1) * AI_PAGE_SIZE, aiReferralTotal).toLocaleString()} / ${aiReferralTotal.toLocaleString()})`} />}
+              </div>}
+            </>}
+          </div>}
+        </section>
+      </div>
     </div>
-    </section>
     </main>
     {detail && !aiConvo && !domainStatsOpen && <RowDetailPanel row={detail} columns={Object.keys(detail).filter((key) => key !== "__rowid")} focusedColumn={null} fileBaseName="BrowserActivity" onClose={closeDetail} onNavigate={() => {}} hostDir={hostDir} isBookmarked={bookmarkedRowids?.has(rowidOf(detail)) ?? false} onToggleBookmark={onToggleBookmark && Number.isFinite(rowidOf(detail)) ? () => onToggleBookmark(rowidOf(detail)) : undefined} />}
     {aiConvo && <AiConversationModal conversation={aiConvo} onClose={closeAiConversation} />}
-    {domainStatsOpen && <DomainStatsModal page={domainStatsPage} data={domainStats} visitTotal={insights.visitTotal} onPage={setDomainStatsPage} onClose={closeDomainStats} />}
+    {domainStatsOpen && <DomainStatsModal page={domainStatsPage} data={domainStats} visitTotal={insights.visitTotal} sortAsc={domainSortAsc} onSortAsc={(next) => { setDomainSortAsc(next); setDomainStatsPage(0); }} onPage={setDomainStatsPage} onClose={closeDomainStats} />}
+    {downloadsOpen && <DownloadsModal page={downloadsPage} rows={downloadsData.rows} total={downloadsData.rowCount} onPage={setDownloadsPage} onOpenRow={(row, opener) => { openDetail(row, opener); }} onClose={closeDownloads} />}
   </div>;
 }
 
-function ActivityRow({ row, final, bookmarked, onOpen, onToggleBookmark }: { row: Row; final: boolean; bookmarked: boolean; onOpen: (opener: HTMLElement) => void; onToggleBookmark?: () => void }) {
+function ActivityRow({ row, final: _final, bookmarked, onOpen, onToggleBookmark }: { row: Row; final: boolean; bookmarked: boolean; onOpen: (opener: HTMLElement) => void; onToggleBookmark?: () => void }) {
   const isDownload = row.kind === "download";
   const isCache = row.kind === "cache";
   const hasRecoveredCacheBody = isCache && row.cache_body_recovered === "1";
   const Icon = isDownload ? DownloadOutlinedIcon : hasRecoveredCacheBody ? Inventory2Icon : isCache ? Inventory2OutlinedIcon : LinkOutlinedIcon;
-  const color = isDownload ? "var(--warning)" : hasRecoveredCacheBody ? "var(--success)" : isCache ? "var(--text-faint)" : "var(--accent)";
+  const color = isDownload ? "var(--warning)" : hasRecoveredCacheBody ? "var(--success)" : isCache ? "var(--text-dim)" : "var(--accent)";
+  const kindLabel = isDownload ? "다운로드" : isCache ? "캐시" : "방문";
   const title = row.title || (isDownload ? "파일 이름 없음" : row.url) || "제목 없음";
   const url = isDownload ? row.source_url || row.url : row.url;
   const facts = isDownload && row.size ? row.size : isCache ? [row.status, row.mime, row.size].filter(Boolean).join(" · ") : row.visit_count ? `${row.visit_count}회` : "";
   const activate = (event: React.KeyboardEvent<HTMLDivElement>) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); onOpen(event.currentTarget); } };
-  return <div className={bookmarked ? "dfir-bookmarked-row" : undefined} onMouseEnter={(event) => { if (!bookmarked) event.currentTarget.style.background = "var(--bg-hover)"; }} onMouseLeave={(event) => { if (!bookmarked) event.currentTarget.style.background = "transparent"; }} style={{ borderRadius: "var(--radius-sm)", display: "grid", gridTemplateColumns: ACTIVITY_LEDGER_COLUMNS, gap: 10, alignItems: "center", padding: "8px 12px", borderBottom: final ? "none" : "1px solid var(--border-subtle)", background: "transparent" }}>
-    <div role="button" tabIndex={0} onClick={(event) => onOpen(event.currentTarget)} onKeyDown={activate} style={{ gridColumn: "1 / 4", display: "grid", gridTemplateColumns: ACTIVITY_LEDGER_CONTENT_COLUMNS, gap: 10, alignItems: "center", minWidth: 0, cursor: "pointer", outlineOffset: -2 }}>
-      <span title={row.timestamp || "시간 정보 없음"} style={{ fontSize: 11.5, color: row.timestamp ? "var(--text-time)" : "var(--text-faint)", fontFamily: "var(--mono)", whiteSpace: "nowrap" }}>{formatAiPayloadTime(row.timestamp) || "시간 정보 없음"}</span>
-      <div style={{ minWidth: 0, display: "grid", gridTemplateColumns: facts ? "minmax(0, 1fr) minmax(0, 34%)" : "minmax(0, 1fr)", alignItems: "center", columnGap: 6 }}>
-        <div style={{ minWidth: 0, display: "grid", gridTemplateRows: "18px 16px", rowGap: 2 }}>
-          <div style={{ display: "flex", minWidth: 0, gap: 6, alignItems: "center" }}>
-            <Icon aria-label={isDownload ? "다운로드" : hasRecoveredCacheBody ? "캐시 · 복구된 본문 있음" : isCache ? "캐시" : "방문"} titleAccess={hasRecoveredCacheBody ? "캐시 · 복구된 본문 있음" : undefined} sx={{ flexShrink: 0, fontSize: 16, color }} />
-            <span title={title} style={{ minWidth: 0, flex: 1, fontSize: 12.5, fontWeight: isCache ? 500 : 650, color: isCache ? "var(--text-dim)" : "var(--text)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{title}</span>
-          </div>
-          <div title={row.url_raw || url} style={{ minWidth: 0, paddingLeft: 22, fontSize: 10.5, lineHeight: "16px", color: isCache ? "var(--text-faint)" : "var(--accent)", fontFamily: "var(--mono)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{url || "주소 정보 없음"}</div>
-        </div>
-        {facts && <span title={facts} style={{ minWidth: 0, alignSelf: "center", fontSize: 10.5, color: isDownload ? "var(--warning)" : "var(--text-faint)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", textAlign: "right" }}>{facts}</span>}
-      </div>
-      <span style={{ minWidth: 0, fontSize: 11, color: "var(--text-dim)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{row.account || "—"}</span>
+  return <div className={bookmarked ? "dfir-bookmarked-row" : undefined} onMouseEnter={(event) => { if (!bookmarked) event.currentTarget.style.background = "var(--bg-hover)"; }} onMouseLeave={(event) => { if (!bookmarked) event.currentTarget.style.background = "var(--bg-panel)"; }} style={{ borderRadius: "var(--radius-md)", display: "flex", alignItems: "center", gap: 10, minHeight: 58, marginBottom: 8, padding: "8px 12px", border: "1px solid var(--border)", background: "var(--bg-panel)", transition: "background .15s ease, border-color .15s ease" }}>
+    <div role="button" tabIndex={0} onClick={(event) => onOpen(event.currentTarget)} onKeyDown={activate} aria-label={`${title} 상세 보기`} style={{ flex: 1, display: "flex", alignItems: "center", gap: 12, minWidth: 0, cursor: "pointer", outlineOffset: -2 }}>
+      <span aria-hidden="true" title={hasRecoveredCacheBody ? "캐시 · 복구된 본문 있음" : kindLabel} style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 32, height: 32, flexShrink: 0, borderRadius: "var(--radius-sm)", background: `color-mix(in srgb, ${color} 15%, transparent)` }}>
+        <Icon sx={{ fontSize: 16, color }} />
+      </span>
+      <span style={{ flex: 1, minWidth: 0, display: "grid", gap: 2 }}>
+        <span style={{ display: "flex", alignItems: "center", gap: 7, minWidth: 0 }}>
+          <span title={title} style={{ minWidth: 0, fontSize: 13, fontWeight: isCache ? 550 : 700, color: isCache ? "var(--text-dim)" : "var(--text)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{title}</span>
+          {facts && <span title={facts} style={{ flexShrink: 0, maxWidth: 220, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 11, color: "var(--text-faint)", fontFamily: "var(--mono)" }}>{facts}</span>}
+        </span>
+        <span title={row.url_raw || url} style={{ minWidth: 0, fontSize: 11.5, color: isCache ? "var(--text-faint)" : "var(--accent)", fontFamily: "var(--mono)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{url || "주소 정보 없음"}</span>
+      </span>
+      <span title={row.account} style={{ flexShrink: 0, maxWidth: 120, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 12, color: row.account ? "var(--text-dim)" : "var(--text-faint)" }}>{row.account || "계정 정보 없음"}</span>
+      <span title={row.timestamp || "시간 정보 없음"} style={{ flexShrink: 0, width: 168, textAlign: "right", fontSize: 12.5, color: row.timestamp ? "var(--text-time)" : "var(--text-faint)", fontFamily: "var(--mono)", whiteSpace: "nowrap" }}>{formatAiPayloadTime(row.timestamp) || "시간 정보 없음"}</span>
     </div>
-    {onToggleBookmark ? <button className={bookmarked ? "dfir-bookmark-control" : undefined} onClick={onToggleBookmark} title={bookmarked ? "북마크 해제" : "북마크에 추가"} aria-label={bookmarked ? "북마크 해제" : "북마크에 추가"} style={{ gridColumn: 4, display: "inline-flex", alignSelf: "center", justifyContent: "center", padding: 2, background: "transparent", border: "none", color: bookmarked ? "var(--bookmark)" : "var(--text-faint)", cursor: "pointer" }}>{bookmarked ? <BookmarkIcon sx={{ fontSize: 17 }} /> : <BookmarkBorderIcon sx={{ fontSize: 17 }} />}</button> : <span aria-hidden="true" style={{ gridColumn: 4 }} />}
+    {onToggleBookmark && <button type="button" className={bookmarked ? "dfir-bookmark-control" : undefined} onClick={onToggleBookmark} aria-label={bookmarked ? "북마크 해제" : "북마크 추가"} title={bookmarked ? "북마크 해제" : "북마크 추가"} style={{ flexShrink: 0, display: "inline-flex", alignItems: "center", justifyContent: "center", width: 28, height: 28, padding: 0, border: "none", background: "transparent", color: bookmarked ? "var(--bookmark-control)" : "var(--text-faint)", cursor: "pointer" }}>{bookmarked ? <BookmarkIcon sx={{ fontSize: 17 }} /> : <BookmarkBorderIcon sx={{ fontSize: 17 }} />}</button>}
+  </div>;
+}
+function DownloadsModal({ page, rows, total, onPage, onOpenRow, onClose }: { page: number; rows: Row[]; total: number; onPage: (page: number) => void; onOpenRow: (row: Row, opener: HTMLElement) => void; onClose: () => void }) {
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const closeButtonRef = useRef<HTMLButtonElement>(null);
+  const pageCount = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  const safePage = Math.min(page, pageCount - 1);
+  const first = total === 0 ? 0 : safePage * PAGE_SIZE + 1;
+  const last = Math.min((safePage + 1) * PAGE_SIZE, total);
+  useEffect(() => {
+    closeButtonRef.current?.focus();
+    const closeOnEscape = (event: KeyboardEvent) => { if (event.key === "Escape") onClose(); };
+    document.addEventListener("keydown", closeOnEscape);
+    return () => document.removeEventListener("keydown", closeOnEscape);
+  }, [onClose]);
+  return <div onClick={onClose} style={{ position: "fixed", inset: 0, zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center", padding: 20, background: "rgba(1,4,9,0.6)" }}>
+    <div ref={dialogRef} role="dialog" aria-modal="true" aria-label="전체 다운로드 이력" onClick={(event) => event.stopPropagation()} style={{ display: "flex", flexDirection: "column", width: 860, maxWidth: "100%", maxHeight: "85vh", minHeight: 0, overflow: "hidden", background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", boxShadow: "var(--shadow-panel)" }}>
+      <header style={{ display: "flex", flexShrink: 0, alignItems: "center", gap: 10, padding: "12px 16px", borderBottom: "1px solid var(--border)" }}>
+        <DownloadOutlinedIcon sx={{ fontSize: 18, color: "var(--warning)" }} />
+        <span style={{ fontSize: 14, fontWeight: 700 }}>전체 다운로드</span>
+        <span style={{ fontSize: 11.5, color: "var(--text-faint)" }}>전체 {total.toLocaleString()}건 · 선택 계정 · 기간 필터 기준</span>
+        <button ref={closeButtonRef} type="button" onClick={onClose} aria-label="닫기" style={{ marginLeft: "auto", display: "inline-flex", padding: 4, border: "none", background: "transparent", color: "var(--text-faint)", cursor: "pointer" }}><CloseIcon sx={{ fontSize: 18 }} /></button>
+      </header>
+      <div style={{ flex: 1, minHeight: 0, overflow: "auto", padding: "10px 14px" }}>
+        {total === 0 ? <div style={{ padding: 20, color: "var(--text-faint)", fontSize: 12.5 }}>기간 필터 내 다운로드 기록이 없습니다.</div> : rows.map((row) => (
+          <button key={String(row.__rowid)} onClick={(event) => onOpenRow(row, event.currentTarget)} title={row.title || "다운로드 상세 보기"} style={{ display: "flex", alignItems: "center", gap: 12, width: "100%", minHeight: 54, marginBottom: 8, padding: "8px 12px", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", background: "var(--bg-elevated)", color: "inherit", cursor: "pointer", textAlign: "left", transition: "background .15s ease" }}
+            onMouseEnter={(event) => { event.currentTarget.style.background = "var(--bg-hover)"; }}
+            onMouseLeave={(event) => { event.currentTarget.style.background = "var(--bg-elevated)"; }}>
+            <span aria-hidden="true" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 32, height: 32, flexShrink: 0, borderRadius: "var(--radius-sm)", background: "color-mix(in srgb, var(--warning) 15%, transparent)" }}>
+              <DownloadOutlinedIcon sx={{ fontSize: 16, color: "var(--warning)" }} />
+            </span>
+            <span style={{ flex: 1, minWidth: 0, display: "grid", gap: 2 }}>
+              <span style={{ display: "flex", alignItems: "center", gap: 7, minWidth: 0 }}>
+                <span title={row.title} style={{ minWidth: 0, fontSize: 13, fontWeight: 700, color: "var(--text)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{row.title || "파일 이름 없음"}</span>
+                {row.size && <span style={{ flexShrink: 0, fontSize: 11, color: "var(--text-faint)", fontFamily: "var(--mono)" }}>{row.size}</span>}
+              </span>
+              <span title={row.source_url || row.url} style={{ minWidth: 0, fontSize: 11.5, color: "var(--accent)", fontFamily: "var(--mono)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{row.source_url || row.url || "주소 정보 없음"}</span>
+            </span>
+            <span title={row.account} style={{ flexShrink: 0, maxWidth: 120, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 12, color: row.account ? "var(--text-dim)" : "var(--text-faint)" }}>{row.account || "계정 정보 없음"}</span>
+            <span style={{ flexShrink: 0, width: 168, textAlign: "right", fontSize: 12.5, color: row.timestamp ? "var(--text-time)" : "var(--text-faint)", fontFamily: "var(--mono)", whiteSpace: "nowrap" }}>{formatAiPayloadTime(row.timestamp) || "시간 정보 없음"}</span>
+          </button>
+        ))}
+      </div>
+      <footer style={{ flexShrink: 0, display: "flex", justifyContent: "center", padding: "8px 0 10px", borderTop: "1px solid var(--border-subtle)" }}>
+        <PaginationControls ariaLabel="전체 다운로드 페이지" page={safePage} pageCount={pageCount} onChange={onPage} summary={`(${first.toLocaleString()}–${last.toLocaleString()} / ${total.toLocaleString()})`} />
+      </footer>
+    </div>
   </div>;
 }
 
-function SimplePager({ page, total, onPage }: { page: number; total: number; onPage: (page: number) => void }) {
-  const pages = Math.ceil(total / AI_PAGE_SIZE);
-  if (pages < 2) return null;
-  return <div style={{ display: "flex", justifyContent: "center", alignItems: "center", gap: 8, marginTop: 10 }}><button className="nm-btn" onClick={() => onPage(Math.max(0, page - 1))} disabled={page === 0} style={pageButton(page === 0)}><ChevronLeftIcon sx={{ fontSize: 16 }} />이전</button><span style={{ fontSize: 12, color: "var(--text-dim)" }}>{page + 1} / {pages} 쪽</span><button className="nm-btn" onClick={() => onPage(Math.min(pages - 1, page + 1))} disabled={page >= pages - 1} style={pageButton(page >= pages - 1)}>다음<ChevronRightIcon sx={{ fontSize: 16 }} /></button></div>;
-}
-
-function DomainStatsModal({ page, data, visitTotal, onPage, onClose }: { page: number; data: BrowserDomainStatsPage; visitTotal: number; onPage: (page: number) => void; onClose: () => void }) {
+function DomainStatsModal({ page, data, visitTotal, sortAsc, onSortAsc, onPage, onClose }: { page: number; data: BrowserDomainStatsPage; visitTotal: number; sortAsc: boolean; onSortAsc: (asc: boolean) => void; onPage: (page: number) => void; onClose: () => void }) {
   const dialogRef = useRef<HTMLDivElement>(null);
   const closeButtonRef = useRef<HTMLButtonElement>(null);
   const pageCount = Math.max(1, Math.ceil(data.total / DOMAIN_PAGE_SIZE));
@@ -467,14 +653,25 @@ function DomainStatsModal({ page, data, visitTotal, onPage, onClose }: { page: n
         <LanguageOutlinedIcon sx={{ fontSize: 18, color: "var(--accent)" }} />
         <span style={{ fontSize: 14, fontWeight: 700 }}>전체 방문 도메인</span>
         <span style={{ fontSize: 11.5, color: "var(--text-faint)" }}>도메인 {data.total.toLocaleString()}개 · 방문 {visitTotal.toLocaleString()}회</span>
-        <button ref={closeButtonRef} onClick={onClose} title="닫기" aria-label="닫기" style={{ marginLeft: "auto", display: "inline-flex", flexShrink: 0, padding: 2, background: "transparent", border: "none", color: "var(--text-faint)", cursor: "pointer" }}><CloseIcon sx={{ fontSize: 18 }} /></button>
+        <button type="button" className="nm-btn" onClick={() => onSortAsc(!sortAsc)} title="방문 횟수 정렬 순서 변경" style={{ marginLeft: "auto", display: "inline-flex", alignItems: "center", gap: 5, minHeight: 29, padding: "3px 10px", background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", color: "var(--text-dim)", cursor: "pointer", fontSize: 11.5, fontWeight: 600, whiteSpace: "nowrap" }}>
+          <SortIcon2 sx={{ fontSize: 15 }} />횟수 · {sortAsc ? "적은 순" : "많은 순"}
+        </button>
+        <button ref={closeButtonRef} onClick={onClose} title="닫기" aria-label="닫기" style={{ display: "inline-flex", flexShrink: 0, padding: 2, background: "transparent", border: "none", color: "var(--text-faint)", cursor: "pointer" }}><CloseIcon sx={{ fontSize: 18 }} /></button>
       </header>
-      <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) 118px 100px", gap: 12, flexShrink: 0, padding: "8px 16px", borderBottom: "1px solid var(--border-subtle)", fontSize: 10.5, fontWeight: 700, color: "var(--text-faint)" }}><span>도메인</span><span style={{ textAlign: "right" }}>서로 다른 URL</span><span style={{ textAlign: "right" }}>방문 횟수</span></div>
-      <main style={{ minHeight: 0, overflow: "auto" }}>{data.total === 0 ? <div style={{ padding: 18, color: "var(--text-faint)", fontSize: 12.5 }}>기간 필터 내 방문 도메인이 없습니다.</div> : data.domains.map((domain) => <div key={domain.domain} title={domain.domain} style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) 118px 100px", gap: 12, alignItems: "center", minHeight: 36, padding: "6px 16px", borderBottom: "1px solid var(--border-subtle)" }}><span style={{ minWidth: 0, color: "var(--text)", fontFamily: "var(--mono)", fontSize: 12, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{domain.domain}</span><span style={{ color: "var(--text-dim)", fontFamily: "var(--mono)", fontSize: 11, textAlign: "right", whiteSpace: "nowrap" }}>{domain.urlCount.toLocaleString()}</span><span style={{ color: "var(--text)", fontFamily: "var(--mono)", fontSize: 11.5, textAlign: "right", whiteSpace: "nowrap" }}>{domain.visitCount.toLocaleString()}회</span></div>)}</main>
-      <footer style={{ flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", gap: 8, padding: "10px 16px", borderTop: "1px solid var(--border-subtle)" }}>
-        <button className="nm-btn" onClick={() => onPage(safePage - 1)} disabled={safePage === 0} style={pageButton(safePage === 0)}><ChevronLeftIcon sx={{ fontSize: 16 }} />이전</button>
-        <span style={{ minWidth: 154, color: "var(--text-dim)", fontSize: 12, textAlign: "center" }}>{safePage + 1} / {pageCount} 쪽 <span style={{ color: "var(--text-faint)" }}>({first.toLocaleString()}–{last.toLocaleString()} / {data.total.toLocaleString()})</span></span>
-        <button className="nm-btn" onClick={() => onPage(safePage + 1)} disabled={safePage >= pageCount - 1} style={pageButton(safePage >= pageCount - 1)}>다음<ChevronRightIcon sx={{ fontSize: 16 }} /></button>
+      <main style={{ minHeight: 0, overflow: "auto", padding: "10px 14px" }}>{data.total === 0 ? <div style={{ padding: 18, color: "var(--text-faint)", fontSize: 12.5 }}>기간 필터 내 방문 도메인이 없습니다.</div> : data.domains.map((domain) => (
+        <div key={domain.domain} title={domain.domain} style={{ display: "flex", alignItems: "center", gap: 12, minHeight: 52, marginBottom: 8, padding: "8px 12px", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", background: "var(--bg-elevated)" }}>
+          <span aria-hidden="true" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 32, height: 32, flexShrink: 0, borderRadius: "var(--radius-sm)", background: "var(--accent-subtle)" }}>
+            <LanguageOutlinedIcon sx={{ fontSize: 16, color: "var(--accent)" }} />
+          </span>
+          <span style={{ flex: 1, minWidth: 0, display: "grid", gap: 2 }}>
+            <span style={{ minWidth: 0, color: "var(--text)", fontFamily: "var(--mono)", fontSize: 13, fontWeight: 650, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{domain.domain}</span>
+            <span style={{ color: "var(--text-faint)", fontSize: 11.5 }}>서로 다른 URL {domain.urlCount.toLocaleString()}개</span>
+          </span>
+          <span style={{ flexShrink: 0, color: "var(--text)", fontFamily: "var(--mono)", fontSize: 13, fontWeight: 700, whiteSpace: "nowrap" }}>{domain.visitCount.toLocaleString()}회</span>
+        </div>
+      ))}</main>
+      <footer style={{ flexShrink: 0, display: "flex", justifyContent: "center", padding: "8px 0 10px", borderTop: "1px solid var(--border-subtle)" }}>
+        <PaginationControls ariaLabel="전체 방문 도메인 페이지" page={safePage} pageCount={pageCount} onChange={onPage} summary={`(${first.toLocaleString()}–${last.toLocaleString()} / ${data.total.toLocaleString()})`} />
       </footer>
     </div>
   </div>;
@@ -524,7 +721,7 @@ function AiConversationModal({ conversation, onClose }: { conversation: DisplayA
         {metadata.map(([label, value]) => <div key={label} style={{ minWidth: 0 }}><div style={{ fontSize: 10, color: "var(--text-faint)", marginBottom: 2 }}>{label}</div><div title={value} style={{ fontSize: 11.5, color: "var(--text-dim)", fontFamily: "var(--mono)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{value}</div></div>)}
       </div>
       <div title={conversation.url} style={{ flexShrink: 0, minWidth: 0, padding: "7px 16px", borderBottom: "1px solid var(--border-subtle)", color: "var(--text-faint)", fontFamily: "var(--mono)", fontSize: 10.5, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{conversation.url}</div>
-      <main aria-label="대화 메시지" style={{ minHeight: 0, overflow: "auto", padding: 16 }}>
+      <main aria-label="대화 메시지" style={{ minHeight: 0, overflow: "auto", padding: 16, background: "var(--bg)" }}>
         {showRaw ? <pre style={{ margin: 0, padding: 10, maxHeight: "62vh", overflow: "auto", background: "var(--bg-input)", border: "1px solid var(--border-subtle)", borderRadius: "var(--radius-sm)", fontFamily: "var(--mono)", fontSize: 11.5, lineHeight: 1.55, whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{conversation.raw}</pre> : conversation.messages.length === 0 ? <div style={{ padding: "18px 0", color: "var(--text-faint)", fontSize: 12.5 }}>표시할 대화 메시지를 추출하지 못했습니다. 원본 JSON에서 확인할 수 있습니다.</div> : <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
           {conversation.messages.map((message, index) => {
             const info = roleInfo(message.role);
@@ -532,9 +729,12 @@ function AiConversationModal({ conversation, onClose }: { conversation: DisplayA
             const roleIsSystem = info.kind === "system";
             const RoleIcon = info.Icon;
             if (roleIsSystem) return <div key={index} style={{ display: "flex", alignItems: "center", gap: 8, color: "var(--text-faint)", fontSize: 11.5 }}><span style={{ height: 1, flex: 1, background: "var(--border-subtle)" }} /><RoleIcon sx={{ fontSize: 14, color: info.color }} /><span>{info.label}{message.time ? ` · ${message.time}` : ""}</span><span style={{ height: 1, flex: 1, background: "var(--border-subtle)" }} /></div>;
-            return <article key={index} aria-label={`${info.label}${message.time ? ` ${message.time}` : ""}`} style={{ display: "flex", flexDirection: "column", alignItems: roleIsUser ? "flex-end" : "flex-start", gap: 4 }}>
-              <div style={{ display: "flex", alignItems: "center", gap: 5, color: info.color, fontSize: 11, fontWeight: 700 }}><RoleIcon sx={{ fontSize: 15 }} /><span>{info.label}</span>{message.time && <time style={{ color: "var(--text-faint)", fontFamily: "var(--mono)", fontSize: 10.5, fontWeight: 400 }}>{message.time}</time>}</div>
-              <div style={{ width: "fit-content", maxWidth: "88%", minWidth: 0, padding: "10px 12px", border: `1px solid ${roleIsUser ? "var(--border)" : "var(--accent)"}`, borderLeftWidth: roleIsUser ? 1 : 3, borderRadius: "var(--radius-sm)", background: roleIsUser ? "var(--bg-input)" : "var(--bg-elevated)", color: "var(--text)", fontSize: 12.5, lineHeight: 1.6, overflow: "hidden" }}><ChatMessageBody text={message.text} /></div>
+            return <article key={index} aria-label={`${info.label}${message.time ? ` ${message.time}` : ""}`} style={{ display: "flex", flexDirection: roleIsUser ? "row-reverse" : "row", alignItems: "flex-start", gap: 8 }}>
+              <span aria-hidden="true" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 28, height: 28, flexShrink: 0, marginTop: 17, borderRadius: "50%", background: `color-mix(in srgb, ${roleIsUser ? "var(--text-dim)" : "var(--accent)"} 15%, transparent)` }}><RoleIcon sx={{ fontSize: 15, color: info.color }} /></span>
+              <div style={{ display: "flex", flexDirection: "column", alignItems: roleIsUser ? "flex-end" : "flex-start", gap: 4, minWidth: 0, maxWidth: "82%" }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 5, color: info.color, fontSize: 11, fontWeight: 700 }}><span>{info.label}</span>{message.time && <time style={{ color: "var(--text-faint)", fontFamily: "var(--mono)", fontSize: 10.5, fontWeight: 400 }}>{message.time}</time>}</div>
+                <div style={{ width: "fit-content", maxWidth: "100%", minWidth: 0, padding: "9px 13px", border: `1px solid ${roleIsUser ? "color-mix(in srgb, var(--accent) 38%, var(--border))" : "var(--border)"}`, borderRadius: roleIsUser ? "12px 4px 12px 12px" : "4px 12px 12px 12px", background: roleIsUser ? "color-mix(in srgb, var(--accent) 13%, transparent)" : "var(--bg-elevated)", color: "var(--text)", fontSize: 12.5, lineHeight: 1.6, overflow: "hidden" }}><ChatMessageBody text={message.text} /></div>
+              </div>
             </article>;
           })}
         </div>}
@@ -543,11 +743,26 @@ function AiConversationModal({ conversation, onClose }: { conversation: DisplayA
   </div>;
 }
 
+// 채팅 본문의 마크다운 경량 렌더링 — **굵게**, `인라인 코드`만 서식으로 바꾼다.
+// 완전한 마크다운 파서가 아니라 캐시에서 복원한 원문을 읽기 좋게 하는 수준.
+function inlineMarkdown(text: string): React.ReactNode[] {
+  return text.split(/(`[^`\n]+`|\*\*[^*\n]+\*\*)/g).filter(Boolean).map((token, index) => {
+    if (token.startsWith("**") && token.endsWith("**")) return <strong key={index}>{token.slice(2, -2)}</strong>;
+    if (token.startsWith("`") && token.endsWith("`")) return <code key={index} style={{ padding: "1px 5px", background: "var(--bg-input)", border: "1px solid var(--border-subtle)", borderRadius: 4, fontFamily: "var(--mono)", fontSize: 11.5 }}>{token.slice(1, -1)}</code>;
+    return <span key={index}>{token}</span>;
+  });
+}
+
 function ChatMessageBody({ text }: { text: string }) {
   const parts = text.split(/(```[\s\S]*?```)/g).filter(Boolean);
   return <>{parts.map((part, index) => {
     const isCode = part.startsWith("```") && part.endsWith("```");
     if (isCode) return <pre key={index} style={{ maxWidth: "100%", margin: index === 0 ? 0 : "8px 0 0", padding: "8px 10px", overflow: "auto", background: "var(--bg)", border: "1px solid var(--border-subtle)", borderRadius: "var(--radius-sm)", color: "var(--text)", fontFamily: "var(--mono)", fontSize: 11.5, lineHeight: 1.5, whiteSpace: "pre" }}>{part.replace(/^```[^\n]*\n?/, "").replace(/```$/, "")}</pre>;
-    return <span key={index} style={{ display: "block", minWidth: 0, whiteSpace: "pre-wrap", overflowWrap: "anywhere", wordBreak: "break-word" }}>{part}</span>;
+    // 텍스트 구간은 줄 단위로 나눠 "#·##·### 제목" 줄만 굵은 블록으로 승격한다.
+    return <span key={index} style={{ display: "block", minWidth: 0, whiteSpace: "pre-wrap", overflowWrap: "anywhere", wordBreak: "break-word" }}>{part.split(/\n/).map((line, lineIndex) => {
+      const heading = /^#{1,6}\s+(.*)$/.exec(line);
+      const content = heading ? <span style={{ display: "inline-block", fontSize: 13, fontWeight: 700 }}>{inlineMarkdown(heading[1])}</span> : inlineMarkdown(line);
+      return <span key={lineIndex}>{lineIndex > 0 && "\n"}{content}</span>;
+    })}</span>;
   })}</>;
 }

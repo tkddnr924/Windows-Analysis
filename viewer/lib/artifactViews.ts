@@ -1,4 +1,5 @@
 import { tagsForBoolean, tagsForDangerType, tagsForEventLevel, tagsForNameMismatch, tagsForPath, type Tag } from "./tagging";
+import { executableNote } from "./executableCatalog";
 import { lookupEventCatalog, parseEventData, extractEventField, extractPsClassicField, tagsForSecurityEvent, EVENT_QUICK_FIELDS, LOGON_TYPE_LABELS } from "./eventCatalog";
 
 export type FieldKind = "text" | "path" | "code" | "hash" | "bytes" | "json" | "badge" | "privileges" | "accountSid" | "account" | "byteSize" | "durationMs" | "cacheData";
@@ -129,7 +130,7 @@ export interface ArtifactViewSpec {
    * Overview correlations (TargetInfo, ...) read as summaries/dashboards, not
    * spreadsheets, so each gets a purpose-built view.
    */
-  customView?: "targetInfo" | "executionHistory" | "powershellFlow" | "defender" | "registryFindings" | "rdpCache" | "browserHistory" | "smb" | "scheduledTasks" | "wer" | "mft";
+  customView?: "targetInfo" | "executionHistory" | "powershellFlow" | "defender" | "registryFindings" | "rdpCache" | "browserHistory" | "smb" | "bits" | "scheduledTasks" | "wer" | "mft";
   /**
    * In the sidebar, present this table split by this column: instead of one
    * row for the whole table, the category lists one entry per distinct value
@@ -364,6 +365,27 @@ function werReason(r: Record<string, string>): string | undefined {
   return parts.length ? parts.join(" · ") : undefined;
 }
 
+// UserAssist 값 이름은 ROT13으로 인코딩된 실행 파일 경로다.
+function rot13(value: string): string {
+  return value.replace(/[a-zA-Z]/g, (ch) => {
+    const base = ch <= "Z" ? 65 : 97;
+    return String.fromCharCode(((ch.charCodeAt(0) - base + 13) % 26) + base);
+  });
+}
+// 실행 파일 카탈로그 참고 태그 — 승격된 원본 레코드(Amcache·Prefetch·
+// Registry·SRUM)에서도 실행 이력과 동일하게 표시한다.
+function executableNoteTags(name: string | undefined): Tag[] {
+  const note = name ? executableNote(name) : "";
+  return note ? [{ label: note, severity: "info", description: "실행 파일 카탈로그 참고 — 공격자가 자주 쓰는 도구입니다. 실행 자체가 악성이라는 뜻은 아닙니다." }] : [];
+}
+
+function userAssistProgram(r: Record<string, string>): string {
+  if (!/userassist/i.test(r.key_path || "") || !r.value_name) return "";
+  const decoded = rot13(r.value_name);
+  // GUID 접두({...}\...)는 알려진 폴더 표기 — 그대로 두되 경로로 읽히게 한다.
+  return decoded;
+}
+
 const VIEWS: Record<string, ArtifactViewSpec> = {
   // Windows Error Reporting — every report field lives in one `report` JSON
   // column; WerView parses it into fault-signature / loaded-modules sections.
@@ -476,9 +498,13 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     timelineSubtitle: (r) => [executionSourceLabel(r), r.program_path].filter(Boolean).join(" · "),
     subtitle: (r) => r.timestamp || "",
     overviewTime: "hide",
-    tags: (r) => executionEvidence(r) === "amcache"
-      ? tagsForPath(r.program_path).concat(tagsForMissingAmcachePublisher(r.publisher))
-      : tagsForPath(r.program_path),
+    tags: (r) => {
+      const base = executionEvidence(r) === "amcache"
+        ? tagsForPath(r.program_path).concat(tagsForMissingAmcachePublisher(r.publisher))
+        : tagsForPath(r.program_path);
+      const note = executableNote(r.program_name || basename(r.program_path));
+      return note ? base.concat([{ label: note, severity: "info", description: "실행 파일 카탈로그 참고 — 공격자가 자주 쓰는 도구입니다. 실행 자체가 악성이라는 뜻은 아닙니다." }]) : base;
+    },
     priorityColumns: ["timestamp", "program_name", "program_path", "run_count", "source_artifact"],
     sections: [
       { heading: "Amcache 프로그램 정보", fields: [
@@ -694,9 +720,14 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
       // Registry-derived findings inherit the source key's LastWrite time.
       // ShimCache is different: its timestamp is the cache entry's FILETIME,
       // not proof of a registry key write.
-      { key: "timestamp", label: "레지스트리 키 마지막 기록 시각", compute: (r) => r.subtype === "ShimCache" ? "" : r.timestamp },
+      { key: "timestamp", label: "레지스트리 키 마지막 기록 시각", compute: (r) => r.subtype === "ShimCache" || r.subtype === "MsiInstall" ? "" : r.timestamp },
       { key: "timestamp", label: "ShimCache 캐시 항목 시각", compute: (r) => r.subtype === "ShimCache" ? r.timestamp : "" },
-      { key: "value", label: "값" },
+      // MSI InstallDate는 날짜만 있는 값이라 자정(00:00:00.000)으로 저장된다.
+      { key: "timestamp", label: "설치 날짜", compute: (r) => r.subtype === "MsiInstall" ? r.timestamp : "" },
+      { key: "value", label: "버전", compute: (r) => r.subtype === "MsiInstall" ? r.value : "" },
+      { key: "detail", label: "제조사", compute: (r) => r.subtype === "MsiInstall" ? r.detail : "" },
+      { key: "properties", label: "InstallProperties 전체", kind: "json" },
+      { key: "value", label: "값", compute: (r) => r.subtype === "MsiInstall" ? "" : r.value },
       { key: "command", label: "명령" },
       { key: "user", label: "사용자" },
       { key: "key_path", label: "키 경로" },
@@ -817,6 +848,34 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     ]}],
   },
 
+
+  BitsHistory: {
+    customView: "bits",
+    title: (r) => r.job_name || "(작업 이름 없음)",
+    subtitle: (r) => r.url || "",
+    links: [{ key: "record_key", label: "이벤트 로그 원본 보기", targetFile: "EventLog_Events", targetColumn: "_record_key" }],
+    visibleColumns: ["timestamp", "job_name", "url", "account", "result", "description"],
+    priorityColumns: ["timestamp", "job_name", "url", "account", "result", "description"],
+    sections: [
+      { heading: "작업", fields: [
+        { key: "job_name", label: "작업 이름" },
+        { key: "job_id", label: "작업 ID" },
+        { key: "url", label: "전송 URL", kind: "path" },
+        { key: "account", label: "계정" },
+        { key: "process", label: "요청 프로세스", kind: "path" },
+      ]},
+      { heading: "전송", fields: [
+        { key: "bytes_transferred", label: "전송한 크기", kind: "bytes" },
+        { key: "bytes_total", label: "전체 크기", kind: "bytes" },
+        { key: "status", label: "상태 코드" },
+      ]},
+      { heading: "상세", fields: [
+        { key: "description", label: "설명" },
+        { key: "result", label: "결과" },
+        { key: "event_id", label: "이벤트 ID" },
+      ]},
+    ],
+  },
   PowerShellHistory: {
     customView: "powershellFlow",
     // ScriptBlock and HostApplication can be arbitrarily long. Keep the
@@ -864,7 +923,7 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     ],
     // HiddenArp=1 means the program was deliberately hidden from Add/Remove
     // Programs — a real self-concealment technique, not just noise.
-    tags: (r) => tagsForBoolean(r.HiddenArp, { label: "제어판에서 숨김(HiddenArp)", severity: "danger", description: "제어판 '프로그램 추가/제거' 목록에서 의도적으로 숨겨진 프로그램입니다. 사용자 눈에 띄지 않게 하려는 자기은폐(self-concealment) 기법으로, 정상 소프트웨어에서는 드뭅니다." }),
+    tags: (r) => tagsForBoolean(r.HiddenArp, { label: "제어판에서 숨김(HiddenArp)", severity: "danger", description: "제어판 '프로그램 추가/제거' 목록에서 의도적으로 숨겨진 프로그램입니다. 사용자 눈에 띄지 않게 하려는 자기은폐(self-concealment) 기법으로, 정상 소프트웨어에서는 드뭅니다." }).concat(executableNoteTags(r.Name)),
     links: [
       { key: "ProgramId", label: "이 프로그램이 설치한 파일 보기", targetFile: "Amcache_Files", targetColumn: "program_id" },
     ],
@@ -903,10 +962,9 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     ],
     // Filename-vs-internal-name mismatch is a classic masquerading signal
     // on top of the general suspicious-path check.
-    tags: (r) => tagsForPath(r.lower_case_long_path)
+    tags: (r) => tagsForPath(r.lower_case_long_path).concat(executableNoteTags(r.name || basename(r.lower_case_long_path)))
       .concat(tagsForNameMismatch(r.name, r.original_file_name))
       .concat(tagsForMissingAmcachePublisher(r.publisher)),
-    links: [{ key: "program_id", label: "이 파일을 설치한 프로그램 보기", targetFile: "Amcache_Programs", targetColumn: "ProgramId" }],
     // No timelineField: reaches the master timeline via ExecutionHistory.
     priorityColumns: ["timestamp", "name", "lower_case_long_path", "product_name", "publisher", "size"],
     sections: [
@@ -937,13 +995,26 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
   // so the per-file logs still get the full catalog/tags/detail view.
   // 원본 레지스트리 레코드 — 실행 이력·레지스트리 특이사항의 북마크가
   // 원본 레코드로 승격되면 이 스펙으로 열린다(생 덤프 방지).
+  // UserAssist 값 이름은 ROT13 인코딩이라 해독해 프로그램 이름으로 보여준다.
   Registry: {
-    title: () => "Registry",
-    subtitle: (r) => r.last_write || "",
+    title: (r) => {
+      const decoded = userAssistProgram(r);
+      if (decoded) return decoded.split("\\").filter(Boolean).pop() || decoded;
+      // BAM처럼 값 이름이 실행 파일 경로면 파일명만 제목으로 쓴다.
+      if (/[\\/]/.test(r.value_name || "")) return basename(r.value_name) || r.value_name;
+      return r.value_name || "Registry";
+    },
+    subtitle: (r) => (userAssistProgram(r) ? `UserAssist · ${r.last_write || ""}`.trim() : r.last_write || ""),
+    tags: (r) => {
+      const decoded = userAssistProgram(r);
+      const name = decoded ? decoded.split("\\").filter(Boolean).pop() : basename(r.value_name);
+      return executableNoteTags(name);
+    },
     overviewTime: "hide",
     priorityColumns: ["last_write", "key_path", "value_name", "value_data"],
     sections: [
       { heading: "레지스트리 원본 레코드", fields: [
+        { key: "_ua_program", label: "실행 프로그램 (UserAssist 해독)", kind: "path", compute: (r) => userAssistProgram(r) || undefined },
         { key: "last_write", label: "마지막 기록 시각" },
         { key: "key_path", label: "키 경로", kind: "path" },
         { key: "value_name", label: "값 이름" },
@@ -957,8 +1028,9 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
 
   // SRUM 원본 레코드 — 실행 이력의 SRUM(첫 관찰) 항목이 승격되는 대상.
   SRUM_ApplicationResourceUsage: {
-    title: () => "SRUM",
-    subtitle: (r) => r.timestamp || "",
+    title: (r) => basename(r.app) || "SRUM",
+    subtitle: (r) => (r.app ? `SRUM · ${r.timestamp || ""}`.trim() : r.timestamp || ""),
+    tags: (r) => executableNoteTags(basename(r.app)),
     overviewTime: "hide",
     priorityColumns: ["timestamp", "app", "user"],
     sections: [
@@ -987,7 +1059,11 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     // service/scheduled-task persistence, audit log clearing, suspicious
     // PowerShell, group-membership changes, etc. Anything not in the
     // curated catalog simply yields no extra tag, it isn't hidden.
-    tags: (r) => tagsForEventLevel(r.LevelName).concat(tagsForSecurityEvent(r.Provider, r.EventID, r.EventData)),
+    tags: (r) => {
+      const base = tagsForEventLevel(r.LevelName).concat(tagsForSecurityEvent(r.Provider, r.EventID, r.EventData));
+      const catalog = lookupEventCatalog(r.Provider, r.EventID);
+      return catalog ? base.concat([{ label: catalog.label, severity: "info", description: `이벤트 카탈로그 · ${catalog.category}` }]) : base;
+    },
     timelineField: "timestamp",
     timelineInclude: includeEventLogTimeline,
     computedColumns: [
@@ -1134,6 +1210,7 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
   Prefetch_Execution: {
     title: (r) => r.executable_filename || "(no exe)",
     subtitle: (r) => (r.run_count ? `실행 ${r.run_count}회` : ""),
+    tags: (r) => executableNoteTags(r.executable_filename),
     badges: [{ key: "_status", kind: "badge", badgeColors: STATUS_COLORS }],
     embeddedLinks: [{ key: "prefetch_hash", label: "Prefetch에 기록된 참조 파일", targetFile: "Prefetch_LoadedFiles", targetColumn: "prefetch_hash" }],
     // No timelineField: Prefetch reaches the master timeline via ExecutionHistory.

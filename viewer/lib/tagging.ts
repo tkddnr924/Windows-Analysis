@@ -1,4 +1,4 @@
-export type TagSeverity = "warning" | "danger";
+export type TagSeverity = "warning" | "danger" | "info";
 
 export interface Tag {
   label: string;

@@ -16,10 +16,12 @@ import BoltOutlinedIcon from "@mui/icons-material/BoltOutlined";
 import ManageSearchOutlinedIcon from "@mui/icons-material/ManageSearchOutlined";
 import TerminalOutlinedIcon from "@mui/icons-material/TerminalOutlined";
 import DnsOutlinedIcon from "@mui/icons-material/DnsOutlined";
+import CloudDownloadOutlinedIcon from "@mui/icons-material/CloudDownloadOutlined";
 import TaskOutlinedIcon from "@mui/icons-material/TaskOutlined";
 import LanguageOutlinedIcon from "@mui/icons-material/LanguageOutlined";
 import PhotoLibraryOutlinedIcon from "@mui/icons-material/PhotoLibraryOutlined";
 import ReportProblemOutlinedIcon from "@mui/icons-material/ReportProblemOutlined";
+import ShieldOutlinedIcon from "@mui/icons-material/ShieldOutlined";
 import type { Case, Host, CategoryEntry, ResultFileEntry } from "@/lib/types";
 import { EMPTY_TIME_RANGE, rangeActive, type TimeRange } from "@/lib/timeRange";
 import DateTimeInput from "./DateTimeInput";
@@ -99,6 +101,7 @@ const OVERVIEW_ORDER: string[] = [
   "RegistryFindings",
   "PowerShellHistory",
   "SmbHistory",
+  "BitsHistory",
   "ScheduledTasks",
   "RdpCache",
 ];
@@ -112,6 +115,7 @@ const OVERVIEW_TABLE_NAMES: Record<string, string> = {
   BrowserActivity: "브라우저 활동",
   RemoteDesktopHistory: "원격 접근 이력 (RDP)",
   SmbHistory: "SMB 접속 이력",
+  BitsHistory: "BITS 전송 이력",
   PowerShellHistory: "파워셸 실행 이력",
   RdpCache: "RDP Cache",
   ScheduledTasks: "작업 스케줄러",
@@ -127,9 +131,12 @@ function OverviewTableIcon({ name }: { name: string }) {
     case "MFT_Records": return <FolderOpenOutlinedIcon {...props} />;
     case "RemoteDesktopHistory": return <DesktopWindowsOutlinedIcon {...props} />;
     case "ExecutionHistory": return <BoltOutlinedIcon {...props} />;
+    // Defender 뷰 헤더와 동일한 방패 아이콘.
+    case "Defender": return <ShieldOutlinedIcon {...props} />;
     case "RegistryFindings": return <ManageSearchOutlinedIcon {...props} />;
     case "PowerShellHistory": return <TerminalOutlinedIcon {...props} />;
     case "SmbHistory": return <DnsOutlinedIcon {...props} />;
+    case "BitsHistory": return <CloudDownloadOutlinedIcon {...props} />;
     case "ScheduledTasks": return <TaskOutlinedIcon {...props} />;
     // Keep the navigation glyph identical to the RDP Cache view header; the
     // remote session ledger itself uses the desktop glyph above.
@@ -196,7 +203,6 @@ function FileRow({
         {leading}
         <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>{label}</span>
       </span>
-      <span style={{ color: "var(--text-faint)", fontSize: 11.5, flexShrink: 0 }}>{(count ?? entry.rowCount).toLocaleString()}</span>
     </div>
   );
 }

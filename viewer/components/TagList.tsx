@@ -10,8 +10,8 @@ export default function TagList({ tags }: { tags: Tag[] }) {
         return (
           <span
             key={tag.label}
-            title={tag.description ?? (tag.severity === "danger" ? "위험 신호 — 확인 필요" : "이상 신호 — 확인 권장")}
-            className={`dfir-tag dfir-tag--${tag.severity === "danger" ? "critical" : "attention"}`}
+            title={tag.description ?? (tag.severity === "danger" ? "위험 신호 — 확인 필요" : tag.severity === "info" ? "카탈로그 참고 정보" : "이상 신호 — 확인 권장")}
+            className={`dfir-tag dfir-tag--${tag.severity === "danger" ? "critical" : tag.severity === "info" ? "note" : "attention"}`}
           >
             {tag.label}
           </span>

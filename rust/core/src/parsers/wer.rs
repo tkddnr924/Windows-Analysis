@@ -107,13 +107,31 @@ impl IntoTuple for (&str, usize, Option<String>) {
     }
 }
 
+fn utf16le(data: &[u8]) -> String {
+    let u: Vec<u16> = data
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    String::from_utf16_lossy(&u)
+}
+
+/// Windows writes some Report.wer files as UTF-16LE with no BOM. The report
+/// text is ASCII-heavy, so such a file has a NUL in nearly every odd byte —
+/// use that to tell it apart from UTF-8.
+fn looks_utf16le(data: &[u8]) -> bool {
+    if data.len() < 4 || !data.len().is_multiple_of(2) {
+        return false;
+    }
+    let sample = &data[..data.len().min(256)];
+    let odd_nuls = sample.iter().skip(1).step_by(2).filter(|&&b| b == 0).count();
+    odd_nuls * 3 > sample.len() / 2
+}
+
 fn decode(data: &[u8]) -> String {
     let s = if data.len() >= 2 && data[0] == 0xFF && data[1] == 0xFE {
-        let u: Vec<u16> = data[2..]
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
-            .collect();
-        String::from_utf16_lossy(&u)
+        utf16le(&data[2..])
+    } else if looks_utf16le(data) {
+        utf16le(data)
     } else {
         String::from_utf8_lossy(data).into_owned()
     };
@@ -246,4 +264,39 @@ pub fn parse_wer_with_sources(root: &Path) -> Result<(Vec<std::path::PathBuf>, V
 
 pub fn parse_wer(root: &Path) -> Result<Vec<Row>> {
     Ok(parse_wer_with_sources(root)?.1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode;
+
+    fn utf16le_bytes(s: &str, bom: bool) -> Vec<u8> {
+        let mut out = Vec::new();
+        if bom {
+            out.extend_from_slice(&[0xFF, 0xFE]);
+        }
+        for u in s.encode_utf16() {
+            out.extend_from_slice(&u.to_le_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn decode_utf16le_with_bom() {
+        let text = "Version=1\r\nEventType=APPCRASH\r\nAppName=foo.exe\r\n";
+        assert_eq!(decode(&utf16le_bytes(text, true)), text);
+    }
+
+    #[test]
+    fn decode_utf16le_without_bom() {
+        // Windows writes some Report.wer files as BOM-less UTF-16LE.
+        let text = "Version=1\r\nEventType=APPCRASH\r\nAppName=foo.exe\r\n";
+        assert_eq!(decode(&utf16le_bytes(text, false)), text);
+    }
+
+    #[test]
+    fn decode_utf8_stays_utf8() {
+        let text = "Version=1\r\nEventType=APPCRASH\r\n";
+        assert_eq!(decode(text.as_bytes()), text);
+    }
 }

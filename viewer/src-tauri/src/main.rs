@@ -25,7 +25,7 @@ use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter};
 use url::Url;
 use wina_core::sqlite::write_table;
 use wina_core::{case_store, overview, pipeline};
@@ -2521,6 +2521,7 @@ async fn browser_activity_insights(
 /// Server-paginated continuation of the compact domain analysis strip. The
 /// same account and global incident-period where clause as insights is used;
 /// a selected day or activity-kind toggle deliberately never narrows it.
+#[allow(clippy::too_many_arguments)] // 정렬 옵션 포함 command 시그니처
 fn browser_activity_domains_blocking(
     full_path: String,
     table_name: String,
@@ -2529,14 +2530,19 @@ fn browser_activity_domains_blocking(
     end: Option<String>,
     offset: i64,
     limit: i64,
+    ascending: Option<bool>,
 ) -> Result<BrowserDomainStatsPage, String> {
-    let domains = browser_visit_domains_cached(
+    let mut domains = browser_visit_domains_cached(
         &full_path,
         &table_name,
         account.as_deref(),
         start.as_deref(),
         end.as_deref(),
     )?;
+    // 기본은 방문 많은 순 — 요청 시 적은 순으로 뒤집는다.
+    if ascending.unwrap_or(false) {
+        domains.reverse();
+    }
     let total = i64::try_from(domains.len()).unwrap_or(i64::MAX);
     let page_offset = usize::try_from(offset.max(0)).unwrap_or(usize::MAX);
     let page_limit = usize::try_from(limit.clamp(1, 100)).unwrap_or(100);
@@ -2549,6 +2555,7 @@ fn browser_activity_domains_blocking(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // 정렬 옵션 포함 command 시그니처
 async fn browser_activity_domains(
     full_path: String,
     table_name: String,
@@ -2557,9 +2564,10 @@ async fn browser_activity_domains(
     end: Option<String>,
     offset: i64,
     limit: i64,
+    ascending: Option<bool>,
 ) -> Result<BrowserDomainStatsPage, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        browser_activity_domains_blocking(full_path, table_name, account, start, end, offset, limit)
+        browser_activity_domains_blocking(full_path, table_name, account, start, end, offset, limit, ascending)
     })
     .await
     .map_err(|error| format!("도메인 통계 작업이 중단되었습니다: {error}"))?
@@ -2911,11 +2919,19 @@ struct MftRecordsPage {
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // 재귀 목록 전용 필터 인자들 — tauri command 시그니처
 fn mft_records_page(
     full_path: String,
     query: String,
     offset: i64,
     limit: i64,
+    sort_key: Option<String>,
+    sort_desc: Option<bool>,
+    files_only: Option<bool>,
+    name_pattern: Option<String>,
+    time_key: Option<String>,
+    time_start: Option<String>,
+    time_end: Option<String>,
 ) -> Result<MftRecordsPage, String> {
     let conn = open_ro(&full_path)?;
     if !table_names(&conn).iter().any(|name| name == MFT_TABLE) {
@@ -2924,35 +2940,96 @@ fn mft_records_page(
     let limit = limit.clamp(1, 500);
     let offset = offset.max(0);
     let query = query.trim();
-    let (where_clause, search_value) = if query.is_empty() {
-        (String::new(), None)
-    } else {
-        (
-            " WHERE file_name LIKE ?1 OR path LIKE ?1".to_string(),
-            Some(format!("%{query}%")),
-        )
-    };
-    let count_sql = format!("SELECT COUNT(*) FROM {}{}", q(MFT_TABLE), where_clause);
-    let total = match search_value.as_ref() {
-        Some(value) => conn.query_row(&count_sql, [value], |row| row.get(0)),
-        None => conn.query_row(&count_sql, [], |row| row.get(0)),
+
+    // 재귀 목록 전용 필터: 파일만 보기 / 파일명 글롭(*·?) / 정렬 기준.
+    let mut clauses: Vec<String> = Vec::new();
+    let mut params: Vec<String> = Vec::new();
+    if !query.is_empty() {
+        params.push(format!("%{query}%"));
+        let n = params.len();
+        clauses.push(format!("(file_name LIKE ?{n} OR path LIKE ?{n})"));
     }
-    .map_err(|error| format!("MFT 레코드 수를 읽지 못했습니다: {error}"))?;
+    if files_only.unwrap_or(false) {
+        clauses.push("is_directory != 'Y'".to_string());
+    }
+    if let Some(pattern) = name_pattern.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+        // 간단 글롭 → SQL LIKE: LIKE 메타문자를 이스케이프한 뒤 * → %, ? → _.
+        let mut like = String::with_capacity(pattern.len() + 4);
+        for ch in pattern.chars() {
+            match ch {
+                '\\' | '%' | '_' => {
+                    like.push('\\');
+                    like.push(ch);
+                }
+                '*' => like.push('%'),
+                '?' => like.push('_'),
+                other => like.push(other),
+            }
+        }
+        params.push(like);
+        let n = params.len();
+        clauses.push(format!("file_name LIKE ?{n} ESCAPE '\\'"));
+    }
+    // 시간 범위 필터 — 지정한 시각 컬럼 기준. 빈 시각은 자연히 제외된다.
+    let time_column = match time_key.as_deref().unwrap_or("created") {
+        "modified" => "si_modified",
+        "accessed" => "si_accessed",
+        "mft_modified" => "si_mft_modified",
+        _ => "si_created",
+    };
+    if let Some(start) = time_start.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+        params.push(start.to_string());
+        clauses.push(format!("{time_column} >= ?{}", params.len()));
+    }
+    if let Some(end) = time_end.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+        params.push(end.to_string());
+        clauses.push(format!("{time_column} <= ?{}", params.len()));
+    }
+    let where_clause = if clauses.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", clauses.join(" AND "))
+    };
+
+    let count_sql = format!("SELECT COUNT(*) FROM {}{}", q(MFT_TABLE), where_clause);
+    let count_refs: Vec<&dyn rusqlite::ToSql> =
+        params.iter().map(|value| value as &dyn rusqlite::ToSql).collect();
+    let total = conn
+        .query_row(&count_sql, count_refs.as_slice(), |row| row.get(0))
+        .map_err(|error| format!("MFT 레코드 수를 읽지 못했습니다: {error}"))?;
+
+    // 정렬 키 화이트리스트 — 시간 정렬은 값 없는 레코드를 항상 뒤로 보낸다.
+    let order_by = match sort_key.as_deref().unwrap_or("path") {
+        "name" => "file_name COLLATE NOCASE".to_string(),
+        key @ ("created" | "modified" | "accessed" | "mft_modified") => {
+            let column = match key {
+                "created" => "si_created",
+                "modified" => "si_modified",
+                "accessed" => "si_accessed",
+                _ => "si_mft_modified",
+            };
+            format!("CASE WHEN {column} = '' THEN 1 ELSE 0 END, {column}")
+        }
+        "size" => "CAST(file_size AS INTEGER)".to_string(),
+        _ => "path COLLATE NOCASE".to_string(),
+    };
+    let direction = if sort_desc.unwrap_or(false) { "DESC" } else { "ASC" };
 
     let page_sql = format!(
-        "SELECT rowid AS __rowid, * FROM {}{} ORDER BY path COLLATE NOCASE, rowid LIMIT ?{} OFFSET ?{}",
+        "SELECT rowid AS __rowid, * FROM {}{} ORDER BY {} {}, rowid LIMIT ?{} OFFSET ?{}",
         q(MFT_TABLE),
         where_clause,
-        if search_value.is_some() { 2 } else { 1 },
-        if search_value.is_some() { 3 } else { 2 },
+        order_by,
+        direction,
+        params.len() + 1,
+        params.len() + 2,
     );
-    let limit_text = limit.to_string();
-    let offset_text = offset.to_string();
-    let rows = match search_value.as_ref() {
-        Some(value) => query_rows(&conn, &page_sql, &[value, &limit_text, &offset_text]),
-        None => query_rows(&conn, &page_sql, &[&limit_text, &offset_text]),
-    }
-    .map_err(|error| format!("MFT 레코드 페이지를 읽지 못했습니다: {error}"))?;
+    params.push(limit.to_string());
+    params.push(offset.to_string());
+    let page_refs: Vec<&dyn rusqlite::ToSql> =
+        params.iter().map(|value| value as &dyn rusqlite::ToSql).collect();
+    let rows = query_rows(&conn, &page_sql, page_refs.as_slice())
+        .map_err(|error| format!("MFT 레코드 페이지를 읽지 못했습니다: {error}"))?;
     Ok(MftRecordsPage { rows, total })
 }
 
@@ -5405,6 +5482,7 @@ mod browser_activity_tests {
             Some("2024-07-31 23:59:59.999".to_string()),
             0,
             1,
+            None,
         )
         .unwrap();
         assert_eq!(first_page.total, 2);
@@ -5422,6 +5500,7 @@ mod browser_activity_tests {
             Some("2024-07-31 23:59:59.999".to_string()),
             1,
             1,
+            None,
         )
         .unwrap();
         assert_eq!(second_page.total, 2);
@@ -5442,6 +5521,7 @@ mod browser_activity_tests {
             Some("2024-07-31 23:59:59.999".to_string()),
             0,
             1,
+            None,
         )
         .unwrap();
         assert_eq!(bob_page.total, 1);
@@ -5467,6 +5547,7 @@ mod browser_activity_tests {
             Some("2024-07-31 23:59:59.999".to_string()),
             0,
             10,
+            None,
         )
         .unwrap();
         assert_eq!(refreshed_page.total, 3);

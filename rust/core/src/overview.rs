@@ -704,6 +704,82 @@ pub fn build_smb_history_with_events(events: &EventLogOverviewCache) -> Vec<Row>
     rows
 }
 
+/// BITS(Background Intelligent Transfer Service) 전송 이벤트를 개요 테이블로.
+/// 공격자가 파일 다운로드 수단으로 자주 악용하므로 작업 생성~전송 결과까지
+/// 한 테이블로 모은다 (Microsoft-Windows-Bits-Client/Operational).
+pub fn build_bits_history(out_dir: &Path) -> Vec<Row> {
+    build_bits_history_with_events(&EventLogOverviewCache::load(out_dir))
+}
+
+pub fn build_bits_history_with_events(events: &EventLogOverviewCache) -> Vec<Row> {
+    // bytesTotal이 이 값이면 전체 크기를 알 수 없다는 뜻 (u64::MAX 센티널).
+    const BITS_UNKNOWN_SIZE: &str = "18446744073709551615";
+    let mut rows = Vec::new();
+    for r in events.rows() {
+        if r.get("Provider").map(|s| s.as_str()) != Some("Microsoft-Windows-Bits-Client") {
+            continue;
+        }
+        let eid = r.get("EventID").cloned().unwrap_or_default();
+        let ed = parse_eventdata(r.get("EventData").map(|s| s.as_str()).unwrap_or(""));
+        let hr = ed_field(&ed, &["hr"]);
+        let (result, description) = match eid.as_str() {
+            "3" => ("정보", "BITS 전송 작업 생성"),
+            "4" => ("성공", "BITS 전송 작업 완료"),
+            "5" => ("정보", "BITS 전송 작업 취소"),
+            "59" => ("정보", "BITS URL 전송 시작"),
+            "60" => {
+                if hr.is_empty() || hr == "0" {
+                    ("성공", "BITS URL 전송 완료")
+                } else {
+                    ("실패", "BITS URL 전송 실패")
+                }
+            }
+            "61" => ("실패", "BITS URL 전송 오류"),
+            _ => continue,
+        };
+        let status = match eid.as_str() {
+            "60" => hr,
+            "61" => ed_field(&ed, &["error"]),
+            _ => String::new(),
+        };
+        let bytes_total = match ed_field(&ed, &["bytesTotal"]) {
+            v if v == BITS_UNKNOWN_SIZE => String::new(),
+            v => v,
+        };
+        let mut row = Row::new();
+        row.insert(
+            "timestamp".into(),
+            r.get("timestamp").cloned().unwrap_or_default(),
+        );
+        row.insert("job_name".into(), ed_field(&ed, &["name", "jobTitle"]));
+        row.insert("job_id".into(), ed_field(&ed, &["Id", "jobId"]));
+        row.insert("url".into(), ed_field(&ed, &["url"]));
+        row.insert(
+            "account".into(),
+            bare_account(&ed_field(&ed, &["jobOwner", "User"])),
+        );
+        row.insert(
+            "process".into(),
+            ed_field(&ed, &["processPath", "ProcessPath"]),
+        );
+        row.insert(
+            "bytes_transferred".into(),
+            ed_field(&ed, &["bytesTransferred"]),
+        );
+        row.insert("bytes_total".into(), bytes_total);
+        row.insert("status".into(), status);
+        row.insert("result".into(), result.to_string());
+        row.insert("description".into(), description.to_string());
+        row.insert("event_id".into(), eid);
+        row.insert(
+            "record_key".into(),
+            r.get("_record_key").cloned().unwrap_or_default(),
+        );
+        rows.push(row);
+    }
+    rows
+}
+
 struct RdpSpec {
     direction: &'static str,
     result: &'static str,
@@ -3229,6 +3305,84 @@ pub fn build_registry_findings(out_dir: &Path) -> Vec<Row> {
     build_registry_findings_with_registry(&registry)
 }
 
+/// MSI InstallDate("20260808")를 "2026-08-08 00:00:00.000"으로. 날짜만 있고
+/// 시각이 없는 값이라 자정으로 고정한다.
+fn msi_install_date(raw: &str) -> String {
+    let digits: String = raw.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.len() == 8 {
+        format!(
+            "{}-{}-{} 00:00:00.000",
+            &digits[0..4],
+            &digits[4..6],
+            &digits[6..8]
+        )
+    } else {
+        String::new()
+    }
+}
+
+/// Windows Installer(.msi)로 설치된 프로그램 —
+/// ...\CurrentVersion\Installer\UserData\<SID>\Products\*\InstallProperties.
+/// 키 하나가 프로그램 하나: 값 전체를 JSON(properties)으로 보존해 상세 보기에서
+/// 다 보이게 하고, 행 요약은 DisplayName/버전/제조사만 쓴다.
+fn rf_msi_installs(hives: &[RegistryOverviewHive]) -> Vec<Row> {
+    let mut rows = Vec::new();
+    for hive in hives {
+        let mut by_key: std::collections::BTreeMap<&str, std::collections::BTreeMap<String, String>> =
+            std::collections::BTreeMap::new();
+        for r in &hive.rows {
+            let Some(kp) = r.get("key_path") else { continue };
+            let low = kp.to_lowercase();
+            if !(low.contains("\\currentversion\\installer\\userdata\\")
+                && low.ends_with("\\installproperties"))
+            {
+                continue;
+            }
+            let name = r.get("value_name").cloned().unwrap_or_default();
+            if name.is_empty() || name == "(default)" {
+                continue;
+            }
+            by_key
+                .entry(kp.as_str())
+                .or_default()
+                .insert(name, r.get("value_data").cloned().unwrap_or_default());
+        }
+        for (kp, props) in by_key {
+            let display_name = props.get("DisplayName").cloned().unwrap_or_default();
+            if display_name.is_empty() {
+                continue;
+            }
+            let timestamp = props
+                .get("InstallDate")
+                .map(|d| msi_install_date(d))
+                .unwrap_or_default();
+            let sid = kp
+                .split('\\')
+                .skip_while(|p| !p.eq_ignore_ascii_case("UserData"))
+                .nth(1)
+                .unwrap_or("")
+                .to_string();
+            rows.push(rf_row(&[
+                ("category", "설치 프로그램 (MSI)".into()),
+                ("name", display_name),
+                ("value", props.get("DisplayVersion").cloned().unwrap_or_default()),
+                ("detail", props.get("Publisher").cloned().unwrap_or_default()),
+                ("status", "정보".into()),
+                ("user", sid),
+                ("timestamp", timestamp),
+                ("subtype", "MsiInstall".into()),
+                (
+                    "properties",
+                    serde_json::to_string(&props).unwrap_or_default(),
+                ),
+                ("key_path", kp.to_string()),
+                ("source", hive.name.clone()),
+            ]));
+        }
+    }
+    rows
+}
+
 pub fn build_registry_findings_with_registry(registry: &RegistryOverviewCache) -> Vec<Row> {
     // Registry rows are intentionally read once per overview build. The old
     // path separately opened SYSTEM/SOFTWARE and then opened every hive twice
@@ -3241,6 +3395,7 @@ pub fn build_registry_findings_with_registry(registry: &RegistryOverviewCache) -
     rows.extend(rf_shares(system));
     rows.extend(rf_sql_auth(software));
     rows.extend(rf_autoruns(registry.hives()));
+    rows.extend(rf_msi_installs(registry.hives()));
     rows.extend(rf_execution_traces(registry.hives()));
     rows.extend(rf_shimcache(registry.hives()));
     rows
@@ -3293,6 +3448,49 @@ mod tests {
             Some("Windows PowerShell.evtx::41")
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn msi_install_properties_become_one_finding_with_midnight_date() {
+        let hive = RegistryOverviewHive {
+            name: "SOFTWARE".into(),
+            database: std::path::PathBuf::new(),
+            rows: [
+                ("DisplayName", "Example App"),
+                ("DisplayVersion", "1.2.3"),
+                ("Publisher", "Example Corp"),
+                ("InstallDate", "20260808"),
+                ("InstallSource", "C:\\Users\\a\\Downloads\\"),
+            ]
+            .into_iter()
+            .map(|(name, data)| {
+                let mut r = Row::new();
+                r.insert(
+                    "key_path".into(),
+                    "\\Microsoft\\Windows\\CurrentVersion\\Installer\\UserData\\S-1-5-18\\Products\\ABC123\\InstallProperties".into(),
+                );
+                r.insert("value_name".into(), name.into());
+                r.insert("value_data".into(), data.into());
+                r.insert("last_write".into(), "2026-08-09 01:02:03.000".into());
+                r
+            })
+            .collect(),
+        };
+        let rows = rf_msi_installs(&[hive]);
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.get("name").map(String::as_str), Some("Example App"));
+        assert_eq!(
+            row.get("timestamp").map(String::as_str),
+            Some("2026-08-08 00:00:00.000")
+        );
+        assert_eq!(row.get("value").map(String::as_str), Some("1.2.3"));
+        assert_eq!(row.get("detail").map(String::as_str), Some("Example Corp"));
+        assert_eq!(row.get("user").map(String::as_str), Some("S-1-5-18"));
+        assert_eq!(row.get("subtype").map(String::as_str), Some("MsiInstall"));
+        let props: serde_json::Value =
+            serde_json::from_str(row.get("properties").unwrap()).unwrap();
+        assert_eq!(props["InstallSource"], "C:\\Users\\a\\Downloads\\");
     }
 
     #[test]
@@ -3467,6 +3665,7 @@ mod tests {
         legacy.extend(rf_shares(legacy_system));
         legacy.extend(rf_sql_auth(legacy_software));
         legacy.extend(rf_autoruns(&legacy_hives));
+        legacy.extend(rf_msi_installs(&legacy_hives));
         legacy.extend(rf_execution_traces(&legacy_hives));
         legacy.extend(rf_shimcache(&legacy_hives));
         let registry = RegistryOverviewCache::load(&root);

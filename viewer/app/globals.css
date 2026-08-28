@@ -14,30 +14,30 @@
   --bg-panel: #16212d;
   --bg-elevated: #1a2735;
   --bg-input: #101822;
-  --bg-hover: rgba(133, 174, 215, 0.09);
+  --bg-hover: rgba(133, 174, 215, 0.13);
   --bg-selected: rgba(70, 145, 224, 0.20);
 
-  --border: rgba(154, 188, 222, 0.12);
-  --border-subtle: rgba(154, 188, 222, 0.08);
+  --border: rgba(154, 188, 222, 0.19);
+  --border-subtle: rgba(154, 188, 222, 0.13);
 
   --text: #eef5ff;
-  --text-dim: #a7b6c8;
-  --text-faint: #718198;
+  --text-dim: #b9c7d8;
+  --text-faint: #8fa0b6;
   /* Timestamps must stay readable — brighter than the faint/dim greys. */
-  --text-time: #b9c2cc;
+  --text-time: #c8d2dc;
   /* A registered analysis host is an identity, not an evidence severity. */
-  --host-registered-text: #c8d3df;
+  --host-registered-text: #d8e3ef;
 
   --accent: #8ab4f8;
   --accent-emphasis: #6d9eeb;
   --accent-subtle: rgba(138, 180, 248, 0.16);
 
-  /* Analyst bookmarks are a neutral silver context state, deliberately
+  /* Analyst bookmarks are a warm yellow context state, deliberately
      separate from navigation blue and warning/danger evidence colours. */
-  --bookmark-row: rgba(198, 207, 218, 0.10);
-  --bookmark-rail: #e0e6ee;
-  --bookmark-control: #d7dfe8;
-  --bookmark-outline: rgba(198, 207, 218, 0.48);
+  --bookmark-row: rgba(244, 213, 120, 0.10);
+  --bookmark-rail: #f4d978;
+  --bookmark-control: #f0cf7a;
+  --bookmark-outline: rgba(244, 213, 120, 0.5);
   /* Compatibility aliases keep inline detail treatments consistent while
      rows migrate to the common class. */
   --bookmark: var(--bookmark-control);
@@ -58,7 +58,7 @@
   --evidence-attention: var(--warning);
   --evidence-critical: var(--danger);
   --tag-neutral-bg: rgba(139, 148, 158, 0.12);
-  --tag-neutral-fg: #b9c2cc;
+  --tag-neutral-fg: #c8d2dc;
 
   --radius-xs: 5px;
   --radius-sm: 8px;
@@ -132,15 +132,14 @@ button:not(:disabled):active {
    Apply this one-level treatment to the actual row surface, not to artifact
    chips, so the evidence's own status colour remains legible. */
 .dfir-bookmarked-row {
-  border-radius: var(--radius-sm);
-  /* Bookmark context is a restrained neutral-slate row tint plus a fixed
-     rail. Selection and evidence modifiers below retain their own meaning. */
-  background: var(--bookmark-row) !important;
-  box-shadow: inset 4px 0 0 var(--bookmark-rail);
+  /* Bookmark context tints the whole row/card — no left rail. Selection and
+     evidence modifiers below retain their own meaning. */
+  background: rgba(244, 213, 120, 0.12) !important;
+  border-color: color-mix(in srgb, var(--bookmark-control) 42%, var(--border)) !important;
 }
 
 .dfir-bookmarked-row:hover {
-  background: rgba(198, 207, 218, 0.15) !important;
+  background: rgba(244, 213, 120, 0.18) !important;
 }
 
 .dfir-bookmarked-row--warning {
@@ -440,12 +439,26 @@ input:focus, select:focus {
 .dfir-tag--attention { color: var(--warning); background: transparent; border-color: color-mix(in srgb, var(--warning) 55%, transparent); }
 .dfir-tag--critical { color: var(--danger); background: transparent; border-color: color-mix(in srgb, var(--danger) 55%, transparent); }
 .dfir-tag--info { color: var(--accent); background: var(--accent-subtle); border-color: color-mix(in srgb, var(--accent) 48%, transparent); }
+/* 카탈로그 참고 정보(도구·이벤트 설명) — 경고가 아닌 힌트. */
+.dfir-tag--note { color: #5bc8c0; background: transparent; border-color: color-mix(in srgb, #5bc8c0 55%, transparent); }
 .dfir-section-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
   font-size: 10.5px;
   font-weight: 750;
   color: var(--text-faint);
   letter-spacing: 0.65px;
   text-transform: uppercase;
+}
+/* 모든 섹션 제목 앞의 파스텔 블루 틱 — 상세 패널·뷰 공통. */
+.dfir-section-label::before {
+  content: "";
+  width: 3px;
+  height: 11px;
+  border-radius: 2px;
+  background: var(--accent);
+  flex-shrink: 0;
 }
 
 /* Case entry: a compact case hub. The primary choice and the new-case action
@@ -695,3 +708,7 @@ button {
 .nm-btn:disabled {
   box-shadow: none;
 }
+
+/* 실행 로그 접기: 기본 ▶ 마커 대신 버튼형 summary를 쓴다. */
+.run-log-details > summary { list-style: none; }
+.run-log-details > summary::-webkit-details-marker { display: none; }

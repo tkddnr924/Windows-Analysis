@@ -1,5 +1,8 @@
 "use client";
+import { toBound } from "@/lib/timeRange";
+import SortOutlinedIcon from "@mui/icons-material/SortOutlined";
 import AccountFilterChips from "@/components/AccountFilterChips";
+import { DateRangeDropdown, HeaderSearchInput, SelectDropdown, ViewHeader } from "@/components/FilterControls";
 import PaginationControls from "@/components/PaginationControls";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -26,7 +29,7 @@ import RowDetailPanel from "./RowDetailPanel";
 type Row = Record<string, string>;
 
 const ROOT_ENTRY = 5;
-const LIST_PAGE_SIZE = 10;
+const LIST_FETCH_SIZE = 200; // lazy 로딩 배치 크기
 const LIST_ROW_HEIGHT = 56;
 
 interface Props {
@@ -155,10 +158,18 @@ export default function MftView({ dbPath, tableBookmarks, onToggleBookmark, allB
   const [searching, setSearching] = useState(false);
   const [searchError, setSearchError] = useState<string | null>(null);
   const searchSeq = useRef(0);
-  const [listOffset, setListOffset] = useState(0);
-  const [listPage, setListPage] = useState<MftRecordsPage | null>(null);
+  const [listRows, setListRows] = useState<Row[]>([]);
+  const [listTotal, setListTotal] = useState<number | null>(null);
   const [listLoading, setListLoading] = useState(false);
   const [listError, setListError] = useState<string | null>(null);
+  // 재귀 목록 전용 필터 — 기본은 파일만, 경로 오름차순.
+  const [listSortKey, setListSortKey] = useState("path");
+  const [listSortDesc, setListSortDesc] = useState(false);
+  const [listFilesOnly, setListFilesOnly] = useState(true);
+  const [listPattern, setListPattern] = useState("");
+  // 재귀 목록 전용 시간 범위 — 시각 정렬 중이면 그 시각, 아니면 생성 시각 기준.
+  const [listTimeStart, setListTimeStart] = useState("");
+  const [listTimeEnd, setListTimeEnd] = useState("");
   const listSeq = useRef(0);
 
   useEffect(() => {
@@ -253,23 +264,53 @@ export default function MftView({ dbPath, tableBookmarks, onToggleBookmark, allB
   // The recursive list owns its own bounded SQLite page. It intentionally
   // does not reuse tree search results, which are capped and may omit paths.
   const listQuery = search.trim().length >= 2 ? search.trim() : "";
-  useEffect(() => setListOffset(0), [dbPath, listQuery]);
+  const listTimeKey = ["created", "modified", "accessed", "mft_modified"].includes(listSortKey) ? listSortKey : "created";
+  const listOptions = useMemo(
+    () => ({
+      sortKey: listSortKey,
+      sortDesc: listSortDesc,
+      filesOnly: listFilesOnly,
+      namePattern: listPattern.trim() || undefined,
+      timeKey: listTimeKey,
+      timeStart: toBound(listTimeStart, "start") || undefined,
+      timeEnd: toBound(listTimeEnd, "end") || undefined,
+    }),
+    [listSortKey, listSortDesc, listFilesOnly, listPattern, listTimeKey, listTimeStart, listTimeEnd],
+  );
+  // 필터·정렬·검색이 바뀌면 처음부터 다시, 스크롤이 끝에 닿으면 이어서 불러온다.
   useEffect(() => {
     if (viewMode !== "list") return;
     const seq = ++listSeq.current;
     setListLoading(true);
     setListError(null);
-    setListPage(null);
-    window.api.mftRecordsPage(dbPath, listQuery, listOffset, LIST_PAGE_SIZE).then((page) => {
+    setListRows([]);
+    setListTotal(null);
+    window.api.mftRecordsPage(dbPath, listQuery, 0, LIST_FETCH_SIZE, listOptions).then((page) => {
       if (seq !== listSeq.current) return;
-      setListPage(page);
+      setListRows(page.rows as Row[]);
+      setListTotal(page.total);
       setListLoading(false);
     }).catch(() => {
       if (seq !== listSeq.current) return;
       setListError("파일 시스템 레코드 목록을 읽지 못했습니다.");
       setListLoading(false);
     });
-  }, [dbPath, listOffset, listQuery, viewMode]);
+  }, [dbPath, listQuery, viewMode, listOptions]);
+  const loadMoreList = useCallback(() => {
+    if (listLoading || listTotal === null || listRows.length >= listTotal) return;
+    const seq = listSeq.current;
+    setListLoading(true);
+    window.api.mftRecordsPage(dbPath, listQuery, listRows.length, LIST_FETCH_SIZE, listOptions).then((page) => {
+      if (seq !== listSeq.current) return;
+      setListRows((previous) => [...previous, ...(page.rows as Row[])]);
+      setListTotal(page.total);
+      setListLoading(false);
+    }).catch(() => {
+      if (seq !== listSeq.current) return;
+      setListError("파일 시스템 레코드 목록을 읽지 못했습니다.");
+      setListLoading(false);
+    });
+  }, [dbPath, listQuery, listOptions, listLoading, listRows.length, listTotal]);
 
   const bmRowids = useMemo(() => new Set(tableBookmarks.map((b) => b.rowid)), [tableBookmarks]);
   const bmFieldKeys = useMemo(() => new Set(tableBookmarks.map((b) => `${b.rowid}@${b.field ?? ""}`)), [tableBookmarks]);
@@ -296,63 +337,38 @@ export default function MftView({ dbPath, tableBookmarks, onToggleBookmark, allB
       }))}
     />
   ) : (
-    <div style={{ display: "flex", alignItems: "center", justifyContent: "center", minHeight: "100%", padding: 24, color: "var(--text-faint)", fontSize: 13 }}>파일을 선택하면 MFT 정보를 표시합니다.</div>
+    <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 9, minHeight: "100%", padding: 24, color: "var(--text-faint)", fontSize: 13 }}>
+      <InsertDriveFileOutlinedIcon sx={{ fontSize: 30, color: "var(--text-faint)" }} />
+      파일을 선택하면 MFT 정보를 표시합니다.
+    </div>
   );
 
   return (
     <div className="dfir-view" style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
-      <header style={{ padding: "14px 18px 12px", flexShrink: 0, borderBottom: "1px solid var(--border)" }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10, flexWrap: "wrap" }}>
-          <h1 style={{ margin: 0, fontSize: 20, lineHeight: 1.2, fontWeight: 700, color: "var(--text)" }}>파일 시스템 정보</h1>
-          <span style={{ color: "var(--text-faint)", fontFamily: "var(--mono)", fontSize: 11.5 }}>$MFT</span>
-          <div role="group" aria-label="MFT 보기 방식" style={{ display: "flex", gap: 4, marginLeft: "auto" }}>
-            <button type="button" aria-pressed={viewMode === "tree"} onClick={() => setViewMode("tree")} style={{ display: "inline-flex", alignItems: "center", gap: 5, minHeight: 28, padding: "3px 8px", border: `1px solid ${viewMode === "tree" ? "var(--accent)" : "var(--border)"}`, borderRadius: "var(--radius-sm)", background: viewMode === "tree" ? "var(--accent-subtle)" : "transparent", color: viewMode === "tree" ? "var(--accent)" : "var(--text-dim)", cursor: "pointer", fontSize: 11.5, fontWeight: 650 }}><AccountTreeOutlinedIcon sx={{ fontSize: 15 }} />탐색기</button>
-            <button type="button" aria-pressed={viewMode === "list"} onClick={() => setViewMode("list")} style={{ display: "inline-flex", alignItems: "center", gap: 5, minHeight: 28, padding: "3px 8px", border: `1px solid ${viewMode === "list" ? "var(--accent)" : "var(--border)"}`, borderRadius: "var(--radius-sm)", background: viewMode === "list" ? "var(--accent-subtle)" : "transparent", color: viewMode === "list" ? "var(--accent)" : "var(--text-dim)", cursor: "pointer", fontSize: 11.5, fontWeight: 650 }}><ViewListOutlinedIcon sx={{ fontSize: 15 }} />전체 목록</button>
-          </div>
-        </div>
-        <div style={{ position: "relative", width: "min(560px, 100%)" }}>
-          <SearchOutlinedIcon aria-hidden="true" sx={{ position: "absolute", left: 9, top: "50%", transform: "translateY(-50%)", fontSize: 17, color: "var(--text-faint)", pointerEvents: "none" }} />
-          <input
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            placeholder="파일명 · 경로 검색 (2자 이상)"
-            aria-label="파일명 또는 경로 검색"
-            style={{ boxSizing: "border-box", width: "100%", height: 34, padding: "7px 38px 7px 31px", fontSize: 12.5, fontFamily: "var(--mono)", background: "var(--bg-input)", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", color: "var(--text)", outline: "none" }}
-          />
-          {search && (
-            <IconButton
-              size="small"
-              aria-label="검색어 지우기"
-              onClick={() => setSearch("")}
-              sx={{ position: "absolute", right: 3, top: "50%", transform: "translateY(-50%)", color: "var(--text-faint)", p: "4px", borderRadius: "var(--radius-sm)" }}
-            >
-              <CloseOutlinedIcon sx={{ fontSize: 16 }} />
-            </IconButton>
-          )}
-        </div>
-        {refAccounts.length > 0 && (
-          <div style={{ display: "flex", alignItems: "center", flexWrap: "wrap", gap: 6, marginTop: 9 }}>
-            <span style={{ fontSize: 11.5, color: "var(--text-faint)", marginRight: 2 }}>교차 참조 계정</span>
+      <ViewHeader icon={FolderOpenOutlinedIcon} title="파일 시스템 정보" meta="$MFT" right={<div role="group" aria-label="MFT 보기 방식" style={{ display: "flex", gap: 4 }}>
+            <button type="button" aria-pressed={viewMode === "tree"} className={viewMode === "tree" ? "nm-btn" : undefined} onClick={() => setViewMode("tree")} style={{ display: "inline-flex", alignItems: "center", gap: 5, minHeight: 30, padding: "3px 11px", border: `1px solid ${viewMode === "tree" ? "var(--accent)" : "var(--border)"}`, borderRadius: "var(--radius-md)", background: viewMode === "tree" ? "var(--accent-subtle)" : "transparent", color: viewMode === "tree" ? "var(--accent)" : "var(--text-dim)", cursor: "pointer", fontSize: 11.5, fontWeight: 650 }}><AccountTreeOutlinedIcon sx={{ fontSize: 15 }} />탐색기</button>
+            <button type="button" aria-pressed={viewMode === "list"} className={viewMode === "list" ? "nm-btn" : undefined} onClick={() => setViewMode("list")} style={{ display: "inline-flex", alignItems: "center", gap: 5, minHeight: 30, padding: "3px 11px", border: `1px solid ${viewMode === "list" ? "var(--accent)" : "var(--border)"}`, borderRadius: "var(--radius-md)", background: viewMode === "list" ? "var(--accent-subtle)" : "transparent", color: viewMode === "list" ? "var(--accent)" : "var(--text-dim)", cursor: "pointer", fontSize: 11.5, fontWeight: 650 }}><ViewListOutlinedIcon sx={{ fontSize: 15 }} />전체 목록</button>
+          </div>}>
+          <HeaderSearchInput value={search} onChange={setSearch} placeholder="파일명 · 경로 검색 (2자 이상)" ariaLabel="파일명 또는 경로 검색" width={300} />
+          {refAccounts.length > 0 && (
             <AccountFilterChips
               accounts={refAccounts}
               hidden={new Set(refAccounts.filter((account) => !selAccounts.has(account)))}
               onToggle={toggleAccount}
               onReset={() => setSelAccounts(new Set(refAccounts))}
               emptyLabel="(계정 미상)"
+              ariaLabel="교차 참조 계정 필터"
             />
-          </div>
-        )}
+          )}
         {pathRefsError && <div role="status" style={{ marginTop: 8, color: "var(--warning)", fontSize: 11.5 }}>{pathRefsError}</div>}
-      </header>
+      
+      </ViewHeader>
 
-      <div className={`mft-content mft-content--${viewMode}`} style={{ flex: 1, minHeight: 0, display: "grid", gridTemplateColumns: stackedInspector ? "minmax(0, 1fr)" : "minmax(0, 3fr) minmax(300px, 1fr)", gridTemplateRows: stackedInspector ? "minmax(300px, 1fr) minmax(260px, .75fr)" : undefined }}>
-        <aside aria-label={viewMode === "tree" ? "파일 탐색기" : "재귀 파일 시스템 목록"} style={{ minWidth: 0, minHeight: 0, overflow: "hidden", padding: viewMode === "tree" ? "8px 12px 16px" : "0", borderRight: "1px solid var(--border)", display: "flex", flexDirection: "column" }}>
+      <div className={`mft-content mft-content--${viewMode}`} style={{ flex: 1, minHeight: 0, display: "grid", gap: 10, padding: 14, background: "var(--bg)", gridTemplateColumns: stackedInspector ? "minmax(0, 1fr)" : "minmax(0, 7fr) minmax(300px, 3fr)", gridTemplateRows: stackedInspector ? "minmax(300px, 1fr) minmax(260px, .75fr)" : undefined }}>
+        <aside aria-label={viewMode === "tree" ? "파일 탐색기" : "재귀 파일 시스템 목록"} style={{ minWidth: 0, minHeight: 0, overflow: "hidden", padding: viewMode === "tree" ? "8px 10px 14px" : "0", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", background: "var(--bg-panel)", display: "flex", flexDirection: "column" }}>
           {viewMode === "list" ? (
-            <MftRecordList page={listPage} loading={listLoading} error={listError} offset={listOffset} pageSize={LIST_PAGE_SIZE} query={listQuery} bmRowids={bmRowids} selectedRowid={selectedRowid} refs={pathRefs} accountFilter={selAccounts} onSelect={setSelected} onPage={(next) => setListOffset(next)} />
+            <MftRecordList rows={listRows} total={listTotal} loading={listLoading} error={listError} query={listQuery} bmRowids={bmRowids} selectedRowid={selectedRowid} refs={pathRefs} accountFilter={selAccounts} onSelect={setSelected} onLoadMore={loadMoreList} sortKey={listSortKey} onSortKey={setListSortKey} sortDesc={listSortDesc} onSortDesc={setListSortDesc} filesOnly={listFilesOnly} onFilesOnly={setListFilesOnly} pattern={listPattern} onPattern={setListPattern} timeStart={listTimeStart} timeEnd={listTimeEnd} onTimeRange={(next) => { setListTimeStart(next.start); setListTimeEnd(next.end); }} timeLabel={listTimeKey === "created" ? "생성 시각" : listTimeKey === "modified" ? "수정 시각" : listTimeKey === "accessed" ? "접근 시각" : "MFT 수정 시각"} />
           ) : <>
-            <div style={{ display: "flex", alignItems: "center", minHeight: 27, padding: "0 7px", borderBottom: "1px solid var(--border)", color: "var(--text-faint)", fontSize: 10.5, fontWeight: 700, letterSpacing: "0.02em" }}>
-              <span>이름</span>
-            </div>
             <div style={{ flex: 1, minHeight: 0, overflow: "auto" }}>
               {results !== null ? (
                 <SearchResults rows={results} searching={searching} error={searchError} bmRowids={bmRowids} selectedRowid={selectedRowid} onSelect={setSelected} refs={pathRefs} accountFilter={selAccounts} />
@@ -385,7 +401,7 @@ export default function MftView({ dbPath, tableBookmarks, onToggleBookmark, allB
             </div>
           </>}
         </aside>
-        <section aria-label="선택 항목 MFT 정보" style={{ minWidth: 0, minHeight: 0, overflow: "auto", borderTop: stackedInspector ? "1px solid var(--border)" : undefined }}>{detailPanel}</section>
+        <section aria-label="선택 항목 MFT 정보" style={{ minWidth: 0, minHeight: 0, overflow: "auto", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", background: "var(--bg-panel)" }}>{detailPanel}</section>
       </div>
       {referenceDetail && (
         <RowDetailPanel
@@ -403,67 +419,131 @@ export default function MftView({ dbPath, tableBookmarks, onToggleBookmark, allB
   );
 }
 
-function MftRecordList({ page, loading, error, offset, pageSize, query, bmRowids, selectedRowid, refs, accountFilter, onSelect, onPage }: {
-  page: MftRecordsPage | null;
+function MftRecordList({ rows, total, loading, error, query, bmRowids, selectedRowid, refs, accountFilter, onSelect, onLoadMore, sortKey, onSortKey, sortDesc, onSortDesc, filesOnly, onFilesOnly, pattern, onPattern, timeStart, timeEnd, onTimeRange, timeLabel }: {
+  rows: Row[];
+  total: number | null;
   loading: boolean;
   error: string | null;
-  offset: number;
-  pageSize: number;
   query: string;
   bmRowids: Set<number>;
   selectedRowid: number | null;
   refs: RefMap;
   accountFilter: Set<string> | null;
   onSelect: (row: Row) => void;
-  onPage: (offset: number) => void;
+  onLoadMore: () => void;
+  sortKey: string;
+  onSortKey: (key: string) => void;
+  sortDesc: boolean;
+  onSortDesc: (desc: boolean) => void;
+  filesOnly: boolean;
+  onFilesOnly: (value: boolean) => void;
+  pattern: string;
+  onPattern: (value: string) => void;
+  timeStart: string;
+  timeEnd: string;
+  onTimeRange: (next: { start: string; end: string }) => void;
+  timeLabel: string;
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
-  const rows = page?.rows ?? [];
   const virtualizer = useVirtualizer({ count: rows.length, getScrollElement: () => scrollRef.current, estimateSize: () => LIST_ROW_HEIGHT, overscan: 12 });
-  const total = page?.total ?? 0;
-  const start = total === 0 ? 0 : offset + 1;
-  const end = Math.min(offset + rows.length, total);
-  // The list is an explorer, not a second detail panel. Type, size and MFT
-  // timestamps belong to the inspector on the right; keep this dense page to
-  // the path needed for scanning and the cross-artifact reference context.
-  // The path/name is the primary scanning signal.  Cross-artifact references
-  // remain available, but are bounded so they never consume the file label.
-  const grid = "minmax(0, 3fr) minmax(108px, 1fr)";
-  useEffect(() => { scrollRef.current?.scrollTo({ top: 0 }); }, [offset, query]);
+  // 시각/크기 기준 정렬이면 그 값을 열로 함께 보여준다.
+  const sortValue: { label: string; column: string; mono: boolean } | null =
+    sortKey === "created" ? { label: "생성 시각", column: "si_created", mono: true }
+    : sortKey === "modified" ? { label: "수정 시각", column: "si_modified", mono: true }
+    : sortKey === "accessed" ? { label: "접근 시각", column: "si_accessed", mono: true }
+    : sortKey === "mft_modified" ? { label: "MFT 수정 시각", column: "si_mft_modified", mono: true }
+    : sortKey === "size" ? { label: "크기", column: "file_size", mono: true }
+    : null;
+  const grid = sortValue ? "minmax(0, 3fr) 176px minmax(108px, 1fr)" : "minmax(0, 3fr) minmax(108px, 1fr)";
+  const virtualItems = virtualizer.getVirtualItems();
+  const lastVisibleIndex = virtualItems.length ? virtualItems[virtualItems.length - 1].index : 0;
+  // lazy 로딩: 스크롤이 끝 30행 안쪽에 닿으면 다음 배치를 이어서 불러온다.
+  useEffect(() => {
+    if (loading || total === null || rows.length >= total) return;
+    if (lastVisibleIndex >= rows.length - 30) onLoadMore();
+  }, [lastVisibleIndex, loading, rows.length, total, onLoadMore]);
+  useEffect(() => { scrollRef.current?.scrollTo({ top: 0 }); }, [query, sortKey, sortDesc, filesOnly, pattern, timeStart, timeEnd]);
 
   return <section aria-label="MFT 재귀 목록" style={{ display: "flex", flexDirection: "column", flex: 1, minHeight: 0 }}>
-    <header style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", flexShrink: 0, minHeight: 42, padding: "7px 12px", borderBottom: "1px solid var(--border)" }}>
+    <header style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", flexShrink: 0, padding: "8px 12px", borderBottom: "1px solid var(--border)" }}>
       <strong style={{ fontSize: 12.5, color: "var(--text)" }}>재귀 목록</strong>
-      <span style={{ color: "var(--text-faint)", fontSize: 11.5 }}>{query ? `검색: ${query}` : "전체 MFT 레코드"}</span>
-      {page && <span style={{ marginLeft: "auto", color: "var(--text-faint)", fontSize: 11.5, fontVariantNumeric: "tabular-nums" }}>{start.toLocaleString()}–{end.toLocaleString()} / {total.toLocaleString()}건</span>}
+      {/* 재귀 목록 전용 필터 — X-Ways 리컬시브 뷰처럼 이 화면에서만 쓴다. */}
+      <input
+        value={pattern}
+        onChange={(event) => onPattern(event.target.value)}
+        placeholder="파일명 패턴 (예: *.txt)"
+        aria-label="파일명 패턴 필터"
+        style={{ flex: "0 1 190px", minWidth: 130, minHeight: 30, padding: "4px 10px", fontSize: 12, fontFamily: "var(--mono)", background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", color: "var(--text)", outline: "none" }}
+      />
+      <SelectDropdown
+        icon={<SortOutlinedIcon sx={{ fontSize: 15 }} />}
+        label="정렬"
+        options={[
+          { value: "path", label: "경로" },
+          { value: "name", label: "파일 이름" },
+          { value: "created", label: "생성 시각" },
+          { value: "modified", label: "수정 시각" },
+          { value: "accessed", label: "접근 시각" },
+          { value: "mft_modified", label: "MFT 수정 시각" },
+          { value: "size", label: "크기" },
+        ]}
+        value={sortKey}
+        defaultValue="path"
+        onChange={onSortKey}
+      />
+      <SelectDropdown
+        label="방향"
+        options={[
+          { value: "asc", label: "오름차순" },
+          { value: "desc", label: "내림차순" },
+        ]}
+        value={sortDesc ? "desc" : "asc"}
+        defaultValue="asc"
+        onChange={(next: string) => onSortDesc(next === "desc")}
+      />
+      <span title={`${timeLabel} 기준으로 거릅니다`} style={{ display: "inline-flex" }}>
+        <DateRangeDropdown start={timeStart} end={timeEnd} onChange={onTimeRange} onReset={() => onTimeRange({ start: "", end: "" })} />
+      </span>
+      <button
+        type="button"
+        className="nm-btn"
+        aria-pressed={!filesOnly}
+        onClick={() => onFilesOnly(!filesOnly)}
+        title={filesOnly ? "폴더도 함께 표시" : "파일만 표시"}
+        style={{ display: "inline-flex", alignItems: "center", gap: 5, minHeight: 31, padding: "4px 11px", background: filesOnly ? "var(--bg-elevated)" : "var(--accent-subtle)", color: filesOnly ? "var(--text-dim)" : "var(--accent)", border: `1px solid ${filesOnly ? "var(--border)" : "color-mix(in srgb, var(--accent) 58%, var(--border))"}`, borderRadius: "var(--radius-md)", cursor: "pointer", fontSize: 12, fontWeight: filesOnly ? 500 : 650, whiteSpace: "nowrap" }}
+      >
+        <FolderOutlinedIcon sx={{ fontSize: 15 }} />폴더 포함
+      </button>
+      <span style={{ marginLeft: "auto", color: "var(--text-faint)", fontSize: 11.5, fontVariantNumeric: "tabular-nums" }}>
+        {total !== null ? `${rows.length.toLocaleString()} / ${total.toLocaleString()}건` : "\u00a0"}
+        {loading && rows.length > 0 && " · 불러오는 중…"}
+      </span>
     </header>
-    {loading && !page ? <div role="status" style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8, flex: 1, color: "var(--text-dim)", fontSize: 12.5 }}><CircularProgress size={17} thickness={4} />MFT 레코드를 불러오는 중</div> : error ? <div role="alert" style={{ padding: 16, color: "var(--danger)", fontSize: 12.5 }}>{error}</div> : !rows.length ? <div role="status" style={{ display: "grid", placeItems: "center", flex: 1, color: "var(--text-faint)", fontSize: 12.5 }}>{query ? "일치하는 MFT 레코드가 없습니다." : "표시할 MFT 레코드가 없습니다."}</div> : <div ref={scrollRef} style={{ flex: 1, minHeight: 0, overflow: "auto" }}>
+    {loading && rows.length === 0 ? <div role="status" style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8, flex: 1, color: "var(--text-dim)", fontSize: 12.5 }}><CircularProgress size={17} thickness={4} />MFT 레코드를 불러오는 중</div> : error ? <div role="alert" style={{ padding: 16, color: "var(--danger)", fontSize: 12.5 }}>{error}</div> : !rows.length ? <div role="status" style={{ display: "grid", placeItems: "center", flex: 1, color: "var(--text-faint)", fontSize: 12.5 }}>{query || pattern ? "일치하는 MFT 레코드가 없습니다." : "표시할 MFT 레코드가 없습니다."}</div> : <div ref={scrollRef} style={{ flex: 1, minHeight: 0, overflow: "auto" }}>
       <div style={{ minWidth: 0 }}>
-        <div aria-hidden="true" style={{ display: "grid", gridTemplateColumns: grid, gap: 10, alignItems: "center", minHeight: 32, padding: "0 12px", borderBottom: "1px solid var(--border)", color: "var(--text-faint)", fontSize: 10.5, fontWeight: 700 }}><span>파일 이름 / 경로</span><span>교차 참조</span></div>
-        <div style={{ position: "relative", height: virtualizer.getTotalSize() }}>{virtualizer.getVirtualItems().map((virtualRow) => {
+        <div aria-hidden="true" style={{ display: "grid", gridTemplateColumns: grid, gap: 10, alignItems: "center", minHeight: 32, padding: "0 12px", borderBottom: "1px solid var(--border)", color: "var(--text-faint)", fontSize: 10.5, fontWeight: 700 }}><span>파일 이름 / 경로</span>{sortValue && <span>{sortValue.label}</span>}<span>교차 참조</span></div>
+        <div style={{ position: "relative", height: virtualizer.getTotalSize() }}>{virtualItems.map((virtualRow) => {
           const row = rows[virtualRow.index];
           const bookmarked = bmRowids.has(Number(row.__rowid));
           const selected = selectedRowid !== null && Number(row.__rowid) === selectedRowid;
           const tags = referenceTags(refs, row, accountFilter).slice(0, 2);
           const path = row.path || row.file_name || "경로 정보 없음";
+          const isFolder = row.is_directory === "Y";
           return <div key={virtualRow.key} className={bookmarked ? `dfir-bookmarked-row${selected ? " dfir-bookmarked-row--selected" : ""}` : undefined} style={{ position: "absolute", top: 0, left: 0, width: "100%", height: LIST_ROW_HEIGHT, transform: `translateY(${virtualRow.start}px)`, borderBottom: "1px solid var(--border-subtle)", background: selected ? "var(--bg-selected)" : "transparent" }}>
             <button type="button" onClick={() => onSelect(row)} title={path} aria-label={`${row.file_name || path} MFT 정보 보기`} style={{ display: "grid", gridTemplateColumns: grid, gap: 10, alignItems: "center", width: "100%", height: "100%", padding: "0 12px", border: 0, background: "transparent", color: "inherit", cursor: "pointer", textAlign: "left" }}>
               <span style={{ minWidth: 0, display: "grid", gridTemplateRows: "18px 16px", gap: 2 }}>
-                <span style={{ minWidth: 0, display: "flex", alignItems: "center", gap: 6, color: "var(--text)", fontSize: 12.5, fontWeight: 650 }}><span title={row.file_name || "(이름 없음)"} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{row.file_name || "(이름 없음)"}</span>{row.in_use === "N" && <span style={{ flexShrink: 0, color: "var(--danger)", fontSize: 10.5, fontWeight: 650 }}>삭제됨</span>}</span>
+                <span style={{ minWidth: 0, display: "flex", alignItems: "center", gap: 6, color: "var(--text)", fontSize: 12.5, fontWeight: 650 }}>{isFolder && <FolderOutlinedIcon sx={{ flexShrink: 0, fontSize: 14, color: "var(--text-faint)" }} />}<span title={row.file_name || "(이름 없음)"} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{row.file_name || "(이름 없음)"}</span>{row.in_use === "N" && <span style={{ flexShrink: 0, color: "var(--danger)", fontSize: 10.5, fontWeight: 650 }}>삭제됨</span>}</span>
                 <span title={path} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text-faint)", fontSize: 10.5, fontFamily: "var(--mono)" }}>{path}</span>
               </span>
+              {sortValue && <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: row[sortValue.column] ? "var(--text-time)" : "var(--text-faint)", fontSize: 12, fontFamily: "var(--mono)", fontVariantNumeric: "tabular-nums" }}>{sortValue.column === "file_size" ? fmtSize(row.file_size) : row[sortValue.column] || "시간 정보 없음"}</span>}
               <span title={tags.map((tag) => `${tag.kind} · ${tag.account || "미상"}`).join(", ") || "교차 참조 없음"} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: tags.length ? "var(--accent)" : "var(--text-faint)", fontSize: 11 }}>{tags.length ? tags.map((tag) => `${tag.kind} · ${tag.account || "미상"}`).join(" / ") : "—"}</span>
             </button>
           </div>;
         })}</div>
       </div>
     </div>}
-    <footer style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", flexShrink: 0, minHeight: 42, padding: "6px 12px", borderTop: "1px solid var(--border)" }}>
-      <PaginationControls ariaLabel="파일 시스템 레코드 페이지" page={Math.floor(offset / pageSize)} pageCount={Math.max(1, Math.ceil(total / pageSize))} disabled={loading || !page} onChange={(next) => onPage(next * pageSize)} />
-    </footer>
   </section>;
 }
-
 function TreeNode({
   row,
   depth,
@@ -512,7 +592,7 @@ function TreeNode({
     <>
       <div
         className={bm ? `dfir-bookmarked-row${isSel ? " dfir-bookmarked-row--selected" : ""}` : undefined}
-        style={{ minHeight: 29, padding: "2px 7px", paddingLeft: 7 + depth * 16, borderRadius: "var(--radius-sm)", opacity: deleted ? 0.55 : 1, background: isSel ? "var(--bg-selected)" : "transparent", borderLeft: "2px solid transparent" }}
+        style={{ minHeight: 32, padding: "2px 7px", paddingLeft: 7 + depth * 16, borderRadius: "var(--radius-sm)", opacity: deleted ? 0.55 : 1, background: isSel ? "var(--bg-selected)" : "transparent", borderLeft: "2px solid transparent" }}
         onMouseEnter={(e) => { if (!isSel && !bm) e.currentTarget.style.background = "var(--bg-hover)"; }}
         onMouseLeave={(e) => { if (!isSel && !bm) e.currentTarget.style.background = "transparent"; }}
       >
@@ -540,9 +620,9 @@ function TreeNode({
             {dir
               ? (open ? <FolderOpenOutlinedIcon aria-hidden="true" sx={{ flexShrink: 0, fontSize: 17, color: "var(--accent)" }} /> : <FolderOutlinedIcon aria-hidden="true" sx={{ flexShrink: 0, fontSize: 17, color: "var(--text-faint)" }} />)
               : <InsertDriveFileOutlinedIcon aria-hidden="true" sx={{ flexShrink: 0, fontSize: 16, color: "var(--text-faint)" }} />}
-            <span style={{ flex: "1 1 0", minInlineSize: "8ch", minWidth: 0, fontSize: 12.5, color: "var(--text)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{row.file_name || "(이름 없음)"}</span>
-            {deleted && <span style={{ flexShrink: 0, fontSize: 9.5, fontWeight: 700, color: "var(--danger)", border: "1px solid var(--danger)", borderRadius: "var(--radius-sm)", padding: "0 4px" }}>삭제됨</span>}
-            {tagSummary && <span title={referenceTagTitle(rowTags)} style={{ flex: "0 1 156px", maxWidth: 156, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 9.5, fontWeight: 700, color: "var(--accent)", border: "1px solid var(--accent)", borderRadius: "var(--radius-xs)", padding: "1px 5px", textAlign: "center" }}>{tagSummary}</span>}
+            <span style={{ flex: "1 1 0", minInlineSize: "8ch", minWidth: 0, fontSize: 13, color: "var(--text)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{row.file_name || "(이름 없음)"}</span>
+            {deleted && <span style={{ flexShrink: 0, fontSize: 10.5, fontWeight: 700, color: "var(--danger)", border: "1px solid var(--danger)", borderRadius: "var(--radius-sm)", padding: "0 6px" }}>삭제됨</span>}
+            {tagSummary && <span title={referenceTagTitle(rowTags)} style={{ flex: "0 1 176px", maxWidth: 176, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 10.5, fontWeight: 700, color: "var(--accent)", border: "1px solid var(--accent)", borderRadius: "var(--radius-sm)", padding: "1px 7px", textAlign: "center" }}>{tagSummary}</span>}
           </button>
         </div>
       </div>
