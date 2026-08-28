@@ -186,11 +186,12 @@ function RawFieldValue({ column, value, focused }: { column: string; value: stri
 
 export default function RowDetailPanel({ row, columns, focusedColumn, fileBaseName, onClose, onNavigate, onFetchLinkedRows, hostDir, accountDirectory, isBookmarked, onToggleBookmark, variant = "drawer", onToggleFieldBookmark, isFieldBookmarked, relatedEvidence = [] }: RowDetailPanelProps) {
   // EventLog-derived overview rows (PowerShell/RDP/SMB correlations) carry a
-  // legacy `<log>.evtx::<rowid>` key. Load that raw event so it always uses the
-  // shared EventLog detail. Other overview record keys (for example the
-  // source-qualified ExecutionHistory keys) remain in their own artifact view.
+  // two-part `<table>::<rowid>` key (legacy hosts: `<log>.evtx::<EventRecordID>`).
+  // Load that raw event so it always uses the shared EventLog detail. Other
+  // overview record keys (for example the three-part source-qualified
+  // ExecutionHistory keys) remain in their own artifact view.
   const recordKey = row.record_key || "";
-  const canLink = Boolean(recordKey && /\.evtx::\d+$/i.test(recordKey) && onFetchLinkedRows);
+  const canLink = Boolean(recordKey && /^[^:]+::\d+$/.test(recordKey) && onFetchLinkedRows);
   const [linked, setLinked] = useState<{ row: Record<string, string>; columns: string[] } | null | undefined>(undefined);
 
   useEffect(() => {

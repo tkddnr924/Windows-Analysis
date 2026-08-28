@@ -141,19 +141,22 @@ fn fmt_ts(system_time: Option<&Value>, record_ts: DateTime<Utc>) -> String {
 
 pub fn parse_evtx_stream(path: &Path, out: &Path, table: &str) -> Result<usize> {
     let src = path.to_string_lossy().to_string();
-    let fname = path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_default();
     let mut parser = EvtxParser::from_path(path)?;
     let mut writer = StreamWriter::create(out, table, EVENT_COLUMNS, EVENT_COLUMNS)?;
 
+    // _record_key = "<출력 테이블명>::<rowid>". 테이블명은 파이프라인이 동명
+    // 로그를 고유화한 이름(Security_2 등)이라 같은 basename의 로그끼리 키가
+    // 충돌하지 않고, 뒷부분은 이 파서가 삽입하는 순번 == 출력 SQLite의 실제
+    // rowid라서(corrupted_chunk 행 포함) 뷰어가 키만으로 원본 행을 조회할 수
+    // 있다. EventRecordID는 별도 컬럼에 그대로 보존된다.
+    let mut next_rowid: i64 = 0;
     for rec in parser.records_json_value() {
         if crate::pipeline::cancelled() {
             break;
         }
         match rec {
             Err(e) => {
+                next_rowid += 1;
                 let mut row = Row::new();
                 row.insert("timestamp".into(), String::new());
                 row.insert("_status".into(), "corrupted_chunk".into());
@@ -162,6 +165,7 @@ pub fn parse_evtx_stream(path: &Path, out: &Path, table: &str) -> Result<usize> 
                 writer.push(row)?;
             }
             Ok(r) => {
+                next_rowid += 1;
                 let data = &r.data;
                 let system = get(data, &["Event", "System"]);
                 let sys = system.unwrap_or(&Value::Null);
@@ -217,7 +221,7 @@ pub fn parse_evtx_stream(path: &Path, out: &Path, table: &str) -> Result<usize> 
                 row.insert("_error".into(), String::new());
                 row.insert(
                     "_record_key".into(),
-                    format!("{}::{}", fname, erid.unwrap_or_default()),
+                    format!("{}::{}", table, next_rowid),
                 );
                 row.insert("_source_file".into(), src.clone());
                 writer.push(row)?;

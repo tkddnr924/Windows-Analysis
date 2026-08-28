@@ -57,11 +57,14 @@ const accountDirectoryKey = (host: Pick<Host, "id" | "dir">): string => `${host.
 
 type SourceRecordRef = { fileName?: string; tableName: string; rowid: number };
 
-// Overview rows retain a raw-evidence pointer. EventLog correlations use the
-// legacy "Security.evtx::123" form; ExecutionHistory uses
-// "Amcache::Amcache_Files::123" so tables from different source databases do
-// not collide. Bookmarks are source-evidence annotations, so this bridges an
-// overview row to the source record in either form.
+// Overview rows retain a raw-evidence pointer. EventLog correlations use
+// "<table>::<rowid>" ("Security_2::57" — the parser writes the unique output
+// table name and the row's actual SQLite rowid; older hosts carry the legacy
+// "Security.evtx::<EventRecordID>" form, which needs a re-parse to bookmark
+// reliably). ExecutionHistory uses "Amcache::Amcache_Files::123" so tables
+// from different source databases do not collide. Bookmarks are
+// source-evidence annotations, so this bridges an overview row to the source
+// record in either form.
 function sourceRecordRef(value: string | undefined): SourceRecordRef | null {
   const parts = (value || "").split("::");
   if (parts.length !== 2 && parts.length !== 3) return null;
@@ -316,6 +319,9 @@ export default function Home() {
       const page = await window.api.readResultFilePage(activeTab.file.fullPath, activeTab.file.tableName, loaded, RAW_TABLE_CHUNK);
       setTabs((prev) => prev.map((t) => {
         if (keyOf(t.file) !== key || !t.data) return t;
+        // 요청 시점의 오프셋과 현재 행 수가 다르면(탭을 닫았다 바로 다시 열어
+        // 초기 청크가 새로 로드된 경우) 늦게 온 응답이라 이어붙이지 않는다.
+        if (t.data.rows.length !== loaded) return t;
         return { ...t, data: { ...t.data, rows: [...t.data.rows, ...page.rows], rowCount: page.rowCount } };
       }));
     } finally {
@@ -325,8 +331,9 @@ export default function Home() {
 
   // EventLog is now one table per source .evtx, so a cross-artifact link into
   // "EventLog_Events" (e.g. RDP/PowerShell "이벤트 로그 원본 보기") can't target a
-  // single fixed table. The _record_key value encodes the real log —
-  // "Security.evtx::123" — so resolve the target table from it.
+  // single fixed table. The _record_key value encodes the real log table —
+  // "Security_2::57" (legacy hosts: "Security.evtx::123") — so resolve the
+  // target table from it.
   function resolveTargetFile(targetFile: string, targetColumn: string, value: string): string {
     if (targetColumn === "_record_key" && value.includes("::")) {
       return value.split("::")[0].replace(/\.evtx$/i, "");
