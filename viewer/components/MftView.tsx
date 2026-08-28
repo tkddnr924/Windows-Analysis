@@ -1,4 +1,6 @@
 "use client";
+import AccountFilterChips from "@/components/AccountFilterChips";
+import PaginationControls from "@/components/PaginationControls";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
@@ -24,7 +26,7 @@ import RowDetailPanel from "./RowDetailPanel";
 type Row = Record<string, string>;
 
 const ROOT_ENTRY = 5;
-const LIST_PAGE_SIZE = 250;
+const LIST_PAGE_SIZE = 10;
 const LIST_ROW_HEIGHT = 56;
 
 interface Props {
@@ -331,15 +333,13 @@ export default function MftView({ dbPath, tableBookmarks, onToggleBookmark, allB
         {refAccounts.length > 0 && (
           <div style={{ display: "flex", alignItems: "center", flexWrap: "wrap", gap: 6, marginTop: 9 }}>
             <span style={{ fontSize: 11.5, color: "var(--text-faint)", marginRight: 2 }}>교차 참조 계정</span>
-            {refAccounts.map((a) => {
-              const on = selAccounts.has(a);
-              return (
-                <label key={a || "(none)"} style={{ display: "inline-flex", alignItems: "center", gap: 4, cursor: "pointer", fontSize: 11.5, fontWeight: 600, minHeight: 24, padding: "1px 7px", borderRadius: "var(--radius-sm)", border: `1px solid ${on ? "var(--accent)" : "var(--border)"}`, color: on ? "var(--accent)" : "var(--text-faint)", background: on ? "var(--accent-subtle, transparent)" : "transparent" }}>
-                  <input type="checkbox" checked={on} onChange={() => toggleAccount(a)} style={{ accentColor: "var(--accent)", width: 12, height: 12 }} />
-                  {a || "(계정 미상)"}
-                </label>
-              );
-            })}
+            <AccountFilterChips
+              accounts={refAccounts}
+              hidden={new Set(refAccounts.filter((account) => !selAccounts.has(account)))}
+              onToggle={toggleAccount}
+              onReset={() => setSelAccounts(new Set(refAccounts))}
+              emptyLabel="(계정 미상)"
+            />
           </div>
         )}
         {pathRefsError && <div role="status" style={{ marginTop: 8, color: "var(--warning)", fontSize: 11.5 }}>{pathRefsError}</div>}
@@ -458,9 +458,8 @@ function MftRecordList({ page, loading, error, offset, pageSize, query, bmRowids
         })}</div>
       </div>
     </div>}
-    <footer style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 7, flexShrink: 0, minHeight: 42, padding: "6px 12px", borderTop: "1px solid var(--border)" }}>
-      <button type="button" disabled={offset <= 0 || loading} onClick={() => onPage(Math.max(0, offset - pageSize))} style={{ minHeight: 26, padding: "3px 8px", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", background: "transparent", color: "var(--text-dim)", cursor: offset <= 0 || loading ? "default" : "pointer", opacity: offset <= 0 || loading ? .45 : 1, fontSize: 11.5 }}>이전</button>
-      <button type="button" disabled={!page || offset + rows.length >= total || loading} onClick={() => onPage(offset + pageSize)} style={{ minHeight: 26, padding: "3px 8px", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", background: "transparent", color: "var(--text-dim)", cursor: !page || offset + rows.length >= total || loading ? "default" : "pointer", opacity: !page || offset + rows.length >= total || loading ? .45 : 1, fontSize: 11.5 }}>다음</button>
+    <footer style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", flexShrink: 0, minHeight: 42, padding: "6px 12px", borderTop: "1px solid var(--border)" }}>
+      <PaginationControls ariaLabel="파일 시스템 레코드 페이지" page={Math.floor(offset / pageSize)} pageCount={Math.max(1, Math.ceil(total / pageSize))} disabled={loading || !page} onChange={(next) => onPage(next * pageSize)} />
     </footer>
   </section>;
 }
@@ -542,8 +541,8 @@ function TreeNode({
               ? (open ? <FolderOpenOutlinedIcon aria-hidden="true" sx={{ flexShrink: 0, fontSize: 17, color: "var(--accent)" }} /> : <FolderOutlinedIcon aria-hidden="true" sx={{ flexShrink: 0, fontSize: 17, color: "var(--text-faint)" }} />)
               : <InsertDriveFileOutlinedIcon aria-hidden="true" sx={{ flexShrink: 0, fontSize: 16, color: "var(--text-faint)" }} />}
             <span style={{ flex: "1 1 0", minInlineSize: "8ch", minWidth: 0, fontSize: 12.5, color: "var(--text)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{row.file_name || "(이름 없음)"}</span>
-            {deleted && <span style={{ flexShrink: 0, fontSize: 9.5, fontWeight: 700, color: "var(--danger)", border: "1px solid var(--danger)", borderRadius: 3, padding: "0 4px" }}>삭제됨</span>}
-            {tagSummary && <span title={referenceTagTitle(rowTags)} style={{ flex: "0 1 156px", maxWidth: 156, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 9.5, fontWeight: 700, color: "var(--accent)", border: "1px solid var(--accent)", borderRadius: 3, padding: "0 4px" }}>{tagSummary}</span>}
+            {deleted && <span style={{ flexShrink: 0, fontSize: 9.5, fontWeight: 700, color: "var(--danger)", border: "1px solid var(--danger)", borderRadius: "var(--radius-sm)", padding: "0 4px" }}>삭제됨</span>}
+            {tagSummary && <span title={referenceTagTitle(rowTags)} style={{ flex: "0 1 156px", maxWidth: 156, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 9.5, fontWeight: 700, color: "var(--accent)", border: "1px solid var(--accent)", borderRadius: "var(--radius-xs)", padding: "1px 5px", textAlign: "center" }}>{tagSummary}</span>}
           </button>
         </div>
       </div>
@@ -611,8 +610,8 @@ function SearchResults({ rows, searching, error, bmRowids, selectedRowid, onSele
               <div style={{ minWidth: 0, display: "flex", alignItems: "center", gap: 6 }}>
               {isDir(r) ? <FolderOutlinedIcon aria-hidden="true" sx={{ flexShrink: 0, fontSize: 16, color: "var(--text-faint)" }} /> : <InsertDriveFileOutlinedIcon aria-hidden="true" sx={{ flexShrink: 0, fontSize: 15, color: "var(--text-faint)" }} />}
               <span style={{ flex: "1 1 0", minInlineSize: "8ch", minWidth: 0, fontSize: 12.5, color: "var(--text)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{r.file_name || "(이름 없음)"}</span>
-              {deleted && <span style={{ fontSize: 9.5, fontWeight: 700, color: "var(--danger)", border: "1px solid var(--danger)", borderRadius: 3, padding: "0 4px" }}>삭제됨</span>}
-              {tagSummary && <span title={referenceTagTitle(rowTags)} style={{ flex: "0 1 156px", maxWidth: 156, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 9.5, fontWeight: 700, color: "var(--accent)", border: "1px solid var(--accent)", borderRadius: 3, padding: "0 4px" }}>{tagSummary}</span>}
+              {deleted && <span style={{ fontSize: 9.5, fontWeight: 700, color: "var(--danger)", border: "1px solid var(--danger)", borderRadius: "var(--radius-xs)", padding: "1px 5px", textAlign: "center" }}>삭제됨</span>}
+              {tagSummary && <span title={referenceTagTitle(rowTags)} style={{ flex: "0 1 156px", maxWidth: 156, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 9.5, fontWeight: 700, color: "var(--accent)", border: "1px solid var(--accent)", borderRadius: "var(--radius-sm)", padding: "0 4px" }}>{tagSummary}</span>}
               </div>
               <div style={{ fontSize: 10.5, color: "var(--text-faint)", fontFamily: "var(--mono)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", marginTop: 1 }}>{r.path}</div>
             </div>
@@ -673,7 +672,7 @@ function DetailPane({ row, bmFieldKeys, onToggleBookmark, refs, onOpenRef, onOpe
           <div style={{ fontSize: 11, color: "var(--text-faint)", marginBottom: 3 }}>선택 항목 MFT 정보</div>
           <div style={{ fontSize: 15, fontWeight: 750, color: "var(--text)", overflowWrap: "anywhere" }}>{row.file_name || "(이름 없음)"}</div>
         </div>
-        {row.in_use === "N" && <span style={{ fontSize: 10, fontWeight: 700, color: "var(--danger)", border: "1px solid var(--danger)", borderRadius: 3, padding: "0 5px" }}>삭제됨</span>}
+        {row.in_use === "N" && <span style={{ fontSize: 10, fontWeight: 700, color: "var(--danger)", border: "1px solid var(--danger)", borderRadius: "var(--radius-sm)", padding: "0 5px" }}>삭제됨</span>}
         <button onClick={onOpenFullDetails} style={{ flexShrink: 0, fontSize: 11, padding: "5px 8px", background: "transparent", color: "var(--text-dim)", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", cursor: "pointer" }}>전체 필드</button>
       </div>
       <div style={{ fontSize: 10.5, color: "var(--text-faint)", fontFamily: "var(--mono)", overflowWrap: "anywhere", paddingBottom: 10, borderBottom: "1px solid var(--border-subtle)" }}>{row.path || "경로 정보 없음"}</div>
@@ -704,7 +703,7 @@ function DetailPane({ row, bmFieldKeys, onToggleBookmark, refs, onOpenRef, onOpe
               onMouseEnter={(e) => (e.currentTarget.style.background = "var(--bg-hover)")}
               onMouseLeave={(e) => (e.currentTarget.style.background = "var(--bg-elevated)")}
             >
-              <span style={{ fontSize: 9.5, fontWeight: 700, color: "var(--accent)", border: "1px solid var(--accent)", borderRadius: 3, padding: "0 4px", whiteSpace: "nowrap" }}>{r.kind}</span>
+              <span style={{ fontSize: 9.5, fontWeight: 700, color: "var(--accent)", border: "1px solid var(--accent)", borderRadius: "var(--radius-sm)", padding: "0 4px", whiteSpace: "nowrap" }}>{r.kind}</span>
               <div style={{ flex: 1, minWidth: 0 }}>
                 <div style={{ fontSize: 11.5, color: "var(--text)" }}>계정: {r.account || "미상"}</div>
                 {r.label && <div style={{ fontSize: 10, color: "var(--text-faint)", fontFamily: "var(--mono)", wordBreak: "break-all" }}>{r.label}</div>}
@@ -752,7 +751,7 @@ function RefModal({ reference: r, allBookmarks, onBookmarkRef, onClose }: {
         style={{ width: "min(680px, 90vw)", maxHeight: "82vh", overflow: "auto", background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "var(--radius-lg)", boxShadow: "var(--shadow-card)", padding: 20 }}
       >
         <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
-          <span style={{ fontSize: 11, fontWeight: 700, color: "var(--accent)", border: "1px solid var(--accent)", borderRadius: 3, padding: "1px 6px" }}>{r.kind}</span>
+          <span style={{ fontSize: 11, fontWeight: 700, color: "var(--accent)", border: "1px solid var(--accent)", borderRadius: "var(--radius-sm)", padding: "1px 6px" }}>{r.kind}</span>
           <span style={{ fontSize: 15, fontWeight: 700 }}>{r.account || "(계정 미상)"}</span>
           <button aria-label="닫기" onClick={onClose} style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", marginLeft: "auto", background: "transparent", border: "none", color: "var(--text-faint)", cursor: "pointer" }}><CloseOutlinedIcon sx={{ fontSize: 18 }} /></button>
         </div>

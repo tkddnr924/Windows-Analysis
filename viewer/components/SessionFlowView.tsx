@@ -1,4 +1,5 @@
 "use client";
+import AccountFilterChips from "@/components/AccountFilterChips";
 
 import { useMemo, useState } from "react";
 import BookmarkBorderOutlinedIcon from "@mui/icons-material/BookmarkBorderOutlined";
@@ -12,6 +13,7 @@ import { getArtifactView } from "@/lib/artifactViews";
 import { formatEvidenceTimestamp, inRange, EMPTY_TIME_RANGE, type TimeRange } from "@/lib/timeRange";
 import RowDetailPanel from "./RowDetailPanel";
 import { resolveAccountDisplay, type AccountDirectory } from "@/lib/accountIdentity";
+import { bareAccount, tsMs } from "@/lib/viewShared";
 
 // A gap longer than this between consecutive events of the same peer starts a
 // new session. RDP sessions cluster their connect/logon/reconnect/disconnect
@@ -24,15 +26,6 @@ const DIRECTION_COLOR: Record<string, string> = { inbound: "#7387a5", outbound: 
 const RESULT_COLOR: Record<string, string> = { 성공: "var(--success)", 실패: "var(--danger)", 정보: "var(--text-faint)" };
 const SESSION_LEDGER_GRID = "28px 88px minmax(210px, 1.35fr) minmax(170px, .8fr) 400px 132px 62px";
 const SESSION_LEDGER_MIN_WIDTH = 1160;
-
-// Providers report the account differently — bare "Administrator" from
-// TerminalServices, "HOST\Administrator" from Security-Auditing. Strip any
-// DOMAIN\/HOST\ prefix (and UPN @suffix) so the same user reads consistently.
-function bareAccount(name: string): string {
-  if (!name) return "";
-  const tail = name.replace(/\//g, "\\").split("\\").pop() ?? name;
-  return tail.split("@")[0].trim();
-}
 
 interface FlowEvent {
   row: Record<string, string>;
@@ -59,9 +52,6 @@ interface Session {
 
 // "YYYY-MM-DD HH:MM:SS.fff" (KST) — parsed as local; only relative deltas are
 // used for gap detection, so the fixed offset cancels out.
-function tsMs(ts: string): number {
-  return ts ? new Date(ts.replace(" ", "T")).getTime() : NaN;
-}
 
 function clusterSessions(data: CsvData, timeRange: TimeRange): Session[] {
   const events: FlowEvent[] = data.rows
@@ -148,6 +138,8 @@ export default function SessionFlowView({
 }: SessionFlowViewProps) {
   const [dirFilter, setDirFilter] = useState<string | undefined>(undefined);
   const [resultFilter, setResultFilter] = useState<ResultFilter>("all");
+  // 계정별 체크 필터 — 기본은 전체 표시, 체크 해제한 계정만 숨긴다.
+  const [hiddenAccounts, setHiddenAccounts] = useState<Set<string>>(new Set());
   const [query, setQuery] = useState("");
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [selected, setSelected] = useState<Record<string, string> | null>(null);
@@ -155,17 +147,22 @@ export default function SessionFlowView({
   const isSmb = fileName === "SmbHistory";
   const spec = getArtifactView(fileName);
   const allSessions = useMemo(() => clusterSessions(data, timeRange), [data, timeRange]);
+  const accounts = useMemo(
+    () => [...new Set(allSessions.map((s) => s.account))].sort((a, b) => a.localeCompare(b)),
+    [allSessions],
+  );
 
   const sessions = useMemo(() => {
     const q = query.trim().toLowerCase();
     return allSessions.filter((s) => {
       if (dirFilter && s.direction !== dirFilter) return false;
+      if (hiddenAccounts.has(s.account)) return false;
       if (resultFilter === "success" && s.success === 0) return false;
       if (resultFilter === "fail" && s.fail === 0) return false;
       if (q && !s.remote_address.toLowerCase().includes(q) && !s.account.toLowerCase().includes(q) && !(hostIpMap[s.remote_address]?.name.toLowerCase().includes(q))) return false;
       return true;
     });
-  }, [allSessions, dirFilter, resultFilter, query, hostIpMap]);
+  }, [allSessions, dirFilter, hiddenAccounts, resultFilter, query, hostIpMap]);
 
   function toggle(key: string) {
     setExpanded((prev) => {
@@ -226,6 +223,20 @@ export default function SessionFlowView({
 
           <FilterChips options={dirTabs.map((t) => ({ label: t.label, value: t.value }))} value={dirFilter} onChange={(v) => setDirFilter(v as string | undefined)} />
           <FilterChips options={resultTabs} value={resultFilter} onChange={(v) => setResultFilter((v as ResultFilter) ?? "all")} />
+          {!isSmb && accounts.length > 0 && (
+            <AccountFilterChips
+              accounts={accounts}
+              hidden={hiddenAccounts}
+              onToggle={(account) => setHiddenAccounts((previous) => {
+                const next = new Set(previous);
+                if (next.has(account)) next.delete(account);
+                else next.add(account);
+                return next;
+              })}
+              onReset={() => setHiddenAccounts(new Set())}
+              accountDirectory={accountDirectory}
+            />
+          )}
         </div>
       </div>
 
@@ -255,7 +266,7 @@ export default function SessionFlowView({
                 type="button"
                 onClick={() => toggle(s.key)}
                 aria-expanded={open}
-                style={{ width: "100%", minWidth: SESSION_LEDGER_MIN_WIDTH, display: "grid", gridTemplateColumns: SESSION_LEDGER_GRID, alignItems: "center", gap: 8, padding: "10px", cursor: "pointer", textAlign: "left", color: "var(--text)", border: "none", background: "transparent", borderLeft: "none", outlineOffset: -2 }}
+                style={{ borderRadius: "var(--radius-sm)", width: "100%", minWidth: SESSION_LEDGER_MIN_WIDTH, display: "grid", gridTemplateColumns: SESSION_LEDGER_GRID, alignItems: "center", gap: 8, padding: "10px", cursor: "pointer", textAlign: "left", color: "var(--text)", border: "none", background: "transparent", borderLeft: "none", outlineOffset: -2 }}
                 onMouseEnter={(e) => (e.currentTarget.style.background = "var(--bg-hover)")}
                 onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
                 onFocus={(e) => { e.currentTarget.style.outline = "2px solid var(--accent)"; }}
@@ -264,6 +275,10 @@ export default function SessionFlowView({
                 {open ? <KeyboardArrowDownOutlinedIcon aria-hidden="true" sx={{ fontSize: 18, color: "var(--text-faint)" }} /> : <KeyboardArrowRightOutlinedIcon aria-hidden="true" sx={{ fontSize: 18, color: "var(--text-faint)" }} />}
                 <span
                   style={{
+                    display: "inline-flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    textAlign: "center",
                     fontSize: 12,
                     fontWeight: 700,
                     padding: "2px 9px",
@@ -305,7 +320,7 @@ export default function SessionFlowView({
                     <div
                       key={i}
                       className={bm ? "dfir-bookmarked-row" : undefined}
-                      style={{ display: "flex", alignItems: "center", gap: 10, minHeight: 40, padding: "8px 12px 8px 30px", fontSize: 13.5, background: bmBg }}
+                      style={{ borderRadius: "var(--radius-sm)", display: "flex", alignItems: "center", gap: 10, minHeight: 40, padding: "8px 12px 8px 30px", fontSize: 13.5, background: bmBg }}
                       onMouseEnter={(e) => { if (!bm) e.currentTarget.style.background = "var(--bg-hover)"; }}
                       onMouseLeave={(e) => { if (!bm) e.currentTarget.style.background = bmBg; }}
                     >

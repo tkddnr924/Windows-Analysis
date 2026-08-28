@@ -119,6 +119,7 @@ function RawFieldValue({ column, value, focused }: { column: string; value: stri
         <div style={{ display: "inline-flex", alignItems: "center", gap: 4, paddingTop: 0 }}>
           {isJson && (
           <button
+            className="nm-btn"
             onClick={() => setBeautified((b) => !b)}
             title={beautified ? "원본(압축) 보기" : "보기 좋게 정렬"}
             style={{
@@ -131,11 +132,12 @@ function RawFieldValue({ column, value, focused }: { column: string; value: stri
               cursor: "pointer",
             }}
           >
-            {beautified ? "{ } 원본" : "{ } 정렬"}
+            {"{ }"}
           </button>
         )}
         {hasEscapes && (
           <button
+            className="nm-btn"
             onClick={() => setUnescaped((u) => !u)}
             title={unescaped ? "이스케이프 원본(\\r \\n \\t) 보기" : "\\r \\n \\t 를 실제 줄바꿈·탭으로 치환"}
             style={{
@@ -152,6 +154,7 @@ function RawFieldValue({ column, value, focused }: { column: string; value: stri
           </button>
         )}
         <button
+          className="nm-btn"
           onClick={copy}
           title={copyError ? "복사 실패" : copied ? "복사됨" : "값 복사"}
           aria-label={copyError ? `${column} 복사 실패` : copied ? `${column} 복사됨` : `${column} 값 복사`}
@@ -159,17 +162,17 @@ function RawFieldValue({ column, value, focused }: { column: string; value: stri
             display: "inline-flex",
             alignItems: "center",
             justifyContent: "center",
-            width: 28,
-            height: 24,
+            width: 32,
+            height: 28,
             padding: 0,
             background: "var(--bg-elevated)",
             color: "var(--text-dim)",
             border: "1px solid var(--border)",
-            borderRadius: "var(--radius-sm)",
+            borderRadius: "var(--radius-md)",
             cursor: "pointer",
           }}
         >
-          {copied ? <CheckIcon sx={{ fontSize: 15, color: "var(--success)" }} /> : <ContentCopyOutlinedIcon sx={{ fontSize: 14, color: copyError ? "var(--danger)" : undefined }} />}
+          {copied ? <CheckIcon sx={{ fontSize: 16, color: "var(--success)" }} /> : <ContentCopyOutlinedIcon sx={{ fontSize: 15, color: copyError ? "var(--danger)" : undefined }} />}
         </button>
         {copyError && <span role="status" style={{ color: "var(--danger)", fontSize: 10.5, whiteSpace: "nowrap" }}>복사 실패</span>}
         </div>
@@ -278,15 +281,16 @@ export default function RowDetailPanel({ row, columns, focusedColumn, fileBaseNa
               }}
             >
               <button
+                className="nm-btn"
                 onClick={() => setShowRaw(false)}
                 aria-pressed={!showRaw}
                 style={{
                   fontSize: 11.5,
-                  padding: "4px 8px",
-                  background: !showRaw ? "var(--accent-subtle)" : "transparent",
+                  padding: "4px 10px",
+                  background: !showRaw ? "var(--accent-subtle)" : "var(--bg-elevated)",
                   color: !showRaw ? "var(--accent)" : "var(--text-faint)",
                   border: "none",
-                  borderRadius: 4,
+                  borderRadius: "var(--radius-sm)",
                   cursor: "pointer",
                   fontWeight: !showRaw ? 700 : 550,
                 }}
@@ -294,15 +298,16 @@ export default function RowDetailPanel({ row, columns, focusedColumn, fileBaseNa
                 주요 정보
               </button>
               <button
+                className="nm-btn"
                 onClick={() => setShowRaw(true)}
                 aria-pressed={showRaw}
                 style={{
                   fontSize: 11.5,
-                  padding: "4px 8px",
-                  background: showRaw ? "var(--accent-subtle)" : "transparent",
+                  padding: "4px 10px",
+                  background: showRaw ? "var(--accent-subtle)" : "var(--bg-elevated)",
                   color: showRaw ? "var(--accent)" : "var(--text-faint)",
                   border: "none",
-                  borderRadius: 4,
+                  borderRadius: "var(--radius-sm)",
                   cursor: "pointer",
                   fontWeight: showRaw ? 700 : 550,
                 }}
@@ -313,7 +318,7 @@ export default function RowDetailPanel({ row, columns, focusedColumn, fileBaseNa
           )}
           {onToggleBookmark && (
             <button
-              className={isBookmarked ? "dfir-bookmark-control" : undefined}
+              className={isBookmarked ? "dfir-bookmark-control nm-btn" : "nm-btn"}
               onClick={onToggleBookmark}
               title={isBookmarked ? "북마크 해제" : "북마크에 추가"}
               style={{
@@ -323,7 +328,7 @@ export default function RowDetailPanel({ row, columns, focusedColumn, fileBaseNa
                 gap: 5,
                 fontSize: 11.5,
                 padding: "5px 10px",
-                background: isBookmarked ? "var(--bookmark-subtle)" : "transparent",
+                background: isBookmarked ? "var(--bookmark-subtle)" : "var(--bg-elevated)",
                 color: isBookmarked ? "var(--bookmark)" : "var(--text-dim)",
                 border: `1px solid ${isBookmarked ? "var(--bookmark-border)" : "var(--border)"}`,
                 borderRadius: "var(--radius-sm)",

@@ -8,15 +8,9 @@ use anyhow::Result;
 use rusqlite::types::ValueRef;
 use rusqlite::Connection;
 
+use crate::hex::hex_lower;
 use crate::sqlite::Row;
 
-fn hex_lower(b: &[u8]) -> String {
-    let mut s = String::with_capacity(b.len() * 2);
-    for x in b {
-        s.push_str(&format!("{:02x}", x));
-    }
-    s
-}
 /// None -> SQL NULL (matches Python None); others -> text cell.
 fn render(v: ValueRef) -> Option<String> {
     match v {
@@ -30,8 +24,11 @@ fn render(v: ValueRef) -> Option<String> {
 
 const SKIP: &[&str] = &["sqlite_sequence", "sqlite_stat1", "history_sync_metadata"];
 
-/// Returns (table_name, rows) per source table, or empty if not a History DB.
-pub fn parse_history(path: &Path) -> Result<Vec<(String, Vec<String>, Vec<Row>)>> {
+/// One source table: (table_name, columns, rows).
+pub type HistoryTable = (String, Vec<String>, Vec<Row>);
+
+/// Returns one entry per source table, or empty if not a History DB.
+pub fn parse_history(path: &Path) -> Result<Vec<HistoryTable>> {
     let uri = format!("file:{}?mode=ro&immutable=1", path.display());
     let con = Connection::open_with_flags(
         &uri,

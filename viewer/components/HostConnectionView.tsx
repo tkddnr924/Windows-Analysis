@@ -8,6 +8,7 @@ import CenterFocusStrongOutlinedIcon from "@mui/icons-material/CenterFocusStrong
 import RefreshOutlinedIcon from "@mui/icons-material/RefreshOutlined";
 import OpenInNewOutlinedIcon from "@mui/icons-material/OpenInNewOutlined";
 import { graphEdgesForScope } from "@/lib/hostGraphScope";
+import PaginationControls from "@/components/PaginationControls";
 import {
   EMPTY_TIME_RANGE,
   formatEvidenceTimestamp,
@@ -254,7 +255,7 @@ function Button(
     & React.ButtonHTMLAttributes<HTMLButtonElement>,
 ) {
   return (
-    <button type="button" {...p} style={{ ...button, ...p.style }}>
+    <button type="button" className="nm-btn" {...p} style={{ ...button, ...p.style }}>
       {children}
     </button>
   );
@@ -1225,24 +1226,13 @@ function Inspector(
               color: "var(--text-faint)",
             }}
           >
-            <span>
-              {current * size + 1}–{Math.min(
-                (current + 1) * size,
-                edge.rows.length,
-              )} / {edge.rows.length}
-            </span>
-            <Button
-              disabled={current === 0}
-              onClick={() => setPage((p) => Math.max(0, p - 1))}
-            >
-              이전
-            </Button>
-            <Button
-              disabled={current >= total - 1}
-              onClick={() => setPage((p) => Math.min(total - 1, p + 1))}
-            >
-              다음
-            </Button>
+            <PaginationControls
+              ariaLabel="접속 기록 페이지"
+              page={current}
+              pageCount={total}
+              onChange={setPage}
+              summary={`(${(current * size + 1).toLocaleString()}–${Math.min((current + 1) * size, edge.rows.length).toLocaleString()} / ${edge.rows.length.toLocaleString()})`}
+            />
           </div>
         )}
       </div>
@@ -1303,7 +1293,7 @@ const button: React.CSSProperties = {
   padding: "3px 8px",
   border: "1px solid var(--border)",
   borderRadius: "var(--radius-sm)",
-  background: "transparent",
+  background: "var(--bg-elevated)",
   color: "var(--text-dim)",
   cursor: "pointer",
   fontSize: 11.5,

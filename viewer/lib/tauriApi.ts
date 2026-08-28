@@ -13,7 +13,6 @@ import type {
 
 function makeApi(): ElectronApi {
   return {
-    setWindowLayout: (layout) => invoke<void>("set_window_layout", { layout }),
     pickFolder: () => invoke<string | null>("pick_folder"),
     listCases: () => invoke<ListCasesResult>("list_cases"),
     createCase: (name) => invoke<Case>("create_case", { name }),

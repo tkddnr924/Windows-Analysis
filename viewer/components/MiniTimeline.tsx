@@ -20,7 +20,7 @@ export default function MiniTimeline({ points }: { points: TimelinePoint[] }) {
 
   return (
     <div style={{ padding: "12px 4px 22px" }}>
-      <div style={{ position: "relative", height: 2, background: "var(--border)", borderRadius: 1, margin: "0 8px" }}>
+      <div style={{ position: "relative", height: 2, background: "var(--border)", borderRadius: "var(--radius-sm)", margin: "0 8px" }}>
         {sorted.map((p, i) => {
           const pct = ((p.date.getTime() - min) / span) * 100;
           const isEndpoint = i === 0 || i === sorted.length - 1;

@@ -170,13 +170,14 @@ impl Cache {
             blocks: HashMap::new(),
         }
     }
-    fn block_bytes(&mut self, name: &str) -> Vec<u8> {
-        if let Some(v) = self.blocks.get(name) {
-            return v.clone();
-        }
-        let data = std::fs::read(self.dir.join(name)).unwrap_or_default();
-        self.blocks.insert(name.to_string(), data.clone());
-        data
+    /// Block files (data_0..3) are memoized once per cache; only the requested
+    /// slice is copied out. Cloning the whole file per access made parsing
+    /// O(entries × file size) on large caches.
+    fn block_bytes(&mut self, name: &str) -> &[u8] {
+        let dir = &self.dir;
+        self.blocks
+            .entry(name.to_string())
+            .or_insert_with(|| std::fs::read(dir.join(name)).unwrap_or_default())
     }
     fn read(&mut self, addr: u32, size: usize) -> Vec<u8> {
         if addr & 0x8000_0000 == 0 {
@@ -199,13 +200,13 @@ impl Cache {
         let file_selector = (addr >> 16) & 0xFF;
         let num_blocks = ((addr >> 24) & 0x3) + 1;
         let block_num = (addr & 0xFFFF) as usize;
-        let data = self.block_bytes(&format!("data_{}", file_selector));
-        let off = BLOCK_HEADER_SIZE + block_num * bs;
         let length = if size > 0 {
             size
         } else {
             num_blocks as usize * bs
         };
+        let off = BLOCK_HEADER_SIZE + block_num * bs;
+        let data = self.block_bytes(&format!("data_{}", file_selector));
         if off >= data.len() {
             return Vec::new();
         }
@@ -446,11 +447,11 @@ fn account_of(path: &Path) -> String {
         .unwrap_or_default()
 }
 
-/// Parse each `index` path that is a real HTTP blockfile cache. Returns the
-/// output name, the consumed cache index, and rows so callers can retain
-/// per-evidence-file extraction counts.
-pub fn parse_caches(paths: &[PathBuf]) -> Vec<(String, PathBuf, Vec<Row>)> {
-    let mut outputs: Vec<(String, PathBuf, Vec<Row>)> = Vec::new();
+/// Valid blockfile cache indexes among `paths`, each with its assigned output
+/// name (`<account>_Chrome_Cache`, uniquified). Unreadable or non-blockfile
+/// indexes are skipped — a corrupted cache is simply not a parsable artifact.
+pub fn cache_outputs(paths: &[PathBuf]) -> Vec<(String, PathBuf)> {
+    let mut outputs: Vec<(String, PathBuf)> = Vec::new();
     let mut taken: HashSet<String> = HashSet::new();
     for index_path in paths {
         let parent_name = index_path
@@ -466,28 +467,14 @@ pub fn parse_caches(paths: &[PathBuf]) -> Vec<(String, PathBuf, Vec<Row>)> {
         {
             continue;
         }
-        let index_bytes = match std::fs::read(index_path) {
-            Ok(b) => b,
-            Err(_) => continue,
-        };
-        if index_bytes.len() < 4 || u32le(&index_bytes, 0) != INDEX_MAGIC {
+        let mut head = [0u8; 4];
+        let readable = std::fs::File::open(index_path)
+            .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut head))
+            .is_ok();
+        if !readable || u32::from_le_bytes(head) != INDEX_MAGIC {
             continue;
         }
-
-        let mut cache = Cache::new(index_path.parent().unwrap_or(Path::new(".")).to_path_buf());
-        let account = account_of(index_path);
-        let source = index_path.to_string_lossy().to_string();
-        let mut rows: Vec<Row> = Vec::new();
-        for addr in walk_addresses(&mut cache, &index_bytes) {
-            if let Some(row) = entry_row(&mut cache, addr, &account, &source) {
-                rows.push(row);
-            }
-        }
-        if rows.is_empty() {
-            continue;
-        }
-
-        let base = format!("{}_Chrome_Cache", account);
+        let base = format!("{}_Chrome_Cache", account_of(index_path));
         let mut name = base.clone();
         let mut i = 2;
         while taken.contains(&name) {
@@ -495,7 +482,72 @@ pub fn parse_caches(paths: &[PathBuf]) -> Vec<(String, PathBuf, Vec<Row>)> {
             i += 1;
         }
         taken.insert(name.clone());
-        outputs.push((name, index_path.clone(), rows));
+        outputs.push((name, index_path.clone()));
     }
     outputs
+}
+
+/// Parse one cache index, handing each entry row to `push` as it is decoded so
+/// the caller can stream rows straight into SQLite — the full result set never
+/// lives in memory. Returns the number of rows pushed.
+pub fn parse_cache_index(
+    index_path: &Path,
+    push: &mut dyn FnMut(Row) -> anyhow::Result<()>,
+) -> anyhow::Result<usize> {
+    let index_bytes = std::fs::read(index_path)?;
+    if index_bytes.len() < 4 || u32le(&index_bytes, 0) != INDEX_MAGIC {
+        anyhow::bail!("not a blockfile cache index");
+    }
+    let mut cache = Cache::new(index_path.parent().unwrap_or(Path::new(".")).to_path_buf());
+    let account = account_of(index_path);
+    let source = index_path.to_string_lossy().to_string();
+    let mut count = 0usize;
+    for addr in walk_addresses(&mut cache, &index_bytes) {
+        if let Some(row) = entry_row(&mut cache, addr, &account, &source) {
+            push(row)?;
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_outputs_skips_invalid_or_unreadable_indexes() {
+        let root = std::env::temp_dir().join(format!(
+            "wina-cache-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let good = root.join("BROWSER/userA/CHROME/Cache/Cache_Data");
+        let bad = root.join("BROWSER/userB/CHROME/Cache/Cache_Data");
+        std::fs::create_dir_all(&good).unwrap();
+        std::fs::create_dir_all(&bad).unwrap();
+        std::fs::write(good.join("index"), INDEX_MAGIC.to_le_bytes()).unwrap();
+        std::fs::write(bad.join("index"), b"nope").unwrap();
+        let paths = vec![
+            good.join("index"),
+            bad.join("index"),
+            root.join("BROWSER/userC/missing/index"),
+        ];
+        let outputs = cache_outputs(&paths);
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].0, "userA_Chrome_Cache");
+        // The magic-only index has an empty hash table — zero rows, no error.
+        let mut rows = 0usize;
+        let counted = parse_cache_index(&outputs[0].1, &mut |_row| {
+            rows += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(counted, 0);
+        assert_eq!(rows, 0);
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

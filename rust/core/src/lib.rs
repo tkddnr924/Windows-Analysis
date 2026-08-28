@@ -3,8 +3,10 @@
 //! existing viewer keeps working while parsers are migrated one by one.
 pub mod case_store;
 pub mod finder;
+pub mod hex;
 pub mod overview;
 pub mod parsers;
 pub mod pipeline;
 pub mod sqlite;
+pub mod timeline_cache;
 pub mod time;

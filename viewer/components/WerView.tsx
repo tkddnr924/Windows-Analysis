@@ -2,7 +2,16 @@
 
 import { useMemo, useState } from "react";
 import type { CsvData } from "@/lib/types";
+import { EMPTY_TIME_RANGE, inRange, rangeActive, type TimeRange } from "@/lib/timeRange";
 import RowDetailPanel from "./RowDetailPanel";
+import PaginationControls from "@/components/PaginationControls";
+import ReportProblemOutlinedIcon from "@mui/icons-material/ReportProblemOutlined";
+import SearchIcon from "@mui/icons-material/Search";
+import SortOutlinedIcon from "@mui/icons-material/SortOutlined";
+import AccessTimeIcon from "@mui/icons-material/AccessTime";
+import ExtensionOutlinedIcon from "@mui/icons-material/ExtensionOutlined";
+import ScienceOutlinedIcon from "@mui/icons-material/ScienceOutlined";
+import DescriptionOutlinedIcon from "@mui/icons-material/DescriptionOutlined";
 
 // Windows Error Reporting (Report.wer) detail view. The parser stores every
 // report field in one `report` JSON column (+ a few promoted scalars); this
@@ -15,6 +24,7 @@ interface Props {
   data: CsvData;
   bookmarkedRowids?: Set<number>;
   onToggleBookmark?: (rowid: number) => void;
+  timeRange?: TimeRange;
 }
 
 type Parsed = {
@@ -49,11 +59,13 @@ function typeTone(t: string): string {
   return "var(--accent)";
 }
 
-export default function WerView({ data, bookmarkedRowids, onToggleBookmark }: Props) {
+export default function WerView({ data, bookmarkedRowids, onToggleBookmark, timeRange = EMPTY_TIME_RANGE }: Props) {
   const [search, setSearch] = useState("");
   const [typeFilter, setTypeFilter] = useState("전체");
   const [detail, setDetail] = useState<Parsed | null>(null);
   const [page, setPage] = useState(0);
+  // 시간순 정렬 — 기본은 오래된 순(오름차순).
+  const [sortDir, setSortDir] = useState<"asc" | "desc">("asc");
 
   const parsed = useMemo<Parsed[]>(
     () =>
@@ -80,17 +92,30 @@ export default function WerView({ data, bookmarkedRowids, onToggleBookmark }: Pr
     return seen.sort();
   }, [parsed]);
 
+  const rangeOn = rangeActive(timeRange);
+  // 전역 기간 필터 — 건수 표기·유형 칩·목록 모두 이 범위 안에서 센다.
+  const ranged = useMemo(
+    () => (rangeOn ? parsed.filter((p) => inRange(p.timestamp, timeRange)) : parsed),
+    [parsed, rangeOn, timeRange],
+  );
   const shown = useMemo(() => {
     const q = search.trim().toLowerCase();
-    return parsed.filter((p) => {
+    const filtered = ranged.filter((p) => {
       if (typeFilter !== "전체" && p.eventType !== typeFilter) return false;
       if (q && ![p.appName, p.appPath, p.eventType, p.friendly, str(p.report.ReportIdentifier)].some((v) => v.toLowerCase().includes(q)))
         return false;
       return true;
     });
-  }, [parsed, search, typeFilter]);
+    // timestamp 형식(YYYY-MM-DD HH:mm:ss.mmm)은 문자열 비교가 곧 시간 비교.
+    // 시각 없는 보고서는 정렬 방향과 무관하게 뒤로 보낸다.
+    return filtered.sort((a, b) => {
+      if (!a.timestamp || !b.timestamp) return a.timestamp ? -1 : b.timestamp ? 1 : 0;
+      const c = a.timestamp.localeCompare(b.timestamp);
+      return sortDir === "asc" ? c : -c;
+    });
+  }, [ranged, search, typeFilter, sortDir]);
 
-  const PAGE = 50;
+  const PAGE = 10;
   const pageCount = Math.max(1, Math.ceil(shown.length / PAGE));
   const safePage = Math.min(page, pageCount - 1);
   const pageRows = shown.slice(safePage * PAGE, (safePage + 1) * PAGE);
@@ -98,15 +123,12 @@ export default function WerView({ data, bookmarkedRowids, onToggleBookmark }: Pr
   return (
     <div className="dfir-view" style={{ flex: 1, minHeight: 0, overflow: "auto", padding: "28px 32px" }}>
       <div style={{ display: "flex", alignItems: "baseline", gap: 12, marginBottom: 2 }}>
-        <span style={{ fontSize: 22, fontWeight: 700, color: "var(--text)" }}>💥 Windows 오류 보고 (WER)</span>
-        <span style={{ fontSize: 12.5, color: "var(--text-faint)" }}>{parsed.length.toLocaleString()}건</span>
+        <span style={{ display: "inline-flex", alignItems: "center", gap: 9, fontSize: 22, fontWeight: 700, color: "var(--text)" }}><ReportProblemOutlinedIcon sx={{ fontSize: 24, color: "var(--text-dim)" }} /> Windows 오류 보고 (WER)</span>
+        <span style={{ fontSize: 12.5, color: "var(--text-faint)" }}>{ranged.length.toLocaleString()}건</span>
       </div>
-      <div style={{ fontSize: 12, color: "var(--text-faint)", marginBottom: 12 }}>
-        앱 크래시·행(APPCRASH/BEX/AppHang 등) 보고서. 클릭하면 오류 시그니처·로드된 모듈 등 상세를 봅니다.
-      </div>
-
-      <div style={{ position: "relative", maxWidth: 420, marginBottom: 12 }}>
-        <span style={{ position: "absolute", left: 10, top: "50%", transform: "translateY(-50%)", fontSize: 12, color: "var(--text-faint)", pointerEvents: "none" }}>🔍</span>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, margin: "12px 0" }}>
+      <div style={{ position: "relative", flex: "0 1 420px" }}>
+        <SearchIcon sx={{ position: "absolute", left: 9, top: "50%", transform: "translateY(-50%)", fontSize: 16, color: "var(--text-faint)", pointerEvents: "none" }} />
         <input
           value={search}
           onChange={(e) => {
@@ -122,12 +144,16 @@ export default function WerView({ data, bookmarkedRowids, onToggleBookmark }: Pr
           </span>
         )}
       </div>
+      <button className="nm-btn" onClick={() => { setSortDir((direction) => (direction === "asc" ? "desc" : "asc")); setPage(0); }} title="정렬 순서 변경" style={{ display: "inline-flex", alignItems: "center", gap: 5, padding: "6px 11px", fontSize: 12, background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", color: "var(--text-dim)", cursor: "pointer", whiteSpace: "nowrap", fontWeight: 600 }}>
+        <SortOutlinedIcon sx={{ fontSize: 16 }} />{sortDir === "asc" ? "오래된 순" : "최근 순"}
+      </button>
+      </div>
 
       {types.length > 1 && (
         <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 14 }}>
           {["전체", ...types].map((t) => {
             const active = typeFilter === t;
-            const count = t === "전체" ? parsed.length : parsed.filter((p) => p.eventType === t).length;
+            const count = t === "전체" ? ranged.length : ranged.filter((p) => p.eventType === t).length;
             return (
               <button
                 key={t}
@@ -135,7 +161,7 @@ export default function WerView({ data, bookmarkedRowids, onToggleBookmark }: Pr
                   setTypeFilter(t);
                   setPage(0);
                 }}
-                style={{ fontSize: 11.5, padding: "3px 10px", borderRadius: 999, cursor: "pointer", whiteSpace: "nowrap", background: active ? "var(--accent-subtle)" : "transparent", color: active ? "var(--accent)" : "var(--text-dim)", border: `1px solid ${active ? "var(--accent)" : "var(--border)"}` }}
+                style={{ fontSize: 12.5, padding: "4px 12px", borderRadius: 999, cursor: "pointer", whiteSpace: "nowrap", background: active ? "var(--accent-subtle)" : "transparent", color: active ? "var(--accent)" : "var(--text-dim)", border: `1px solid ${active ? "var(--accent)" : "var(--border)"}` }}
               >
                 {t} <span style={{ color: "var(--text-faint)" }}>{count.toLocaleString()}</span>
               </button>
@@ -156,31 +182,26 @@ export default function WerView({ data, bookmarkedRowids, onToggleBookmark }: Pr
               onClick={() => setDetail(p)}
               onMouseEnter={(e) => { if (!bm) e.currentTarget.style.background = "var(--bg-hover)"; }}
               onMouseLeave={(e) => { if (!bm) e.currentTarget.style.background = "transparent"; }}
-              style={{ padding: "9px 12px", borderBottom: i < pageRows.length - 1 ? "1px solid var(--border-subtle)" : "none", cursor: "pointer" }}
+              style={{ borderRadius: "var(--radius-sm)", padding: "9px 12px", borderBottom: i < pageRows.length - 1 ? "1px solid var(--border-subtle)" : "none", cursor: "pointer" }}
               title="클릭하면 WER 상세 보기"
             >
               <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-                <span style={{ fontSize: 12.5, fontWeight: 600, color: "var(--text)" }}>{p.appName || "(이름 없음)"}</span>
+                <span style={{ fontSize: 14, fontWeight: 600, color: "var(--text)" }}>{p.appName || "(이름 없음)"}</span>
                 <Pill text={p.eventType || "?"} color={typeTone(p.eventType)} />
-                {p.friendly && <span style={{ fontSize: 10.5, color: "var(--text-faint)" }}>{p.friendly}</span>}
+                {p.friendly && <span style={{ fontSize: 12, color: "var(--text-faint)" }}>{p.friendly}</span>}
               </div>
               {p.appPath && (
-                <div style={{ fontSize: 11, color: "var(--text-dim)", fontFamily: "var(--mono)", marginTop: 3, wordBreak: "break-all" }}>{p.appPath}</div>
+                <div style={{ fontSize: 12.5, color: "var(--text-dim)", fontFamily: "var(--mono)", marginTop: 3, wordBreak: "break-all" }}>{p.appPath}</div>
               )}
-              {p.timestamp && <div style={{ fontSize: 10.5, color: "var(--text-time)", fontFamily: "var(--mono)", marginTop: 2 }}>🕑 {p.timestamp}</div>}
+              {p.timestamp && <div style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 12, color: "var(--text-time)", fontFamily: "var(--mono)", marginTop: 2 }}><AccessTimeIcon sx={{ fontSize: 13.5 }} /> {p.timestamp}</div>}
             </div>
           );
         })}
       </div>
 
-      {pageCount > 1 && (
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8, marginTop: 12 }}>
-          <button onClick={() => setPage(safePage - 1)} disabled={safePage === 0} style={pgBtn(safePage === 0)}>‹ 이전</button>
-          <span style={{ fontSize: 11.5, color: "var(--text-dim)" }}>
-            {safePage + 1} / {pageCount}{" "}
-            <span style={{ color: "var(--text-faint)" }}>({(safePage * PAGE + 1).toLocaleString()}–{Math.min((safePage + 1) * PAGE, shown.length).toLocaleString()} / {shown.length.toLocaleString()})</span>
-          </span>
-          <button onClick={() => setPage(safePage + 1)} disabled={safePage >= pageCount - 1} style={pgBtn(safePage >= pageCount - 1)}>다음 ›</button>
+      {shown.length > 0 && (
+        <div style={{ marginTop: 12 }}>
+          <PaginationControls ariaLabel="WER 페이지" page={safePage} pageCount={pageCount} onChange={setPage} summary={`(${(safePage * PAGE + 1).toLocaleString()}–${Math.min((safePage + 1) * PAGE, shown.length).toLocaleString()} / ${shown.length.toLocaleString()})`} />
         </div>
       )}
 
@@ -200,7 +221,6 @@ export default function WerView({ data, bookmarkedRowids, onToggleBookmark }: Pr
   );
 }
 
-const pgBtn = (disabled: boolean): React.CSSProperties => ({ fontSize: 11.5, padding: "3px 10px", background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", color: "var(--text-dim)", cursor: disabled ? "default" : "pointer", opacity: disabled ? 0.4 : 1 });
 
 // --- detail ---
 
@@ -275,10 +295,10 @@ function WerDetailModal({ p, onClose, isBookmarked, onToggleBookmark }: { p: Par
 
           <MetaRows rows={summary} />
 
-          {sig.length > 0 && <KVSection heading="🧩 오류 시그니처 (Sig)" pairs={sig} highlight />}
-          {dynSig.length > 0 && <KVSection heading="🧪 동적 시그니처 (DynamicSig)" pairs={dynSig} />}
+          {sig.length > 0 && <KVSection heading={<><ExtensionOutlinedIcon sx={{ fontSize: 14 }} /> 오류 시그니처 (Sig)</>} pairs={sig} highlight />}
+          {dynSig.length > 0 && <KVSection heading={<><ScienceOutlinedIcon sx={{ fontSize: 14 }} /> 동적 시그니처 (DynamicSig)</>} pairs={dynSig} />}
 
-          <div style={{ fontSize: 11, fontWeight: 700, color: "var(--text-faint)", margin: "16px 0 6px" }}>📄 보고서 정보</div>
+          <div style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 11, fontWeight: 700, color: "var(--text-faint)", margin: "16px 0 6px" }}><DescriptionOutlinedIcon sx={{ fontSize: 14 }} /> 보고서 정보</div>
           <MetaRows rows={reportMeta} />
 
           {modules.length > 0 && (
@@ -340,10 +360,10 @@ function MetaRows({ rows }: { rows: [string, string][] }) {
   );
 }
 
-function KVSection({ heading, pairs, highlight, compact }: { heading: string; pairs: { k: string; val: string }[]; highlight?: boolean; compact?: boolean }) {
+function KVSection({ heading, pairs, highlight, compact }: { heading: React.ReactNode; pairs: { k: string; val: string }[]; highlight?: boolean; compact?: boolean }) {
   return (
     <div style={{ marginTop: compact ? 8 : 16 }}>
-      <div style={{ fontSize: 11, fontWeight: 700, color: "var(--text-faint)", marginBottom: 6 }}>{heading}</div>
+      <div style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 11, fontWeight: 700, color: "var(--text-faint)", marginBottom: 6 }}>{heading}</div>
       <div style={{ border: "1px solid var(--border)", borderRadius: "var(--radius-md)", background: "var(--bg)", overflow: "hidden" }}>
         {pairs.map((p, i) => (
           <div key={i} style={{ display: "flex", gap: 12, padding: "5px 10px", borderTop: i === 0 ? "none" : "1px solid var(--border-subtle)", alignItems: "baseline" }}>
@@ -359,5 +379,5 @@ function KVSection({ heading, pairs, highlight, compact }: { heading: string; pa
 const collapseBtn: React.CSSProperties = { background: "transparent", border: "none", color: "var(--text-dim)", fontSize: 12, fontWeight: 700, cursor: "pointer", padding: "4px 0" };
 
 function Pill({ text, color }: { text: string; color: string }) {
-  return <span style={{ fontSize: 10.5, fontWeight: 700, color, border: `1px solid ${color}`, borderRadius: 4, padding: "0 6px", whiteSpace: "nowrap" }}>{text}</span>;
+  return <span style={{ fontSize: 11.5, fontWeight: 700, color, border: `1px solid ${color}`, borderRadius: "var(--radius-sm)", padding: "0 6px", whiteSpace: "nowrap" }}>{text}</span>;
 }

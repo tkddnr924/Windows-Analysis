@@ -1,19 +1,19 @@
 "use client";
+import AccountFilterChips from "@/components/AccountFilterChips";
 
 import { useEffect, useMemo, useState, type CSSProperties } from "react";
 import BookmarkBorderOutlinedIcon from "@mui/icons-material/BookmarkBorderOutlined";
 import BookmarkOutlinedIcon from "@mui/icons-material/BookmarkOutlined";
 import CloseOutlinedIcon from "@mui/icons-material/CloseOutlined";
-import NavigateBeforeOutlinedIcon from "@mui/icons-material/NavigateBeforeOutlined";
-import NavigateNextOutlinedIcon from "@mui/icons-material/NavigateNextOutlined";
 import RowDetailPanel from "./RowDetailPanel";
 import { inRange, rangeActive, EMPTY_TIME_RANGE, type TimeRange } from "@/lib/timeRange";
 import { tagsForPath, type Tag } from "@/lib/tagging";
 import type { CsvData, FetchLinkedRows } from "@/lib/types";
 import type { AccountDirectory } from "@/lib/accountIdentity";
+import PaginationControls from "@/components/PaginationControls";
 
 const TABLE = "ScheduledTasks";
-const PAGE = 12;
+const PAGE = 10;
 
 interface Props {
   data: CsvData;
@@ -101,6 +101,8 @@ function cellStyle(extra?: CSSProperties): CSSProperties {
 
 export default function ScheduledTasksView({ data, onNavigate, onFetchLinkedRows, bookmarkedRowids, onToggleBookmark, timeRange = EMPTY_TIME_RANGE, accountDirectory }: Props) {
   const [filter, setFilter] = useState<FilterKey>("user");
+  // 계정별 체크 필터 — 기본은 전체 표시, 체크 해제한 계정만 숨긴다.
+  const [hiddenAccounts, setHiddenAccounts] = useState<Set<string>>(new Set());
   const [search, setSearch] = useState("");
   const [page, setPage] = useState(0);
   const [selected, setSelected] = useState<Entry | null>(null);
@@ -114,21 +116,26 @@ export default function ScheduledTasksView({ data, onNavigate, onFetchLinkedRows
     hidden: all.filter((entry) => entry.hidden).length,
   }), [all]);
 
+  const allAccounts = useMemo(
+    () => [...new Set(all.map((entry) => entry.runAs))].sort((a, b) => a.localeCompare(b)),
+    [all],
+  );
   const filtered = useMemo(() => {
     const query = search.trim().toLowerCase();
     return all
       .filter((entry) => {
         if (rangeOn && !inRange(entry.row.timestamp || "", timeRange)) return false;
         if (filter === "user" && entry.isMicrosoft) return false;
+        if (hiddenAccounts.has(entry.runAs)) return false;
         if (filter === "review" && !entry.review) return false;
         if (filter === "hidden" && !entry.hidden) return false;
         if (!query) return true;
         return [entry.name, entry.actions, entry.runAs, entry.trigger, entry.row.author || ""].some((value) => value.toLowerCase().includes(query));
       })
       .sort((left, right) => Number(right.review) - Number(left.review) || Number(left.isMicrosoft) - Number(right.isMicrosoft) || left.name.localeCompare(right.name));
-  }, [all, filter, rangeOn, search, timeRange]);
+  }, [all, filter, hiddenAccounts, rangeOn, search, timeRange]);
 
-  useEffect(() => setPage(0), [filter, rangeOn, search, timeRange]);
+  useEffect(() => setPage(0), [filter, hiddenAccounts, rangeOn, search, timeRange]);
   const pageCount = Math.max(1, Math.ceil(filtered.length / PAGE));
   const safePage = Math.min(page, pageCount - 1);
   const pageRows = filtered.slice(safePage * PAGE, (safePage + 1) * PAGE);
@@ -148,6 +155,7 @@ export default function ScheduledTasksView({ data, onNavigate, onFetchLinkedRows
           <FilterButton active={filter === "all"} onClick={() => setFilter("all")}>전체 {counts.total.toLocaleString()}</FilterButton>
           <FilterButton active={filter === "review"} onClick={() => setFilter("review")}>검토 신호 {counts.review.toLocaleString()}</FilterButton>
           <FilterButton active={filter === "hidden"} onClick={() => setFilter("hidden")}>숨김 {counts.hidden.toLocaleString()}</FilterButton>
+          <AccountFilterChips accounts={allAccounts} hidden={hiddenAccounts} onToggle={(account: string) => setHiddenAccounts((previous) => { const next = new Set(previous); if (next.has(account)) next.delete(account); else next.add(account); return next; })} onReset={() => setHiddenAccounts(new Set())} accountDirectory={accountDirectory} />
           <div style={{ flex: 1, minWidth: 12 }} />
           <div style={{ position: "relative", width: "min(100%, 290px)" }}>
             <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="작업 이름 · 명령 · 계정 · 트리거 검색" aria-label="작업 스케줄러 검색"
@@ -187,11 +195,7 @@ export default function ScheduledTasksView({ data, onNavigate, onFetchLinkedRows
 
       <footer className="scheduler-footer" style={{ flexShrink: 0, display: "grid", gridTemplateColumns: "minmax(0, 1fr) auto minmax(0, 1fr)", alignItems: "center", minHeight: 46, gap: 12, padding: "0 20px", borderTop: "1px solid var(--border)", color: "var(--text-faint)", fontSize: 11.5 }}>
         <span title={filtered.length ? `표시 ${pageStart.toLocaleString()}–${pageEnd.toLocaleString()} / ${filtered.length.toLocaleString()}건` : "표시할 작업 없음"} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{filtered.length ? `표시 ${pageStart.toLocaleString()}–${pageEnd.toLocaleString()} / ${filtered.length.toLocaleString()}건` : "표시할 작업 없음"}{filtered.length !== counts.total && <span style={{ marginLeft: 7, color: "var(--text-faint)" }}>전체 {counts.total.toLocaleString()}건</span>}</span>
-        {pageCount > 1 && <nav aria-label="작업 스케줄러 페이지" aria-live="polite" style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8, whiteSpace: "nowrap" }}>
-          <button type="button" aria-label="이전 페이지" title="이전 페이지" onClick={() => setPage(safePage - 1)} disabled={safePage === 0} style={{ ...pageButton(safePage === 0), display: "inline-grid", placeItems: "center", width: 28, padding: 0 }}><NavigateBeforeOutlinedIcon sx={{ fontSize: 17 }} /></button>
-          <span style={{ minWidth: 174, color: "var(--text-dim)", textAlign: "center" }}>{safePage + 1} / {pageCount}쪽 · ({pageStart.toLocaleString()}–{pageEnd.toLocaleString()} / {filtered.length.toLocaleString()})</span>
-          <button type="button" aria-label="다음 페이지" title="다음 페이지" onClick={() => setPage(safePage + 1)} disabled={safePage >= pageCount - 1} style={{ ...pageButton(safePage >= pageCount - 1), display: "inline-grid", placeItems: "center", width: 28, padding: 0 }}><NavigateNextOutlinedIcon sx={{ fontSize: 17 }} /></button>
-        </nav>}
+        <PaginationControls ariaLabel="작업 스케줄러 페이지" page={safePage} pageCount={pageCount} onChange={setPage} />
         <span className="scheduler-footer-spacer" aria-hidden="true" />
       </footer>
 
@@ -200,6 +204,3 @@ export default function ScheduledTasksView({ data, onNavigate, onFetchLinkedRows
   );
 }
 
-function pageButton(disabled: boolean): CSSProperties {
-  return { height: 27, padding: "0 9px", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", background: "transparent", color: "var(--text-dim)", fontSize: 11, cursor: disabled ? "default" : "pointer", opacity: disabled ? 0.45 : 1 };
-}

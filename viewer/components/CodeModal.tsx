@@ -1,6 +1,8 @@
 "use client";
 
 import { useId, useState } from "react";
+import CheckIcon from "@mui/icons-material/Check";
+import ContentCopyOutlinedIcon from "@mui/icons-material/ContentCopyOutlined";
 import { useModalDialog } from "@/lib/useModalDialog";
 
 // A full-screen overlay that shows one code/text blob on its own — for when a
@@ -34,12 +36,17 @@ export default function CodeModal({
   }
 
   const btnStyle: React.CSSProperties = {
-    fontSize: 11,
-    padding: "3px 9px",
+    display: "inline-flex",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 4,
+    minHeight: 28,
+    fontSize: 11.5,
+    padding: "3px 10px",
     background: "var(--bg-elevated)",
     color: "var(--text-dim)",
     border: "1px solid var(--border)",
-    borderRadius: "var(--radius-sm)",
+    borderRadius: "var(--radius-md)",
     cursor: "pointer",
   };
 
@@ -89,13 +96,13 @@ export default function CodeModal({
         >
           <strong id={titleId} style={{ fontSize: 13 }}>{title}</strong>
           <span style={{ fontSize: 11, color: "var(--text-faint)" }}>{code.length.toLocaleString()}자</span>
-          <button onClick={() => setWrap((w) => !w)} style={{ ...btnStyle, marginLeft: "auto" }}>
+          <button className="nm-btn" onClick={() => setWrap((w) => !w)} style={{ ...btnStyle, marginLeft: "auto" }}>
             {wrap ? "줄바꿈 끄기" : "줄바꿈 켜기"}
           </button>
-          <button onClick={copyCode} style={{ ...btnStyle, color: copyError ? "var(--danger)" : btnStyle.color }}>
-            {copyError ? "복사 실패" : copied ? "복사됨" : "복사"}
+          <button className="nm-btn" onClick={copyCode} title={copyError ? "복사 실패" : copied ? "복사됨" : "복사"} aria-label={copyError ? "복사 실패" : copied ? "복사됨" : "코드 복사"} style={{ ...btnStyle, width: 32, padding: 0, color: copyError ? "var(--danger)" : btnStyle.color }}>
+            {copied ? <CheckIcon sx={{ fontSize: 16, color: "var(--success)" }} /> : <ContentCopyOutlinedIcon sx={{ fontSize: 15 }} />}
           </button>
-          <button
+          <button className="nm-btn"
             onClick={onClose}
             data-dialog-autofocus
             aria-label="코드 보기 닫기"

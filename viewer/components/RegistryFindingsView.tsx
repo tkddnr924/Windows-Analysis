@@ -1,4 +1,5 @@
 "use client";
+import AccountFilterChips from "@/components/AccountFilterChips";
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
@@ -20,6 +21,7 @@ import { tagsForPath } from "@/lib/tagging";
 import { inRange, rangeActive, EMPTY_TIME_RANGE, type TimeRange } from "@/lib/timeRange";
 import type { CsvData } from "@/lib/types";
 import { resolveAccountDisplay, type AccountDirectory } from "@/lib/accountIdentity";
+import { visuallyHidden } from "@/lib/viewShared";
 
 type Row = Record<string, string>;
 type CategoryMeta = { icon: typeof KeyOutlinedIcon; label: string };
@@ -97,13 +99,19 @@ function sortByRegistryTime(rows: Row[], order: TimeOrder): Row[] {
     .map(({ row }) => row);
 }
 
-export default function RegistryFindingsView({ data, bookmarkedRowids, onToggleBookmark, timeRange = EMPTY_TIME_RANGE, accountDirectory }: Props) {
+export default function RegistryFindingsView({ data, bookmarkedRowids, onToggleBookmark, accountDirectory }: Props) {
   const [selectedCategory, setSelectedCategory] = useState(ALL_ITEMS);
   const [selectedTab, setSelectedTab] = useState("전체");
   const [search, setSearch] = useState("");
   const [timeOrder, setTimeOrder] = useState<TimeOrder>("desc");
+  // 계정별 체크 필터 — 기본은 전체 표시, 체크 해제한 계정만 숨긴다.
+  const [hiddenAccounts, setHiddenAccounts] = useState<Set<string>>(new Set());
   const [detail, setDetail] = useState<Row | null>(null);
-  const rangeOn = rangeActive(timeRange);
+  // 레지스트리 특이사항은 전역 기간 필터(사고 시점)를 따르지 않는다 —
+  // 레지스트리 시각은 마지막 기록 시각이라 사고 창과 어긋나는 일이 많다.
+  // 대신 뷰 자체의 날짜 필터를 쓴다.
+  const [localRange, setLocalRange] = useState<TimeRange>(EMPTY_TIME_RANGE);
+  const rangeOn = rangeActive(localRange);
   const allRows = useMemo(() => (data.rows as Row[]).map(registryRow), [data.rows]);
   const groups = useMemo(() => {
     const byCategory = new Map<string, Row[]>();
@@ -127,10 +135,15 @@ export default function RegistryFindingsView({ data, bookmarkedRowids, onToggleB
     : groups.find((group) => group.category === selectedCategory);
   const tabField = currentGroup ? TAB_FIELD[currentGroup.category] : undefined;
   const tabs = useMemo(() => !currentGroup || !tabField ? [] : [...new Set(currentGroup.rows.map((row) => row[tabField] || "(기타)"))], [currentGroup, tabField]);
+  const allAccounts = useMemo(
+    () => [...new Set(allRows.map((row) => (row.user || "").trim()))].sort((a, b) => a.localeCompare(b)),
+    [allRows],
+  );
   const { rows, untimedExcluded } = useMemo(() => {
     if (!currentGroup) return { rows: [], untimedExcluded: 0 };
     const needle = search.trim().toLowerCase();
     const filtered = currentGroup.rows.filter((row) => {
+      if (hiddenAccounts.has((row.user || "").trim())) return false;
       if (tabField && selectedTab !== "전체" && (row[tabField] || "(기타)") !== selectedTab) return false;
       return !needle || [row.name, row.value, row.key_path, row.command, row.detail, row.source, row.user, row.subtype]
         .some((value) => (value || "").toLowerCase().includes(needle));
@@ -139,14 +152,33 @@ export default function RegistryFindingsView({ data, bookmarkedRowids, onToggleB
       ? filtered.filter((row) => !row.timestamp?.trim()).length
       : 0;
     const timeScoped = rangeOn
-      ? filtered.filter((row) => inRange(row.timestamp?.trim() ?? "", timeRange))
+      ? filtered.filter((row) => inRange(row.timestamp?.trim() ?? "", localRange))
       : filtered;
     return { rows: sortByRegistryTime(timeScoped, timeOrder), untimedExcluded };
-  }, [currentGroup, rangeOn, search, selectedTab, tabField, timeOrder, timeRange]);
+  }, [currentGroup, hiddenAccounts, localRange, rangeOn, search, selectedTab, tabField, timeOrder]);
   return <div className="dfir-view" style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", padding: "18px 20px" }}>
     <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12 }}>
       <h1 className="dfir-page-title" style={{ margin: 0, fontSize: 20 }}>레지스트리 특이사항</h1>
-      {rangeOn && <span style={{ color: "var(--accent)", fontSize: 11.5 }}>기간 필터 적용</span>}
+      <input
+        value={localRange.start}
+        onChange={(event) => setLocalRange((previous) => ({ ...previous, start: event.target.value }))}
+        placeholder="시작 (YYYY-MM-DD HH:mm:ss)"
+        aria-label="레지스트리 기록 시작 시각 필터"
+        style={{ width: 186, height: 28, padding: "0 8px", fontSize: 11.5, fontFamily: "var(--mono)", background: "var(--bg-input)", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", color: "var(--text)" }}
+      />
+      <input
+        value={localRange.end}
+        onChange={(event) => setLocalRange((previous) => ({ ...previous, end: event.target.value }))}
+        placeholder="종료 (YYYY-MM-DD HH:mm:ss)"
+        aria-label="레지스트리 기록 종료 시각 필터"
+        style={{ width: 186, height: 28, padding: "0 8px", fontSize: 11.5, fontFamily: "var(--mono)", background: "var(--bg-input)", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", color: "var(--text)" }}
+      />
+      {rangeOn && (
+        <button type="button" className="nm-btn" onClick={() => setLocalRange(EMPTY_TIME_RANGE)} style={{ height: 28, padding: "0 9px", background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", color: "var(--text-dim)", cursor: "pointer", fontSize: 11.5 }}>
+          초기화
+        </button>
+      )}
+      <div style={{ marginLeft: "auto" }}><AccountFilterChips align="right" accounts={allAccounts} hidden={hiddenAccounts} onToggle={(account: string) => setHiddenAccounts((previous) => { const next = new Set(previous); if (next.has(account)) next.delete(account); else next.add(account); return next; })} onReset={() => setHiddenAccounts(new Set())} accountDirectory={accountDirectory} /></div>
     </div>
     <div style={{ minHeight: 0, flex: 1, display: "grid", gridTemplateColumns: "210px minmax(0, 1fr)", overflow: "hidden", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", background: "var(--bg-panel)", boxShadow: "var(--shadow-card)" }}>
       <CategoryNavigation groups={groups} selected={selectedCategory} onSelect={setSelectedCategory} />
@@ -192,7 +224,6 @@ function RegistryToolbar({ search, onSearch, tabs, activeTab, onTab, tabField, t
 }
 
 function RegistryLedger({ rows, untimedExcluded, category, onSelect, bookmarkedRowids, onToggleBookmark, accountDirectory }: { rows: Row[]; untimedExcluded: number; category: string; onSelect: (row: Row) => void; bookmarkedRowids?: Set<number>; onToggleBookmark?: (rowid: number) => void; accountDirectory?: AccountDirectory }) {
-  const Icon = categoryMeta(category).icon;
   const scrollRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: 0 });
@@ -214,7 +245,7 @@ function RegistryLedger({ rows, untimedExcluded, category, onSelect, bookmarkedR
         return <div key={stableKey || virtualRow.key} className={bookmarked ? "dfir-bookmarked-row" : undefined} style={{ position: "absolute", top: 0, left: 0, width: "100%", height: ROW_HEIGHT, transform: `translateY(${virtualRow.start}px)`, display: "grid", gridTemplateColumns: "minmax(0, 1fr) 34px", gap: 12, alignItems: "center", padding: "0 12px", borderBottom: "1px solid var(--border-subtle)", borderLeft: "3px solid transparent", background: "transparent" }}>
           <div role="button" tabIndex={0} aria-label={`${row.name || "레지스트리 항목"} 상세 보기`} onClick={() => onSelect(row)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); onSelect(row); } }} style={{ minWidth: 0, height: "100%", display: "grid", gridTemplateColumns: "48px minmax(185px, .8fr) minmax(240px, 1.2fr) minmax(120px, .55fr) minmax(185px, .9fr) 170px", gap: 12, alignItems: "center", cursor: "pointer", outlineOffset: -3 }}>
             <span><span style={{ display: "inline-flex", padding: "2px 6px", borderRadius: "var(--radius-sm)", background: tone.bg, color: tone.fg, border: `1px solid ${tone.border}`, fontSize: 10.5, fontWeight: 700 }}>{row.status || "정보"}</span></span>
-            <span style={{ minWidth: 0, display: "flex", alignItems: "center", gap: 6, overflow: "hidden" }}><Icon sx={{ fontSize: 15, flexShrink: 0, color: "var(--text-faint)" }} /><span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text)", fontSize: 12.5, fontWeight: 650 }}>{row.name || "값 이름 없음"}</span></span>
+            <span style={{ minWidth: 0, display: "flex", alignItems: "center", gap: 6, overflow: "hidden" }}><span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text)", fontSize: 12.5, fontWeight: 650 }}>{row.name || "값 이름 없음"}</span></span>
             <span title={value || undefined} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: looksLikePath(value) ? "var(--accent)" : "var(--text-dim)", fontFamily: looksLikePath(value) ? "var(--mono)" : "var(--sans)", fontSize: 12 }}>{value || "값 없음"}</span>
             <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text-dim)", fontSize: 12 }}>{resolveAccountDisplay(row.user, accountDirectory) || "계정 정보 없음"}</span>
             <span title={row.key_path || undefined} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text-faint)", fontFamily: "var(--mono)", fontSize: 11 }}>{row.key_path || "키 경로 없음"}</span>
@@ -228,14 +259,3 @@ function RegistryLedger({ rows, untimedExcluded, category, onSelect, bookmarkedR
   </div>;
 }
 
-const visuallyHidden: React.CSSProperties = {
-  position: "absolute",
-  width: 1,
-  height: 1,
-  padding: 0,
-  margin: -1,
-  overflow: "hidden",
-  clip: "rect(0, 0, 0, 0)",
-  whiteSpace: "nowrap",
-  border: 0,
-};

@@ -1,4 +1,5 @@
 "use client";
+import AccountFilterChips from "@/components/AccountFilterChips";
 
 import { useMemo, useState } from "react";
 import BookmarkBorderOutlinedIcon from "@mui/icons-material/BookmarkBorderOutlined";
@@ -10,6 +11,7 @@ import type { CsvData, FetchLinkedRows } from "@/lib/types";
 import { formatEvidenceTimestamp, inRange, EMPTY_TIME_RANGE, type TimeRange } from "@/lib/timeRange";
 import RowDetailPanel from "./RowDetailPanel";
 import { resolveAccountDisplay, type AccountDirectory } from "@/lib/accountIdentity";
+import { tsMs } from "@/lib/viewShared";
 
 const TABLE_NAME = "PowerShellHistory";
 const SESSION_GAP_MS = 30 * 60 * 1000;
@@ -39,9 +41,6 @@ interface PsSession {
   events: PsEvent[];
 }
 
-function tsMs(timestamp: string): number {
-  return timestamp ? new Date(timestamp.replace(" ", "T")).getTime() : Number.NaN;
-}
 
 function firstLine(value: string, limit = 220): string {
   const line = value.split(/\r?\n/).find((item) => item.trim())?.trim() ?? value.trim();
@@ -131,6 +130,8 @@ export default function PowerShellFlowView({
   data, onNavigate, onFetchLinkedRows, bookmarkedRowids, onToggleBookmark, timeRange = EMPTY_TIME_RANGE, accountDirectory,
 }: PowerShellFlowViewProps) {
   const [kindFilter, setKindFilter] = useState<PsKind | undefined>();
+  // 계정별 체크 필터 — 기본은 전체 표시, 체크 해제한 계정만 숨긴다.
+  const [hiddenAccounts, setHiddenAccounts] = useState<Set<string>>(new Set());
   const [query, setQuery] = useState("");
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [selected, setSelected] = useState<Record<string, string> | null>(null);
@@ -141,14 +142,19 @@ export default function PowerShellFlowView({
     return allSessions.flatMap((session) => {
       const events = session.events.filter((event) => {
         if (kindFilter && event.kind !== kindFilter) return false;
+        if (hiddenAccounts.has(event.account)) return false;
         if (!needle) return true;
         return [event.account, event.process, event.processId, event.command, event.scriptBlock, event.hostApplication]
           .some((value) => value.toLowerCase().includes(needle));
       });
       return events.length ? [{ ...session, events, start: events[0].timestamp, end: events[events.length - 1].timestamp }] : [];
     });
-  }, [allSessions, kindFilter, query]);
+  }, [allSessions, hiddenAccounts, kindFilter, query]);
   const eventCount = useMemo(() => sessions.reduce((count, session) => count + session.events.length, 0), [sessions]);
+  const allAccounts = useMemo(
+    () => [...new Set(allSessions.flatMap((session) => session.events.map((event) => event.account)))].sort((a, b) => a.localeCompare(b)),
+    [allSessions],
+  );
 
   function toggle(sessionKey: string) {
     setExpanded((previous) => {
@@ -177,6 +183,7 @@ export default function PowerShellFlowView({
               return <button key={filter.label} type="button" onClick={() => setKindFilter(filter.value)} aria-pressed={active} style={{ height: 30, padding: "0 10px", fontSize: 11.5, fontWeight: active ? 700 : 550, color: active ? "var(--accent)" : "var(--text-dim)", background: active ? "var(--accent-subtle)" : "transparent", border: `1px solid ${active ? "var(--accent)" : "var(--border)"}`, borderRadius: "var(--radius-sm)", cursor: "pointer" }}>{filter.label}</button>;
             })}
           </div>
+          <AccountFilterChips accounts={allAccounts} hidden={hiddenAccounts} onToggle={(account: string) => setHiddenAccounts((previous) => { const next = new Set(previous); if (next.has(account)) next.delete(account); else next.add(account); return next; })} onReset={() => setHiddenAccounts(new Set())} accountDirectory={accountDirectory} />
         </div>
       </header>
 
@@ -188,7 +195,7 @@ export default function PowerShellFlowView({
             const recordSummary = sessionRecordSummary(session.events);
             const recordsId = `powershell-session-records-${session.key}`;
             return <section key={session.key} style={{ borderTop: "1px solid var(--border-subtle)" }}>
-              <button type="button" className="ps-session-summary" onClick={() => toggle(session.key)} aria-expanded={open} aria-controls={recordsId} aria-label={`${session.process || "powershell.exe"} ${session.processId ? `PID ${session.processId} ` : ""}세션의 원본 기록 ${session.events.length}건 ${open ? "접기" : "펼치기"}`} style={{ width: "100%", display: "grid", gridTemplateColumns: "32px minmax(150px, .72fr) minmax(110px, .46fr) minmax(190px, 1fr) minmax(210px, .9fr)", gap: 8, alignItems: "center", padding: "10px 12px", color: "var(--text)", border: "none", background: "transparent", cursor: "pointer", textAlign: "left", outlineOffset: -2 }} onMouseEnter={(event) => { event.currentTarget.style.background = "var(--bg-hover)"; }} onMouseLeave={(event) => { event.currentTarget.style.background = "transparent"; }}>
+              <button type="button" className="ps-session-summary" onClick={() => toggle(session.key)} aria-expanded={open} aria-controls={recordsId} aria-label={`${session.process || "powershell.exe"} ${session.processId ? `PID ${session.processId} ` : ""}세션의 원본 기록 ${session.events.length}건 ${open ? "접기" : "펼치기"}`} style={{ borderRadius: "var(--radius-sm)", width: "100%", display: "grid", gridTemplateColumns: "32px minmax(150px, .72fr) minmax(110px, .46fr) minmax(190px, 1fr) minmax(210px, .9fr)", gap: 8, alignItems: "center", padding: "10px 12px", color: "var(--text)", border: "none", background: "transparent", cursor: "pointer", textAlign: "left", outlineOffset: -2 }} onMouseEnter={(event) => { event.currentTarget.style.background = "var(--bg-hover)"; }} onMouseLeave={(event) => { event.currentTarget.style.background = "transparent"; }}>
                 <span className="ps-session-toggle">{open ? <KeyboardArrowDownOutlinedIcon aria-hidden="true" sx={{ fontSize: 18, color: "var(--text-faint)" }} /> : <KeyboardArrowRightOutlinedIcon aria-hidden="true" sx={{ fontSize: 18, color: "var(--text-faint)" }} />}</span>
                 <span className="ps-session-process" style={{ minWidth: 0 }}><span style={{ display: "block", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontFamily: "var(--mono)", fontSize: 12.5, fontWeight: 700 }}>{session.process || "powershell.exe"}</span>{session.processId && <span style={{ display: "block", marginTop: 2, color: "var(--text-faint)", fontSize: 10.5, fontFamily: "var(--mono)" }}>PID {session.processId}</span>}</span>
                 <span className="ps-session-account" style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: session.account ? "var(--text)" : "var(--text-faint)", fontSize: 12 }}>{resolveAccountDisplay(session.account, accountDirectory) || "계정 정보 없음"}</span>
@@ -201,7 +208,7 @@ export default function PowerShellFlowView({
                   const evidence = eventEvidence(event);
                   const bookmarked = Number.isFinite(event.rowid) && (bookmarkedRowids?.has(event.rowid) ?? false);
                   const hostApplicationSecondary = evidence.label !== "HostApplication" ? firstLine(event.hostApplication, 180) : "";
-                  return <div key={`${event.rowid}-${event.timestamp}`} className={bookmarked ? "dfir-bookmarked-row ps-session-event" : "ps-session-event"} style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) 32px", gap: 8, alignItems: "center", minHeight: 40, padding: "7px 12px 7px 56px", background: "transparent" }} onMouseEnter={(mouseEvent) => { if (!bookmarked) mouseEvent.currentTarget.style.background = "var(--bg-hover)"; }} onMouseLeave={(mouseEvent) => { if (!bookmarked) mouseEvent.currentTarget.style.background = "transparent"; }}>
+                  return <div key={`${event.rowid}-${event.timestamp}`} className={bookmarked ? "dfir-bookmarked-row ps-session-event" : "ps-session-event"} style={{ borderRadius: "var(--radius-sm)", display: "grid", gridTemplateColumns: "minmax(0, 1fr) 32px", gap: 8, alignItems: "center", minHeight: 40, padding: "7px 12px 7px 56px", background: "transparent" }} onMouseEnter={(mouseEvent) => { if (!bookmarked) mouseEvent.currentTarget.style.background = "var(--bg-hover)"; }} onMouseLeave={(mouseEvent) => { if (!bookmarked) mouseEvent.currentTarget.style.background = "transparent"; }}>
                     <button type="button" className="ps-session-child" onClick={() => setSelected(event.row)} aria-label={`${formatEvidenceTimestamp(event.timestamp)} ${event.kind || evidence.label} 상세 보기`} style={{ display: "grid", gridTemplateColumns: "160px 104px minmax(0, 1fr)", gap: 8, alignItems: "center", minWidth: 0, padding: 0, color: "var(--text)", cursor: "pointer", border: "none", background: "transparent", textAlign: "left", outlineOffset: 2 }}>
                       <span className="ps-session-child-time" style={{ color: "var(--text-time)", fontFamily: "var(--mono)", fontSize: 11.5, whiteSpace: "nowrap" }}>{formatEvidenceTimestamp(event.timestamp)}</span>
                       <span className="ps-session-child-type" style={{ color: "var(--text-dim)", fontSize: 11.5 }}>{event.kind || evidence.label}</span>

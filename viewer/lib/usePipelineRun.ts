@@ -18,6 +18,8 @@ export interface PipelineRun {
   runningHostName: string | null;
   logs: PipelineLogEntry[];
   currentArtifact: string | null;
+  /** Artifacts currently being parsed (several run in parallel). */
+  runningArtifacts: string[];
   doneArtifacts: Set<string>;
   totalSteps: number;
   completedSteps: number;
@@ -45,6 +47,7 @@ export interface PipelineRunItem {
   hostName: string;
   status: "queued" | "running" | "complete" | "partial" | "error" | "cancelled";
   currentArtifact: string | null;
+  runningArtifacts: string[];
   totalSteps: number;
   completedSteps: number;
   failedArtifacts: string[];
@@ -57,6 +60,32 @@ export interface PipelineRunItem {
 // renderer-side state survive component unmounts.
 const MAX_LOG_LINES = 2000;
 
+// Parser progress protocol: "=== <phase> ===" section markers plus
+// per-artifact "[시작] X" / "[완료] X" lines — several artifacts parse in
+// parallel, so progress is tracked per artifact instead of per section.
+type LineSignal =
+  | { kind: "section"; name: string }
+  | { kind: "start"; name: string }
+  | { kind: "done"; name: string }
+  | { kind: "failure"; name: string }
+  | { kind: "none" };
+
+function interpretLine(line: string): LineSignal {
+  const section = line.match(/^=== (.+) ===$/);
+  if (section) return { kind: "section", name: section[1] };
+  const start = line.match(/^\[시작\] (\S+)/);
+  if (start) return { kind: "start", name: start[1] };
+  const done = line.match(/^\[완료\] (\S+)/);
+  if (done) return { kind: "done", name: done[1] };
+  const failure = line.match(/^\[!\]\s+(.+?)\s+failed:/);
+  if (failure) return { kind: "failure", name: failure[1].trim() };
+  return { kind: "none" };
+}
+
+function runningLabel(running: string[]): string | null {
+  return running.length ? running.join(" · ") : null;
+}
+
 function newRunId(): string {
   // This identifier is both an event key and a path-safe immutable log name.
   return `gui-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
@@ -67,6 +96,7 @@ export function usePipelineRun(onDone?: () => void): PipelineRun {
   const [runningHostName, setRunningHostName] = useState<string | null>(null);
   const [logs, setLogs] = useState<PipelineLogEntry[]>([]);
   const [currentArtifact, setCurrentArtifact] = useState<string | null>(null);
+  const [runningArtifacts, setRunningArtifacts] = useState<string[]>([]);
   const [doneArtifacts, setDoneArtifacts] = useState<Set<string>>(new Set());
   const [totalSteps, setTotalSteps] = useState(0);
   const [completedSteps, setCompletedSteps] = useState(0);
@@ -75,7 +105,7 @@ export function usePipelineRun(onDone?: () => void): PipelineRun {
   const [failedArtifacts, setFailedArtifacts] = useState<string[]>([]);
   const [dismissed, setDismissed] = useState(true);
   const [runs, setRuns] = useState<PipelineRunItem[]>([]);
-  const currentRef = useRef<string | null>(null);
+  const runningRef = useRef<string[]>([]);
   const currentRunRef = useRef<string | null>(null);
   const onDoneRef = useRef(onDone);
   /** Immutable run ids cancelled by the analyst. A batch may have two active
@@ -84,28 +114,47 @@ export function usePipelineRun(onDone?: () => void): PipelineRun {
   const cancelledRunsRef = useRef<Set<string>>(new Set());
   onDoneRef.current = onDone;
 
-  // Mark the current section done (✓) — a section is finished once the next
-  // one starts (or the run ends). Progress counting happens on section START.
-  function flushCurrentSection() {
-    const prev = currentRef.current;
-    if (prev) setDoneArtifacts((done) => new Set(done).add(prev));
-    currentRef.current = null;
+  // A run's terminal state (or cancel) clears any still-running markers; the
+  // percent jumps to 100 via runComplete, so no synthetic done-count is needed.
+  function clearRunning() {
+    runningRef.current = [];
+    setRunningArtifacts([]);
   }
 
   useEffect(() => {
     const unsubscribe = window.api.onPipelineLog((entry) => {
+      const signal = interpretLine(entry.line);
       setRuns((previous) => previous.map((run) => {
         if (run.runId !== entry.runId) return run;
-        const section = entry.line.match(/^=== (.+) ===$/);
-        const failure = entry.line.match(/^\[!\]\s+(.+?)\s+failed:/);
+        let running = run.runningArtifacts;
+        let completed = run.completedSteps;
+        let current = entry.status === "running" ? run.currentArtifact : null;
+        let failed = run.failedArtifacts;
+        if (signal.kind === "section") {
+          if (signal.name === "_OVERVIEW") {
+            running = [];
+            current = "_OVERVIEW";
+          } else if (signal.name === "파일 확인") {
+            current = "파일 확인";
+          } else if (signal.name === "파싱") {
+            current = runningLabel(running);
+          }
+        } else if (signal.kind === "start") {
+          if (!running.includes(signal.name)) running = [...running, signal.name];
+          current = runningLabel(running);
+        } else if ((signal.kind === "done" || signal.kind === "failure") && running.includes(signal.name)) {
+          running = running.filter((name) => name !== signal.name);
+          completed = Math.min(run.totalSteps, completed + 1);
+          current = runningLabel(running);
+          if (signal.kind === "failure" && !failed.includes(signal.name)) failed = [...failed, signal.name];
+        }
         return {
           ...run,
           status: entry.status,
-          currentArtifact: section ? section[1] : (entry.status === "running" ? run.currentArtifact : null),
-          completedSteps: section ? Math.min(run.totalSteps, run.completedSteps + 1) : run.completedSteps,
-          failedArtifacts: failure && !run.failedArtifacts.includes(failure[1].trim())
-            ? [...run.failedArtifacts, failure[1].trim()]
-            : run.failedArtifacts,
+          currentArtifact: current,
+          runningArtifacts: running,
+          completedSteps: completed,
+          failedArtifacts: failed,
         };
       }));
       // The legacy compact progress banner follows the latest user-selected
@@ -120,17 +169,31 @@ export function usePipelineRun(onDone?: () => void): PipelineRun {
           ? [...prev.slice(prev.length - MAX_LOG_LINES + 1), entry]
           : [...prev, entry],
       );
-      const match = entry.line.match(/^=== (.+) ===$/);
-      if (match) {
-        flushCurrentSection();
-        currentRef.current = match[1];
-        setCurrentArtifact(match[1]);
+      if (signal.kind === "section") {
+        if (signal.name === "_OVERVIEW") {
+          clearRunning();
+          setCurrentArtifact("_OVERVIEW");
+        } else if (signal.name === "파일 확인") {
+          setCurrentArtifact("파일 확인");
+        } else if (signal.name === "파싱") {
+          setCurrentArtifact(runningLabel(runningRef.current));
+        }
+      } else if (signal.kind === "start") {
+        if (!runningRef.current.includes(signal.name)) {
+          runningRef.current = [...runningRef.current, signal.name];
+        }
+        setRunningArtifacts(runningRef.current);
+        setCurrentArtifact(runningLabel(runningRef.current));
+      } else if ((signal.kind === "done" || signal.kind === "failure") && runningRef.current.includes(signal.name)) {
+        const name = signal.name;
+        runningRef.current = runningRef.current.filter((item) => item !== name);
+        setRunningArtifacts(runningRef.current);
+        setDoneArtifacts((done) => new Set(done).add(name));
         setCompletedSteps((c) => c + 1);
-      }
-      const failure = entry.line.match(/^\[!\]\s+(.+?)\s+failed:/);
-      if (failure) {
-        const artifact = failure[1].trim();
-        setFailedArtifacts((previous) => previous.includes(artifact) ? previous : [...previous, artifact]);
+        setCurrentArtifact(runningLabel(runningRef.current));
+        if (signal.kind === "failure") {
+          setFailedArtifacts((previous) => previous.includes(name) ? previous : [...previous, name]);
+        }
       }
     });
     return unsubscribe;
@@ -143,7 +206,8 @@ export function usePipelineRun(onDone?: () => void): PipelineRun {
     setRunningHostId(opts.hostId);
     setRunningHostName(opts.hostName);
     setLogs([]);
-    currentRef.current = null;
+    runningRef.current = [];
+    setRunningArtifacts([]);
     setCurrentArtifact(null);
     setDoneArtifacts(new Set());
     setCompletedSteps(0);
@@ -158,6 +222,7 @@ export function usePipelineRun(onDone?: () => void): PipelineRun {
       hostName: opts.hostName,
       status: "queued",
       currentArtifact: null,
+      runningArtifacts: [],
       totalSteps: (opts.only ? opts.only.length : opts.totalArtifacts) + 1,
       completedSteps: 0,
       failedArtifacts: [],
@@ -199,7 +264,7 @@ export function usePipelineRun(onDone?: () => void): PipelineRun {
       return;
     }
     if (currentRunRef.current === runId) {
-      flushCurrentSection();
+      clearRunning();
       setRunningHostId(null);
       setCurrentArtifact(null);
       setCompletedHostId(opts.hostId);
@@ -225,7 +290,7 @@ export function usePipelineRun(onDone?: () => void): PipelineRun {
         : run));
     }
     if (targetRunId && targetRunId !== currentRunRef.current) return;
-    flushCurrentSection();
+    clearRunning();
     setRunningHostId(null);
     setCurrentArtifact(null);
     setRunComplete(false);
@@ -249,7 +314,9 @@ export function usePipelineRun(onDone?: () => void): PipelineRun {
     ? hadError ? "완료 (일부 오류)" : "완료"
     : currentArtifact === "_OVERVIEW"
       ? "종합 분석 생성 중…"
-      : currentArtifact ? `${currentArtifact} 파싱 중…` : runningHostId ? "준비 중…" : "대기 중";
+      : currentArtifact === "파일 확인"
+        ? "원본 파일 확인 중…"
+        : currentArtifact ? `${currentArtifact} 파싱 중…` : runningHostId ? "준비 중…" : "대기 중";
   // Several hosts can run concurrently.  A terminal latest-clicked host must
   // not hide the global notice while an earlier queue entry is still alive.
   // `dismissed` affects only the notice, never the backend scheduler.
@@ -257,7 +324,7 @@ export function usePipelineRun(onDone?: () => void): PipelineRun {
   const active = !dismissed && (hasLiveRuns || runComplete);
 
   return {
-    runningHostId, runningHostName, logs, currentArtifact, doneArtifacts,
+    runningHostId, runningHostName, logs, currentArtifact, runningArtifacts, doneArtifacts,
     totalSteps, completedSteps, runComplete, completedHostId, failedArtifacts, active, percent, stepLabel, hadError, runs,
     start, cancel, dismiss,
   };

@@ -11,10 +11,11 @@ import AccountTreeOutlinedIcon from "@mui/icons-material/AccountTreeOutlined";
 import CircularProgress from "@mui/material/CircularProgress";
 import type { Bookmark, FetchLinkedRows, Host, ResultRow } from "@/lib/types";
 import { getArtifactView, resolveArtifactView } from "@/lib/artifactViews";
-import { formatEvidenceTimestamp, inRange, rangeActive, type TimeRange } from "@/lib/timeRange";
+import { formatEvidenceTimestamp, type TimeRange } from "@/lib/timeRange";
 import TagList from "./TagList";
 import RowDetailPanel from "./RowDetailPanel";
 import { resolveAccountDisplay, type AccountDirectory } from "@/lib/accountIdentity";
+import { pathBelongsToHost, visuallyHidden } from "@/lib/viewShared";
 
 interface BookmarksViewProps {
   bookmarks: Bookmark[];
@@ -64,11 +65,6 @@ function bookmarkKey(bookmark: Bookmark): string {
   return `${bookmark.fullPath}\u0000${bookmark.tableName}#${bookmark.rowid}`;
 }
 
-function pathBelongsToHost(fullPath: string, hostDir: string): boolean {
-  const path = fullPath.replace(/\\/g, "/").replace(/\/+$/, "");
-  const root = hostDir.replace(/\\/g, "/").replace(/\/+$/, "");
-  return path === root || path.startsWith(`${root}/`);
-}
 
 function hostForBookmark(bookmark: Bookmark, hosts: Host[]): { id: string; name: string } {
   if (bookmark.hostId || bookmark.hostName) {
@@ -186,7 +182,9 @@ export default function BookmarksView({ bookmarks, hosts, hostIpMap, currentHost
   }), [bookmarks, hosts, rowCache]);
 
   const { timedEntries, undatedEntries, unresolvedEntries } = useMemo(() => {
-    const timed = entries.filter((entry) => Boolean(entry.eventTime) && (!rangeActive(timeRange) || inRange(entry.eventTime, timeRange)));
+    // 북마크는 분석가가 직접 고른 증거다 — 기간 필터(사고 시점)와 무관하게
+    // 항상 전부 표시한다.
+    const timed = entries.filter((entry) => Boolean(entry.eventTime));
     const undated = entries.filter((entry) => entry.load?.status === "ready" && !entry.eventTime);
     const unresolved = entries.filter((entry) => !entry.load || entry.load.status === "error");
     const compare = (left: BookmarkEntry, right: BookmarkEntry) => sortDir === "asc" ? left.eventTime.localeCompare(right.eventTime) : right.eventTime.localeCompare(left.eventTime);
@@ -215,7 +213,7 @@ export default function BookmarksView({ bookmarks, hosts, hostIpMap, currentHost
   return (
     <main className="dfir-view" aria-labelledby="analysis-info-title" style={{ display: "flex", flexDirection: "column", flex: 1, minHeight: 0, minWidth: 0 }}>
       <header style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", padding: "10px 14px", borderBottom: "1px solid var(--border)", background: "var(--bg-panel)", flexShrink: 0 }}>
-        <BookmarkBorderOutlinedIcon sx={{ fontSize: 18, color: "var(--accent)" }} aria-hidden="true" /><strong id="analysis-info-title" style={{ fontSize: 14, color: "var(--text)" }}>분석 정보</strong><span style={{ color: "var(--text-faint)", fontSize: 11.5 }}>{bookmarks.length.toLocaleString()}건</span><span style={{ color: "var(--text-faint)", fontSize: 11.5, borderLeft: "1px solid var(--border)", paddingLeft: 10 }}>{rangeActive(timeRange) ? "전역 기간 필터 적용" : "북마크 전체"}</span>
+        <BookmarkBorderOutlinedIcon sx={{ fontSize: 18, color: "var(--accent)" }} aria-hidden="true" /><strong id="analysis-info-title" style={{ fontSize: 14, color: "var(--text)" }}>분석 정보</strong><span style={{ color: "var(--text-faint)", fontSize: 11.5 }}>{bookmarks.length.toLocaleString()}건</span><span style={{ color: "var(--text-faint)", fontSize: 11.5, borderLeft: "1px solid var(--border)", paddingLeft: 10 }}>북마크 전체</span>
         <div style={{ display: "flex", gap: 4, marginLeft: "auto" }} role="group" aria-label="정렬 순서"><ControlButton active={sortDir === "asc"} onClick={() => setSortDir("asc")} ariaLabel="시간 오름차순 정렬">오래된순</ControlButton><ControlButton active={sortDir === "desc"} onClick={() => setSortDir("desc")} ariaLabel="시간 내림차순 정렬">최근순</ControlButton></div>
         <div style={{ display: "flex", gap: 4 }} role="group" aria-label="분석 정보 표시 방식"><ControlButton active={viewMode === "timeline"} onClick={() => setViewMode("timeline")} ariaLabel="시간 원장 보기"><TimelineOutlinedIcon sx={{ fontSize: 15, verticalAlign: "-3px", marginRight: "4px" }} />시간 원장</ControlButton><ControlButton active={viewMode === "sequence"} onClick={() => setViewMode("sequence")} ariaLabel="호스트 흐름 보기"><AccountTreeOutlinedIcon sx={{ fontSize: 15, verticalAlign: "-3px", marginRight: "4px" }} />호스트 흐름</ControlButton></div>
       </header>
@@ -310,17 +308,6 @@ function HostFlowLedger({ entries, undatedEntries, unresolvedEntries, currentHos
   </div></section>;
 }
 
-const visuallyHidden: React.CSSProperties = {
-  position: "absolute",
-  width: 1,
-  height: 1,
-  padding: 0,
-  margin: -1,
-  overflow: "hidden",
-  clip: "rect(0, 0, 0, 0)",
-  whiteSpace: "nowrap",
-  border: 0,
-};
 
 function SequenceCanvasEvent({ entry, index, participants, onOpen, accountDirectory }: { entry: SequenceEntry; index: number; participants: SequenceParticipant[]; onOpen: (entry: BookmarkEntry) => void; accountDirectory?: AccountDirectory }) {
   const sourceKey = participantKeyForHost(entry.host);

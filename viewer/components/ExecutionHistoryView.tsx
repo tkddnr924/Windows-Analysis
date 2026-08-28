@@ -1,9 +1,13 @@
 "use client";
+import AccountFilterChips from "@/components/AccountFilterChips";
 
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import BookmarkBorderOutlinedIcon from "@mui/icons-material/BookmarkBorderOutlined";
 import BookmarkIcon from "@mui/icons-material/Bookmark";
+import KeyboardArrowDownOutlinedIcon from "@mui/icons-material/KeyboardArrowDownOutlined";
+import KeyboardArrowRightOutlinedIcon from "@mui/icons-material/KeyboardArrowRightOutlined";
+import PaginationControls from "@/components/PaginationControls";
 import ClearOutlinedIcon from "@mui/icons-material/ClearOutlined";
 import FilterListOutlinedIcon from "@mui/icons-material/FilterListOutlined";
 import SearchOutlinedIcon from "@mui/icons-material/SearchOutlined";
@@ -16,6 +20,7 @@ import { tagsForPath, type Tag } from "@/lib/tagging";
 import { inRange, rangeActive, type TimeRange } from "@/lib/timeRange";
 import type { CsvData, FetchLinkedRows } from "@/lib/types";
 import { resolveAccountDisplay, type AccountDirectory } from "@/lib/accountIdentity";
+import { basename } from "@/lib/viewShared";
 
 interface ExecutionHistoryViewProps {
   data: CsvData;
@@ -54,10 +59,6 @@ interface Entry {
 }
 
 function sourceLabel(source: string): string { return (SOURCE_LABELS[source] ?? source) || "출처 없음"; }
-function basename(path: string): string {
-  const clean = (path || "").replace(/[\\/]+$/, "");
-  return clean.split(/[\\/]/).at(-1) || path;
-}
 function isWindowsSystemPath(path: string): boolean {
   const value = (path || "").toLowerCase();
   return /^[a-z]:\\windows(\\|$)/.test(value)
@@ -100,12 +101,17 @@ function FilterButton({ active, children, onClick }: { active: boolean; children
 const artifactTagStyle: React.CSSProperties = { flexShrink: 0, padding: "2px 6px", borderRadius: "var(--radius-sm)", color: "#fff", fontSize: 10.5, fontWeight: 700, lineHeight: 1.3 };
 export default function ExecutionHistoryView({ data, onNavigate, onFetchLinkedRows, bookmarkedRowids, onToggleBookmark, timeRange, accountDirectory }: ExecutionHistoryViewProps) {
   const [disabledSources, setDisabledSources] = useState<Set<string>>(new Set());
+  // 계정별 체크 필터 — 기본은 전체 표시, 체크 해제한 계정만 숨긴다.
+  const [hiddenAccounts, setHiddenAccounts] = useState<Set<string>>(new Set());
   const [onlyRisk, setOnlyRisk] = useState(false);
   const [onlyUnsigned, setOnlyUnsigned] = useState(false);
   const [excludeWindows, setExcludeWindows] = useState(false);
   const [sort, setSort] = useState<SortKey>("oldest");
   const [search, setSearch] = useState("");
   const [selected, setSelected] = useState<Entry | null>(null);
+  // 시간 정보가 없는 항목은 본 테이블과 분리해 접이식 구역으로 보여준다.
+  const [untimedOpen, setUntimedOpen] = useState(false);
+  const [untimedPage, setUntimedPage] = useState(0);
   const [sourceAnchor, setSourceAnchor] = useState<HTMLElement | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
 
@@ -118,17 +124,30 @@ export default function ExecutionHistoryView({ data, onNavigate, onFetchLinkedRo
   const activeSourceCount = sources.filter(([source]) => !disabledSources.has(source)).length;
   const filtersActive = disabledSources.size > 0 || onlyRisk || onlyUnsigned || excludeWindows || Boolean(search.trim());
   const inGlobalRange = useMemo(() => all.filter((entry) => !rangeActive(timeRange) || inRange(entry.timestamp, timeRange)), [all, timeRange]);
-  const filtered = useMemo(() => {
+  const allAccounts = useMemo(
+    () => [...new Set(inGlobalRange.map((entry) => (entry.user || "").trim()))].sort((a, b) => a.localeCompare(b)),
+    [inGlobalRange],
+  );
+  const { filtered, untimed } = useMemo(() => {
     const needle = search.trim().toLowerCase();
-    return inGlobalRange.filter((entry) => {
+    const kept = inGlobalRange.filter((entry) => {
       if (disabledSources.has(entry.source) || (excludeWindows && entry.winPath) || (onlyRisk && entry.risk === 0) || (onlyUnsigned && !entry.unsigned)) return false;
+      if (hiddenAccounts.has((entry.user || "").trim())) return false;
       return !needle || [entry.name, entry.path, entry.publisher, entry.user, entry.source].some((value) => value.toLowerCase().includes(needle));
-    }).sort((left, right) => {
+    });
+    const timed = kept.filter((entry) => entry.timestamp).sort((left, right) => {
       if (sort === "risk" && left.risk !== right.risk) return right.risk - left.risk;
-      const compare = (left.timestamp || "").localeCompare(right.timestamp || "");
+      const compare = left.timestamp.localeCompare(right.timestamp);
       return sort === "oldest" ? compare : -compare;
     });
-  }, [disabledSources, excludeWindows, inGlobalRange, onlyRisk, onlyUnsigned, search, sort]);
+    // 기간 필터가 켜지면 시간 없는 항목은 결과에서 제외된다(inGlobalRange에서
+    // 이미 걸러짐) — 여기서는 꺼져 있을 때만 별도 구역으로 모은다.
+    const untimed = kept
+      .filter((entry) => !entry.timestamp)
+      .sort((left, right) => left.name.localeCompare(right.name));
+    return { filtered: timed, untimed };
+  }, [disabledSources, excludeWindows, hiddenAccounts, inGlobalRange, onlyRisk, onlyUnsigned, search, sort]);
+  useEffect(() => setUntimedPage(0), [disabledSources, excludeWindows, hiddenAccounts, onlyRisk, onlyUnsigned, search]);
   const virtualizer = useVirtualizer({ count: filtered.length, getScrollElement: () => scrollRef.current, estimateSize: () => ROW_HEIGHT, overscan: 12 });
   const allSourcesSelected = sources.length > 0 && activeSourceCount === sources.length;
   const sourceSelectionPartial = activeSourceCount > 0 && !allSourcesSelected;
@@ -148,6 +167,8 @@ export default function ExecutionHistoryView({ data, onNavigate, onFetchLinkedRo
       <span style={{ width: 1, height: 20, background: "var(--border)", margin: "0 2px" }} />
       <span style={{ color: "var(--text-faint)", fontSize: 11.5, padding: "0 1px" }}>정렬</span>
       {(Object.keys(SORT_LABEL) as SortKey[]).map((key) => <FilterButton key={key} active={sort === key} onClick={() => setSort(key)}>{SORT_LABEL[key]}</FilterButton>)}
+      <span style={{ width: 1, height: 20, background: "var(--border)", margin: "0 2px" }} />
+      <AccountFilterChips accounts={allAccounts} hidden={hiddenAccounts} onToggle={(account: string) => setHiddenAccounts((previous) => { const next = new Set(previous); if (next.has(account)) next.delete(account); else next.add(account); return next; })} onReset={() => setHiddenAccounts(new Set())} accountDirectory={accountDirectory} />
       <div style={{ flex: 1, minWidth: 10 }} />
       {filtersActive && <Tooltip title="화면 내 필터 초기화"><IconButton aria-label="화면 내 필터 초기화" size="small" onClick={clearFilters} sx={{ color: "var(--text-dim)", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)" }}><ClearOutlinedIcon sx={{ fontSize: 17 }} /></IconButton></Tooltip>}
       <div style={{ position: "relative", width: 245, maxWidth: "100%" }}><SearchOutlinedIcon sx={{ position: "absolute", top: 7, left: 8, color: "var(--text-faint)", fontSize: 17, pointerEvents: "none" }} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="이름 · 경로 · 계정 검색" aria-label="실행 이력 검색" style={{ width: "100%", height: 30, padding: "5px 9px 5px 31px", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", color: "var(--text)", fontSize: 12.5 }} /></div>
@@ -162,6 +183,46 @@ export default function ExecutionHistoryView({ data, onNavigate, onFetchLinkedRo
       })}</div>
     </Popover>
 
+    {untimed.length > 0 && (
+      <section style={{ margin: "0 20px 8px", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", background: "var(--bg-panel)", overflow: "hidden", flexShrink: 0 }}>
+        <button
+          type="button"
+          onClick={() => setUntimedOpen((open) => !open)}
+          aria-expanded={untimedOpen}
+          style={{ width: "100%", display: "flex", alignItems: "center", gap: 7, padding: "8px 12px", background: "transparent", border: "none", color: "var(--text-dim)", cursor: "pointer", fontSize: 12.5, textAlign: "left" }}
+        >
+          {untimedOpen ? <KeyboardArrowDownOutlinedIcon sx={{ fontSize: 17 }} /> : <KeyboardArrowRightOutlinedIcon sx={{ fontSize: 17 }} />}
+          <strong style={{ color: "var(--text)" }}>시간 정보 없음</strong>
+          <span style={{ color: "var(--text-faint)" }}>{untimed.length.toLocaleString()}건</span>
+        </button>
+        {untimedOpen && (
+          <div style={{ borderTop: "1px solid var(--border-subtle)" }}>
+            {untimed.slice(untimedPage * 10, untimedPage * 10 + 10).map((entry) => {
+              const bookmarked = bookmarkedRowids?.has(entry.rowid) ?? false;
+              const selectedRow = selected?.rowid === entry.rowid && selected.source === entry.source;
+              return (
+                <div key={`${entry.source}:${entry.rowid}`} role="button" tabIndex={0} aria-label={`${entry.name} 상세 보기`} className={bookmarked ? `dfir-bookmarked-row${selectedRow ? " dfir-bookmarked-row--selected" : ""}` : undefined} style={{ display: "grid", gridTemplateColumns: "minmax(205px, 1fr) minmax(330px, 1.7fr) 112px minmax(145px, .75fr) 34px", gap: 12, alignItems: "center", minHeight: 38, padding: "0 12px", borderBottom: "1px solid var(--border-subtle)", borderRadius: "var(--radius-sm)", cursor: "pointer" }}
+                  onClick={() => setSelected(entry)}
+                  onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); setSelected(entry); } }}
+                  onMouseEnter={(event) => { if (!bookmarked) event.currentTarget.style.background = "var(--bg-hover)"; }}
+                  onMouseLeave={(event) => { if (!bookmarked) event.currentTarget.style.background = "transparent"; }}
+                >
+                  <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 13, fontWeight: 650 }}>{entry.name}</span>
+                  <span title={entry.path || undefined} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text-dim)", fontSize: 12 }}>{entry.path || "경로 정보 없음"}</span>
+                  <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text-dim)", fontSize: 12 }}>{sourceLabel(entry.source)}</span>
+                  <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: accountDisplayLabel(entry.row, accountDirectory) === "계정 정보 없음" ? "var(--text-faint)" : "var(--text-dim)", fontSize: 12 }}>{accountDisplayLabel(entry.row, accountDirectory)}</span>
+                  <Tooltip title={bookmarked ? "북마크 해제" : "북마크"}><span><IconButton className={bookmarked ? "dfir-bookmark-control" : undefined} aria-label={bookmarked ? "북마크 해제" : "북마크"} disabled={!onToggleBookmark} size="small" onClick={(event) => { event.stopPropagation(); onToggleBookmark?.(entry.rowid); }} sx={{ color: bookmarked ? "var(--bookmark)" : "var(--text-faint)" }}>{bookmarked ? <BookmarkIcon sx={{ fontSize: 17 }} /> : <BookmarkBorderOutlinedIcon sx={{ fontSize: 17 }} />}</IconButton></span></Tooltip>
+                </div>
+              );
+            })}
+            <div style={{ display: "flex", justifyContent: "center", padding: "6px 0" }}>
+              <PaginationControls ariaLabel="시간 정보 없음 페이지" page={untimedPage} pageCount={Math.max(1, Math.ceil(untimed.length / 10))} onChange={setUntimedPage} summary={`(${Math.min(untimed.length, untimedPage * 10 + 1).toLocaleString()}–${Math.min(untimed.length, untimedPage * 10 + 10).toLocaleString()} / ${untimed.length.toLocaleString()})`} />
+            </div>
+          </div>
+        )}
+      </section>
+    )}
+
     <div style={{ minHeight: 0, flex: 1, margin: "0 20px", display: "flex", flexDirection: "column", overflow: "hidden", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", background: "var(--bg-panel)", boxShadow: "var(--shadow-card)" }}>
       <div style={{ display: "grid", gridTemplateColumns: "174px minmax(205px, 1fr) minmax(330px, 1.7fr) 112px minmax(145px, .75fr) 34px", gap: 12, alignItems: "center", minHeight: 34, padding: "0 12px", borderBottom: "1px solid var(--border)", color: "var(--text-faint)", fontSize: 10.5, fontWeight: 700, letterSpacing: ".02em" }}><span>시간</span><span>실행 항목</span><span>경로</span><span>출처</span><span>계정</span><span aria-label="북마크" /></div>
       <div ref={scrollRef} style={{ flex: 1, minHeight: 0, overflow: "auto" }}>
@@ -169,7 +230,7 @@ export default function ExecutionHistoryView({ data, onNavigate, onFetchLinkedRo
           const entry = filtered[virtualRow.index];
           const bookmarked = bookmarkedRowids?.has(entry.rowid) ?? false;
           const selectedRow = selected?.rowid === entry.rowid && selected.source === entry.source;
-          return <div key={virtualRow.key} className={bookmarked ? `dfir-bookmarked-row${selectedRow ? " dfir-bookmarked-row--selected" : ""}` : undefined} style={{ position: "absolute", top: 0, left: 0, width: "100%", height: ROW_HEIGHT, transform: `translateY(${virtualRow.start}px)`, display: "grid", gridTemplateColumns: "minmax(0, 1fr) 34px", gap: 12, alignItems: "center", padding: "0 12px", borderBottom: "1px solid var(--border-subtle)", borderLeft: "3px solid transparent", background: selectedRow ? "var(--bg-selected)" : "transparent", color: "var(--text)" }} onMouseEnter={(event) => { if (!selectedRow && !bookmarked) event.currentTarget.style.background = "var(--bg-hover)"; }} onMouseLeave={(event) => { if (!selectedRow && !bookmarked) event.currentTarget.style.background = "transparent"; }}>
+          return <div key={virtualRow.key} className={bookmarked ? `dfir-bookmarked-row${selectedRow ? " dfir-bookmarked-row--selected" : ""}` : undefined} style={{ borderRadius: "var(--radius-sm)", position: "absolute", top: 0, left: 0, width: "100%", height: ROW_HEIGHT, transform: `translateY(${virtualRow.start}px)`, display: "grid", gridTemplateColumns: "minmax(0, 1fr) 34px", gap: 12, alignItems: "center", padding: "0 12px", borderBottom: "1px solid var(--border-subtle)", borderLeft: "3px solid transparent", background: selectedRow ? "var(--bg-selected)" : "transparent", color: "var(--text)" }} onMouseEnter={(event) => { if (!selectedRow && !bookmarked) event.currentTarget.style.background = "var(--bg-hover)"; }} onMouseLeave={(event) => { if (!selectedRow && !bookmarked) event.currentTarget.style.background = "transparent"; }}>
             <div role="button" tabIndex={0} aria-label={`${entry.name} 상세 보기`} onClick={() => setSelected(entry)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); setSelected(entry); } }} style={{ minWidth: 0, height: "100%", display: "grid", gridTemplateColumns: "174px minmax(205px, 1fr) minmax(330px, 1.7fr) 112px minmax(145px, .75fr)", gap: 12, alignItems: "center", cursor: "pointer", outlineOffset: -3 }}>
             <span style={{ color: "var(--text-time)", fontSize: 12.5, fontVariantNumeric: "tabular-nums", whiteSpace: "nowrap" }}>{entry.timestamp || "시간 정보 없음"}</span>
             <span style={{ minWidth: 0, display: "flex", alignItems: "center", gap: 6, overflow: "hidden" }}><span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 13, fontWeight: 650 }}>{entry.name}</span>{entry.tags.map((tag) => <span key={tag.label} title={tag.description} style={{ ...artifactTagStyle, background: tag.severity === "danger" ? "var(--danger)" : "var(--warning)" }}>{tag.label}</span>)}</span>

@@ -12,6 +12,7 @@ use std::path::Path;
 use anyhow::Result;
 use base64::Engine;
 
+use crate::hex::hex_lower;
 use crate::sqlite::Row;
 
 pub const RDP_TABLE: &str = "RdpBitmapCache";
@@ -80,13 +81,6 @@ struct Tile {
     rgb: Vec<u8>,
 }
 
-fn hex_lower(b: &[u8]) -> String {
-    let mut s = String::with_capacity(b.len() * 2);
-    for x in b {
-        s.push_str(&format!("{:02x}", x));
-    }
-    s
-}
 
 fn png_b64(width: usize, height: usize, rgb: &[u8]) -> String {
     let mut buf = Vec::new();
@@ -94,6 +88,9 @@ fn png_b64(width: usize, height: usize, rgb: &[u8]) -> String {
         let mut enc = png::Encoder::new(&mut buf, width as u32, height as u32);
         enc.set_color(png::ColorType::Rgb);
         enc.set_depth(png::BitDepth::Eight);
+        // 무손실은 그대로, 압축 수준만 빠르게 — 타일 수천 개 인코딩이 RdpCache
+        // 파싱 시간의 대부분이라 크기 약간 늘리고 속도를 몇 배 얻는다.
+        enc.set_compression(png::Compression::Fast);
         let mut w = enc.write_header().unwrap();
         w.write_image_data(rgb).unwrap();
     }
@@ -204,7 +201,7 @@ fn mosaic_row(src: &str, full: &str, tiles: &[Tile]) -> Option<Row> {
         return None;
     }
     let cols = MOSAIC_COLS.min(tiles.len());
-    let rows_n = (tiles.len() + cols - 1) / cols;
+    let rows_n = tiles.len().div_ceil(cols);
     let (mw, mh) = (cols * TILE, rows_n * TILE);
     let mut canvas = bg_canvas(mw, mh);
     for (i, t) in tiles.iter().enumerate() {
@@ -237,11 +234,19 @@ fn uniform(edge: &[u8]) -> bool {
     edge.chunks_exact(3).all(|px| px == &edge[0..3])
 }
 
+/// Edge lookup key: (edge length, edge pixel bytes).
+type EdgeKey = (usize, Vec<u8>);
+/// A tile's four edges: (left, right, top, bottom) pixel bytes.
+type TileEdges = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
+
+/// Stitch result: (tile-index components, tile index -> grid (col, row)).
+type StitchResult = (Vec<Vec<usize>>, HashMap<usize, (i32, i32)>);
+
 /// Stitch tiles into connected components with grid positions (mirrors Python).
-fn stitch(tiles: &[Tile]) -> (Vec<Vec<usize>>, HashMap<usize, (i32, i32)>) {
-    let mut left_idx: HashMap<(usize, Vec<u8>), Vec<usize>> = HashMap::new();
-    let mut top_idx: HashMap<(usize, Vec<u8>), Vec<usize>> = HashMap::new();
-    let mut edge: HashMap<usize, (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> = HashMap::new();
+fn stitch(tiles: &[Tile]) -> StitchResult {
+    let mut left_idx: HashMap<EdgeKey, Vec<usize>> = HashMap::new();
+    let mut top_idx: HashMap<EdgeKey, Vec<usize>> = HashMap::new();
+    let mut edge: HashMap<usize, TileEdges> = HashMap::new();
     for t in tiles {
         let l = col_bytes(t, 0);
         let r = col_bytes(t, t.w - 1);
@@ -329,7 +334,7 @@ fn stitch(tiles: &[Tile]) -> (Vec<Vec<usize>>, HashMap<usize, (i32, i32)>) {
         }
         comps.push(members);
     }
-    comps.sort_by(|a, b| b.len().cmp(&a.len()));
+    comps.sort_by_key(|component| std::cmp::Reverse(component.len()));
     (comps, pos)
 }
 
@@ -411,7 +416,7 @@ fn tile_rows(src: &str, full: &str, tiles: &[Tile]) -> Vec<Row> {
             (rgb, id, c)
         })
         .collect();
-    items.sort_by(|a, b| b.2.cmp(&a.2)); // stable, count desc
+    items.sort_by_key(|item| std::cmp::Reverse(item.2)); // stable, count desc
     for (_, id, count) in items {
         let t = byid[&id];
         let mut r = Row::new();
@@ -432,8 +437,8 @@ fn tile_rows(src: &str, full: &str, tiles: &[Tile]) -> Vec<Row> {
 
 /// Cache files carrying the RDP bitmap signature are evidence inputs even when
 /// tile decoding yields no rows (for example, a valid but empty/corrupt cache).
-pub fn parse_rdpcache_with_sources(root: &Path) -> Result<(Vec<std::path::PathBuf>, Vec<Row>)> {
-    let mut rows = Vec::new();
+/// Only the first 4 KB of each candidate is read for the signature test.
+pub fn rdpcache_sources(root: &Path) -> Vec<std::path::PathBuf> {
     let mut sources = Vec::new();
     for entry in walkdir::WalkDir::new(root)
         .into_iter()
@@ -443,19 +448,39 @@ pub fn parse_rdpcache_with_sources(root: &Path) -> Result<(Vec<std::path::PathBu
             continue;
         }
         // located by content marker (like the Python find_files_by_content)
-        let raw = match std::fs::read(entry.path()) {
-            Ok(d) => d,
+        let mut head = Vec::new();
+        match std::fs::File::open(entry.path()) {
+            Ok(f) => {
+                use std::io::Read;
+                if Read::take(f, 4096).read_to_end(&mut head).is_err() {
+                    continue;
+                }
+            }
             Err(_) => continue,
-        };
-        let head = &raw[..raw.len().min(4096)];
-        if !head.windows(MAGIC.len()).any(|w| w == MAGIC) {
-            continue;
         }
-        sources.push(entry.path().to_path_buf());
-        let (tiles, corrupt) = decode_file(entry.path());
-        let src = entry.file_name().to_string_lossy().to_string();
-        let full = entry.path().to_string_lossy().to_string();
-        let account = account_of(entry.path());
+        if head.windows(MAGIC.len()).any(|w| w == MAGIC) {
+            sources.push(entry.path().to_path_buf());
+        }
+    }
+    sources.sort();
+    sources
+}
+
+/// Decode already-discovered RDP bitmap cache files, handing each row to
+/// `push` as soon as its source file is decoded — only one file's tiles live
+/// in memory at a time, so the base64 PNG payloads never accumulate.
+pub fn parse_rdpcache_into(
+    sources: &[std::path::PathBuf],
+    push: &mut dyn FnMut(Row) -> Result<()>,
+) -> Result<()> {
+    for path in sources {
+        let (tiles, corrupt) = decode_file(path);
+        let src = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let full = path.to_string_lossy().to_string();
+        let account = account_of(path);
         // Collect this file's rows, then stamp the account on every one so the
         // viewer can group/tag RDP cache by the user it was captured under.
         let mut file_rows: Vec<Row> = Vec::new();
@@ -464,12 +489,27 @@ pub fn parse_rdpcache_with_sources(root: &Path) -> Result<(Vec<std::path::PathBu
         }
         file_rows.extend(tile_rows(&src, &full, &tiles));
         file_rows.extend(corrupt);
-        for r in &mut file_rows {
+        for mut r in file_rows {
             r.insert("account".into(), account.clone());
+            push(r)?;
         }
-        rows.extend(file_rows);
     }
-    sources.sort();
+    Ok(())
+}
+
+/// Decode already-discovered RDP bitmap cache files into one row list.
+pub fn parse_rdpcache_from(sources: &[std::path::PathBuf]) -> Vec<Row> {
+    let mut rows = Vec::new();
+    let _ = parse_rdpcache_into(sources, &mut |row| {
+        rows.push(row);
+        Ok(())
+    });
+    rows
+}
+
+pub fn parse_rdpcache_with_sources(root: &Path) -> Result<(Vec<std::path::PathBuf>, Vec<Row>)> {
+    let sources = rdpcache_sources(root);
+    let rows = parse_rdpcache_from(&sources);
     Ok((sources, rows))
 }
 

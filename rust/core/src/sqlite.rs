@@ -21,6 +21,10 @@ pub fn write_table(
         std::fs::create_dir_all(parent)?;
     }
     let mut conn = Connection::open(db_path)?;
+    // 스테이징 출력은 실패 시 통째로 폐기되므로 내구성 보장(journal/fsync)이
+    // 필요 없다 — StreamWriter와 같은 설정으로 대량 insert를 빠르게 한다.
+    conn.pragma_update(None, "journal_mode", "OFF").ok();
+    conn.pragma_update(None, "synchronous", "OFF").ok();
     conn.execute(&format!("DROP TABLE IF EXISTS \"{}\"", table_name), [])?;
     if rows.is_empty() {
         return Ok(());
@@ -78,7 +82,7 @@ pub fn write_table(
                 .iter()
                 .map(|c| r.get(c).map(|s| s.as_str()))
                 .collect();
-            stmt.execute(rusqlite::params_from_iter(vals.into_iter()))?;
+            stmt.execute(rusqlite::params_from_iter(vals))?;
         }
     }
     tx.commit()?;
@@ -100,6 +104,8 @@ pub fn write_table_cols(
         std::fs::create_dir_all(parent)?;
     }
     let mut conn = Connection::open(db_path)?;
+    conn.pragma_update(None, "journal_mode", "OFF").ok();
+    conn.pragma_update(None, "synchronous", "OFF").ok();
     conn.execute(&format!("DROP TABLE IF EXISTS \"{}\"", table_name), [])?;
     if rows.is_empty() {
         return Ok(());
@@ -146,7 +152,7 @@ pub fn write_table_cols(
                 .iter()
                 .map(|c| r.get(c).map(|s| s.as_str()))
                 .collect();
-            stmt.execute(rusqlite::params_from_iter(vals.into_iter()))?;
+            stmt.execute(rusqlite::params_from_iter(vals))?;
         }
     }
     tx.commit()?;
@@ -164,8 +170,16 @@ pub struct StreamWriter {
     insert_sql: String,
     buf: Vec<Row>,
     batch: usize,
+    /// Approximate bytes buffered. Rows with large values (browser-cache
+    /// bodies) flush well before `batch` rows so memory stays bounded.
+    buffered_bytes: usize,
     total: usize,
 }
+
+/// Flush the row buffer once it holds roughly this many bytes, regardless of
+/// row count. Small-row tables (MFT, EventLog) never reach it and keep the
+/// row-count batching.
+const BATCH_BYTE_LIMIT: usize = 64 * 1024 * 1024;
 
 impl StreamWriter {
     /// `universe` = every column the table can contain; `preferred` = leading
@@ -225,13 +239,18 @@ impl StreamWriter {
             insert_sql,
             buf: Vec::new(),
             batch: 50_000,
+            buffered_bytes: 0,
             total: 0,
         })
     }
 
     pub fn push(&mut self, row: Row) -> Result<()> {
+        self.buffered_bytes += row
+            .iter()
+            .map(|(key, value)| key.len() + value.len())
+            .sum::<usize>();
         self.buf.push(row);
-        if self.buf.len() >= self.batch {
+        if self.buf.len() >= self.batch || self.buffered_bytes >= BATCH_BYTE_LIMIT {
             self.flush()?;
         }
         Ok(())
@@ -250,12 +269,13 @@ impl StreamWriter {
                     .iter()
                     .map(|c| r.get(c).map(|s| s.as_str()))
                     .collect();
-                stmt.execute(rusqlite::params_from_iter(vals.into_iter()))?;
+                stmt.execute(rusqlite::params_from_iter(vals))?;
             }
         }
         tx.commit()?;
         self.total += self.buf.len();
         self.buf.clear();
+        self.buffered_bytes = 0;
         Ok(())
     }
 

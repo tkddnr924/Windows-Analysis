@@ -12,6 +12,7 @@ use notatin::cell_value::CellValue;
 use notatin::parser::ParserIterator;
 use notatin::parser_builder::ParserBuilder;
 
+use crate::hex::hex_lower;
 use crate::sqlite::Row;
 use crate::time::fmt_kst;
 
@@ -65,13 +66,6 @@ fn map_legacy_program(name: &str) -> &str {
     }
 }
 
-fn hex_lower(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push_str(&format!("{:02x}", b));
-    }
-    s
-}
 fn render(cv: &CellValue) -> String {
     match cv {
         CellValue::String(s) => s.trim_end_matches('\u{0}').to_string(),
@@ -93,7 +87,7 @@ fn underscore(s: &str) -> String {
         let c = ch[i];
         if i > 0 && c.is_ascii_uppercase() {
             let prev = ch[i - 1];
-            let next_lower = ch.get(i + 1).map_or(false, |n| n.is_ascii_lowercase());
+            let next_lower = ch.get(i + 1).is_some_and(|n| n.is_ascii_lowercase());
             if prev.is_ascii_lowercase()
                 || prev.is_ascii_digit()
                 || (prev.is_ascii_uppercase() && next_lower)
@@ -123,6 +117,8 @@ fn recovery_label(key: &notatin::cell_key_node::CellKeyNode) -> String {
 
 pub fn parse_amcache(hive: &Path) -> Result<(Vec<Row>, Vec<Row>)> {
     let source = hive.to_string_lossy().to_string();
+    // notatin stores the path, so a borrowed &Path fails the 'static bound.
+    #[allow(clippy::unnecessary_to_owned)]
     let mut builder = ParserBuilder::from_path(hive.to_path_buf());
     for log in sibling_logs(hive) {
         builder.with_transaction_log(log);
@@ -178,7 +174,7 @@ pub fn parse_amcache(hive: &Path) -> Result<(Vec<Row>, Vec<Row>)> {
                 }
             }
             if let Some(sha) = row.get("sha1").cloned() {
-                let s = if sha.len() > 4 && row.get("file_id").map_or(true, |f| *f != sha) {
+                let s = if sha.len() > 4 && row.get("file_id").is_none_or(|f| *f != sha) {
                     sha[4..].to_string()
                 } else {
                     sha

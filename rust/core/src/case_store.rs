@@ -89,10 +89,7 @@ fn slugify(name: &str) -> String {
 }
 
 fn id_for(name: &str, created_at: &str) -> String {
-    let compact = created_at
-        .replace(':', "")
-        .replace('-', "")
-        .replace(' ', "_");
+    let compact = created_at.replace([':', '-'], "").replace(' ', "_");
     format!("{}_{}", slugify(name), compact)
 }
 
@@ -297,6 +294,7 @@ fn acquire_migration_lock(cases_dir: &Path) -> Result<MigrationLock> {
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .open(&path)
         .with_context(|| format!("open migration lock {}", path.display()))?;
     for _ in 0..80 {

@@ -18,8 +18,11 @@ use crate::time::fmt_filetime;
 pub const JUMPLIST_TABLE: &str = "JumpList_Entries";
 pub const JUMPLIST_FIELD_ORDER: &[&str] = &[
     "timestamp",
+    "lnk_accessed",
     "created_time",
     "modified_time",
+    "access_count",
+    "hostname",
     "app_id",
     "jumplist_type",
     "target_path",
@@ -225,10 +228,10 @@ fn temp_lnk_path() -> std::path::PathBuf {
 /// `lnk` 0.5 only accepts a path, not a reader.  Reuse one temporary path for
 /// every stream in a source JumpList: creating and unlinking a file per entry
 /// dominated runtime on JumpLists with many links.
-fn parse_lnk(
-    data: &[u8],
-    tmp: &Path,
-) -> Result<(String, String, String, String, String, String, String)> {
+/// (target, created, modified, accessed, args, working_dir, machine_id)
+type LnkFields = (String, String, String, String, String, String, String);
+
+fn parse_lnk(data: &[u8], tmp: &Path) -> Result<LnkFields> {
     std::fs::File::create(tmp)?.write_all(data)?;
     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ShellLink::open(tmp)));
     let sl = match res {
@@ -258,19 +261,8 @@ fn parse_lnk(
     Ok((target, created, modified, accessed, args, wdir, machine_id))
 }
 
-fn row_ok(
-    target: String,
-    created: String,
-    modified: String,
-    accessed: String,
-    args: String,
-    wdir: String,
-    machine_id: String,
-    app_id: &str,
-    jl_type: &str,
-    stream_id: &str,
-    source: &str,
-) -> Row {
+fn row_ok(fields: LnkFields, app_id: &str, jl_type: &str, stream_id: &str, source: &str) -> Row {
+    let (target, created, modified, accessed, args, wdir, machine_id) = fields;
     let mut r = Row::new();
     r.insert("timestamp".into(), accessed);
     r.insert("created_time".into(), created);
@@ -299,6 +291,84 @@ fn row_err(app_id: &str, jl_type: &str, stream_id: &str, source: &str, err: Stri
     r
 }
 
+/// DestList 엔트리 하나: (마지막 사용 시각, 사용 횟수, 호스트명).
+struct DestEntry {
+    access_time: String,
+    access_count: String,
+    hostname: String,
+}
+
+/// AutomaticDestinations의 DestList 스트림 — 엔트리별 마지막 사용 시각·사용
+/// 횟수·호스트명을 담는 실제 사용 기록. 키는 LNK 스트림 이름과 같은
+/// 소문자 16진 엔트리 번호. 헤더 32바이트, 엔트리는 버전 1(Win7/8)이면
+/// 경로 길이 @112, 버전 3/4(Win10+)이면 @120 + 경로 뒤 4바이트 패딩.
+/// 손상 지점을 만나면 그때까지 읽은 엔트리만 반환한다.
+fn parse_destlist(data: &[u8]) -> std::collections::HashMap<String, DestEntry> {
+    let mut map = std::collections::HashMap::new();
+    if data.len() < 32 {
+        return map;
+    }
+    let version = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+    let (path_len_off, trailer) = if version >= 3 { (120usize, 4usize) } else { (112, 0) };
+    let mut pos = 32usize;
+    while pos + path_len_off + 2 <= data.len() {
+        let entry_number = read_u32_le(data, pos + 88).unwrap_or(0);
+        let hostname = {
+            let raw = &data[pos + 72..pos + 88];
+            let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+            String::from_utf8_lossy(&raw[..end]).trim().to_string()
+        };
+        let access_count = {
+            let bits = read_u32_le(data, pos + 96).unwrap_or(0);
+            let count = f32::from_bits(bits);
+            if count.is_finite() && count > 0.0 {
+                (count.round() as u64).to_string()
+            } else {
+                String::new()
+            }
+        };
+        let access_time = {
+            let mut bytes = [0u8; 8];
+            bytes.copy_from_slice(&data[pos + 100..pos + 108]);
+            let ft = i64::from_le_bytes(bytes);
+            if ft > 0 {
+                fmt_filetime(ft)
+            } else {
+                String::new()
+            }
+        };
+        let path_chars = u16::from_le_bytes([data[pos + path_len_off], data[pos + path_len_off + 1]]) as usize;
+        let next = pos + path_len_off + 2 + path_chars * 2 + trailer;
+        if next > data.len() {
+            break;
+        }
+        map.insert(
+            format!("{:x}", entry_number),
+            DestEntry {
+                access_time,
+                access_count,
+                hostname,
+            },
+        );
+        pos = next;
+    }
+    map
+}
+
+/// LNK 헤더 접근 시각을 lnk_accessed로 보존하고, DestList 기록이 있으면
+/// timestamp를 실제 마지막 사용 시각으로 바꾼다(없으면 LNK 시각 유지).
+fn apply_destlist(row: &mut Row, entry: Option<&DestEntry>) {
+    let lnk_accessed = row.get("timestamp").cloned().unwrap_or_default();
+    row.insert("lnk_accessed".into(), lnk_accessed);
+    if let Some(entry) = entry {
+        if !entry.access_time.is_empty() {
+            row.insert("timestamp".into(), entry.access_time.clone());
+        }
+        row.insert("access_count".into(), entry.access_count.clone());
+        row.insert("hostname".into(), entry.hostname.clone());
+    }
+}
+
 fn parse_automatic(path: &Path, rows: &mut Vec<Row>) {
     let app_id = path
         .file_stem()
@@ -318,6 +388,16 @@ fn parse_automatic(path: &Path, rows: &mut Vec<Row>) {
         .map(|e| e.name().to_string())
         .filter(|n| n != "DestList" && n != "DestListPropertyStore")
         .collect();
+    let dest_entries = {
+        let mut buf = Vec::new();
+        match comp
+            .open_stream("DestList")
+            .and_then(|mut s| s.read_to_end(&mut buf).map(|_| ()))
+        {
+            Ok(()) => parse_destlist(&buf),
+            Err(_) => std::collections::HashMap::new(),
+        }
+    };
     let tmp = temp_lnk_path();
     for name in names {
         let mut buf = Vec::new();
@@ -329,19 +409,11 @@ fn parse_automatic(path: &Path, rows: &mut Vec<Row>) {
             continue;
         }
         match parse_lnk(&buf, &tmp) {
-            Ok((t, c, m, a, ar, w, mid)) => rows.push(row_ok(
-                t,
-                c,
-                m,
-                a,
-                ar,
-                w,
-                mid,
-                &app_id,
-                "Automatic",
-                &name,
-                &source,
-            )),
+            Ok(fields) => {
+                let mut row = row_ok(fields, &app_id, "Automatic", &name, &source);
+                apply_destlist(&mut row, dest_entries.get(&name.to_lowercase()));
+                rows.push(row);
+            }
             Err(e) => rows.push(row_err(&app_id, "Automatic", &name, &source, e.to_string())),
         }
     }
@@ -375,19 +447,7 @@ fn parse_custom(path: &Path, rows: &mut Vec<Row>) {
     for (idx, &start) in offsets.iter().enumerate() {
         let end = offsets.get(idx + 1).copied().unwrap_or(data.len());
         match parse_lnk(&data[start..end], &tmp) {
-            Ok((t, c, m, a, ar, w, mid)) => rows.push(row_ok(
-                t,
-                c,
-                m,
-                a,
-                ar,
-                w,
-                mid,
-                &app_id,
-                "Custom",
-                &idx.to_string(),
-                &source,
-            )),
+            Ok(fields) => rows.push(row_ok(fields, &app_id, "Custom", &idx.to_string(), &source)),
             Err(e) => rows.push(row_err(
                 &app_id,
                 "Custom",
@@ -418,13 +478,13 @@ pub fn jumplist_sources(root: &Path) -> Vec<std::path::PathBuf> {
     paths
 }
 
-pub fn parse_jumplists_with_sources(root: &Path) -> Result<(Vec<std::path::PathBuf>, Vec<Row>)> {
+/// Parse already-discovered destination files.
+pub fn parse_jumplists_from(sources: &[std::path::PathBuf]) -> Vec<Row> {
     // The lnk crate panics on some malformed shell links; we catch those per
     // entry. Silence the default panic hook so caught panics don't flood the
     // log, then restore it.
     let prev_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
-    let sources = jumplist_sources(root);
     let rows: Vec<Row> = sources
         .par_iter()
         .flat_map(|path| {
@@ -435,14 +495,20 @@ pub fn parse_jumplists_with_sources(root: &Path) -> Result<(Vec<std::path::PathB
                 .to_string_lossy()
                 .to_lowercase();
             if name.ends_with(".automaticdestinations-ms") {
-                parse_automatic(&path, &mut local_rows);
+                parse_automatic(path, &mut local_rows);
             } else if name.ends_with(".customdestinations-ms") {
-                parse_custom(&path, &mut local_rows);
+                parse_custom(path, &mut local_rows);
             }
             local_rows
         })
         .collect();
     std::panic::set_hook(prev_hook);
+    rows
+}
+
+pub fn parse_jumplists_with_sources(root: &Path) -> Result<(Vec<std::path::PathBuf>, Vec<Row>)> {
+    let sources = jumplist_sources(root);
+    let rows = parse_jumplists_from(&sources);
     Ok((sources, rows))
 }
 
@@ -453,6 +519,39 @@ pub fn parse_jumplists(root: &Path) -> Result<Vec<Row>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn destlist_bytes(version: u32) -> Vec<u8> {
+        // 헤더 32바이트 + 엔트리 1개(엔트리 번호 0x1a, 경로 "C:\\a.txt").
+        let (path_len_off, trailer) = if version >= 3 { (120, 4) } else { (112, 0) };
+        let path: Vec<u16> = "C:\\a.txt".encode_utf16().collect();
+        let mut data = vec![0u8; 32 + path_len_off + 2 + path.len() * 2 + trailer];
+        data[0..4].copy_from_slice(&version.to_le_bytes());
+        let e = 32;
+        data[e + 72..e + 72 + 7].copy_from_slice(b"HOST-01");
+        data[e + 88..e + 92].copy_from_slice(&0x1au32.to_le_bytes());
+        data[e + 96..e + 100].copy_from_slice(&7.0f32.to_bits().to_le_bytes());
+        data[e + 100..e + 108].copy_from_slice(&131_500_000_000_000_000i64.to_le_bytes());
+        data[e + path_len_off..e + path_len_off + 2]
+            .copy_from_slice(&(path.len() as u16).to_le_bytes());
+        let mut pos = e + path_len_off + 2;
+        for unit in path {
+            data[pos..pos + 2].copy_from_slice(&unit.to_le_bytes());
+            pos += 2;
+        }
+        data
+    }
+
+    #[test]
+    fn destlist_entries_parse_for_win7_and_win10_layouts() {
+        for version in [1u32, 3, 4] {
+            let map = parse_destlist(&destlist_bytes(version));
+            let entry = map.get("1a").unwrap_or_else(|| panic!("v{version} entry"));
+            assert_eq!(entry.hostname, "HOST-01");
+            assert_eq!(entry.access_count, "7");
+            assert!(!entry.access_time.is_empty(), "v{version} access time");
+        }
+        assert!(parse_destlist(b"tiny").is_empty());
+    }
 
     fn write_u32(data: &mut [u8], offset: usize, value: u32) {
         data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());

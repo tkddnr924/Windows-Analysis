@@ -8,6 +8,7 @@ import type { FetchLinkedRows, Host, ResultRow, SearchHit } from "@/lib/types";
 import type { AccountDirectory } from "@/lib/accountIdentity";
 import { formatEvidenceTimestamp, rangeActive, type TimeRange } from "@/lib/timeRange";
 import RowDetailPanel from "./RowDetailPanel";
+import { pathBelongsToHost } from "@/lib/viewShared";
 
 interface Props {
   hosts: Host[];
@@ -21,13 +22,8 @@ interface Props {
 }
 
 type DetailState = { hit: SearchHit; result?: ResultRow; error?: "fetch" | "missing" };
-const PAGE_SIZE = 75;
+const PAGE_SIZE = 10;
 
-function pathBelongsToHost(fullPath: string, hostDir: string): boolean {
-  const path = fullPath.replace(/\\/g, "/").replace(/\/+$/, "");
-  const root = hostDir.replace(/\\/g, "/").replace(/\/+$/, "");
-  return path === root || path.startsWith(`${root}/`);
-}
 
 function hostDirForHit(hit: SearchHit, hosts: Host[]): string | undefined {
   // The backend-provided host id is authoritative. The path relation is only
@@ -39,7 +35,7 @@ function hostDirForHit(hit: SearchHit, hosts: Host[]): string | undefined {
 }
 
 function Button({ children, onClick, disabled = false, primary = false, ariaLabel }: { children: React.ReactNode; onClick: () => void; disabled?: boolean; primary?: boolean; ariaLabel?: string }) {
-  return <button type="button" onClick={onClick} disabled={disabled} aria-label={ariaLabel} style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", gap: 5, minHeight: 30, padding: "4px 9px", border: `1px solid ${primary ? "var(--accent)" : "var(--border)"}`, borderRadius: "var(--radius-sm)", background: primary ? "var(--accent-subtle)" : "transparent", color: primary ? "var(--accent)" : "var(--text-dim)", cursor: disabled ? "default" : "pointer", opacity: disabled ? 0.55 : 1, fontSize: 11.5, fontWeight: primary ? 700 : 600 }}>{children}</button>;
+  return <button type="button" className="nm-btn" onClick={onClick} disabled={disabled} aria-label={ariaLabel} style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", gap: 5, minHeight: 30, padding: "4px 9px", border: `1px solid ${primary ? "var(--accent)" : "var(--border)"}`, borderRadius: "var(--radius-md)", background: primary ? "var(--accent-subtle)" : "var(--bg-elevated)", color: primary ? "var(--accent)" : "var(--text-dim)", cursor: disabled ? "default" : "pointer", opacity: disabled ? 0.55 : 1, fontSize: 11.5, fontWeight: primary ? 700 : 600 }}>{children}</button>;
 }
 
 export default function CaseSearchView({ hosts, currentHostId, timeRange, isBookmarked, onOpenSource, onToggleBookmark, onFetchLinkedRows, accountDirectoryForHost }: Props) {

@@ -6,7 +6,6 @@ use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
 
 use anyhow::Result;
 use serde::Serialize;
@@ -26,7 +25,8 @@ use std::sync::Mutex;
 // Global progress sink (Send). When set (by the GUI), progress lines route here
 // instead of stdout; unset (CLI) prints to stdout. Global + Send so worker
 // threads (parallel registry parsing) reach the same sink.
-static LOG_SINK: Mutex<Option<Box<dyn FnMut(&str) + Send>>> = Mutex::new(None);
+pub type LogSink = Box<dyn FnMut(&str) + Send>;
+static LOG_SINK: Mutex<Option<LogSink>> = Mutex::new(None);
 
 /// Immutable per-run text logs are retained outside artifact output folders so
 /// a full reparse can clear derived SQLite without erasing prior diagnostics.
@@ -229,55 +229,6 @@ fn publish_staging_output(live_dir: &Path, stage: &Path, run_id: &str) -> Result
     Ok(())
 }
 
-type OutputSignature = (u64, u128);
-
-fn staged_file_signatures(root: &Path) -> std::collections::HashMap<PathBuf, OutputSignature> {
-    fn visit(
-        root: &Path,
-        current: &Path,
-        out: &mut std::collections::HashMap<PathBuf, OutputSignature>,
-    ) {
-        let Ok(entries) = std::fs::read_dir(current) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                if path
-                    .file_name()
-                    .is_some_and(|name| name == PARSE_COMMITTED_DIRECTORY)
-                {
-                    continue;
-                }
-                visit(root, &path, out);
-                continue;
-            }
-            let Ok(metadata) = entry.metadata() else {
-                continue;
-            };
-            let modified = metadata
-                .modified()
-                .ok()
-                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-                .map(|duration| duration.as_nanos())
-                .unwrap_or_default();
-            if let Ok(relative) = path.strip_prefix(root) {
-                if relative
-                    .components()
-                    .next()
-                    .is_some_and(|component| component.as_os_str() == PARSE_COMMITTED_DIRECTORY)
-                {
-                    continue;
-                }
-                out.insert(relative.to_path_buf(), (metadata.len(), modified));
-            }
-        }
-    }
-    let mut out = std::collections::HashMap::new();
-    visit(root, root, &mut out);
-    out
-}
-
 /// A sealed output is copied immediately after one artifact finishes.  The
 /// partial-run publisher reads this immutable snapshot rather than the shared
 /// staging category, which prevents a later failing artifact from leaking a
@@ -321,21 +272,6 @@ fn seal_artifact_outputs(
         });
     }
     Ok(sealed)
-}
-
-fn changed_staged_outputs(
-    before: &std::collections::HashMap<PathBuf, OutputSignature>,
-    root: &Path,
-) -> Vec<String> {
-    let after = staged_file_signatures(root);
-    let mut changed: Vec<String> = after
-        .iter()
-        .filter_map(|(path, signature)| {
-            (before.get(path) != Some(signature)).then(|| path.to_string_lossy().to_string())
-        })
-        .collect();
-    changed.sort();
-    changed
 }
 
 /// Publish only complete files belonging to artifacts that completed in this
@@ -682,7 +618,7 @@ fn write_terminal_report(live_dir: &Path, run_id: &str, report: &ParseReport) ->
 }
 
 /// Install (or clear) the progress sink.
-pub fn set_log_sink(sink: Option<Box<dyn FnMut(&str) + Send>>) {
+pub fn set_log_sink(sink: Option<LogSink>) {
     *LOG_SINK.lock().unwrap() = sink;
 }
 
@@ -726,61 +662,10 @@ pub const ARTIFACT_NAMES: &[&str] = &[
     "WER",
 ];
 
-fn announce(name: &str) {
-    emit(&format!("=== {} ===", name));
-}
-fn found(paths: &[std::path::PathBuf]) {
-    if paths.is_empty() {
-        emit(&format!("[!] no matching files found"));
-    } else if paths.len() <= 20 {
-        for p in paths {
-            emit(&format!("[*] found: {}", p.display()));
-        }
-    } else {
-        emit(&format!("[*] found: {} files", paths.len()));
-    }
-}
-
-fn record_inputs(report: &mut ParseReport, artifact: &str, paths: &[std::path::PathBuf]) {
-    if let Some(entry) = report
-        .artifacts
-        .iter_mut()
-        .rev()
-        .find(|entry| entry.name == artifact)
-    {
-        entry.input_discovery_checked = true;
-        entry.evidence_discovered |= !paths.is_empty();
-    }
-    for path in paths {
-        record_input(report, artifact, path, false);
-        if artifact == "Amcache" {
-            for log in registry::sibling_logs(path) {
-                record_input(report, artifact, &log, true);
-            }
-        }
-    }
-}
-
-/// An artifact can be validly attempted without its evidence file being
-/// present.  This is distinct from a parser failure: no output exists, and a
-/// retry cannot produce one until the missing evidence is supplied.
-fn mark_artifact_no_input(report: &mut ParseReport, artifact: &str) {
-    if let Some(entry) = report
-        .artifacts
-        .iter_mut()
-        .rev()
-        .find(|entry| entry.name == artifact)
-    {
-        entry.status = "no_input".to_string();
-        entry.publication_status = Some("not_published".to_string());
-    }
-}
-
 /// A parser section with neither discovered evidence nor staged output is not
 /// a successful empty parse.  Treat it consistently as an evidence-missing
 /// state so the report/UI never says "completed" for an artifact that was
-/// never able to run.  Parsers may still explicitly mark this earlier (MFT
-/// does so to provide a more specific log line).
+/// never able to run.
 fn artifact_has_no_input(entry: &ParseArtifactReport, outputs: &[String]) -> bool {
     entry.status == "no_input"
         || (entry.input_discovery_checked && !entry.evidence_discovered && outputs.is_empty())
@@ -819,15 +704,7 @@ fn record_published_outputs(report: &mut ParseReport, outputs: &[SealedArtifactO
     }
 }
 
-fn record_input(report: &mut ParseReport, artifact: &str, path: &Path, recovery_log: bool) {
-    let Some(entry) = report
-        .artifacts
-        .iter_mut()
-        .rev()
-        .find(|entry| entry.name == artifact)
-    else {
-        return;
-    };
+fn entry_record_input(entry: &mut ParseArtifactReport, path: &Path, recovery_log: bool) {
     entry.input_discovery_checked = true;
     entry.evidence_discovered = true;
     let source_path = path.to_string_lossy().to_string();
@@ -850,59 +727,53 @@ fn record_input(report: &mut ParseReport, artifact: &str, path: &Path, recovery_
     });
 }
 
-fn record_input_count(report: &mut ParseReport, artifact: &str, path: &Path, record_count: usize) {
-    record_input(report, artifact, path, false);
+fn entry_record_inputs(entry: &mut ParseArtifactReport, paths: &[PathBuf]) {
+    entry.input_discovery_checked = true;
+    entry.evidence_discovered |= !paths.is_empty();
+    for path in paths {
+        entry_record_input(entry, path, false);
+    }
+}
+
+fn entry_record_input_count(entry: &mut ParseArtifactReport, path: &Path, record_count: usize) {
+    entry_record_input(entry, path, false);
     let source_path = path.to_string_lossy();
-    if let Some(entry) = report
-        .artifacts
+    if let Some(input) = entry
+        .inputs
         .iter_mut()
-        .rev()
-        .find(|entry| entry.name == artifact)
+        .find(|input| input.source_path == source_path.as_ref())
     {
+        input.record_count = record_count;
+    }
+}
+
+fn entry_record_rows_by_source(entry: &mut ParseArtifactReport, rows: &[Row]) {
+    let mut counts = std::collections::HashMap::<String, usize>::new();
+    for row in rows {
+        if let Some(source) = row.get("_source_file").filter(|source| !source.is_empty()) {
+            *counts.entry(source.clone()).or_default() += 1;
+        }
+    }
+    for (source, count) in counts {
+        entry_record_input_count(entry, Path::new(&source), count);
+    }
+}
+
+fn entry_add_rows_by_source(entry: &mut ParseArtifactReport, rows: &[Row]) {
+    let mut counts = std::collections::HashMap::<String, usize>::new();
+    for row in rows {
+        if let Some(source) = row.get("_source_file").filter(|source| !source.is_empty()) {
+            *counts.entry(source.clone()).or_default() += 1;
+        }
+    }
+    for (source, count) in counts {
+        entry_record_input(entry, Path::new(&source), false);
         if let Some(input) = entry
             .inputs
             .iter_mut()
-            .find(|input| input.source_path == source_path.as_ref())
+            .find(|input| input.source_path == source)
         {
-            input.record_count = record_count;
-        }
-    }
-}
-
-fn record_rows_by_source(report: &mut ParseReport, artifact: &str, rows: &[Row]) {
-    let mut counts = std::collections::HashMap::<String, usize>::new();
-    for row in rows {
-        if let Some(source) = row.get("_source_file").filter(|source| !source.is_empty()) {
-            *counts.entry(source.clone()).or_default() += 1;
-        }
-    }
-    for (source, count) in counts {
-        record_input_count(report, artifact, Path::new(&source), count);
-    }
-}
-
-fn add_rows_by_source(report: &mut ParseReport, artifact: &str, rows: &[Row]) {
-    let mut counts = std::collections::HashMap::<String, usize>::new();
-    for row in rows {
-        if let Some(source) = row.get("_source_file").filter(|source| !source.is_empty()) {
-            *counts.entry(source.clone()).or_default() += 1;
-        }
-    }
-    for (source, count) in counts {
-        record_input(report, artifact, Path::new(&source), false);
-        if let Some(entry) = report
-            .artifacts
-            .iter_mut()
-            .rev()
-            .find(|entry| entry.name == artifact)
-        {
-            if let Some(input) = entry
-                .inputs
-                .iter_mut()
-                .find(|input| input.source_path == source)
-            {
-                input.record_count = input.record_count.saturating_add(count);
-            }
+            input.record_count = input.record_count.saturating_add(count);
         }
     }
 }
@@ -937,6 +808,842 @@ fn uniq_name(base: &str, taken: &mut HashSet<String>) -> String {
         }
         i += 1;
     }
+}
+
+/// One artifact's parse result: its report entry, sealed outputs, and (for
+/// Registry) the per-hive extras. Each parallel worker fills exactly one of
+/// these, so the shared `ParseReport` is only touched by the merge step.
+struct ArtifactOutcome {
+    entry: ParseArtifactReport,
+    sealed: Vec<SealedArtifactOutput>,
+    errors: Vec<String>,
+    registry_hives: Vec<RegistryHiveReport>,
+    registry_recovery: Option<RegistryRecoveryReport>,
+}
+
+impl ArtifactOutcome {
+    fn new(name: &str) -> Self {
+        Self {
+            entry: ParseArtifactReport {
+                name: name.to_string(),
+                status: "running".to_string(),
+                input_discovery_checked: false,
+                evidence_discovered: false,
+                outputs: Vec::new(),
+                published_outputs: Vec::new(),
+                publication_status: None,
+                error: None,
+                inputs: Vec::new(),
+            },
+            sealed: Vec::new(),
+            errors: Vec::new(),
+            registry_hives: Vec::new(),
+            registry_recovery: None,
+        }
+    }
+}
+
+/// Locate one artifact's evidence files under the target (path/content rules
+/// unchanged from the sequential pipeline).
+fn discover_artifact_files(name: &str, target: &Path) -> Vec<PathBuf> {
+    match name {
+        "Amcache" => finder::dedupe_by_content(finder::by_name(target, &["Amcache.hve"])),
+        "EventLog" => finder::dedupe_by_content(finder::by_name(target, eventlog::ALLOWLIST)),
+        "Registry" => {
+            let mut all = finder::by_name(target, registry::REG_FILENAMES);
+            all.extend(finder::by_suffix(target, registry::REG_SUFFIXES));
+            // drop a RegBack copy when the live hive of the same name is present
+            let live: HashSet<String> = all
+                .iter()
+                .filter(|p| {
+                    !p.components().any(|c| {
+                        c.as_os_str()
+                            .to_string_lossy()
+                            .eq_ignore_ascii_case("regback")
+                    })
+                })
+                .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_uppercase()))
+                .collect();
+            all.retain(|p| {
+                let is_regback = p.components().any(|c| {
+                    c.as_os_str()
+                        .to_string_lossy()
+                        .eq_ignore_ascii_case("regback")
+                });
+                let nm = p
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_uppercase())
+                    .unwrap_or_default();
+                !is_regback || !live.contains(&nm)
+            });
+            finder::dedupe_by_content(all)
+        }
+        "UsnJrnl" => finder::dedupe_by_content(finder::by_name(target, &["$J"])),
+        "MFT" => finder::dedupe_by_content(finder::by_name(target, &["$MFT"])),
+        "SRUM" => finder::dedupe_by_content(finder::by_name(target, &["SRUDB.dat"])),
+        "JumpList" => jumplist::jumplist_sources(target),
+        "TaskScheduler" => taskscheduler::task_sources(target),
+        "RdpCache" => rdpcache::rdpcache_sources(target),
+        "BrowserHistory" => finder::dedupe_by_content(finder::by_name(target, &["History"])),
+        "BrowserCache" => finder::dedupe_by_content(finder::by_name(target, &["index"])),
+        "PowerShell" => {
+            finder::dedupe_by_content(finder::by_name(target, &["ConsoleHost_history.txt"]))
+        }
+        "Prefetch" => finder::dedupe_by_content(finder::by_extension(target, &[".pf"])),
+        "WER" => wer::wer_sources(target),
+        _ => Vec::new(),
+    }
+}
+
+/// 디스크 부족·I/O 실패 같은 저장 환경 오류인지 판별한다. 이런 오류는 데이터
+/// 손상이 아니므로 건너뛰지 않고 아티팩트 실패(partial)로 올린다.
+fn is_storage_error(error: &anyhow::Error) -> bool {
+    for cause in error.chain() {
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            // ENOSPC — 저장 공간 부족.
+            if io.raw_os_error() == Some(28) {
+                return true;
+            }
+        }
+        if let Some(rusqlite::Error::SqliteFailure(failure, _)) =
+            cause.downcast_ref::<rusqlite::Error>()
+        {
+            if matches!(
+                failure.code,
+                rusqlite::ErrorCode::DiskFull | rusqlite::ErrorCode::SystemIoFailure
+            ) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// 파서가 잘 짜여 있다는 전제 하에, 파싱·저장 실패는 데이터 손상으로 판단하고
+/// 해당 출력만 정리한 뒤 다음 단계로 넘어간다(Ok(None)). 유일한 예외는 저장
+/// 환경 오류(디스크 부족 등) — 이는 손상이 아니므로 Err로 올려 아티팩트를
+/// 실패(partial)로 처리한다. 실패·건너뜀 단위의 반쯤 쓰인 파일은 즉시
+/// 삭제되어 발행될 수 없다.
+fn run_unit_or_skip<T>(
+    label: &str,
+    outputs_to_clean: &[&Path],
+    unit: impl FnOnce() -> Result<T>,
+) -> Result<Option<T>> {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(unit));
+    match result {
+        Ok(Ok(value)) => Ok(Some(value)),
+        Ok(Err(error)) => {
+            for output in outputs_to_clean {
+                let _ = std::fs::remove_file(output);
+            }
+            if is_storage_error(&error) {
+                return Err(error);
+            }
+            emit(&format!("[*] 손상된 데이터 건너뜀: {} ({})", label, error));
+            Ok(None)
+        }
+        Err(_) => {
+            for output in outputs_to_clean {
+                let _ = std::fs::remove_file(output);
+            }
+            emit(&format!("[*] 손상된 데이터 건너뜀: {}", label));
+            Ok(None)
+        }
+    }
+}
+
+fn parse_amcache_artifact(
+    paths: &[PathBuf],
+    out_dir: &Path,
+    entry: &mut ParseArtifactReport,
+) -> Result<Vec<String>> {
+    entry_record_inputs(entry, paths);
+    for p in paths {
+        for log in registry::sibling_logs(p) {
+            entry_record_input(entry, &log, true);
+        }
+    }
+    let mut outputs = Vec::new();
+    let mut taken = HashSet::new();
+    // 하이브 하나가 손상돼도 그 하이브만 건너뛴다(파싱 실패 == 손상 아티팩트).
+    for p in paths {
+        let base = p
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "Amcache".into());
+        let name = uniq_name(&base, &mut taken);
+        let relative = format!("AMCACHE/{}.sqlite", name);
+        let out = out_dir.join(&relative);
+        let unit = run_unit_or_skip(&p.display().to_string(), &[&out], || -> Result<(usize, usize)> {
+            let (progs, files) = amcache::parse_amcache(p)?;
+            write_table(
+                &out,
+                amcache::PROGRAMS_TABLE,
+                &progs,
+                amcache::PROGRAMS_FIELD_ORDER,
+            )?;
+            write_table(
+                &out,
+                amcache::FILES_TABLE,
+                &files,
+                amcache::FILES_FIELD_ORDER,
+            )?;
+            Ok((progs.len(), files.len()))
+        })?;
+        if let Some((prog_count, file_count)) = unit {
+            entry_record_input_count(entry, p, prog_count + file_count);
+            emit(&format!(
+                "[+] {} programs, {} files -> {}",
+                prog_count,
+                file_count,
+                out.display()
+            ));
+            outputs.push(relative);
+        }
+    }
+    Ok(outputs)
+}
+
+fn parse_eventlog_artifact(
+    paths: &[PathBuf],
+    out_dir: &Path,
+    entry: &mut ParseArtifactReport,
+) -> Result<Vec<String>> {
+    entry_record_inputs(entry, paths);
+    let mut outputs = Vec::new();
+    let mut taken = HashSet::new();
+    // 손상된 레코드는 파서가 corrupted_chunk 행으로 격리한다. 파일 자체가
+    // 열리지 않는 로그는 그 파일만 건너뛰어, 나머지 로그의 저장 완료분이
+    // 함께 폐기되지 않게 한다(파싱 실패 == 손상 아티팩트).
+    for p in paths {
+        let base = p
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "EventLog".into());
+        let name = uniq_name(&base, &mut taken);
+        let relative = format!("EVENTLOG/{}.sqlite", name);
+        let out = out_dir.join(&relative);
+        if let Some(n) = run_unit_or_skip(&p.display().to_string(), &[&out], || {
+            eventlog::parse_evtx_stream(p, &out, &name)
+        })? {
+            entry_record_input_count(entry, p, n);
+            if n > 0 {
+                emit(&format!("[+] {} rows -> {} [{}]", n, out.display(), name));
+            }
+            outputs.push(relative);
+        }
+    }
+    Ok(outputs)
+}
+
+fn parse_registry_artifact(
+    paths: &[PathBuf],
+    out_dir: &Path,
+    outcome: &mut ArtifactOutcome,
+) -> Result<Vec<String>> {
+    entry_record_inputs(&mut outcome.entry, paths);
+    // 트랜잭션 로그는 항상 조합해 최신 정합 상태를 파싱한다. 삭제 셀 복구는
+    // 비용이 커서 임시로 끈 상태 — 보고서에 그대로 드러낸다.
+    if registry::registry_recovery_disabled() {
+        outcome.registry_recovery = Some(RegistryRecoveryReport {
+            mode: "transaction_logs_only".to_string(),
+            deleted_cell_recovery_applied: false,
+            transaction_logs_applied: true,
+        });
+        emit("[*] 레지스트리: 트랜잭션 로그(.LOG1/.LOG2) 조합 적용 · 삭제 셀 복구는 수행하지 않음");
+    } else {
+        outcome.registry_recovery = Some(RegistryRecoveryReport {
+            mode: "enabled".to_string(),
+            deleted_cell_recovery_applied: true,
+            transaction_logs_applied: true,
+        });
+    }
+    // Assign each hive a unique output name, then parse hives in parallel.
+    // Every worker writes its own SQLite output, so normal allocated-record
+    // parsing remains isolated in live-only mode.
+    let mut taken = HashSet::new();
+    let mut jobs: Vec<(PathBuf, PathBuf, String)> = Vec::new();
+    for p in paths {
+        let base = p
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "hive".into());
+        let name = uniq_name(&base, &mut taken);
+        let relative = format!("REGISTRY/{}.sqlite", name);
+        jobs.push((p.clone(), out_dir.join(&relative), relative));
+    }
+    // Keep Registry hive work bounded at two workers. If temporary recovery is
+    // later re-enabled, the parser's process-wide permits continue to cap the
+    // expensive builder/recovery stage as well.
+    let workers = registry::registry_recovery_worker_count(jobs.len());
+    let next = AtomicUsize::new(0);
+    let parsed_counts = Mutex::new(Vec::<(PathBuf, String, registry::HiveParseMetrics)>::with_capacity(jobs.len()));
+    // (설명, 저장 환경 오류 여부) — 손상 하이브는 건너뛰고, 디스크 부족 같은
+    // 저장 오류만 아티팩트 실패로 올린다.
+    let source_failures = Mutex::new(Vec::<(String, bool)>::new());
+    std::thread::scope(|s| {
+        for _ in 0..workers {
+            s.spawn(|| loop {
+                if CANCEL.load(Ordering::Relaxed) {
+                    break;
+                } // stop starting new hives
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                if i >= jobs.len() {
+                    break;
+                }
+                let (src, out, relative) = &jobs[i];
+                if CANCEL.load(Ordering::Relaxed) {
+                    break;
+                }
+                match registry::parse_hive_stream_with_metrics(src, out) {
+                    Ok(metrics) => {
+                        if let Ok(mut counts) = parsed_counts.lock() {
+                            counts.push((src.clone(), relative.clone(), metrics.clone()));
+                        }
+                        emit(&format!(
+                            "[+] {} rows -> {} [Registry]",
+                            metrics.row_count,
+                            out.display()
+                        ));
+                    }
+                    Err(e) => {
+                        let _ = std::fs::remove_file(out);
+                        let storage = is_storage_error(&e);
+                        if !storage {
+                            emit(&format!("[*] 손상된 하이브 건너뜀: {} ({})", src.display(), e));
+                        }
+                        if let Ok(mut failures) = source_failures.lock() {
+                            failures.push((format!("{}: {}", src.display(), e), storage));
+                        }
+                    }
+                }
+            });
+        }
+    });
+    let mut outputs = Vec::new();
+    if let Ok(counts) = parsed_counts.into_inner() {
+        for (source, relative, metrics) in counts {
+            entry_record_input_count(&mut outcome.entry, &source, metrics.row_count);
+            outcome.registry_hives.push(RegistryHiveReport {
+                source_path: source.to_string_lossy().to_string(),
+                status: "completed".to_string(),
+                row_count: metrics.row_count,
+                recovery_logs_discovered: metrics.recovery_logs_discovered,
+                recovery_log_count: metrics.recovery_log_count,
+                recovery_enabled: metrics.recovery_enabled,
+                recovered_row_count: metrics.recovered_row_count,
+                recovery_permit_wait_ms: metrics.recovery_permit_wait_ms,
+                build_recovery_ms: metrics.build_recovery_ms,
+                iteration_and_sqlite_write_ms: metrics.iteration_and_sqlite_write_ms,
+                error: None,
+            });
+            outputs.push(relative);
+        }
+    }
+    // 손상된 하이브는 건너뛴 것으로 취급한다(파싱 실패 == 손상 아티팩트).
+    // 성공한 하이브 출력은 그대로 발행되고, 건너뛴 사실은 보고서의
+    // registry_hives에만 남는다. 디스크 부족 같은 저장 환경 오류만
+    // 아티팩트 실패(partial)로 올린다.
+    let failures = source_failures.into_inner().unwrap_or_default();
+    outcome
+        .registry_hives
+        .extend(failures.iter().map(|(failure, storage)| RegistryHiveReport {
+            source_path: failure
+                .split_once(": ")
+                .map(|(path, _)| path)
+                .unwrap_or(failure)
+                .to_string(),
+            status: if *storage { "failed" } else { "skipped_corrupted" }.to_string(),
+            row_count: 0,
+            recovery_logs_discovered: 0,
+            recovery_log_count: 0,
+            recovery_enabled: !registry::registry_recovery_disabled(),
+            recovered_row_count: 0,
+            recovery_permit_wait_ms: 0,
+            build_recovery_ms: 0,
+            iteration_and_sqlite_write_ms: 0,
+            error: Some(failure.clone()),
+        }));
+    let storage_failures: Vec<&String> = failures
+        .iter()
+        .filter(|(_, storage)| *storage)
+        .map(|(failure, _)| failure)
+        .collect();
+    if !storage_failures.is_empty() {
+        anyhow::bail!(
+            "{} Registry storage failure(s): {}",
+            storage_failures.len(),
+            storage_failures
+                .iter()
+                .map(|failure| failure.as_str())
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
+    }
+    outputs.sort();
+    Ok(outputs)
+}
+
+fn parse_usnjrnl_artifact(
+    paths: &[PathBuf],
+    out_dir: &Path,
+    entry: &mut ParseArtifactReport,
+) -> Result<Vec<String>> {
+    entry_record_inputs(entry, paths);
+    let mut outputs = Vec::new();
+    // 손상 레코드는 파서가 재동기화로 건너뛴다. 파일 열기/저장 실패만 여기서
+    // 데이터 손상으로 판단해 건너뛴다.
+    if let Some(p) = paths.first() {
+        let relative = "FILESYSTEM/UsnJrnl_Records.sqlite".to_string();
+        let out = out_dir.join(&relative);
+        if let Some(n) = run_unit_or_skip(&p.display().to_string(), &[&out], || {
+            usnjrnl::parse_usn_stream(p, &out)
+        })? {
+            entry_record_input_count(entry, p, n);
+            emit(&format!("[+] {} rows -> {}", n, out.display()));
+            outputs.push(relative);
+        }
+    }
+    Ok(outputs)
+}
+
+fn parse_mft_artifact(
+    paths: &[PathBuf],
+    out_dir: &Path,
+    entry: &mut ParseArtifactReport,
+) -> Result<Vec<String>> {
+    entry_record_inputs(entry, paths);
+    let mut outputs = Vec::new();
+    // 손상 엔트리는 파서가 레코드 단위로 건너뛴다. 파일 열기/저장 실패만
+    // 여기서 데이터 손상으로 판단해 건너뛴다.
+    if let Some(p) = paths.first() {
+        let relative = "_OVERVIEW/MFT_Records.sqlite".to_string();
+        let out = out_dir.join(&relative);
+        if let Some(n) = run_unit_or_skip(&p.display().to_string(), &[&out], || {
+            mft::parse_mft_stream(p, &out)
+        })? {
+            entry_record_input_count(entry, p, n);
+            emit(&format!("[+] {} rows -> {}", n, out.display()));
+            outputs.push(relative);
+        }
+    } else {
+        emit("[*] MFT 원본이 없어 이번 실행에서 MFT 결과를 만들지 않았습니다");
+    }
+    Ok(outputs)
+}
+
+fn parse_srum_artifact(
+    paths: &[PathBuf],
+    out_dir: &Path,
+    entry: &mut ParseArtifactReport,
+) -> Result<Vec<String>> {
+    entry_record_inputs(entry, paths);
+    let mut outputs = Vec::new();
+    let mut taken = HashSet::new();
+    // 손상된 SRUDB는 그 파일만 건너뛴다(파싱 실패 == 손상 아티팩트).
+    for p in paths {
+        let base = p
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "SRUDB".into());
+        let name = uniq_name(&base, &mut taken);
+        let relative = format!("SRUM/{}.sqlite", name);
+        let out = out_dir.join(&relative);
+        let unit = run_unit_or_skip(&p.display().to_string(), &[&out], || {
+            srum::parse_srum_stream(p, &out)
+        })?;
+        if let Some(tables) = unit {
+            let record_count = tables.iter().map(|(_, count)| *count).sum();
+            entry_record_input_count(entry, p, record_count);
+            for (t, n) in tables {
+                emit(&format!("[+] {} rows -> {} [{}]", n, out.display(), t));
+            }
+            outputs.push(relative);
+        }
+    }
+    Ok(outputs)
+}
+
+fn parse_jumplist_artifact(
+    paths: &[PathBuf],
+    out_dir: &Path,
+    entry: &mut ParseArtifactReport,
+) -> Result<Vec<String>> {
+    entry_record_inputs(entry, paths);
+    let rows = jumplist::parse_jumplists_from(paths);
+    entry_record_rows_by_source(entry, &rows);
+    let mut outputs = Vec::new();
+    if !rows.is_empty() {
+        let relative = "JUMPLIST/JumpList_Entries.sqlite".to_string();
+        let out = out_dir.join(&relative);
+        if run_unit_or_skip("JumpList", &[&out], || {
+            write_table(
+                &out,
+                jumplist::JUMPLIST_TABLE,
+                &rows,
+                jumplist::JUMPLIST_FIELD_ORDER,
+            )
+        })?
+        .is_some()
+        {
+            emit(&format!("[+] {} rows -> {}", rows.len(), out.display()));
+            outputs.push(relative);
+        }
+    }
+    Ok(outputs)
+}
+
+fn parse_taskscheduler_artifact(
+    paths: &[PathBuf],
+    out_dir: &Path,
+    entry: &mut ParseArtifactReport,
+) -> Result<Vec<String>> {
+    entry_record_inputs(entry, paths);
+    let rows = taskscheduler::parse_tasks_from(paths);
+    entry_record_rows_by_source(entry, &rows);
+    let mut outputs = Vec::new();
+    if !rows.is_empty() {
+        let relative = "TASKSCHEDULER/TaskScheduler_Tasks.sqlite".to_string();
+        let out = out_dir.join(&relative);
+        if run_unit_or_skip("TaskScheduler", &[&out], || {
+            write_table(
+                &out,
+                taskscheduler::TASK_TABLE,
+                &rows,
+                taskscheduler::TASK_FIELD_ORDER,
+            )
+        })?
+        .is_some()
+        {
+            emit(&format!("[+] {} rows -> {}", rows.len(), out.display()));
+            outputs.push(relative);
+        }
+    }
+    Ok(outputs)
+}
+
+fn parse_rdpcache_artifact(
+    paths: &[PathBuf],
+    out_dir: &Path,
+    entry: &mut ParseArtifactReport,
+) -> Result<Vec<String>> {
+    entry_record_inputs(entry, paths);
+    let mut outputs = Vec::new();
+    if paths.is_empty() {
+        return Ok(outputs);
+    }
+    // 타일·모자이크 PNG(base64)는 행마다 커서 전량 적재하지 않고, 파일 하나
+    // 디코딩이 끝날 때마다 스트리밍으로 기록한다.
+    let relative = "RDPCACHE/RdpBitmapCache.sqlite".to_string();
+    let out = out_dir.join(&relative);
+    let mut per_source = std::collections::HashMap::<String, usize>::new();
+    let unit = run_unit_or_skip("RdpCache", &[&out], || -> Result<usize> {
+        let mut writer = crate::sqlite::StreamWriter::create(
+            &out,
+            rdpcache::RDP_TABLE,
+            rdpcache::RDP_FIELD_ORDER,
+            rdpcache::RDP_FIELD_ORDER,
+        )?;
+        rdpcache::parse_rdpcache_into(paths, &mut |row| {
+            if let Some(source) = row.get("_source_file").filter(|source| !source.is_empty()) {
+                *per_source.entry(source.clone()).or_default() += 1;
+            }
+            writer.push(row)
+        })?;
+        writer.finish()
+    })?;
+    let Some(total) = unit else {
+        return Ok(outputs);
+    };
+    for (source, count) in per_source {
+        entry_record_input_count(entry, Path::new(&source), count);
+    }
+    if total == 0 {
+        let _ = std::fs::remove_file(&out);
+    } else {
+        emit(&format!("[+] {} rows -> {}", total, out.display()));
+        outputs.push(relative);
+    }
+    Ok(outputs)
+}
+
+fn parse_wer_artifact(
+    paths: &[PathBuf],
+    out_dir: &Path,
+    entry: &mut ParseArtifactReport,
+) -> Result<Vec<String>> {
+    entry_record_inputs(entry, paths);
+    let rows = wer::parse_wer_from(paths);
+    entry_record_rows_by_source(entry, &rows);
+    let mut outputs = Vec::new();
+    if !rows.is_empty() {
+        let relative = "WER/WER_Reports.sqlite".to_string();
+        let out = out_dir.join(&relative);
+        if run_unit_or_skip("WER", &[&out], || {
+            write_table(&out, wer::WER_TABLE, &rows, wer::WER_FIELD_ORDER)
+        })?
+        .is_some()
+        {
+            emit(&format!("[+] {} rows -> {}", rows.len(), out.display()));
+            outputs.push(relative);
+        }
+    }
+    Ok(outputs)
+}
+
+fn parse_browser_history_artifact(
+    paths: &[PathBuf],
+    out_dir: &Path,
+    entry: &mut ParseArtifactReport,
+) -> Result<Vec<String>> {
+    entry_record_inputs(entry, paths);
+    let mut outputs = Vec::new();
+    let mut taken = HashSet::new();
+    // 계정 하나의 History가 손상돼도 그 계정만 건너뛴다(파싱 실패 == 손상
+    // 아티팩트). 이미 저장 완료된 다른 계정 결과는 그대로 발행된다.
+    for p in paths {
+        let acct = browser_account(p);
+        let name = uniq_name(&acct, &mut taken);
+        let relative = format!("BROWSER/{}.sqlite", name);
+        let out = out_dir.join(&relative);
+        let unit = run_unit_or_skip(&p.display().to_string(), &[&out], || -> Result<(usize, bool)> {
+            let tables = browser_history::parse_history(p)?;
+            let record_count = tables.iter().map(|(_, _, rows)| rows.len()).sum();
+            for (t, cols, rows) in &tables {
+                write_table_cols(&out, t, rows, cols, &[])?;
+                emit(&format!(
+                    "[+] {} rows -> {} [{}]",
+                    rows.len(),
+                    out.display(),
+                    t
+                ));
+            }
+            Ok((record_count, !tables.is_empty()))
+        })?;
+        if let Some((record_count, wrote)) = unit {
+            entry_record_input_count(entry, p, record_count);
+            if wrote {
+                outputs.push(relative);
+            }
+        }
+    }
+    Ok(outputs)
+}
+
+fn parse_browser_cache_artifact(
+    paths: &[PathBuf],
+    out_dir: &Path,
+    entry: &mut ParseArtifactReport,
+) -> Result<Vec<String>> {
+    entry_record_inputs(entry, paths);
+    let mut outputs = Vec::new();
+    // 계정(수집된 사용자 프로필)별 캐시 index 하나 = 출력 SQLite 하나.
+    // 엔트리를 파싱하는 즉시 스트리밍 기록하므로 전체 결과가 메모리에 남지
+    // 않고, 손상된 캐시는 해당 계정만 건너뛴다(파싱 실패 == 손상 아티팩트).
+    for (name, index_path) in browser_cache::cache_outputs(paths) {
+        let relative = format!("BROWSER/{}.sqlite", name);
+        let out = out_dir.join(&relative);
+        let unit = run_unit_or_skip(&index_path.display().to_string(), &[&out], || -> Result<usize> {
+            let mut writer = crate::sqlite::StreamWriter::create(
+                &out,
+                browser_cache::CACHE_TABLE,
+                browser_cache::CACHE_FIELD_ORDER,
+                browser_cache::CACHE_FIELD_ORDER,
+            )?;
+            browser_cache::parse_cache_index(&index_path, &mut |row| writer.push(row))?;
+            writer.finish()
+        })?;
+        match unit {
+            Some(0) => {
+                let _ = std::fs::remove_file(&out);
+            }
+            Some(count) => {
+                entry_record_input_count(entry, &index_path, count);
+                emit(&format!("[+] {} rows -> {}", count, out.display()));
+                outputs.push(relative);
+            }
+            None => {}
+        }
+    }
+    Ok(outputs)
+}
+
+fn parse_prefetch_artifact(
+    paths: &[PathBuf],
+    out_dir: &Path,
+    entry: &mut ParseArtifactReport,
+) -> Result<Vec<String>> {
+    entry_record_inputs(entry, paths);
+    let mut outputs = Vec::new();
+    if !paths.is_empty() {
+        let exec_relative = format!("PREFETCH/{}.sqlite", prefetch::EXEC_TABLE);
+        let loaded_relative = format!("PREFETCH/{}.sqlite", prefetch::LOADED_TABLE);
+        let ex = out_dir.join(&exec_relative);
+        let lf = out_dir.join(&loaded_relative);
+        let unit = run_unit_or_skip("Prefetch", &[&ex, &lf], || -> Result<(Vec<Row>, Vec<Row>)> {
+            let (exec_rows, loaded_rows) = prefetch::parse_prefetch(paths);
+            write_table(
+                &ex,
+                prefetch::EXEC_TABLE,
+                &exec_rows,
+                prefetch::EXEC_FIELD_ORDER,
+            )?;
+            write_table(
+                &lf,
+                prefetch::LOADED_TABLE,
+                &loaded_rows,
+                prefetch::LOADED_FIELD_ORDER,
+            )?;
+            Ok((exec_rows, loaded_rows))
+        })?;
+        if let Some((exec_rows, loaded_rows)) = unit {
+            entry_record_rows_by_source(entry, &exec_rows);
+            entry_add_rows_by_source(entry, &loaded_rows);
+            emit(&format!("[+] {} rows -> {}", exec_rows.len(), ex.display()));
+            emit(&format!(
+                "[+] {} rows -> {}",
+                loaded_rows.len(),
+                lf.display()
+            ));
+            outputs.push(exec_relative);
+            outputs.push(loaded_relative);
+        }
+    }
+    Ok(outputs)
+}
+
+fn parse_powershell_artifact(
+    paths: &[PathBuf],
+    out_dir: &Path,
+    entry: &mut ParseArtifactReport,
+) -> Result<Vec<String>> {
+    entry_record_inputs(entry, paths);
+    let mut outputs = Vec::new();
+    if !paths.is_empty() {
+        let relative = format!("POWERSHELL/{}.sqlite", powershell_history::PS_TABLE);
+        let out = out_dir.join(&relative);
+        let unit = run_unit_or_skip("PowerShell", &[&out], || -> Result<Vec<Row>> {
+            let rows = powershell_history::parse_console_history(paths)?;
+            write_table(
+                &out,
+                powershell_history::PS_TABLE,
+                &rows,
+                powershell_history::PS_FIELD_ORDER,
+            )?;
+            Ok(rows)
+        })?;
+        if let Some(rows) = unit {
+            entry_record_rows_by_source(entry, &rows);
+            emit(&format!("[+] {} rows -> {}", rows.len(), out.display()));
+            outputs.push(relative);
+        }
+    }
+    Ok(outputs)
+}
+
+fn parse_artifact_sources(
+    name: &str,
+    paths: &[PathBuf],
+    out_dir: &Path,
+    outcome: &mut ArtifactOutcome,
+) -> Result<Vec<String>> {
+    match name {
+        "Amcache" => parse_amcache_artifact(paths, out_dir, &mut outcome.entry),
+        "EventLog" => parse_eventlog_artifact(paths, out_dir, &mut outcome.entry),
+        "Registry" => parse_registry_artifact(paths, out_dir, outcome),
+        "UsnJrnl" => parse_usnjrnl_artifact(paths, out_dir, &mut outcome.entry),
+        "MFT" => parse_mft_artifact(paths, out_dir, &mut outcome.entry),
+        "SRUM" => parse_srum_artifact(paths, out_dir, &mut outcome.entry),
+        "JumpList" => parse_jumplist_artifact(paths, out_dir, &mut outcome.entry),
+        "TaskScheduler" => parse_taskscheduler_artifact(paths, out_dir, &mut outcome.entry),
+        "RdpCache" => parse_rdpcache_artifact(paths, out_dir, &mut outcome.entry),
+        "BrowserHistory" => parse_browser_history_artifact(paths, out_dir, &mut outcome.entry),
+        "BrowserCache" => parse_browser_cache_artifact(paths, out_dir, &mut outcome.entry),
+        "PowerShell" => parse_powershell_artifact(paths, out_dir, &mut outcome.entry),
+        "Prefetch" => parse_prefetch_artifact(paths, out_dir, &mut outcome.entry),
+        "WER" => parse_wer_artifact(paths, out_dir, &mut outcome.entry),
+        other => anyhow::bail!("unknown artifact {other}"),
+    }
+}
+
+fn mark_artifact_failed(outcome: &mut ArtifactOutcome, name: &str, error: String) {
+    outcome.errors.push(format!("{}: {}", name, error));
+    outcome.entry.status = "failed".to_string();
+    outcome.entry.error = Some(error.clone());
+    append_current_log_lifecycle(&format!(
+        "artifact_finished name={} status=failed error={}",
+        name, error
+    ));
+}
+
+/// Run one artifact end-to-end inside a worker thread: parse into the staging
+/// tree, seal its outputs, and record the terminal state. An Err is logged and
+/// isolated, and a *panic* (e.g. a malformed structure that trips an index) is
+/// caught too, so one bad artifact can never stop the ones running beside it
+/// or the _OVERVIEW stage.
+fn run_artifact_job(name: &str, paths: &[PathBuf], out_dir: &Path) -> ArtifactOutcome {
+    let mut outcome = ArtifactOutcome::new(name);
+    append_current_log_lifecycle(&format!("artifact_started name={}", name));
+    if CANCEL.load(Ordering::Relaxed) {
+        outcome.entry.status = "cancelled".to_string();
+        append_current_log_lifecycle(&format!(
+            "artifact_finished name={} status=cancelled",
+            name
+        ));
+        return outcome;
+    }
+    emit(&format!("[시작] {}", name));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        parse_artifact_sources(name, paths, out_dir, &mut outcome)
+    }));
+    match result {
+        Ok(Ok(outputs)) => {
+            if artifact_has_no_input(&outcome.entry, &outputs) {
+                outcome.entry.status = "no_input".to_string();
+                outcome.entry.publication_status = Some("not_published".to_string());
+                emit(&format!("[완료] {} — 원본 없음", name));
+                append_current_log_lifecycle(&format!(
+                    "artifact_finished name={} status=no_input",
+                    name
+                ));
+            } else {
+                match seal_artifact_outputs(out_dir, name, &outputs) {
+                    Ok(sealed) => {
+                        outcome.entry.status = "completed".to_string();
+                        outcome.entry.outputs = outputs;
+                        outcome.sealed = sealed;
+                        emit(&format!("[완료] {}", name));
+                        append_current_log_lifecycle(&format!(
+                            "artifact_finished name={} status=completed",
+                            name
+                        ));
+                    }
+                    Err(error) => {
+                        let error = format!("sealed output: {error}");
+                        emit(&format!("[!] {} failed: {}", name, error));
+                        mark_artifact_failed(&mut outcome, name, error);
+                    }
+                }
+            }
+        }
+        Ok(Err(error)) => {
+            let error = error.to_string();
+            emit(&format!("[!] {} failed: {}", name, error));
+            mark_artifact_failed(&mut outcome, name, error);
+        }
+        Err(payload) => {
+            let error = panic_details(payload);
+            emit(&format!("[!] {} panicked — skipped: {}", name, error));
+            outcome.errors.push(format!("{}: panic: {}", name, error));
+            outcome.entry.status = "failed".to_string();
+            outcome.entry.error = Some(format!("panic: {}", error));
+            append_current_log_lifecycle(&format!(
+                "artifact_finished name={} status=failed panic={}",
+                name, error
+            ));
+        }
+    }
+    outcome
 }
 
 pub fn run_host(
@@ -1009,575 +1716,130 @@ pub fn run_host_with_log_id(
         }
     };
     append_current_log_lifecycle(&format!("staging_started path={}", out_dir.display()));
-    let want = |n: &str| only.as_ref().map_or(true, |o| o.contains(n));
+    let want = |n: &str| only.as_ref().is_none_or(|o| o.contains(n));
     let mut artifacts_run: Vec<String> = Vec::new();
     let mut sealed_outputs: Vec<SealedArtifactOutput> = Vec::new();
     let mut had_error = false;
-    let cat = |c: &str| out_dir.join(c);
 
-    // Each artifact is isolated: an Err is logged and skipped, and a *panic*
-    // (e.g. a malformed structure that trips an index) is caught too, so one
-    // bad artifact can never stop the ones after it or the _OVERVIEW stage.
-    macro_rules! guard { ($name:expr, $body:block) => {{
-        report.artifacts.push(ParseArtifactReport { name: $name.to_string(), status: "running".to_string(), input_discovery_checked: false, evidence_discovered: false, outputs: Vec::new(), published_outputs: Vec::new(), publication_status: None, error: None, inputs: Vec::new() });
-        append_current_log_lifecycle(&format!("artifact_started name={}", $name));
-        if !CANCEL.load(Ordering::Relaxed) {
-            let output_before = staged_file_signatures(&out_dir);
-            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> { $body Ok(()) }));
-            match res {
-                Ok(Ok(())) => {
-                    let outputs = changed_staged_outputs(&output_before, &out_dir);
-                    let no_input = report
-                        .artifacts
-                        .last()
-                        .is_some_and(|entry| artifact_has_no_input(entry, &outputs));
-                    if no_input {
-                        // Most artifact sections only know that there was no
-                        // evidence after their finder returns.  Centralising
-                        // the terminal state here keeps Prefetch and every
-                        // future artifact truthful without relying on each
-                        // parser branch to remember a special case.
-                        mark_artifact_no_input(&mut report, $name);
-                        append_current_log_lifecycle(&format!(
-                            "artifact_finished name={} status=no_input",
-                            $name
-                        ));
-                    } else { match seal_artifact_outputs(&out_dir, $name, &outputs) {
-                        Ok(sealed) => {
-                            if let Some(entry) = report.artifacts.last_mut() {
-                                entry.status = "completed".to_string();
-                                entry.outputs = outputs;
-                            }
-                            sealed_outputs.extend(sealed);
-                            report.completed_artifacts.push($name.to_string());
-                            append_current_log_lifecycle(&format!(
-                                "artifact_finished name={} status=completed",
-                                $name
-                            ));
-                        }
-                        Err(error) => {
-                            let error = format!("sealed output: {error}");
-                            emit(&format!("[!] {} failed: {}", $name, error));
-                            had_error = true;
-                            report.errors.push(format!("{}: {}", $name, error));
-                            if let Some(entry) = report.artifacts.last_mut() {
-                                entry.status = "failed".to_string();
-                                entry.error = Some(error.clone());
-                            }
-                            append_current_log_lifecycle(&format!(
-                                "artifact_finished name={} status=failed error={}",
-                                $name, error
-                            ));
-                        }
-                    }}
-                }
-                Ok(Err(error)) => {
-                    emit(&format!("[!] {} failed: {}", $name, error));
-                    had_error = true;
-                    let error = error.to_string();
-                    report.errors.push(format!("{}: {}", $name, error));
-                    if let Some(entry) = report.artifacts.last_mut() {
-                        entry.status = "failed".to_string();
-                        entry.error = Some(error.clone());
+    // ---- 1단계: 아티팩트별 원본 파일 확인(경로/내용 기준) 및 목록화 ----
+    let wanted: Vec<&'static str> = ARTIFACT_NAMES
+        .iter()
+        .copied()
+        .filter(|name| want(name))
+        .collect();
+    emit("=== 파일 확인 ===");
+    append_current_log_lifecycle("discovery_started");
+    let discovered: std::collections::HashMap<&'static str, Vec<PathBuf>> = {
+        let slots: Vec<Mutex<Vec<PathBuf>>> = wanted.iter().map(|_| Mutex::new(Vec::new())).collect();
+        let next = AtomicUsize::new(0);
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .min(wanted.len().max(1));
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(|| loop {
+                    if CANCEL.load(Ordering::Relaxed) {
+                        break;
                     }
-                    append_current_log_lifecycle(&format!(
-                        "artifact_finished name={} status=failed error={}",
-                        $name, error
-                    ));
-                }
-                Err(payload) => {
-                    let error = panic_details(payload);
-                    emit(&format!("[!] {} panicked — skipped: {}", $name, error));
-                    had_error = true;
-                    report.errors.push(format!("{}: panic: {}", $name, error));
-                    if let Some(entry) = report.artifacts.last_mut() {
-                        entry.status = "failed".to_string();
-                        entry.error = Some(format!("panic: {}", error));
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    if index >= wanted.len() {
+                        break;
                     }
-                    append_current_log_lifecycle(&format!(
-                        "artifact_finished name={} status=failed panic={}",
-                        $name, error
-                    ));
-                }
-            }
-        } else if let Some(entry) = report.artifacts.last_mut() { entry.status = "cancelled".to_string(); append_current_log_lifecycle(&format!("artifact_finished name={} status=cancelled", $name)); }
-        artifacts_run.push($name.to_string());
-    }}; }
-
-    // --- Amcache (AMCACHE/<stem>.sqlite: Amcache_Programs + Amcache_Files) ---
-    if want("Amcache") {
-        announce("Amcache");
-        guard!("Amcache", {
-            let paths = finder::dedupe_by_content(finder::by_name(&target, &["Amcache.hve"]));
-            found(&paths);
-            record_inputs(&mut report, "Amcache", &paths);
-            let mut taken = HashSet::new();
-            for p in &paths {
-                let base = p
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "Amcache".into());
-                let name = uniq_name(&base, &mut taken);
-                let out = cat("AMCACHE").join(format!("{}.sqlite", name));
-                let (progs, files) = amcache::parse_amcache(p)?;
-                write_table(
-                    &out,
-                    amcache::PROGRAMS_TABLE,
-                    &progs,
-                    amcache::PROGRAMS_FIELD_ORDER,
-                )?;
-                write_table(
-                    &out,
-                    amcache::FILES_TABLE,
-                    &files,
-                    amcache::FILES_FIELD_ORDER,
-                )?;
-                record_input_count(&mut report, "Amcache", p, progs.len() + files.len());
-                emit(&format!(
-                    "[+] {} programs, {} files -> {}",
-                    progs.len(),
-                    files.len(),
-                    out.display()
-                ));
-            }
-        });
-    }
-
-    // --- EventLog (EVENTLOG/<stem>.sqlite) ---
-    if want("EventLog") {
-        announce("EventLog");
-        guard!("EventLog", {
-            let paths = finder::dedupe_by_content(finder::by_name(&target, eventlog::ALLOWLIST));
-            found(&paths);
-            record_inputs(&mut report, "EventLog", &paths);
-            let mut taken = HashSet::new();
-            for p in &paths {
-                let base = p
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "EventLog".into());
-                let name = uniq_name(&base, &mut taken);
-                let out = cat("EVENTLOG").join(format!("{}.sqlite", name));
-                let n = eventlog::parse_evtx_stream(p, &out, &name)?;
-                record_input_count(&mut report, "EventLog", p, n);
-                if n > 0 {
-                    emit(&format!("[+] {} rows -> {} [{}]", n, out.display(), name));
-                }
-            }
-        });
-    }
-
-    // --- Registry (REGISTRY/<filename>.sqlite, table Registry) ---
-    if want("Registry") {
-        announce("Registry");
-        guard!("Registry", {
-            let mut all = finder::by_name(&target, registry::REG_FILENAMES);
-            all.extend(finder::by_suffix(&target, registry::REG_SUFFIXES));
-            // drop a RegBack copy when the live hive of the same name is present
-            let live: HashSet<String> = all
-                .iter()
-                .filter(|p| {
-                    !p.components().any(|c| {
-                        c.as_os_str()
-                            .to_string_lossy()
-                            .eq_ignore_ascii_case("regback")
-                    })
-                })
-                .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_uppercase()))
-                .collect();
-            all.retain(|p| {
-                let is_regback = p.components().any(|c| {
-                    c.as_os_str()
-                        .to_string_lossy()
-                        .eq_ignore_ascii_case("regback")
-                });
-                let nm = p
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_uppercase())
-                    .unwrap_or_default();
-                !is_regback || !live.contains(&nm)
-            });
-            let paths = finder::dedupe_by_content(all);
-            found(&paths);
-            record_inputs(&mut report, "Registry", &paths);
-            if registry::registry_recovery_disabled() {
-                report.registry_recovery = Some(RegistryRecoveryReport {
-                    mode: "disabled".to_string(),
-                    deleted_cell_recovery_applied: false,
-                    transaction_logs_applied: false,
-                });
-                emit("[*] Registry recovery disabled temporarily: deleted cells and transaction logs were not applied; parsing allocated live hive records only");
-            } else {
-                report.registry_recovery = Some(RegistryRecoveryReport {
-                    mode: "enabled".to_string(),
-                    deleted_cell_recovery_applied: true,
-                    transaction_logs_applied: true,
+                    let paths = discover_artifact_files(wanted[index], &target);
+                    if let Ok(mut slot) = slots[index].lock() {
+                        *slot = paths;
+                    }
                 });
             }
-            // Assign each hive a unique output name, then parse hives in
-            // parallel. Every worker writes its own SQLite output, so normal
-            // allocated-record parsing remains isolated in live-only mode.
-            let mut taken = HashSet::new();
-            let mut jobs: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
-            for p in &paths {
-                let base = p
-                    .file_name()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "hive".into());
-                let name = uniq_name(&base, &mut taken);
-                jobs.push((p.clone(), cat("REGISTRY").join(format!("{}.sqlite", name))));
+        });
+        wanted
+            .iter()
+            .zip(slots)
+            .map(|(name, slot)| (*name, slot.into_inner().unwrap_or_default()))
+            .collect()
+    };
+    for &name in &wanted {
+        let paths = &discovered[name];
+        emit(&format!("[파일] {}: {}개", name, paths.len()));
+        if paths.len() <= 20 {
+            for path in paths {
+                emit(&format!("[*] found: {}", path.display()));
             }
-            // Keep Registry hive work bounded at two workers. If temporary
-            // recovery is later re-enabled, the parser's process-wide permits
-            // continue to cap the expensive builder/recovery stage as well.
-            let workers = registry::registry_recovery_worker_count(jobs.len());
-            let next = AtomicUsize::new(0);
-            let parsed_counts = Mutex::new(
-                Vec::<(std::path::PathBuf, registry::HiveParseMetrics)>::with_capacity(jobs.len()),
-            );
-            let source_failures = Mutex::new(Vec::<String>::new());
-            std::thread::scope(|s| {
-                for _ in 0..workers {
-                    s.spawn(|| loop {
-                        if CANCEL.load(Ordering::Relaxed) {
-                            break;
-                        } // stop starting new hives
-                        let i = next.fetch_add(1, Ordering::Relaxed);
-                        if i >= jobs.len() {
-                            break;
-                        }
-                        let (src, out) = &jobs[i];
-                        if CANCEL.load(Ordering::Relaxed) {
-                            break;
-                        }
-                        match registry::parse_hive_stream_with_metrics(src, out) {
-                            Ok(metrics) => {
-                                if let Ok(mut counts) = parsed_counts.lock() {
-                                    counts.push((src.clone(), metrics.clone()));
-                                }
-                                emit(&format!(
-                                    "[+] {} rows -> {} [Registry]",
-                                    metrics.row_count,
-                                    out.display()
-                                ));
-                            }
-                            Err(e) => {
-                                emit(&format!("[!] {} failed: {}", out.display(), e));
-                                if let Ok(mut failures) = source_failures.lock() {
-                                    failures.push(format!("{}: {}", src.display(), e));
-                                }
-                            }
-                        }
-                    });
-                }
-            });
-            if let Ok(counts) = parsed_counts.into_inner() {
-                for (source, metrics) in counts {
-                    record_input_count(&mut report, "Registry", &source, metrics.row_count);
-                    report.registry_hives.push(RegistryHiveReport {
-                        source_path: source.to_string_lossy().to_string(),
-                        status: "completed".to_string(),
-                        row_count: metrics.row_count,
-                        recovery_logs_discovered: metrics.recovery_logs_discovered,
-                        recovery_log_count: metrics.recovery_log_count,
-                        recovery_enabled: metrics.recovery_enabled,
-                        recovered_row_count: metrics.recovered_row_count,
-                        recovery_permit_wait_ms: metrics.recovery_permit_wait_ms,
-                        build_recovery_ms: metrics.build_recovery_ms,
-                        iteration_and_sqlite_write_ms: metrics.iteration_and_sqlite_write_ms,
-                        error: None,
-                    });
-                }
+        }
+    }
+    append_current_log_lifecycle("discovery_finished");
+
+    // ---- 2단계: 아티팩트 병렬 파싱 — 각 아티팩트의 원본 데이터베이스 저장 ----
+    // BrowserHistory와 BrowserCache는 같은 BROWSER/<account>.sqlite 파일을
+    // 공유할 수 있어 한 체인 안에서 순서대로 실행한다(마지막 성공 기록이
+    // 남는 기존 규칙 유지). 나머지 아티팩트는 서로 독립적으로 병렬 실행된다.
+    let mut chains: Vec<Vec<&'static str>> = Vec::new();
+    for &name in &wanted {
+        if name == "BrowserCache" {
+            if let Some(chain) = chains
+                .iter_mut()
+                .find(|chain| chain.contains(&"BrowserHistory"))
+            {
+                chain.push(name);
+                continue;
             }
-            let failures = source_failures.into_inner().unwrap_or_default();
-            if !failures.is_empty() {
-                report.registry_hives.extend(failures.iter().map(|failure| {
-                    RegistryHiveReport {
-                        source_path: failure
-                            .split_once(": ")
-                            .map(|(path, _)| path)
-                            .unwrap_or(failure)
-                            .to_string(),
-                        status: "failed".to_string(),
-                        row_count: 0,
-                        recovery_logs_discovered: 0,
-                        recovery_log_count: 0,
-                        recovery_enabled: !registry::registry_recovery_disabled(),
-                        recovered_row_count: 0,
-                        recovery_permit_wait_ms: 0,
-                        build_recovery_ms: 0,
-                        iteration_and_sqlite_write_ms: 0,
-                        error: Some(failure.clone()),
+        }
+        chains.push(vec![name]);
+    }
+    emit("=== 파싱 ===");
+    let outcomes: Mutex<Vec<ArtifactOutcome>> = Mutex::new(Vec::with_capacity(wanted.len()));
+    {
+        let next = AtomicUsize::new(0);
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .min(chains.len().max(1));
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(|| loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    if index >= chains.len() {
+                        break;
                     }
-                }));
-                anyhow::bail!(
-                    "{} Registry source(s) failed: {}",
-                    failures.len(),
-                    failures.join("; ")
-                );
-            }
-        });
-    }
-
-    // --- UsnJrnl (FILESYSTEM/UsnJrnl_Records.sqlite) ---
-    if want("UsnJrnl") {
-        announce("UsnJrnl");
-        guard!("UsnJrnl", {
-            let paths = finder::dedupe_by_content(finder::by_name(&target, &["$J"]));
-            found(&paths);
-            record_inputs(&mut report, "UsnJrnl", &paths);
-            if let Some(p) = paths.first() {
-                let out = cat("FILESYSTEM").join("UsnJrnl_Records.sqlite");
-                let n = usnjrnl::parse_usn_stream(p, &out)?;
-                record_input_count(&mut report, "UsnJrnl", p, n);
-                emit(&format!("[+] {} rows -> {}", n, out.display()));
-            }
-        });
-    }
-
-    // --- MFT (_OVERVIEW/MFT_Records.sqlite) ---
-    if want("MFT") {
-        announce("MFT");
-        guard!("MFT", {
-            let paths = finder::dedupe_by_content(finder::by_name(&target, &["$MFT"]));
-            found(&paths);
-            record_inputs(&mut report, "MFT", &paths);
-            if let Some(p) = paths.first() {
-                let out = cat("_OVERVIEW").join("MFT_Records.sqlite");
-                let n = mft::parse_mft_stream(p, &out)?;
-                record_input_count(&mut report, "MFT", p, n);
-                emit(&format!("[+] {} rows -> {}", n, out.display()));
-            } else {
-                mark_artifact_no_input(&mut report, "MFT");
-                emit("[*] MFT 원본이 없어 이번 실행에서 MFT 결과를 만들지 않았습니다");
-            }
-        });
-    }
-
-    // --- SRUM (SRUM/<stem>.sqlite, table per provider) ---
-    if want("SRUM") {
-        announce("SRUM");
-        guard!("SRUM", {
-            let paths = finder::dedupe_by_content(finder::by_name(&target, &["SRUDB.dat"]));
-            found(&paths);
-            record_inputs(&mut report, "SRUM", &paths);
-            let mut taken = HashSet::new();
-            let mut source_failures = Vec::new();
-            for p in &paths {
-                let base = p
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "SRUDB".into());
-                let name = uniq_name(&base, &mut taken);
-                let out = cat("SRUM").join(format!("{}.sqlite", name));
-                match srum::parse_srum_stream(p, &out) {
-                    Ok(tables) => {
-                        let record_count = tables.iter().map(|(_, count)| *count).sum();
-                        record_input_count(&mut report, "SRUM", p, record_count);
-                        for (t, n) in tables {
-                            emit(&format!("[+] {} rows -> {} [{}]", n, out.display(), t));
-                        }
+                    for &name in &chains[index] {
+                        let paths = discovered
+                            .get(name)
+                            .map(|paths| paths.as_slice())
+                            .unwrap_or(&[]);
+                        let outcome = run_artifact_job(name, paths, &out_dir);
+                        let mut collected = outcomes
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        collected.push(outcome);
                     }
-                    Err(e) => {
-                        emit(&format!("[!] SRUM failed for {}: {}", p.display(), e));
-                        source_failures.push(format!("{}: {}", p.display(), e));
-                    }
-                }
-            }
-            if !source_failures.is_empty() {
-                anyhow::bail!(
-                    "{} SRUM source(s) failed: {}",
-                    source_failures.len(),
-                    source_failures.join("; ")
-                );
+                });
             }
         });
     }
-
-    // --- JumpList (JUMPLIST/JumpList_Entries.sqlite) ---
-    if want("JumpList") {
-        announce("JumpList");
-        guard!("JumpList", {
-            let (sources, rows) = jumplist::parse_jumplists_with_sources(&target)?;
-            record_inputs(&mut report, "JumpList", &sources);
-            record_rows_by_source(&mut report, "JumpList", &rows);
-            if !rows.is_empty() {
-                let out = cat("JUMPLIST").join("JumpList_Entries.sqlite");
-                write_table(
-                    &out,
-                    jumplist::JUMPLIST_TABLE,
-                    &rows,
-                    jumplist::JUMPLIST_FIELD_ORDER,
-                )?;
-                emit(&format!("[+] {} rows -> {}", rows.len(), out.display()));
-            } else {
-                emit(&format!("[!] no matching files found"));
-            }
-        });
-    }
-
-    // --- TaskScheduler (TASKSCHEDULER/TaskScheduler_Tasks.sqlite) ---
-    if want("TaskScheduler") {
-        announce("TaskScheduler");
-        guard!("TaskScheduler", {
-            let (sources, rows) = taskscheduler::parse_tasks_with_sources(&target)?;
-            record_inputs(&mut report, "TaskScheduler", &sources);
-            record_rows_by_source(&mut report, "TaskScheduler", &rows);
-            if !rows.is_empty() {
-                let out = cat("TASKSCHEDULER").join("TaskScheduler_Tasks.sqlite");
-                write_table(
-                    &out,
-                    taskscheduler::TASK_TABLE,
-                    &rows,
-                    taskscheduler::TASK_FIELD_ORDER,
-                )?;
-                emit(&format!("[+] {} rows -> {}", rows.len(), out.display()));
-            } else {
-                emit(&format!("[!] no matching files found"));
-            }
-        });
-    }
-
-    // --- RdpCache (RDPCACHE/RdpBitmapCache.sqlite) ---
-    if want("RdpCache") {
-        announce("RdpCache");
-        guard!("RdpCache", {
-            let (sources, rows) = rdpcache::parse_rdpcache_with_sources(&target)?;
-            record_inputs(&mut report, "RdpCache", &sources);
-            record_rows_by_source(&mut report, "RdpCache", &rows);
-            if !rows.is_empty() {
-                let out = cat("RDPCACHE").join("RdpBitmapCache.sqlite");
-                write_table(&out, rdpcache::RDP_TABLE, &rows, rdpcache::RDP_FIELD_ORDER)?;
-                emit(&format!("[+] {} rows -> {}", rows.len(), out.display()));
-            } else {
-                emit(&format!("[!] no matching files found"));
-            }
-        });
-    }
-
-    // --- WER (WER/WER_Reports.sqlite) ---
-    if want("WER") {
-        announce("WER");
-        guard!("WER", {
-            let (sources, rows) = wer::parse_wer_with_sources(&target)?;
-            record_inputs(&mut report, "WER", &sources);
-            record_rows_by_source(&mut report, "WER", &rows);
-            if !rows.is_empty() {
-                let out = cat("WER").join("WER_Reports.sqlite");
-                write_table(&out, wer::WER_TABLE, &rows, wer::WER_FIELD_ORDER)?;
-                emit(&format!("[+] {} rows -> {}", rows.len(), out.display()));
-            } else {
-                emit(&format!("[!] no matching files found"));
-            }
-        });
-    }
-
-    // --- BrowserHistory (BROWSER/<account>.sqlite, table per source table) ---
-    if want("BrowserHistory") {
-        announce("BrowserHistory");
-        guard!("BrowserHistory", {
-            let paths = finder::dedupe_by_content(finder::by_name(&target, &["History"]));
-            found(&paths);
-            record_inputs(&mut report, "BrowserHistory", &paths);
-            let mut taken = HashSet::new();
-            for p in &paths {
-                let acct = browser_account(p);
-                let name = uniq_name(&acct, &mut taken);
-                let out = cat("BROWSER").join(format!("{}.sqlite", name));
-                let tables = browser_history::parse_history(p)?;
-                let record_count = tables.iter().map(|(_, _, rows)| rows.len()).sum();
-                record_input_count(&mut report, "BrowserHistory", p, record_count);
-                for (t, cols, rows) in &tables {
-                    write_table_cols(&out, t, rows, cols, &[])?;
-                    emit(&format!(
-                        "[+] {} rows -> {} [{}]",
-                        rows.len(),
-                        out.display(),
-                        t
-                    ));
-                }
-            }
-        });
-    }
-
-    // --- BrowserCache (BROWSER/<account>_Chrome_Cache.sqlite — shared with BrowserHistory) ---
-    if want("BrowserCache") {
-        announce("BrowserCache");
-        guard!("BrowserCache", {
-            let paths = finder::dedupe_by_content(finder::by_name(&target, &["index"]));
-            found(&paths);
-            record_inputs(&mut report, "BrowserCache", &paths);
-            for (name, source, rows) in browser_cache::parse_caches(&paths) {
-                let out = cat("BROWSER").join(format!("{}.sqlite", name));
-                write_table(
-                    &out,
-                    browser_cache::CACHE_TABLE,
-                    &rows,
-                    browser_cache::CACHE_FIELD_ORDER,
-                )?;
-                record_input_count(&mut report, "BrowserCache", &source, rows.len());
-                emit(&format!("[+] {} rows -> {}", rows.len(), out.display()));
-            }
-        });
-    }
-
-    // --- Prefetch (PREFETCH/Prefetch_Execution.sqlite + Prefetch_LoadedFiles.sqlite) ---
-    if want("Prefetch") {
-        announce("Prefetch");
-        guard!("Prefetch", {
-            let paths = finder::dedupe_by_content(finder::by_extension(&target, &[".pf"]));
-            found(&paths);
-            record_inputs(&mut report, "Prefetch", &paths);
-            if !paths.is_empty() {
-                let (exec_rows, loaded_rows) = prefetch::parse_prefetch(&paths);
-                record_rows_by_source(&mut report, "Prefetch", &exec_rows);
-                add_rows_by_source(&mut report, "Prefetch", &loaded_rows);
-                let ex = cat("PREFETCH").join(format!("{}.sqlite", prefetch::EXEC_TABLE));
-                write_table(
-                    &ex,
-                    prefetch::EXEC_TABLE,
-                    &exec_rows,
-                    prefetch::EXEC_FIELD_ORDER,
-                )?;
-                emit(&format!("[+] {} rows -> {}", exec_rows.len(), ex.display()));
-                let lf = cat("PREFETCH").join(format!("{}.sqlite", prefetch::LOADED_TABLE));
-                write_table(
-                    &lf,
-                    prefetch::LOADED_TABLE,
-                    &loaded_rows,
-                    prefetch::LOADED_FIELD_ORDER,
-                )?;
-                emit(&format!(
-                    "[+] {} rows -> {}",
-                    loaded_rows.len(),
-                    lf.display()
-                ));
-            }
-        });
-    }
-
-    // --- PowerShell console history (POWERSHELL/PowerShell_ConsoleHistory.sqlite) ---
-    if want("PowerShell") {
-        announce("PowerShell");
-        guard!("PowerShell", {
-            let paths =
-                finder::dedupe_by_content(finder::by_name(&target, &["ConsoleHost_history.txt"]));
-            found(&paths);
-            record_inputs(&mut report, "PowerShell", &paths);
-            if !paths.is_empty() {
-                let rows = powershell_history::parse_console_history(&paths)?;
-                record_rows_by_source(&mut report, "PowerShell", &rows);
-                let out =
-                    cat("POWERSHELL").join(format!("{}.sqlite", powershell_history::PS_TABLE));
-                write_table(
-                    &out,
-                    powershell_history::PS_TABLE,
-                    &rows,
-                    powershell_history::PS_FIELD_ORDER,
-                )?;
-                emit(&format!("[+] {} rows -> {}", rows.len(), out.display()));
-            }
-        });
+    let mut outcomes = outcomes
+        .into_inner()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for &name in &wanted {
+        let Some(position) = outcomes
+            .iter()
+            .position(|outcome| outcome.entry.name == name)
+        else {
+            continue;
+        };
+        let outcome = outcomes.remove(position);
+        had_error |= !outcome.errors.is_empty();
+        report.errors.extend(outcome.errors);
+        if outcome.entry.status == "completed" {
+            report.completed_artifacts.push(name.to_string());
+        }
+        report.registry_hives.extend(outcome.registry_hives);
+        if outcome.registry_recovery.is_some() {
+            report.registry_recovery = outcome.registry_recovery;
+        }
+        sealed_outputs.extend(outcome.sealed);
+        report.artifacts.push(outcome.entry);
+        artifacts_run.push(name.to_string());
     }
 
     // The correlation overview is built from the staging tree, which always
@@ -1590,7 +1852,7 @@ pub fn run_host_with_log_id(
     // parsed cleanly. Only a cancel skips it, because a cancelled run may have
     // stopped mid-artifact and left the staging tree incomplete.
     if !cancelled() {
-        emit(&format!("=== _OVERVIEW ==="));
+        emit("=== _OVERVIEW ===");
         append_current_log_lifecycle("overview_started");
         let ov = out_dir.join("_OVERVIEW");
         // TargetInfo, BAM execution history, and RegistryFindings all inspect
@@ -1617,18 +1879,29 @@ pub fn run_host_with_log_id(
                 true,
             )?;
             write_ov("RdpCache", overview::build_rdp_cache(&out_dir), true)?;
-            write_ov("Defender", overview::build_defender(&out_dir), false)?;
+            // 이벤트 로그 행은 4개 빌더가 공유한다 — 한 번만 로드.
+            let events = overview::EventLogOverviewCache::load(&out_dir);
+            write_ov(
+                "Defender",
+                overview::build_defender_with_events(&events),
+                false,
+            )?;
             write_ov(
                 "RemoteDesktopHistory",
-                overview::build_remote_desktop_history(&out_dir),
+                overview::build_remote_desktop_history_with_events(&events),
                 false,
             )?;
-            write_ov("SmbHistory", overview::build_smb_history(&out_dir), true)?;
+            write_ov(
+                "SmbHistory",
+                overview::build_smb_history_with_events(&events),
+                true,
+            )?;
             write_ov(
                 "PowerShellHistory",
-                overview::build_powershell_history(&out_dir),
+                overview::build_powershell_history_with_events(&out_dir, &events),
                 false,
             )?;
+            drop(events);
             write_ov(
                 "BrowserActivity",
                 overview::build_browser_history(&out_dir),
@@ -1675,13 +1948,40 @@ pub fn run_host_with_log_id(
             Err(error) => emit(&format!("[!] _OVERVIEW seal failed: {error}")),
         }
     } else {
-        emit(&format!("=== 취소됨 — 종합 분석 건너뜀 ==="));
+        emit("=== 취소됨 — 종합 분석 건너뜀 ===");
         append_current_log_lifecycle("overview_finished status=cancelled");
     }
 
     let run_at = chrono::Local::now()
         .format("%Y-%m-%d %H:%M:%S%.3f")
         .to_string();
+
+    // 가공의 마지막 단계: 통합 타임라인 캐시. run_at(=호스트의 lastRunAt)을
+    // 키로 스테이징 루트에 기록하고, 발행 시 호스트 루트로 함께 이동한다.
+    // 캐시 생성 실패는 치명적이지 않다 — 뷰어가 탭 열람 시 직접 다시 만든다.
+    if !cancelled() {
+        match crate::timeline_cache::build_master_timeline_cache(&out_dir, &live_dir, &run_at) {
+            Ok(entry_count) => {
+                emit(&format!("[+] {} rows -> 통합 타임라인", entry_count));
+                append_current_log_lifecycle("timeline_cache_finished status=completed");
+                match seal_artifact_outputs(
+                    &out_dir,
+                    "_OVERVIEW",
+                    &["_master_timeline.cache.json".to_string()],
+                ) {
+                    Ok(sealed) => sealed_outputs.extend(sealed),
+                    Err(error) => emit(&format!("[!] 통합 타임라인 캐시 seal 실패: {error}")),
+                }
+            }
+            Err(error) => {
+                emit(&format!("[!] 통합 타임라인 캐시 생성 실패: {error}"));
+                append_current_log_lifecycle(&format!(
+                    "timeline_cache_finished status=failed error={error}"
+                ));
+            }
+        }
+    }
+
     let mut status = if cancelled() {
         "cancelled"
     } else if had_error {
@@ -1720,7 +2020,15 @@ pub fn run_host_with_log_id(
         // analysis tabs stay populated instead of blanking when one raw
         // artifact (such as a dirty SRUM database) fails.
         let outputs: Vec<SealedArtifactOutput> = sealed_outputs;
-        if outputs.is_empty() {
+        // A partial publish must carry at least one successful RAW artifact.
+        // The _OVERVIEW tables can contain default findings derived from zero
+        // evidence, so an overview-only seal (every selected source failed)
+        // would otherwise publish and report `published=true` for a run that
+        // produced nothing.
+        let has_completed_raw = outputs
+            .iter()
+            .any(|output| output.artifact != "_OVERVIEW");
+        if !has_completed_raw {
             record_published_outputs(&mut report, &[]);
             append_current_log_lifecycle(
                 "staging_discarded status=partial reason=no_completed_raw_outputs",
@@ -2015,7 +2323,8 @@ mod persistent_log_tests {
             Some("withheld")
         );
 
-        mark_artifact_no_input(&mut report, "MFT");
+        report.artifacts[1].status = "no_input".to_string();
+        report.artifacts[1].publication_status = Some("not_published".to_string());
         assert_eq!(report.artifacts[1].status, "no_input");
         assert_eq!(
             report.artifacts[1].publication_status.as_deref(),
@@ -2093,9 +2402,8 @@ mod persistent_log_tests {
             }],
             overview: Vec::new(),
         };
-        record_inputs(
-            &mut report,
-            "BrowserCache",
+        entry_record_inputs(
+            &mut report.artifacts[0],
             &[PathBuf::from("/evidence/Cache/index")],
         );
         let artifact = &report.artifacts[0];
@@ -2147,14 +2455,15 @@ mod persistent_log_tests {
     }
 
     #[test]
-    fn registry_and_srum_source_failures_mark_report_host_and_log_as_partial() {
+    fn corrupted_registry_and_srum_sources_are_skipped_and_run_completes() {
         let _serial = PIPELINE_LOG_TEST_LOCK.lock().unwrap();
         let root = temporary_directory("source-errors");
         let cases_dir = root.join("cases");
         let target_dir = root.join("target");
         std::fs::create_dir_all(&target_dir).unwrap();
         // The filename makes it a Registry candidate; the content is not a
-        // hive, exercising a per-source parse error without aborting the run.
+        // hive. A corrupted source is skipped — it must not fail the artifact
+        // or discard sibling results (파싱 실패 == 손상 아티팩트).
         std::fs::write(target_dir.join("SOFTWARE"), b"not a registry hive").unwrap();
         std::fs::write(target_dir.join("SRUDB.dat"), b"not an ESE database").unwrap();
         let case = case_store::create_case("case", "2026-08-23 01:02:03", &cases_dir).unwrap();
@@ -2171,11 +2480,8 @@ mod persistent_log_tests {
         only.insert("SRUM".to_string());
         let run_id = "source-errors";
 
-        let result = run_host_with_log_id(&case.id, &host.id, &cases_dir, Some(only), Some(run_id));
-        assert!(
-            result.is_err(),
-            "failed artifacts must produce a nonzero worker exit"
-        );
+        run_host_with_log_id(&case.id, &host.id, &cases_dir, Some(only), Some(run_id))
+            .expect("skipped corrupted sources must not fail the run");
 
         let host_dir = case_store::host_dir(&cases_dir, &case.id, &host.id);
         let report: serde_json::Value =
@@ -2183,29 +2489,32 @@ mod persistent_log_tests {
                 .unwrap();
         let artifacts = report["artifacts"].as_array().expect("artifact report");
         for artifact in ["Registry", "SRUM"] {
-            assert!(
-                artifacts
-                    .iter()
-                    .any(|entry| { entry["name"] == artifact && entry["status"] == "failed" }),
-                "{artifact} source failure must make the artifact fail"
+            let entry = artifacts
+                .iter()
+                .find(|entry| entry["name"] == artifact)
+                .expect("artifact entry");
+            assert_eq!(
+                entry["status"], "completed",
+                "{artifact}: a skipped corrupted source completes with no output"
             );
+            assert!(entry.get("outputs").is_none() || entry["outputs"].as_array().unwrap().is_empty());
         }
+        // The skipped hive stays visible in the per-hive report data.
         assert!(report["registryHives"]
             .as_array()
-            .is_some_and(|hives| hives.iter().any(|hive| hive["status"] == "failed")));
+            .is_some_and(|hives| hives.iter().any(|hive| hive["status"] == "skipped_corrupted")));
+        assert_eq!(report["status"], "ok");
         assert_eq!(
             case_store::load_host(&case.id, &host.id, &cases_dir)
                 .unwrap()
                 .last_run_status
                 .as_deref(),
-            Some("partial")
+            Some("ok")
         );
-        assert_eq!(report["status"], "partial");
-        assert_eq!(report["published"], false);
         let log = std::fs::read_to_string(parse_run_log_path(&host_dir, run_id)).unwrap();
-        assert!(log.contains("artifact_finished name=Registry status=failed"));
-        assert!(log.contains("artifact_finished name=SRUM status=failed"));
-        assert!(log.contains("run_finished status=partial"));
+        assert!(log.contains("artifact_finished name=Registry status=completed"));
+        assert!(log.contains("artifact_finished name=SRUM status=completed"));
+        assert!(log.contains("run_finished status=ok"));
         let _ = std::fs::remove_dir_all(root);
     }
 }

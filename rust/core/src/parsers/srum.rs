@@ -10,18 +10,12 @@ use std::path::Path;
 use anyhow::Result;
 use libesedb::{EseDb, Value};
 
+use crate::hex::hex_lower;
 use crate::sqlite::{Row, StreamWriter};
 use crate::time::fmt_ole;
 
 pub const SRUM_PREFIX: &[&str] = &["timestamp", "app", "user", "AutoIncId", "AppId", "UserId"];
 
-fn hex_lower(b: &[u8]) -> String {
-    let mut s = String::with_capacity(b.len() * 2);
-    for x in b {
-        s.push_str(&format!("{:02x}", x));
-    }
-    s
-}
 
 /// A binary SID -> "S-1-5-..." (matches the Python _format_sid).
 fn format_sid(data: &[u8]) -> String {
@@ -79,7 +73,39 @@ fn render(v: &Value) -> String {
             hex_lower(b)
         }
         Value::Text(s) | Value::LargeText(s) => s.trim_end_matches('\u{0}').to_string(),
+        // Long/Multi 값은 레코드 수준에서 별도 API로 조회한다(render_record_value).
         Value::Long | Value::Multi => String::new(),
+    }
+}
+
+/// 레코드의 한 컬럼을 렌더링한다. ESE long value(행 밖에 저장되는 큰 텍스트/
+/// 바이너리)와 multi value는 `rec.value()`가 자리표시자만 돌려주므로, 전용
+/// API로 실제 내용을 가져온다 — 그냥 render()만 쓰면 해당 셀이 통째로
+/// 비어(누락) 나온다.
+fn render_record_value(rec: &libesedb::Record, entry: i32, v: &Value) -> String {
+    match v {
+        Value::Long => match rec.long(entry) {
+            Ok(lv) => match lv.variant() {
+                Value::Text(_) | Value::LargeText(_) => lv
+                    .utf8()
+                    .map(|s| s.trim_end_matches('\u{0}').to_string())
+                    .unwrap_or_default(),
+                _ => hex_lower(&lv.vec().unwrap_or_default()),
+            },
+            Err(_) => String::new(),
+        },
+        Value::Multi => match rec.multi(entry) {
+            Ok(mv) => match mv.iter_values() {
+                Ok(values) => values
+                    .filter_map(|value| value.ok())
+                    .map(|value| render(&value))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                Err(_) => String::new(),
+            },
+            Err(_) => String::new(),
+        },
+        other => render(other),
     }
 }
 
@@ -136,14 +162,23 @@ fn build_id_map(db: &EseDb) -> HashMap<i64, String> {
             let id_type = it.and_then(|i| rec.value(i).ok()).and_then(|v| as_int(&v));
             let blob = rec.value(ib).ok();
             if let (Some(idx), Some(v)) = (idx, blob) {
-                let bytes: &[u8] = match &v {
-                    Value::Binary(b) | Value::LargeBinary(b) | Value::SuperLarge(b) => b,
+                let bytes: Vec<u8> = match &v {
+                    Value::Binary(b) | Value::LargeBinary(b) | Value::SuperLarge(b) => b.clone(),
+                    // 긴 경로/이름은 long value로 저장된다 — 건너뛰면 해당
+                    // app/user 매핑이 통째로 비게 되므로 실제 바이트를 조회한다.
+                    Value::Long => match rec.long(ib) {
+                        Ok(lv) => lv.vec().unwrap_or_default(),
+                        Err(_) => continue,
+                    },
                     _ => continue,
                 };
+                if bytes.is_empty() {
+                    continue;
+                }
                 let s = if id_type == Some(3) {
-                    format_sid(bytes)
+                    format_sid(&bytes)
                 } else {
-                    utf16le(bytes)
+                    utf16le(&bytes)
                 };
                 map.insert(idx, s);
             }
@@ -198,7 +233,7 @@ fn dump_table_stream(
             } else {
                 name
             };
-            row.insert(key.into(), render(&v));
+            row.insert(key.into(), render_record_value(&rec, i as i32, &v));
         }
         if let Some(a) = app_id {
             row.insert("app".into(), id_map.get(&a).cloned().unwrap_or_default());
@@ -234,7 +269,16 @@ pub fn parse_srum_stream(path: &Path, out_db: &Path) -> Result<Vec<(String, usiz
             .filter_map(|c| c.ok())
             .filter_map(|c| c.name().ok())
             .collect();
-        let name = friendly_name(&gname, &cols);
+        // 시그니처가 같은 테이블이 둘일 수 있다(예: EnergyUsage와 장기 집계인
+        // {GUID}LT). 같은 출력 이름을 쓰면 뒤 테이블이 앞 테이블을 DROP하고
+        // 덮어써 행이 유실되므로 이름을 반드시 구분한다.
+        let mut name = friendly_name(&gname, &cols);
+        if gname.ends_with("LT") {
+            name.push_str("LT");
+        }
+        while out.iter().any(|(existing, _)| *existing == name) {
+            name.push('_');
+        }
         let n = dump_table_stream(&table, &id_map, &source, out_db, &name)?;
         out.push((name, n));
     }

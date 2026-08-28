@@ -1,4 +1,6 @@
 "use client";
+import FilterAltOutlinedIcon from "@mui/icons-material/FilterAltOutlined";
+import CheckIcon from "@mui/icons-material/Check";
 
 import { useEffect, useMemo, useState } from "react";
 import KeyboardArrowDownIcon from "@mui/icons-material/KeyboardArrowDown";
@@ -6,7 +8,6 @@ import KeyboardArrowRightIcon from "@mui/icons-material/KeyboardArrowRight";
 import SearchIcon from "@mui/icons-material/Search";
 import AccountTreeIcon from "@mui/icons-material/AccountTree";
 import BookmarkBorderIcon from "@mui/icons-material/BookmarkBorder";
-import DashboardOutlinedIcon from "@mui/icons-material/DashboardOutlined";
 import TimelineIcon from "@mui/icons-material/Timeline";
 import InfoOutlinedIcon from "@mui/icons-material/InfoOutlined";
 import FolderOpenOutlinedIcon from "@mui/icons-material/FolderOpenOutlined";
@@ -18,6 +19,7 @@ import DnsOutlinedIcon from "@mui/icons-material/DnsOutlined";
 import TaskOutlinedIcon from "@mui/icons-material/TaskOutlined";
 import LanguageOutlinedIcon from "@mui/icons-material/LanguageOutlined";
 import PhotoLibraryOutlinedIcon from "@mui/icons-material/PhotoLibraryOutlined";
+import ReportProblemOutlinedIcon from "@mui/icons-material/ReportProblemOutlined";
 import type { Case, Host, CategoryEntry, ResultFileEntry } from "@/lib/types";
 import { EMPTY_TIME_RANGE, rangeActive, type TimeRange } from "@/lib/timeRange";
 import DateTimeInput from "./DateTimeInput";
@@ -277,15 +279,23 @@ interface CategoryNodeProps {
   pinned?: boolean;
   hideHeader?: boolean;
   onNavigate?: (targetFile: string, targetColumn: string, value: string) => void;
+  /** 이 파일 이름은 목록에서 숨긴다(고정 항목으로 승격된 경우). */
+  hideFileName?: string;
+  /** 이미 조회된 파일 목록 — 있으면 다시 조회하지 않는다(비싼 COUNT 절약). */
+  preloadedFiles?: ResultFileEntry[];
 }
 
-function CategoryNode({ category, selectedFile, onSelectFile, displayName, pinned, hideHeader, onNavigate }: CategoryNodeProps) {
+function CategoryNode({ category, selectedFile, onSelectFile, displayName, pinned, hideHeader, hideFileName, preloadedFiles, onNavigate }: CategoryNodeProps) {
   const [expanded, setExpanded] = useState(false);
   const [files, setFiles] = useState<ResultFileEntry[] | null>(null);
 
   useEffect(() => {
+    if (preloadedFiles) {
+      setFiles(preloadedFiles);
+      return;
+    }
     window.api.listResultFiles(category.fullPath).then(setFiles);
-  }, [category.fullPath]);
+  }, [category.fullPath, preloadedFiles]);
 
   // Group the per-table entries back by their source file, so one .sqlite is
   // one node (expandable when it holds several tables).
@@ -293,6 +303,7 @@ function CategoryNode({ category, selectedFile, onSelectFile, displayName, pinne
     if (!files) return null;
     const map = new Map<string, ResultFileEntry[]>();
     for (const file of files) {
+      if (hideFileName && file.name === hideFileName) continue;
       if (!map.has(file.fileName)) map.set(file.fileName, []);
       map.get(file.fileName)!.push(file);
     }
@@ -408,12 +419,12 @@ interface SidebarProps {
   activeHost: Host;
   onSelectHost: (h: Host) => void;
   onBackToHosts: () => void;
-  onRefresh: () => void;
   categories: CategoryEntry[];
   selectedFile: ResultFileEntry | null;
   onSelectFile: (file: ResultFileEntry) => void;
   activeVirtualTab: "timeline" | "bookmarks" | "connections" | "search" | null;
-  onSelectDashboard: () => void;
+  /** 호스트 오픈 시 한 번 조회한 _OVERVIEW 파일 목록(비싼 COUNT 포함) 공유. */
+  overviewFiles?: ResultFileEntry[] | null;
   onSelectTimeline: () => void;
   onSelectBookmarks: () => void;
   onSelectConnections: () => void;
@@ -429,12 +440,11 @@ export default function Sidebar({
   activeHost,
   onSelectHost,
   onBackToHosts,
-  onRefresh,
   categories,
   selectedFile,
   onSelectFile,
   activeVirtualTab,
-  onSelectDashboard,
+  overviewFiles,
   onSelectTimeline,
   onSelectBookmarks,
   onSelectConnections,
@@ -447,7 +457,45 @@ export default function Sidebar({
   const [rawDataExpanded, setRawDataExpanded] = useState(false);
   const hasTimeRange = rangeActive(timeRange);
   const overviewCategory = categories.find((c) => c.name === "_OVERVIEW");
-  const rawCategories = categories.filter((c) => c.name !== "_OVERVIEW");
+  // 호스트 정보(TargetInfo)는 호스트 분석 최상단 고정 항목으로 승격 —
+  // 종합 분석 목록에서는 숨겨 중복 표시를 피한다.
+  const [fetchedTargetInfo, setFetchedTargetInfo] = useState<ResultFileEntry | null>(null);
+  useEffect(() => {
+    if (overviewFiles || !overviewCategory) {
+      setFetchedTargetInfo(null);
+      return;
+    }
+    let cancelled = false;
+    window.api.listResultFiles(overviewCategory.fullPath).then((files) => {
+      if (!cancelled) setFetchedTargetInfo(files.find((file) => file.name === "TargetInfo") ?? null);
+    });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [overviewFiles, overviewCategory?.fullPath]);
+  const targetInfoEntry = overviewFiles
+    ? overviewFiles.find((file) => file.name === "TargetInfo") ?? null
+    : fetchedTargetInfo;
+  // WER(오류 보고)은 전용 뷰가 있는 분석 항목이라 호스트 분석 목록으로 승격 —
+  // 원본 데이터 목록에서는 빼서 중복 표시를 피한다.
+  const werCategory = categories.find((c) => c.name === "WER");
+  const [werEntry, setWerEntry] = useState<ResultFileEntry | null>(null);
+  useEffect(() => {
+    if (!werCategory) {
+      setWerEntry(null);
+      return;
+    }
+    let cancelled = false;
+    window.api.listResultFiles(werCategory.fullPath).then((files) => {
+      if (!cancelled) setWerEntry(files.find((file) => file.name === "WER_Reports") ?? files[0] ?? null);
+    });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [werCategory?.fullPath]);
+  const rawCategories = categories.filter((c) => c.name !== "_OVERVIEW" && c.name !== "WER");
 
   // Every artifact that ran, mapped to its category, in run order — so the
   // "원본 데이터" list is 1:1 with the run list. Categories with real output
@@ -459,7 +507,7 @@ export default function Sidebar({
   const seenNames = new Set<string>();
   for (const artifact of activeHost.artifactsRun ?? []) {
     const cat = categoryForArtifact(artifact);
-    if (cat === "_OVERVIEW" || seenNames.has(cat)) continue;
+    if (cat === "_OVERVIEW" || cat === "WER" || seenNames.has(cat)) continue;
     seenNames.add(cat);
     orderedNames.push(cat);
   }
@@ -482,72 +530,49 @@ export default function Sidebar({
       <div style={{ padding: 12, borderBottom: "1px solid var(--border)" }}>
         {/* Current host control. The internal session case is intentionally not shown. */}
         <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 8, fontSize: 11.5 }}>
-          <button onClick={onBackToHosts} title="호스트 목록" style={{ background: "transparent", border: "none", color: "var(--accent)", cursor: "pointer", fontWeight: 600, padding: 0 }}>
+          <button className="nm-btn" onClick={onBackToHosts} title="호스트 목록" style={{ background: "var(--bg-elevated)", border: "1px solid var(--border)", color: "var(--accent)", cursor: "pointer", fontWeight: 600, fontSize: 11, padding: "3px 10px", borderRadius: "var(--radius-md)" }}>
             호스트 등록
-          </button>
-          <button onClick={onRefresh} title="케이스·호스트·분석 결과를 다시 불러옵니다" style={{ marginLeft: "auto", background: "var(--bg-elevated)", border: "1px solid var(--border)", color: "var(--text-dim)", borderRadius: "var(--radius-sm)", cursor: "pointer", fontSize: 11, padding: "3px 7px" }}>
-            새로고침
           </button>
         </div>
         {/* host selector — switch between machines in this case */}
-        <div>
-          <select
-            value={activeHost.id}
-            onChange={(e) => {
-              const found = activeCase.hosts.find((h) => h.id === e.target.value);
-              if (found) onSelectHost(found);
-            }}
-            style={{
-              width: "100%",
-              padding: "7px 10px",
-              background: "var(--bg-input)",
-              color: "var(--text)",
-              border: "1px solid var(--border)",
-              borderRadius: "var(--radius-md)",
-              appearance: "none",
-              cursor: "pointer",
-              fontWeight: 600,
-            }}
-          >
-            {activeCase.hosts.map((h) => (
-              <option key={h.id} value={h.id}>
-                {h.name}
-              </option>
-            ))}
-          </select>
-        </div>
-        <div style={{ marginTop: 8, fontSize: 11, color: "var(--text-faint)" }}>
-          {activeHost.lastRunAt ? `마지막 실행: ${activeHost.lastRunAt}` : "아직 파싱되지 않음"}
-        </div>
-        {(
-          <div style={{ marginTop: 10 }}>
-            <div className="sidebar-time-range-head" style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) 62px", alignItems: "center", minHeight: 24, gap: 6, marginBottom: 5 }}>
-              <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 10.5, fontWeight: 700, color: "var(--text-faint)", textTransform: "uppercase", letterSpacing: 0.6 }}>
-                기간 필터 (사고 시점)
-              </span>
-              <span style={{ display: "flex", justifyContent: "flex-end", minWidth: 0 }}>
-                {hasTimeRange && <button type="button" onClick={() => onTimeRangeChange(EMPTY_TIME_RANGE)} title="기간 초기화" aria-label="기간 초기화" style={{ minWidth: 42, padding: 0, fontSize: 10.5, background: "transparent", border: "none", color: "var(--accent)", cursor: "pointer", fontWeight: 600 }}>초기화</button>}
-              </span>
-            </div>
-            <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-              <DateTimeInput
-                value={timeRange.start}
-                onChange={(v) => onTimeRangeChange({ ...timeRange, start: v })}
-                style={timeInputStyle}
-                ariaLabel="시작 시각"
-                placeholder="시작 (YYYY-MM-DD HH:mm:ss)"
-              />
-              <DateTimeInput
-                value={timeRange.end}
-                onChange={(v) => onTimeRangeChange({ ...timeRange, end: v })}
-                style={timeInputStyle}
-                ariaLabel="종료 시각"
-                placeholder="종료 (YYYY-MM-DD HH:mm:ss)"
-              />
-            </div>
-            <div aria-live={hasTimeRange ? "polite" : undefined} aria-hidden={!hasTimeRange} style={{ minHeight: 16, marginTop: 5, fontSize: 10.5, color: "var(--accent)" }}>{hasTimeRange ? "이 기간으로 모든 데이터를 거릅니다" : null}</div>
+        <HostPicker hosts={activeCase.hosts} activeHost={activeHost} onSelectHost={onSelectHost} />
+        <div
+          className="sidebar-time-range-head"
+          style={{ marginTop: 10, padding: "8px 9px 9px", background: "var(--bg-elevated)", border: `1px solid ${hasTimeRange ? "color-mix(in srgb, var(--accent) 48%, var(--border))" : "var(--border)"}`, borderRadius: "var(--radius-md)" }}
+        >
+          <div style={{ display: "flex", alignItems: "center", gap: 6, minHeight: 22, marginBottom: 7 }}>
+            <FilterAltOutlinedIcon sx={{ fontSize: 15, color: hasTimeRange ? "var(--accent)" : "var(--text-faint)" }} />
+            <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 11, fontWeight: 700, letterSpacing: 0.4, color: hasTimeRange ? "var(--accent)" : "var(--text-dim)" }}>
+              기간 필터
+            </span>
+            {hasTimeRange && (
+              <button type="button" className="nm-btn" onClick={() => onTimeRangeChange(EMPTY_TIME_RANGE)} title="기간 초기화" aria-label="기간 초기화" style={{ padding: "2px 9px", fontSize: 10.5, background: "var(--bg-input)", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", color: "var(--accent)", cursor: "pointer", fontWeight: 650 }}>
+                초기화
+              </button>
+            )}
           </div>
-        )}
+          <div style={{ display: "grid", gridTemplateColumns: "30px minmax(0, 1fr)", alignItems: "center", rowGap: 5, columnGap: 6 }}>
+            <span style={{ fontSize: 10.5, fontWeight: 650, color: "var(--text-faint)" }}>시작</span>
+            <DateTimeInput
+              value={timeRange.start}
+              onChange={(v) => onTimeRangeChange({ ...timeRange, start: v })}
+              style={timeInputStyle}
+              ariaLabel="시작 시각"
+              placeholder="YYYY-MM-DD HH:mm:ss"
+            />
+            <span style={{ fontSize: 10.5, fontWeight: 650, color: "var(--text-faint)" }}>종료</span>
+            <DateTimeInput
+              value={timeRange.end}
+              onChange={(v) => onTimeRangeChange({ ...timeRange, end: v })}
+              style={timeInputStyle}
+              ariaLabel="종료 시각"
+              placeholder="YYYY-MM-DD HH:mm:ss"
+            />
+          </div>
+          {hasTimeRange && (
+            <div aria-live="polite" style={{ marginTop: 7, fontSize: 10.5, fontWeight: 600, color: "var(--accent)" }}>모든 보기에 적용 중</div>
+          )}
+        </div>
       </div>
       <div style={{ overflowY: "auto", flex: 1 }}>
         {categories.length === 0 && (
@@ -584,12 +609,14 @@ export default function Sidebar({
           {/* 호스트 분석 — the currently open host */}
           <div style={{ borderBottom: "1px solid var(--border-subtle)" }}>
             <div style={{ padding: "12px 14px 6px", fontSize: 11.5, fontWeight: 750, letterSpacing: 0.6, color: "var(--text-faint)", textTransform: "uppercase" }}>호스트 분석</div>
-            <PinnedNavRow
-              icon={<DashboardOutlinedIcon sx={{ fontSize: 19 }} />}
-              label="대시보드"
-              selected={!activeVirtualTab && !selectedFile}
-              onClick={onSelectDashboard}
-            />
+            {targetInfoEntry && (
+              <PinnedNavRow
+                icon={<InfoOutlinedIcon sx={{ fontSize: 19 }} />}
+                label="호스트 정보"
+                selected={sameEntry(selectedFile, targetInfoEntry)}
+                onClick={() => onSelectFile(targetInfoEntry)}
+              />
+            )}
             <PinnedNavRow
               icon={<TimelineIcon sx={{ fontSize: 19 }} />}
               label="통합 타임라인"
@@ -601,8 +628,18 @@ export default function Sidebar({
                 category={overviewCategory}
                 pinned
                 hideHeader
+                hideFileName="TargetInfo"
+                preloadedFiles={overviewFiles ?? undefined}
                 selectedFile={selectedFile}
                 onSelectFile={onSelectFile}
+              />
+            )}
+            {werEntry && (
+              <PinnedNavRow
+                icon={<ReportProblemOutlinedIcon sx={{ fontSize: 19 }} />}
+                label="오류 보고 (WER)"
+                selected={sameEntry(selectedFile, werEntry)}
+                onClick={() => onSelectFile(werEntry)}
               />
             )}
           </div>
@@ -632,3 +669,51 @@ export default function Sidebar({
     </div>
   );
 }
+
+/// 케이스 내 호스트 전환 드롭다운 — OS 기본 select 대신 앱 스타일 패널.
+function HostPicker({ hosts, activeHost, onSelectHost }: { hosts: Host[]; activeHost: Host; onSelectHost: (host: Host) => void }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div style={{ position: "relative" }}>
+      <button
+        type="button"
+        className="nm-btn"
+        aria-expanded={open}
+        aria-label="호스트 전환"
+        onClick={() => setOpen((value) => !value)}
+        style={{ width: "100%", display: "flex", alignItems: "center", gap: 8, minHeight: 34, padding: "6px 10px", background: "var(--bg-input)", color: "var(--text)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", cursor: "pointer", fontWeight: 600, fontSize: 13, textAlign: "left" }}
+      >
+        <span aria-hidden="true" style={{ width: 7, height: 7, borderRadius: "50%", flexShrink: 0, background: activeHost.lastRunStatus === "ok" ? "var(--success)" : activeHost.lastRunStatus ? "var(--warning)" : "var(--text-faint)" }} />
+        <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{activeHost.name}</span>
+        <KeyboardArrowDownIcon sx={{ fontSize: 17, color: "var(--text-faint)", flexShrink: 0, transform: open ? "rotate(180deg)" : "none", transition: "transform .12s ease" }} />
+      </button>
+      {open && (
+        <>
+          <div onClick={() => setOpen(false)} style={{ position: "fixed", inset: 0, zIndex: 60 }} />
+          <div role="listbox" aria-label="호스트 목록" style={{ position: "absolute", top: "calc(100% + 6px)", left: 0, right: 0, zIndex: 61, maxHeight: 340, overflowY: "auto", background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", boxShadow: "var(--shadow-panel)", padding: 5 }}>
+            {hosts.map((host) => {
+              const current = host.id === activeHost.id;
+              return (
+                <button
+                  key={host.id}
+                  type="button"
+                  role="option"
+                  aria-selected={current}
+                  onClick={() => { setOpen(false); if (!current) onSelectHost(host); }}
+                  style={{ width: "100%", display: "flex", alignItems: "center", gap: 8, minHeight: 34, padding: "5px 9px", background: current ? "var(--accent-subtle)" : "transparent", border: "none", borderRadius: "var(--radius-sm)", color: current ? "var(--accent)" : "var(--text)", cursor: "pointer", fontSize: 12.5, fontWeight: current ? 700 : 550, textAlign: "left" }}
+                  onMouseEnter={(event) => { if (!current) event.currentTarget.style.background = "var(--bg-hover)"; }}
+                  onMouseLeave={(event) => { if (!current) event.currentTarget.style.background = "transparent"; }}
+                >
+                  <span aria-hidden="true" style={{ width: 6, height: 6, borderRadius: "50%", flexShrink: 0, background: host.lastRunStatus === "ok" ? "var(--success)" : host.lastRunStatus ? "var(--warning)" : "var(--text-faint)" }} />
+                  <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{host.name}</span>
+                  {current && <CheckIcon sx={{ fontSize: 15, flexShrink: 0 }} />}
+                </button>
+              );
+            })}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+

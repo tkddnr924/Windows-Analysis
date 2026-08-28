@@ -25,7 +25,7 @@ use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use tauri::{AppHandle, Emitter, LogicalSize, Manager, PhysicalPosition};
+use tauri::{AppHandle, Emitter, Manager};
 use url::Url;
 use wina_core::sqlite::write_table;
 use wina_core::{case_store, overview, pipeline};
@@ -101,54 +101,6 @@ struct Case {
 struct ListCasesResult {
     cases: Vec<Case>,
     error: Option<String>,
-}
-
-/// The case and host setup screens need a focused form factor, while artifact
-/// analysis needs enough width for the navigation tree and evidence table.
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-enum WindowLayout {
-    Setup,
-    Analysis,
-}
-
-#[tauri::command]
-fn set_window_layout(app: AppHandle, layout: WindowLayout) -> Result<(), String> {
-    let window = app
-        .get_webview_window("main")
-        .ok_or_else(|| "main window is unavailable".to_owned())?;
-    let (width, height, center) = match layout {
-        WindowLayout::Setup => (1080.0, 760.0, true),
-        WindowLayout::Analysis => (1680.0, 1020.0, true),
-    };
-    window
-        .set_size(LogicalSize::new(width, height))
-        .map_err(|error| format!("failed to resize main window: {error}"))?;
-    if center {
-        // On macOS, `center()` immediately after `set_size()` can still use
-        // the previous (compact) geometry. Center the requested analysis size
-        // directly in the active monitor instead.
-        if let Some(monitor) = window
-            .current_monitor()
-            .map_err(|error| format!("failed to read current monitor: {error}"))?
-        {
-            let scale = monitor.scale_factor();
-            let requested_width = (width * scale).round() as i32;
-            let requested_height = (height * scale).round() as i32;
-            let monitor_size = monitor.size();
-            let monitor_position = monitor.position();
-            let x = monitor_position.x + (monitor_size.width as i32 - requested_width) / 2;
-            let y = monitor_position.y + (monitor_size.height as i32 - requested_height) / 2;
-            window
-                .set_position(PhysicalPosition::new(x, y))
-                .map_err(|error| format!("failed to position main window: {error}"))?;
-        } else {
-            window
-                .center()
-                .map_err(|error| format!("failed to center main window: {error}"))?;
-        }
-    }
-    Ok(())
 }
 
 // --- wina-core mapping (add the frontend's `dir` field) --------------------
@@ -472,7 +424,7 @@ fn delete_host(case_id: String, host_id: String) -> bool {
 }
 
 fn delete_host_dir_and_bookmarks(case_dir: &Path, host_id: &str) -> bool {
-    let target = case_dir.join(&host_id);
+    let target = case_dir.join(host_id);
     if !target.exists() || std::fs::remove_dir_all(&target).is_err() {
         return false;
     }
@@ -481,21 +433,21 @@ fn delete_host_dir_and_bookmarks(case_dir: &Path, host_id: &str) -> bool {
     // rows live under a host directory. Delete only annotations tied to the removed host
     // after its output directory has been removed. `hostName` is deliberately
     // not used: several registered hosts can share a display name.
-    let bookmarks = match read_bookmarks_path(&case_dir) {
+    let bookmarks = match read_bookmarks_path(case_dir) {
         Ok(bookmarks) => bookmarks,
         Err(_) => return false,
     };
     let bookmark_count = bookmarks.len();
     let retained: Vec<Value> = bookmarks
         .into_iter()
-        .filter(|bookmark| !bookmark_belongs_to_host(bookmark, &host_id, &target))
+        .filter(|bookmark| !bookmark_belongs_to_host(bookmark, host_id, &target))
         .collect();
     if retained.len() != bookmark_count {
         // The host directory has already been removed, so report a failed
         // cleanup instead of pretending the case-level annotations were
         // persisted. `list_bookmarks` will retry the safely attributable
         // orphan cleanup on the next load.
-        if write_bookmarks_path(&case_dir, &retained).is_err() {
+        if write_bookmarks_path(case_dir, &retained).is_err() {
             return false;
         }
     }
@@ -4004,7 +3956,7 @@ fn shellbag_references(host_dir: &str) -> Vec<PathReference> {
 /// Decode a lowercase/uppercase hex string to bytes ("" or odd length -> empty).
 fn unhex(s: &str) -> Vec<u8> {
     let b = s.as_bytes();
-    if b.len() % 2 != 0 {
+    if !b.len().is_multiple_of(2) {
         return Vec::new();
     }
     let hv = |c: u8| -> Option<u8> {
@@ -5823,7 +5775,6 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .manage(PipelineState::default())
         .invoke_handler(tauri::generate_handler![
-            set_window_layout,
             list_cases,
             create_case,
             create_host,

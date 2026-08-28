@@ -1,4 +1,5 @@
 "use client";
+import AccountFilterChips from "@/components/AccountFilterChips";
 
 import { useMemo, useState } from "react";
 import BookmarkBorderOutlinedIcon from "@mui/icons-material/BookmarkBorderOutlined";
@@ -11,6 +12,7 @@ import { getArtifactView } from "@/lib/artifactViews";
 import { inRange, EMPTY_TIME_RANGE, type TimeRange } from "@/lib/timeRange";
 import RowDetailPanel from "./RowDetailPanel";
 import { resolveAccountDisplay, type AccountDirectory } from "@/lib/accountIdentity";
+import { bareAccount } from "@/lib/viewShared";
 
 const TABLE = "SmbHistory";
 const RESULT_COLOR: Record<string, string> = {
@@ -40,11 +42,6 @@ interface Peer {
   events: Row[];
 }
 
-function bareAccount(name: string): string {
-  if (!name) return "";
-  const tail = name.replace(/\//g, "\\").split("\\").pop() ?? name;
-  return tail.split("@")[0].trim();
-}
 
 function timeSpan(first: string, last: string): string {
   if (!first) return "시간 정보 없음";
@@ -81,6 +78,8 @@ export default function SmbHistoryView({
 }: Props) {
   const [query, setQuery] = useState("");
   const [resultFilter, setResultFilter] = useState<ResultFilter>("all");
+  // 계정별 체크 필터 — 기본은 전체 표시, 체크 해제한 계정만 숨긴다.
+  const [hiddenAccounts, setHiddenAccounts] = useState<Set<string>>(new Set());
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [selected, setSelected] = useState<Record<string, string> | null>(null);
   const spec = getArtifactView(TABLE);
@@ -91,6 +90,7 @@ export default function SmbHistoryView({
       const timestamp = raw.timestamp ?? "";
       if (!inRange(timestamp, timeRange)) continue;
 
+      if (hiddenAccounts.has(bareAccount(raw.account ?? ""))) continue;
       const ip = raw.remote_address || "주소 정보 없음";
       const peer = byIp.get(ip) ?? {
         ip,
@@ -120,7 +120,12 @@ export default function SmbHistoryView({
     return [...byIp.values()]
       .map((peer) => ({ ...peer, events: peer.events.sort((left, right) => (left.timestamp ?? "").localeCompare(right.timestamp ?? "")) }))
       .sort((left, right) => right.attempts - left.attempts || left.ip.localeCompare(right.ip));
-  }, [data.rows, timeRange]);
+  }, [data.rows, timeRange, hiddenAccounts]);
+
+  const allAccounts = useMemo(
+    () => [...new Set((data.rows as Row[]).map((raw) => bareAccount(raw.account ?? "")))].sort((a, b) => a.localeCompare(b)),
+    [data.rows],
+  );
 
   const shownPeers = useMemo(() => {
     const needle = query.trim().toLowerCase();
@@ -161,7 +166,7 @@ export default function SmbHistoryView({
               onBlur={(event) => { event.currentTarget.style.borderColor = "var(--border)"; event.currentTarget.style.boxShadow = "none"; }}
               style={{ width: "100%", height: 31, padding: "0 31px 0 10px", fontSize: 12, fontFamily: "var(--mono)", borderRadius: "var(--radius-sm)", border: "1px solid var(--border)", color: "var(--text)", background: "var(--bg-elevated)", outline: "none" }}
             />
-            {query && <button type="button" onClick={() => setQuery("")} aria-label="검색어 지우기" style={clearButtonStyle}><CloseOutlinedIcon sx={{ fontSize: 16 }} /></button>}
+            {query && <button className="nm-btn" type="button" onClick={() => setQuery("")} aria-label="검색어 지우기" style={clearButtonStyle}><CloseOutlinedIcon sx={{ fontSize: 16 }} /></button>}
           </div>
           <div style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
             {([
@@ -173,6 +178,7 @@ export default function SmbHistoryView({
               return <button key={value} type="button" onClick={() => setResultFilter(value)} aria-pressed={active} style={{ height: 30, padding: "0 10px", fontSize: 11.5, fontWeight: active ? 700 : 550, color: active ? color : "var(--text-dim)", background: active ? `color-mix(in srgb, ${color} 13%, transparent)` : "transparent", border: `1px solid ${active ? color : "var(--border)"}`, borderRadius: "var(--radius-sm)", cursor: "pointer" }}>{label}</button>;
             })}
           </div>
+          <AccountFilterChips accounts={allAccounts} hidden={hiddenAccounts} onToggle={(account) => setHiddenAccounts((previous) => { const next = new Set(previous); if (next.has(account)) next.delete(account); else next.add(account); return next; })} onReset={() => setHiddenAccounts(new Set())} accountDirectory={accountDirectory} />
         </div>
       </header>
 
@@ -186,7 +192,7 @@ export default function SmbHistoryView({
                 type="button"
                 onClick={() => toggle(peer.ip)}
                 aria-expanded={open}
-                style={{ width: "100%", display: "grid", gridTemplateColumns: "32px minmax(140px, .8fr) minmax(150px, .9fr) minmax(210px, 1.35fr) minmax(170px, 1.05fr) minmax(118px, .7fr) 50px", gap: 8, alignItems: "center", padding: "10px 12px", color: "var(--text)", border: "none", background: "transparent", cursor: "pointer", textAlign: "left", outlineOffset: -2 }}
+                style={{ borderRadius: "var(--radius-sm)", width: "100%", display: "grid", gridTemplateColumns: "32px minmax(140px, .8fr) minmax(150px, .9fr) minmax(210px, 1.35fr) minmax(170px, 1.05fr) minmax(118px, .7fr) 50px", gap: 8, alignItems: "center", padding: "10px 12px", color: "var(--text)", border: "none", background: "transparent", cursor: "pointer", textAlign: "left", outlineOffset: -2 }}
                 onMouseEnter={(event) => { event.currentTarget.style.background = "var(--bg-hover)"; }}
                 onMouseLeave={(event) => { event.currentTarget.style.background = "transparent"; }}
               >
@@ -209,7 +215,7 @@ export default function SmbHistoryView({
                   const bookmarked = Number.isFinite(rowid) && (bookmarkedRowids?.has(rowid) ?? false);
                   const rowBackground = "transparent";
                   const resultColor = RESULT_COLOR[event.result ?? ""] ?? "var(--text-faint)";
-                  return <div key={`${rowid}-${event.timestamp}-${index}`} className={bookmarked ? "dfir-bookmarked-row" : undefined} style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) 32px", gap: 8, alignItems: "center", minHeight: 36, padding: "6px 12px 6px 44px", background: rowBackground }} onMouseEnter={(mouseEvent) => { if (!bookmarked) mouseEvent.currentTarget.style.background = "var(--bg-hover)"; }} onMouseLeave={(mouseEvent) => { if (!bookmarked) mouseEvent.currentTarget.style.background = rowBackground; }}>
+                  return <div key={`${rowid}-${event.timestamp}-${index}`} className={bookmarked ? "dfir-bookmarked-row" : undefined} style={{ borderRadius: "var(--radius-sm)", display: "grid", gridTemplateColumns: "minmax(0, 1fr) 32px", gap: 8, alignItems: "center", minHeight: 36, padding: "6px 12px 6px 44px", background: rowBackground }} onMouseEnter={(mouseEvent) => { if (!bookmarked) mouseEvent.currentTarget.style.background = "var(--bg-hover)"; }} onMouseLeave={(mouseEvent) => { if (!bookmarked) mouseEvent.currentTarget.style.background = rowBackground; }}>
                     <div role="button" tabIndex={0} onClick={() => setSelected(event as Record<string, string>)} onKeyDown={(keyboardEvent) => { if (keyboardEvent.key === "Enter" || keyboardEvent.key === " ") { keyboardEvent.preventDefault(); setSelected(event as Record<string, string>); } }} style={{ display: "grid", gridTemplateColumns: "170px 80px minmax(130px, .6fr) minmax(250px, 1.45fr) 68px", gap: 8, alignItems: "center", minWidth: 0, color: "var(--text)", cursor: "pointer", outlineOffset: 2 }}>
                       <span style={{ color: "var(--text-time)", fontFamily: "var(--mono)", fontSize: 11.5, whiteSpace: "nowrap" }}>{event.timestamp || "시간 정보 없음"}</span>
                       <span style={{ color: resultColor, fontSize: 11.5, fontWeight: 700 }}>{event.result || "정보"}</span>

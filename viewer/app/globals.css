@@ -28,9 +28,9 @@
   /* A registered analysis host is an identity, not an evidence severity. */
   --host-registered-text: #c8d3df;
 
-  --accent: #67b2ff;
-  --accent-emphasis: #287fe8;
-  --accent-subtle: rgba(103, 178, 255, 0.14);
+  --accent: #8ab4f8;
+  --accent-emphasis: #6d9eeb;
+  --accent-subtle: rgba(138, 180, 248, 0.16);
 
   /* Analyst bookmarks are a neutral silver context state, deliberately
      separate from navigation blue and warning/danger evidence colours. */
@@ -44,12 +44,12 @@
   --bookmark-border: var(--bookmark-outline);
   --bookmark-subtle: var(--bookmark-row);
 
-  --success: #3fb950;
-  --success-subtle: rgba(63, 185, 80, 0.12);
-  --warning: #d29922;
-  --warning-subtle: rgba(210, 153, 34, 0.12);
-  --danger: #f85149;
-  --danger-subtle: rgba(248, 81, 73, 0.12);
+  --success: #81c995;
+  --success-subtle: rgba(129, 201, 149, 0.14);
+  --warning: #f8d477;
+  --warning-subtle: rgba(248, 212, 119, 0.13);
+  --danger: #f28b82;
+  --danger-subtle: rgba(242, 139, 130, 0.14);
 
   /* Semantic evidence states.  Do not use arbitrary per-view colours: each
      colour has one meaning throughout the investigator workspace. */
@@ -60,9 +60,10 @@
   --tag-neutral-bg: rgba(139, 148, 158, 0.12);
   --tag-neutral-fg: #b9c2cc;
 
-  --radius-sm: 6px;
-  --radius-md: 9px;
-  --radius-lg: 14px;
+  --radius-xs: 5px;
+  --radius-sm: 8px;
+  --radius-md: 10px;
+  --radius-lg: 16px;
 
   --neu-light: rgba(103, 138, 174, 0.10);
   --neu-shadow: rgba(4, 8, 13, 0.72);
@@ -131,6 +132,7 @@ button:not(:disabled):active {
    Apply this one-level treatment to the actual row surface, not to artifact
    chips, so the evidence's own status colour remains legible. */
 .dfir-bookmarked-row {
+  border-radius: var(--radius-sm);
   /* Bookmark context is a restrained neutral-slate row tint plus a fixed
      rail. Selection and evidence modifiers below retain their own meaning. */
   background: var(--bookmark-row) !important;
@@ -334,9 +336,10 @@ input:focus, select:focus {
 .host-ledger-confirm {
   display: flex;
   align-items: center;
+  justify-content: flex-end;
   gap: 9px;
-  grid-column: 1 / -1;
   min-width: 248px;
+  white-space: nowrap;
 }
 @container (max-width: 1119px) {
   .host-ledger-heading { display: none; }
@@ -419,21 +422,23 @@ input:focus, select:focus {
 .dfir-tag {
   display: inline-flex;
   align-items: center;
+  justify-content: center;
   gap: 4px;
   min-height: 22px;
   padding: 2px 8px;
-  border: 1px solid var(--border);
-  /* Evidence/status labels are compact rectangular labels, not pills. */
-  border-radius: 2px;
-  background: var(--tag-neutral-bg);
+  /* 라벨은 아웃라인 스타일 — 채움은 버튼의 몫이다. */
+  border: 1px solid color-mix(in srgb, var(--tag-neutral-fg) 45%, var(--border));
+  border-radius: var(--radius-sm);
+  background: transparent;
   color: var(--tag-neutral-fg);
   font-size: 11px;
   font-weight: 650;
   line-height: 1;
+  text-align: center;
   white-space: nowrap;
 }
-.dfir-tag--attention { color: var(--warning); background: var(--warning-subtle); border-color: color-mix(in srgb, var(--warning) 48%, transparent); }
-.dfir-tag--critical { color: var(--danger); background: var(--danger-subtle); border-color: color-mix(in srgb, var(--danger) 48%, transparent); }
+.dfir-tag--attention { color: var(--warning); background: transparent; border-color: color-mix(in srgb, var(--warning) 55%, transparent); }
+.dfir-tag--critical { color: var(--danger); background: transparent; border-color: color-mix(in srgb, var(--danger) 55%, transparent); }
 .dfir-tag--info { color: var(--accent); background: var(--accent-subtle); border-color: color-mix(in srgb, var(--accent) 48%, transparent); }
 .dfir-section-label {
   font-size: 10.5px;
@@ -594,7 +599,7 @@ input:focus, select:focus {
 
 ::-webkit-scrollbar-thumb {
   background: #30363d;
-  border-radius: 5px;
+  border-radius: var(--radius-sm);
   border: 2px solid transparent;
   background-clip: padding-box;
 }
@@ -655,4 +660,38 @@ input:focus, select:focus {
   .ps-session-child-time { grid-area: time; }
   .ps-session-child-type { grid-area: type; text-align: right; }
   .ps-session-child-content { grid-area: content; }
+}
+
+/* --- 버튼 공통: Apple 근사 radius + 텍스트 가운데 --- */
+button {
+  border-radius: var(--radius-md);
+  text-align: center;
+}
+
+/* 실동작 버튼(채움형)에만 적용하는 은은한 neumorphism.
+   기본 상태는 살짝 떠 있고, 누르면 안으로 들어간다. 버튼 전용 — 라벨·트리
+   행에는 쓰지 않는다. */
+.nm-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  border-radius: var(--radius-md);
+  /* 상단 안쪽 하이라이트가 채움색과 무관하게 볼록감을 만든다 — 파란
+     강조 버튼처럼 밝은 채움에서도 neumorphism이 읽히게. */
+  box-shadow:
+    2px 2px 4px rgba(0, 0, 0, 0.5),
+    -1px -1px 2px rgba(255, 255, 255, 0.05),
+    inset 0 1px 0 rgba(255, 255, 255, 0.16),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.22);
+  transition: box-shadow 0.1s ease, transform 0.1s ease;
+}
+.nm-btn:active:not(:disabled) {
+  box-shadow:
+    inset 2px 2px 4px rgba(0, 0, 0, 0.5),
+    inset -1px -1px 2px rgba(255, 255, 255, 0.05);
+  transform: translateY(0.5px);
+}
+.nm-btn:disabled {
+  box-shadow: none;
 }

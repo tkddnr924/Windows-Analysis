@@ -214,11 +214,10 @@ fn parse_task(path: &Path) -> Result<Row> {
     Ok(row)
 }
 
-/// Walk `root`, parse every file whose content carries the task XML namespace.
-/// Parse tasks and retain every file whose header identifies it as a task XML
+/// Walk `root` and retain every file whose header identifies it as a task XML
 /// source. The source list is distinct from parsed rows because a valid task
 /// file can still produce zero usable fields.
-pub fn parse_tasks_with_sources(root: &Path) -> Result<(Vec<std::path::PathBuf>, Vec<Row>)> {
+pub fn task_sources(root: &Path) -> Vec<std::path::PathBuf> {
     let paths: Vec<_> = WalkDir::new(root)
         .into_iter()
         .filter_map(|e| e.ok())
@@ -227,7 +226,7 @@ pub fn parse_tasks_with_sources(root: &Path) -> Result<(Vec<std::path::PathBuf>,
         .collect();
     let utf8 = TASK_NAMESPACE.as_bytes().to_vec();
     let utf16: Vec<u8> = TASK_NAMESPACE.bytes().flat_map(|b| [b, 0]).collect();
-    let parsed: Vec<_> = paths
+    let mut sources: Vec<_> = paths
         .par_iter()
         .filter_map(|path| {
             // Read only the first 4 KB to test for the task namespace — never the
@@ -237,38 +236,48 @@ pub fn parse_tasks_with_sources(root: &Path) -> Result<(Vec<std::path::PathBuf>,
             match std::fs::File::open(path) {
                 Ok(f) => {
                     use std::io::Read;
-                    if std::io::Read::take(f, 4096).read_to_end(&mut head).is_err() {
+                    if Read::take(f, 4096).read_to_end(&mut head).is_err() {
                         return None;
                     }
                 }
                 Err(_) => return None,
             }
             let has = |needle: &[u8]| head.windows(needle.len()).any(|w| w == needle);
-            if !(has(&utf8) || has(&utf16)) {
-                return None;
-            }
-            match parse_task(path) {
-                Ok(r) => Some((path.clone(), r)),
-                Err(e) => {
-                    let mut row = Row::new();
-                    row.insert("timestamp".into(), String::new());
-                    row.insert(
-                        "task_name".into(),
-                        path.file_name()
-                            .map(|n| n.to_string_lossy().to_string())
-                            .unwrap_or_default(),
-                    );
-                    row.insert("_source_file".into(), path.to_string_lossy().to_string());
-                    row.insert("_status".into(), "unreadable_file".into());
-                    row.insert("_error".into(), e.to_string());
-                    Some((path.clone(), row))
-                }
-            }
+            (has(&utf8) || has(&utf16)).then(|| path.clone())
         })
         .collect();
-    let mut sources: Vec<_> = parsed.iter().map(|(path, _)| path.clone()).collect();
     sources.sort();
-    let rows = parsed.into_iter().map(|(_, row)| row).collect();
+    sources
+}
+
+/// Parse already-discovered task XML files (one row per file; unreadable files
+/// keep an error row so every evidence input stays represented).
+pub fn parse_tasks_from(paths: &[std::path::PathBuf]) -> Vec<Row> {
+    paths
+        .par_iter()
+        .map(|path| match parse_task(path) {
+            Ok(r) => r,
+            Err(e) => {
+                let mut row = Row::new();
+                row.insert("timestamp".into(), String::new());
+                row.insert(
+                    "task_name".into(),
+                    path.file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default(),
+                );
+                row.insert("_source_file".into(), path.to_string_lossy().to_string());
+                row.insert("_status".into(), "unreadable_file".into());
+                row.insert("_error".into(), e.to_string());
+                row
+            }
+        })
+        .collect()
+}
+
+pub fn parse_tasks_with_sources(root: &Path) -> Result<(Vec<std::path::PathBuf>, Vec<Row>)> {
+    let sources = task_sources(root);
+    let rows = parse_tasks_from(&sources);
     Ok((sources, rows))
 }
 

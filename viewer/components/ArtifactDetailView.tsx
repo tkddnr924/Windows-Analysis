@@ -1,4 +1,5 @@
 "use client";
+import PaginationControls from "@/components/PaginationControls";
 
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import AccountCircleOutlinedIcon from "@mui/icons-material/AccountCircleOutlined";
@@ -8,6 +9,8 @@ import CircularProgress from "@mui/material/CircularProgress";
 import ExpandLessOutlinedIcon from "@mui/icons-material/ExpandLessOutlined";
 import ExpandMoreOutlinedIcon from "@mui/icons-material/ExpandMoreOutlined";
 import OpenInFullOutlinedIcon from "@mui/icons-material/OpenInFullOutlined";
+import ContentCopyOutlinedIcon from "@mui/icons-material/ContentCopyOutlined";
+import CheckIcon from "@mui/icons-material/Check";
 import type { ArtifactViewSpec, DetailSectionSpec, FieldKind, FieldSpec, LinkSpec } from "@/lib/artifactViews";
 import { getArtifactView } from "@/lib/artifactViews";
 import type { CacheBodyPreview, FetchLinkedRows } from "@/lib/types";
@@ -110,12 +113,17 @@ function CodeOrJsonBlock({ raw, expandTitle }: { raw: string; expandTitle?: stri
   }
 
   const btnStyle: React.CSSProperties = {
-    fontSize: 10,
-    padding: "1px 8px",
+    display: "inline-flex",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 4,
+    minHeight: 28,
+    fontSize: 11.5,
+    padding: "3px 10px",
     background: "var(--bg-elevated)",
     color: "var(--accent)",
     border: "1px solid var(--border)",
-    borderRadius: "var(--radius-sm)",
+    borderRadius: "var(--radius-md)",
     cursor: "pointer",
   };
 
@@ -123,19 +131,19 @@ function CodeOrJsonBlock({ raw, expandTitle }: { raw: string; expandTitle?: stri
     <div>
       <div style={{ display: "flex", justifyContent: "flex-end", gap: 6, marginBottom: 4 }}>
         {isJson && (
-          <button
+          <button className="nm-btn"
             onClick={() => setBeautified((b) => !b)}
             title={beautified ? "원본(압축) 보기" : "보기 좋게 정렬"}
             style={btnStyle}
           >
-            {beautified ? "{ } 원본" : "{ } 정렬"}
+            {"{ }"}
           </button>
         )}
-        <button onClick={copy} style={{ ...btnStyle, color: copyError ? "var(--danger)" : btnStyle.color }}>
-          {copyError ? "복사 실패" : copied ? "복사됨" : "복사"}
+        <button className="nm-btn" onClick={copy} title={copyError ? "복사 실패" : copied ? "복사됨" : "복사"} aria-label={copyError ? "복사 실패" : copied ? "복사됨" : "값 복사"} style={{ ...btnStyle, width: 32, padding: 0, color: copyError ? "var(--danger)" : "var(--text-dim)" }}>
+          {copied ? <CheckIcon sx={{ fontSize: 16, color: "var(--success)" }} /> : <ContentCopyOutlinedIcon sx={{ fontSize: 15 }} />}
         </button>
-        <button onClick={() => setExpanded(true)} title="크게 보기" style={{ ...btnStyle, display: "inline-flex", alignItems: "center", gap: 3 }}>
-          <OpenInFullOutlinedIcon aria-hidden="true" sx={{ fontSize: 12 }} /> 확장
+        <button className="nm-btn" onClick={() => setExpanded(true)} title="크게 보기" aria-label="크게 보기" style={{ ...btnStyle, width: 32, padding: 0, color: "var(--text-dim)" }}>
+          <OpenInFullOutlinedIcon aria-hidden="true" sx={{ fontSize: 15 }} />
         </button>
       </div>
       {copyError && <div role="status" style={{ marginBottom: 4, color: "var(--danger)", fontSize: 10.5 }}>클립보드에 복사하지 못했습니다.</div>}
@@ -194,20 +202,25 @@ function CopyButton({ value }: { value: string }) {
           window.setTimeout(() => setCopyError(false), 2400);
         }
       }}
+      className="nm-btn"
       title={copyError ? "복사 실패" : copied ? "복사됨" : "복사"}
       aria-label={copyError ? "복사 실패" : copied ? "복사됨" : "값 복사"}
       style={{
-        fontSize: 10,
-        padding: "1px 6px",
+        display: "inline-flex",
+        alignItems: "center",
+        justifyContent: "center",
+        width: 32,
+        height: 28,
+        padding: 0,
         background: "var(--bg-elevated)",
-        color: copyError ? "var(--danger)" : "var(--text-faint)",
+        color: copyError ? "var(--danger)" : "var(--text-dim)",
         border: "1px solid var(--border)",
-        borderRadius: "var(--radius-sm)",
+        borderRadius: "var(--radius-md)",
         cursor: "pointer",
         flexShrink: 0,
       }}
     >
-      {copyError ? "복사 실패" : copied ? "복사됨" : "복사"}
+      {copied ? <CheckIcon sx={{ fontSize: 16, color: "var(--success)" }} /> : <ContentCopyOutlinedIcon sx={{ fontSize: 15 }} />}
     </button>
   );
 }
@@ -264,7 +277,7 @@ function ByteSizeValue({ value }: { value: string }) {
       <span style={{ fontFamily: "var(--mono)", fontSize: 12.5 }}>{display}</span>
       <div role="group" aria-label="크기 단위" style={{ display: "inline-flex", gap: 2, padding: 2, background: "var(--bg-input)", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)" }}>
         {(["Bytes", "KB", "MB", "GB"] as const).map((nextUnit) => (
-          <button key={nextUnit} type="button" onClick={() => setUnit(nextUnit)} aria-pressed={unit === nextUnit} style={{ padding: "3px 6px", border: "none", borderRadius: 3, cursor: "pointer", fontSize: 10.5, fontWeight: 650, background: unit === nextUnit ? "var(--accent-subtle)" : "transparent", color: unit === nextUnit ? "var(--accent)" : "var(--text-faint)" }}>
+          <button key={nextUnit} type="button" onClick={() => setUnit(nextUnit)} aria-pressed={unit === nextUnit} style={{ padding: "3px 6px", border: "none", borderRadius: "var(--radius-sm)", cursor: "pointer", fontSize: 10.5, fontWeight: 650, background: unit === nextUnit ? "var(--accent-subtle)" : "transparent", color: unit === nextUnit ? "var(--accent)" : "var(--text-faint)" }}>
             {nextUnit}
           </button>
         ))}
@@ -461,8 +474,8 @@ function FieldRow({ field, row, onFetchLinkedRows, hostDir, accountDirectory, on
   );
 }
 
-const LINKED_ROWS_PAGE_SIZE = 100;
-const EMBEDDED_ROWS_PAGE_SIZE = 5;
+const LINKED_ROWS_PAGE_SIZE = 10;
+const EMBEDDED_ROWS_PAGE_SIZE = 10;
 
 function LinkedRowList({
   link,
@@ -523,10 +536,7 @@ function LinkPagination({
   return (
     <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, padding: "7px 10px", borderTop: "1px solid var(--border-subtle)", fontSize: 11.5, color: "var(--text-faint)" }}>
       <span>{start.toLocaleString()}–{end.toLocaleString()} / {rowCount.toLocaleString()}개</span>
-      <span style={{ display: "inline-flex", gap: 4 }}>
-        <button type="button" aria-label="이전 페이지" disabled={page === 0} onClick={(event) => { event.preventDefault(); onPageChange(page - 1); }} style={{ ...buttonStyle, cursor: page === 0 ? "default" : "pointer", opacity: page === 0 ? 0.42 : 1 }}>이전</button>
-        <button type="button" aria-label="다음 페이지" disabled={page + 1 >= totalPages} onClick={(event) => { event.preventDefault(); onPageChange(page + 1); }} style={{ ...buttonStyle, cursor: page + 1 >= totalPages ? "default" : "pointer", opacity: page + 1 >= totalPages ? 0.42 : 1 }}>다음</button>
-      </span>
+      <PaginationControls ariaLabel="연결 레코드 페이지" page={page} pageCount={totalPages} onChange={onPageChange} />
     </div>
   );
 }

@@ -370,8 +370,6 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
   WER_Reports: {
     customView: "wer",
     title: (r) => r.AppName || "(WER)",
-    subtitle: (r) => r.EventType || "",
-    badges: [{ key: "EventType", kind: "badge" }],
     priorityColumns: ["timestamp", "EventType", "AppName", "AppPath", "TargetAppId", "ReportIdentifier"],
     sections: [{ heading: "보고서", fields: [{ key: "EventType" }, { key: "AppPath" }, { key: "ReportIdentifier" }, { key: "report", kind: "json" }] }],
   },
@@ -937,6 +935,44 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
   // EventLog is now one table per source .evtx (Security, System, ...), each
   // resolved to this shared spec by resolveArtifactView() via its columns —
   // so the per-file logs still get the full catalog/tags/detail view.
+  // 원본 레지스트리 레코드 — 실행 이력·레지스트리 특이사항의 북마크가
+  // 원본 레코드로 승격되면 이 스펙으로 열린다(생 덤프 방지).
+  Registry: {
+    title: () => "Registry",
+    subtitle: (r) => r.last_write || "",
+    overviewTime: "hide",
+    priorityColumns: ["last_write", "key_path", "value_name", "value_data"],
+    sections: [
+      { heading: "레지스트리 원본 레코드", fields: [
+        { key: "last_write", label: "마지막 기록 시각" },
+        { key: "key_path", label: "키 경로", kind: "path" },
+        { key: "value_name", label: "값 이름" },
+        { key: "value_type", label: "값 유형", kind: "badge" },
+        { key: "value_data", label: "값 데이터", kind: "code" },
+        { key: "_recovery", label: "레코드 상태", kind: "badge" },
+        { key: "_source_file", label: "원본 하이브", kind: "path" },
+      ]},
+    ],
+  },
+
+  // SRUM 원본 레코드 — 실행 이력의 SRUM(첫 관찰) 항목이 승격되는 대상.
+  SRUM_ApplicationResourceUsage: {
+    title: () => "SRUM",
+    subtitle: (r) => r.timestamp || "",
+    overviewTime: "hide",
+    priorityColumns: ["timestamp", "app", "user"],
+    sections: [
+      { heading: "SRUM 애플리케이션 리소스 사용", fields: [
+        { key: "timestamp", label: "기록 시각" },
+        { key: "app", label: "애플리케이션", kind: "path" },
+        { key: "user", label: "사용자", kind: "account" },
+        { key: "ForegroundCycleTime", label: "포그라운드 CPU 사이클" },
+        { key: "BackgroundCycleTime", label: "백그라운드 CPU 사이클" },
+        { key: "_source_file", label: "원본 파일", kind: "path" },
+      ]},
+    ],
+  },
+
   EventLog_Events: {
     // Detail framing names the evidence type only. The timeline has its own
     // event title below, so EventLog's internal source table never leaks as
@@ -1063,14 +1099,19 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     timelineFields: [
       { key: "created_time", label: "LNK 생성" },
       { key: "modified_time", label: "LNK 수정" },
-      { key: "timestamp", label: "LNK 접근" },
+      { key: "timestamp", label: "마지막 사용" },
     ],
-    timelineHeading: "LNK 헤더 시간 흐름",
+    timelineHeading: "사용 시간 흐름",
     timelineField: "timestamp",
     priorityColumns: ["timestamp", "target_path", "jumplist_type", "arguments"],
     sections: [
+      { heading: "사용 기록 (DestList)", fields: [
+        { key: "timestamp", label: "마지막 사용 시각" },
+        { key: "access_count", label: "사용 횟수" },
+        { key: "hostname", label: "호스트명" },
+      ]},
       { heading: "LNK 헤더 시간", fields: [
-        { key: "timestamp", label: "LNK 헤더 접근 시각" },
+        { key: "lnk_accessed", label: "LNK 헤더 접근 시각" },
         { key: "created_time", label: "LNK 헤더 생성 시각" },
         { key: "modified_time", label: "LNK 헤더 수정 시각" },
       ]},

@@ -89,14 +89,12 @@ fn parse_index(key: &str) -> Option<(String, usize, Option<String>)> {
     let rest = &after[rb + 1..];
     let sub = if rest.is_empty() {
         None
-    } else if let Some(s) = rest.strip_prefix('.') {
-        if ident_ok(s) {
-            Some(s.to_string())
-        } else {
+    } else {
+        let s = rest.strip_prefix('.')?;
+        if !ident_ok(s) {
             return None;
         }
-    } else {
-        return None;
+        Some(s.to_string())
     };
     Some((family, idx, sub).into_tuple())
 }
@@ -233,11 +231,16 @@ pub fn wer_sources(root: &Path) -> Vec<std::path::PathBuf> {
     paths
 }
 
-pub fn parse_wer_with_sources(root: &Path) -> Result<(Vec<std::path::PathBuf>, Vec<Row>)> {
-    let paths = wer_sources(root);
+/// Parse already-discovered Report.wer files.
+pub fn parse_wer_from(paths: &[std::path::PathBuf]) -> Vec<Row> {
     // Reports are independent. Parallel decoding/parsing leaves every report
     // represented, while indexed parallel collection keeps discovery order.
-    let rows = paths.par_iter().map(|path| parse_report(path)).collect();
+    paths.par_iter().map(|path| parse_report(path)).collect()
+}
+
+pub fn parse_wer_with_sources(root: &Path) -> Result<(Vec<std::path::PathBuf>, Vec<Row>)> {
+    let paths = wer_sources(root);
+    let rows = parse_wer_from(&paths);
     Ok((paths, rows))
 }
 

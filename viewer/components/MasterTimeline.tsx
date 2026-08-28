@@ -1,7 +1,6 @@
 "use client";
 
-import { type CSSProperties, useMemo, useRef, useState } from "react";
-import { useVirtualizer } from "@tanstack/react-virtual";
+import { type CSSProperties, useEffect, useMemo, useState } from "react";
 import Checkbox from "@mui/material/Checkbox";
 import CircularProgress from "@mui/material/CircularProgress";
 import Tooltip from "@mui/material/Tooltip";
@@ -18,8 +17,10 @@ import ViewListOutlinedIcon from "@mui/icons-material/ViewListOutlined";
 import { resolveArtifactView } from "@/lib/artifactViews";
 import RowDetailPanel from "./RowDetailPanel";
 import type { AccountDirectory } from "@/lib/accountIdentity";
+import PaginationControls from "@/components/PaginationControls";
 
 const ROW_HEIGHT = 52;
+const PAGE_SIZE = 10;
 // Bookmark context stays neutral, distinct from navigation blue and from
 // severity colours used by investigative evidence.
 const BOOKMARK_TEXT = "var(--text)";
@@ -247,7 +248,7 @@ interface MasterTimelineProps {
 }
 
 export default function MasterTimeline({ entries, loading, onNavigate, onFetchLinkedRows, isBookmarked, onToggleBookmark, globalTimeRange, accountDirectory }: MasterTimelineProps) {
-  const scrollRef = useRef<HTMLDivElement>(null);
+  const [page, setPage] = useState(0);
   const [sortDir, setSortDir] = useState<"asc" | "desc">("asc");
   const [hiddenTables, setHiddenTables] = useState<Set<string>>(new Set());
   const [hiddenExecutionSources, setHiddenExecutionSources] = useState<Set<string>>(new Set());
@@ -421,12 +422,15 @@ export default function MasterTimeline({ entries, loading, onNavigate, onFetchLi
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [allRows, sortDir, hiddenTables, hiddenExecutionSources, hiddenBrowserKinds, globalActive, globalTimeRange, onlySuspicious]);
 
-  const virtualizer = useVirtualizer({
-    count: rows.length,
-    getScrollElement: () => scrollRef.current,
-    estimateSize: () => ROW_HEIGHT,
-    overscan: 15,
-  });
+  // 페이지 단위 표시(10건). 필터·정렬이 바뀌면 첫 페이지로 돌아간다.
+  const pageCount = Math.max(1, Math.ceil(rows.length / PAGE_SIZE));
+  const safePage = Math.min(page, pageCount - 1);
+  const pageRows = rows.slice(safePage * PAGE_SIZE, safePage * PAGE_SIZE + PAGE_SIZE);
+  const pageStart = rows.length === 0 ? 0 : safePage * PAGE_SIZE + 1;
+  const pageEnd = Math.min(rows.length, safePage * PAGE_SIZE + PAGE_SIZE);
+  useEffect(() => {
+    setPage(0);
+  }, [sortDir, hiddenTables, hiddenExecutionSources, hiddenBrowserKinds, globalTimeRange, onlySuspicious]);
 
   if (loading) {
     return (
@@ -454,10 +458,6 @@ export default function MasterTimeline({ entries, loading, onNavigate, onFetchLi
     );
   }
 
-  const virtualRows = virtualizer.getVirtualItems();
-  const totalHeight = virtualizer.getTotalSize();
-  const paddingTop = virtualRows.length > 0 ? virtualRows[0].start : 0;
-  const paddingBottom = virtualRows.length > 0 ? totalHeight - virtualRows[virtualRows.length - 1].end : 0;
   const hasArtifactFilters = hiddenTables.size > 0 || hiddenExecutionSources.size > 0 || hiddenBrowserKinds.size > 0;
 
   return (
@@ -466,14 +466,14 @@ export default function MasterTimeline({ entries, loading, onNavigate, onFetchLi
         <TimelineOutlinedIcon sx={{ fontSize: 20, color: "var(--accent)" }} />
         <h1 style={{ margin: 0, fontSize: 16, letterSpacing: "-0.02em" }}>통합 타임라인</h1>
         <div style={{ display: "flex", alignItems: "center", gap: 6, marginLeft: "auto" }}>
-          <button onClick={() => setSortDir((direction) => direction === "asc" ? "desc" : "asc")} title="정렬 순서 변경" style={toolbarButtonStyle}>
+          <button className="nm-btn" onClick={() => setSortDir((direction) => direction === "asc" ? "desc" : "asc")} title="정렬 순서 변경" style={toolbarButtonStyle}>
             <SortOutlinedIcon sx={{ fontSize: 16 }} />{sortDir === "asc" ? "오래된 순" : "최근 순"}
           </button>
-          <button onClick={() => setOnlySuspicious((value) => !value)} title="의심 태그가 붙은 항목만 표시" aria-pressed={onlySuspicious} style={{ ...toolbarButtonStyle, background: onlySuspicious ? "var(--danger-subtle)" : "var(--bg-elevated)", color: onlySuspicious ? "var(--danger)" : "var(--text-dim)", borderColor: onlySuspicious ? "var(--danger)" : "var(--border)" }}>
+          <button className="nm-btn" onClick={() => setOnlySuspicious((value) => !value)} title="의심 태그가 붙은 항목만 표시" aria-pressed={onlySuspicious} style={{ ...toolbarButtonStyle, background: onlySuspicious ? "var(--danger-subtle)" : "var(--bg-elevated)", color: onlySuspicious ? "var(--danger)" : "var(--text-dim)", borderColor: onlySuspicious ? "var(--danger)" : "var(--border)" }}>
             <ReportProblemOutlinedIcon sx={{ fontSize: 16 }} />의심 항목
           </button>
             <div style={{ position: "relative" }}>
-            <button onClick={() => setShowArtifactMenu((value) => !value)} title="표시할 아티팩트 선택" aria-expanded={showArtifactMenu} style={{ ...toolbarButtonStyle, background: hasArtifactFilters ? "var(--accent-subtle)" : "var(--bg-elevated)", color: hasArtifactFilters ? "var(--accent)" : "var(--text-dim)", borderColor: hasArtifactFilters ? "var(--accent)" : "var(--border)" }}>
+            <button className="nm-btn" onClick={() => setShowArtifactMenu((value) => !value)} title="표시할 아티팩트 선택" aria-expanded={showArtifactMenu} style={{ ...toolbarButtonStyle, background: hasArtifactFilters ? "var(--accent-subtle)" : "var(--bg-elevated)", color: hasArtifactFilters ? "var(--accent)" : "var(--text-dim)", borderColor: hasArtifactFilters ? "var(--accent)" : "var(--border)" }}>
               <ViewListOutlinedIcon sx={{ fontSize: 16 }} />아티팩트
             </button>
             {showArtifactMenu && (
@@ -666,19 +666,19 @@ export default function MasterTimeline({ entries, loading, onNavigate, onFetchLi
           <span>{allArtifactsHidden ? "표시할 아티팩트를 선택하세요." : globalActive ? "사고 기간에 해당하는 기록이 없습니다." : "표시할 시간 기록이 없습니다."}</span>
         </div>
       ) : (
-      <div ref={scrollRef} style={{ flex: 1, minHeight: 0, overflow: "auto" }}>
-        <div style={{ height: paddingTop }} />
-        {virtualRows.map((virtualRow) => {
-          const entry = rows[virtualRow.index];
+      <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
+      <div style={{ flex: 1, minHeight: 0, overflow: "auto" }}>
+        {pageRows.map((entry, indexInPage) => {
+          const absoluteIndex = safePage * PAGE_SIZE + indexInPage;
           const presentation = currentTimelinePresentation(entry);
           const dangerTag = entry.tags.find((t) => t.severity === "danger");
           const warningTag = entry.tags.find((t) => t.severity === "warning");
           const bookmarked = isBookmarked(entry);
           const chipTone = artifactChipTone(entry.category, entry.table);
-          const rowBackground = virtualRow.index % 2 === 0 ? "transparent" : "rgba(255,255,255,0.02)";
+          const rowBackground = absoluteIndex % 2 === 0 ? "transparent" : "rgba(255,255,255,0.02)";
           return (
             <div
-              key={virtualRow.key}
+              key={`${entry.fullPath}:${entry.rowid}:${absoluteIndex}`}
               className={bookmarked ? "dfir-bookmarked-row" : undefined}
               onClick={() => setSelectedEntry(entry)}
               style={{
@@ -705,12 +705,11 @@ export default function MasterTimeline({ entries, loading, onNavigate, onFetchLi
                   fontWeight: 650,
                   padding: "3px 7px",
                   border: `1px solid ${chipTone.border}`,
-                  borderRadius: "var(--radius-md)",
-                  // Artifact labels use the same filled identity treatment in
-                  // normal and bookmarked rows. Bookmark state belongs to the
-                  // row surface and left accent, never to artifact identity.
-                  background: chipTone.border,
-                  color: "#ffffff",
+                  borderRadius: "var(--radius-sm)",
+                  // 라벨은 아웃라인 스타일 — 아티팩트 정체성은 테두리·글자
+                  // 색으로 드러낸다.
+                  background: "transparent",
+                  color: chipTone.border,
                   whiteSpace: "nowrap",
                   overflow: "hidden",
                   textOverflow: "ellipsis",
@@ -776,7 +775,10 @@ export default function MasterTimeline({ entries, loading, onNavigate, onFetchLi
             </div>
           );
         })}
-        <div style={{ height: paddingBottom }} />
+      </div>
+      <footer style={{ flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", minHeight: 44, padding: "6px 16px", borderTop: "1px solid var(--border)" }}>
+        <PaginationControls ariaLabel="통합 타임라인 페이지" page={safePage} pageCount={pageCount} onChange={setPage} summary={`(${pageStart.toLocaleString()}–${pageEnd.toLocaleString()} / ${rows.length.toLocaleString()})`} />
+      </footer>
       </div>
       )}
 

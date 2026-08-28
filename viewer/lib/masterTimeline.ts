@@ -43,6 +43,72 @@ export class TimelineBuildAborted extends Error {
   }
 }
 
+
+// 워커에서 캐시 디코딩·JSON 파싱·보강을 수행한다. 입력 버퍼는 transferable로
+// zero-copy 이동하고, 결과는 청크로 나눠 받으므로 메인 스레드는 짧은 수신
+// 처리만 한다. builtForRunAt이 다르면(오래된 캐시) null, 워커 생성이 불가하면
+// 예외를 던져 호출부가 메인 스레드 폴백을 타게 한다.
+export function loadCachedTimelineInWorker(
+  buffer: ArrayBuffer,
+  builtForRunAt: string,
+  signal?: AbortSignal,
+): Promise<TimelineEntry[] | null> {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(new URL("./timelineCacheLoader.worker.ts", import.meta.url));
+    const collected: TimelineEntry[] = [];
+    const cleanup = () => {
+      worker.terminate();
+      signal?.removeEventListener("abort", onAbort);
+    };
+    const onAbort = () => {
+      cleanup();
+      reject(new TimelineBuildAborted());
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+    worker.onmessage = (
+      event: MessageEvent<{ type: "chunk" | "done" | "miss"; entries?: TimelineEntry[] }>,
+    ) => {
+      if (event.data.type === "chunk" && event.data.entries) {
+        collected.push(...event.data.entries);
+        return;
+      }
+      cleanup();
+      resolve(event.data.type === "done" ? collected : null);
+    };
+    worker.onerror = () => {
+      cleanup();
+      reject(new Error("timeline cache worker failed"));
+    };
+    worker.postMessage({ buffer, builtForRunAt }, [buffer]);
+  });
+}
+
+// The parse pipeline writes the timeline cache with raw rows only — the
+// presentation strings and tags come from the TS specs, which stay the single
+// source of wording. This fills them in on load, chunked so the UI stays live.
+// Entries built in the viewer already carry tags and pass through unchanged.
+export async function enrichCachedTimeline(
+  entries: TimelineEntry[],
+  signal?: AbortSignal,
+): Promise<TimelineEntry[]> {
+  if (!entries.length || entries[0].tags !== undefined) return entries;
+  let sinceYield = 0;
+  for (const entry of entries) {
+    const spec = resolveArtifactView(entry.table, entry.columns);
+    if (spec) {
+      entry.summary = (spec.timelineTitle ?? spec.title)(entry.row);
+      entry.subtitle = (spec.timelineSubtitle ?? spec.subtitle)?.(entry.row) ?? "";
+    }
+    entry.tags = spec?.tags?.(entry.row) ?? [];
+    if (++sinceYield >= YIELD_EVERY) {
+      sinceYield = 0;
+      await yieldToEventLoop();
+      if (signal?.aborted) throw new TimelineBuildAborted();
+    }
+  }
+  return entries;
+}
+
 export async function buildMasterTimeline(
   categories: CategoryEntry[],
   signal?: AbortSignal,

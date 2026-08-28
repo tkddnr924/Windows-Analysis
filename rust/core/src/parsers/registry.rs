@@ -11,6 +11,7 @@ use notatin::parser::ParserIterator;
 use notatin::parser_builder::ParserBuilder;
 use serde::Serialize;
 
+use crate::hex::hex_lower;
 use crate::sqlite::{Row, StreamWriter};
 use crate::time::fmt_kst;
 
@@ -29,9 +30,13 @@ pub const REG_FIELD_ORDER: &[&str] = &[
 
 /// Temporary incident-response performance switch.  Keep this explicit rather
 /// than deleting recovery code: normal, allocated Registry records continue to
-/// be parsed and published, but deleted-cell discovery and transaction-log
-/// application are deliberately not performed for this run generation.
+/// be parsed and published, but deleted-cell discovery is deliberately not
+/// performed for this run generation (비용이 큰 복구 단계).
 pub const TEMPORARILY_DISABLE_RECOVERY: bool = true;
+
+/// 트랜잭션 로그(.LOG1/.LOG2)는 복구가 아니라 하이브의 최신 정합 상태를 만드는
+/// 조합 단계다 — 로그 파일이 하이브 옆에 있으면 항상 적용한다.
+pub const APPLY_TRANSACTION_LOGS: bool = true;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RegistryRecoveryPlan {
@@ -42,7 +47,7 @@ struct RegistryRecoveryPlan {
 fn registry_recovery_plan() -> RegistryRecoveryPlan {
     RegistryRecoveryPlan {
         recover_deleted_cells: !TEMPORARILY_DISABLE_RECOVERY,
-        apply_transaction_logs: !TEMPORARILY_DISABLE_RECOVERY,
+        apply_transaction_logs: APPLY_TRANSACTION_LOGS,
     }
 }
 
@@ -65,8 +70,7 @@ pub fn registry_recovery_disabled() -> bool {
 #[serde(rename_all = "camelCase")]
 pub struct HiveParseMetrics {
     pub row_count: usize,
-    /// Transaction logs found beside this hive. These are provenance only when
-    /// recovery is disabled; they were not applied to the parser.
+    /// Transaction logs found beside this hive.
     pub recovery_logs_discovered: usize,
     /// Transaction logs actually applied during this parse.
     pub recovery_log_count: usize,
@@ -115,6 +119,7 @@ fn acquire_recovery_permit() -> Result<RegistryRecoveryPermit> {
                 .read(true)
                 .write(true)
                 .create(true)
+                .truncate(false)
                 .open(path)?;
             let result = unsafe {
                 libc::flock(
@@ -161,13 +166,6 @@ pub(crate) fn registry_recovery_worker_count(hive_count: usize) -> usize {
 fn has_control(s: &str) -> bool {
     s.chars()
         .any(|c| c == '\u{0}' || ((c as u32) < 32 && c != '\t' && c != '\n' && c != '\r'))
-}
-fn hex_lower(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push_str(&format!("{:02x}", b));
-    }
-    s
 }
 /// Mirror the Python `_clean` for a decoded string: strip a trailing NUL, and
 /// if control bytes remain, hex-encode (latin-1) instead of storing a BLOB.
@@ -279,6 +277,8 @@ pub fn parse_hive_stream(primary: &Path, out: &Path) -> Result<usize> {
 
 pub fn parse_hive_stream_with_metrics(primary: &Path, out: &Path) -> Result<HiveParseMetrics> {
     let source = primary.to_string_lossy().to_string();
+    // notatin stores the path, so a borrowed &Path fails the 'static bound.
+    #[allow(clippy::unnecessary_to_owned)]
     let mut builder = ParserBuilder::from_path(primary.to_path_buf());
     let logs = sibling_logs(primary);
     let recovery_plan = registry_recovery_plan();
@@ -398,12 +398,16 @@ mod tests {
     }
 
     #[test]
-    fn temporary_live_only_mode_never_configures_deleted_or_transaction_log_recovery() {
+    #[allow(clippy::assertions_on_constants)]
+    fn transaction_logs_are_applied_while_deleted_cell_recovery_stays_off() {
         let plan = registry_recovery_plan();
         let discovered_logs = vec![PathBuf::from("SYSTEM.LOG1"), PathBuf::from("SYSTEM.LOG2")];
         assert!(TEMPORARILY_DISABLE_RECOVERY);
         assert!(!plan.recover_deleted_cells);
-        assert!(!plan.apply_transaction_logs);
-        assert!(transaction_logs_to_apply(&discovered_logs, plan).is_empty());
+        assert!(plan.apply_transaction_logs);
+        assert_eq!(
+            transaction_logs_to_apply(&discovered_logs, plan),
+            discovered_logs.as_slice()
+        );
     }
 }

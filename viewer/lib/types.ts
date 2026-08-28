@@ -408,7 +408,6 @@ export interface AccountDirectoryEntry {
 
 export interface ElectronApi {
   /** Resize the single desktop window to fit the current application stage. */
-  setWindowLayout(layout: "setup" | "analysis"): Promise<void>;
   pickFolder(): Promise<string | null>;
   listCases(): Promise<ListCasesResult>;
   createCase(name: string): Promise<Case>;

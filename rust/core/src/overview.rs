@@ -54,7 +54,7 @@ fn read_table_inner(db: &Path, table: &str, include_rowid: bool) -> Vec<Row> {
                 Ok(ValueRef::Text(t)) => String::from_utf8_lossy(t).into_owned(),
                 Ok(ValueRef::Integer(n)) => n.to_string(),
                 Ok(ValueRef::Real(f)) => f.to_string(),
-                Ok(ValueRef::Blob(b)) => b.iter().map(|x| format!("{:02x}", x)).collect(),
+                Ok(ValueRef::Blob(b)) => crate::hex::hex_lower(b),
                 Err(_) => continue,
             };
             row.insert(c.clone(), v);
@@ -190,6 +190,40 @@ pub fn read_eventlog(out_dir: &Path, needle: &str) -> Vec<Row> {
     out
 }
 
+/// EventLog 행 공유 캐시 — SMB/RDP/PowerShell/Defender 빌더가 같은 이벤트
+/// 행을 각자 SQLite에서 다시 읽지 않도록 가공 단계 동안 한 번만 로드한다.
+pub struct EventLogOverviewCache {
+    rows: Vec<Row>,
+}
+
+impl EventLogOverviewCache {
+    pub fn load(out_dir: &Path) -> Self {
+        Self {
+            rows: read_eventlog(out_dir, ""),
+        }
+    }
+
+    pub fn rows(&self) -> &[Row] {
+        &self.rows
+    }
+
+    /// `_source_file` 스템에 `needle`(소문자)이 들어간 행만 — read_eventlog의
+    /// 파일 스템 필터와 같은 의미.
+    pub fn rows_from(&self, needle: &str) -> impl Iterator<Item = &Row> + '_ {
+        let needle = needle.to_string();
+        self.rows.iter().filter(move |row| {
+            row.get("_source_file")
+                .map(|source| {
+                    Path::new(source)
+                        .file_stem()
+                        .map(|stem| stem.to_string_lossy().to_lowercase().contains(&needle))
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false)
+        })
+    }
+}
+
 /// Parse an EventData JSON blob into a serde_json object (empty on error).
 pub fn parse_eventdata(raw: &str) -> serde_json::Map<String, serde_json::Value> {
     if raw.is_empty() {
@@ -267,6 +301,10 @@ const TAMPER_KEYS: &[&str] = &[
 ];
 
 pub fn build_defender(out_dir: &Path) -> Vec<Row> {
+    build_defender_with_events(&EventLogOverviewCache::load(out_dir))
+}
+
+pub fn build_defender_with_events(events: &EventLogOverviewCache) -> Vec<Row> {
     // detections: insertion-ordered map keyed by detection id (Vec preserves
     // order for stable tie-break in the timestamp sort below).
     let mut det_keys: Vec<String> = Vec::new();
@@ -278,7 +316,7 @@ pub fn build_defender(out_dir: &Path) -> Vec<Row> {
     let mut rt_events: Vec<(String, bool, String)> = Vec::new();
     let mut sig_latest: Option<(String, String, String)> = None;
 
-    for r in read_eventlog(out_dir, "defender") {
+    for r in events.rows_from("defender") {
         let eid = r.get("EventID").cloned().unwrap_or_default();
         let ts = r.get("timestamp").cloned().unwrap_or_default();
         let rk = r.get("_record_key").cloned().unwrap_or_default();
@@ -599,8 +637,12 @@ fn smb_client_ip(client_name: &str) -> String {
 }
 
 pub fn build_smb_history(out_dir: &Path) -> Vec<Row> {
+    build_smb_history_with_events(&EventLogOverviewCache::load(out_dir))
+}
+
+pub fn build_smb_history_with_events(events: &EventLogOverviewCache) -> Vec<Row> {
     let mut rows = Vec::new();
-    for r in read_eventlog(out_dir, "") {
+    for r in events.rows() {
         let provider = r.get("Provider").cloned().unwrap_or_default();
         let eid = r.get("EventID").cloned().unwrap_or_default();
         let ed = parse_eventdata(r.get("EventData").map(|s| s.as_str()).unwrap_or(""));
@@ -818,13 +860,17 @@ fn ts_epoch(ts: &str) -> Option<f64> {
 }
 
 pub fn build_remote_desktop_history(out_dir: &Path) -> Vec<Row> {
+    build_remote_desktop_history_with_events(&EventLogOverviewCache::load(out_dir))
+}
+
+pub fn build_remote_desktop_history_with_events(events: &EventLogOverviewCache) -> Vec<Row> {
     const LSM: &str = "Microsoft-Windows-TerminalServices-LocalSessionManager";
     let mut rows: Vec<Row> = Vec::new();
     let mut sess_info: std::collections::HashMap<String, [Option<String>; 2]> =
         std::collections::HashMap::new();
     let mut lsm_pending: Vec<(usize, String)> = Vec::new();
 
-    for r in read_eventlog(out_dir, "") {
+    for r in events.rows() {
         let provider = r.get("Provider").cloned().unwrap_or_default();
         let eid = r.get("EventID").cloned().unwrap_or_default();
         let spec = match rdp_spec(&provider, &eid) {
@@ -1103,6 +1149,13 @@ fn ps_row(
 }
 
 pub fn build_powershell_history(out_dir: &Path) -> Vec<Row> {
+    build_powershell_history_with_events(out_dir, &EventLogOverviewCache::load(out_dir))
+}
+
+pub fn build_powershell_history_with_events(
+    out_dir: &Path,
+    events: &EventLogOverviewCache,
+) -> Vec<Row> {
     let umap = user_map(out_dir);
     let account_for = |sid: &str| -> String {
         match umap.get(sid) {
@@ -1111,21 +1164,20 @@ pub fn build_powershell_history(out_dir: &Path) -> Vec<Row> {
         }
     };
     let mut rows: Vec<Row> = Vec::new();
-    // ScriptBlockId -> (parts: BTreeMap<i64,String>, timestamp, sid, pid, rk, path)
-    let mut block_keys: Vec<String> = Vec::new();
-    let mut blocks: std::collections::HashMap<
+    // (parts: BTreeMap<i64,String>, timestamp, sid, pid, rk, path)
+    type BlockEntry = (
+        std::collections::BTreeMap<i64, String>,
         String,
-        (
-            std::collections::BTreeMap<i64, String>,
-            String,
-            String,
-            String,
-            String,
-            String,
-        ),
-    > = std::collections::HashMap::new();
+        String,
+        String,
+        String,
+        String,
+    );
+    let mut block_keys: Vec<String> = Vec::new();
+    let mut blocks: std::collections::HashMap<String, BlockEntry> =
+        std::collections::HashMap::new();
 
-    for r in read_eventlog(out_dir, "") {
+    for r in events.rows() {
         let provider = r.get("Provider").cloned().unwrap_or_default();
         let event_id = r.get("EventID").cloned().unwrap_or_default();
         let ed = parse_eventdata(r.get("EventData").map(|s| s.as_str()).unwrap_or(""));
@@ -1416,11 +1468,81 @@ fn browser_sources(
         .collect()
 }
 
+/// CacheEntries에서 브라우저 활동 개요가 쓰는 메타데이터 컬럼만 읽는다.
+/// body_b64는 본문 존재 여부만 필요하므로 플래그("1"/"")로 축약해, 다중 MB
+/// base64 본문이 개요 생성 중 메모리에 올라오지 않게 한다. 없는 컬럼은 빈 값.
+fn read_cache_entry_meta(db: &Path) -> Vec<Row> {
+    const META_COLUMNS: &[&str] = &[
+        "account",
+        "url",
+        "response_time",
+        "creation_time",
+        "content_length",
+        "body_size",
+        "content_type",
+        "status",
+        "cache_key",
+    ];
+    if !db.exists() {
+        return Vec::new();
+    }
+    let con = match Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let mut present: Vec<String> = Vec::new();
+    if let Ok(mut stmt) = con.prepare("SELECT name FROM pragma_table_info('CacheEntries')") {
+        if let Ok(mut q) = stmt.query([]) {
+            while let Ok(Some(r)) = q.next() {
+                if let Ok(name) = r.get::<_, String>(0) {
+                    present.push(name);
+                }
+            }
+        }
+    }
+    let mut select: Vec<String> = Vec::new();
+    let mut keys: Vec<&str> = Vec::new();
+    for column in META_COLUMNS {
+        if present.iter().any(|name| name == column) {
+            select.push(format!("\"{}\"", column));
+            keys.push(column);
+        }
+    }
+    if present.iter().any(|name| name == "body_b64") {
+        select.push("CASE WHEN \"body_b64\" IS NULL OR \"body_b64\" = '' THEN '' ELSE '1' END".to_string());
+        keys.push("body_b64");
+    }
+    if select.is_empty() {
+        return Vec::new();
+    }
+    let mut stmt = match con.prepare(&format!(
+        "SELECT {} FROM \"CacheEntries\"",
+        select.join(", ")
+    )) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    let mut q = match stmt.query([]) {
+        Ok(q) => q,
+        Err(_) => return Vec::new(),
+    };
+    while let Ok(Some(r)) = q.next() {
+        let mut row = Row::new();
+        for (i, key) in keys.iter().enumerate() {
+            let value: String = r.get::<_, Option<String>>(i).ok().flatten().unwrap_or_default();
+            row.insert((*key).to_string(), value);
+        }
+        out.push(row);
+    }
+    out
+}
+
 pub fn build_browser_history(out_dir: &Path) -> Vec<Row> {
     let mut rows: Vec<Row> = Vec::new();
     // Cached HTTP responses (BrowserCache) — empty when no cache artifact present.
     for (account, db) in browser_sources(out_dir, "BROWSER", "_Chrome_Cache") {
-        for c in read_table(&db, "CacheEntries") {
+        for c in read_cache_entry_meta(&db) {
             let g = |k: &str| c.get(k).cloned().unwrap_or_default();
             let ts = {
                 let r = g("response_time");
@@ -1628,7 +1750,7 @@ fn le_u64(b: &[u8], off: usize) -> u64 {
 
 fn unhex(s: &str) -> Vec<u8> {
     let s = s.trim();
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return Vec::new();
     }
     let mut out = Vec::with_capacity(s.len() / 2);

@@ -18,6 +18,8 @@ import type { FetchLinkedRows } from "@/lib/types";
 import { toBound, type TimeRange } from "@/lib/timeRange";
 import RowDetailPanel from "./RowDetailPanel";
 import type { AccountDirectory } from "@/lib/accountIdentity";
+import { basename } from "@/lib/viewShared";
+import PaginationControls from "@/components/PaginationControls";
 
 interface TargetInfoViewProps {
   data: CsvData;
@@ -101,11 +103,6 @@ interface Account {
   sourceArtifact: string;
 }
 
-function basename(p: string): string {
-  const cleaned = p.replace(/[\\/]+$/, "");
-  const parts = cleaned.split(/[\\/]/);
-  return parts[parts.length - 1] || p;
-}
 
 function buildAccount(r: Row): Account {
   const sid = r.name || "";
@@ -319,7 +316,7 @@ export default function TargetInfoView({ data, loadAccountEvents, timeRange, onN
                   type="button"
                   key={`${n.ip}|${n.guid}`}
                   onClick={() => { setSelectedNetwork(null); setSelectedInterface(n); }}
-                  style={{ display: "flex", alignItems: "center", minHeight: 40, padding: "0 12px", background: selectedInterface?.guid === n.guid && selectedInterface?.ip === n.ip ? "var(--bg-selected)" : "transparent", border: "none", borderBottom: "1px solid var(--border-subtle)", color: "var(--text)", cursor: "pointer", fontFamily: "inherit", textAlign: "left" }}
+                  style={{ borderRadius: "var(--radius-sm)", display: "flex", alignItems: "center", minHeight: 40, padding: "0 12px", background: selectedInterface?.guid === n.guid && selectedInterface?.ip === n.ip ? "var(--bg-selected)" : "transparent", border: "none", borderBottom: "1px solid var(--border-subtle)", color: "var(--text)", cursor: "pointer", fontFamily: "inherit", textAlign: "left" }}
                   onMouseEnter={(e) => (e.currentTarget.style.background = "var(--bg-hover)")}
                   onMouseLeave={(e) => (e.currentTarget.style.background = selectedInterface?.guid === n.guid && selectedInterface?.ip === n.ip ? "var(--bg-selected)" : "transparent")}
                 >
@@ -342,7 +339,7 @@ export default function TargetInfoView({ data, loadAccountEvents, timeRange, onN
                 title={`${n.name} 상세 보기`}
                 aria-label={`${n.name} 네트워크 프로필 상세 보기`}
                 onClick={() => { setSelectedInterface(null); setSelectedNetwork(n); }}
-                style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) auto 24px", width: "100%", gap: 16, alignItems: "center", minHeight: 40, padding: "0 2px", background: selectedNetwork?.name === n.name && selectedNetwork?.timestamp === n.timestamp ? "var(--bg-selected)" : "transparent", border: "none", borderBottom: "1px solid var(--border-subtle)", color: "inherit", cursor: "pointer", fontFamily: "inherit", textAlign: "left" }}
+                style={{ borderRadius: "var(--radius-sm)", display: "grid", gridTemplateColumns: "minmax(0, 1fr) auto 24px", width: "100%", gap: 16, alignItems: "center", minHeight: 40, padding: "0 2px", background: selectedNetwork?.name === n.name && selectedNetwork?.timestamp === n.timestamp ? "var(--bg-selected)" : "transparent", border: "none", borderBottom: "1px solid var(--border-subtle)", color: "inherit", cursor: "pointer", fontFamily: "inherit", textAlign: "left" }}
                 onMouseEnter={(e) => (e.currentTarget.style.background = "var(--bg-hover)")}
                 onMouseLeave={(e) => (e.currentTarget.style.background = selectedNetwork?.name === n.name && selectedNetwork?.timestamp === n.timestamp ? "var(--bg-selected)" : "transparent")}
               >
@@ -405,7 +402,7 @@ function AccountRow({ account, bookmarked, onSelect, gridStyle }: { account: Acc
       title="자세히 보기"
       aria-label={`${account.username || "이름 없는 계정"} 계정 상세 보기${bookmarked ? ", 북마크됨" : ""}`}
       className={bookmarked ? "dfir-bookmarked-row" : undefined}
-      style={{ ...gridStyle, width: "100%", alignItems: "center", textAlign: "left", minHeight: 52, padding: "7px 0 7px 12px", background: "transparent", border: "none", borderBottom: "1px solid var(--border-subtle)", color: "inherit", cursor: "pointer", fontFamily: "inherit" }}
+      style={{ borderRadius: "var(--radius-sm)", ...gridStyle, width: "100%", alignItems: "center", textAlign: "left", minHeight: 52, padding: "7px 0 7px 12px", background: "transparent", border: "none", borderBottom: "1px solid var(--border-subtle)", color: "inherit", cursor: "pointer", fontFamily: "inherit" }}
       onMouseEnter={(e) => { if (!bookmarked) e.currentTarget.style.background = "var(--bg-hover)"; }}
       onMouseLeave={(e) => { if (!bookmarked) e.currentTarget.style.background = "transparent"; }}
     >
@@ -717,7 +714,7 @@ function AccountDetailPage({ account, onBack, loadEvents, timeRange, onNavigate,
                 onClick={() => setSelectedEvent(r)}
                 onMouseEnter={(e) => { if (!bookmarked) e.currentTarget.style.background = "var(--bg-hover)"; }}
                 onMouseLeave={(e) => { if (!bookmarked) e.currentTarget.style.background = "transparent"; }}
-                style={{ display: "grid", gridTemplateColumns: "minmax(174px, 1.15fr) minmax(150px, 1fr) 70px minmax(160px, 1fr) 22px", width: "100%", alignItems: "center", columnGap: 10, minHeight: 42, padding: "6px 2px", background: "transparent", border: "none", borderBottom: i < pagedEvents.length - 1 ? "1px solid var(--border-subtle)" : "none", color: "inherit", cursor: "pointer", fontFamily: "inherit", textAlign: "left" }}
+                style={{ borderRadius: "var(--radius-sm)", display: "grid", gridTemplateColumns: "minmax(174px, 1.15fr) minmax(150px, 1fr) 70px minmax(160px, 1fr) 22px", width: "100%", alignItems: "center", columnGap: 10, minHeight: 42, padding: "6px 2px", background: "transparent", border: "none", borderBottom: i < pagedEvents.length - 1 ? "1px solid var(--border-subtle)" : "none", color: "inherit", cursor: "pointer", fontFamily: "inherit", textAlign: "left" }}
               >
                 <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 13.5, fontWeight: 650, color: "var(--text-time)", fontFamily: "var(--mono)" }}>{r.timestamp || "시간 정보 없음"}</span>
                 <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 13, fontWeight: 700, color: "var(--text)" }}>{label}</span>
@@ -729,10 +726,8 @@ function AccountDetailPage({ account, onBack, loadEvents, timeRange, onNavigate,
           })}
           </div></div>}
           {loadEvents && visibleEvents && evPageCount > 1 && (
-            <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 6, marginTop: 10 }}>
-              <button onClick={() => { setPageFilterKey(filterKey); setEvPage(renderedSafePage - 1); }} disabled={refreshing || renderedSafePage === 0} aria-label="이전 이벤트 페이지" title="이전" style={{ ...evPgBtn(refreshing || renderedSafePage === 0), display: "inline-flex", alignItems: "center", justifyContent: "center", width: 28, height: 26, padding: 0 }}><ChevronLeftOutlinedIcon sx={{ fontSize: 17 }} /></button>
-              <span style={{ fontSize: 11.5, color: "var(--text-dim)" }}>{renderedSafePage + 1} / {evPageCount} 쪽 <span style={{ color: "var(--text-faint)" }}>({evCount.toLocaleString()}건)</span></span>
-              <button onClick={() => { setPageFilterKey(filterKey); setEvPage(renderedSafePage + 1); }} disabled={refreshing || renderedSafePage >= evPageCount - 1} aria-label="다음 이벤트 페이지" title="다음" style={{ ...evPgBtn(refreshing || renderedSafePage >= evPageCount - 1), display: "inline-flex", alignItems: "center", justifyContent: "center", width: 28, height: 26, padding: 0 }}><ChevronRightOutlinedIcon sx={{ fontSize: 17 }} /></button>
+            <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 10 }}>
+              <PaginationControls ariaLabel="이벤트 페이지" page={renderedSafePage} pageCount={evPageCount} disabled={refreshing} onChange={(next) => { setPageFilterKey(filterKey); setEvPage(next); }} summary={`(${evCount.toLocaleString()}건)`} />
             </div>
           )}
         </DetailSurface>
