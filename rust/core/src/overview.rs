@@ -809,8 +809,12 @@ fn fw_action(raw: &str) -> String {
 fn fw_protocol(raw: &str) -> String {
     match raw {
         "1" => "ICMP".into(),
+        "2" => "IGMP".into(),
         "6" => "TCP".into(),
         "17" => "UDP".into(),
+        "47" => "GRE".into(),
+        "50" => "ESP".into(),
+        "51" => "AH".into(),
         "58" => "ICMPv6".into(),
         "256" => "모든 프로토콜".into(),
         "" => String::new(),
@@ -1541,7 +1545,9 @@ pub fn build_powershell_history_with_events(
             ));
         } else if provider == "PowerShell" && event_id == "800" {
             let mut strs = Vec::new();
-            all_strings(&serde_json::Value::Object(ed.clone()), &mut strs);
+            for value in ed.values() {
+                all_strings(value, &mut strs);
+            }
             let blob = strs.join("\n");
             let host = find_token(&blob, "HostApplication=");
             let command = find_token(&blob, "CommandLine=");
@@ -1589,7 +1595,9 @@ pub fn build_powershell_history_with_events(
             // 엔진 수명주기 — 400 시작(Available)/403 종료(Stopped). 명령은 없지만
             // HostApplication이 실행 주체를 남기는 독립 증거다.
             let mut strs = Vec::new();
-            all_strings(&serde_json::Value::Object(ed.clone()), &mut strs);
+            for value in ed.values() {
+                all_strings(value, &mut strs);
+            }
             let blob = strs.join("\n");
             let host = find_token(&blob, "HostApplication=");
             let proc = {
@@ -1623,7 +1631,9 @@ pub fn build_powershell_history_with_events(
             // 공급자 시작은 세션마다 여러 건 나와 시끄럽다 — 원격(WinRM) 사용
             // 흔적인 WSMan 공급자만 남긴다.
             let mut strs = Vec::new();
-            all_strings(&serde_json::Value::Object(ed.clone()), &mut strs);
+            for value in ed.values() {
+                all_strings(value, &mut strs);
+            }
             let blob = strs.join("\n");
             let provider_name = {
                 let token = find_token(&blob, "ProviderName=");
