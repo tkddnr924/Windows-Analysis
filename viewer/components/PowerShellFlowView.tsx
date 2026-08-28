@@ -18,7 +18,7 @@ import { tsMs } from "@/lib/viewShared";
 const TABLE_NAME = "PowerShellHistory";
 const SESSION_GAP_MS = 30 * 60 * 1000;
 
-type PsKind = "스크립트 블록" | "파이프라인" | "명령 실행";
+type PsKind = "스크립트 블록" | "파이프라인" | "명령 실행" | "엔진 시작" | "엔진 종료" | "콘솔 시작" | "원격 공급자 시작";
 
 interface PsEvent {
   row: Record<string, string>;
@@ -76,7 +76,10 @@ function clusterSessions(data: CsvData, timeRange: TimeRange): PsSession[] {
 
   const byIdentity = new Map<string, PsEvent[]>();
   for (const event of events) {
-    const key = `${event.account}||${event.processId || event.process}`;
+    // 같은 PID는 같은 세션이다: 400/403처럼 계정이 비는 이벤트가 계정이
+    // 남는 800/4103과 갈라지지 않도록 PID를 우선 키로 쓴다. PID 재사용은
+    // 아래 SESSION_GAP_MS 시간 분할이 걸러낸다.
+    const key = event.processId ? `pid:${event.processId}` : `acct:${event.account}||${event.process}`;
     const group = byIdentity.get(key) ?? [];
     group.push(event);
     byIdentity.set(key, group);
@@ -118,6 +121,10 @@ const FILTERS: { label: string; value?: PsKind }[] = [
   { label: "스크립트 블록", value: "스크립트 블록" },
   { label: "파이프라인", value: "파이프라인" },
   { label: "명령 실행", value: "명령 실행" },
+  { label: "엔진 시작", value: "엔진 시작" },
+  { label: "엔진 종료", value: "엔진 종료" },
+  { label: "콘솔 시작", value: "콘솔 시작" },
+  { label: "원격 공급자 시작", value: "원격 공급자 시작" },
 ];
 
 export default function PowerShellFlowView({

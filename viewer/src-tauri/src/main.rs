@@ -4211,6 +4211,10 @@ struct BookmarkInput {
     rowid: i64,
     #[serde(default)]
     field: Option<String>,
+    /// 개요 행에서 승격된 북마크의 사건 시각. 원시 레코드(Registry 등)에는
+    /// 실행 시각이 없어 last_write 같은 엉뚱한 시각으로 배치되는 것을 막는다.
+    #[serde(default)]
+    event_time: Option<String>,
     #[serde(default)]
     host_id: Option<String>,
     #[serde(default)]
@@ -4238,6 +4242,9 @@ fn toggle_bookmark(case_dir: String, entry: BookmarkInput) -> Result<Vec<Value>,
         b.insert("rowid".into(), Value::from(entry.rowid));
         if !field.is_empty() {
             b.insert("field".into(), Value::from(field));
+        }
+        if let Some(event_time) = entry.event_time.filter(|t| !t.is_empty()) {
+            b.insert("eventTime".into(), Value::from(event_time));
         }
         b.insert("note".into(), Value::from(""));
         b.insert("taggedAt".into(), Value::from(now_iso()));
@@ -4411,6 +4418,7 @@ mod bookmark_tests {
             table_name: table_name.to_string(),
             rowid: 42,
             field: None,
+            event_time: None,
             host_id: Some("host-a".to_string()),
             host_name: Some("HOST-A".to_string()),
         }

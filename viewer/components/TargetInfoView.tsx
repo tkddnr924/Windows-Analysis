@@ -290,7 +290,7 @@ export default function TargetInfoView({ data, loadAccountEvents, timeRange, onN
     <div className="dfir-view" style={{ flex: 1, minWidth: 0, minHeight: 0, display: "flex", flexDirection: "column", overflow: "hidden", background: "var(--bg)" }}>
       <ViewHeader icon={InfoOutlinedIcon} title={<>호스트 정보 <span aria-hidden="true" style={{ color: "var(--text-faint)", padding: "0 2px" }}>|</span> {computerName}</>} right={osSummary ? <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text-dim)", fontSize: 12.5 }}>{osSummary}</span> : undefined} />
 
-      <div style={{ flex: 1, minHeight: 0, display: "grid", gridTemplateColumns: "minmax(210px, 25%) minmax(0, 1fr)", overflow: "hidden" }}>
+      <div style={{ flex: 1, minHeight: 0, display: "grid", gridTemplateColumns: "minmax(170px, 15%) minmax(0, 1fr)", overflow: "hidden" }}>
         <nav aria-label="호스트 정보 범주" style={{ minHeight: 0, overflow: "auto", padding: 10, borderRight: "1px solid var(--border)" }}>
           <div style={{ padding: "4px 8px 8px", color: "var(--text-faint)", fontSize: 11.5, fontWeight: 700 }}>호스트 범주</div>
           {sections.map(({ key, label, icon: Icon }) => {

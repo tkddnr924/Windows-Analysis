@@ -100,6 +100,11 @@ function resolveBookmarkEventTime(
 ): { value: string; label?: string } {
   if (bookmark.field) return { value: row[bookmark.field] || "", label: fieldLabel(bookmark.field) };
 
+  // 개요 행에서 승격되며 저장된 사건 시각이 있으면 그것이 분석가가 본 시각이다.
+  if (bookmark.eventTime && EVIDENCE_TIMESTAMP.test(bookmark.eventTime)) {
+    return { value: bookmark.eventTime };
+  }
+
   const defaultTime = row[spec?.timelineField ?? "timestamp"] || row.timestamp || "";
   if (defaultTime) return { value: defaultTime };
 

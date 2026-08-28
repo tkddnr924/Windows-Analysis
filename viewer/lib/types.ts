@@ -214,6 +214,10 @@ export interface Bookmark {
    * Created/Modified/...), which one this bookmark marks — so the same row can
    * be bookmarked on each time independently. Absent for whole-row bookmarks. */
   field?: string;
+  /** Event time carried over from the overview row this bookmark was promoted
+   * from. Raw source records (e.g. Registry) may lack the execution timestamp,
+   * so the bookmark timeline prefers this when present. */
+  eventTime?: string;
   /** Which direct host this bookmark's row belongs to (bookmarks are shared
    * across registered hosts). Optional for backward compatibility
    * with bookmarks saved before host attribution existed. */
@@ -226,6 +230,7 @@ export interface BookmarkInput {
   tableName: string;
   rowid: number;
   field?: string;
+  eventTime?: string;
   hostId?: string;
   hostName?: string;
 }

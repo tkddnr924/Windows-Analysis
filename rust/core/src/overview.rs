@@ -780,6 +780,198 @@ pub fn build_bits_history_with_events(events: &EventLogOverviewCache) -> Vec<Row
     rows
 }
 
+/// 방화벽 규칙·정책 변경 이력 — Windows Firewall With Advanced Security/Firewall
+/// 채널(2004 추가, 2005 변경, 2006 삭제, 2033 전체 삭제, 2010 프로필 전환,
+/// 2002·2003 설정 변경, 2011 수신 차단)과 Security 감사 이벤트(4946~4950,
+/// 5025, 5031)를 한 테이블로 모은다. 새 정책(규칙) 등록이 핵심 증거다.
+const FIREWALL_PROVIDER: &str = "Microsoft-Windows-Windows Firewall With Advanced Security";
+
+fn fw_direction(raw: &str) -> String {
+    match raw {
+        "1" => "인바운드".into(),
+        "2" => "아웃바운드".into(),
+        "" => String::new(),
+        other => other.to_string(),
+    }
+}
+
+fn fw_action(raw: &str) -> String {
+    // MS-FASP FW_RULE_ACTION: 1 AllowBypass, 2 Allow, 3 Block.
+    match raw {
+        "1" => "보안 허용".into(),
+        "2" => "허용".into(),
+        "3" => "차단".into(),
+        "" => String::new(),
+        other => other.to_string(),
+    }
+}
+
+fn fw_protocol(raw: &str) -> String {
+    match raw {
+        "1" => "ICMP".into(),
+        "6" => "TCP".into(),
+        "17" => "UDP".into(),
+        "58" => "ICMPv6".into(),
+        "256" => "모든 프로토콜".into(),
+        "" => String::new(),
+        other => other.to_string(),
+    }
+}
+
+fn fw_profiles(raw: &str) -> String {
+    let Ok(mask) = raw.parse::<u32>() else {
+        return raw.to_string();
+    };
+    if mask == 0x7FFF_FFFF {
+        return "모든 프로필".into();
+    }
+    let mut parts = Vec::new();
+    if mask & 1 != 0 {
+        parts.push("도메인");
+    }
+    if mask & 2 != 0 {
+        parts.push("개인");
+    }
+    if mask & 4 != 0 {
+        parts.push("공용");
+    }
+    if parts.is_empty() {
+        raw.to_string()
+    } else {
+        parts.join(", ")
+    }
+}
+
+/// 프로필 값 하나를 표시명으로. 0은 "없음" (2010의 OldProfile 등).
+fn fw_profile_name(raw: &str) -> String {
+    if raw == "0" {
+        return "없음".into();
+    }
+    fw_profiles(raw)
+}
+
+pub fn build_firewall_history(out_dir: &Path) -> Vec<Row> {
+    build_firewall_history_with_events(out_dir, &EventLogOverviewCache::load(out_dir))
+}
+
+pub fn build_firewall_history_with_events(
+    out_dir: &Path,
+    events: &EventLogOverviewCache,
+) -> Vec<Row> {
+    let umap = user_map(out_dir);
+    let account_for = |sid: &str| -> String {
+        match umap.get(sid) {
+            Some(n) if !n.is_empty() => n.clone(),
+            _ => sid.to_string(),
+        }
+    };
+    let mut rows = Vec::new();
+    for r in events.rows() {
+        let provider = r.get("Provider").cloned().unwrap_or_default();
+        let eid = r.get("EventID").cloned().unwrap_or_default();
+        let (kind, detail) = if provider == FIREWALL_PROVIDER {
+            match eid.as_str() {
+                "2004" => ("규칙 추가", "새 방화벽 규칙 등록"),
+                "2005" => ("규칙 변경", "방화벽 규칙 수정"),
+                "2006" => ("규칙 삭제", "방화벽 규칙 삭제"),
+                "2033" => ("모든 규칙 삭제", "방화벽 규칙 일괄 삭제"),
+                "2010" => ("프로필 전환", "네트워크 인터페이스 방화벽 프로필 변경"),
+                "2002" | "2003" => ("설정 변경", "방화벽 설정 변경"),
+                "2011" => ("수신 차단", "인바운드 수신 차단 알림"),
+                _ => continue,
+            }
+        } else if provider == "Microsoft-Windows-Security-Auditing" {
+            match eid.as_str() {
+                "4946" => ("규칙 추가", "방화벽 예외 규칙 추가 (감사)"),
+                "4947" => ("규칙 변경", "방화벽 예외 규칙 수정 (감사)"),
+                "4948" => ("규칙 삭제", "방화벽 예외 규칙 삭제 (감사)"),
+                "4950" => ("설정 변경", "방화벽 설정 변경 (감사)"),
+                "5025" => ("서비스 중지", "Windows 방화벽 서비스 중지"),
+                "5031" => ("수신 차단", "응용 프로그램 인바운드 수신 차단"),
+                _ => continue,
+            }
+        } else {
+            continue;
+        };
+        let ed = parse_eventdata(r.get("EventData").map(|s| s.as_str()).unwrap_or(""));
+        // 이벤트별 실데이터 보강: 규칙 이름이 없는 이벤트(프로필 전환·설정
+        // 변경)는 인터페이스/설정값 같은 관찰 데이터를 제목·설명으로 쓴다.
+        let mut rule_name = ed_field(&ed, &["RuleName"]);
+        let mut detail_text = detail.to_string();
+        let mut profiles = fw_profiles(&ed_field(&ed, &["Profiles", "Profile", "ProfileChanged"]));
+        if provider == FIREWALL_PROVIDER && eid == "2010" {
+            let interface = ed_field(&ed, &["InterfaceName", "InterfaceGuid"]);
+            let old_profile = fw_profile_name(&ed_field(&ed, &["OldProfile"]));
+            let new_profile = fw_profile_name(&ed_field(&ed, &["NewProfile"]));
+            if !interface.is_empty() {
+                rule_name = interface;
+            }
+            if !new_profile.is_empty() {
+                detail_text = if old_profile.is_empty() {
+                    format!("적용 프로필 {}", new_profile)
+                } else {
+                    format!("적용 프로필 {} → {}", old_profile, new_profile)
+                };
+                profiles = new_profile;
+            }
+        } else if provider == FIREWALL_PROVIDER && (eid == "2002" || eid == "2003") {
+            let setting = ed_field(&ed, &["Type", "SettingType"]);
+            let value = ed_field(&ed, &["Value", "SettingValue"]);
+            if !setting.is_empty() {
+                rule_name = setting.clone();
+                if !value.is_empty() {
+                    detail_text = format!("{} = {}", setting, value);
+                }
+            }
+        }
+        let modifying_user = ed_field(&ed, &["ModifyingUser"]);
+        let account = if modifying_user.is_empty() {
+            String::new()
+        } else {
+            account_for(&modifying_user)
+        };
+        let mut row = Row::new();
+        row.insert(
+            "timestamp".into(),
+            r.get("timestamp").cloned().unwrap_or_default(),
+        );
+        row.insert("kind".into(), kind.to_string());
+        row.insert("rule_name".into(), rule_name);
+        row.insert("rule_id".into(), ed_field(&ed, &["RuleId"]));
+        row.insert(
+            "app_path".into(),
+            ed_field(&ed, &["ApplicationPath", "Application"]),
+        );
+        row.insert("service".into(), ed_field(&ed, &["ServiceName"]));
+        row.insert(
+            "direction".into(),
+            fw_direction(&ed_field(&ed, &["Direction"])),
+        );
+        row.insert("action".into(), fw_action(&ed_field(&ed, &["Action"])));
+        row.insert(
+            "protocol".into(),
+            fw_protocol(&ed_field(&ed, &["Protocol"])),
+        );
+        row.insert("local_ports".into(), ed_field(&ed, &["LocalPorts"]));
+        row.insert("remote_ports".into(), ed_field(&ed, &["RemotePorts"]));
+        row.insert("profiles".into(), profiles);
+        row.insert("account".into(), account);
+        row.insert(
+            "modifying_app".into(),
+            ed_field(&ed, &["ModifyingApplication"]),
+        );
+        row.insert("detail".into(), detail_text);
+        row.insert("event_id".into(), eid);
+        row.insert("provider".into(), provider);
+        row.insert(
+            "record_key".into(),
+            r.get("_record_key").cloned().unwrap_or_default(),
+        );
+        rows.push(row);
+    }
+    rows
+}
+
 struct RdpSpec {
     direction: &'static str,
     result: &'static str,
@@ -1391,6 +1583,96 @@ pub fn build_powershell_history_with_events(
                 &event_id,
                 &provider,
                 &script_name,
+                &rk,
+            ));
+        } else if provider == "PowerShell" && (event_id == "400" || event_id == "403") {
+            // 엔진 수명주기 — 400 시작(Available)/403 종료(Stopped). 명령은 없지만
+            // HostApplication이 실행 주체를 남기는 독립 증거다.
+            let mut strs = Vec::new();
+            all_strings(&serde_json::Value::Object(ed.clone()), &mut strs);
+            let blob = strs.join("\n");
+            let host = find_token(&blob, "HostApplication=");
+            let proc = {
+                let e = exe_from_host(&host);
+                if e.is_empty() {
+                    "powershell.exe".to_string()
+                } else {
+                    e
+                }
+            };
+            let kind = if event_id == "400" {
+                "엔진 시작"
+            } else {
+                "엔진 종료"
+            };
+            rows.push(ps_row(
+                &ts,
+                &account_for(&sid),
+                &proc,
+                &pid,
+                "",
+                "",
+                &host,
+                kind,
+                &event_id,
+                &provider,
+                "",
+                &rk,
+            ));
+        } else if provider == "PowerShell" && event_id == "600" {
+            // 공급자 시작은 세션마다 여러 건 나와 시끄럽다 — 원격(WinRM) 사용
+            // 흔적인 WSMan 공급자만 남긴다.
+            let mut strs = Vec::new();
+            all_strings(&serde_json::Value::Object(ed.clone()), &mut strs);
+            let blob = strs.join("\n");
+            let provider_name = {
+                let token = find_token(&blob, "ProviderName=");
+                if token.is_empty() {
+                    strs.first().cloned().unwrap_or_default()
+                } else {
+                    token
+                }
+            };
+            if !provider_name.eq_ignore_ascii_case("wsman") {
+                continue;
+            }
+            let host = find_token(&blob, "HostApplication=");
+            let proc = {
+                let e = exe_from_host(&host);
+                if e.is_empty() {
+                    "powershell.exe".to_string()
+                } else {
+                    e
+                }
+            };
+            rows.push(ps_row(
+                &ts,
+                &account_for(&sid),
+                &proc,
+                &pid,
+                "",
+                "",
+                &host,
+                "원격 공급자 시작",
+                &event_id,
+                &provider,
+                "",
+                &rk,
+            ));
+        } else if provider == "Microsoft-Windows-PowerShell" && event_id == "40961" {
+            // 콘솔 시작 — 클래식 400과 달리 UserID(SID)가 남는 실행 증거.
+            rows.push(ps_row(
+                &ts,
+                &account_for(&sid),
+                "powershell.exe",
+                &pid,
+                "",
+                "",
+                "",
+                "콘솔 시작",
+                &event_id,
+                &provider,
+                "",
                 &rk,
             ));
         }
@@ -3491,6 +3773,117 @@ mod tests {
         let props: serde_json::Value =
             serde_json::from_str(row.get("properties").unwrap()).unwrap();
         assert_eq!(props["InstallSource"], "C:\\Users\\a\\Downloads\\");
+    }
+
+    #[test]
+    fn powershell_event_400_becomes_engine_start_row() {
+        let root =
+            std::env::temp_dir().join(format!("wina-ps400-overview-{}", std::process::id()));
+        let event_dir = root.join("EVENTLOG");
+        std::fs::create_dir_all(&event_dir).unwrap();
+        let db_path = event_dir.join("PowerShell.sqlite");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "CREATE TABLE PowerShell (Provider TEXT, EventID TEXT, EventData TEXT, UserID TEXT, ProcessID TEXT, timestamp TEXT, _record_key TEXT)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO PowerShell VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                "PowerShell",
+                "400",
+                r#"{"Message":"NewEngineState=Available\n\tHostApplication=C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe -enc AAA"}"#,
+                "",
+                "512",
+                "2026-08-21 09:59:59.000",
+                "Windows PowerShell.evtx::40",
+            ],
+        ).unwrap();
+        drop(conn);
+
+        let rows = build_powershell_history(&root);
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.get("kind").map(String::as_str), Some("엔진 시작"));
+        assert_eq!(row.get("event_id").map(String::as_str), Some("400"));
+        assert_eq!(
+            row.get("host_application").map(String::as_str),
+            Some("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe -enc AAA")
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn firewall_profile_change_event_2010_surfaces_interface_and_profiles() {
+        let root =
+            std::env::temp_dir().join(format!("wina-fw2010-overview-{}", std::process::id()));
+        let event_dir = root.join("EVENTLOG");
+        std::fs::create_dir_all(&event_dir).unwrap();
+        let db_path = event_dir.join("Firewall.sqlite");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "CREATE TABLE Firewall (Provider TEXT, EventID TEXT, EventData TEXT, timestamp TEXT, _record_key TEXT)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO Firewall VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                FIREWALL_PROVIDER,
+                "2010",
+                r#"{"InterfaceName":"이더넷","OldProfile":"4","NewProfile":"2"}"#,
+                "2026-08-21 11:05:00.000",
+                "Firewall.evtx::9",
+            ],
+        ).unwrap();
+        drop(conn);
+
+        let rows = build_firewall_history(&root);
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.get("rule_name").map(String::as_str), Some("이더넷"));
+        assert_eq!(
+            row.get("detail").map(String::as_str),
+            Some("적용 프로필 공용 → 개인")
+        );
+        assert_eq!(row.get("profiles").map(String::as_str), Some("개인"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn firewall_rule_added_event_2004_maps_direction_action_protocol() {
+        let root =
+            std::env::temp_dir().join(format!("wina-fw2004-overview-{}", std::process::id()));
+        let event_dir = root.join("EVENTLOG");
+        std::fs::create_dir_all(&event_dir).unwrap();
+        let db_path = event_dir.join("Firewall.sqlite");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "CREATE TABLE Firewall (Provider TEXT, EventID TEXT, EventData TEXT, timestamp TEXT, _record_key TEXT)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO Firewall VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                FIREWALL_PROVIDER,
+                "2004",
+                r#"{"RuleName":"Evil Ingress","RuleId":"{11111111-2222}","Direction":"1","Action":"2","Protocol":"6","LocalPorts":"4444","Profiles":"2147483647","ApplicationPath":"C:\\tools\\nc.exe","ModifyingApplication":"C:\\Windows\\System32\\netsh.exe"}"#,
+                "2026-08-21 11:00:00.000",
+                "Firewall.evtx::7",
+            ],
+        ).unwrap();
+        drop(conn);
+
+        let rows = build_firewall_history(&root);
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.get("kind").map(String::as_str), Some("규칙 추가"));
+        assert_eq!(row.get("rule_name").map(String::as_str), Some("Evil Ingress"));
+        assert_eq!(row.get("direction").map(String::as_str), Some("인바운드"));
+        assert_eq!(row.get("action").map(String::as_str), Some("허용"));
+        assert_eq!(row.get("protocol").map(String::as_str), Some("TCP"));
+        assert_eq!(row.get("profiles").map(String::as_str), Some("모든 프로필"));
+        assert_eq!(row.get("local_ports").map(String::as_str), Some("4444"));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

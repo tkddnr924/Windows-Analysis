@@ -1902,6 +1902,11 @@ pub fn run_host_with_log_id(
                 true,
             )?;
             write_ov(
+                "FirewallHistory",
+                overview::build_firewall_history_with_events(&out_dir, &events),
+                true,
+            )?;
+            write_ov(
                 "PowerShellHistory",
                 overview::build_powershell_history_with_events(&out_dir, &events),
                 false,

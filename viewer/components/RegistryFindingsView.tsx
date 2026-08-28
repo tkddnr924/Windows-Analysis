@@ -177,7 +177,7 @@ export default function RegistryFindingsView({ data, bookmarkedRowids, onToggleB
         )}
       
       </ViewHeader>
-    <div style={{ minHeight: 0, flex: 1, display: "grid", gridTemplateColumns: "minmax(210px, 25%) minmax(0, 1fr)", overflow: "hidden" }}>
+    <div style={{ minHeight: 0, flex: 1, display: "grid", gridTemplateColumns: "minmax(170px, 15%) minmax(0, 1fr)", overflow: "hidden" }}>
       <CategoryNavigation groups={groups} selected={selectedCategory} onSelect={setSelectedCategory} />
       <section style={{ minWidth: 0, minHeight: 0, display: "flex", flexDirection: "column", overflow: "hidden" }}>
         <RegistryLedger rows={rows} untimedExcluded={untimedExcluded} category={selectedCategory} onSelect={setDetail} bookmarkedRowids={bookmarkedRowids} onToggleBookmark={onToggleBookmark} accountDirectory={accountDirectory} />

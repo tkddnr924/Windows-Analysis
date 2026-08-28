@@ -130,7 +130,7 @@ export interface ArtifactViewSpec {
    * Overview correlations (TargetInfo, ...) read as summaries/dashboards, not
    * spreadsheets, so each gets a purpose-built view.
    */
-  customView?: "targetInfo" | "executionHistory" | "powershellFlow" | "defender" | "registryFindings" | "rdpCache" | "browserHistory" | "smb" | "bits" | "scheduledTasks" | "wer" | "mft";
+  customView?: "targetInfo" | "executionHistory" | "powershellFlow" | "defender" | "registryFindings" | "rdpCache" | "browserHistory" | "smb" | "bits" | "firewall" | "scheduledTasks" | "wer" | "mft";
   /**
    * In the sidebar, present this table split by this column: instead of one
    * row for the whole table, the category lists one entry per distinct value
@@ -873,6 +873,39 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
         { key: "description", label: "설명" },
         { key: "result", label: "결과" },
         { key: "event_id", label: "이벤트 ID" },
+      ]},
+    ],
+  },
+
+  FirewallHistory: {
+    customView: "firewall",
+    title: (r) => r.rule_name || r.detail || "(규칙 이름 없음)",
+    subtitle: (r) => r.detail || "",
+    links: [{ key: "record_key", label: "이벤트 로그 원본 보기", targetFile: "EventLog_Events", targetColumn: "_record_key" }],
+    visibleColumns: ["timestamp", "kind", "rule_name", "direction", "action", "app_path", "account"],
+    priorityColumns: ["timestamp", "kind", "rule_name", "direction", "action", "app_path", "account", "detail"],
+    sections: [
+      { heading: "규칙", fields: [
+        { key: "rule_name", label: "규칙 이름" },
+        { key: "rule_id", label: "규칙 ID" },
+        { key: "direction", label: "방향" },
+        { key: "action", label: "동작" },
+        { key: "protocol", label: "프로토콜" },
+        { key: "local_ports", label: "로컬 포트" },
+        { key: "remote_ports", label: "원격 포트" },
+        { key: "profiles", label: "적용 프로필" },
+        { key: "app_path", label: "대상 프로그램", kind: "path" },
+        { key: "service", label: "대상 서비스" },
+      ]},
+      { heading: "변경 주체", fields: [
+        { key: "account", label: "계정", kind: "account" },
+        { key: "modifying_app", label: "변경 프로그램", kind: "path" },
+      ]},
+      { heading: "상세", fields: [
+        { key: "kind", label: "유형" },
+        { key: "detail", label: "설명" },
+        { key: "event_id", label: "이벤트 ID" },
+        { key: "provider", label: "공급자" },
       ]},
     ],
   },

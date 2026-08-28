@@ -17,6 +17,7 @@ import ManageSearchOutlinedIcon from "@mui/icons-material/ManageSearchOutlined";
 import TerminalOutlinedIcon from "@mui/icons-material/TerminalOutlined";
 import DnsOutlinedIcon from "@mui/icons-material/DnsOutlined";
 import CloudDownloadOutlinedIcon from "@mui/icons-material/CloudDownloadOutlined";
+import SecurityOutlinedIcon from "@mui/icons-material/SecurityOutlined";
 import TaskOutlinedIcon from "@mui/icons-material/TaskOutlined";
 import LanguageOutlinedIcon from "@mui/icons-material/LanguageOutlined";
 import PhotoLibraryOutlinedIcon from "@mui/icons-material/PhotoLibraryOutlined";
@@ -102,6 +103,7 @@ const OVERVIEW_ORDER: string[] = [
   "PowerShellHistory",
   "SmbHistory",
   "BitsHistory",
+  "FirewallHistory",
   "ScheduledTasks",
   "RdpCache",
 ];
@@ -116,6 +118,7 @@ const OVERVIEW_TABLE_NAMES: Record<string, string> = {
   RemoteDesktopHistory: "원격 접근 이력 (RDP)",
   SmbHistory: "SMB 접속 이력",
   BitsHistory: "BITS 전송 이력",
+  FirewallHistory: "방화벽 이력",
   PowerShellHistory: "파워셸 실행 이력",
   RdpCache: "RDP Cache",
   ScheduledTasks: "작업 스케줄러",
@@ -137,6 +140,7 @@ function OverviewTableIcon({ name }: { name: string }) {
     case "PowerShellHistory": return <TerminalOutlinedIcon {...props} />;
     case "SmbHistory": return <DnsOutlinedIcon {...props} />;
     case "BitsHistory": return <CloudDownloadOutlinedIcon {...props} />;
+    case "FirewallHistory": return <SecurityOutlinedIcon {...props} />;
     case "ScheduledTasks": return <TaskOutlinedIcon {...props} />;
     // Keep the navigation glyph identical to the RDP Cache view header; the
     // remote session ledger itself uses the desktop glyph above.
