@@ -49,6 +49,9 @@ type VirtualTab = "timeline" | "bookmarks" | "connections" | "search" | null;
 const keyOf = (f: ResultFileEntry): string => `${f.fullPath}\u0000${f.tableName}`;
 // A host dir is cases/<host>; its parent is the direct host-store root.
 // Bookmarks live there so they remain shared across registered hosts.
+// 원본(전용 뷰 없는) 테이블의 페이지 로딩 청크 크기.
+const RAW_TABLE_CHUNK = 20000;
+
 const parentDir = (dir: string): string => dir.slice(0, Math.max(dir.lastIndexOf("/"), dir.lastIndexOf("\\")));
 const accountDirectoryKey = (host: Pick<Host, "id" | "dir">): string => `${host.id}\u0000${host.dir.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase()}`;
 
@@ -285,12 +288,38 @@ export default function Home() {
         if (refreshed) setMasterTimeline(null);
       }
       const isBrowserActivity = getArtifactView(file.name)?.customView === "browserHistory";
+      // 전용 뷰(customView)가 없는 원본 테이블은 DataTable로 렌더된다. 원본
+      // EventLog처럼 수십만 행짜리 테이블을 통째로 IPC에 싣지 않도록 이
+      // 경로만 청크 단위로 받고, 스크롤 시 이어 받는다. 개요 뷰들은 전체
+      // 행을 집계(세션 묶음·건수)에 쓰므로 기존 전량 로드를 유지한다.
+      const isPagedRaw = !isBrowserActivity && !getArtifactView(file.name)?.customView;
       const data = isBrowserActivity
         ? { columns: [], rows: [], rowCount: file.rowCount }
-        : await window.api.readResultFile(file.fullPath, file.tableName);
+        : isPagedRaw
+          ? await window.api.readResultFilePage(file.fullPath, file.tableName, 0, RAW_TABLE_CHUNK)
+          : await window.api.readResultFile(file.fullPath, file.tableName);
       setTabs((prev) => prev.map((t) => (keyOf(t.file) === key ? { ...t, data, loading: false } : t)));
     } catch (e) {
       setTabs((prev) => prev.map((t) => (keyOf(t.file) === key ? { ...t, error: String(e), loading: false } : t)));
+    }
+  }
+
+  // 원본 테이블 청크 크기 — 초기 로드와 스크롤 이어받기 단위.
+  const rawLoadInFlight = useRef<Set<string>>(new Set());
+  async function loadMoreRawRows() {
+    if (!activeTab?.data) return;
+    const key = keyOf(activeTab.file);
+    const loaded = activeTab.data.rows.length;
+    if (loaded >= activeTab.data.rowCount || rawLoadInFlight.current.has(key)) return;
+    rawLoadInFlight.current.add(key);
+    try {
+      const page = await window.api.readResultFilePage(activeTab.file.fullPath, activeTab.file.tableName, loaded, RAW_TABLE_CHUNK);
+      setTabs((prev) => prev.map((t) => {
+        if (keyOf(t.file) !== key || !t.data) return t;
+        return { ...t, data: { ...t.data, rows: [...t.data.rows, ...page.rows], rowCount: page.rowCount } };
+      }));
+    } finally {
+      rawLoadInFlight.current.delete(key);
     }
   }
 
@@ -1227,6 +1256,7 @@ export default function Home() {
                 <DataTable
                   fileName={activeTab.file.name}
                   data={activeTab.data}
+                  onLoadMore={activeTab.data.rows.length < activeTab.data.rowCount ? loadMoreRawRows : undefined}
                   initialFilter={pendingFilter}
                   onInitialFilterConsumed={() => setPendingFilter(null)}
                   onNavigate={handleNavigate}

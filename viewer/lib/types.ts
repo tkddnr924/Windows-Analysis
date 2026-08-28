@@ -443,6 +443,7 @@ export interface ElectronApi {
   /** Reads the existing TargetInfo account map. It never reparses evidence. */
   accountDirectory(hostDir: string): Promise<AccountDirectoryEntry[]>;
   readResultFile(fullPath: string, tableName?: string): Promise<CsvData>;
+  readResultFilePage(fullPath: string, tableName: string | undefined, offset: number, limit: number): Promise<CsvData>;
   linkedResultRows(fullPath: string, tableName: string, matchColumn: string, matchValue: string, search: string, offset: number, limit: number): Promise<LinkedRowsPage>;
   resultRow(fullPath: string, tableName: string, rowid: number): Promise<ResultRow>;
   browserActivitySummary(fullPath: string, tableName: string, query: BrowserActivityQuery): Promise<BrowserActivitySummary>;

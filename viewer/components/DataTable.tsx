@@ -62,11 +62,15 @@ interface DataTableProps {
   /** Global incident-window filter from the sidebar; applied to this table's time column if it has one. */
   timeRange?: TimeRange;
   accountDirectory?: AccountDirectory;
+  /** 원본 테이블 페이지 로딩: 스크롤이 끝에 가까워지면 다음 청크를 요청한다.
+   * data.rows가 data.rowCount보다 적을 때만 전달된다. */
+  onLoadMore?: () => void;
 }
 
 export default function DataTable({
   fileName,
   data,
+  onLoadMore,
   initialFilter,
   onInitialFilterConsumed,
   onNavigate,
@@ -220,14 +224,28 @@ export default function DataTable({
   }, [rowHeight]);
 
   const virtualRows = virtualizer.getVirtualItems();
+  const lastVisibleIndex = virtualRows.length > 0 ? virtualRows[virtualRows.length - 1].index : 0;
+  useEffect(() => {
+    // 필터로 걸러진 목록 기준 마지막 근처에 오면 다음 청크를 이어 받는다 —
+    // 검색 중이라면 일치 행을 찾을 때까지 자연스럽게 전체를 훑게 된다.
+    if (onLoadMore && lastVisibleIndex >= rows.length - 40) onLoadMore();
+  }, [onLoadMore, lastVisibleIndex, rows.length]);
   const totalHeight = virtualizer.getTotalSize();
   const paddingTop = virtualRows.length > 0 ? virtualRows[0].start : 0;
   const paddingBottom = virtualRows.length > 0 ? totalHeight - virtualRows[virtualRows.length - 1].end : 0;
 
   const activeFilterCount = columnFilters.length;
 
+  const partiallyLoaded = data.rows.length < data.rowCount;
+
   return (
     <div className="dfir-view" style={{ display: "flex", flexDirection: "column", flex: 1, minHeight: 0, minWidth: 0 }}>
+      {partiallyLoaded && (
+        <div role="status" style={{ flexShrink: 0, display: "flex", alignItems: "center", gap: 8, padding: "6px 14px", borderBottom: "1px solid var(--border-subtle)", background: "color-mix(in srgb, var(--accent) 6%, var(--bg-panel))", color: "var(--text-dim)", fontSize: 11.5 }}>
+          <span style={{ fontFamily: "var(--mono)", color: "var(--text)" }}>{data.rows.length.toLocaleString()} / {data.rowCount.toLocaleString()}행 로드됨</span>
+          <span>스크롤하면 이어서 불러옵니다 · 검색·필터·정렬은 로드된 행 기준입니다</span>
+        </div>
+      )}
       <div
         style={{
           display: "flex",

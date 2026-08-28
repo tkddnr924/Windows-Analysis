@@ -928,7 +928,16 @@ pub fn build_firewall_history_with_events(
                 }
             }
         }
-        let modifying_user = ed_field(&ed, &["ModifyingUser"]);
+        // Security 감사 이벤트에는 ModifyingUser가 없다 — Subject 필드와
+        // 이벤트 레코드의 UserID(SID)로 폴백해 변경 주체를 남긴다.
+        let modifying_user = {
+            let field = ed_field(&ed, &["ModifyingUser", "SubjectUserName", "SubjectUserSid"]);
+            if field.is_empty() {
+                r.get("UserID").cloned().unwrap_or_default()
+            } else {
+                field
+            }
+        };
         let account = if modifying_user.is_empty() {
             String::new()
         } else {
@@ -956,8 +965,14 @@ pub fn build_firewall_history_with_events(
             "protocol".into(),
             fw_protocol(&ed_field(&ed, &["Protocol"])),
         );
-        row.insert("local_ports".into(), ed_field(&ed, &["LocalPorts"]));
-        row.insert("remote_ports".into(), ed_field(&ed, &["RemotePorts"]));
+        row.insert(
+            "local_ports".into(),
+            ed_field(&ed, &["LocalPorts", "LocalPort", "Port"]),
+        );
+        row.insert(
+            "remote_ports".into(),
+            ed_field(&ed, &["RemotePorts", "RemotePort"]),
+        );
         row.insert("profiles".into(), profiles);
         row.insert("account".into(), account);
         row.insert(
@@ -1344,6 +1359,14 @@ fn exe_from_host(host: &str) -> String {
             Some(e) => &rest[..e],
             None => rest,
         }
+    } else if let Some(idx) = h
+        .as_bytes()
+        .windows(4)
+        .position(|w| w.eq_ignore_ascii_case(b".exe"))
+    {
+        // "C:\Program Files\...\pwsh.exe -Command ..." 같은 비인용 경로가
+        // 첫 공백에서 잘려 "Program"이 되지 않게 한다.
+        &h[..idx + 4]
     } else {
         h.split(' ').next().unwrap_or(h)
     };
@@ -3856,6 +3879,52 @@ mod tests {
             Some("적용 프로필 공용 → 개인")
         );
         assert_eq!(row.get("profiles").map(String::as_str), Some("개인"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn exe_from_host_handles_unquoted_path_with_spaces() {
+        assert_eq!(
+            exe_from_host("C:\\Program Files\\PowerShell\\7\\pwsh.exe -Command Get-Item"),
+            "pwsh.exe"
+        );
+        assert_eq!(
+            exe_from_host("\"C:\\Program Files\\a b\\x.exe\" -y"),
+            "x.exe"
+        );
+        assert_eq!(exe_from_host("powershell.exe -NoProfile"), "powershell.exe");
+    }
+
+    #[test]
+    fn firewall_block_event_2011_reads_singular_port_and_userid_fallback() {
+        let root =
+            std::env::temp_dir().join(format!("wina-fw2011-overview-{}", std::process::id()));
+        let event_dir = root.join("EVENTLOG");
+        std::fs::create_dir_all(&event_dir).unwrap();
+        let db_path = event_dir.join("Firewall.sqlite");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "CREATE TABLE Firewall (Provider TEXT, EventID TEXT, EventData TEXT, UserID TEXT, timestamp TEXT, _record_key TEXT)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO Firewall VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                FIREWALL_PROVIDER,
+                "2011",
+                r#"{"ApplicationPath":"C:\\tools\\srv.exe","Port":"8443","Protocol":"6"}"#,
+                "S-1-5-18",
+                "2026-08-21 11:10:00.000",
+                "Firewall.evtx::11",
+            ],
+        ).unwrap();
+        drop(conn);
+
+        let rows = build_firewall_history(&root);
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.get("local_ports").map(String::as_str), Some("8443"));
+        assert_eq!(row.get("account").map(String::as_str), Some("S-1-5-18"));
         std::fs::remove_dir_all(root).unwrap();
     }
 

@@ -2737,6 +2737,58 @@ fn read_result_file(full_path: String, table_name: Option<String>) -> Result<Csv
     })
 }
 
+/// 대형 원본 테이블용 페이지 조회. read_result_file과 같은 열 규칙(CacheEntries
+/// body_b64 제외)을 따르되 offset/limit 창만 직렬화한다 — 원본 EVTX처럼 수십만
+/// 행짜리 테이블을 웹뷰 메모리에 통째로 올리지 않기 위한 경로. row_count는
+/// 전체 건수라 호출 측이 남은 분량을 스크롤 시점에 이어 받는다.
+#[tauri::command]
+fn read_result_file_page(
+    full_path: String,
+    table_name: Option<String>,
+    offset: i64,
+    limit: i64,
+) -> Result<CsvData, String> {
+    let conn = open_ro(&full_path)?;
+    let table = match table_name.or_else(|| first_table(&conn)) {
+        Some(t) => t,
+        None => {
+            return Ok(CsvData {
+                columns: vec![],
+                rows: vec![],
+                row_count: 0,
+            })
+        }
+    };
+    let mut columns = table_columns(&conn, &table);
+    let is_cache = table == "CacheEntries";
+    if is_cache {
+        columns.retain(|c| c != "body_b64");
+    }
+    let select = if is_cache {
+        columns.iter().map(|c| q(c)).collect::<Vec<_>>().join(", ")
+    } else {
+        "*".into()
+    };
+    let row_count: i64 = conn
+        .query_row(&format!("SELECT COUNT(*) FROM {}", q(&table)), [], |r| {
+            r.get(0)
+        })
+        .unwrap_or(0);
+    let sql = format!(
+        "SELECT rowid AS __rowid, {} FROM {} ORDER BY rowid LIMIT ? OFFSET ?",
+        select,
+        q(&table)
+    );
+    let limit = limit.clamp(1, 100_000);
+    let offset = offset.max(0);
+    let rows = query_rows(&conn, &sql, &[&limit, &offset])?;
+    Ok(CsvData {
+        columns,
+        rows,
+        row_count,
+    })
+}
+
 /// Reads a bounded page of evidence rows connected to a selected record.
 ///
 /// The match column is verified against SQLite metadata before it is used as
@@ -4141,6 +4193,17 @@ fn bookmark_id_v2(full_path: &str, table_name: &str, rowid: i64, field: &str) ->
     )
 }
 
+// bookmarks.json은 read-modify-write라 임계 구역 보호가 없으면 겹치는 토글이
+// 서로의 저장을 덮어쓴다 (마지막 rename만 남음). 케이스 파일 단위 잠금 대신
+// 프로세스 전역 잠금 하나로 충분하다 — 북마크 쓰기는 드물고 짧다.
+static BOOKMARK_FILE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn lock_bookmarks() -> std::sync::MutexGuard<'static, ()> {
+    BOOKMARK_FILE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn read_bookmarks_path(case_dir: &Path) -> Result<Vec<Value>, String> {
     match std::fs::read_to_string(case_dir.join("bookmarks.json")) {
         Ok(serialized) => serde_json::from_str::<Value>(&serialized)
@@ -4187,6 +4250,7 @@ fn write_bookmarks(case_dir: &str, bookmarks: &[Value]) -> Result<(), String> {
 
 #[tauri::command]
 fn list_bookmarks(case_dir: String) -> Result<Vec<Value>, String> {
+    let _guard = lock_bookmarks();
     let case_path = Path::new(&case_dir);
     if !case_path.is_dir() {
         return Err("북마크 저장 위치를 찾을 수 없습니다".to_string());
@@ -4223,6 +4287,7 @@ struct BookmarkInput {
 
 #[tauri::command]
 fn toggle_bookmark(case_dir: String, entry: BookmarkInput) -> Result<Vec<Value>, String> {
+    let _guard = lock_bookmarks();
     let mut bookmarks = read_bookmarks(&case_dir)?;
     let field = entry.field.clone().unwrap_or_default();
     let idx = bookmarks.iter().position(|b| {
@@ -4264,6 +4329,7 @@ fn toggle_bookmark(case_dir: String, entry: BookmarkInput) -> Result<Vec<Value>,
 
 #[tauri::command]
 fn update_bookmark_note(case_dir: String, id: String, note: String) -> Result<Vec<Value>, String> {
+    let _guard = lock_bookmarks();
     let mut bookmarks = read_bookmarks(&case_dir)?;
     for b in bookmarks.iter_mut() {
         if b.get("id").and_then(|v| v.as_str()) == Some(id.as_str()) {
@@ -4422,6 +4488,38 @@ mod bookmark_tests {
             host_id: Some("host-a".to_string()),
             host_name: Some("HOST-A".to_string()),
         }
+    }
+
+    #[test]
+    fn concurrent_bookmark_toggles_preserve_every_record() {
+        let case_dir = std::env::temp_dir().join(format!(
+            "wina-bookmark-race-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&case_dir).unwrap();
+        let dir = case_dir.to_string_lossy().to_string();
+        let handles: Vec<_> = (0..8)
+            .map(|worker| {
+                let dir = dir.clone();
+                std::thread::spawn(move || {
+                    for step in 0..5 {
+                        let mut item = entry("Registry");
+                        item.rowid = (worker * 100 + step) as i64;
+                        toggle_bookmark(dir.clone(), item).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        let stored = read_bookmarks(&dir).unwrap();
+        assert_eq!(stored.len(), 40, "겹친 토글이 서로의 저장을 덮어쓰면 안 된다");
+        std::fs::remove_dir_all(case_dir).unwrap();
     }
 
     #[test]
@@ -5884,6 +5982,7 @@ fn main() {
             parse_report,
             parse_run_log,
             read_result_file,
+            read_result_file_page,
             linked_result_rows,
             result_row,
             list_column_values,
