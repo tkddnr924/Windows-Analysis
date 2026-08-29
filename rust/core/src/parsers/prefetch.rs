@@ -277,11 +277,40 @@ fn parse_one(path: &Path, exec_rows: &mut Vec<Row>, loaded_rows: &mut Vec<Row>) 
     Ok(())
 }
 
-/// Returns (execution_rows, loaded_file_rows).
-pub fn parse_prefetch(paths: &[PathBuf]) -> (Vec<Row>, Vec<Row>) {
-    let mut exec_rows = Vec::new();
-    let mut loaded_rows = Vec::new();
+/// 스트리밍 파싱 결과 집계 — 행 자체는 SQLite에 즉시 기록되고, 보고서용
+/// 카운트만 남긴다.
+pub struct PrefetchCounts {
+    pub exec_rows: usize,
+    pub loaded_rows: usize,
+    /// _source_file별 (실행 행 + 로드 파일 행) 수 — parse_report 입력 집계용.
+    pub exec_by_source: std::collections::HashMap<String, usize>,
+    pub loaded_by_source: std::collections::HashMap<String, usize>,
+}
+
+/// 각 .pf를 파싱하는 즉시 두 출력 테이블로 스트리밍 기록한다 — LoadedFiles가
+/// 수십만 행이어도 파일 하나 분량만 메모리에 머문다. 손상 .pf는 corrupted
+/// 행으로 격리하고 계속 진행한다(종전 동작 유지).
+pub fn parse_prefetch_stream(
+    paths: &[PathBuf],
+    exec_out: &Path,
+    loaded_out: &Path,
+) -> anyhow::Result<PrefetchCounts> {
+    use crate::sqlite::StreamWriter;
+    let mut exec = StreamWriter::create(exec_out, EXEC_TABLE, EXEC_FIELD_ORDER, EXEC_FIELD_ORDER)?;
+    let mut loaded =
+        StreamWriter::create(loaded_out, LOADED_TABLE, LOADED_FIELD_ORDER, LOADED_FIELD_ORDER)?;
+    let mut counts = PrefetchCounts {
+        exec_rows: 0,
+        loaded_rows: 0,
+        exec_by_source: std::collections::HashMap::new(),
+        loaded_by_source: std::collections::HashMap::new(),
+    };
     for path in paths {
+        if crate::pipeline::cancelled() {
+            break;
+        }
+        let mut exec_rows = Vec::new();
+        let mut loaded_rows = Vec::new();
         if let Err(e) = parse_one(path, &mut exec_rows, &mut loaded_rows) {
             let mut row = Row::new();
             row.insert("last_run_time".into(), String::new());
@@ -290,8 +319,24 @@ pub fn parse_prefetch(paths: &[PathBuf]) -> (Vec<Row>, Vec<Row>) {
             row.insert("_source_file".into(), path.to_string_lossy().to_string());
             exec_rows.push(row);
         }
+        for row in exec_rows {
+            if let Some(source) = row.get("_source_file").filter(|s| !s.is_empty()) {
+                *counts.exec_by_source.entry(source.clone()).or_default() += 1;
+            }
+            counts.exec_rows += 1;
+            exec.push(row)?;
+        }
+        for row in loaded_rows {
+            if let Some(source) = row.get("_source_file").filter(|s| !s.is_empty()) {
+                *counts.loaded_by_source.entry(source.clone()).or_default() += 1;
+            }
+            counts.loaded_rows += 1;
+            loaded.push(row)?;
+        }
     }
-    (exec_rows, loaded_rows)
+    exec.finish()?;
+    loaded.finish()?;
+    Ok(counts)
 }
 
 #[cfg(test)]

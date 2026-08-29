@@ -88,39 +88,84 @@ fn u128le(d: &[u8], p: usize) -> u128 {
 }
 
 pub fn parse_usn_stream(path: &Path, out: &Path) -> Result<usize> {
+    use std::io::Read;
     let source = path.to_string_lossy().to_string();
-    let data = std::fs::read(path)?;
-    let n = data.len();
     let mut writer = StreamWriter::create(out, USN_TABLE, USN_FIELD_ORDER, USN_FIELD_ORDER)?;
+    let mut file = std::fs::File::open(path)?;
+    // 수 GB짜리 $J를 통째로 메모리에 올리지 않는다 — 4 MiB 창을 굴리며
+    // 레코드 단위로 해석하고, 창 끝에 걸린 레코드는 리필 후 이어서 본다.
+    // 이름 오프셋·길이가 u16이라 유효 레코드는 128 KiB를 넘을 수 없다.
+    const WINDOW: usize = 4 * 1024 * 1024;
+    const MAX_RECLEN: usize = 128 * 1024;
+    let mut buf: Vec<u8> = Vec::new();
+    // 리필용 읽기 버퍼는 한 번만 할당해 재사용한다 — 수 GB $J에서 리필마다
+    // 4 MiB를 새로 할당·제로화하면 allocator 부하만 커진다.
+    let mut chunk = vec![0u8; WINDOW];
     let mut pos = 0usize;
-    while pos < n {
+    let mut eof = false;
+    loop {
         if crate::pipeline::cancelled() {
             break;
+        }
+        if pos > buf.len() {
+            pos = buf.len();
+        }
+        if !eof && buf.len() - pos < MAX_RECLEN {
+            buf.drain(..pos);
+            pos = 0;
+            while buf.len() < WINDOW {
+                let read = file.read(&mut chunk)?;
+                if read == 0 {
+                    eof = true;
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..read]);
+            }
+        }
+        let data = buf.as_slice();
+        let n = data.len();
+        if pos >= n {
+            if eof {
+                break;
+            }
+            continue;
         }
         if data[pos] == 0 {
             pos += 1;
             continue;
         }
         if pos + 4 > n {
-            break;
+            if eof {
+                break;
+            }
+            continue;
         }
-        let reclen = u32le(&data, pos) as usize;
+        let reclen = u32le(data, pos) as usize;
         // A corrupt record length must not hide valid records that follow.
         // USN records are 8-byte aligned, so resynchronize conservatively.
-        if reclen < 60 || reclen > n.saturating_sub(pos) {
+        if !(60..=MAX_RECLEN).contains(&reclen) {
             pos = (pos + 8).min(n);
             continue;
         }
-        let major = u16le(&data, pos + 4);
+        if reclen > n - pos {
+            if eof {
+                // 파일 끝에서 잘린 레코드 — 종전 동작대로 재동기화.
+                pos = (pos + 8).min(n);
+                continue;
+            }
+            // 창 끝에 걸린 레코드 — 리필 후 다시 본다.
+            continue;
+        }
+        let major = u16le(data, pos + 4);
         let advance = (reclen + 7) & !7;
 
         let (file_ref, parent_ref, hdr): (u128, u128, usize) = match major {
             2 => (
-                u64le(&data, pos + 8) as u128,
-                u64le(&data, pos + 16) as u128,
+                u64le(data, pos + 8) as u128,
+                u64le(data, pos + 16) as u128,
                 pos + 24,
             ),
-            3 => (u128le(&data, pos + 8), u128le(&data, pos + 24), pos + 40),
+            3 => (u128le(data, pos + 8), u128le(data, pos + 24), pos + 40),
             _ => {
                 pos += advance;
                 continue;
@@ -131,14 +176,14 @@ pub fn parse_usn_stream(path: &Path, out: &Path) -> Result<usize> {
             pos += advance.min(n - pos);
             continue;
         }
-        let usn = u64le(&data, hdr);
-        let ts = u64le(&data, hdr + 8) as i64;
-        let reason = u32le(&data, hdr + 16);
-        let source_info = u32le(&data, hdr + 20);
-        let security_id = u32le(&data, hdr + 24);
-        let attrs = u32le(&data, hdr + 28);
-        let name_len = u16le(&data, hdr + 32) as usize;
-        let name_off = u16le(&data, hdr + 34) as usize;
+        let usn = u64le(data, hdr);
+        let ts = u64le(data, hdr + 8) as i64;
+        let reason = u32le(data, hdr + 16);
+        let source_info = u32le(data, hdr + 20);
+        let security_id = u32le(data, hdr + 24);
+        let attrs = u32le(data, hdr + 28);
+        let name_len = u16le(data, hdr + 32) as usize;
+        let name_off = u16le(data, hdr + 34) as usize;
         // 파일명 범위는 파일 끝이 아니라 "이 레코드"의 경계로 검증한다 —
         // 조작된 오프셋/길이가 다음 레코드나 슬랙 바이트를 이름으로 읽으면
         // 실제 USN·MFT 참조에 존재하지 않는 파일명을 결합한 허위 행이 되므로,

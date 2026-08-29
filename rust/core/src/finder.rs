@@ -1,9 +1,8 @@
 //! File discovery, mirroring common/finder.py: by exact name, extension,
-//! suffix, or content marker; plus dedupe_by_content (drop byte-identical
-//! copies). Recursive walk of the target tree.
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
-use std::io::{Read, Seek, SeekFrom};
+//! suffix, or content marker. Recursive walk of the target tree.
+//! 수집기는 같은 파일을 두 경로에 두지 않는다는 운영 전제에 따라(2026-08-30
+//! 사용자 확정) 내용 지문 기반 중복 제거는 두지 않는다 — 발견된 파일은 전부
+//! 파싱 계획에 포함되어 증거가 접혀 사라지는 일이 없다.
 use std::path::{Path, PathBuf};
 
 use walkdir::WalkDir;
@@ -72,49 +71,4 @@ pub fn by_content(root: &Path, marker: &str) -> Vec<PathBuf> {
                 || head.windows(utf16.len()).any(|w| w == utf16.as_slice())
         })
         .collect()
-}
-
-/// Drop byte-identical copies (a collector saving the same file under two
-/// category folders). Keeps first occurrence.
-/// A cheap content fingerprint: file size + a hash of the first and last 64 KB.
-/// Byte-identical files share it; distinct files (which diverge in the hive
-/// header/first pages and/or the tail) don't. Bounded to 128 KB/file so a
-/// 100 MB+ registry hive or a 1 GB $MFT isn't slurped whole just to de-dup —
-/// the parser reads the real bytes afterward anyway.
-fn content_key(p: &Path) -> Option<(u64, u64)> {
-    const CHUNK: usize = 64 * 1024;
-    let mut f = std::fs::File::open(p).ok()?;
-    let len = f.metadata().ok()?.len();
-    let mut h = DefaultHasher::new();
-    len.hash(&mut h);
-    if len as usize <= CHUNK * 2 {
-        let mut buf = Vec::new();
-        f.read_to_end(&mut buf).ok()?;
-        buf.hash(&mut h);
-    } else {
-        let mut head = vec![0u8; CHUNK];
-        f.read_exact(&mut head).ok()?;
-        head.hash(&mut h);
-        f.seek(SeekFrom::End(-(CHUNK as i64))).ok()?;
-        let mut tail = vec![0u8; CHUNK];
-        f.read_exact(&mut tail).ok()?;
-        tail.hash(&mut h);
-    }
-    Some((len, h.finish()))
-}
-
-pub fn dedupe_by_content(paths: Vec<PathBuf>) -> Vec<PathBuf> {
-    let mut seen = std::collections::HashSet::new();
-    let mut out = Vec::new();
-    for p in paths {
-        match content_key(&p) {
-            Some(key) => {
-                if seen.insert(key) {
-                    out.push(p);
-                }
-            }
-            None => out.push(p), // unreadable — keep it (parser will report)
-        }
-    }
-    out
 }

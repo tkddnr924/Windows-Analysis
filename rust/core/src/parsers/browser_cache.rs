@@ -57,43 +57,39 @@ fn is_displayable(ct: &str) -> bool {
 
 /// Decode a cached body per its Content-Encoding (Chrome stores it as received).
 /// Falls back to the raw bytes if the encoding is unknown or decoding fails.
+/// 해제 스트림은 DECODED_CAP+1 바이트에서 끊어 읽는다 — 사후 길이 검사만으로는
+/// 압축 폭탄이 검사 전에 무제한 메모리를 삼키므로, 상한 초과분은 호출부의
+/// 기존 길이 검사가 거부하도록 cap+1까지만 만든다.
 fn decode_body(raw: &[u8], encoding: &str) -> Vec<u8> {
-    use std::io::Read;
-    let enc = encoding.to_lowercase();
-    if enc.contains("br") {
+    fn bounded<R: std::io::Read>(reader: R) -> Option<Vec<u8>> {
+        use std::io::Read;
         let mut out = Vec::new();
-        if brotli::Decompressor::new(raw, 4096)
+        if reader
+            .take(DECODED_CAP as u64 + 1)
             .read_to_end(&mut out)
             .is_ok()
             && !out.is_empty()
         {
+            Some(out)
+        } else {
+            None
+        }
+    }
+    let enc = encoding.to_lowercase();
+    if enc.contains("br") {
+        if let Some(out) = bounded(brotli::Decompressor::new(raw, 4096)) {
             return out;
         }
     } else if enc.contains("gzip") {
-        let mut out = Vec::new();
-        if flate2::read::GzDecoder::new(raw)
-            .read_to_end(&mut out)
-            .is_ok()
-            && !out.is_empty()
-        {
+        if let Some(out) = bounded(flate2::read::GzDecoder::new(raw)) {
             return out;
         }
     } else if enc.contains("deflate") {
-        let mut out = Vec::new();
-        if flate2::read::ZlibDecoder::new(raw)
-            .read_to_end(&mut out)
-            .is_ok()
-            && !out.is_empty()
-        {
+        if let Some(out) = bounded(flate2::read::ZlibDecoder::new(raw)) {
             return out;
         }
-        let mut out2 = Vec::new();
-        if flate2::read::DeflateDecoder::new(raw)
-            .read_to_end(&mut out2)
-            .is_ok()
-            && !out2.is_empty()
-        {
-            return out2;
+        if let Some(out) = bounded(flate2::read::DeflateDecoder::new(raw)) {
+            return out;
         }
     }
     raw.to_vec()
@@ -186,12 +182,16 @@ impl Cache {
         let file_type = (addr >> 28) & 0x7;
         if file_type == 0 {
             let f = self.dir.join(format!("f_{:06x}", addr & 0x0FFF_FFFF));
-            let data = std::fs::read(f).unwrap_or_default();
-            return if size > 0 {
-                data.into_iter().take(size).collect()
-            } else {
-                data
-            };
+            // 외부 캐시 파일(f_######)은 통째로 읽지 않는다 — 엔트리가 주장한
+            // 길이와 무관하게 실제 파일은 수백 MiB일 수 있으므로 요청 길이만,
+            // 길이 미지정·과대 주장 경로(헤더 등)는 RAW_CAP까지만 읽는다.
+            let limit = if size > 0 { size.min(RAW_CAP) } else { RAW_CAP };
+            let mut out = Vec::new();
+            if let Ok(file) = std::fs::File::open(f) {
+                use std::io::Read;
+                let _ = file.take(limit as u64).read_to_end(&mut out);
+            }
+            return out;
         }
         let bs = match block_size(file_type) {
             Some(b) => b,
@@ -514,6 +514,60 @@ pub fn parse_cache_index(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_body_bounds_decompression_memory() {
+        use std::io::Write;
+        // 8 MiB 제로 본문 — DECODED_CAP(4 MiB)을 넘게 팽창하는 고압축 입력.
+        // 해제 결과는 cap+1 바이트에서 끊겨야 하고(메모리 상한), 호출부의
+        // 길이 검사가 그 값을 거부한다.
+        let plain = vec![0u8; 8 * 1024 * 1024];
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(&plain).unwrap();
+        let gz = gz.finish().unwrap();
+        assert_eq!(decode_body(&gz, "gzip").len(), DECODED_CAP + 1);
+
+        let mut zl = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        zl.write_all(&plain).unwrap();
+        let zl = zl.finish().unwrap();
+        assert_eq!(decode_body(&zl, "deflate").len(), DECODED_CAP + 1);
+
+        let mut br = Vec::new();
+        {
+            let mut w = brotli::CompressorWriter::new(&mut br, 4096, 5, 22);
+            w.write_all(&plain).unwrap();
+        }
+        assert_eq!(decode_body(&br, "br").len(), DECODED_CAP + 1);
+
+        // 상한 이내의 정상 본문은 온전히 해제된다.
+        let small = b"hello cache body".repeat(64);
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(&small).unwrap();
+        let gz = gz.finish().unwrap();
+        assert_eq!(decode_body(&gz, "gzip"), small);
+    }
+
+    #[test]
+    fn external_cache_file_read_is_bounded() {
+        let root = std::env::temp_dir().join(format!(
+            "wina-cache-extfile-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        // 실제 외부 파일은 RAW_CAP보다 크다 — 엔트리가 주장한 길이(작음)나
+        // 길이 미지정 경로 모두 요청 상한을 넘겨 읽으면 안 된다.
+        std::fs::write(root.join("f_000001"), vec![0u8; RAW_CAP + 1024 * 1024]).unwrap();
+        let mut cache = Cache::new(root.clone());
+        let addr = 0x8000_0001u32; // external file #1
+        assert_eq!(cache.read(addr, 100).len(), 100);
+        assert_eq!(cache.read(addr, 0).len(), RAW_CAP);
+        assert_eq!(cache.read(addr, usize::MAX).len(), RAW_CAP);
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[test]
     fn cache_outputs_skips_invalid_or_unreadable_indexes() {

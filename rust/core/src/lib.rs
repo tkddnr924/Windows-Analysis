@@ -5,6 +5,7 @@ pub mod case_store;
 pub mod finder;
 pub mod hex;
 pub mod overview;
+pub mod shellbag;
 pub mod parsers;
 pub mod pipeline;
 pub mod sqlite;

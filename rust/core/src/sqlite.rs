@@ -11,6 +11,12 @@ use rusqlite::Connection;
 /// written as "" (matching the Python `.get(f, "")`).
 pub type Row = BTreeMap<String, String>;
 
+/// SQLite 식별자 인용 — 원본에서 온 테이블·열 이름(증거 데이터)에 큰따옴표가
+/// 있어도 DROP/CREATE/INSERT가 깨지지 않게 SQLite 규칙(`""`)으로 이스케이프한다.
+pub fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
 pub fn write_table(
     db_path: &Path,
     table_name: &str,
@@ -25,8 +31,22 @@ pub fn write_table(
     // 필요 없다 — StreamWriter와 같은 설정으로 대량 insert를 빠르게 한다.
     conn.pragma_update(None, "journal_mode", "OFF").ok();
     conn.pragma_update(None, "synchronous", "OFF").ok();
-    conn.execute(&format!("DROP TABLE IF EXISTS \"{}\"", table_name), [])?;
+    conn.execute(&format!("DROP TABLE IF EXISTS {}", quote_ident(table_name)), [])?;
     if rows.is_empty() {
+        // 0건 결과도 스키마는 남긴다 — parse_report가 "0행 발행"으로 기록한
+        // derived 테이블을 뷰어·검증 도구가 sqlite_master에서 찾을 수 있어야
+        // 보고서와 저장소의 계약이 일치한다. 고정 컬럼을 받은 경우에만 가능.
+        if !preferred_order.is_empty() {
+            let cols_sql = preferred_order
+                .iter()
+                .map(|c| format!("{} TEXT", quote_ident(c)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            conn.execute(
+                &format!("CREATE TABLE {} ({})", quote_ident(table_name), cols_sql),
+                [],
+            )?;
+        }
         return Ok(());
     }
 
@@ -52,23 +72,25 @@ pub fn write_table(
 
     let cols_sql = columns
         .iter()
-        .map(|c| format!("\"{}\" TEXT", c))
+        .map(|c| format!("{} TEXT", quote_ident(c)))
         .collect::<Vec<_>>()
         .join(", ");
     conn.execute(
-        &format!("CREATE TABLE \"{}\" ({})", table_name, cols_sql),
+        &format!("CREATE TABLE {} ({})", quote_ident(table_name), cols_sql),
         [],
     )?;
 
     let placeholders = vec!["?"; columns.len()].join(", ");
     let quoted = columns
         .iter()
-        .map(|c| format!("\"{}\"", c))
+        .map(|c| quote_ident(c))
         .collect::<Vec<_>>()
         .join(", ");
     let insert_sql = format!(
-        "INSERT INTO \"{}\" ({}) VALUES ({})",
-        table_name, quoted, placeholders
+        "INSERT INTO {} ({}) VALUES ({})",
+        quote_ident(table_name),
+        quoted,
+        placeholders
     );
 
     let tx = conn.transaction()?;
@@ -106,7 +128,7 @@ pub fn write_table_cols(
     let mut conn = Connection::open(db_path)?;
     conn.pragma_update(None, "journal_mode", "OFF").ok();
     conn.pragma_update(None, "synchronous", "OFF").ok();
-    conn.execute(&format!("DROP TABLE IF EXISTS \"{}\"", table_name), [])?;
+    conn.execute(&format!("DROP TABLE IF EXISTS {}", quote_ident(table_name)), [])?;
     if rows.is_empty() {
         return Ok(());
     }
@@ -127,22 +149,24 @@ pub fn write_table_cols(
     }
     let cols_sql = columns
         .iter()
-        .map(|c| format!("\"{}\" TEXT", c))
+        .map(|c| format!("{} TEXT", quote_ident(c)))
         .collect::<Vec<_>>()
         .join(", ");
     conn.execute(
-        &format!("CREATE TABLE \"{}\" ({})", table_name, cols_sql),
+        &format!("CREATE TABLE {} ({})", quote_ident(table_name), cols_sql),
         [],
     )?;
     let placeholders = vec!["?"; columns.len()].join(", ");
     let quoted = columns
         .iter()
-        .map(|c| format!("\"{}\"", c))
+        .map(|c| quote_ident(c))
         .collect::<Vec<_>>()
         .join(", ");
     let insert_sql = format!(
-        "INSERT INTO \"{}\" ({}) VALUES ({})",
-        table_name, quoted, placeholders
+        "INSERT INTO {} ({}) VALUES ({})",
+        quote_ident(table_name),
+        quoted,
+        placeholders
     );
     let tx = conn.transaction()?;
     {
@@ -194,7 +218,7 @@ impl StreamWriter {
             std::fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(db_path)?;
-        conn.execute(&format!("DROP TABLE IF EXISTS \"{}\"", table_name), [])?;
+        conn.execute(&format!("DROP TABLE IF EXISTS {}", quote_ident(table_name)), [])?;
         conn.pragma_update(None, "journal_mode", "OFF").ok();
         conn.pragma_update(None, "synchronous", "OFF").ok();
 
@@ -216,22 +240,24 @@ impl StreamWriter {
 
         let cols_sql = columns
             .iter()
-            .map(|c| format!("\"{}\" TEXT", c))
+            .map(|c| format!("{} TEXT", quote_ident(c)))
             .collect::<Vec<_>>()
             .join(", ");
         conn.execute(
-            &format!("CREATE TABLE \"{}\" ({})", table_name, cols_sql),
+            &format!("CREATE TABLE {} ({})", quote_ident(table_name), cols_sql),
             [],
         )?;
         let placeholders = vec!["?"; columns.len()].join(", ");
         let quoted = columns
             .iter()
-            .map(|c| format!("\"{}\"", c))
+            .map(|c| quote_ident(c))
             .collect::<Vec<_>>()
             .join(", ");
         let insert_sql = format!(
-            "INSERT INTO \"{}\" ({}) VALUES ({})",
-            table_name, quoted, placeholders
+            "INSERT INTO {} ({}) VALUES ({})",
+            quote_ident(table_name),
+            quoted,
+            placeholders
         );
         Ok(Self {
             conn,
@@ -282,5 +308,77 @@ impl StreamWriter {
     pub fn finish(mut self) -> Result<usize> {
         self.flush()?;
         Ok(self.total)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_rows_with_fixed_columns_create_schema() {
+        let root = std::env::temp_dir().join(format!(
+            "wina-empty-schema-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("derived.sqlite");
+        // 0건 derived 결과도 보고서(0행 발행)와 저장소가 일치해야 한다 —
+        // 고정 컬럼이 주어지면 빈 테이블 스키마를 생성한다.
+        write_table(&db, "RegistryFindings", &[], &["timestamp", "category"]).unwrap();
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='RegistryFindings'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 1);
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM RegistryFindings", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn identifiers_with_quotes_roundtrip_safely() {
+        let root = std::env::temp_dir().join(format!(
+            "wina-quote-ident-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("quoted.sqlite");
+        // 원본 스키마·value name은 증거 데이터다 — 큰따옴표가 든 테이블·열
+        // 이름도 저장이 깨지면 안 된다.
+        let table = r#"evil"table"#;
+        let column = r#"va"lue"#;
+        let mut row = Row::new();
+        row.insert(column.to_string(), "x".to_string());
+        write_table(&db, table, &[row], &[]).unwrap();
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let count: i64 = conn
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {}", quote_ident(table)),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        let mut writer = StreamWriter::create(&db, table, &[column], &[]).unwrap();
+        let mut row = Row::new();
+        row.insert(column.to_string(), "y".to_string());
+        writer.push(row).unwrap();
+        assert_eq!(writer.finish().unwrap(), 1);
+        let _ = std::fs::remove_dir_all(root);
     }
 }

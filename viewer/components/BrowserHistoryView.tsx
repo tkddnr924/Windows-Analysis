@@ -753,8 +753,25 @@ function inlineMarkdown(text: string): React.ReactNode[] {
   });
 }
 
+// 표시용 정리 — 원문(raw JSON)은 모달에 그대로 남고, 채팅 버블에서만 과도한
+// 띄어쓰기·연속 빈 줄을 줄인다. 코드 펜스 안은 서식 자체가 의미라 건드리지
+// 않는다.
+function cleanAiText(text: string): string {
+  return text
+    .split(/(```[\s\S]*?```)/g)
+    .map((part) => {
+      if (part.startsWith("```")) return part;
+      return part
+        .replace(/[ \t]+$/gm, "")
+        .replace(/[ \t]{3,}/g, " ")
+        .replace(/\n{3,}/g, "\n\n");
+    })
+    .join("")
+    .trim();
+}
+
 function ChatMessageBody({ text }: { text: string }) {
-  const parts = text.split(/(```[\s\S]*?```)/g).filter(Boolean);
+  const parts = cleanAiText(text).split(/(```[\s\S]*?```)/g).filter(Boolean);
   return <>{parts.map((part, index) => {
     const isCode = part.startsWith("```") && part.endsWith("```");
     if (isCode) return <pre key={index} style={{ maxWidth: "100%", margin: index === 0 ? 0 : "8px 0 0", padding: "8px 10px", overflow: "auto", background: "var(--bg)", border: "1px solid var(--border-subtle)", borderRadius: "var(--radius-sm)", color: "var(--text)", fontFamily: "var(--mono)", fontSize: 11.5, lineHeight: 1.5, whiteSpace: "pre" }}>{part.replace(/^```[^\n]*\n?/, "").replace(/```$/, "")}</pre>;

@@ -159,6 +159,8 @@ export interface ParseReport {
   published?: boolean;
   errors?: string[];
   registryHives?: ParseReportRegistryHive[];
+  /** Per-hive Amcache transaction-log outcome; mirrors registryHives. */
+  amcacheHives?: ParseReportAmcacheHive[];
   /** Recovery policy used by this run; disabled means live hive records only. */
   registryRecovery?: ParseReportRegistryRecovery;
   /** Parser stages that completed; this does not imply their results were published. */
@@ -186,6 +188,25 @@ export interface ParseReportRegistryHive {
   recoveryPermitWaitMs?: number;
   buildRecoveryMs: number;
   iterationAndSqliteWriteMs: number;
+  error?: string;
+}
+
+export interface MftChildrenPage {
+  rows: Record<string, string>[];
+  /** 첫 페이지(offset 0)에서만 계산된다. 후속 페이지는 -1 — 호출자가 보관한 값을 쓴다. */
+  total: number;
+}
+
+export interface ParseReportAmcacheHive {
+  sourcePath: string;
+  status: "completed" | "skipped_corrupted" | string;
+  /** Sibling LOG1/LOG2 files found beside the hive. */
+  logsDiscovered: number;
+  /** Transaction logs actually applied; 0 after a no-log fallback. */
+  logsApplied: number;
+  /** Why discovered logs could not be applied (primary hive parsed without them). */
+  logApplyError?: string;
+  /** Why the hive itself was skipped as corrupted. */
   error?: string;
 }
 
@@ -452,7 +473,7 @@ export interface ElectronApi {
   browserActivityPage(fullPath: string, tableName: string, query: BrowserActivityQuery): Promise<CsvData>;
   accountEventPage(sources: AccountEventSource[], query: AccountEventQuery): Promise<AccountEventPage>;
   aiReferrals(fullPath: string, tableName: string, start: string | undefined, end: string | undefined, offset: number, limit: number): Promise<CsvData>;
-  mftChildren(fullPath: string, parentEntry: number): Promise<Record<string, string>[]>;
+  mftChildren(fullPath: string, parentEntry: number, offset?: number, limit?: number): Promise<MftChildrenPage>;
   mftSearch(fullPath: string, query: string, limit: number): Promise<Record<string, string>[]>;
   mftRow(fullPath: string, rowid: number): Promise<Record<string, string> | null>;
   mftRecordsPage(fullPath: string, query: string, offset: number, limit: number, options?: { sortKey?: string; sortDesc?: boolean; filesOnly?: boolean; namePattern?: string; timeKey?: string; timeStart?: string; timeEnd?: string }): Promise<MftRecordsPage>;
@@ -462,7 +483,8 @@ export interface ElectronApi {
   toggleBookmark(hostDir: string, entry: BookmarkInput): Promise<Bookmark[]>;
   updateBookmarkNote(hostDir: string, id: string, note: string): Promise<Bookmark[]>;
   /** Cross-artifact references to filesystem paths for a host. */
-  pathReferences(hostDir: string): Promise<PathReference[]>;
+  pathReferences(hostDir: string, paths: string[]): Promise<PathReference[]>;
+  pathReferenceAccounts(hostDir: string): Promise<string[]>;
   /** Fetch an IPC-bounded preview for one exact cache record. An empty bodyB64
    * means the parser did not retain a recoverable response body. */
   cacheEntryBody(hostDir: string, account: string, url: string, cacheKey: string): Promise<CacheBodyPreview>;

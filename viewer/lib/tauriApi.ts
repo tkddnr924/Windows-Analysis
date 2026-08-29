@@ -50,7 +50,7 @@ function makeApi(): ElectronApi {
     browserActivityPage: (fullPath, tableName, query) => invoke<CsvData>("browser_activity_page", { fullPath, tableName, query }),
     accountEventPage: (sources: AccountEventSource[], query: AccountEventQuery) => invoke<AccountEventPage>("account_event_page", { sources, query }),
     aiReferrals: (fullPath, tableName, start, end, offset, limit) => invoke<CsvData>("ai_referrals", { fullPath, tableName, start, end, offset, limit }),
-    mftChildren: (fullPath, parentEntry) => invoke<Record<string, string>[]>("mft_children", { fullPath, parentEntry }),
+    mftChildren: (fullPath, parentEntry, offset, limit) => invoke<import("./types").MftChildrenPage>("mft_children", { fullPath, parentEntry, offset, limit }),
     mftSearch: (fullPath, query, limit) => invoke<Record<string, string>[]>("mft_search", { fullPath, query, limit }),
     mftRow: (fullPath, rowid) => invoke<Record<string, string> | null>("mft_row", { fullPath, rowid }),
     mftRecordsPage: (fullPath, query, offset, limit, options) => invoke<MftRecordsPage>("mft_records_page", { fullPath, query, offset, limit, sortKey: options?.sortKey ?? null, sortDesc: options?.sortDesc ?? null, filesOnly: options?.filesOnly ?? null, namePattern: options?.namePattern ?? null, timeKey: options?.timeKey ?? null, timeStart: options?.timeStart ?? null, timeEnd: options?.timeEnd ?? null }),
@@ -62,7 +62,8 @@ function makeApi(): ElectronApi {
     updateBookmarkNote: (caseDir, id, note) => invoke<Bookmark[]>("update_bookmark_note", { caseDir, id, note }),
     saveMasterTimeline: (hostDir, payload) => invoke<void>("save_master_timeline", { hostDir, payload }),
     loadMasterTimeline: (hostDir) => invoke<string | null>("load_master_timeline", { hostDir }),
-    pathReferences: (hostDir) => invoke<PathReference[]>("path_references", { hostDir }),
+    pathReferences: (hostDir, paths) => invoke<PathReference[]>("path_references", { hostDir, paths }),
+    pathReferenceAccounts: (hostDir) => invoke<string[]>("path_reference_accounts", { hostDir }),
     cacheEntryBody: (hostDir, account, url, cacheKey) => invoke<CacheBodyPreview>("cache_entry_body", { hostDir, account, url, cacheKey }),
     aiConversations: (hostDir, query) => invoke<AiConversationPage>("ai_conversations", { hostDir, query }),
   };

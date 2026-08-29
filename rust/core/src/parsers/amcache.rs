@@ -4,9 +4,8 @@
 //! Files use the same snake_case column names + sha1/file_id handling as the
 //! Python parser (regipy's AmCachePlugin) so it feeds the execution-history
 //! overview identically.
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use crate::parsers::registry::sibling_logs;
 use anyhow::Result;
 use notatin::cell_value::CellValue;
 use notatin::parser::ParserIterator;
@@ -143,15 +142,17 @@ pub struct AmcacheParse {
     pub log_apply_error: Option<String>,
 }
 
-pub fn parse_amcache(hive: &Path) -> Result<AmcacheParse> {
+/// `logs`는 호출자가 확정한 파싱 계획의 트랜잭션 로그 목록이다 — 파서가
+/// 디렉터리를 재탐색하지 않아야 보고서의 입력 목록·logsDiscovered와 실제
+/// 적용 로그가 항상 같은 스냅샷을 가리킨다.
+pub fn parse_amcache(hive: &Path, logs: &[PathBuf]) -> Result<AmcacheParse> {
     let source = hive.to_string_lossy().to_string();
-    let logs = sibling_logs(hive);
     let make_builder = |with_logs: bool| {
         // notatin stores the path, so a borrowed &Path fails the 'static bound.
         #[allow(clippy::unnecessary_to_owned)]
         let mut builder = ParserBuilder::from_path(hive.to_path_buf());
         if with_logs {
-            for log in &logs {
+            for log in logs {
                 builder.with_transaction_log(log.clone());
             }
         }

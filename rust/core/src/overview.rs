@@ -259,7 +259,7 @@ fn earlier(candidate: &str, current: &str) -> bool {
 }
 
 // --- Defender ("Windows Defender") ---
-const DEF_KEYS: &[&str] = &[
+pub const DEF_KEYS: &[&str] = &[
     "section",
     "timestamp",
     "event_id",
@@ -1146,6 +1146,19 @@ fn ts_epoch(ts: &str) -> Option<f64> {
     None
 }
 
+/// RemoteDesktopHistory 파생 테이블의 고정 컬럼 (0건 스키마 생성용).
+pub const RDP_KEYS: &[&str] = &[
+    "timestamp",
+    "account",
+    "description",
+    "direction",
+    "event_id",
+    "provider",
+    "remote_address",
+    "result",
+    "record_key",
+];
+
 pub fn build_remote_desktop_history(out_dir: &Path) -> Vec<Row> {
     build_remote_desktop_history_with_events(&EventLogOverviewCache::load(out_dir))
 }
@@ -1410,6 +1423,26 @@ fn to_int(v: Option<&serde_json::Value>, default: i64) -> i64 {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// PowerShellHistory 파생 테이블의 고정 컬럼 — 0건에도 스키마를 만들 수
+/// 있게 발행 측(write_ov)이 사용한다. script_block_status는 분할 4104가
+/// 불완전할 때만 값이 생기는 상태 컬럼이다.
+pub const PS_KEYS: &[&str] = &[
+    "timestamp",
+    "account",
+    "process",
+    "process_id",
+    "command",
+    "script_block",
+    "host_application",
+    "kind",
+    "event_id",
+    "provider",
+    "script_path",
+    "record_key",
+    "script_block_status",
+];
+
+#[allow(clippy::too_many_arguments)] // PowerShellHistory 행 고정 필드 세트
 fn ps_row(
     timestamp: &str,
     account: &str,
@@ -1459,17 +1492,22 @@ pub fn build_powershell_history_with_events(
         }
     };
     let mut rows: Vec<Row> = Vec::new();
-    // (parts: BTreeMap<i64,String>, timestamp, sid, pid, rk, path)
-    type BlockEntry = (
-        std::collections::BTreeMap<i64, String>,
-        String,
-        String,
-        String,
-        String,
-        String,
-    );
+    // 재조합 중인 분할 ScriptBlock — 완전성 검증을 위해 기대 조각 수와
+    // 이상(누락·중복·범위 밖·총수 불일치)을 함께 추적한다. EVTX 손상·유실로
+    // 조각이 빠져도 최선의 본문은 남기되 불완전함을 표시해, 잘린 문자열이
+    // 완전한 원문으로 오인되지 않게 한다.
+    struct ScriptBlockParts {
+        parts: std::collections::BTreeMap<i64, String>,
+        timestamp: String,
+        sid: String,
+        pid: String,
+        record_key: String,
+        path: String,
+        expected_total: i64,
+        anomalies: Vec<String>,
+    }
     let mut block_keys: Vec<String> = Vec::new();
-    let mut blocks: std::collections::HashMap<String, BlockEntry> =
+    let mut blocks: std::collections::HashMap<String, ScriptBlockParts> =
         std::collections::HashMap::new();
 
     for r in events.rows() {
@@ -1492,21 +1530,47 @@ pub fn build_powershell_history_with_events(
                     block_keys.push(sbid.clone());
                     blocks.insert(
                         sbid.clone(),
-                        (
-                            std::collections::BTreeMap::new(),
-                            ts.clone(),
-                            sid.clone(),
-                            pid.clone(),
-                            rk.clone(),
-                            path.clone(),
-                        ),
+                        ScriptBlockParts {
+                            parts: std::collections::BTreeMap::new(),
+                            timestamp: ts.clone(),
+                            sid: sid.clone(),
+                            pid: pid.clone(),
+                            record_key: rk.clone(),
+                            path: path.clone(),
+                            expected_total: total,
+                            anomalies: Vec::new(),
+                        },
                     );
                 }
                 let slot = blocks.get_mut(&sbid).unwrap();
-                slot.0.insert(num, text);
-                if !ts.is_empty() && (slot.1.is_empty() || ts < slot.1) {
-                    slot.1 = ts.clone();
-                    slot.4 = rk.clone();
+                if total != slot.expected_total {
+                    let note = format!(
+                        "총 조각 수 불일치({} vs {})",
+                        slot.expected_total, total
+                    );
+                    if !slot.anomalies.contains(&note) {
+                        slot.anomalies.push(note);
+                    }
+                }
+                if num < 1 || num > slot.expected_total.max(total) {
+                    slot.anomalies.push(format!("범위 밖 조각 번호 {}", num));
+                }
+                match slot.parts.get(&num) {
+                    // 같은 번호가 다른 내용으로 오면 어느 쪽이 진짜인지 알 수
+                    // 없다 — 나중 값을 쓰되 이상으로 남긴다. 동일 내용 중복은
+                    // 로그 중복 수집의 정상 잔상이라 조용히 무시한다.
+                    Some(existing) if *existing != text => {
+                        slot.anomalies.push(format!("조각 {} 중복(내용 상이)", num));
+                        slot.parts.insert(num, text);
+                    }
+                    Some(_) => {}
+                    None => {
+                        slot.parts.insert(num, text);
+                    }
+                }
+                if !ts.is_empty() && (slot.timestamp.is_empty() || ts < slot.timestamp) {
+                    slot.timestamp = ts.clone();
+                    slot.record_key = rk.clone();
                 }
                 continue;
             }
@@ -1713,27 +1777,42 @@ pub fn build_powershell_history_with_events(
 
     for k in &block_keys {
         let slot = &blocks[k];
-        let text: String = slot.0.values().cloned().collect();
-        rows.push(ps_row(
-            &slot.1,
-            &account_for(&slot.2),
+        let text: String = slot.parts.values().cloned().collect();
+        let missing: Vec<String> = (1..=slot.expected_total)
+            .filter(|n| !slot.parts.contains_key(n))
+            .map(|n| n.to_string())
+            .collect();
+        let mut anomalies = slot.anomalies.clone();
+        if !missing.is_empty() {
+            anomalies.push(format!("누락 조각: {}", missing.join(",")));
+        }
+        let mut row = ps_row(
+            &slot.timestamp,
+            &account_for(&slot.sid),
             "powershell.exe",
-            &slot.3,
+            &slot.pid,
             "",
             &text,
             "",
             "스크립트 블록",
             "4104",
             "Microsoft-Windows-PowerShell",
-            &slot.5,
-            &slot.4,
-        ));
+            &slot.path,
+            &slot.record_key,
+        );
+        if !anomalies.is_empty() {
+            row.insert(
+                "script_block_status".into(),
+                format!("불완전 — {}", anomalies.join(" · ")),
+            );
+        }
+        rows.push(row);
     }
     rows
 }
 
 // --- BrowserActivity ("BrowserActivity") — visits + downloads + cache ---
-const BH_KEYS: &[&str] = &[
+pub const BH_KEYS: &[&str] = &[
     "account",
     "kind",
     "timestamp",
@@ -2074,7 +2153,7 @@ pub fn build_browser_history(out_dir: &Path) -> Vec<Row> {
 }
 
 // --- TargetInfo ("TargetInfo") — system / accounts / networks / interfaces ---
-const TI_KEYS: &[&str] = &[
+pub const TI_KEYS: &[&str] = &[
     "timestamp",
     "category",
     "name",
@@ -2843,7 +2922,7 @@ pub fn build_target_info_with_registry(registry: &RegistryOverviewCache) -> Vec<
 }
 
 // --- ExecutionHistory ("ExecutionHistory") — amcache + userassist + srum + bam ---
-const ROW_KEYS: &[&str] = &[
+pub const ROW_KEYS: &[&str] = &[
     "timestamp",
     "program_name",
     "program_path",
@@ -3182,7 +3261,7 @@ pub fn build_execution_history_with_registry(
 }
 
 // --- RegistryFindings ("레지스트리 특이사항") ---
-const RF_KEYS: &[&str] = &[
+pub const RF_KEYS: &[&str] = &[
     "timestamp",
     "category",
     "name",
@@ -4957,6 +5036,158 @@ fn rf_shimcache(hives: &[RegistryOverviewHive]) -> Vec<Row> {
     rows
 }
 
+/// MFT 탐색기 교차 참조 태그용 파생 테이블(PathReferences)의 고정 컬럼.
+pub const PR_KEYS: &[&str] = &[
+    "path",
+    "kind",
+    "account",
+    "label",
+    "timestamp",
+    "target_path",
+    "app_id",
+    "jumplist_type",
+    "arguments",
+    "working_directory",
+    "machine_id",
+    "created_time",
+    "modified_time",
+    "_source_file",
+    "source_relative",
+    "source_table",
+    "source_rowid",
+];
+
+fn pr_row() -> Row {
+    let mut r = Row::new();
+    for k in PR_KEYS {
+        r.insert((*k).to_string(), String::new());
+    }
+    r
+}
+
+/// "C:\Users\x" → "\users\x" — $MFT 경로와 대조 가능한 볼륨 상대·소문자 키.
+fn to_volume_relative(p: &str) -> String {
+    let low = p.to_lowercase();
+    let b = low.as_bytes();
+    if b.len() >= 2 && b[1] == b':' && b[0].is_ascii_alphabetic() {
+        let rest = &low[2..];
+        if rest.is_empty() {
+            "\\".to_string()
+        } else if rest.starts_with('\\') {
+            rest.to_string()
+        } else {
+            format!("\\{}", rest)
+        }
+    } else {
+        low
+    }
+}
+
+/// per-user 아티팩트의 계정: LNK/JUMPLIST 수집 폴더 바로 다음 경로 조각.
+fn account_from_source(src: &str) -> String {
+    let parts: Vec<&str> = src.split(['/', '\\']).collect();
+    for (i, part) in parts.iter().enumerate() {
+        let up = part.to_uppercase();
+        if (up == "LNK" || up == "JUMPLIST") && i + 1 < parts.len() {
+            return parts[i + 1].to_string();
+        }
+    }
+    String::new()
+}
+
+/// $MFT 탐색기의 교차 참조(JumpList 대상 경로 + Shellbag 폴더 열람 흔적)를
+/// 파싱 단계에서 미리 조합해 derived로 저장한다 — 화면 진입마다 원본 전수
+/// 스캔·Shellbag 재구성을 하지 않기 위한 협약 이행. 뷰어는 이 테이블을
+/// 표시 중인 경로 배치로만 조회한다.
+pub fn build_path_references(out_dir: &Path, registry: &RegistryOverviewCache) -> Vec<Row> {
+    let mut rows = Vec::new();
+    let jumplist = out_dir.join("JUMPLIST").join("JumpList_Entries.sqlite");
+    for r in read_table_with_rowid(&jumplist, "JumpList_Entries") {
+        let target = r.get("target_path").cloned().unwrap_or_default();
+        if target.is_empty() {
+            continue;
+        }
+        let source = r.get("_source_file").cloned().unwrap_or_default();
+        let mut row = pr_row();
+        row.insert("path".into(), to_volume_relative(&target));
+        row.insert("kind".into(), "Jumplist".into());
+        row.insert("account".into(), account_from_source(&source));
+        row.insert("label".into(), target.clone());
+        row.insert("target_path".into(), target);
+        for k in [
+            "timestamp",
+            "app_id",
+            "jumplist_type",
+            "arguments",
+            "working_directory",
+            "machine_id",
+            "created_time",
+            "modified_time",
+            "_source_file",
+        ] {
+            if let Some(v) = r.get(k) {
+                row.insert((*k).to_string(), v.clone());
+            }
+        }
+        row.insert(
+            "source_relative".into(),
+            "JUMPLIST/JumpList_Entries.sqlite".into(),
+        );
+        row.insert("source_table".into(), "JumpList_Entries".into());
+        row.insert(
+            "source_rowid".into(),
+            r.get("__source_rowid").cloned().unwrap_or_else(|| "-1".into()),
+        );
+        rows.push(row);
+    }
+    // Shellbag — BagMRU 숫자 값(자식 셸 아이템)을 하이브별로 모아 재구성.
+    // 계정은 하이브 파일명의 사용자 접두(Administrator_UsrClass.dat 등).
+    let mut bag_rows: Vec<crate::shellbag::BagRow> = Vec::new();
+    for hive in registry.hives() {
+        let account = hive
+            .name
+            .split('_')
+            .next()
+            .unwrap_or(hive.name.as_str())
+            .to_string();
+        for r in &hive.rows {
+            let key_path = r.get("key_path").cloned().unwrap_or_default();
+            if !key_path.to_lowercase().contains("bagmru") {
+                continue;
+            }
+            let value_name = r.get("value_name").cloned().unwrap_or_default();
+            if !value_name
+                .chars()
+                .next()
+                .map(|c| c.is_ascii_digit())
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let data = unhex(&r.get("value_data").cloned().unwrap_or_default());
+            if data.is_empty() {
+                continue;
+            }
+            bag_rows.push(crate::shellbag::BagRow {
+                key_path,
+                value_name,
+                data,
+                account: account.clone(),
+            });
+        }
+    }
+    for bag in crate::shellbag::reconstruct(bag_rows) {
+        let mut row = pr_row();
+        row.insert("path".into(), bag.path);
+        row.insert("kind".into(), "Shellbag".into());
+        row.insert("account".into(), bag.account);
+        row.insert("label".into(), bag.display);
+        row.insert("source_rowid".into(), "-1".into());
+        rows.push(row);
+    }
+    rows
+}
+
 pub fn build_registry_findings(out_dir: &Path) -> Vec<Row> {
     let registry = RegistryOverviewCache::load(out_dir);
     build_registry_findings_with_registry(&registry)
@@ -5589,6 +5820,72 @@ mod tests {
         };
         assert_eq!(status_of("evil64.dll").as_deref(), Some("의심"));
         assert_eq!(status_of("evil32.dll").as_deref(), Some("주의"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn script_block_reassembly_flags_incomplete_fragments() {
+        let root = std::env::temp_dir().join(format!(
+            "wina-ps4104-parts-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        ));
+        let event_dir = root.join("EVENTLOG");
+        std::fs::create_dir_all(&event_dir).unwrap();
+        let conn = Connection::open(event_dir.join("PowerShell.sqlite")).unwrap();
+        conn.execute(
+            "CREATE TABLE PowerShell (Provider TEXT, EventID TEXT, EventData TEXT, UserID TEXT, ProcessID TEXT, timestamp TEXT, _record_key TEXT)",
+            [],
+        ).unwrap();
+        let insert = |sbid: &str, num: i64, total: i64, text: &str, rk: &str| {
+            conn.execute(
+                "INSERT INTO PowerShell VALUES ('Microsoft-Windows-PowerShell', '4104', ?1, 'S-1-5-21-1', '100', '2026-08-01 10:00:00.000', ?2)",
+                rusqlite::params![
+                    format!(
+                        r#"{{"ScriptBlockText":"{text}","ScriptBlockId":"{sbid}","MessageNumber":"{num}","MessageTotal":"{total}","Path":""}}"#
+                    ),
+                    rk,
+                ],
+            )
+            .unwrap();
+        };
+        // 정상 1..2 / 중간 누락 / 중복(내용 상이) / 범위 밖 번호 / 총수 불일치
+        insert("sb-full", 1, 2, "AA", "PowerShell::1");
+        insert("sb-full", 2, 2, "BB", "PowerShell::2");
+        insert("sb-miss", 1, 3, "M1", "PowerShell::3");
+        insert("sb-miss", 3, 3, "M3", "PowerShell::4");
+        insert("sb-dup", 1, 2, "D-first", "PowerShell::5");
+        insert("sb-dup", 1, 2, "D-second", "PowerShell::6");
+        insert("sb-dup", 2, 2, "D2", "PowerShell::7");
+        insert("sb-range", 1, 2, "R1", "PowerShell::8");
+        insert("sb-range", 5, 2, "R5", "PowerShell::9");
+        insert("sb-total", 1, 2, "T1", "PowerShell::10");
+        insert("sb-total", 2, 3, "T2", "PowerShell::11");
+        drop(conn);
+
+        let rows = build_powershell_history(&root);
+        let status_of = |needle: &str| -> Option<String> {
+            rows.iter()
+                .find(|row| {
+                    row.get("script_block")
+                        .map(|text| text.contains(needle))
+                        .unwrap_or(false)
+                })
+                .map(|row| row.get("script_block_status").cloned().unwrap_or_default())
+        };
+        // 완전한 블록은 상태 표시가 없어야 한다.
+        assert_eq!(status_of("AABB").as_deref(), Some(""));
+        let miss = status_of("M1M3").expect("missing-fragment block");
+        assert!(miss.contains("불완전") && miss.contains("누락 조각: 2"), "{miss}");
+        let dup = status_of("D-secondD2").expect("duplicate-fragment block");
+        assert!(dup.contains("조각 1 중복(내용 상이)"), "{dup}");
+        let range = status_of("R1").expect("out-of-range block");
+        assert!(range.contains("범위 밖 조각 번호 5"), "{range}");
+        let total = status_of("T1T2").expect("total-mismatch block");
+        assert!(total.contains("총 조각 수 불일치(2 vs 3)"), "{total}");
         let _ = std::fs::remove_dir_all(root);
     }
 

@@ -28,6 +28,9 @@ import RowDetailPanel from "./RowDetailPanel";
 
 type Row = Record<string, string>;
 
+// 폴더 펼치기 한 페이지의 자식 수 — 초과분은 "더 불러오기"로 이어 받는다.
+const MFT_CHILDREN_PAGE = 100;
+
 const ROOT_ENTRY = 5;
 const LIST_FETCH_SIZE = 200; // lazy 로딩 배치 크기
 const LIST_ROW_HEIGHT = 56;
@@ -102,11 +105,14 @@ function fmtSize(v: string): string {
 }
 
 export default function MftView({ dbPath, tableBookmarks, onToggleBookmark, allBookmarks, onBookmarkRef }: Props) {
-  const [root, setRoot] = useState<Row[] | null>(null);
-  const [childrenCache, setChildrenCache] = useState<Record<string, Row[]>>({});
+  const [root, setRoot] = useState<{ rows: Row[]; total: number } | null>(null);
+  const [childrenCache, setChildrenCache] = useState<Record<string, { rows: Row[]; total: number }>>({});
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [loadingEntry, setLoadingEntry] = useState<Set<string>>(new Set());
   const [failedEntries, setFailedEntries] = useState<Set<string>>(new Set());
+  // 첫 페이지는 받았는데 "더 불러오기"만 실패한 폴더 — 최초 실패와 분리해야
+  // 이미 적재된 행이 오류 문구에 가려지지 않고, 버튼으로 재시도할 수 있다.
+  const [loadMoreFailed, setLoadMoreFailed] = useState<Set<string>>(new Set());
   const [rootError, setRootError] = useState<string | null>(null);
   const [selected, setSelected] = useState<Row | null>(null);
   const [referenceDetail, setReferenceDetail] = useState<PathReference | null>(null);
@@ -120,33 +126,29 @@ export default function MftView({ dbPath, tableBookmarks, onToggleBookmark, allB
   const [refAccounts, setRefAccounts] = useState<string[]>([]);
   const [selAccounts, setSelAccounts] = useState<Set<string>>(new Set());
 
+  // 교차 참조는 파싱 단계에서 만든 _OVERVIEW/PathReferences 파생 테이블을
+  // "지금 화면에 로드된 경로"만 배치로 조회한다 — 화면 진입 시 전체
+  // JumpList·Shellbag을 재구성해 통째로 들고 있던 방식을 대체 (협약: 즉석
+  // 가공 금지). 계정 필터 목록은 파생 테이블 집계로 따로 받는다.
+  const requestedRefPaths = useRef<Set<string>>(new Set());
   useEffect(() => {
+    requestedRefPaths.current = new Set();
+    setPathRefs(new Map());
+    setPathRefsError(null);
     let alive = true;
-    window.api.pathReferences(hostDirOf(dbPath)).then((list) => {
+    window.api.pathReferenceAccounts(hostDirOf(dbPath)).then((accounts) => {
       if (!alive) return;
-      const m: RefMap = new Map();
-      const accts = new Set<string>();
-      for (const r of list) {
-        const arr = m.get(r.path);
-        if (arr) arr.push(r); else m.set(r.path, [r]);
-        accts.add(r.account);
-      }
-      const sorted = [...accts].sort((a, b) => a.localeCompare(b));
-      setPathRefs(m);
-      setRefAccounts(sorted);
-      setSelAccounts(new Set(sorted)); // default: all accounts shown
-      setPathRefsError(null);
+      setRefAccounts(accounts);
+      setSelAccounts(new Set(accounts)); // default: all accounts shown
     }).catch(() => {
       if (!alive) return;
-      // $MFT evidence remains usable without optional cross-artifact tags;
-      // make that degraded state explicit instead of silently looking empty.
-      setPathRefs(new Map());
       setRefAccounts([]);
       setSelAccounts(new Set());
-      setPathRefsError("교차 참조 정보를 불러오지 못했습니다.");
     });
     return () => { alive = false; };
   }, [dbPath]);
+
+
 
   const toggleAccount = useCallback((acct: string) => {
     setSelAccounts((s) => { const n = new Set(s); if (n.has(acct)) n.delete(acct); else n.add(acct); return n; });
@@ -159,6 +161,44 @@ export default function MftView({ dbPath, tableBookmarks, onToggleBookmark, allB
   const [searchError, setSearchError] = useState<string | null>(null);
   const searchSeq = useRef(0);
   const [listRows, setListRows] = useState<Row[]>([]);
+
+  useEffect(() => {
+    const pending: string[] = [];
+    const collect = (row: Row | undefined) => {
+      const path = (row?.path || "").toLowerCase();
+      if (!path || requestedRefPaths.current.has(path)) return;
+      requestedRefPaths.current.add(path);
+      pending.push(path);
+    };
+    root?.rows.forEach(collect);
+    Object.values(childrenCache).forEach((page) => page.rows.forEach(collect));
+    listRows.forEach(collect);
+    (results ?? []).forEach(collect);
+    if (pending.length === 0) return;
+    let alive = true;
+    window.api.pathReferences(hostDirOf(dbPath), pending).then((list) => {
+      if (!alive) return;
+      setPathRefsError(null);
+      if (list.length === 0) return;
+      setPathRefs((prev) => {
+        const merged: RefMap = new Map(prev);
+        for (const r of list) {
+          const arr = merged.get(r.path);
+          if (arr) merged.set(r.path, [...arr, r]); else merged.set(r.path, [r]);
+        }
+        return merged;
+      });
+    }).catch(() => {
+      // $MFT evidence remains usable without optional cross-artifact tags;
+      // make that degraded state explicit instead of silently looking empty.
+      // 실패한 배치의 경로는 요청 이력에서 되돌린다 — 다음 트리 확장·검색으로
+      // effect가 다시 돌 때 자연 재시도되고, 일시 오류가 해당 경로들의 태그를
+      // 세션 내내 누락시키지 않는다 (재등록 선점으로 중복 요청은 없음).
+      for (const path of pending) requestedRefPaths.current.delete(path);
+      if (alive) setPathRefsError("교차 참조 정보를 불러오지 못했습니다.");
+    });
+    return () => { alive = false; };
+  }, [dbPath, root, childrenCache, listRows, results]);
   const [listTotal, setListTotal] = useState<number | null>(null);
   const [listLoading, setListLoading] = useState(false);
   const [listError, setListError] = useState<string | null>(null);
@@ -179,13 +219,14 @@ export default function MftView({ dbPath, tableBookmarks, onToggleBookmark, allB
     setChildrenCache({});
     setExpanded(new Set());
     setFailedEntries(new Set());
+    setLoadMoreFailed(new Set());
     setSelected(null);
     setReferenceDetail(null);
-    window.api.mftChildren(dbPath, ROOT_ENTRY).then((rows) => {
-      if (!cancelled) setRoot(rows);
+    window.api.mftChildren(dbPath, ROOT_ENTRY, 0, MFT_CHILDREN_PAGE).then((page) => {
+      if (!cancelled) setRoot(page);
     }).catch(() => {
       if (!cancelled) {
-        setRoot([]);
+        setRoot({ rows: [], total: 0 });
         setRootError("최상위 파일 시스템 레코드를 읽지 못했습니다.");
       }
     });
@@ -200,8 +241,8 @@ export default function MftView({ dbPath, tableBookmarks, onToggleBookmark, allB
       setLoadingEntry((s) => new Set(s).add(entry));
       setFailedEntries((s) => { const next = new Set(s); next.delete(entry); return next; });
       try {
-        const rows = await window.api.mftChildren(dbPath, Number(entry));
-        setChildrenCache((c) => ({ ...c, [entry]: rows }));
+        const page = await window.api.mftChildren(dbPath, Number(entry), 0, MFT_CHILDREN_PAGE);
+        setChildrenCache((c) => ({ ...c, [entry]: page }));
       } catch {
         setFailedEntries((s) => new Set(s).add(entry));
       } finally {
@@ -213,6 +254,34 @@ export default function MftView({ dbPath, tableBookmarks, onToggleBookmark, allB
       }
     },
     [dbPath, childrenCache],
+  );
+
+  // 대형 폴더(수만 자식)에서 전체를 한 번에 IPC로 받지 않도록 페이지로 이어
+  // 받는다 — "더 불러오기" 버튼이 다음 페이지를 기존 목록 뒤에 붙인다.
+  const loadMoreChildren = useCallback(
+    async (entry: string) => {
+      const cached = entry === String(ROOT_ENTRY) ? root : childrenCache[entry];
+      if (!cached || cached.rows.length >= cached.total || loadingEntry.has(entry)) return;
+      setLoadingEntry((s) => new Set(s).add(entry));
+      try {
+        const page = await window.api.mftChildren(dbPath, Number(entry), cached.rows.length, MFT_CHILDREN_PAGE);
+        // 후속 페이지는 서버가 COUNT를 생략하고 total=-1을 준다 — 첫 페이지의
+        // 값을 유지한다.
+        const merged = { rows: [...cached.rows, ...page.rows], total: page.total >= 0 ? page.total : cached.total };
+        if (entry === String(ROOT_ENTRY)) setRoot(merged);
+        else setChildrenCache((c) => ({ ...c, [entry]: merged }));
+        setLoadMoreFailed((s) => { const n = new Set(s); n.delete(entry); return n; });
+      } catch {
+        setLoadMoreFailed((s) => new Set(s).add(entry));
+      } finally {
+        setLoadingEntry((s) => {
+          const n = new Set(s);
+          n.delete(entry);
+          return n;
+        });
+      }
+    },
+    [dbPath, childrenCache, root, loadingEntry],
   );
 
   const toggle = useCallback(
@@ -380,23 +449,41 @@ export default function MftView({ dbPath, tableBookmarks, onToggleBookmark, allB
               ) : rootError ? (
                 <div style={{ padding: "16px 8px", color: "var(--danger)", fontSize: 12.5 }}>{rootError}</div>
               ) : (
-                root.map((r) => (
-                  <TreeNode
-                    key={r.entry + "-" + r.__rowid}
-                    row={r}
-                    depth={0}
-                    expanded={expanded}
-                    childrenCache={childrenCache}
-                    loadingEntry={loadingEntry}
-                    failedEntries={failedEntries}
-                    bmRowids={bmRowids}
-                    selectedRowid={selectedRowid}
-                    onToggle={toggle}
-                    onSelect={setSelected}
-                    refs={pathRefs}
-                    accountFilter={selAccounts}
-                  />
-                ))
+                <>
+                  {root.rows.map((r) => (
+                    <TreeNode
+                      key={r.entry + "-" + r.__rowid}
+                      row={r}
+                      depth={0}
+                      expanded={expanded}
+                      childrenCache={childrenCache}
+                      loadingEntry={loadingEntry}
+                      failedEntries={failedEntries}
+                      loadMoreFailed={loadMoreFailed}
+                      bmRowids={bmRowids}
+                      selectedRowid={selectedRowid}
+                      onToggle={toggle}
+                      onSelect={setSelected}
+                      onLoadMore={loadMoreChildren}
+                      refs={pathRefs}
+                      accountFilter={selAccounts}
+                    />
+                  ))}
+                  {root.rows.length < root.total && (
+                    <button
+                      type="button"
+                      disabled={loadingEntry.has(String(ROOT_ENTRY))}
+                      onClick={() => loadMoreChildren(String(ROOT_ENTRY))}
+                      style={{ display: "block", marginLeft: 27, minHeight: 27, padding: "2px 10px", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", background: "var(--bg-elevated)", color: "var(--accent)", cursor: "pointer", fontSize: 11.5 }}
+                    >
+                      {loadingEntry.has(String(ROOT_ENTRY))
+                        ? "불러오는 중…"
+                        : loadMoreFailed.has(String(ROOT_ENTRY))
+                          ? `이어받기 실패 — 다시 시도 (${root.rows.length.toLocaleString()}/${root.total.toLocaleString()})`
+                          : `더 불러오기 (${root.rows.length.toLocaleString()}/${root.total.toLocaleString()})`}
+                    </button>
+                  )}
+                </>
               )}
             </div>
           </>}
@@ -551,23 +638,27 @@ function TreeNode({
   childrenCache,
   loadingEntry,
   failedEntries,
+  loadMoreFailed,
   bmRowids,
   selectedRowid,
   onToggle,
   onSelect,
+  onLoadMore,
   refs,
   accountFilter,
 }: {
   row: Row;
   depth: number;
   expanded: Set<string>;
-  childrenCache: Record<string, Row[]>;
+  childrenCache: Record<string, { rows: Row[]; total: number }>;
   loadingEntry: Set<string>;
   failedEntries: Set<string>;
+  loadMoreFailed: Set<string>;
   bmRowids: Set<number>;
   selectedRowid: number | null;
   onToggle: (r: Row) => void;
   onSelect: (r: Row) => void;
+  onLoadMore: (entry: string) => void;
   refs: RefMap;
   accountFilter: Set<string> | null;
 }) {
@@ -630,28 +721,46 @@ function TreeNode({
         <div id={childRegionId} hidden={!open}>
         {open && (loadingEntry.has(row.entry) && !kids ? (
           <div style={{ display: "flex", alignItems: "center", gap: 6, paddingLeft: 7 + (depth + 1) * 16 + 20, minHeight: 27, fontSize: 11.5, color: "var(--text-faint)" }}><CircularProgress size={13} thickness={4} /> 하위 항목을 불러오는 중</div>
-        ) : failedEntries.has(row.entry) ? (
+        ) : failedEntries.has(row.entry) && !kids ? (
           <div style={{ paddingLeft: 7 + (depth + 1) * 16 + 20, minHeight: 27, fontSize: 11.5, lineHeight: "27px", color: "var(--danger)" }}>하위 항목을 읽지 못했습니다. 접었다가 다시 펼쳐 재시도할 수 있습니다.</div>
-        ) : kids && kids.length === 0 ? (
+        ) : kids && kids.rows.length === 0 ? (
           <div style={{ paddingLeft: 7 + (depth + 1) * 16 + 20, minHeight: 27, fontSize: 11.5, lineHeight: "27px", color: "var(--text-faint)" }}>비어 있음</div>
         ) : (
-          (kids ?? []).map((c) => (
-            <TreeNode
-              key={c.entry + "-" + c.__rowid}
-              row={c}
-              depth={depth + 1}
-              expanded={expanded}
-              childrenCache={childrenCache}
-              loadingEntry={loadingEntry}
-              failedEntries={failedEntries}
-              bmRowids={bmRowids}
-              selectedRowid={selectedRowid}
-              onToggle={onToggle}
-              onSelect={onSelect}
-              refs={refs}
-              accountFilter={accountFilter}
-            />
-          ))
+          <>
+            {(kids?.rows ?? []).map((c) => (
+              <TreeNode
+                key={c.entry + "-" + c.__rowid}
+                row={c}
+                depth={depth + 1}
+                expanded={expanded}
+                childrenCache={childrenCache}
+                loadingEntry={loadingEntry}
+                failedEntries={failedEntries}
+                loadMoreFailed={loadMoreFailed}
+                bmRowids={bmRowids}
+                selectedRowid={selectedRowid}
+                onToggle={onToggle}
+                onSelect={onSelect}
+                onLoadMore={onLoadMore}
+                refs={refs}
+                accountFilter={accountFilter}
+              />
+            ))}
+            {kids && kids.rows.length < kids.total && (
+              <button
+                type="button"
+                disabled={loadingEntry.has(row.entry)}
+                onClick={() => onLoadMore(row.entry)}
+                style={{ display: "block", marginLeft: 7 + (depth + 1) * 16 + 20, minHeight: 27, padding: "2px 10px", border: `1px solid ${loadMoreFailed.has(row.entry) ? "var(--danger)" : "var(--border)"}`, borderRadius: "var(--radius-sm)", background: "var(--bg-elevated)", color: loadMoreFailed.has(row.entry) ? "var(--danger)" : "var(--accent)", cursor: "pointer", fontSize: 11.5 }}
+              >
+                {loadingEntry.has(row.entry)
+                  ? "불러오는 중…"
+                  : loadMoreFailed.has(row.entry)
+                    ? `이어받기 실패 — 다시 시도 (${kids.rows.length.toLocaleString()}/${kids.total.toLocaleString()})`
+                    : `더 불러오기 (${kids.rows.length.toLocaleString()}/${kids.total.toLocaleString()})`}
+              </button>
+            )}
+          </>
         ))}
         </div>
       )}

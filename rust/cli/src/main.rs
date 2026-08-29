@@ -9,7 +9,7 @@ use wina_core::pipeline::run_host;
 use wina_core::parsers::amcache::{
     parse_amcache, FILES_FIELD_ORDER, FILES_TABLE, PROGRAMS_FIELD_ORDER, PROGRAMS_TABLE,
 };
-use wina_core::parsers::browser_history::parse_history;
+use wina_core::parsers::browser_history::parse_history_stream;
 use wina_core::parsers::eventlog::parse_evtx_stream;
 use wina_core::parsers::jumplist::{parse_jumplists, JUMPLIST_FIELD_ORDER, JUMPLIST_TABLE};
 use wina_core::parsers::mft::parse_mft_stream;
@@ -19,7 +19,7 @@ use wina_core::parsers::srum::parse_srum_stream;
 use wina_core::parsers::taskscheduler::{parse_tasks, TASK_FIELD_ORDER, TASK_TABLE};
 use wina_core::parsers::usnjrnl::parse_usn_stream;
 use wina_core::parsers::wer::{parse_wer, WER_FIELD_ORDER, WER_TABLE};
-use wina_core::sqlite::{write_table, write_table_cols};
+use wina_core::sqlite::write_table;
 
 fn now() -> String {
     chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
@@ -131,7 +131,7 @@ fn debug_parse(args: &[String]) -> Result<()> {
             eprintln!("UsnJrnl: {} rows", n);
         }
         "parse-amcache" => {
-            let parsed = parse_amcache(&inp)?;
+            let parsed = parse_amcache(&inp, &wina_core::parsers::registry::sibling_logs(&inp))?;
             if let Some(reason) = &parsed.log_apply_error {
                 eprintln!("Amcache: log apply failed, parsed primary hive only ({reason})");
             }
@@ -166,11 +166,8 @@ fn debug_parse(args: &[String]) -> Result<()> {
             eprintln!("WER: {} reports", r.len());
         }
         "parse-history" => {
-            let t = parse_history(&inp)?;
-            for (n, cols, rows) in &t {
-                write_table_cols(&out, n, rows, cols, &[])?;
-            }
-            eprintln!("BrowserHistory: {} tables", t.len());
+            let (rows, _) = parse_history_stream(&inp, &out)?;
+            eprintln!("BrowserHistory: {} rows", rows);
         }
         "parse-rdpcache" => {
             let r = parse_rdpcache(&inp)?;

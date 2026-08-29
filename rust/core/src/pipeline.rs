@@ -17,7 +17,7 @@ use crate::parsers::{
     amcache, browser_cache, browser_history, eventlog, jumplist, mft, powershell_history, prefetch,
     rdpcache, registry, srum, taskscheduler, usnjrnl, wer,
 };
-use crate::sqlite::{write_table, write_table_cols, Row};
+use crate::sqlite::{write_table, Row};
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -147,6 +147,52 @@ fn copy_tree(source: &Path, destination: &Path, copy_data: bool) -> Result<()> {
 
 /// Build an isolated output tree.  A failed/cancelled parser can therefore
 /// never expose a half-written SQLite database to the analysis views.
+/// 재파싱은 이전 결과를 보존하지 않는다(사용자 확정, 2026-08-30). 호스트의
+/// 수집 데이터는 불변이므로 실패한 파싱은 다시 해도 실패한다 — 이전 실행
+/// 결과를 남기면 서로 다른 시점의 facts와 _OVERVIEW가 섞여 화면 간 모순이
+/// 생긴다. 전체 실행은 모든 결과 카테고리를, 범위 실행은 해당 아티팩트의
+/// 카테고리(+항상 재생성되는 _OVERVIEW)만 지우고 이번 실행 산출물만 발행한다.
+/// 취소된 실행은 발행 단계에 오지 않으므로 이전 결과가 유지된다.
+fn clear_previous_results(live_dir: &Path, only: Option<&HashSet<String>>) -> Result<()> {
+    let scoped = only.map(|only| artifact_output_categories(Some(only)));
+    for entry in std::fs::read_dir(live_dir)? {
+        let entry = entry?;
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy().to_string();
+        if name == PARSE_LOG_DIRECTORY
+            || name == PARSE_STAGING_DIRECTORY
+            || name == PARSE_COMMITTED_DIRECTORY
+        {
+            continue;
+        }
+        if let Some(scoped) = &scoped {
+            if !scoped.contains(name.as_str()) {
+                continue;
+            }
+        }
+        std::fs::remove_dir_all(entry.path())?;
+    }
+    // 통합 타임라인 캐시는 매 실행 재생성된다 — 지운 facts와 어긋난 이전
+    // 캐시가 남지 않게 함께 제거한다.
+    let _ = std::fs::remove_file(live_dir.join("_master_timeline.cache.json"));
+    Ok(())
+}
+
+/// 범위 재파싱 스테이지에는 이전 실행의 _OVERVIEW 복사본이 들어 있다.
+/// skip_empty 파생이 0건이면 write_ov가 파일을 만들지도 지우지도 않아 이전
+/// 파일이 그대로 발행된다 — 파생 생성 직전에 비워, 발행되는 파생은 항상
+/// 이번 실행 facts에서 만든 것만 남긴다 (facts/derived 동일 시점 보장).
+fn reset_stage_overview(ov: &Path) -> Result<()> {
+    if ov.exists() {
+        std::fs::remove_dir_all(ov)?;
+    }
+    std::fs::create_dir_all(ov)?;
+    Ok(())
+}
+
 fn prepare_staging_output(
     live_dir: &Path,
     run_id: &str,
@@ -509,6 +555,8 @@ struct ParseReport {
     errors: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     registry_hives: Vec<RegistryHiveReport>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    amcache_hives: Vec<AmcacheHiveReport>,
     /// Explicit run-wide Registry recovery contract.  This prevents a fast
     /// live-only run from being mistaken for one that applied deleted cells or
     /// transaction logs.
@@ -559,6 +607,24 @@ struct RegistryRecoveryReport {
     mode: String,
     deleted_cell_recovery_applied: bool,
     transaction_logs_applied: bool,
+}
+
+/// Amcache 하이브별 트랜잭션 로그 처리 실적 — 실행이 끝난 뒤에도 결과가 로그
+/// 정합본인지, 손상 로그 때문에 기본 하이브만으로 폴백한 것인지 구분할 수
+/// 있게 parse_report.json에 남는다 (Registry의 registry_hives와 동형 목적).
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AmcacheHiveReport {
+    source_path: String,
+    /// registry_hives와 같은 어휘 — "completed" 또는 "skipped_corrupted".
+    /// 건너뛴 손상 하이브도 여기 남아야 0건 결과와 구분된다.
+    status: String,
+    logs_discovered: usize,
+    logs_applied: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    log_apply_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -762,22 +828,16 @@ fn entry_record_rows_by_source(entry: &mut ParseArtifactReport, rows: &[Row]) {
     }
 }
 
-fn entry_add_rows_by_source(entry: &mut ParseArtifactReport, rows: &[Row]) {
-    let mut counts = std::collections::HashMap::<String, usize>::new();
-    for row in rows {
-        if let Some(source) = row.get("_source_file").filter(|source| !source.is_empty()) {
-            *counts.entry(source.clone()).or_default() += 1;
-        }
-    }
-    for (source, count) in counts {
-        entry_record_input(entry, Path::new(&source), false);
-        if let Some(input) = entry
-            .inputs
-            .iter_mut()
-            .find(|input| input.source_path == source)
-        {
-            input.record_count = input.record_count.saturating_add(count);
-        }
+/// 이미 기록된 입력의 레코드 수에 추가분을 더한다 (없으면 입력을 만들고 더함).
+fn entry_add_input_count(entry: &mut ParseArtifactReport, source: &Path, count: usize) {
+    entry_record_input(entry, source, false);
+    let source = source.to_string_lossy().to_string();
+    if let Some(input) = entry
+        .inputs
+        .iter_mut()
+        .find(|input| input.source_path == source)
+    {
+        input.record_count = input.record_count.saturating_add(count);
     }
 }
 
@@ -821,6 +881,7 @@ struct ArtifactOutcome {
     sealed: Vec<SealedArtifactOutput>,
     errors: Vec<String>,
     registry_hives: Vec<RegistryHiveReport>,
+    amcache_hives: Vec<AmcacheHiveReport>,
     registry_recovery: Option<RegistryRecoveryReport>,
 }
 
@@ -841,6 +902,7 @@ impl ArtifactOutcome {
             sealed: Vec::new(),
             errors: Vec::new(),
             registry_hives: Vec::new(),
+            amcache_hives: Vec::new(),
             registry_recovery: None,
         }
     }
@@ -850,8 +912,8 @@ impl ArtifactOutcome {
 /// unchanged from the sequential pipeline).
 fn discover_artifact_files(name: &str, target: &Path) -> Vec<PathBuf> {
     match name {
-        "Amcache" => finder::dedupe_by_content(finder::by_name(target, &["Amcache.hve"])),
-        "EventLog" => finder::dedupe_by_content(finder::by_name(target, eventlog::ALLOWLIST)),
+        "Amcache" => finder::by_name(target, &["Amcache.hve"]),
+        "EventLog" => finder::by_name(target, eventlog::ALLOWLIST),
         "Registry" => {
             let mut all = finder::by_name(target, registry::REG_FILENAMES);
             all.extend(finder::by_suffix(target, registry::REG_SUFFIXES));
@@ -879,20 +941,18 @@ fn discover_artifact_files(name: &str, target: &Path) -> Vec<PathBuf> {
                     .unwrap_or_default();
                 !is_regback || !live.contains(&nm)
             });
-            finder::dedupe_by_content(all)
+            all
         }
-        "UsnJrnl" => finder::dedupe_by_content(finder::by_name(target, &["$J"])),
-        "MFT" => finder::dedupe_by_content(finder::by_name(target, &["$MFT"])),
-        "SRUM" => finder::dedupe_by_content(finder::by_name(target, &["SRUDB.dat"])),
+        "UsnJrnl" => finder::by_name(target, &["$J"]),
+        "MFT" => finder::by_name(target, &["$MFT"]),
+        "SRUM" => finder::by_name(target, &["SRUDB.dat"]),
         "JumpList" => jumplist::jumplist_sources(target),
         "TaskScheduler" => taskscheduler::task_sources(target),
         "RdpCache" => rdpcache::rdpcache_sources(target),
-        "BrowserHistory" => finder::dedupe_by_content(finder::by_name(target, &["History"])),
-        "BrowserCache" => finder::dedupe_by_content(finder::by_name(target, &["index"])),
-        "PowerShell" => {
-            finder::dedupe_by_content(finder::by_name(target, &["ConsoleHost_history.txt"]))
-        }
-        "Prefetch" => finder::dedupe_by_content(finder::by_extension(target, &[".pf"])),
+        "BrowserHistory" => finder::by_name(target, &["History"]),
+        "BrowserCache" => finder::by_name(target, &["index"]),
+        "PowerShell" => finder::by_name(target, &["ConsoleHost_history.txt"]),
+        "Prefetch" => finder::by_extension(target, &[".pf"]),
         "WER" => wer::wer_sources(target),
         _ => Vec::new(),
     }
@@ -900,11 +960,26 @@ fn discover_artifact_files(name: &str, target: &Path) -> Vec<PathBuf> {
 
 /// 디스크 부족·I/O 실패 같은 저장 환경 오류인지 판별한다. 이런 오류는 데이터
 /// 손상이 아니므로 건너뛰지 않고 아티팩트 실패(partial)로 올린다.
+/// 실행 환경(저장 공간·권한·장치 I/O) 문제인지 판별한다. 환경 오류는 증거
+/// 손상이 아니므로 "손상 아티팩트 건너뜀"이 아니라 아티팩트 실패(partial)로
+/// 올라가야 한다 — 권한 거부로 못 읽은 원본이 "손상된 하이브"로 표시되면
+/// 분석가가 증거 상태를 오판한다. 포맷 해석 실패만 손상으로 남긴다.
 fn is_storage_error(error: &anyhow::Error) -> bool {
+    use std::io::ErrorKind;
     for cause in error.chain() {
         if let Some(io) = cause.downcast_ref::<std::io::Error>() {
             // ENOSPC — 저장 공간 부족.
             if io.raw_os_error() == Some(28) {
+                return true;
+            }
+            if matches!(
+                io.kind(),
+                ErrorKind::PermissionDenied
+                    | ErrorKind::Interrupted
+                    | ErrorKind::TimedOut
+                    | ErrorKind::WouldBlock
+                    | ErrorKind::NotConnected
+            ) {
                 return true;
             }
         }
@@ -958,18 +1033,26 @@ fn run_unit_or_skip<T>(
 fn parse_amcache_artifact(
     paths: &[PathBuf],
     out_dir: &Path,
-    entry: &mut ParseArtifactReport,
+    outcome: &mut ArtifactOutcome,
 ) -> Result<Vec<String>> {
-    entry_record_inputs(entry, paths);
-    for p in paths {
-        for log in registry::sibling_logs(p) {
-            entry_record_input(entry, &log, true);
+    entry_record_inputs(&mut outcome.entry, paths);
+    // 하이브별 트랜잭션 로그 목록은 여기서 한 번만 확정한다(파싱 계획 고정) —
+    // 입력 기록·logsDiscovered·실제 파서 입력이 전부 같은 스냅샷을 쓰므로,
+    // 목록화 이후 디렉터리가 변해도 보고서와 실제 적용 로그가 어긋나지 않는다.
+    let planned: Vec<(&PathBuf, Vec<PathBuf>)> = paths
+        .iter()
+        .map(|p| (p, registry::sibling_logs(p)))
+        .collect();
+    for (_, logs) in &planned {
+        for log in logs {
+            entry_record_input(&mut outcome.entry, log, true);
         }
     }
     let mut outputs = Vec::new();
     let mut taken = HashSet::new();
     // 하이브 하나가 손상돼도 그 하이브만 건너뛴다(파싱 실패 == 손상 아티팩트).
-    for p in paths {
+    for (p, logs) in &planned {
+        let p = *p;
         let base = p
             .file_stem()
             .map(|s| s.to_string_lossy().to_string())
@@ -977,15 +1060,28 @@ fn parse_amcache_artifact(
         let name = uniq_name(&base, &mut taken);
         let relative = format!("AMCACHE/{}.sqlite", name);
         let out = out_dir.join(&relative);
-        let unit = run_unit_or_skip(&p.display().to_string(), &[&out], || -> Result<(usize, usize)> {
-            let parsed = amcache::parse_amcache(p)?;
-            if let Some(reason) = &parsed.log_apply_error {
-                emit(&format!(
-                    "[*] Amcache 로그 적용 실패 — 기본 하이브만 파싱: {} ({})",
-                    p.display(),
-                    reason
-                ));
-            }
+        let logs_discovered = logs.len();
+        // 하이브 자체가 열리지 않는 손상은 사유를 보고서까지 가져가야 하므로
+        // run_unit_or_skip이 삼키기 전에 클로저 안에서 가로챈다 — 저장 환경
+        // 오류(디스크 부족 등)만 종전대로 Err로 올려 아티팩트를 partial 처리.
+        enum AmcacheUnit {
+            Parsed {
+                programs: usize,
+                files: usize,
+                log_apply_error: Option<String>,
+            },
+            Skipped(String),
+        }
+        let unit = run_unit_or_skip(&p.display().to_string(), &[&out], || -> Result<AmcacheUnit> {
+            let parsed = match amcache::parse_amcache(p, logs) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    if is_storage_error(&error) {
+                        return Err(error);
+                    }
+                    return Ok(AmcacheUnit::Skipped(error.to_string()));
+                }
+            };
             write_table(
                 &out,
                 amcache::PROGRAMS_TABLE,
@@ -998,17 +1094,75 @@ fn parse_amcache_artifact(
                 &parsed.files,
                 amcache::FILES_FIELD_ORDER,
             )?;
-            Ok((parsed.programs.len(), parsed.files.len()))
+            Ok(AmcacheUnit::Parsed {
+                programs: parsed.programs.len(),
+                files: parsed.files.len(),
+                log_apply_error: parsed.log_apply_error,
+            })
         })?;
-        if let Some((prog_count, file_count)) = unit {
-            entry_record_input_count(entry, p, prog_count + file_count);
-            emit(&format!(
-                "[+] {} programs, {} files -> {}",
-                prog_count,
-                file_count,
-                out.display()
-            ));
-            outputs.push(relative);
+        match unit {
+            Some(AmcacheUnit::Parsed {
+                programs: prog_count,
+                files: file_count,
+                log_apply_error,
+            }) => {
+                entry_record_input_count(&mut outcome.entry, p, prog_count + file_count);
+                if let Some(reason) = &log_apply_error {
+                    emit(&format!(
+                        "[*] Amcache 로그 적용 실패 — 기본 하이브만 파싱: {} ({})",
+                        p.display(),
+                        reason
+                    ));
+                }
+                // 폴백 여부는 실행 로그가 아니라 영구 보고서에 남아야, 실행이
+                // 끝난 뒤에도 이 결과가 로그 정합본인지 구분할 수 있다.
+                outcome.amcache_hives.push(AmcacheHiveReport {
+                    source_path: p.to_string_lossy().to_string(),
+                    status: "completed".to_string(),
+                    logs_discovered,
+                    logs_applied: if log_apply_error.is_none() {
+                        logs_discovered
+                    } else {
+                        0
+                    },
+                    log_apply_error,
+                    error: None,
+                });
+                emit(&format!(
+                    "[+] {} programs, {} files -> {}",
+                    prog_count,
+                    file_count,
+                    out.display()
+                ));
+                outputs.push(relative);
+            }
+            Some(AmcacheUnit::Skipped(reason)) => {
+                emit(&format!(
+                    "[*] 손상된 Amcache 하이브 건너뜀: {} ({})",
+                    p.display(),
+                    reason
+                ));
+                outcome.amcache_hives.push(AmcacheHiveReport {
+                    source_path: p.to_string_lossy().to_string(),
+                    status: "skipped_corrupted".to_string(),
+                    logs_discovered,
+                    logs_applied: 0,
+                    log_apply_error: None,
+                    error: Some(reason),
+                });
+            }
+            // run_unit_or_skip이 삼킨 잔여 경로(패닉, 손상성 저장 오류) —
+            // 사유 원문은 없지만 건너뛴 사실 자체는 보고서에 남긴다.
+            None => {
+                outcome.amcache_hives.push(AmcacheHiveReport {
+                    source_path: p.to_string_lossy().to_string(),
+                    status: "skipped_corrupted".to_string(),
+                    logs_discovered,
+                    logs_applied: 0,
+                    log_apply_error: None,
+                    error: Some("파싱이 중단됨 — 실행 로그 참조".to_string()),
+                });
+            }
         }
     }
     Ok(outputs)
@@ -1435,18 +1589,12 @@ fn parse_browser_history_artifact(
         let relative = format!("BROWSER/{}.sqlite", name);
         let out = out_dir.join(&relative);
         let unit = run_unit_or_skip(&p.display().to_string(), &[&out], || -> Result<(usize, bool)> {
-            let tables = browser_history::parse_history(p)?;
-            let record_count = tables.iter().map(|(_, _, rows)| rows.len()).sum();
-            for (t, cols, rows) in &tables {
-                write_table_cols(&out, t, rows, cols, &[])?;
-                emit(&format!(
-                    "[+] {} rows -> {} [{}]",
-                    rows.len(),
-                    out.display(),
-                    t
-                ));
+            // 테이블 단위 스트리밍 기록 — 전체 행을 메모리에 쌓지 않는다.
+            let (record_count, wrote) = browser_history::parse_history_stream(p, &out)?;
+            if wrote {
+                emit(&format!("[+] {} rows -> {}", record_count, out.display()));
             }
-            Ok((record_count, !tables.is_empty()))
+            Ok((record_count, wrote))
         })?;
         if let Some((record_count, wrote)) = unit {
             entry_record_input_count(entry, p, record_count);
@@ -1508,29 +1656,22 @@ fn parse_prefetch_artifact(
         let loaded_relative = format!("PREFETCH/{}.sqlite", prefetch::LOADED_TABLE);
         let ex = out_dir.join(&exec_relative);
         let lf = out_dir.join(&loaded_relative);
-        let unit = run_unit_or_skip("Prefetch", &[&ex, &lf], || -> Result<(Vec<Row>, Vec<Row>)> {
-            let (exec_rows, loaded_rows) = prefetch::parse_prefetch(paths);
-            write_table(
-                &ex,
-                prefetch::EXEC_TABLE,
-                &exec_rows,
-                prefetch::EXEC_FIELD_ORDER,
-            )?;
-            write_table(
-                &lf,
-                prefetch::LOADED_TABLE,
-                &loaded_rows,
-                prefetch::LOADED_FIELD_ORDER,
-            )?;
-            Ok((exec_rows, loaded_rows))
+        let unit = run_unit_or_skip("Prefetch", &[&ex, &lf], || -> Result<prefetch::PrefetchCounts> {
+            // 파싱 즉시 스트리밍 기록 — 전체 행을 메모리에 쌓지 않는다.
+            prefetch::parse_prefetch_stream(paths, &ex, &lf)
         })?;
-        if let Some((exec_rows, loaded_rows)) = unit {
-            entry_record_rows_by_source(entry, &exec_rows);
-            entry_add_rows_by_source(entry, &loaded_rows);
-            emit(&format!("[+] {} rows -> {}", exec_rows.len(), ex.display()));
+        if let Some(counts) = unit {
+            for (source, count) in &counts.exec_by_source {
+                entry_record_input_count(entry, Path::new(source), *count);
+            }
+            for (source, count) in &counts.loaded_by_source {
+                entry_record_input(entry, Path::new(source), false);
+                entry_add_input_count(entry, Path::new(source), *count);
+            }
+            emit(&format!("[+] {} rows -> {}", counts.exec_rows, ex.display()));
             emit(&format!(
                 "[+] {} rows -> {}",
-                loaded_rows.len(),
+                counts.loaded_rows,
                 lf.display()
             ));
             outputs.push(exec_relative);
@@ -1576,7 +1717,7 @@ fn parse_artifact_sources(
     outcome: &mut ArtifactOutcome,
 ) -> Result<Vec<String>> {
     match name {
-        "Amcache" => parse_amcache_artifact(paths, out_dir, &mut outcome.entry),
+        "Amcache" => parse_amcache_artifact(paths, out_dir, outcome),
         "EventLog" => parse_eventlog_artifact(paths, out_dir, &mut outcome.entry),
         "Registry" => parse_registry_artifact(paths, out_dir, outcome),
         "UsnJrnl" => parse_usnjrnl_artifact(paths, out_dir, &mut outcome.entry),
@@ -1706,6 +1847,7 @@ pub fn run_host_with_log_id(
         published: false,
         errors: Vec::new(),
         registry_hives: Vec::new(),
+        amcache_hives: Vec::new(),
         registry_recovery: None,
         completed_artifacts: Vec::new(),
         published_artifacts: Vec::new(),
@@ -1862,6 +2004,7 @@ pub fn run_host_with_log_id(
             report.completed_artifacts.push(name.to_string());
         }
         report.registry_hives.extend(outcome.registry_hives);
+        report.amcache_hives.extend(outcome.amcache_hives);
         if outcome.registry_recovery.is_some() {
             report.registry_recovery = outcome.registry_recovery;
         }
@@ -1883,16 +2026,19 @@ pub fn run_host_with_log_id(
         emit("=== _OVERVIEW ===");
         append_current_log_lifecycle("overview_started");
         let ov = out_dir.join("_OVERVIEW");
+        reset_stage_overview(&ov)?;
         // TargetInfo, BAM execution history, and RegistryFindings all inspect
         // the same recovered Registry SQLite rows.  Keep one in-memory cache
         // for this overview pass only, preserving rowids/source identities.
         let registry_overview = overview::RegistryOverviewCache::load(&out_dir);
-        let mut write_ov = |name: &str, rows: Vec<Row>, skip_empty: bool| -> Result<()> {
+        // columns: 0건에도 스키마를 만들 고정 컬럼 목록. skip_empty 뷰는
+        // 0건이면 파일 자체를 만들지 않으므로 빈 목록을 넘긴다.
+        let mut write_ov = |name: &str, rows: Vec<Row>, skip_empty: bool, columns: &[&str]| -> Result<()> {
             if rows.is_empty() && skip_empty {
                 return Ok(());
             }
             let out = ov.join(format!("{}.sqlite", name));
-            write_table(&out, name, &rows, &[])?;
+            write_table(&out, name, &rows, columns)?;
             emit(&format!("[+] {} rows -> {}", rows.len(), out.display()));
             report.overview.push(OverviewTableReport {
                 name: name.to_string(),
@@ -1905,60 +2051,77 @@ pub fn run_host_with_log_id(
                 "ScheduledTasks",
                 overview::build_scheduled_tasks(&out_dir),
                 true,
+                &[],
             )?;
-            write_ov("RdpCache", overview::build_rdp_cache(&out_dir), true)?;
+            write_ov("RdpCache", overview::build_rdp_cache(&out_dir), true, &[])?;
             // 이벤트 로그 행은 4개 빌더가 공유한다 — 한 번만 로드.
             let events = overview::EventLogOverviewCache::load(&out_dir);
             write_ov(
                 "Defender",
                 overview::build_defender_with_events(&events),
                 false,
+                overview::DEF_KEYS,
             )?;
             write_ov(
                 "RemoteDesktopHistory",
                 overview::build_remote_desktop_history_with_events(&events),
                 false,
+                overview::RDP_KEYS,
             )?;
             write_ov(
                 "SmbHistory",
                 overview::build_smb_history_with_events(&events),
                 true,
+                &[],
             )?;
             write_ov(
                 "BitsHistory",
                 overview::build_bits_history_with_events(&events),
                 true,
+                &[],
             )?;
             write_ov(
                 "FirewallHistory",
                 overview::build_firewall_history_with_events(&out_dir, &events),
                 true,
+                &[],
             )?;
             write_ov(
                 "PowerShellHistory",
                 overview::build_powershell_history_with_events(&out_dir, &events),
                 false,
+                overview::PS_KEYS,
             )?;
             drop(events);
             write_ov(
                 "BrowserActivity",
                 overview::build_browser_history(&out_dir),
                 false,
+                overview::BH_KEYS,
             )?;
             write_ov(
                 "TargetInfo",
                 overview::build_target_info_with_registry(&registry_overview),
                 false,
+                overview::TI_KEYS,
             )?;
             write_ov(
                 "ExecutionHistory",
                 overview::build_execution_history_with_registry(&out_dir, &registry_overview),
                 false,
+                overview::ROW_KEYS,
             )?;
             write_ov(
                 "RegistryFindings",
                 overview::build_registry_findings_with_registry(&registry_overview),
                 false,
+                overview::RF_KEYS,
+            )?;
+            write_ov(
+                "PathReferences",
+                overview::build_path_references(&out_dir, &registry_overview),
+                false,
+                overview::PR_KEYS,
             )?;
             Ok(())
         })();
@@ -2035,6 +2198,9 @@ pub fn run_host_with_log_id(
     // staged evidence was rejected: it contains no derived rows and makes the
     // failure/cancel state visible without exposing half-written SQLite files.
     if status == "ok" {
+        if let Err(error) = clear_previous_results(&live_dir, only.as_ref()) {
+            report.errors.push(format!("clear previous results: {error}"));
+        }
         match publish_staging_output(&live_dir, &out_dir, &run_id) {
             Ok(()) => {
                 record_published_outputs(&mut report, &sealed_outputs);
@@ -2052,6 +2218,11 @@ pub fn run_host_with_log_id(
         }
     }
     if status == "partial" {
+        // 실패 아티팩트의 이전 결과도 함께 지운다 — 남은 것은 항상 이번 실행
+        // 한 시점의 산출물뿐이다(실패 = 손상·오수집 원본 판정, 보고서에 기록).
+        if let Err(error) = clear_previous_results(&live_dir, only.as_ref()) {
+            report.errors.push(format!("clear previous results: {error}"));
+        }
         // Publish every sealed file, including the freshly-built `_OVERVIEW`
         // correlation tables and the MFT raw table. A partial run still derives
         // a valid overview from the artifacts that staged successfully, so the
@@ -2165,6 +2336,56 @@ mod persistent_log_tests {
     }
 
     #[test]
+    fn environment_io_errors_escalate_but_format_errors_do_not() {
+        // 권한 거부는 증거 손상이 아니라 실행 환경 문제 — partial로 승격.
+        let denied = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "denied",
+        ));
+        assert!(is_storage_error(&denied));
+        let enospc = anyhow::Error::new(std::io::Error::from_raw_os_error(28));
+        assert!(is_storage_error(&enospc));
+        // 포맷 해석 실패는 손상 아티팩트로 건너뛴다.
+        let format = anyhow::anyhow!("not a registry hive");
+        assert!(!is_storage_error(&format));
+        let not_found = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "gone",
+        ));
+        assert!(!is_storage_error(&not_found));
+    }
+
+    #[test]
+    fn amcache_hive_report_serializes_log_fallback() {
+        let fallback = AmcacheHiveReport {
+            source_path: "C:\\Amcache.hve".to_string(),
+            status: "completed".to_string(),
+            logs_discovered: 2,
+            logs_applied: 0,
+            log_apply_error: Some("bad LOG1".to_string()),
+            error: None,
+        };
+        let value = serde_json::to_value(&fallback).unwrap();
+        assert_eq!(value["status"], "completed");
+        assert_eq!(value["logsDiscovered"], 2);
+        assert_eq!(value["logsApplied"], 0);
+        assert_eq!(value["logApplyError"], "bad LOG1");
+        assert!(value.get("error").is_none());
+        let skipped = AmcacheHiveReport {
+            source_path: "C:\\Amcache.hve".to_string(),
+            status: "skipped_corrupted".to_string(),
+            logs_discovered: 2,
+            logs_applied: 0,
+            log_apply_error: None,
+            error: Some("not a hive".to_string()),
+        };
+        let value = serde_json::to_value(&skipped).unwrap();
+        assert_eq!(value["status"], "skipped_corrupted");
+        assert_eq!(value["error"], "not a hive");
+        assert!(value.get("logApplyError").is_none());
+    }
+
+    #[test]
     fn report_serializes_temporary_registry_recovery_policy_explicitly() {
         let policy = RegistryRecoveryReport {
             mode: "disabled".to_string(),
@@ -2240,11 +2461,14 @@ mod persistent_log_tests {
     }
 
     #[test]
-    fn partial_publish_uses_sealed_success_outputs_and_keeps_prior_overview() {
+    fn partial_publish_clears_prior_results_and_publishes_only_sealed_outputs() {
         let root = temporary_directory("partial-publish");
         let live = root.join("host");
+        // 이전 실행의 파생 결과 — 재파싱은 이전 결과를 보존하지 않으므로
+        // (수집 데이터 불변, 실패 파싱은 반복 실패) 발행 전에 지워져야 한다.
         std::fs::create_dir_all(live.join("_OVERVIEW")).unwrap();
         std::fs::write(live.join("_OVERVIEW/MFT_Records.sqlite"), b"prior-overview").unwrap();
+        std::fs::write(live.join("_master_timeline.cache.json"), b"prior-cache").unwrap();
 
         let stage = prepare_staging_output(&live, "partial-run", None).unwrap();
         std::fs::create_dir_all(stage.join("REGISTRY")).unwrap();
@@ -2260,15 +2484,60 @@ mod persistent_log_tests {
         // A failed later artifact can still leave a partial stage file, but it
         // has no seal and therefore cannot be published with Registry.
         std::fs::write(stage.join("_OVERVIEW/MFT_Records.sqlite"), b"partial-mft").unwrap();
+        clear_previous_results(&live, None).unwrap();
         publish_staged_artifact_files(&live, &stage, "partial-run", &sealed).unwrap();
 
         assert_eq!(
             std::fs::read(live.join("REGISTRY/Registry.sqlite")).unwrap(),
             b"successful-registry"
         );
+        // 이전 파생 결과·타임라인 캐시는 남지 않는다 — "새 facts + 이전
+        // derived" 혼재가 구조적으로 불가능해야 한다. 봉인되지 않은 실패
+        // 아티팩트의 stage 파일도 발행되지 않는다.
+        assert!(!live.join("_OVERVIEW/MFT_Records.sqlite").exists());
+        assert!(!live.join("_master_timeline.cache.json").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stage_overview_reset_drops_copied_prior_derived_files() {
+        let root = temporary_directory("stage-ov-reset");
+        let live = root.join("host");
+        // 범위 재파싱: 이전 실행의 파생 파일이 live에 있고, 스테이지 준비가
+        // 이를 복사해 온다. 0건이 된 skip_empty 파생은 write_ov가 아무것도
+        // 안 하므로, 리셋 없이는 이 복사본이 그대로 재발행된다.
+        std::fs::create_dir_all(live.join("_OVERVIEW")).unwrap();
+        std::fs::write(live.join("_OVERVIEW/ScheduledTasks.sqlite"), b"prior").unwrap();
+        let mut only = HashSet::new();
+        only.insert("TaskScheduler".to_string());
+        let stage = prepare_staging_output(&live, "scoped-ov", Some(&only)).unwrap();
+        assert!(stage.join("_OVERVIEW/ScheduledTasks.sqlite").exists());
+        reset_stage_overview(&stage.join("_OVERVIEW")).unwrap();
+        assert!(!stage.join("_OVERVIEW/ScheduledTasks.sqlite").exists());
+        assert!(stage.join("_OVERVIEW").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn scoped_clear_removes_only_target_categories() {
+        let root = temporary_directory("scoped-clear");
+        let live = root.join("host");
+        std::fs::create_dir_all(live.join("REGISTRY")).unwrap();
+        std::fs::create_dir_all(live.join("EVENTLOG")).unwrap();
+        std::fs::create_dir_all(live.join("_OVERVIEW")).unwrap();
+        std::fs::write(live.join("REGISTRY/Registry.sqlite"), b"old").unwrap();
+        std::fs::write(live.join("EVENTLOG/Security.sqlite"), b"keep").unwrap();
+        std::fs::write(live.join("_OVERVIEW/TargetInfo.sqlite"), b"old").unwrap();
+        let mut only = HashSet::new();
+        only.insert("Registry".to_string());
+        clear_previous_results(&live, Some(&only)).unwrap();
+        // 대상 아티팩트 카테고리와 항상 재생성되는 _OVERVIEW만 지워지고,
+        // 범위 밖 카테고리는 유지된다.
+        assert!(!live.join("REGISTRY").exists());
+        assert!(!live.join("_OVERVIEW").exists());
         assert_eq!(
-            std::fs::read(live.join("_OVERVIEW/MFT_Records.sqlite")).unwrap(),
-            b"prior-overview"
+            std::fs::read(live.join("EVENTLOG/Security.sqlite")).unwrap(),
+            b"keep"
         );
         let _ = std::fs::remove_dir_all(root);
     }
@@ -2312,6 +2581,7 @@ mod persistent_log_tests {
             published: false,
             errors: Vec::new(),
             registry_hives: Vec::new(),
+            amcache_hives: Vec::new(),
             registry_recovery: None,
             completed_artifacts: vec!["Registry".to_string(), "MFT".to_string()],
             published_artifacts: Vec::new(),
@@ -2423,6 +2693,7 @@ mod persistent_log_tests {
             published: false,
             errors: Vec::new(),
             registry_hives: Vec::new(),
+            amcache_hives: Vec::new(),
             registry_recovery: None,
             completed_artifacts: Vec::new(),
             published_artifacts: Vec::new(),
@@ -2504,6 +2775,7 @@ mod persistent_log_tests {
         // or discard sibling results (파싱 실패 == 손상 아티팩트).
         std::fs::write(target_dir.join("SOFTWARE"), b"not a registry hive").unwrap();
         std::fs::write(target_dir.join("SRUDB.dat"), b"not an ESE database").unwrap();
+        std::fs::write(target_dir.join("Amcache.hve"), b"not an amcache hive").unwrap();
         let case = case_store::create_case("case", "2026-08-23 01:02:03", &cases_dir).unwrap();
         let host = case_store::create_host(
             &case.id,
@@ -2516,6 +2788,7 @@ mod persistent_log_tests {
         let mut only = HashSet::new();
         only.insert("Registry".to_string());
         only.insert("SRUM".to_string());
+        only.insert("Amcache".to_string());
         let run_id = "source-errors";
 
         run_host_with_log_id(&case.id, &host.id, &cases_dir, Some(only), Some(run_id))
@@ -2526,7 +2799,7 @@ mod persistent_log_tests {
             serde_json::from_slice(&std::fs::read(host_dir.join("parse_report.json")).unwrap())
                 .unwrap();
         let artifacts = report["artifacts"].as_array().expect("artifact report");
-        for artifact in ["Registry", "SRUM"] {
+        for artifact in ["Registry", "SRUM", "Amcache"] {
             let entry = artifacts
                 .iter()
                 .find(|entry| entry["name"] == artifact)
@@ -2541,6 +2814,20 @@ mod persistent_log_tests {
         assert!(report["registryHives"]
             .as_array()
             .is_some_and(|hives| hives.iter().any(|hive| hive["status"] == "skipped_corrupted")));
+        // 손상 Amcache 건너뜀도 경로·오류와 함께 영구 보고서에 남아야
+        // 0건 결과와 구분된다.
+        let amcache_hive = report["amcacheHives"]
+            .as_array()
+            .and_then(|hives| {
+                hives
+                    .iter()
+                    .find(|hive| hive["status"] == "skipped_corrupted")
+            })
+            .expect("skipped amcache hive report");
+        assert!(amcache_hive["sourcePath"]
+            .as_str()
+            .is_some_and(|path| path.ends_with("Amcache.hve")));
+        assert!(amcache_hive["error"].as_str().is_some_and(|e| !e.is_empty()));
         assert_eq!(report["status"], "ok");
         assert_eq!(
             case_store::load_host(&case.id, &host.id, &cases_dir)

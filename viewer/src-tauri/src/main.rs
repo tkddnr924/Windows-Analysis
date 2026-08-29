@@ -12,7 +12,6 @@
 // onto these commands.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod shellbag;
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::Read;
@@ -1288,7 +1287,7 @@ fn artifact_input_files(source_file: String) -> Vec<ArtifactInputFile> {
     let mut inputs = vec![ArtifactInputFile {
         name: hive_name.unwrap_or_else(|| "Amcache.hve".to_string()),
         kind: "hive".to_string(),
-        detail: "레지스트리 하이브를 파싱하며 삭제된 셀 복구를 포함합니다.".to_string(),
+        detail: "레지스트리 하이브에서 할당된(live) 레코드를 파싱합니다.".to_string(),
     }];
     if let Some(parent) = hive.parent() {
         if let Ok(entries) = std::fs::read_dir(parent) {
@@ -1298,7 +1297,10 @@ fn artifact_input_files(source_file: String) -> Vec<ArtifactInputFile> {
                     inputs.push(ArtifactInputFile {
                         name,
                         kind: "transactionLog".to_string(),
-                        detail: "트랜잭션 로그를 함께 적용해 복구 가능한 변경 사항을 파싱합니다."
+                        // 이 목록은 현재 디렉터리 재탐색 결과라 "적용 여부"를
+                        // 단정하면 안 된다 — 실제 적용/폴백 실적은 실행 시
+                        // parse_report.json의 amcacheHives에 기록된다.
+                        detail: "하이브와 함께 발견된 트랜잭션 로그 — 실제 적용 여부는 파싱 보고서(amcacheHives)에 기록됩니다."
                             .to_string(),
                     });
                 }
@@ -2938,14 +2940,66 @@ fn list_column_values(
 const MFT_TABLE: &str = "MFT_Records";
 
 #[tauri::command]
-fn mft_children(full_path: String, parent_entry: i64) -> Vec<Map<String, Value>> {
-    let conn = match open_ro(&full_path) {
-        Ok(c) => c,
-        Err(_) => return vec![],
-    };
-    let sql = format!("SELECT rowid AS __rowid, * FROM {} WHERE parent_entry = ?1 AND entry != ?1 ORDER BY is_directory DESC, file_name COLLATE NOCASE", q(MFT_TABLE));
+async fn mft_children(
+    full_path: String,
+    parent_entry: i64,
+    offset: Option<i64>,
+    limit: Option<i64>,
+) -> Result<MftChildrenPage, String> {
+    // 대형 수집본의 폴더 탐색이 다른 IPC 응답성을 막지 않게 blocking
+    // executor로 분리한다 (Browser Activity·Cache 본문과 같은 규칙).
+    tauri::async_runtime::spawn_blocking(move || {
+        mft_children_blocking(
+            full_path,
+            parent_entry,
+            offset.unwrap_or(0),
+            limit.unwrap_or(100),
+        )
+    })
+    .await
+    .map_err(|error| format!("MFT 자식 조회 작업이 중단되었습니다: {error}"))?
+}
+
+/// 읽기·쿼리 실패는 빈 폴더가 아니라 오류로 전파한다 — MFT 탐색은 증거
+/// 누락·손상 판단 기능이라, 실패를 "비어 있음"으로 표시하면 잘못된 증거
+/// 해석으로 이어진다. UI는 기존 failedEntries/rootError 경로로 재시도를
+/// 안내한다.
+fn mft_children_blocking(
+    full_path: String,
+    parent_entry: i64,
+    offset: i64,
+    limit: i64,
+) -> Result<MftChildrenPage, String> {
+    let conn = open_ro(&full_path)?;
+    if !table_names(&conn).iter().any(|name| name == MFT_TABLE) {
+        return Err("MFT 레코드 테이블을 찾을 수 없습니다".to_string());
+    }
+    // NTFS에는 자식 수만~수십만 개짜리 디렉터리가 실존한다 — 폴더 하나
+    // 펼치기가 무제한 IPC가 되지 않게 서버에서 상한을 강제하고, UI가
+    // "더 불러오기"로 이어 받는다. rowid 2차 정렬로 페이지 순서를 고정하며,
+    // 파싱 단계에서 만든 (parent_entry, is_directory, file_name) 인덱스를
+    // 그대로 탄다.
+    let limit = limit.clamp(1, 500);
+    let offset = offset.max(0);
     let pe = parent_entry.to_string();
-    query_rows(&conn, &sql, &[&pe]).unwrap_or_default()
+    // 전체 건수는 첫 페이지에서만 계산한다 — "더 불러오기"마다 COUNT를
+    // 반복하지 않도록 후속 페이지는 -1을 반환하고 UI가 보관한 값을 쓴다.
+    let total: i64 = if offset == 0 {
+        conn.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM {} WHERE parent_entry = ?1 AND entry != ?1",
+                q(MFT_TABLE)
+            ),
+            [&pe],
+            |r| r.get(0),
+        )
+        .map_err(|error| format!("MFT 자식 수 조회 실패: {error}"))?
+    } else {
+        -1
+    };
+    let sql = format!("SELECT rowid AS __rowid, * FROM {} WHERE parent_entry = ?1 AND entry != ?1 ORDER BY is_directory DESC, file_name COLLATE NOCASE, rowid LIMIT ?2 OFFSET ?3", q(MFT_TABLE));
+    let rows = query_rows(&conn, &sql, &[&pe, &limit, &offset])?;
+    Ok(MftChildrenPage { rows, total })
 }
 
 #[tauri::command]
@@ -2954,6 +3008,8 @@ fn mft_search(full_path: String, query: String, limit: i64) -> Vec<Map<String, V
         Ok(c) => c,
         Err(_) => return vec![],
     };
+    // 호출자 값에 의존하지 않는 서버 측 상한.
+    let limit = limit.clamp(1, 500);
     let like = format!("%{}%", query);
     let sql = format!("SELECT rowid AS __rowid, * FROM {} WHERE file_name LIKE ?1 OR path LIKE ?1 ORDER BY is_directory DESC, path COLLATE NOCASE LIMIT ?2", q(MFT_TABLE));
     query_rows(&conn, &sql, &[&like, &limit]).unwrap_or_default()
@@ -2966,6 +3022,15 @@ fn mft_search(full_path: String, query: String, limit: i64) -> Vec<Map<String, V
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct MftRecordsPage {
+    rows: Vec<Map<String, Value>>,
+    total: i64,
+}
+
+/// 탐색기 트리의 폴더 자식 한 페이지 — total로 UI가 "더 불러오기" 여부를
+/// 판단한다.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MftChildrenPage {
     rows: Vec<Map<String, Value>>,
     total: i64,
 }
@@ -3936,177 +4001,118 @@ fn to_volume_relative(p: &str) -> String {
     }
 }
 
-/// The account a per-user artifact belongs to: the path component right after
-/// a LNK/JUMPLIST collection folder (…/LNK/<account>/Recent/…).
-fn account_from_source(src: &str) -> String {
-    let parts: Vec<&str> = src.split(['/', '\\']).collect();
-    for (i, p) in parts.iter().enumerate() {
-        let up = p.to_uppercase();
-        if (up == "LNK" || up == "JUMPLIST") && i + 1 < parts.len() {
-            return parts[i + 1].to_string();
-        }
-    }
-    String::new()
-}
 
-/// Every cross-artifact reference to a filesystem path for this host, so the
-/// $MFT explorer can tag files that also appear in a JumpList (etc.) and show
-/// the details on demand. Returned as a flat list; the frontend indexes it by
-/// `path`.
+/// MFT 탐색기 교차 참조 — 파싱 단계에서 만들어 둔 `_OVERVIEW/PathReferences`
+/// 파생 테이블을 **표시 중인 경로 배치**로만 조회한다. 화면 진입마다 JumpList
+/// 전수 스캔·Shellbag 재구성을 하던 즉석 가공은 파서로 이전됐다(협약).
+/// 파생 테이블이 없는 이전 파싱 호스트는 빈 결과를 돌려준다(재파싱 필요).
 #[tauri::command]
-fn path_references(host_dir: String) -> Vec<PathReference> {
+async fn path_references(
+    host_dir: String,
+    paths: Vec<String>,
+) -> Result<Vec<PathReference>, String> {
+    tauri::async_runtime::spawn_blocking(move || path_references_blocking(host_dir, paths))
+        .await
+        .map_err(|error| format!("교차 참조 조회 작업이 중단되었습니다: {error}"))?
+}
+
+fn path_references_blocking(
+    host_dir: String,
+    paths: Vec<String>,
+) -> Result<Vec<PathReference>, String> {
+    let db = PathBuf::from(&host_dir)
+        .join("_OVERVIEW")
+        .join("PathReferences.sqlite");
+    if !db.exists() {
+        return Ok(vec![]);
+    }
+    let conn = open_ro(&db.to_string_lossy())?;
+    // 요청 경로를 파생 테이블의 키와 같은 형식(볼륨 상대·소문자)으로 정규화.
+    let mut keys: Vec<String> = paths.iter().map(|p| to_volume_relative(p)).collect();
+    keys.sort();
+    keys.dedup();
     let mut out = Vec::new();
-    let jl = PathBuf::from(&host_dir)
-        .join("JUMPLIST")
-        .join("JumpList_Entries.sqlite");
-    if let Ok(conn) = open_ro(&jl.to_string_lossy()) {
-        let sql = "SELECT rowid AS __rowid, target_path, app_id, jumplist_type, arguments, working_directory, \
-                   machine_id, timestamp, created_time, modified_time, _source_file \
-                   FROM JumpList_Entries WHERE target_path IS NOT NULL AND target_path != ''";
-        if let Ok(rows) = query_rows(&conn, sql, &[]) {
-            for r in rows {
-                let get = |k: &str| r.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let target = get("target_path");
-                if target.is_empty() {
-                    continue;
-                }
-                let src = get("_source_file");
-                let rowid = r.get("__rowid").and_then(|v| v.as_i64()).unwrap_or(-1);
-                let mut fields = Map::new();
-                for k in [
-                    "target_path",
-                    "app_id",
-                    "jumplist_type",
-                    "arguments",
-                    "working_directory",
-                    "machine_id",
-                    "timestamp",
-                    "created_time",
-                    "modified_time",
-                    "_source_file",
-                ] {
-                    let v = get(k);
-                    if !v.is_empty() {
-                        fields.insert(k.to_string(), Value::from(v));
-                    }
-                }
-                out.push(PathReference {
-                    path: to_volume_relative(&target),
-                    kind: "Jumplist".to_string(),
-                    account: account_from_source(&src),
-                    label: target.clone(),
-                    fields,
-                    full_path: jl.to_string_lossy().to_string(),
-                    table_name: "JumpList_Entries".to_string(),
-                    rowid,
-                });
-            }
-        }
-    }
-    out.extend(shellbag_references(&host_dir));
-    out
-}
-
-/// Decode shellbags from the host's registry dumps and turn them into path
-/// references (kind = "Shellbag").
-fn shellbag_references(host_dir: &str) -> Vec<PathReference> {
-    let reg_dir = PathBuf::from(host_dir).join("REGISTRY");
-    let mut rows: Vec<shellbag::BagRow> = Vec::new();
-    let files = match std::fs::read_dir(&reg_dir) {
-        Ok(rd) => rd
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().map(|x| x == "sqlite").unwrap_or(false))
-            .collect::<Vec<_>>(),
-        Err(_) => return vec![],
-    };
-    for f in files {
-        // Account = the hive's user prefix (Administrator_UsrClass.dat -> Administrator).
-        let stem = f
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_default();
-        let account = stem.split('_').next().unwrap_or(&stem).to_string();
-        let conn = match open_ro(&f.to_string_lossy()) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-        let sql = "SELECT key_path, value_name, value_data FROM Registry \
-                   WHERE lower(key_path) LIKE '%bagmru%' AND value_name GLOB '[0-9]*' \
-                   AND value_data IS NOT NULL AND value_data != ''";
-        let mut stmt = match conn.prepare(sql) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        let it = stmt.query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-            ))
-        });
-        if let Ok(it) = it {
-            for row in it.filter_map(|x| x.ok()) {
-                let (key_path, value_name, hex) = row;
-                let data = unhex(&hex);
-                if data.is_empty() {
-                    continue;
-                }
-                rows.push(shellbag::BagRow {
-                    key_path,
-                    value_name,
-                    data,
-                    account: account.clone(),
-                });
-            }
-        }
-    }
-    shellbag::reconstruct(rows)
-        .into_iter()
-        .map(|s| {
+    // SQLite 바인딩 수 제한을 고려해 청크로 조회한다.
+    for chunk in keys.chunks(400) {
+        let placeholders = vec!["?"; chunk.len()].join(", ");
+        let sql = format!(
+            "SELECT rowid AS __rowid, * FROM PathReferences WHERE path IN ({placeholders})"
+        );
+        let params: Vec<&dyn rusqlite::ToSql> =
+            chunk.iter().map(|k| k as &dyn rusqlite::ToSql).collect();
+        for r in query_rows(&conn, &sql, &params)? {
+            let get = |k: &str| r.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
             let mut fields = Map::new();
-            fields.insert("path".into(), Value::from(s.display.clone()));
-            if !s.account.is_empty() {
-                fields.insert("account".into(), Value::from(s.account.clone()));
+            for k in [
+                "target_path",
+                "app_id",
+                "jumplist_type",
+                "arguments",
+                "working_directory",
+                "machine_id",
+                "timestamp",
+                "created_time",
+                "modified_time",
+                "_source_file",
+                "path",
+                "account",
+            ] {
+                let v = get(k);
+                if !v.is_empty() {
+                    fields.insert(k.to_string(), Value::from(v));
+                }
             }
-            PathReference {
-                path: s.path,
-                kind: "Shellbag".to_string(),
-                account: s.account,
-                label: s.display,
+            let source_relative = get("source_relative");
+            let full_path = if source_relative.is_empty() {
+                String::new()
+            } else {
+                PathBuf::from(&host_dir)
+                    .join(&source_relative)
+                    .to_string_lossy()
+                    .to_string()
+            };
+            out.push(PathReference {
+                path: get("path"),
+                kind: get("kind"),
+                account: get("account"),
+                label: get("label"),
                 fields,
-                full_path: String::new(),
-                table_name: String::new(),
-                rowid: -1,
-            }
-        })
-        .collect()
+                full_path,
+                table_name: get("source_table"),
+                rowid: get("source_rowid").parse().unwrap_or(-1),
+            });
+        }
+    }
+    Ok(out)
 }
 
-/// Decode a lowercase/uppercase hex string to bytes ("" or odd length -> empty).
-fn unhex(s: &str) -> Vec<u8> {
-    let b = s.as_bytes();
-    if !b.len().is_multiple_of(2) {
-        return Vec::new();
-    }
-    let hv = |c: u8| -> Option<u8> {
-        match c {
-            b'0'..=b'9' => Some(c - b'0'),
-            b'a'..=b'f' => Some(c - b'a' + 10),
-            b'A'..=b'F' => Some(c - b'A' + 10),
-            _ => None,
+/// 교차 참조에 등장하는 계정 목록(필터 칩용) — 파생 테이블에서 바로 집계.
+#[tauri::command]
+async fn path_reference_accounts(host_dir: String) -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let db = PathBuf::from(&host_dir)
+            .join("_OVERVIEW")
+            .join("PathReferences.sqlite");
+        if !db.exists() {
+            return Ok(vec![]);
         }
-    };
-    let mut out = Vec::with_capacity(b.len() / 2);
-    let mut i = 0;
-    while i + 1 < b.len() {
-        match (hv(b[i]), hv(b[i + 1])) {
-            (Some(h), Some(l)) => out.push(h << 4 | l),
-            _ => return Vec::new(),
-        }
-        i += 2;
-    }
-    out
+        let conn = open_ro(&db.to_string_lossy())?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT DISTINCT account FROM PathReferences WHERE account != '' ORDER BY account LIMIT 500",
+            )
+            .map_err(|error| format!("교차 참조 계정 조회 실패: {error}"))?;
+        let accounts = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|error| format!("교차 참조 계정 조회 실패: {error}"))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(accounts)
+    })
+    .await
+    .map_err(|error| format!("교차 참조 계정 작업이 중단되었습니다: {error}"))?
 }
+
 
 // --- commands: bookmarks (JSON file) ---------------------------------------
 
@@ -5950,14 +5956,6 @@ fn main() {
     if let Some(code) = run_as_parse_worker() {
         std::process::exit(code);
     }
-    // Debug: `--__shellbag <hostDir>` prints reconstructed shellbag refs.
-    let a: Vec<String> = std::env::args().collect();
-    if a.len() >= 3 && a[1] == "--__shellbag" {
-        for r in shellbag_references(&a[2]) {
-            println!("[{}] {}  {}", r.account, r.label, r.path);
-        }
-        std::process::exit(0);
-    }
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(PipelineState::default())
@@ -5996,6 +5994,7 @@ fn main() {
             update_bookmark_note,
             pick_folder,
             path_references,
+            path_reference_accounts,
             browser_activity_summary,
             browser_activity_insights,
             browser_activity_domains,

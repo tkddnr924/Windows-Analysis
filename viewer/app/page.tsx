@@ -1110,10 +1110,6 @@ export default function Home() {
                 timeRange={timeRange}
                 focusHostName={selectedHost?.name ?? null}
                 onRefresh={() => handleSelectConnections(true)}
-                onOpenHost={(name) => {
-                  const h = selectedCase?.hosts.find((x) => x.name === name);
-                  if (h) openHost(h);
-                }}
               />
             )}
 

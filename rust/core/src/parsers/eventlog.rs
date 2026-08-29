@@ -161,6 +161,12 @@ pub fn parse_evtx_stream(path: &Path, out: &Path, table: &str) -> Result<usize> 
                 row.insert("timestamp".into(), String::new());
                 row.insert("_status".into(), "corrupted_chunk".into());
                 row.insert("_error".into(), e.to_string());
+                // 손상 행도 record_key 계약(<테이블>::<rowid>)을 지켜야 상세
+                // 패널·북마크가 이 행을 안정적으로 참조할 수 있다.
+                row.insert(
+                    "_record_key".into(),
+                    format!("{}::{}", table, next_rowid),
+                );
                 row.insert("_source_file".into(), src.clone());
                 writer.push(row)?;
             }

@@ -279,7 +279,19 @@ pub fn parse_mft_stream(mft_path: &Path, out: &Path) -> Result<usize> {
         row.insert("_source_file".into(), src.clone());
         writer.push(row)?;
     }
-    writer.finish()
+    let count = writer.finish()?;
+    // 뷰어의 폴더 자식 페이지 조회(mft_children)가 대형 MFT에서 요청마다
+    // 전수 필터·정렬을 반복하지 않도록, 뷰 가공 준비는 파싱 단계에서 한다는
+    // 협약대로 여기서 인덱스를 만들어 둔다.
+    let conn = rusqlite::Connection::open(out)?;
+    conn.execute(
+        &format!(
+            "CREATE INDEX IF NOT EXISTS idx_mft_children ON \"{}\"(parent_entry, is_directory, file_name COLLATE NOCASE)",
+            MFT_TABLE
+        ),
+        [],
+    )?;
+    Ok(count)
 }
 
 #[cfg(test)]
