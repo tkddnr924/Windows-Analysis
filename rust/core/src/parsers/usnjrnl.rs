@@ -139,18 +139,31 @@ pub fn parse_usn_stream(path: &Path, out: &Path) -> Result<usize> {
         let attrs = u32le(&data, hdr + 28);
         let name_len = u16le(&data, hdr + 32) as usize;
         let name_off = u16le(&data, hdr + 34) as usize;
+        // 파일명 범위는 파일 끝이 아니라 "이 레코드"의 경계로 검증한다 —
+        // 조작된 오프셋/길이가 다음 레코드나 슬랙 바이트를 이름으로 읽으면
+        // 실제 USN·MFT 참조에 존재하지 않는 파일명을 결합한 허위 행이 되므로,
+        // 위반 레코드는 통째로 손상으로 격리하고 다음 정렬 위치로 진행한다.
+        let fixed_end = (hdr - pos) + 36;
+        let Some(name_end) = name_off.checked_add(name_len) else {
+            pos += advance;
+            continue;
+        };
+        if name_len > 0 && (name_off < fixed_end || !name_len.is_multiple_of(2)) {
+            pos += advance;
+            continue;
+        }
+        if name_end > reclen {
+            pos += advance;
+            continue;
+        }
         let name = {
             let start = pos + name_off;
-            let end = start + name_len;
-            if end <= n {
-                let u16s: Vec<u16> = data[start..end]
-                    .chunks_exact(2)
-                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
-                    .collect();
-                String::from_utf16_lossy(&u16s)
-            } else {
-                String::new()
-            }
+            let end = pos + name_end;
+            let u16s: Vec<u16> = data[start..end]
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            String::from_utf16_lossy(&u16s)
         };
 
         let mut row = Row::new();
@@ -176,4 +189,60 @@ pub fn parse_usn_stream(path: &Path, out: &Path) -> Result<usize> {
         pos += advance;
     }
     writer.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// V2 레코드: 60바이트 고정 헤더 + UTF-16LE 파일명. 이름 오프셋·길이는
+    /// 인자로 조작할 수 있게 해 손상 케이스를 만든다.
+    fn usn_v2(reclen: u32, usn: u64, name: &str, name_off: u16, name_len: u16) -> Vec<u8> {
+        let name_bytes: Vec<u8> = name.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let mut b = vec![0u8; 60];
+        b[0..4].copy_from_slice(&reclen.to_le_bytes());
+        b[4..6].copy_from_slice(&2u16.to_le_bytes());
+        b[24..32].copy_from_slice(&usn.to_le_bytes());
+        b[56..58].copy_from_slice(&name_len.to_le_bytes());
+        b[58..60].copy_from_slice(&name_off.to_le_bytes());
+        b.extend(name_bytes);
+        while !b.len().is_multiple_of(8) {
+            b.push(0);
+        }
+        b
+    }
+
+    #[test]
+    fn name_range_is_bounded_to_its_own_record() {
+        let root = std::env::temp_dir().join(format!(
+            "wina-usn-bounds-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        // 레코드 A: reclen=60인데 이름 범위가 [60,76) — 자기 레코드 경계를
+        // 넘어 다음 레코드(B)의 파일명 바이트를 가리키는 조작 케이스.
+        // 레코드 B: 정상 (이름 "evil.exe" 포함, reclen=76).
+        let mut data = usn_v2(60, 111, "", 60, 16);
+        data.extend(usn_v2(76, 222, "evil.exe", 60, 16));
+        let src = root.join("J");
+        std::fs::write(&src, &data).unwrap();
+        let out = root.join("usn.sqlite");
+        let count = parse_usn_stream(&src, &out).unwrap();
+        assert_eq!(count, 1, "경계를 넘는 레코드 A는 손상으로 격리되어야 한다");
+        let conn = rusqlite::Connection::open(&out).unwrap();
+        let (usn, name): (String, String) = conn
+            .query_row(
+                &format!("SELECT usn, filename FROM \"{}\"", USN_TABLE),
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(usn, "222");
+        assert_eq!(name, "evil.exe");
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

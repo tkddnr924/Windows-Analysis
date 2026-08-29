@@ -107,24 +107,71 @@ fn after_root(path: &str) -> Option<Vec<&str>> {
     Some(path[idx + 6..].split('\\').collect())
 }
 
-fn recovery_label(key: &notatin::cell_key_node::CellKeyNode) -> String {
-    if key.cell_state.is_deleted() {
-        format!("{:?}", key.cell_state)
-    } else {
-        "live".to_string()
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AmcacheKeyKind {
+    ProgramModern,
+    ProgramLegacy,
+    FileModern,
+    FileLegacy,
+    Other,
+}
+
+/// Root 하위 세그먼트를 Programs/Files 분기로 분류한다. 레지스트리 키 이름은
+/// 대소문자를 구분하지 않으므로 inventoryapplication 같은 표기 변형도 같은
+/// 분기로 들어가야 유효한 설치·실행 증거가 표기만으로 누락되지 않는다.
+fn classify_key(segs: &[&str]) -> AmcacheKeyKind {
+    match segs {
+        // programs: Root\InventoryApplication\<id> (modern) or Root\Programs\<id> (legacy)
+        [root, _] if root.eq_ignore_ascii_case("InventoryApplication") => {
+            AmcacheKeyKind::ProgramModern
+        }
+        [root, _] if root.eq_ignore_ascii_case("Programs") => AmcacheKeyKind::ProgramLegacy,
+        // files: Root\InventoryApplicationFile\<id> (modern) or Root\File\<vol>\<fileid> (legacy)
+        [root, _] if root.eq_ignore_ascii_case("InventoryApplicationFile") => {
+            AmcacheKeyKind::FileModern
+        }
+        [root, _, _] if root.eq_ignore_ascii_case("File") => AmcacheKeyKind::FileLegacy,
+        _ => AmcacheKeyKind::Other,
     }
 }
 
-pub fn parse_amcache(hive: &Path) -> Result<(Vec<Row>, Vec<Row>)> {
+pub struct AmcacheParse {
+    pub programs: Vec<Row>,
+    pub files: Vec<Row>,
+    /// 발견된 트랜잭션 로그를 적용하지 못해 기본 하이브만으로 폴백한 사유.
+    /// None이면 로그가 없었거나 정상 적용된 것이다.
+    pub log_apply_error: Option<String>,
+}
+
+pub fn parse_amcache(hive: &Path) -> Result<AmcacheParse> {
     let source = hive.to_string_lossy().to_string();
-    // notatin stores the path, so a borrowed &Path fails the 'static bound.
-    #[allow(clippy::unnecessary_to_owned)]
-    let mut builder = ParserBuilder::from_path(hive.to_path_buf());
-    for log in sibling_logs(hive) {
-        builder.with_transaction_log(log);
-    }
-    builder.recover_deleted(true);
-    let parser = builder.build()?;
+    let logs = sibling_logs(hive);
+    let make_builder = |with_logs: bool| {
+        // notatin stores the path, so a borrowed &Path fails the 'static bound.
+        #[allow(clippy::unnecessary_to_owned)]
+        let mut builder = ParserBuilder::from_path(hive.to_path_buf());
+        if with_logs {
+            for log in &logs {
+                builder.with_transaction_log(log.clone());
+            }
+        }
+        // 복구 정책(사용자 확정): 삭제된 셀은 복구하지 않는다 — Registry
+        // 파서와 동일하게 할당된(live) 키만 순회한다.
+        builder
+    };
+    // Registry 파서와 같은 규칙: 로그 포함 빌드가 실패해도 유효한 기본
+    // 하이브까지 버리지 않고, 실패 사유를 남긴 뒤 로그 없이 한 번 재시도한다.
+    let mut log_apply_error: Option<String> = None;
+    let parser = match make_builder(!logs.is_empty()).build() {
+        Ok(parser) => parser,
+        Err(error) => {
+            if logs.is_empty() {
+                return Err(error.into());
+            }
+            log_apply_error = Some(error.to_string());
+            make_builder(false).build()?
+        }
+    };
     let mut programs: Vec<Row> = Vec::new();
     let mut files: Vec<Row> = Vec::new();
 
@@ -135,12 +182,11 @@ pub fn parse_amcache(hive: &Path) -> Result<(Vec<Row>, Vec<Row>)> {
         };
         let ts = fmt_kst(key.last_key_written_date_and_time());
 
-        // programs: Root\InventoryApplication\<id> (modern) or Root\Programs\<id> (legacy)
-        let is_prog_modern = segs.len() == 2 && segs[0] == "InventoryApplication";
-        let is_prog_legacy = segs.len() == 2 && segs[0] == "Programs";
-        // files: Root\InventoryApplicationFile\<id> (modern) or Root\File\<vol>\<fileid> (legacy)
-        let is_file_modern = segs.len() == 2 && segs[0] == "InventoryApplicationFile";
-        let is_file_legacy = segs.len() == 3 && segs[0] == "File";
+        let kind = classify_key(&segs);
+        let is_prog_modern = kind == AmcacheKeyKind::ProgramModern;
+        let is_prog_legacy = kind == AmcacheKeyKind::ProgramLegacy;
+        let is_file_modern = kind == AmcacheKeyKind::FileModern;
+        let is_file_legacy = kind == AmcacheKeyKind::FileLegacy;
 
         if is_prog_modern || is_prog_legacy {
             let mut row = Row::new();
@@ -155,7 +201,7 @@ pub fn parse_amcache(hive: &Path) -> Result<(Vec<Row>, Vec<Row>)> {
                 row.insert(name, render(&cv));
             }
             row.insert("timestamp".into(), ts);
-            row.insert("_recovery".into(), recovery_label(&key));
+            row.insert("_recovery".into(), "live".into());
             row.insert("_source_file".into(), source.clone());
             programs.push(row);
         } else if is_file_modern || is_file_legacy {
@@ -196,10 +242,38 @@ pub fn parse_amcache(hive: &Path) -> Result<(Vec<Row>, Vec<Row>)> {
                 row.insert("SHA1".into(), s);
             }
             row.insert("timestamp".into(), ts);
-            row.insert("_recovery".into(), recovery_label(&key));
+            row.insert("_recovery".into(), "live".into());
             row.insert("_source_file".into(), source.clone());
             files.push(row);
         }
     }
-    Ok((programs, files))
+    Ok(AmcacheParse {
+        programs,
+        files,
+        log_apply_error,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{after_root, classify_key, AmcacheKeyKind};
+
+    #[test]
+    fn key_classification_ignores_case() {
+        let cases: &[(&str, AmcacheKeyKind)] = &[
+            ("\\Root\\InventoryApplication\\id1", AmcacheKeyKind::ProgramModern),
+            ("\\Root\\inventoryapplication\\id1", AmcacheKeyKind::ProgramModern),
+            ("\\Root\\PROGRAMS\\id2", AmcacheKeyKind::ProgramLegacy),
+            ("\\Root\\INVENTORYAPPLICATIONFILE\\id3", AmcacheKeyKind::FileModern),
+            ("\\Root\\file\\vol1\\fid1", AmcacheKeyKind::FileLegacy),
+            // 세그먼트 수가 다르거나 무관한 키는 분류되지 않아야 한다.
+            ("\\Root\\InventoryApplication\\id\\extra", AmcacheKeyKind::Other),
+            ("\\Root\\File\\onlyvol", AmcacheKeyKind::Other),
+            ("\\Root\\DeviceContainers\\x", AmcacheKeyKind::Other),
+        ];
+        for (path, expected) in cases {
+            let segs = after_root(path).expect("segments");
+            assert_eq!(classify_key(&segs), *expected, "path: {path}");
+        }
+    }
 }

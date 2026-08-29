@@ -9,6 +9,8 @@ import BookmarkIcon from "@mui/icons-material/Bookmark";
 import ArrowDownwardOutlinedIcon from "@mui/icons-material/ArrowDownwardOutlined";
 import ArrowUpwardOutlinedIcon from "@mui/icons-material/ArrowUpwardOutlined";
 import FolderSharedOutlinedIcon from "@mui/icons-material/FolderSharedOutlined";
+import GppMaybeOutlinedIcon from "@mui/icons-material/GppMaybeOutlined";
+import SettingsRemoteOutlinedIcon from "@mui/icons-material/SettingsRemoteOutlined";
 import Inventory2OutlinedIcon from "@mui/icons-material/Inventory2Outlined";
 import KeyOutlinedIcon from "@mui/icons-material/KeyOutlined";
 import ManageSearchOutlinedIcon from "@mui/icons-material/ManageSearchOutlined";
@@ -40,15 +42,17 @@ interface Props {
 
 const ALL_ITEMS = "전체 항목";
 const PAGE = 10;
-const TAB_FIELD: Record<string, string> = { "자동 실행": "user", "기타 레지스트리": "subtype" };
-const CATEGORY_ORDER = ["자격 증명 보호", "공유 폴더", "SQL 인증", "자동 실행", "설치 프로그램 (MSI)", "기타 레지스트리"];
+const TAB_FIELD: Record<string, string> = { "자동 실행": "user", "보안 설정": "subtype", "원격 접속": "subtype", "기타 레지스트리": "subtype" };
+const CATEGORY_ORDER = ["자격 증명 보호", "보안 설정", "공유 폴더", "SQL 인증", "자동 실행", "원격 접속", "설치 프로그램 (MSI)", "기타 레지스트리"];
 const CATEGORY_META: Record<string, CategoryMeta> = {
   [ALL_ITEMS]: { icon: ManageSearchOutlinedIcon, label: ALL_ITEMS },
   "자격 증명 보호": { icon: VpnKeyOutlinedIcon, label: "자격 증명 보호" },
+  "보안 설정": { icon: GppMaybeOutlinedIcon, label: "보안 설정" },
   "공유 폴더": { icon: FolderSharedOutlinedIcon, label: "공유 폴더" },
   "SQL 인증": { icon: StorageOutlinedIcon, label: "SQL 인증" },
   "자동 실행": { icon: PlayCircleOutlineOutlinedIcon, label: "자동 실행" },
-  "설치 프로그램 (MSI)": { icon: Inventory2OutlinedIcon, label: "설치 프로그램 (MSI)" },
+  "원격 접속": { icon: SettingsRemoteOutlinedIcon, label: "원격 접속" },
+  "설치 프로그램 (MSI)": { icon: Inventory2OutlinedIcon, label: "설치 프로그램" },
   "기타 레지스트리": { icon: ManageSearchOutlinedIcon, label: "실행 흔적" },
 };
 const LEGACY_RUN_MRU_TITLE = "Run 대화상자 입력 (RunMRU)";

@@ -1305,7 +1305,7 @@ fn user_map(out_dir: &Path) -> std::collections::HashMap<String, String> {
         let kp = r.get("key_path").cloned().unwrap_or_default();
         if kp.to_lowercase().contains("\\profilelist\\s-")
             && r.get("value_name")
-                .map(|s| s == "ProfileImagePath")
+                .map(|s| s.eq_ignore_ascii_case("ProfileImagePath"))
                 .unwrap_or(false)
         {
             let sid = kp.rsplit('\\').next().unwrap_or("").to_string();
@@ -2224,6 +2224,43 @@ struct RegistryOverviewHive {
     rows: Vec<Row>,
 }
 
+impl RegistryOverviewHive {
+    /// 원본 3-요소 record_key(`<파일>::Registry::<rowid>`)를 각 행에 미리
+    /// 새겨 둔다 — rf_* 판정 함수들이 시그니처 변경 없이 매칭 행에서 증거
+    /// 키를 파생 행으로 옮겨 담아, 개요 북마크가 원본 Registry 레코드로
+    /// 승격될 수 있게 한다.
+    fn load(database: std::path::PathBuf) -> Self {
+        let mut rows: Vec<Row> = read_table_with_rowid(&database, "Registry")
+            .into_iter()
+            .filter(is_live)
+            .collect();
+        for row in rows.iter_mut() {
+            let key = source_record_key(&database, "Registry", row);
+            if !key.is_empty() {
+                row.insert("__record_key".into(), key);
+            }
+        }
+        Self {
+            name: database
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().to_string())
+                .unwrap_or_default(),
+            rows,
+            database,
+        }
+    }
+}
+
+/// 캐시 행에 새겨 둔 원본 record_key — 직접 캐시에서 읽은 행이 아니면(합성
+/// 값·테스트 픽스처) 빈 값이고, 그 행의 북마크는 파생 행에 남는다.
+fn reg_record_key(row: &Row) -> String {
+    row.get("__record_key").cloned().unwrap_or_default()
+}
+
+fn picked_record_key(row: Option<&Row>) -> String {
+    row.map(reg_record_key).unwrap_or_default()
+}
+
 /// Bounded to one overview generation.  This avoids reopening every large
 /// recovered hive for TargetInfo, BAM, and RegistryFindings while never
 /// crossing a host/run boundary or changing the raw parser/recovery output.
@@ -2245,20 +2282,7 @@ impl RegistryOverviewCache {
             Err(_) => return Self { hives: Vec::new() },
         };
         files.sort();
-        let hives = files
-            .into_iter()
-            .map(|database| RegistryOverviewHive {
-                name: database
-                    .file_stem()
-                    .map(|stem| stem.to_string_lossy().to_string())
-                    .unwrap_or_default(),
-                rows: read_table_with_rowid(&database, "Registry")
-                    .into_iter()
-                    .filter(is_live)
-                    .collect(),
-                database,
-            })
-            .collect();
+        let hives = files.into_iter().map(RegistryOverviewHive::load).collect();
         Self { hives }
     }
 
@@ -2275,9 +2299,32 @@ impl RegistryOverviewCache {
     }
 }
 
-/// First non-empty value for a key ending in `key_suffix` + value_name,
-/// preferring ControlSet001 over the ...002 backup.
-fn reg_pick(rows: &[Row], key_suffix: &str, value_name: &str) -> String {
+/// SYSTEM 하이브의 Select\Current가 가리키는 활성 ControlSet 토큰
+/// ("controlset002" 등). 값이 없거나 못 읽으면 종전 기본인 001 — LKG 부팅
+/// 후 002가 활성인 증거에서 001의 낡은 값을 고르지 않기 위한 기준점이다.
+fn active_control_set(rows: &[Row]) -> String {
+    rows.iter()
+        .find(|r| {
+            r.get("key_path")
+                .map(|k| k.to_lowercase().ends_with("\\select"))
+                .unwrap_or(false)
+                && r.get("value_name")
+                    .map(|n| n.eq_ignore_ascii_case("Current"))
+                    .unwrap_or(false)
+        })
+        .and_then(|r| r.get("value_data"))
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|n| *n > 0)
+        .map(|n| format!("controlset{:03}", n))
+        .unwrap_or_else(|| "controlset001".into())
+}
+
+/// First matching row for a key ending in `key_suffix` + value_name,
+/// preferring the active ControlSet (Select\Current, 기본 001) over stale
+/// mirrors — the row form exists so RegistryFindings can carry the matched
+/// row's record_key alongside the value. 값 이름은 레지스트리 의미대로
+/// 대소문자를 무시한다 (소문자 변형으로 탐지를 우회하지 못하게).
+fn reg_pick_row<'a>(rows: &'a [Row], key_suffix: &str, value_name: &str) -> Option<&'a Row> {
     let ks = key_suffix.to_lowercase();
     let hits: Vec<&Row> = rows
         .iter()
@@ -2286,21 +2333,29 @@ fn reg_pick(rows: &[Row], key_suffix: &str, value_name: &str) -> String {
                 .map(|k| k.to_lowercase().ends_with(&ks))
                 .unwrap_or(false)
                 && r.get("value_name")
-                    .map(|v| v == value_name)
+                    .map(|v| v.eq_ignore_ascii_case(value_name))
                     .unwrap_or(false)
                 && r.get("value_data").map(|v| !v.is_empty()).unwrap_or(false)
         })
         .collect();
-    for r in &hits {
-        if r.get("key_path")
-            .map(|k| k.to_lowercase().contains("controlset001"))
-            .unwrap_or(false)
-        {
-            return r.get("value_data").cloned().unwrap_or_default();
+    if hits.len() > 1 {
+        let active = active_control_set(rows);
+        if let Some(r) = hits.iter().find(|r| {
+            r.get("key_path")
+                .map(|k| k.to_lowercase().contains(&active))
+                .unwrap_or(false)
+        }) {
+            return Some(r);
         }
     }
-    hits.first()
-        .map(|r| r.get("value_data").cloned().unwrap_or_default())
+    hits.first().copied()
+}
+
+/// First non-empty value for a key ending in `key_suffix` + value_name,
+/// preferring ControlSet001 over the ...002 backup.
+fn reg_pick(rows: &[Row], key_suffix: &str, value_name: &str) -> String {
+    reg_pick_row(rows, key_suffix, value_name)
+        .and_then(|r| r.get("value_data").cloned())
         .unwrap_or_default()
 }
 
@@ -2482,7 +2537,7 @@ fn ti_accounts(sam: &[Row], software: &[Row]) -> Vec<Row> {
         let kp = r.get("key_path").cloned().unwrap_or_default();
         if kp.to_lowercase().contains("\\profilelist\\s-")
             && r.get("value_name")
-                .map(|v| v == "ProfileImagePath")
+                .map(|v| v.eq_ignore_ascii_case("ProfileImagePath"))
                 .unwrap_or(false)
         {
             let sid = kp.rsplit('\\').next().unwrap_or("").to_string();
@@ -2659,12 +2714,11 @@ fn ti_networks(software: &[Row]) -> Vec<Row> {
                 prof.insert(kp.clone(), (String::new(), String::new()));
             }
             let e = prof.get_mut(&kp).unwrap();
-            match r.get("value_name").map(|s| s.as_str()) {
-                Some("ProfileName") => e.0 = r.get("value_data").cloned().unwrap_or_default(),
-                Some("DateLastConnected") => {
-                    e.1 = systemtime_hex(&r.get("value_data").cloned().unwrap_or_default())
-                }
-                _ => {}
+            let name = r.get("value_name").cloned().unwrap_or_default();
+            if name.eq_ignore_ascii_case("ProfileName") {
+                e.0 = r.get("value_data").cloned().unwrap_or_default();
+            } else if name.eq_ignore_ascii_case("DateLastConnected") {
+                e.1 = systemtime_hex(&r.get("value_data").cloned().unwrap_or_default());
             }
         }
     }
@@ -2690,9 +2744,16 @@ fn ti_network_interfaces(system: &[Row]) -> Vec<Row> {
     let mark = "\\services\\tcpip\\parameters\\interfaces\\";
     let mut guids: Vec<String> = Vec::new();
     let mut ifaces: HashMap<String, HashMap<String, String>> = HashMap::new();
+    // 두 ControlSet의 같은 GUID 값을 한 맵에 덮으면 현재 IP와 과거
+    // DNS/게이트웨이가 섞인, 실존한 적 없는 네트워크 구성이 만들어진다 —
+    // 활성 세트(Select\Current)의 행만 조합한다.
+    let active_set = active_control_set(system);
     for r in system {
         let kp = r.get("key_path").cloned().unwrap_or_default();
         let low = kp.to_lowercase();
+        if !low.contains(&active_set) {
+            continue;
+        }
         if let Some(i) = low.find(mark) {
             let rest = &kp[i + mark.len()..];
             let guid = rest.split('\\').next().unwrap_or("").to_string();
@@ -2703,8 +2764,13 @@ fn ti_network_interfaces(system: &[Row]) -> Vec<Row> {
                 guids.push(guid.clone());
                 ifaces.insert(guid.clone(), HashMap::new());
             }
+            // 값 이름은 레지스트리 의미대로 대소문자 무시 — 소문자 키로
+            // 정규화해 ipaddress 같은 변형도 같은 속성으로 조회되게 한다.
             ifaces.get_mut(&guid).unwrap().insert(
-                r.get("value_name").cloned().unwrap_or_default(),
+                r.get("value_name")
+                    .cloned()
+                    .unwrap_or_default()
+                    .to_ascii_lowercase(),
                 r.get("value_data").cloned().unwrap_or_default(),
             );
         }
@@ -2712,7 +2778,7 @@ fn ti_network_interfaces(system: &[Row]) -> Vec<Row> {
     let mut rows = Vec::new();
     for guid in &guids {
         let d = &ifaces[guid];
-        let g = |k: &str| d.get(k).cloned().unwrap_or_default();
+        let g = |k: &str| d.get(&k.to_ascii_lowercase()).cloned().unwrap_or_default();
         let ip = {
             let a = iplist(&g("IPAddress"));
             if !a.is_empty() {
@@ -3128,7 +3194,22 @@ const RF_KEYS: &[&str] = &[
     "command",
     "user",
     "subtype",
+    "record_key",
 ];
+/// 속성 맵에서 값 이름을 레지스트리 의미대로 대소문자 무시로 찾는다 —
+/// 저장 키는 원문 casing을 유지해 properties 직렬화(상세 화면)에 그대로
+/// 남기고, 조회만 관대하게 한다. casing만 바꾼 값(actions, displayname 등)이
+/// 표시·판정에서 빠지면 안 되기 때문.
+fn prop_ci<'a>(
+    props: &'a std::collections::BTreeMap<String, String>,
+    name: &str,
+) -> Option<&'a String> {
+    props
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value)
+}
+
 fn rf_row(pairs: &[(&str, String)]) -> Row {
     let mut r = Row::new();
     for k in RF_KEYS {
@@ -3207,11 +3288,15 @@ fn parse_shimcache(data: &[u8]) -> Vec<(String, u64)> {
 
 fn rf_credential_protection(system: &[Row]) -> Vec<Row> {
     let mut rows = Vec::new();
-    let wd = reg_pick(system, "\\securityproviders\\wdigest", "UseLogonCredential");
+    let wd_row = reg_pick_row(system, "\\securityproviders\\wdigest", "UseLogonCredential");
+    let wd = wd_row
+        .and_then(|r| r.get("value_data").cloned())
+        .unwrap_or_default();
+    let wd_rk = picked_record_key(wd_row);
     if wd == "1" {
         rows.push(rf_row(&[("category", "자격 증명 보호".into()), ("name", "WDigest UseLogonCredential".into()), ("value", "1 (사용)".into()), ("status", "의심".into()),
             ("detail", "WDigest 평문 자격증명 캐시가 켜져 있음 — mimikatz(sekurlsa/wdigest) 등으로 LSASS에서 평문 암호 추출 가능 (공격자 사전작업 흔적)".into()),
-            ("key_path", "…\\Control\\SecurityProviders\\WDigest".into()), ("source", "SYSTEM".into())]));
+            ("key_path", "…\\Control\\SecurityProviders\\WDigest".into()), ("source", "SYSTEM".into()), ("record_key", wd_rk)]));
     } else if wd == "0" {
         rows.push(rf_row(&[
             ("category", "자격 증명 보호".into()),
@@ -3221,13 +3306,18 @@ fn rf_credential_protection(system: &[Row]) -> Vec<Row> {
             ("detail", "WDigest 평문 자격증명 캐시 비활성".into()),
             ("key_path", "…\\Control\\SecurityProviders\\WDigest".into()),
             ("source", "SYSTEM".into()),
+            ("record_key", wd_rk),
         ]));
     } else {
         rows.push(rf_row(&[("category", "자격 증명 보호".into()), ("name", "WDigest UseLogonCredential".into()), ("value", "미설정 (기본값)".into()), ("status", "정보".into()),
             ("detail", "미설정 — 최신 Windows(8.1/2012 R2+)는 기본 비활성이나, 구버전이거나 값이 추가되면 평문 캐시가 켜질 수 있음".into()),
             ("key_path", "…\\Control\\SecurityProviders\\WDigest".into()), ("source", "SYSTEM".into())]));
     }
-    let ppl = reg_pick(system, "\\control\\lsa", "RunAsPPL");
+    let ppl_row = reg_pick_row(system, "\\control\\lsa", "RunAsPPL");
+    let ppl = ppl_row
+        .and_then(|r| r.get("value_data").cloned())
+        .unwrap_or_default();
+    let ppl_rk = picked_record_key(ppl_row);
     if ppl == "1" || ppl == "2" {
         rows.push(rf_row(&[
             ("category", "자격 증명 보호".into()),
@@ -3240,6 +3330,7 @@ fn rf_credential_protection(system: &[Row]) -> Vec<Row> {
             ),
             ("key_path", "…\\Control\\Lsa".into()),
             ("source", "SYSTEM".into()),
+            ("record_key", ppl_rk),
         ]));
     } else {
         rows.push(rf_row(&[
@@ -3255,6 +3346,1180 @@ fn rf_credential_protection(system: &[Row]) -> Vec<Row> {
             ("key_path", "…\\Control\\Lsa".into()),
             ("source", "SYSTEM".into()),
         ]));
+    }
+    rows.extend(rf_lsa_packages(system));
+    rows
+}
+
+/// ⑭ Control\Lsa 확장 — 자격증명 노출도를 좌우하는 나머지 Lsa 값들.
+/// 비표준 Notification/Security Packages는 평문 암호 필터/LSASS 주입 지속성의
+/// 고전적 흔적이라 목록으로 뽑아 준다.
+fn rf_lsa_packages(system: &[Row]) -> Vec<Row> {
+    let mut rows = Vec::new();
+
+    let nolm_row = reg_pick_row(system, "\\control\\lsa", "NoLmHash");
+    if nolm_row.and_then(|r| r.get("value_data").cloned()).as_deref() == Some("0") {
+        rows.push(rf_row(&[
+            ("category", "자격 증명 보호".into()),
+            ("name", "NoLmHash".into()),
+            ("value", "0 (LM 해시 저장)".into()),
+            ("status", "주의".into()),
+            ("detail", "LM 해시 저장이 켜져 있음 — 취약한 LM 해시가 SAM에 남아 크래킹이 용이".into()),
+            ("key_path", "…\\Control\\Lsa".into()),
+            ("source", "SYSTEM".into()),
+            ("record_key", picked_record_key(nolm_row)),
+        ]));
+    }
+    let dra_row = reg_pick_row(system, "\\control\\lsa", "DisableRestrictedAdmin");
+    if dra_row.and_then(|r| r.get("value_data").cloned()).as_deref() == Some("0") {
+        rows.push(rf_row(&[
+            ("category", "자격 증명 보호".into()),
+            ("name", "DisableRestrictedAdmin".into()),
+            ("value", "0 (Restricted Admin 허용)".into()),
+            ("status", "주의".into()),
+            ("detail", "RDP Restricted Admin 모드 허용 — Pass-the-Hash 방식 RDP 접속에 노출".into()),
+            ("key_path", "…\\Control\\Lsa".into()),
+            ("source", "SYSTEM".into()),
+            ("record_key", picked_record_key(dra_row)),
+        ]));
+    }
+
+    // 표준 패키지 화이트리스트 밖의 값만 의심으로 뽑는다.
+    const STD_NOTIFY: &[&str] = &["scecli"];
+    const STD_SECURITY: &[&str] = &[
+        "kerberos", "msv1_0", "schannel", "wdigest", "tspkg", "pku2u", "cloudap", "negoexts",
+    ];
+    let notify_row = reg_pick_row(system, "\\control\\lsa", "Notification Packages");
+    let notify = notify_row
+        .and_then(|r| r.get("value_data").cloned())
+        .unwrap_or_default();
+    for pkg in multi_sz(&notify) {
+        let low = pkg.to_lowercase();
+        if pkg.trim().is_empty() || STD_NOTIFY.contains(&low.as_str()) {
+            continue;
+        }
+        rows.push(rf_row(&[
+            ("category", "자격 증명 보호".into()),
+            ("name", "Notification Package (비표준)".into()),
+            ("value", pkg),
+            ("status", "의심".into()),
+            ("detail", "비표준 암호 필터 DLL — 암호 변경 시 평문을 가로채는 자격증명 탈취 지속성 의심".into()),
+            ("key_path", "…\\Control\\Lsa\\Notification Packages".into()),
+            ("source", "SYSTEM".into()),
+            ("record_key", picked_record_key(notify_row)),
+        ]));
+    }
+    let secpkgs_row = reg_pick_row(system, "\\control\\lsa", "Security Packages");
+    let secpkgs = secpkgs_row
+        .and_then(|r| r.get("value_data").cloned())
+        .unwrap_or_default();
+    for pkg in multi_sz(&secpkgs) {
+        let low = pkg.to_lowercase();
+        if pkg.trim().is_empty() || pkg == "\"\"" || STD_SECURITY.contains(&low.as_str()) {
+            continue;
+        }
+        rows.push(rf_row(&[
+            ("category", "자격 증명 보호".into()),
+            ("name", "Security Package (비표준)".into()),
+            ("value", pkg),
+            ("status", "의심".into()),
+            ("detail", "비표준 SSP 등록 — LSASS에 로드되어 자격증명을 수집하는 주입형 패키지 의심".into()),
+            ("key_path", "…\\Control\\Lsa\\Security Packages".into()),
+            ("source", "SYSTEM".into()),
+            ("record_key", picked_record_key(secpkgs_row)),
+        ]));
+    }
+    rows
+}
+
+/// REG_MULTI_SZ(JSON 배열 문자열) 또는 공백 구분 문자열을 항목 목록으로.
+fn multi_sz(value: &str) -> Vec<String> {
+    let v = value.trim();
+    if v.is_empty() {
+        return Vec::new();
+    }
+    if v.starts_with('[') {
+        if let Ok(items) = serde_json::from_str::<Vec<String>>(v) {
+            return items;
+        }
+    }
+    v.split_whitespace().map(|s| s.to_string()).collect()
+}
+
+fn utf16le_until_nul(b: &[u8]) -> String {
+    let mut u16s = Vec::new();
+    for c in b.chunks_exact(2) {
+        let v = u16::from_le_bytes([c[0], c[1]]);
+        if v == 0 {
+            break;
+        }
+        u16s.push(v);
+    }
+    String::from_utf16_lossy(&u16s)
+}
+
+/// Winlogon 체인 — 로그온마다 무조건 실행되는 Shell/Userinit 값 변조와
+/// 평문 자동 로그온 설정을 본다. 값 이름이 대문자(USERINIT)로 저장된
+/// 하이브가 실재하므로 이름은 대소문자 무시로 매칭한다.
+fn rf_winlogon(software: &[Row]) -> Vec<Row> {
+    let mut rows = Vec::new();
+    let (mut shell, mut userinit, mut auto_logon) = (None, None, None);
+    let (mut has_password, mut taskman, mut gina) = (false, None, None);
+    for r in software {
+        let low = r
+            .get("key_path")
+            .cloned()
+            .unwrap_or_default()
+            .to_lowercase();
+        if !low.ends_with("\\microsoft\\windows nt\\currentversion\\winlogon")
+            || low.contains("wow6432node")
+        {
+            continue;
+        }
+        let data = r.get("value_data").cloned().unwrap_or_default();
+        let name = r.get("value_name").cloned().unwrap_or_default();
+        let rk = reg_record_key(r);
+        match name.to_ascii_lowercase().as_str() {
+            "shell" => shell = Some((data, rk)),
+            "userinit" => userinit = Some((data, rk)),
+            "autoadminlogon" => auto_logon = Some((data, rk)),
+            "defaultpassword" => has_password = !data.is_empty(),
+            "taskman" => taskman = Some((data, rk)).filter(|(d, _)| !d.is_empty()),
+            "ginadll" => gina = Some((data, rk)).filter(|(d, _)| !d.is_empty()),
+            _ => {}
+        }
+    }
+    let kp = "…\\Windows NT\\CurrentVersion\\Winlogon";
+    if let Some((shell, shell_rk)) = shell {
+        let normal = shell.trim().eq_ignore_ascii_case("explorer.exe");
+        rows.push(rf_row(&[
+            ("category", "자동 실행".into()),
+            ("subtype", "Winlogon".into()),
+            ("name", "Winlogon Shell".into()),
+            ("value", shell.clone()),
+            ("command", shell),
+            ("status", if normal { "정상" } else { "의심" }.into()),
+            ("detail", if normal {
+                "로그온 셸이 기본값(explorer.exe)".into()
+            } else {
+                "로그온 셸이 기본값(explorer.exe)이 아님 — 모든 로그온에서 대체/추가 페이로드 실행 (지속성)".into()
+            }),
+            ("key_path", kp.into()),
+            ("source", "SOFTWARE".into()),
+            ("user", "(시스템)".into()),
+            ("record_key", shell_rk),
+        ]));
+    }
+    if let Some((userinit, userinit_rk)) = userinit {
+        let items: Vec<&str> = userinit
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let normal = items.len() == 1
+            && items[0].eq_ignore_ascii_case("c:\\windows\\system32\\userinit.exe");
+        rows.push(rf_row(&[
+            ("category", "자동 실행".into()),
+            ("subtype", "Winlogon".into()),
+            ("name", "Winlogon Userinit".into()),
+            ("value", userinit.clone()),
+            ("command", userinit),
+            ("status", if normal { "정상" } else { "의심" }.into()),
+            ("detail", if normal {
+                "Userinit이 기본값(userinit.exe 단독)".into()
+            } else {
+                "Userinit에 기본 userinit.exe 외 항목이 있음 — 로그온마다 추가 바이너리 실행 (지속성)".into()
+            }),
+            ("key_path", kp.into()),
+            ("source", "SOFTWARE".into()),
+            ("user", "(시스템)".into()),
+            ("record_key", userinit_rk),
+        ]));
+    }
+    if let Some((_, auto_rk)) = auto_logon.filter(|(v, _)| v.as_str() == "1") {
+        rows.push(rf_row(&[
+            ("category", "자동 실행".into()),
+            ("subtype", "Winlogon".into()),
+            ("name", "AutoAdminLogon".into()),
+            ("value", if has_password { "1 (DefaultPassword 저장됨)" } else { "1" }.into()),
+            ("status", if has_password { "의심" } else { "주의" }.into()),
+            ("detail", if has_password {
+                "자동 로그온 + DefaultPassword 평문 저장 — 레지스트리만 읽어도 계정 암호 탈취 가능".into()
+            } else {
+                "자동 로그온 활성 — 부팅만으로 해당 계정 세션 획득 가능".into()
+            }),
+            ("key_path", kp.into()),
+            ("source", "SOFTWARE".into()),
+            ("user", "(시스템)".into()),
+            ("record_key", auto_rk),
+        ]));
+    }
+    if let Some((taskman, taskman_rk)) = taskman {
+        rows.push(rf_row(&[
+            ("category", "자동 실행".into()),
+            ("subtype", "Winlogon".into()),
+            ("name", "Winlogon Taskman".into()),
+            ("value", taskman.clone()),
+            ("command", taskman),
+            ("status", "주의".into()),
+            ("detail", "Taskman 값은 기본적으로 없음 — Ctrl+Alt+Del 작업 관리자 대체 실행 지점".into()),
+            ("key_path", kp.into()),
+            ("source", "SOFTWARE".into()),
+            ("user", "(시스템)".into()),
+            ("record_key", taskman_rk),
+        ]));
+    }
+    if let Some((gina, gina_rk)) = gina {
+        rows.push(rf_row(&[
+            ("category", "자동 실행".into()),
+            ("subtype", "Winlogon".into()),
+            ("name", "GinaDLL".into()),
+            ("value", gina),
+            ("status", "의심".into()),
+            ("detail", "GinaDLL 등록 — 로그온 자격증명을 가로채는 구식 GINA 대체 DLL".into()),
+            ("key_path", kp.into()),
+            ("source", "SOFTWARE".into()),
+            ("user", "(시스템)".into()),
+            ("record_key", gina_rk),
+        ]));
+    }
+    rows
+}
+
+/// IFEO SilentProcessExit — 대상 프로세스가 종료될 때 MonitorProcess로 지정된
+/// 프로그램이 실행된다 (lsass 종료 시 덤프 도구 실행 같은 은닉 트리거).
+fn rf_silent_process_exit(software: &[Row]) -> Vec<Row> {
+    let mut rows = Vec::new();
+    for r in software {
+        let kp = r.get("key_path").cloned().unwrap_or_default();
+        let low = kp.to_lowercase();
+        if !low.contains("\\silentprocessexit\\") {
+            continue;
+        }
+        if !r
+            .get("value_name")
+            .map(|n| n.eq_ignore_ascii_case("MonitorProcess"))
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let target = kp.rsplit('\\').next().unwrap_or("").to_string();
+        let cmd = r.get("value_data").cloned().unwrap_or_default();
+        if cmd.is_empty() {
+            continue;
+        }
+        rows.push(rf_row(&[
+            ("category", "자동 실행".into()),
+            ("subtype", "SilentProcessExit".into()),
+            ("name", format!("SilentProcessExit: {}", target)),
+            ("value", cmd.clone()),
+            ("command", cmd),
+            ("status", "의심".into()),
+            ("detail", format!(
+                "{} 종료 시 MonitorProcess가 실행됨 — 정상 시스템엔 거의 없는 은닉 트리거 (lsass 대상이면 자격증명 덤프 자동화)",
+                target
+            )),
+            ("key_path", kp),
+            ("source", "SOFTWARE".into()),
+            ("user", "(시스템)".into()),
+            ("timestamp", r.get("last_write").cloned().unwrap_or_default()),
+            ("record_key", reg_record_key(r)),
+        ]));
+    }
+    rows
+}
+
+/// TaskCache Actions(REG_BINARY) — 버전(u16) + Author 문자열 + 액션 목록에서
+/// Exec(0x6666) 명령·인자와 ComHandler(0x7777) CLSID를 추출한다. 형식이
+/// 어긋나면 그때까지 모은 것과 함께 미해석 여부(incomplete)를 돌려준다 —
+/// 손상·미지원 Actions가 "명령 없는 정상 작업"으로 보이면 안 되기 때문.
+fn parse_task_actions(b: &[u8]) -> (String, bool) {
+    fn read_str(b: &[u8], off: &mut usize) -> Option<String> {
+        if *off + 4 > b.len() {
+            return None;
+        }
+        let len = le_u32(b, *off) as usize;
+        *off += 4;
+        if !len.is_multiple_of(2) || len > b.len().saturating_sub(*off) {
+            return None;
+        }
+        let s = utf16le_until_nul(&b[*off..*off + len]);
+        *off += len;
+        Some(s)
+    }
+    const MAGICS: [u16; 4] = [0x6666, 0x7777, 0x8888, 0x9999];
+    let mut parts: Vec<String> = Vec::new();
+    if b.is_empty() {
+        return (String::new(), false);
+    }
+    if b.len() < 2 {
+        return (String::new(), true);
+    }
+    let mut incomplete = false;
+    let mut off = 2usize;
+    if read_str(b, &mut off).is_none() {
+        return (String::new(), true);
+    }
+    while off + 2 <= b.len() {
+        let magic = le_u16(b, off);
+        off += 2;
+        match magic {
+            0x6666 => {
+                // ID·작업 디렉터리는 요약에 쓰지 않지만, 잘림은 명령 잘림과
+                // 같은 손상이므로 동일하게 미해석으로 전파한다.
+                if read_str(b, &mut off).is_none() {
+                    incomplete = true;
+                }
+                let Some(cmd) = read_str(b, &mut off) else {
+                    incomplete = true;
+                    break;
+                };
+                let args = match read_str(b, &mut off) {
+                    Some(args) => args,
+                    None => {
+                        incomplete = true;
+                        String::new()
+                    }
+                };
+                if read_str(b, &mut off).is_none() {
+                    incomplete = true;
+                }
+                // 버전 3 Exec 액션 뒤에는 2바이트 플래그가 올 수 있다 —
+                // 다음 액션 매직이 아니면 한 번 건너뛴다.
+                if off + 2 <= b.len() && !MAGICS.contains(&le_u16(b, off)) {
+                    off += 2;
+                }
+                parts.push(if args.is_empty() {
+                    cmd
+                } else {
+                    format!("{} {}", cmd, args)
+                });
+            }
+            0x7777 => {
+                if read_str(b, &mut off).is_none() {
+                    incomplete = true;
+                }
+                if off + 16 > b.len() {
+                    incomplete = true;
+                    break;
+                }
+                let c = &b[off..off + 16];
+                off += 16;
+                let data = match read_str(b, &mut off) {
+                    Some(data) => data,
+                    None => {
+                        incomplete = true;
+                        String::new()
+                    }
+                };
+                parts.push(format!(
+                    "COM {{{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}}} {}",
+                    le_u32(c, 0), le_u16(c, 4), le_u16(c, 6),
+                    c[8], c[9], c[10], c[11], c[12], c[13], c[14], c[15], data
+                ).trim_end().to_string());
+            }
+            // 이메일(0x8888)·메시지(0x9999) 등 해석하지 않는 액션 형식 —
+            // 남은 바이트를 버리므로 미해석으로 표시한다.
+            _ => {
+                incomplete = true;
+                break;
+            }
+        }
+    }
+    (parts.join(" ; "), incomplete)
+}
+
+/// TaskCache DynamicInfo — 오프셋 12의 FILETIME이 마지막 실행 시각.
+fn task_last_run(b: &[u8]) -> String {
+    if b.len() >= 20 {
+        let ft = le_u64(b, 12);
+        if ft > 0 {
+            return filetime(ft);
+        }
+    }
+    String::new()
+}
+
+/// 예약 작업 레지스트리 잔존(TaskCache) — XML 파일을 지워도 남는다.
+/// 비-Microsoft 작업은 실행 명령과 함께 나열하고, Tree에 없는 Tasks 항목
+/// (스케줄러 UI에서 안 보이는 은닉 작업)과 SD 삭제는 의심으로 올린다.
+/// Tree에만 남고 대응 Tasks\{GUID}가 없는 항목도 삭제·손상된 작업의 잔존
+/// (작업 삭제 흔적)이라 주의로 올린다 — 정상 시스템은 Tree/Tasks가 1:1이다.
+fn rf_taskcache(software: &[Row]) -> Vec<Row> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut tasks: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+    let mut tree_guids: BTreeSet<String> = BTreeSet::new();
+    let mut tree_id_keys: BTreeMap<String, (String, String)> = BTreeMap::new(); // key_path -> (guid, record_key)
+    let mut tree_sd_keys: BTreeSet<String> = BTreeSet::new();
+    for r in software {
+        let kp = r.get("key_path").cloned().unwrap_or_default();
+        let low = kp.to_lowercase();
+        let name = r.get("value_name").cloned().unwrap_or_default();
+        let data = r.get("value_data").cloned().unwrap_or_default();
+        if let Some(pos) = low.find("\\taskcache\\tasks\\") {
+            let guid = low[pos + "\\taskcache\\tasks\\".len()..]
+                .split('\\')
+                .next()
+                .unwrap_or("")
+                .to_string();
+            if guid.is_empty() {
+                continue;
+            }
+            let entry = tasks.entry(guid).or_default();
+            entry.insert("__key_path".into(), kp);
+            // 대표 record_key — 핵심 증거인 Actions 값 행을 우선한다 (해석
+            // 실패 시 원본 대조가 바로 그 행에서 이뤄져야 하므로).
+            let rk = reg_record_key(r);
+            if name.eq_ignore_ascii_case("Actions") {
+                entry.insert("__record_key".into(), rk);
+            } else {
+                entry.entry("__record_key".into()).or_insert(rk);
+            }
+            entry
+                .entry("__last_write".into())
+                .or_insert_with(|| r.get("last_write").cloned().unwrap_or_default());
+            if !name.is_empty() && name != "(default)" {
+                entry.insert(name, data);
+            }
+        } else if low.contains("\\taskcache\\tree\\") {
+            if name.eq_ignore_ascii_case("Id") {
+                tree_guids.insert(data.to_lowercase());
+                tree_id_keys.insert(kp, (data.to_lowercase(), reg_record_key(r)));
+            } else if name.eq_ignore_ascii_case("SD") {
+                tree_sd_keys.insert(kp);
+            }
+        }
+    }
+    let mut rows = Vec::new();
+    for (guid, props) in &tasks {
+        let path = prop_ci(props, "Path").cloned().unwrap_or_default();
+        let hidden = !tree_guids.contains(guid);
+        if !hidden && path.to_lowercase().starts_with("\\microsoft\\") {
+            continue;
+        }
+        let (actions, actions_incomplete) = prop_ci(props, "Actions")
+            .map(|h| parse_task_actions(&unhex(h)))
+            .unwrap_or_default();
+        let last_run = prop_ci(props, "DynamicInfo")
+            .map(|h| task_last_run(&unhex(h)))
+            .unwrap_or_default();
+        let display = if path.is_empty() { guid.clone() } else { path.clone() };
+        let mut detail = if hidden {
+            "TaskCache Tasks에는 있으나 Tree에 없음 — 스케줄러 UI에 보이지 않는 은닉 예약 작업".to_string()
+        } else {
+            format!("예약 작업 (레지스트리 잔존){}", if last_run.is_empty() { String::new() } else { " — timestamp는 마지막 실행 시각".to_string() })
+        };
+        if actions_incomplete {
+            detail.push_str(" · Actions 바이너리를 끝까지 해석하지 못함 — 손상되었거나 미지원 액션 형식이라 원본 값 확인 필요");
+        }
+        rows.push(rf_row(&[
+            ("category", "자동 실행".into()),
+            ("subtype", "TaskCache".into()),
+            ("name", display),
+            ("value", if actions.is_empty() && actions_incomplete {
+                "Actions 해석 실패".into()
+            } else {
+                actions.clone()
+            }),
+            ("command", actions),
+            ("status", if hidden {
+                "의심"
+            } else if actions_incomplete {
+                "주의"
+            } else {
+                "정보"
+            }.into()),
+            ("detail", detail),
+            ("key_path", props.get("__key_path").cloned().unwrap_or_default()),
+            ("source", "SOFTWARE".into()),
+            ("user", "(시스템)".into()),
+            ("record_key", props.get("__record_key").cloned().unwrap_or_default()),
+            ("timestamp", if last_run.is_empty() {
+                props.get("__last_write").cloned().unwrap_or_default()
+            } else {
+                last_run
+            }),
+        ]));
+    }
+    for (kp, (guid, rk)) in &tree_id_keys {
+        let task_name = || {
+            kp.split("\\Tree\\")
+                .nth(1)
+                .map(|s| format!("\\{}", s))
+                .unwrap_or_else(|| kp.clone())
+        };
+        // Tree에 Id는 남았는데 대응 Tasks\{GUID} 키가 없다 — 삭제·손상된
+        // 예약 작업의 잔존. Tasks 기준 첫 루프는 이 경우를 못 본다.
+        if !tasks.contains_key(guid) {
+            rows.push(rf_row(&[
+                ("category", "자동 실행".into()),
+                ("subtype", "TaskCache".into()),
+                ("name", task_name()),
+                ("value", format!("Tasks 항목 없음 ({})", guid)),
+                ("status", "주의".into()),
+                ("detail", "Tree에는 등록이 남았지만 대응 Tasks 키가 없음 — 삭제되었거나 손상된 예약 작업의 잔존 (작업 삭제 흔적)".into()),
+                ("key_path", kp.clone()),
+                ("source", "SOFTWARE".into()),
+                ("user", "(시스템)".into()),
+                ("record_key", rk.clone()),
+            ]));
+        }
+        if tree_sd_keys.contains(kp) {
+            continue;
+        }
+        rows.push(rf_row(&[
+            ("category", "자동 실행".into()),
+            ("subtype", "TaskCache".into()),
+            ("name", task_name()),
+            ("value", format!("SD 값 없음 ({})", guid)),
+            ("status", "의심".into()),
+            ("detail", "Tree 항목에 보안 설명자(SD)가 없음 — SD 삭제는 작업을 스케줄러에서 숨기는 알려진 은닉 기법".into()),
+            ("key_path", kp.clone()),
+            ("source", "SOFTWARE".into()),
+            ("user", "(시스템)".into()),
+            ("record_key", rk.clone()),
+        ]));
+    }
+    rows
+}
+
+/// Active Setup — 각 사용자가 최초 로그온할 때 StubPath가 1회 실행된다.
+/// Run 키만 보는 도구가 놓치는 저명도 지속성 지점.
+fn rf_active_setup(software: &[Row]) -> Vec<Row> {
+    let mut rows = Vec::new();
+    for r in software {
+        let kp = r.get("key_path").cloned().unwrap_or_default();
+        let low = kp.to_lowercase();
+        if !low.contains("\\active setup\\installed components\\") {
+            continue;
+        }
+        if !r
+            .get("value_name")
+            .map(|n| n.eq_ignore_ascii_case("StubPath"))
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let cmd = r.get("value_data").cloned().unwrap_or_default();
+        if cmd.is_empty() {
+            continue;
+        }
+        let comp = kp.rsplit('\\').next().unwrap_or("").to_string();
+        rows.push(rf_row(&[
+            ("category", "자동 실행".into()),
+            ("subtype", "ActiveSetup".into()),
+            ("name", format!("Active Setup {}", comp)),
+            ("value", cmd.clone()),
+            ("command", cmd),
+            ("status", "정보".into()),
+            ("detail", "사용자 최초 로그온 시 1회 실행되는 StubPath".into()),
+            ("key_path", kp),
+            ("source", "SOFTWARE".into()),
+            ("user", "(시스템)".into()),
+            ("timestamp", r.get("last_write").cloned().unwrap_or_default()),
+            ("record_key", reg_record_key(r)),
+        ]));
+    }
+    rows
+}
+
+/// 전역 DLL 주입 지점 — AppInit_DLLs(user32를 로드하는 모든 프로세스)와
+/// AppCertDLLs(CreateProcess 호출 프로세스). 정상 시스템은 둘 다 빈 값.
+fn rf_appinit(software: &[Row], system: &[Row]) -> Vec<Row> {
+    let mut rows = Vec::new();
+    for r in software {
+        let kp = r.get("key_path").cloned().unwrap_or_default();
+        let low = kp.to_lowercase();
+        if !low.ends_with("\\currentversion\\windows") {
+            continue;
+        }
+        if !r
+            .get("value_name")
+            .map(|n| n.eq_ignore_ascii_case("AppInit_DLLs"))
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let dlls = r.get("value_data").cloned().unwrap_or_default();
+        if dlls.trim().is_empty() {
+            continue;
+        }
+        // 활성 플래그는 이 AppInit_DLLs 행과 같은 키에서만 읽는다 — suffix
+        // 검색은 일반/Wow6432Node 뷰를 구분하지 못해, 두 뷰의
+        // LoadAppInit_DLLs가 다르면 남의 뷰 플래그로 활성/비활성을 오판한다
+        // (두 값은 64/32비트 프로세스에 각각 독립 적용).
+        let load = software
+            .iter()
+            .find(|row| {
+                row.get("key_path").map(String::as_str) == Some(kp.as_str())
+                    && row
+                        .get("value_name")
+                        .map(|n| n.eq_ignore_ascii_case("LoadAppInit_DLLs"))
+                        .unwrap_or(false)
+            })
+            .and_then(|row| row.get("value_data").cloned())
+            .unwrap_or_default();
+        rows.push(rf_row(&[
+            ("category", "자동 실행".into()),
+            ("subtype", "AppInit".into()),
+            ("name", "AppInit_DLLs".into()),
+            ("value", dlls),
+            ("status", if load == "1" { "의심" } else { "주의" }.into()),
+            ("detail", if load == "1" {
+                "AppInit_DLLs 등록 + LoadAppInit_DLLs=1 — user32를 로드하는 모든 프로세스에 DLL 주입 활성".into()
+            } else {
+                "AppInit_DLLs에 DLL이 등록됨 (LoadAppInit_DLLs 비활성 상태) — 주입 준비 흔적".into()
+            }),
+            ("key_path", kp),
+            ("source", "SOFTWARE".into()),
+            ("user", "(시스템)".into()),
+            ("timestamp", r.get("last_write").cloned().unwrap_or_default()),
+            ("record_key", reg_record_key(r)),
+        ]));
+    }
+    // AppCertDLLs도 전 행 순회 — 활성 ControlSet만 수집해 미러 중복과
+    // 비활성 세트의 낡은 등록이 활성 주입 지점처럼 보이는 것을 막는다.
+    let active_set = active_control_set(system);
+    for r in system {
+        let kp = r.get("key_path").cloned().unwrap_or_default();
+        let low = kp.to_lowercase();
+        if !low.contains("\\control\\session manager\\appcertdlls") || !low.contains(&active_set) {
+            continue;
+        }
+        let name = r.get("value_name").cloned().unwrap_or_default();
+        let dll = r.get("value_data").cloned().unwrap_or_default();
+        if dll.trim().is_empty() {
+            continue;
+        }
+        rows.push(rf_row(&[
+            ("category", "자동 실행".into()),
+            ("subtype", "AppInit".into()),
+            ("name", format!("AppCertDLLs {}", name)),
+            ("value", dll),
+            ("status", "의심".into()),
+            ("detail", "AppCertDLLs 등록 — CreateProcess를 쓰는 모든 프로세스에 DLL이 로드되는 전역 주입 지점 (정상 시스템엔 없음)".into()),
+            ("key_path", kp),
+            ("source", "SYSTEM".into()),
+            ("user", "(시스템)".into()),
+            ("timestamp", r.get("last_write").cloned().unwrap_or_default()),
+            ("record_key", reg_record_key(r)),
+        ]));
+    }
+    rows
+}
+
+/// Session Manager — 커널 초기화 단계 실행(BootExecute/SetupExecute)과
+/// 재부팅 시 파일 이동·삭제 예약(PendingFileRenameOperations).
+fn rf_session_manager(system: &[Row]) -> Vec<Row> {
+    let mut rows = Vec::new();
+    let boot_row = reg_pick_row(system, "\\control\\session manager", "BootExecute");
+    let boot = boot_row
+        .and_then(|r| r.get("value_data").cloned())
+        .unwrap_or_default();
+    let extras: Vec<String> = multi_sz(&boot)
+        .into_iter()
+        .filter(|item| {
+            let t = item.trim();
+            !t.is_empty() && !t.eq_ignore_ascii_case("autocheck autochk *")
+        })
+        .collect();
+    if !extras.is_empty() {
+        rows.push(rf_row(&[
+            ("category", "자동 실행".into()),
+            ("subtype", "SessionManager".into()),
+            ("name", "BootExecute (비기본)".into()),
+            ("value", extras.join(" ; ")),
+            ("command", extras.join(" ; ")),
+            ("status", "의심".into()),
+            ("detail", "부트 단계(커널 초기화)에 기본 autochk 외 항목 실행 — 백신·EDR보다 먼저 뜨는 지속성".into()),
+            ("key_path", "…\\Control\\Session Manager".into()),
+            ("source", "SYSTEM".into()),
+            ("user", "(시스템)".into()),
+            ("record_key", picked_record_key(boot_row)),
+        ]));
+    }
+    let setup_row = reg_pick_row(system, "\\control\\session manager", "SetupExecute");
+    let setup = setup_row
+        .and_then(|r| r.get("value_data").cloned())
+        .unwrap_or_default();
+    let setup_items: Vec<String> = multi_sz(&setup)
+        .into_iter()
+        .filter(|item| !item.trim().is_empty())
+        .collect();
+    if !setup_items.is_empty() {
+        rows.push(rf_row(&[
+            ("category", "자동 실행".into()),
+            ("subtype", "SessionManager".into()),
+            ("name", "SetupExecute".into()),
+            ("value", setup_items.join(" ; ")),
+            ("command", setup_items.join(" ; ")),
+            ("status", "의심".into()),
+            ("detail", "SetupExecute는 정상적으로 빈 값 — 부트 단계 실행 항목이 등록됨".into()),
+            ("key_path", "…\\Control\\Session Manager".into()),
+            ("source", "SYSTEM".into()),
+            ("user", "(시스템)".into()),
+            ("record_key", picked_record_key(setup_row)),
+        ]));
+    }
+    // 재부팅 시 파일 조작 예약 — 목적지가 없는 항목은 삭제 예약이며,
+    // 흔적 인멸 대상 파일 목록이 그대로 남는다. \??\ 접두 항목이 경로다.
+    // 이 루프는 pick 헬퍼와 달리 전 행을 순회하므로 ControlSet 미러의 같은
+    // 예약이 중복 출력되지 않게 한 세트만 수집한다 — 어느 세트가 실제 다음
+    // 부팅에 적용되는지는 Select\Current가 결정하므로(LKG 부팅 후 002가
+    // 활성인 증거가 실존) 001 고정이 아니라 활성 세트를 따른다.
+    let active_set = active_control_set(system);
+    for r in system {
+        let low = r
+            .get("key_path")
+            .cloned()
+            .unwrap_or_default()
+            .to_lowercase();
+        if !low.ends_with("\\control\\session manager") || !low.contains(&active_set) {
+            continue;
+        }
+        let name = r.get("value_name").cloned().unwrap_or_default();
+        if !name
+            .to_ascii_lowercase()
+            .starts_with("pendingfilerenameoperations")
+        {
+            continue;
+        }
+        let items = multi_sz(&r.get("value_data").cloned().unwrap_or_default());
+        let clean = |s: &str| -> String {
+            match s.find("\\??\\") {
+                Some(p) => s[p + 4..].to_string(),
+                None => s.to_string(),
+            }
+        };
+        let mut i = 0;
+        while i < items.len() {
+            let src = clean(&items[i]);
+            let dst = items.get(i + 1).map(|s| clean(s)).unwrap_or_default();
+            i += 2;
+            if src.is_empty() {
+                continue;
+            }
+            let delete = dst.is_empty();
+            let benign = {
+                let l = src.to_lowercase();
+                l.contains("\\$recycle.bin\\")
+                    || l.contains("\\temp\\")
+                    || l.contains("\\windows\\installer\\")
+            };
+            rows.push(rf_row(&[
+                ("category", "기타 레지스트리".into()),
+                ("subtype", "PendingFileRename".into()),
+                ("name", if delete { "재부팅 시 삭제 예약" } else { "재부팅 시 이동 예약" }.into()),
+                ("value", if delete { src } else { format!("{} → {}", src, dst) }),
+                ("status", if delete && !benign { "주의" } else { "정보" }.into()),
+                ("detail", if delete {
+                    "재부팅 시 삭제가 예약된 파일 — 자기삭제·흔적 인멸에 쓰이는 표준 경로 (수집 시점엔 파일이 아직 있을 수 있음)".into()
+                } else {
+                    "재부팅 시 파일 이동 예약 (업데이트·설치 과정에서도 흔함)".into()
+                }),
+                ("key_path", r.get("key_path").cloned().unwrap_or_default()),
+                ("source", "SYSTEM".into()),
+                ("user", "(시스템)".into()),
+                ("timestamp", r.get("last_write").cloned().unwrap_or_default()),
+                ("record_key", reg_record_key(r)),
+            ]));
+        }
+    }
+    rows
+}
+
+/// 보안 설정 — Defender 보호 기능 비활성 플래그와 PowerShell 로깅 상태.
+/// PowerShell 로깅 상태는 EVTX 4104/4103 분석 결과의 해석 전제가 된다.
+fn rf_security_config(software: &[Row]) -> Vec<Row> {
+    let mut rows = Vec::new();
+    const DEFENDER_DISABLES: &[(&str, &str, &str)] = &[
+        ("DisableRealtimeMonitoring", "의심", "실시간 감시 비활성"),
+        ("DisableBehaviorMonitoring", "의심", "행위 기반 탐지 비활성"),
+        ("DisableScriptScanning", "의심", "스크립트 검사 비활성"),
+        ("DisableIOAVProtection", "의심", "다운로드·첨부 검사 비활성"),
+        ("DisableOnAccessProtection", "의심", "실시간 파일 접근 검사 비활성"),
+        ("DisableAntiSpyware", "주의", "Defender 전체 비활성 플래그 (서드파티 백신 설치 시에도 설정됨)"),
+        ("DisableAntiVirus", "주의", "Defender 바이러스 검사 비활성 플래그"),
+    ];
+    for r in software {
+        let kp = r.get("key_path").cloned().unwrap_or_default();
+        let low = kp.to_lowercase();
+        if !low.contains("\\windows defender") {
+            continue;
+        }
+        let name = r.get("value_name").cloned().unwrap_or_default();
+        // 레지스트리 값 이름은 대소문자 무시 — 소문자로 만든 비활성 플래그도
+        // Windows에는 동일하게 적용되므로 같은 규칙으로 매칭한다.
+        let Some((_, status, what)) = DEFENDER_DISABLES
+            .iter()
+            .find(|(n, _, _)| n.eq_ignore_ascii_case(&name))
+        else {
+            continue;
+        };
+        if r.get("value_data").map(|d| d != "1").unwrap_or(true) {
+            continue;
+        }
+        let via_policy = low.contains("\\policies\\");
+        rows.push(rf_row(&[
+            ("category", "보안 설정".into()),
+            ("subtype", "Defender".into()),
+            ("name", name),
+            ("value", "1 (비활성)".into()),
+            ("status", if via_policy { "의심" } else { *status }.into()),
+            ("detail", format!(
+                "{}{} — 랜섬웨어·페이로드 배포 직전의 표준 무력화 절차와 일치하는지 시각을 확인",
+                what,
+                if via_policy { " (정책 키로 강제됨)" } else { "" }
+            )),
+            ("key_path", kp),
+            ("source", "SOFTWARE".into()),
+            ("timestamp", r.get("last_write").cloned().unwrap_or_default()),
+            ("record_key", reg_record_key(r)),
+        ]));
+    }
+    // PowerShell 로깅 — 4104(스크립트 블록) 존재 기대치를 결정한다.
+    let sbl_row = reg_pick_row(software, "\\powershell\\scriptblocklogging", "EnableScriptBlockLogging");
+    let sbl = sbl_row
+        .and_then(|r| r.get("value_data").cloned())
+        .unwrap_or_default();
+    let (value, status, detail) = match sbl.as_str() {
+        "1" => ("1 (활성)", "정상", "스크립트 블록 로깅 활성 — EVTX 4104 이벤트가 존재해야 정상"),
+        "0" => ("0 (명시적 비활성)", "주의", "스크립트 블록 로깅이 명시적으로 꺼짐 — 4104 부재는 로깅 차단의 결과일 수 있음"),
+        _ => ("미설정 (기본 비활성)", "정보", "스크립트 블록 로깅 미설정 — 4104 이벤트 부재가 정상인 환경"),
+    };
+    rows.push(rf_row(&[
+        ("category", "보안 설정".into()),
+        ("subtype", "PowerShell".into()),
+        ("name", "ScriptBlockLogging".into()),
+        ("value", value.into()),
+        ("status", status.into()),
+        ("detail", detail.into()),
+        ("key_path", "…\\Policies\\Microsoft\\Windows\\PowerShell\\ScriptBlockLogging".into()),
+        ("source", "SOFTWARE".into()),
+        ("record_key", picked_record_key(sbl_row)),
+    ]));
+    let transcript_row = reg_pick_row(software, "\\powershell\\transcription", "EnableTranscripting");
+    let transcript = transcript_row
+        .and_then(|r| r.get("value_data").cloned())
+        .unwrap_or_default();
+    if transcript == "1" {
+        let outdir = reg_pick(software, "\\powershell\\transcription", "OutputDirectory");
+        rows.push(rf_row(&[
+            ("category", "보안 설정".into()),
+            ("subtype", "PowerShell".into()),
+            ("name", "Transcription".into()),
+            ("value", if outdir.is_empty() { "활성 (기본 내 문서 폴더)".into() } else { outdir }),
+            ("status", "정보".into()),
+            ("detail", "PowerShell 전사(Transcription) 활성 — 표시된 경로의 전사 로그가 추가 수집 대상".into()),
+            ("key_path", "…\\Policies\\Microsoft\\Windows\\PowerShell\\Transcription".into()),
+            ("source", "SOFTWARE".into()),
+            ("record_key", picked_record_key(transcript_row)),
+        ]));
+    }
+    for r in software {
+        let kp = r.get("key_path").cloned().unwrap_or_default();
+        let low = kp.to_lowercase();
+        if !low.contains("\\powershell") {
+            continue;
+        }
+        if !r
+            .get("value_name")
+            .map(|n| n.eq_ignore_ascii_case("ExecutionPolicy"))
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let policy = r.get("value_data").cloned().unwrap_or_default();
+        let lowp = policy.to_lowercase();
+        if !(lowp.contains("bypass") || lowp.contains("unrestricted")) {
+            continue;
+        }
+        rows.push(rf_row(&[
+            ("category", "보안 설정".into()),
+            ("subtype", "PowerShell".into()),
+            ("name", "ExecutionPolicy".into()),
+            ("value", policy),
+            ("status", "주의".into()),
+            ("detail", "실행 정책이 Bypass/Unrestricted — 스크립트 실행 제한이 해제된 상태".into()),
+            ("key_path", kp),
+            ("source", "SOFTWARE".into()),
+            ("timestamp", r.get("last_write").cloned().unwrap_or_default()),
+            ("record_key", reg_record_key(r)),
+        ]));
+    }
+    rows
+}
+
+/// 원격제어(RMM) 도구 설치 흔적과 Sysinternals EULA 수락 키.
+/// RMM은 정상 서명 도구라 백신에 안 걸려 C2 대용으로 선호된다 —
+/// "조직이 쓰지 않는 도구의 존재" 자체가 침해 지표. Sysinternals EULA
+/// 키는 해당 계정에서 그 도구가 실행됐다는 증거로, 실행파일을 지워도 남는다.
+fn rf_remote_tools(hives: &[RegistryOverviewHive]) -> Vec<Row> {
+    const RMM_MARKERS: &[(&str, &str)] = &[
+        ("\\teamviewer", "TeamViewer"),
+        ("\\anydesk", "AnyDesk"),
+        ("screenconnect", "ScreenConnect"),
+        ("rustdesk", "RustDesk"),
+        ("\\ateraagent", "Atera"),
+        ("\\splashtop", "Splashtop"),
+        ("\\netsupport", "NetSupport"),
+        ("\\tightvnc", "TightVNC"),
+        ("\\winvnc", "UltraVNC/WinVNC"),
+        ("\\ammyy", "Ammyy Admin"),
+        ("\\remoteutilities", "Remote Utilities"),
+    ];
+    const RMM_VALUES: &[&str] = &[
+        "ImagePath",
+        "InstallLocation",
+        "InstallationDirectory",
+        "Version",
+        "DisplayVersion",
+        "ClientID",
+        "InstallationDate",
+    ];
+    let mut rows = Vec::new();
+    for hive in hives {
+        let user = hive_user(&hive.name);
+        // (대표 key_path, last_write, 관심 값, 대표 record_key)
+        type RmmEntry = (
+            String,
+            String,
+            std::collections::BTreeMap<String, String>,
+            String,
+        );
+        let mut tools: std::collections::BTreeMap<&str, RmmEntry> =
+            std::collections::BTreeMap::new();
+        for r in &hive.rows {
+            let kp = r.get("key_path").cloned().unwrap_or_default();
+            let low = kp.to_lowercase();
+            let Some((_, tool)) = RMM_MARKERS.iter().find(|(m, _)| low.contains(m)) else {
+                // Sysinternals EULA는 도구 집계와 무관하게 행 단위로 바로 뽑는다.
+                if low.contains("\\software\\sysinternals\\")
+                    && r.get("value_name")
+                        .map(|n| n.eq_ignore_ascii_case("EulaAccepted"))
+                        .unwrap_or(false)
+                    && r.get("value_data").map(|d| d == "1").unwrap_or(false)
+                {
+                    let tool = kp.rsplit('\\').next().unwrap_or("").to_string();
+                    let tl = tool.to_lowercase();
+                    let critical = matches!(
+                        tl.as_str(),
+                        "psexec" | "psexec64" | "procdump" | "procdump64" | "sdelete" | "sdelete64"
+                    );
+                    rows.push(rf_row(&[
+                        ("category", "원격 접속".into()),
+                        ("subtype", "Sysinternals".into()),
+                        ("name", format!("Sysinternals {}", tool)),
+                        ("value", "EulaAccepted=1".into()),
+                        ("status", if critical { "의심" } else { "정보" }.into()),
+                        ("detail", match tl.as_str() {
+                            "psexec" | "psexec64" => "PsExec 실행 흔적 — 측면이동 표준 도구. 키 LastWrite가 이 계정의 최초 실행 시각".into(),
+                            "procdump" | "procdump64" => "ProcDump 실행 흔적 — LSASS 덤프(자격증명 탈취)에 상용되는 도구".into(),
+                            "sdelete" | "sdelete64" => "SDelete 실행 흔적 — 복구 불가 삭제(안티포렌식) 도구".into(),
+                            _ => "Sysinternals 도구 실행 흔적 — EULA 수락 키는 실행파일 삭제 후에도 남음".into(),
+                        }),
+                        ("key_path", kp),
+                        ("source", hive.name.clone()),
+                        ("user", user.clone()),
+                        ("timestamp", r.get("last_write").cloned().unwrap_or_default()),
+                        ("record_key", reg_record_key(r)),
+                    ]));
+                }
+                continue;
+            };
+            let entry = tools
+                .entry(tool)
+                .or_insert_with(|| (kp.clone(), String::new(), Default::default(), reg_record_key(r)));
+            let lw = r.get("last_write").cloned().unwrap_or_default();
+            if lw > entry.1 {
+                entry.1 = lw;
+            }
+            let name = r.get("value_name").cloned().unwrap_or_default();
+            if RMM_VALUES.iter().any(|v| name.eq_ignore_ascii_case(v)) {
+                let data = r.get("value_data").cloned().unwrap_or_default();
+                if !data.is_empty() {
+                    entry.0 = kp;
+                    // 대표 key_path를 제공한 행이 원본 승격 대상도 된다.
+                    entry.3 = reg_record_key(r);
+                    entry.2.entry(name).or_insert(data);
+                }
+            }
+        }
+        for (tool, (kp, last_write, props, record_key)) in tools {
+            let path = prop_ci(&props, "ImagePath")
+                .or_else(|| prop_ci(&props, "InstallLocation"))
+                .or_else(|| prop_ci(&props, "InstallationDirectory"))
+                .cloned()
+                .unwrap_or_default();
+            let version = prop_ci(&props, "Version")
+                .or_else(|| prop_ci(&props, "DisplayVersion"))
+                .cloned()
+                .unwrap_or_default();
+            let mut detail = format!(
+                "원격제어 도구 설치 흔적{} — 조직에서 쓰지 않는 도구라면 침해 지표",
+                if version.is_empty() { String::new() } else { format!(" (버전 {})", version) }
+            );
+            if tool == "ScreenConnect" && path.contains("h=") {
+                detail.push_str(". ImagePath 인자에 접속 서버(C2 후보) 주소가 포함됨");
+            }
+            if let Some(cid) = prop_ci(&props, "ClientID") {
+                detail.push_str(&format!(". ClientID {} — 접속 로그 대조용 식별자", cid));
+            }
+            rows.push(rf_row(&[
+                ("category", "원격 접속".into()),
+                ("subtype", "RMM".into()),
+                ("name", tool.into()),
+                ("value", if path.is_empty() { "설치 흔적 (경로 값 없음)".into() } else { path.clone() }),
+                ("command", path),
+                ("status", "정보".into()),
+                ("detail", detail),
+                ("key_path", kp),
+                ("source", hive.name.clone()),
+                ("user", user.clone()),
+                ("timestamp", last_write),
+                ("record_key", record_key),
+            ]));
+        }
+    }
+    rows
+}
+
+/// Uninstall 키 이름의 ProductCode GUID를 MSI Products 키의 packed(압축)
+/// 형식으로 변환한다 — 앞 세 필드는 문자열 역순, 나머지 8바이트는 바이트별
+/// 두 자리 스왑(Darwin 변환). GUID 형태가 아니면 None.
+fn msi_packed_product_code(leaf: &str) -> Option<String> {
+    let t = leaf.trim().strip_prefix('{')?.strip_suffix('}')?;
+    let segs: Vec<&str> = t.split('-').collect();
+    if segs.len() != 5
+        || [8usize, 4, 4, 4, 12]
+            .iter()
+            .zip(&segs)
+            .any(|(len, seg)| seg.len() != *len)
+        || !t.chars().all(|c| c == '-' || c.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    let mut out = String::with_capacity(32);
+    out.extend(segs[0].chars().rev());
+    out.extend(segs[1].chars().rev());
+    out.extend(segs[2].chars().rev());
+    let tail = format!("{}{}", segs[3], segs[4]);
+    for pair in tail.as_bytes().chunks(2) {
+        out.push(pair[1] as char);
+        out.push(pair[0] as char);
+    }
+    Some(out.to_ascii_lowercase())
+}
+
+/// InstallProperties 키 경로에서 Products\<packed ProductCode> 구성 요소.
+fn msi_products_component(kp: &str) -> Option<String> {
+    let mut parts = kp.split('\\');
+    while let Some(part) = parts.next() {
+        if part.eq_ignore_ascii_case("Products") {
+            return parts.next().map(str::to_ascii_lowercase);
+        }
+    }
+    None
+}
+
+/// 비-MSI 설치 프로그램 — …\CurrentVersion\Uninstall\* (+Wow6432Node, NTUSER).
+/// MSI 설치는 InstallProperties와 Uninstall 키 양쪽에 등록되므로 같은 설치의
+/// Uninstall 쌍둥이만 걸러 한 번만 남긴다. 쌍 판정은 이름·버전 휴리스틱이
+/// 아니라 Uninstall 키 GUID를 packed ProductCode로 변환한 정확 일치 — 이름과
+/// 버전은 고유 식별자가 아니어서(동명 패키지, 위장 항목) 별개 증거가 함께
+/// 사라진다. 쌍을 확인할 수 없는 키는 전부 보존한다.
+fn rf_uninstall_installs(hives: &[RegistryOverviewHive]) -> Vec<Row> {
+    use std::collections::{BTreeMap, BTreeSet};
+    // (하이브, packed ProductCode) — rf_msi_installs가 표시하는 키만 모은다.
+    let mut msi_products: BTreeSet<(String, String)> = BTreeSet::new();
+    for hive in hives {
+        for r in &hive.rows {
+            let Some(kp) = r.get("key_path") else { continue };
+            let low = kp.to_lowercase();
+            if !(low.contains("\\currentversion\\installer\\userdata\\")
+                && low.ends_with("\\installproperties"))
+            {
+                continue;
+            }
+            if !r
+                .get("value_name")
+                .map(|n| n.eq_ignore_ascii_case("DisplayName"))
+                .unwrap_or(false)
+                || r.get("value_data").map(|d| d.is_empty()).unwrap_or(true)
+            {
+                continue;
+            }
+            if let Some(packed) = msi_products_component(kp) {
+                msi_products.insert((hive.name.clone(), packed));
+            }
+        }
+    }
+    let mut rows = Vec::new();
+    for hive in hives {
+        let user = hive_user(&hive.name);
+        let mut by_key: BTreeMap<&str, BTreeMap<String, String>> = BTreeMap::new();
+        let mut key_write: BTreeMap<&str, String> = BTreeMap::new();
+        let mut key_rk: BTreeMap<&str, String> = BTreeMap::new();
+        for r in &hive.rows {
+            let Some(kp) = r.get("key_path") else { continue };
+            let low = kp.to_lowercase();
+            if !low.contains("\\currentversion\\uninstall\\") {
+                continue;
+            }
+            let name = r.get("value_name").cloned().unwrap_or_default();
+            key_write
+                .entry(kp.as_str())
+                .or_insert_with(|| r.get("last_write").cloned().unwrap_or_default());
+            key_rk
+                .entry(kp.as_str())
+                .or_insert_with(|| reg_record_key(r));
+            if name.is_empty() || name == "(default)" {
+                continue;
+            }
+            by_key
+                .entry(kp.as_str())
+                .or_default()
+                .insert(name, r.get("value_data").cloned().unwrap_or_default());
+        }
+        for (kp, props) in by_key {
+            let display_name = prop_ci(&props, "DisplayName").cloned().unwrap_or_default();
+            if display_name.is_empty() {
+                continue;
+            }
+            // 키 이름이 같은 하이브 MSI 제품의 ProductCode와 정확히 일치할
+            // 때만 같은 설치의 쌍둥이로 보고 접는다. 그 외 키는 고유
+            // key_path·record_key를 가진 별개 원본 증거라 전부 남긴다.
+            let is_msi_twin = kp
+                .rsplit('\\')
+                .next()
+                .and_then(msi_packed_product_code)
+                .map(|packed| msi_products.contains(&(hive.name.clone(), packed)))
+                .unwrap_or(false);
+            if is_msi_twin {
+                continue;
+            }
+            let timestamp = prop_ci(&props, "InstallDate")
+                .map(|d| msi_install_date(d))
+                .filter(|t| !t.is_empty())
+                .unwrap_or_else(|| key_write.get(kp).cloned().unwrap_or_default());
+            rows.push(rf_row(&[
+                ("category", "설치 프로그램 (MSI)".into()),
+                ("subtype", "Uninstall".into()),
+                ("name", display_name),
+                ("value", prop_ci(&props, "DisplayVersion").cloned().unwrap_or_default()),
+                ("detail", prop_ci(&props, "Publisher").cloned().unwrap_or_default()),
+                ("status", "정보".into()),
+                ("user", user.clone()),
+                ("timestamp", timestamp),
+                (
+                    "properties",
+                    serde_json::to_string(&props).unwrap_or_default(),
+                ),
+                ("key_path", kp.to_string()),
+                ("source", hive.name.clone()),
+                ("record_key", key_rk.get(kp).cloned().unwrap_or_default()),
+            ]));
+        }
     }
     rows
 }
@@ -3275,7 +4540,10 @@ fn share_path(value: &str) -> String {
 
 fn rf_shares(system: &[Row]) -> Vec<Row> {
     let mut rows = Vec::new();
-    let start = reg_pick(system, "\\services\\lanmanserver", "Start");
+    let start_row = reg_pick_row(system, "\\services\\lanmanserver", "Start");
+    let start = start_row
+        .and_then(|r| r.get("value_data").cloned())
+        .unwrap_or_default();
     if !start.is_empty() {
         let enabled = start == "2" || start == "3";
         let vmap = match start.as_str() {
@@ -3309,13 +4577,17 @@ fn rf_shares(system: &[Row]) -> Vec<Row> {
             ),
             ("key_path", "…\\Services\\LanmanServer".into()),
             ("source", "SYSTEM".into()),
+            ("record_key", picked_record_key(start_row)),
         ]));
     }
     for (vname, role) in [
         ("AutoShareServer", "서버"),
         ("AutoShareWks", "워크스테이션"),
     ] {
-        let auto = reg_pick(system, "\\lanmanserver\\parameters", vname);
+        let auto_row = reg_pick_row(system, "\\lanmanserver\\parameters", vname);
+        let auto = auto_row
+            .and_then(|r| r.get("value_data").cloned())
+            .unwrap_or_default();
         if auto == "0" {
             rows.push(rf_row(&[
                 ("category", "공유 폴더".into()),
@@ -3331,16 +4603,21 @@ fn rf_shares(system: &[Row]) -> Vec<Row> {
                 ),
                 ("key_path", "…\\LanmanServer\\Parameters".into()),
                 ("source", "SYSTEM".into()),
+                ("record_key", picked_record_key(auto_row)),
             ]));
         }
     }
     let mut seen: HashSet<String> = HashSet::new();
+    // 전 행 순회라 ControlSet 미러가 그대로 섞인다 — 현재 노출된 공유는
+    // 활성 세트의 것이므로 그쪽만 수집한다 (PendingFileRename과 같은 규칙).
+    let active_set = active_control_set(system);
     for r in system {
-        if !r
+        let low = r
             .get("key_path")
-            .map(|k| k.to_lowercase().ends_with("\\lanmanserver\\shares"))
-            .unwrap_or(false)
-        {
+            .cloned()
+            .unwrap_or_default()
+            .to_lowercase();
+        if !low.ends_with("\\lanmanserver\\shares") || !low.contains(&active_set) {
             continue;
         }
         let name = r.get("value_name").cloned().unwrap_or_default();
@@ -3370,6 +4647,7 @@ fn rf_shares(system: &[Row]) -> Vec<Row> {
                 "timestamp",
                 r.get("last_write").cloned().unwrap_or_default(),
             ),
+            ("record_key", reg_record_key(r)),
         ]));
     }
     rows
@@ -3408,9 +4686,10 @@ fn rf_sql_auth(software: &[Row]) -> Vec<Row> {
     let mut rows = Vec::new();
     for r in software {
         let kp = r.get("key_path").cloned().unwrap_or_default();
-        if r.get("value_name")
-            .map(|v| v != "LoginMode")
-            .unwrap_or(true)
+        if !r
+            .get("value_name")
+            .map(|v| v.eq_ignore_ascii_case("LoginMode"))
+            .unwrap_or(false)
             || !kp.to_lowercase().contains("microsoft sql server")
         {
             continue;
@@ -3463,6 +4742,7 @@ fn rf_sql_auth(software: &[Row]) -> Vec<Row> {
             ),
             ("key_path", kp),
             ("source", "SOFTWARE".into()),
+            ("record_key", reg_record_key(r)),
         ]));
     }
     rows
@@ -3513,6 +4793,7 @@ fn rf_autoruns(hives: &[RegistryOverviewHive]) -> Vec<Row> {
                     "timestamp",
                     r.get("last_write").cloned().unwrap_or_default(),
                 ),
+                ("record_key", reg_record_key(r)),
             ]));
         }
     }
@@ -3554,6 +4835,7 @@ fn rf_execution_traces(hives: &[RegistryOverviewHive]) -> Vec<Row> {
                         "timestamp",
                         r.get("last_write").cloned().unwrap_or_default(),
                     ),
+                    ("record_key", reg_record_key(r)),
                 ]));
             } else if low.ends_with("\\explorer\\typedpaths") {
                 rows.push(rf_row(&[
@@ -3569,6 +4851,55 @@ fn rf_execution_traces(hives: &[RegistryOverviewHive]) -> Vec<Row> {
                         "timestamp",
                         r.get("last_write").cloned().unwrap_or_default(),
                     ),
+                    ("record_key", reg_record_key(r)),
+                ]));
+            } else if low.contains("\\explorer\\recentdocs\\") {
+                // REG_BINARY 선두가 UTF-16LE 파일명 — 파일이 삭제돼도 이름이 남는다.
+                // 부모 RecentDocs 키는 확장자 서브키와 같은 항목을 중복 보유하므로
+                // 확장자별 서브키만 수집한다.
+                let fname = utf16le_until_nul(&unhex(&data));
+                if fname.is_empty() {
+                    continue;
+                }
+                let kp = r.get("key_path").cloned().unwrap_or_default();
+                let ext = kp.rsplit('\\').next().unwrap_or("").to_string();
+                rows.push(rf_row(&[
+                    ("category", "기타 레지스트리".into()),
+                    ("subtype", "RecentDocs".into()),
+                    ("name", "최근 문서 (RecentDocs)".into()),
+                    ("value", fname),
+                    ("status", "정보".into()),
+                    ("detail", format!("{} — 키 시각은 이 그룹의 최종 열람 시각", ext)),
+                    ("user", user.clone()),
+                    ("key_path", kp),
+                    ("source", hive.name.clone()),
+                    (
+                        "timestamp",
+                        r.get("last_write").cloned().unwrap_or_default(),
+                    ),
+                    ("record_key", reg_record_key(r)),
+                ]));
+            } else if low.ends_with("\\explorer\\wordwheelquery") {
+                // REG_BINARY UTF-16LE — 탐색기 검색창에 입력한 검색어.
+                let term = utf16le_until_nul(&unhex(&data));
+                if term.is_empty() {
+                    continue;
+                }
+                rows.push(rf_row(&[
+                    ("category", "기타 레지스트리".into()),
+                    ("subtype", "WordWheelQuery".into()),
+                    ("name", "탐색기 검색어".into()),
+                    ("value", term),
+                    ("status", "정보".into()),
+                    ("detail", "사용자가 탐색기에서 검색한 키워드 — 의도 입증 자료".into()),
+                    ("user", user.clone()),
+                    ("key_path", r.get("key_path").cloned().unwrap_or_default()),
+                    ("source", hive.name.clone()),
+                    (
+                        "timestamp",
+                        r.get("last_write").cloned().unwrap_or_default(),
+                    ),
+                    ("record_key", reg_record_key(r)),
                 ]));
             }
         }
@@ -3583,10 +4914,19 @@ fn rf_shimcache(hives: &[RegistryOverviewHive]) -> Vec<Row> {
         if !hive.name.eq_ignore_ascii_case("SYSTEM") {
             continue;
         }
+        // 두 ControlSet의 AppCompatCache를 다 읽으면 경로 dedup이 행 순서에
+        // 따라 비활성 세트의 낡은 FILETIME을 남길 수 있다 — 실행 이력의
+        // 시각·원본 연결이 임의로 뒤섞이지 않게 활성 세트만 해석한다.
+        let active_set = active_control_set(&hive.rows);
         for r in &hive.rows {
-            if r.get("value_name")
-                .map(|v| v != "AppCompatCache")
-                .unwrap_or(true)
+            if !r
+                .get("value_name")
+                .map(|v| v.eq_ignore_ascii_case("AppCompatCache"))
+                .unwrap_or(false)
+                || !r
+                    .get("key_path")
+                    .map(|k| k.to_lowercase().contains(&active_set))
+                    .unwrap_or(false)
             {
                 continue;
             }
@@ -3608,6 +4948,8 @@ fn rf_shimcache(hives: &[RegistryOverviewHive]) -> Vec<Row> {
                         "…\\Control\\Session Manager\\AppCompatCache".into(),
                     ),
                     ("source", "SYSTEM".into()),
+                    // 파생 항목 전부가 같은 AppCompatCache 바이너리 행에서 나온다.
+                    ("record_key", reg_record_key(r)),
                 ]));
             }
         }
@@ -3645,6 +4987,7 @@ fn rf_msi_installs(hives: &[RegistryOverviewHive]) -> Vec<Row> {
     for hive in hives {
         let mut by_key: std::collections::BTreeMap<&str, std::collections::BTreeMap<String, String>> =
             std::collections::BTreeMap::new();
+        let mut key_rk: std::collections::BTreeMap<&str, String> = std::collections::BTreeMap::new();
         for r in &hive.rows {
             let Some(kp) = r.get("key_path") else { continue };
             let low = kp.to_lowercase();
@@ -3657,18 +5000,20 @@ fn rf_msi_installs(hives: &[RegistryOverviewHive]) -> Vec<Row> {
             if name.is_empty() || name == "(default)" {
                 continue;
             }
+            key_rk
+                .entry(kp.as_str())
+                .or_insert_with(|| reg_record_key(r));
             by_key
                 .entry(kp.as_str())
                 .or_default()
                 .insert(name, r.get("value_data").cloned().unwrap_or_default());
         }
         for (kp, props) in by_key {
-            let display_name = props.get("DisplayName").cloned().unwrap_or_default();
+            let display_name = prop_ci(&props, "DisplayName").cloned().unwrap_or_default();
             if display_name.is_empty() {
                 continue;
             }
-            let timestamp = props
-                .get("InstallDate")
+            let timestamp = prop_ci(&props, "InstallDate")
                 .map(|d| msi_install_date(d))
                 .unwrap_or_default();
             let sid = kp
@@ -3680,8 +5025,8 @@ fn rf_msi_installs(hives: &[RegistryOverviewHive]) -> Vec<Row> {
             rows.push(rf_row(&[
                 ("category", "설치 프로그램 (MSI)".into()),
                 ("name", display_name),
-                ("value", props.get("DisplayVersion").cloned().unwrap_or_default()),
-                ("detail", props.get("Publisher").cloned().unwrap_or_default()),
+                ("value", prop_ci(&props, "DisplayVersion").cloned().unwrap_or_default()),
+                ("detail", prop_ci(&props, "Publisher").cloned().unwrap_or_default()),
                 ("status", "정보".into()),
                 ("user", sid),
                 ("timestamp", timestamp),
@@ -3692,6 +5037,7 @@ fn rf_msi_installs(hives: &[RegistryOverviewHive]) -> Vec<Row> {
                 ),
                 ("key_path", kp.to_string()),
                 ("source", hive.name.clone()),
+                ("record_key", key_rk.get(kp).cloned().unwrap_or_default()),
             ]));
         }
     }
@@ -3706,11 +5052,22 @@ pub fn build_registry_findings_with_registry(registry: &RegistryOverviewCache) -
     let system = registry.rows("SYSTEM");
     let software = registry.rows("SOFTWARE");
     let mut rows = Vec::new();
+    // rf_credential_protection이 rf_lsa_packages 결과까지 합쳐 반환한다 —
+    // 여기서 다시 호출하면 Lsa 확장 행이 전부 두 번 생긴다.
     rows.extend(rf_credential_protection(system));
     rows.extend(rf_shares(system));
     rows.extend(rf_sql_auth(software));
     rows.extend(rf_autoruns(registry.hives()));
+    rows.extend(rf_winlogon(software));
+    rows.extend(rf_silent_process_exit(software));
+    rows.extend(rf_taskcache(software));
+    rows.extend(rf_active_setup(software));
+    rows.extend(rf_appinit(software, system));
+    rows.extend(rf_session_manager(system));
+    rows.extend(rf_security_config(software));
+    rows.extend(rf_remote_tools(registry.hives()));
     rows.extend(rf_msi_installs(registry.hives()));
+    rows.extend(rf_uninstall_installs(registry.hives()));
     rows.extend(rf_execution_traces(registry.hives()));
     rows.extend(rf_shimcache(registry.hives()));
     rows
@@ -4046,6 +5403,775 @@ mod tests {
     }
 
     #[test]
+    fn pending_file_rename_follows_active_control_set() {
+        let root = std::env::temp_dir().join(format!(
+            "wina-pending-rename-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        ));
+        let registry_dir = root.join("REGISTRY");
+        std::fs::create_dir_all(&registry_dir).unwrap();
+        let conn = Connection::open(registry_dir.join("SYSTEM.sqlite")).unwrap();
+        conn.execute("CREATE TABLE Registry (key_path TEXT, value_name TEXT, value_data TEXT, last_write TEXT, _recovery TEXT, _source_file TEXT)", []).unwrap();
+        // LKG 부팅 후 상태: 활성 세트는 002, 001에는 낡은 미러가 남아 있다.
+        for row in [
+            ("\\Select", "Current", "2"),
+            (
+                "\\ControlSet002\\Control\\Session Manager",
+                "PendingFileRenameOperations",
+                r#"["\\??\\C:\\Users\\victim\\mal.exe",""]"#,
+            ),
+            (
+                "\\ControlSet001\\Control\\Session Manager",
+                "PendingFileRenameOperations",
+                r#"["\\??\\C:\\stale\\old.tmp",""]"#,
+            ),
+        ] {
+            conn.execute(
+                "INSERT INTO Registry VALUES (?1, ?2, ?3, '2026-01-01 00:00:00.000', 'live', 'evidence/SYSTEM')",
+                rusqlite::params![row.0, row.1, row.2],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let registry = RegistryOverviewCache::load(&root);
+        let findings = build_registry_findings_with_registry(&registry);
+        let pending: Vec<_> = findings
+            .iter()
+            .filter(|row| row.get("subtype").map(String::as_str) == Some("PendingFileRename"))
+            .collect();
+        // 활성 세트(002)의 예약만 나와야 한다 — 001 고정이면 낡은 미러가
+        // 나오고, 필터가 없으면 두 세트가 중복 출력된다.
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].get("value").map(String::as_str),
+            Some("C:\\Users\\victim\\mal.exe")
+        );
+        assert_eq!(
+            pending[0].get("record_key").map(String::as_str),
+            Some("SYSTEM::Registry::2")
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Actions 문자열 인코딩: u32 LE 바이트 길이 + UTF-16LE 본문.
+    fn task_str(s: &str) -> Vec<u8> {
+        let utf16: Vec<u8> = s.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let mut out = (utf16.len() as u32).to_le_bytes().to_vec();
+        out.extend(utf16);
+        out
+    }
+
+    #[test]
+    fn task_actions_parses_exec_and_com_handler() {
+        let mut b: Vec<u8> = vec![1, 0];
+        b.extend(task_str("Author"));
+        b.extend([0x66, 0x66]);
+        b.extend(task_str("{id}"));
+        b.extend(task_str("cmd.exe"));
+        b.extend(task_str("/c evil"));
+        b.extend(task_str(""));
+        b.extend([0x77, 0x77]);
+        b.extend(task_str(""));
+        b.extend((0u8..16).collect::<Vec<u8>>());
+        b.extend(task_str("payload.dll"));
+        let (summary, incomplete) = parse_task_actions(&b);
+        assert!(!incomplete);
+        assert_eq!(
+            summary,
+            "cmd.exe /c evil ; COM {03020100-0504-0706-0809-0a0b0c0d0e0f} payload.dll"
+        );
+    }
+
+    #[test]
+    fn task_actions_flags_unsupported_magic_as_incomplete() {
+        let mut b: Vec<u8> = vec![1, 0];
+        b.extend(task_str("Author"));
+        // 이메일(0x8888) 등 해석하지 않는 액션 — 남은 바이트가 버려지므로
+        // "명령 없는 정상 작업"이 아니라 미해석으로 보여야 한다.
+        b.extend([0x88, 0x88]);
+        b.extend(task_str("dropped"));
+        let (summary, incomplete) = parse_task_actions(&b);
+        assert!(incomplete);
+        assert_eq!(summary, "");
+    }
+
+    #[test]
+    fn task_actions_flags_truncated_string_as_incomplete() {
+        let mut b: Vec<u8> = vec![1, 0];
+        b.extend(task_str("Author"));
+        b.extend([0x66, 0x66]);
+        b.extend(task_str("{id}"));
+        // 명령 문자열이 선언 길이(100바이트)보다 짧게 잘림 — 손상 케이스.
+        b.extend(100u32.to_le_bytes());
+        b.extend([0x41, 0x00]);
+        let (summary, incomplete) = parse_task_actions(&b);
+        assert!(incomplete);
+        assert_eq!(summary, "");
+    }
+
+    #[test]
+    fn task_actions_flags_truncated_workdir_as_incomplete() {
+        let mut b: Vec<u8> = vec![1, 0];
+        b.extend(task_str("Author"));
+        b.extend([0x66, 0x66]);
+        b.extend(task_str("{id}"));
+        b.extend(task_str("cmd.exe"));
+        b.extend(task_str("/c evil"));
+        // 명령·인자는 정상인데 작업 디렉터리 문자열이 선언 길이(50바이트)보다
+        // 짧게 잘림 — 해석된 명령은 유지하되 미해석으로 표시해야 한다.
+        b.extend(50u32.to_le_bytes());
+        b.extend([0x41, 0x00]);
+        let (summary, incomplete) = parse_task_actions(&b);
+        assert!(incomplete);
+        assert_eq!(summary, "cmd.exe /c evil");
+    }
+
+    #[test]
+    fn task_actions_flags_truncated_com_id_as_incomplete() {
+        let mut b: Vec<u8> = vec![1, 0];
+        b.extend(task_str("Author"));
+        b.extend([0x77, 0x77]);
+        // ComHandler ID 문자열이 선언 길이(100바이트)보다 짧게 잘림.
+        b.extend(100u32.to_le_bytes());
+        b.extend([0x41, 0x00]);
+        let (summary, incomplete) = parse_task_actions(&b);
+        assert!(incomplete);
+        assert_eq!(summary, "");
+    }
+
+    #[test]
+    fn appinit_flag_is_read_from_same_registry_view() {
+        let root = std::env::temp_dir().join(format!(
+            "wina-appinit-view-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        ));
+        let registry_dir = root.join("REGISTRY");
+        std::fs::create_dir_all(&registry_dir).unwrap();
+        let conn = Connection::open(registry_dir.join("SOFTWARE.sqlite")).unwrap();
+        conn.execute("CREATE TABLE Registry (key_path TEXT, value_name TEXT, value_data TEXT, last_write TEXT, _recovery TEXT, _source_file TEXT)", []).unwrap();
+        const NATIVE: &str = "\\Microsoft\\Windows NT\\CurrentVersion\\Windows";
+        const WOW: &str = "\\Wow6432Node\\Microsoft\\Windows NT\\CurrentVersion\\Windows";
+        // 64비트 뷰는 주입 활성(Load=1), 32비트(Wow6432Node) 뷰는 비활성(Load=0)
+        // — 각 행이 자기 뷰의 플래그로만 판정되어야 한다.
+        for row in [
+            (NATIVE, "AppInit_DLLs", "evil64.dll"),
+            (NATIVE, "LoadAppInit_DLLs", "1"),
+            (WOW, "AppInit_DLLs", "evil32.dll"),
+            (WOW, "LoadAppInit_DLLs", "0"),
+        ] {
+            conn.execute(
+                "INSERT INTO Registry VALUES (?1, ?2, ?3, '2026-01-01 00:00:00.000', 'live', 'evidence/SOFTWARE')",
+                rusqlite::params![row.0, row.1, row.2],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let registry = RegistryOverviewCache::load(&root);
+        let findings = build_registry_findings_with_registry(&registry);
+        let status_of = |value: &str| {
+            findings
+                .iter()
+                .find(|row| {
+                    row.get("subtype").map(String::as_str) == Some("AppInit")
+                        && row.get("value").map(String::as_str) == Some(value)
+                })
+                .and_then(|row| row.get("status").cloned())
+        };
+        assert_eq!(status_of("evil64.dll").as_deref(), Some("의심"));
+        assert_eq!(status_of("evil32.dll").as_deref(), Some("주의"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn taskcache_reports_tree_entry_without_tasks_key() {
+        let root = std::env::temp_dir().join(format!(
+            "wina-taskcache-tree-only-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        ));
+        let registry_dir = root.join("REGISTRY");
+        std::fs::create_dir_all(&registry_dir).unwrap();
+        let conn = Connection::open(registry_dir.join("SOFTWARE.sqlite")).unwrap();
+        conn.execute("CREATE TABLE Registry (key_path TEXT, value_name TEXT, value_data TEXT, last_write TEXT, _recovery TEXT, _source_file TEXT)", []).unwrap();
+        const TREE: &str = "\\Microsoft\\Windows NT\\CurrentVersion\\Schedule\\TaskCache\\Tree";
+        const TASKS: &str = "\\Microsoft\\Windows NT\\CurrentVersion\\Schedule\\TaskCache\\Tasks";
+        // EvilTask: Tree에 Id·SD가 남았지만 Tasks 키가 삭제됨(작업 삭제 잔존).
+        // GoodTask: Tree/Tasks 1:1 정상 쌍 — 오탐 없이 일반 행으로만 나와야 한다.
+        for row in [
+            (format!("{TREE}\\EvilTask"), "Id", "{DEAD-1111}".to_string()),
+            (format!("{TREE}\\EvilTask"), "SD", "01000480".to_string()),
+            (format!("{TREE}\\GoodTask"), "Id", "{GOOD-2222}".to_string()),
+            (format!("{TREE}\\GoodTask"), "SD", "01000480".to_string()),
+            (format!("{TASKS}\\{{good-2222}}"), "Path", "\\GoodTask".to_string()),
+        ] {
+            conn.execute(
+                "INSERT INTO Registry VALUES (?1, ?2, ?3, '2026-01-01 00:00:00.000', 'live', 'evidence/SOFTWARE')",
+                rusqlite::params![row.0, row.1, row.2],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let registry = RegistryOverviewCache::load(&root);
+        let findings = build_registry_findings_with_registry(&registry);
+        let task_rows: Vec<_> = findings
+            .iter()
+            .filter(|row| row.get("subtype").map(String::as_str) == Some("TaskCache"))
+            .collect();
+        let missing: Vec<_> = task_rows
+            .iter()
+            .filter(|row| {
+                row.get("value")
+                    .map(|value| value.starts_with("Tasks 항목 없음"))
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert_eq!(missing.len(), 1, "Tree-only 잔존은 정확히 한 행이어야 한다");
+        assert_eq!(missing[0].get("name").map(String::as_str), Some("\\EvilTask"));
+        assert_eq!(
+            missing[0].get("record_key").map(String::as_str),
+            Some("SOFTWARE::Registry::1")
+        );
+        // SD가 존재하므로 SD-삭제 행은 나오지 않아야 한다.
+        assert!(task_rows.iter().all(|row| {
+            !row.get("value")
+                .map(|value| value.starts_with("SD 값 없음"))
+                .unwrap_or(false)
+        }));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn uninstall_keeps_distinct_same_name_installs() {
+        let root = std::env::temp_dir().join(format!(
+            "wina-uninstall-dedup-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        ));
+        let registry_dir = root.join("REGISTRY");
+        std::fs::create_dir_all(&registry_dir).unwrap();
+        // SOFTWARE: 같은 설치(Tool X 1.0)가 MSI InstallProperties(packed
+        // ProductCode)와 Uninstall({GUID}) 양쪽에 등록된 상태 + 이름·버전이
+        // 같지만 키가 다른 위장 항목. NTUSER: 동명 다른 버전 사용자 설치.
+        // GUID {12345678-1234-1234-1234-123456789ABC}의 packed(Darwin) 형식.
+        const PACKED: &str = "8765432143214321214321436587A9CB";
+        let msi_kp = format!("\\Microsoft\\Windows\\CurrentVersion\\Installer\\UserData\\S-1-5-18\\Products\\{PACKED}\\InstallProperties");
+        for (name, rows) in [
+            (
+                "SOFTWARE",
+                vec![
+                    (msi_kp.clone(), "DisplayName", "Tool X"),
+                    (msi_kp.clone(), "DisplayVersion", "1.0"),
+                    ("\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{12345678-1234-1234-1234-123456789ABC}".to_string(), "DisplayName", "Tool X"),
+                    ("\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{12345678-1234-1234-1234-123456789ABC}".to_string(), "DisplayVersion", "1.0"),
+                    ("\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\FakeToolX".to_string(), "DisplayName", "Tool X"),
+                    ("\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\FakeToolX".to_string(), "DisplayVersion", "1.0"),
+                ],
+            ),
+            (
+                "analyst_NTUSER.DAT",
+                vec![
+                    ("\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\ToolX".to_string(), "DisplayName", "Tool X"),
+                    ("\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\ToolX".to_string(), "DisplayVersion", "2.0"),
+                ],
+            ),
+        ] {
+            let conn = Connection::open(registry_dir.join(format!("{name}.sqlite"))).unwrap();
+            conn.execute("CREATE TABLE Registry (key_path TEXT, value_name TEXT, value_data TEXT, last_write TEXT, _recovery TEXT, _source_file TEXT)", []).unwrap();
+            for row in rows {
+                conn.execute(
+                    "INSERT INTO Registry VALUES (?1, ?2, ?3, '2026-01-01 00:00:00.000', 'live', ?4)",
+                    rusqlite::params![row.0, row.1, row.2, format!("evidence/{name}")],
+                )
+                .unwrap();
+            }
+        }
+
+        let registry = RegistryOverviewCache::load(&root);
+        let findings = build_registry_findings_with_registry(&registry);
+        // MSI 설치 자체는 rf_msi_installs가 한 번 표시한다.
+        let msi: Vec<_> = findings
+            .iter()
+            .filter(|row| row.get("subtype").map(String::as_str) == Some("MsiInstall"))
+            .collect();
+        assert_eq!(msi.len(), 1);
+        // Uninstall에는 ProductCode가 일치하는 진짜 쌍둥이({GUID} 키)만 접히고,
+        // 이름·버전이 같아도 키가 다른 위장 항목(FakeToolX)과 동명 사용자
+        // 설치(NTUSER 2.0)는 각자의 record_key와 함께 남는다.
+        let uninstall: Vec<_> = findings
+            .iter()
+            .filter(|row| row.get("subtype").map(String::as_str) == Some("Uninstall"))
+            .collect();
+        assert_eq!(uninstall.len(), 2);
+        let fake = uninstall
+            .iter()
+            .find(|row| {
+                row.get("key_path")
+                    .map(|kp| kp.ends_with("\\FakeToolX"))
+                    .unwrap_or(false)
+            })
+            .expect("fake uninstall entry preserved");
+        assert_eq!(fake.get("source").map(String::as_str), Some("SOFTWARE"));
+        let user_install = uninstall
+            .iter()
+            .find(|row| row.get("source").map(String::as_str) == Some("analyst_NTUSER.DAT"))
+            .expect("per-user install preserved");
+        assert_eq!(user_install.get("value").map(String::as_str), Some("2.0"));
+        assert_eq!(
+            user_install.get("record_key").map(String::as_str),
+            Some("analyst_NTUSER.DAT::Registry::1")
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn value_name_matching_ignores_case() {
+        let root = std::env::temp_dir().join(format!(
+            "wina-value-case-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        ));
+        let registry_dir = root.join("REGISTRY");
+        std::fs::create_dir_all(&registry_dir).unwrap();
+        // 레지스트리 값 이름은 대소문자 무시 — 소문자로 만든 값도 Windows에는
+        // 표준 이름과 동일하게 적용되므로 탐지도 잡아야 한다.
+        for (hive, kp, name, data) in [
+            (
+                "SOFTWARE",
+                "\\Policies\\Microsoft\\Windows Defender\\Real-Time Protection",
+                "disablerealtimemonitoring",
+                "1",
+            ),
+            ("SYSTEM", "\\ControlSet001\\Control\\Lsa", "nolmhash", "0"),
+        ] {
+            let db = registry_dir.join(format!("{hive}.sqlite"));
+            let conn = Connection::open(&db).unwrap();
+            conn.execute("CREATE TABLE IF NOT EXISTS Registry (key_path TEXT, value_name TEXT, value_data TEXT, last_write TEXT, _recovery TEXT, _source_file TEXT)", []).unwrap();
+            conn.execute(
+                "INSERT INTO Registry VALUES (?1, ?2, ?3, '2026-01-01 00:00:00.000', 'live', 'evidence')",
+                rusqlite::params![kp, name, data],
+            )
+            .unwrap();
+        }
+
+        let registry = RegistryOverviewCache::load(&root);
+        let findings = build_registry_findings_with_registry(&registry);
+        assert!(
+            findings.iter().any(|row| {
+                row.get("subtype").map(String::as_str) == Some("Defender")
+                    && row.get("value").map(String::as_str) == Some("1 (비활성)")
+            }),
+            "소문자 Defender 비활성 플래그를 탐지해야 한다"
+        );
+        assert!(
+            findings.iter().any(|row| {
+                row.get("name").map(String::as_str) == Some("NoLmHash")
+            }),
+            "소문자 nolmhash=0을 탐지해야 한다"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reg_picks_follow_active_control_set() {
+        let root = std::env::temp_dir().join(format!(
+            "wina-active-set-pick-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        ));
+        let registry_dir = root.join("REGISTRY");
+        std::fs::create_dir_all(&registry_dir).unwrap();
+        let conn = Connection::open(registry_dir.join("SYSTEM.sqlite")).unwrap();
+        conn.execute("CREATE TABLE Registry (key_path TEXT, value_name TEXT, value_data TEXT, last_write TEXT, _recovery TEXT, _source_file TEXT)", []).unwrap();
+        // 활성 세트는 002 — 001에는 낡은 값이 남아 있다. BootExecute·Lsa 모두
+        // 002의 값으로 판정되어야 한다 (001 고정이면 stale.exe와 NoLmHash=1을
+        // 골라 판정이 뒤집힌다).
+        for row in [
+            ("\\Select", "Current", "2"),
+            (
+                "\\ControlSet001\\Control\\Session Manager",
+                "BootExecute",
+                r#"["autocheck autochk *","stale.exe"]"#,
+            ),
+            (
+                "\\ControlSet002\\Control\\Session Manager",
+                "BootExecute",
+                r#"["autocheck autochk *","active.exe"]"#,
+            ),
+            ("\\ControlSet001\\Control\\Lsa", "NoLmHash", "1"),
+            ("\\ControlSet002\\Control\\Lsa", "NoLmHash", "0"),
+        ] {
+            conn.execute(
+                "INSERT INTO Registry VALUES (?1, ?2, ?3, '2026-01-01 00:00:00.000', 'live', 'evidence/SYSTEM')",
+                rusqlite::params![row.0, row.1, row.2],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let registry = RegistryOverviewCache::load(&root);
+        let findings = build_registry_findings_with_registry(&registry);
+        let boot = findings
+            .iter()
+            .find(|row| row.get("name").map(String::as_str) == Some("BootExecute (비기본)"))
+            .expect("BootExecute finding");
+        assert_eq!(boot.get("value").map(String::as_str), Some("active.exe"));
+        assert!(
+            findings
+                .iter()
+                .any(|row| row.get("name").map(String::as_str) == Some("NoLmHash")),
+            "활성 세트(002)의 NoLmHash=0으로 판정해야 한다"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn to_hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    #[test]
+    fn taskcache_reads_properties_case_insensitively() {
+        let root = std::env::temp_dir().join(format!(
+            "wina-taskcache-case-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        ));
+        let registry_dir = root.join("REGISTRY");
+        std::fs::create_dir_all(&registry_dir).unwrap();
+        let conn = Connection::open(registry_dir.join("SOFTWARE.sqlite")).unwrap();
+        conn.execute("CREATE TABLE Registry (key_path TEXT, value_name TEXT, value_data TEXT, last_write TEXT, _recovery TEXT, _source_file TEXT)", []).unwrap();
+        let mut actions: Vec<u8> = vec![1, 0];
+        actions.extend(task_str("Author"));
+        actions.extend([0x66, 0x66]);
+        actions.extend(task_str("{id}"));
+        actions.extend(task_str("evil.exe"));
+        actions.extend(task_str(""));
+        actions.extend(task_str(""));
+        const FT: u64 = 133_500_000_000_000_000;
+        let mut dynamic = vec![0u8; 12];
+        dynamic.extend(FT.to_le_bytes());
+        let kp = "\\Microsoft\\Windows NT\\CurrentVersion\\Schedule\\TaskCache\\Tasks\\{evil-1}";
+        // 값 이름을 전부 소문자로 저장 — Windows에는 표준 casing과 동일하게
+        // 적용되므로 경로·명령·마지막 실행 시각이 그대로 나와야 한다.
+        for (name, data) in [
+            ("path", "\\EvilTask".to_string()),
+            ("actions", to_hex(&actions)),
+            ("dynamicinfo", to_hex(&dynamic)),
+        ] {
+            conn.execute(
+                "INSERT INTO Registry VALUES (?1, ?2, ?3, '2026-01-01 00:00:00.000', 'live', 'evidence/SOFTWARE')",
+                rusqlite::params![kp, name, data],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let registry = RegistryOverviewCache::load(&root);
+        let findings = build_registry_findings_with_registry(&registry);
+        let task = findings
+            .iter()
+            .find(|row| row.get("subtype").map(String::as_str) == Some("TaskCache"))
+            .expect("TaskCache finding");
+        assert_eq!(task.get("name").map(String::as_str), Some("\\EvilTask"));
+        assert_eq!(task.get("command").map(String::as_str), Some("evil.exe"));
+        assert_eq!(task.get("timestamp").cloned(), Some(filetime(FT)));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn msi_display_and_pair_suppression_agree_on_case() {
+        let root = std::env::temp_dir().join(format!(
+            "wina-msi-case-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        ));
+        let registry_dir = root.join("REGISTRY");
+        std::fs::create_dir_all(&registry_dir).unwrap();
+        let conn = Connection::open(registry_dir.join("SOFTWARE.sqlite")).unwrap();
+        conn.execute("CREATE TABLE Registry (key_path TEXT, value_name TEXT, value_data TEXT, last_write TEXT, _recovery TEXT, _source_file TEXT)", []).unwrap();
+        // InstallProperties의 값 이름이 소문자(displayname)여도 MSI 행은
+        // 만들어지고, ProductCode가 일치하는 Uninstall 쌍둥이만 억제되어야
+        // 한다 — 표시와 쌍 판정의 casing 처리가 어긋나면 두 행이 모두 사라진다.
+        const PACKED: &str = "8765432143214321214321436587A9CB";
+        let msi_kp = format!("\\Microsoft\\Windows\\CurrentVersion\\Installer\\UserData\\S-1-5-18\\Products\\{PACKED}\\InstallProperties");
+        let un_kp = "\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{12345678-1234-1234-1234-123456789ABC}";
+        for (kp, name, data) in [
+            (msi_kp.as_str(), "displayname", "Tool Y"),
+            (msi_kp.as_str(), "displayversion", "3.0"),
+            (un_kp, "DisplayName", "Tool Y"),
+        ] {
+            conn.execute(
+                "INSERT INTO Registry VALUES (?1, ?2, ?3, '2026-01-01 00:00:00.000', 'live', 'evidence/SOFTWARE')",
+                rusqlite::params![kp, name, data],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let registry = RegistryOverviewCache::load(&root);
+        let findings = build_registry_findings_with_registry(&registry);
+        let msi: Vec<_> = findings
+            .iter()
+            .filter(|row| row.get("subtype").map(String::as_str) == Some("MsiInstall"))
+            .collect();
+        assert_eq!(msi.len(), 1, "소문자 displayname으로도 MSI 행이 생겨야 한다");
+        assert_eq!(msi[0].get("name").map(String::as_str), Some("Tool Y"));
+        assert_eq!(msi[0].get("value").map(String::as_str), Some("3.0"));
+        assert!(
+            !findings
+                .iter()
+                .any(|row| row.get("subtype").map(String::as_str) == Some("Uninstall")),
+            "ProductCode가 일치하는 Uninstall 쌍둥이는 억제되어야 한다"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Win10 "10ts" AppCompatCache 블롭 한 항목: 헤더(u32 오프셋) + 시그니처 +
+    /// ce_size + [u16 경로길이][UTF-16LE 경로][FILETIME].
+    fn shim_blob(path: &str, ft: u64) -> Vec<u8> {
+        let path_utf16: Vec<u8> = path.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let ce_size = 2 + path_utf16.len() + 8;
+        let mut b = 4u32.to_le_bytes().to_vec();
+        b.extend(b"10ts");
+        b.extend([0, 0, 0, 0]);
+        b.extend((ce_size as u32).to_le_bytes());
+        b.extend((path_utf16.len() as u16).to_le_bytes());
+        b.extend(path_utf16);
+        b.extend(ft.to_le_bytes());
+        b
+    }
+
+    #[test]
+    fn shares_and_appcert_follow_active_control_set() {
+        let root = std::env::temp_dir().join(format!(
+            "wina-shares-active-set-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        ));
+        let registry_dir = root.join("REGISTRY");
+        std::fs::create_dir_all(&registry_dir).unwrap();
+        let conn = Connection::open(registry_dir.join("SYSTEM.sqlite")).unwrap();
+        conn.execute("CREATE TABLE Registry (key_path TEXT, value_name TEXT, value_data TEXT, last_write TEXT, _recovery TEXT, _source_file TEXT)", []).unwrap();
+        // 활성 세트는 002 — 001의 과거 공유·AppCertDLLs 등록은 현재 구성이
+        // 아니므로 표시되면 안 되고, 같은 공유 이름은 002의 경로를 골라야 한다.
+        for row in [
+            ("\\Select", "Current", "2"),
+            ("\\ControlSet001\\Services\\LanmanServer\\Shares", "OldShare", "Path=C:\\Old"),
+            ("\\ControlSet001\\Services\\LanmanServer\\Shares", "Common", "Path=C:\\OldCommon"),
+            ("\\ControlSet002\\Services\\LanmanServer\\Shares", "Data", "Path=C:\\Data"),
+            ("\\ControlSet002\\Services\\LanmanServer\\Shares", "Common", "Path=C:\\NewCommon"),
+            ("\\ControlSet001\\Control\\Session Manager\\AppCertDlls", "Legacy", "old.dll"),
+            ("\\ControlSet002\\Control\\Session Manager\\AppCertDlls", "Inject", "evil.dll"),
+        ] {
+            conn.execute(
+                "INSERT INTO Registry VALUES (?1, ?2, ?3, '2026-01-01 00:00:00.000', 'live', 'evidence/SYSTEM')",
+                rusqlite::params![row.0, row.1, row.2],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let registry = RegistryOverviewCache::load(&root);
+        let findings = build_registry_findings_with_registry(&registry);
+        let shares: Vec<_> = findings
+            .iter()
+            .filter(|row| {
+                row.get("category").map(String::as_str) == Some("공유 폴더")
+                    && row.get("status").map(String::as_str) == Some("주의")
+            })
+            .collect();
+        let share_values: Vec<(&str, &str)> = shares
+            .iter()
+            .map(|row| {
+                (
+                    row.get("name").map(String::as_str).unwrap_or(""),
+                    row.get("value").map(String::as_str).unwrap_or(""),
+                )
+            })
+            .collect();
+        assert_eq!(shares.len(), 2, "활성 세트(002)의 공유만 나와야 한다: {share_values:?}");
+        assert!(share_values.contains(&("Data", "C:\\Data")));
+        assert!(share_values.contains(&("Common", "C:\\NewCommon")));
+        let appcert: Vec<_> = findings
+            .iter()
+            .filter(|row| {
+                row.get("name")
+                    .map(|name| name.starts_with("AppCertDLLs"))
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert_eq!(appcert.len(), 1);
+        assert_eq!(
+            appcert[0].get("value").map(String::as_str),
+            Some("evil.dll")
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn shimcache_follows_active_control_set() {
+        let root = std::env::temp_dir().join(format!(
+            "wina-shim-active-set-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        ));
+        let registry_dir = root.join("REGISTRY");
+        std::fs::create_dir_all(&registry_dir).unwrap();
+        let conn = Connection::open(registry_dir.join("SYSTEM.sqlite")).unwrap();
+        conn.execute("CREATE TABLE Registry (key_path TEXT, value_name TEXT, value_data TEXT, last_write TEXT, _recovery TEXT, _source_file TEXT)", []).unwrap();
+        const FT_OLD: u64 = 133_000_000_000_000_000;
+        const FT_NEW: u64 = 133_500_000_000_000_000;
+        // 같은 경로가 두 세트에 다른 FILETIME으로 존재 — 화면의 실행 시각은
+        // 행 순서가 아니라 활성 세트(002)의 것이어야 한다.
+        for row in [
+            ("\\Select", "Current", "2".to_string()),
+            (
+                "\\ControlSet001\\Control\\Session Manager\\AppCompatCache",
+                "AppCompatCache",
+                to_hex(&shim_blob("C:\\tools\\evil.exe", FT_OLD)),
+            ),
+            (
+                "\\ControlSet002\\Control\\Session Manager\\AppCompatCache",
+                "AppCompatCache",
+                to_hex(&shim_blob("C:\\tools\\evil.exe", FT_NEW)),
+            ),
+        ] {
+            conn.execute(
+                "INSERT INTO Registry VALUES (?1, ?2, ?3, '2026-01-01 00:00:00.000', 'live', 'evidence/SYSTEM')",
+                rusqlite::params![row.0, row.1, row.2],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let registry = RegistryOverviewCache::load(&root);
+        let findings = build_registry_findings_with_registry(&registry);
+        let shim: Vec<_> = findings
+            .iter()
+            .filter(|row| row.get("subtype").map(String::as_str) == Some("ShimCache"))
+            .collect();
+        assert_eq!(shim.len(), 1);
+        assert_eq!(
+            shim[0].get("value").map(String::as_str),
+            Some("C:\\tools\\evil.exe")
+        );
+        assert_eq!(shim[0].get("timestamp").cloned(), Some(filetime(FT_NEW)));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn target_info_network_follows_active_set_and_ignores_value_case() {
+        let root = std::env::temp_dir().join(format!(
+            "wina-ti-network-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        ));
+        let registry_dir = root.join("REGISTRY");
+        std::fs::create_dir_all(&registry_dir).unwrap();
+        // SYSTEM: 활성 세트는 002. 001에는 낡은 IP·DNS가 남아 있고, 002의 값
+        // 이름은 소문자다 — 출력은 002 구성만으로 만들어져야 하며(현재 IP +
+        // 과거 DNS 합성 금지), 소문자 값 이름도 같은 속성으로 해석돼야 한다.
+        const IFACE_001: &str =
+            "\\ControlSet001\\Services\\Tcpip\\Parameters\\Interfaces\\{IF-1}";
+        const IFACE_002: &str =
+            "\\ControlSet002\\Services\\Tcpip\\Parameters\\Interfaces\\{IF-1}";
+        for (hive, rows) in [
+            (
+                "SYSTEM",
+                vec![
+                    ("\\Select", "Current", "2"),
+                    (IFACE_001, "IPAddress", "192.168.0.9"),
+                    (IFACE_001, "NameServer", "9.9.9.9"),
+                    (IFACE_002, "ipaddress", "10.0.0.5"),
+                    (IFACE_002, "nameserver", "8.8.8.8"),
+                ],
+            ),
+            (
+                "SOFTWARE",
+                vec![(
+                    "\\Microsoft\\Windows NT\\CurrentVersion\\NetworkList\\Profiles\\{P-1}",
+                    "profilename",
+                    "CorpWiFi",
+                )],
+            ),
+        ] {
+            let conn = Connection::open(registry_dir.join(format!("{hive}.sqlite"))).unwrap();
+            conn.execute("CREATE TABLE Registry (key_path TEXT, value_name TEXT, value_data TEXT, last_write TEXT, _recovery TEXT, _source_file TEXT)", []).unwrap();
+            for row in rows {
+                conn.execute(
+                    "INSERT INTO Registry VALUES (?1, ?2, ?3, '2026-01-01 00:00:00.000', 'live', ?4)",
+                    rusqlite::params![row.0, row.1, row.2, format!("evidence/{hive}")],
+                )
+                .unwrap();
+            }
+        }
+
+        let registry = RegistryOverviewCache::load(&root);
+        let rows = build_target_info_with_registry(&registry);
+        let iface = rows
+            .iter()
+            .find(|row| row.get("category").map(String::as_str) == Some("NetworkInterface"))
+            .expect("network interface row");
+        assert_eq!(iface.get("value").map(String::as_str), Some("10.0.0.5"));
+        assert_eq!(iface.get("dns_server").map(String::as_str), Some("8.8.8.8"));
+        assert!(
+            rows.iter().any(|row| {
+                row.get("category").map(String::as_str) == Some("Network")
+                    && row.get("value").map(String::as_str) == Some("CorpWiFi")
+            }),
+            "소문자 profilename도 네트워크 프로필로 나와야 한다"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn msi_packed_product_code_applies_darwin_transform() {
+        assert_eq!(
+            msi_packed_product_code("{12345678-1234-1234-1234-123456789ABC}").as_deref(),
+            Some("8765432143214321214321436587a9cb")
+        );
+        assert_eq!(msi_packed_product_code("FakeToolX"), None);
+        assert_eq!(msi_packed_product_code("{1234-5678}"), None);
+    }
+
+    #[test]
     fn registry_findings_reuses_single_hive_load_without_changing_rows() {
         let root = std::env::temp_dir().join(format!(
             "wina-registry-findings-{}-{}",
@@ -4060,12 +6186,22 @@ mod tests {
         for (name, rows) in [
             (
                 "SYSTEM",
-                vec![(
-                    "\\Control\\Session Manager\\AppCompatCache",
-                    "AppCompatCache",
-                    "",
-                    "2026-01-01 00:00:00.000",
-                )],
+                vec![
+                    (
+                        "\\Control\\Session Manager\\AppCompatCache",
+                        "AppCompatCache",
+                        "",
+                        "2026-01-01 00:00:00.000",
+                    ),
+                    // rf_lsa_packages가 행을 내놓아야 빌더의 이중 호출(중복
+                    // 생성) 회귀가 아래 유일성 검사에 걸린다.
+                    (
+                        "\\ControlSet001\\Control\\Lsa",
+                        "NoLmHash",
+                        "0",
+                        "2026-01-01 00:00:00.000",
+                    ),
+                ],
             ),
             (
                 "SOFTWARE",
@@ -4110,17 +6246,7 @@ mod tests {
         databases.sort();
         let legacy_hives = databases
             .into_iter()
-            .map(|database| RegistryOverviewHive {
-                name: database
-                    .file_stem()
-                    .map(|stem| stem.to_string_lossy().to_string())
-                    .unwrap_or_default(),
-                rows: read_table(&database, "Registry")
-                    .into_iter()
-                    .filter(is_live)
-                    .collect(),
-                database,
-            })
+            .map(RegistryOverviewHive::load)
             .collect::<Vec<_>>();
         let legacy_system = legacy_hives
             .iter()
@@ -4137,11 +6263,55 @@ mod tests {
         legacy.extend(rf_shares(legacy_system));
         legacy.extend(rf_sql_auth(legacy_software));
         legacy.extend(rf_autoruns(&legacy_hives));
+        legacy.extend(rf_winlogon(legacy_software));
+        legacy.extend(rf_silent_process_exit(legacy_software));
+        legacy.extend(rf_taskcache(legacy_software));
+        legacy.extend(rf_active_setup(legacy_software));
+        legacy.extend(rf_appinit(legacy_software, legacy_system));
+        legacy.extend(rf_session_manager(legacy_system));
+        legacy.extend(rf_security_config(legacy_software));
+        legacy.extend(rf_remote_tools(&legacy_hives));
         legacy.extend(rf_msi_installs(&legacy_hives));
+        legacy.extend(rf_uninstall_installs(&legacy_hives));
         legacy.extend(rf_execution_traces(&legacy_hives));
         legacy.extend(rf_shimcache(&legacy_hives));
         let registry = RegistryOverviewCache::load(&root);
-        assert_eq!(build_registry_findings_with_registry(&registry), legacy);
+        let findings = build_registry_findings_with_registry(&registry);
+        assert_eq!(findings, legacy);
+        // Lsa 확장(rf_lsa_packages)이 rf_credential_protection 내부와 빌더
+        // 양쪽에서 호출되면 같은 행이 두 번 생긴다 — 동일 식별 4요소는 한
+        // 번만 나와야 한다.
+        let mut seen = std::collections::HashSet::new();
+        for row in &findings {
+            let identity = (
+                row.get("category").cloned().unwrap_or_default(),
+                row.get("name").cloned().unwrap_or_default(),
+                row.get("value").cloned().unwrap_or_default(),
+                row.get("key_path").cloned().unwrap_or_default(),
+            );
+            assert!(
+                seen.insert(identity.clone()),
+                "duplicate finding emitted twice: {identity:?}"
+            );
+        }
+        // 원본 레지스트리 행에서 나온 판정은 3-요소 record_key를 보존해
+        // 개요 북마크가 원본 Registry 레코드로 승격될 수 있어야 한다.
+        let nolm = findings
+            .iter()
+            .find(|row| row.get("name").map(String::as_str) == Some("NoLmHash"))
+            .expect("NoLmHash finding");
+        assert_eq!(
+            nolm.get("record_key").map(String::as_str),
+            Some("SYSTEM::Registry::2")
+        );
+        let run_mru = findings
+            .iter()
+            .find(|row| row.get("subtype").map(String::as_str) == Some("RunMRU"))
+            .expect("RunMRU finding");
+        assert_eq!(
+            run_mru.get("record_key").map(String::as_str),
+            Some("analyst_NTUSER.DAT::Registry::1")
+        );
         assert_eq!(
             build_target_info(&root),
             build_target_info_with_registry(&registry),
@@ -4168,6 +6338,7 @@ mod tests {
             raw_identity,
             vec![
                 ("live".to_string(), "evidence/SOFTWARE".to_string()),
+                ("live".to_string(), "evidence/SYSTEM".to_string()),
                 ("live".to_string(), "evidence/SYSTEM".to_string()),
                 (
                     "live".to_string(),

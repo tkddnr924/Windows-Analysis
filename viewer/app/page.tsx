@@ -272,6 +272,8 @@ export default function Home() {
     const alreadyOpen = tabs.some((t) => keyOf(t.file) === key);
     setTabs((prev) => (prev.some((t) => keyOf(t.file) === key) ? prev : [...prev, { file, data: null, loading: true, error: null }]));
     if (alreadyOpen) return;
+    // 새로 여는 탭은 이어받기 실패 기록을 지워 재시도 기회를 준다.
+    rawLoadFailed.current.delete(key);
 
     try {
       if (file.tableName === "MFT_Records") {
@@ -309,11 +311,16 @@ export default function Home() {
 
   // 원본 테이블 청크 크기 — 초기 로드와 스크롤 이어받기 단위.
   const rawLoadInFlight = useRef<Set<string>>(new Set());
+  // 이어받기가 실패한 탭 — onLoadMore는 렌더마다 새 함수라 effect가 계속
+  // 재실행되므로, 실패를 기록하지 않으면 영구 오류(파일 교체·권한 등)에서
+  // 같은 IPC를 무한 재시도한다. 실패한 키는 자동 이어받기를 멈추고 이미 받은
+  // 행만 유지한다. unhandled rejection도 여기서 흡수한다.
+  const rawLoadFailed = useRef<Set<string>>(new Set());
   async function loadMoreRawRows() {
     if (!activeTab?.data) return;
     const key = keyOf(activeTab.file);
     const loaded = activeTab.data.rows.length;
-    if (loaded >= activeTab.data.rowCount || rawLoadInFlight.current.has(key)) return;
+    if (loaded >= activeTab.data.rowCount || rawLoadInFlight.current.has(key) || rawLoadFailed.current.has(key)) return;
     rawLoadInFlight.current.add(key);
     try {
       const page = await window.api.readResultFilePage(activeTab.file.fullPath, activeTab.file.tableName, loaded, RAW_TABLE_CHUNK);
@@ -324,6 +331,9 @@ export default function Home() {
         if (t.data.rows.length !== loaded) return t;
         return { ...t, data: { ...t.data, rows: [...t.data.rows, ...page.rows], rowCount: page.rowCount } };
       }));
+    } catch (e) {
+      rawLoadFailed.current.add(key);
+      console.error(`raw chunk load failed for ${key}:`, e);
     } finally {
       rawLoadInFlight.current.delete(key);
     }

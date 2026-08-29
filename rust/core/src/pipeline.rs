@@ -545,6 +545,9 @@ struct RegistryHiveReport {
     recovery_permit_wait_ms: u128,
     build_recovery_ms: u128,
     iteration_and_sqlite_write_ms: u128,
+    /// 발견된 트랜잭션 로그를 적용하지 못해 기본 하이브만으로 폴백한 사유.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recovery_log_apply_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
 }
@@ -975,20 +978,27 @@ fn parse_amcache_artifact(
         let relative = format!("AMCACHE/{}.sqlite", name);
         let out = out_dir.join(&relative);
         let unit = run_unit_or_skip(&p.display().to_string(), &[&out], || -> Result<(usize, usize)> {
-            let (progs, files) = amcache::parse_amcache(p)?;
+            let parsed = amcache::parse_amcache(p)?;
+            if let Some(reason) = &parsed.log_apply_error {
+                emit(&format!(
+                    "[*] Amcache 로그 적용 실패 — 기본 하이브만 파싱: {} ({})",
+                    p.display(),
+                    reason
+                ));
+            }
             write_table(
                 &out,
                 amcache::PROGRAMS_TABLE,
-                &progs,
+                &parsed.programs,
                 amcache::PROGRAMS_FIELD_ORDER,
             )?;
             write_table(
                 &out,
                 amcache::FILES_TABLE,
-                &files,
+                &parsed.files,
                 amcache::FILES_FIELD_ORDER,
             )?;
-            Ok((progs.len(), files.len()))
+            Ok((parsed.programs.len(), parsed.files.len()))
         })?;
         if let Some((prog_count, file_count)) = unit {
             entry_record_input_count(entry, p, prog_count + file_count);
@@ -1121,9 +1131,20 @@ fn parse_registry_artifact(
         }
     });
     let mut outputs = Vec::new();
+    let mut any_logs_applied = false;
+    let mut any_log_apply_failed = false;
     if let Ok(counts) = parsed_counts.into_inner() {
         for (source, relative, metrics) in counts {
             entry_record_input_count(&mut outcome.entry, &source, metrics.row_count);
+            any_logs_applied |= metrics.recovery_log_count > 0;
+            if let Some(reason) = &metrics.recovery_log_apply_error {
+                any_log_apply_failed = true;
+                emit(&format!(
+                    "[*] 레지스트리 로그 적용 실패 — 기본 하이브만 파싱: {} ({})",
+                    source.display(),
+                    reason
+                ));
+            }
             outcome.registry_hives.push(RegistryHiveReport {
                 source_path: source.to_string_lossy().to_string(),
                 status: "completed".to_string(),
@@ -1135,10 +1156,16 @@ fn parse_registry_artifact(
                 recovery_permit_wait_ms: metrics.recovery_permit_wait_ms,
                 build_recovery_ms: metrics.build_recovery_ms,
                 iteration_and_sqlite_write_ms: metrics.iteration_and_sqlite_write_ms,
+                recovery_log_apply_error: metrics.recovery_log_apply_error.clone(),
                 error: None,
             });
             outputs.push(relative);
         }
+    }
+    // 아티팩트 요약의 "로그 적용됨"은 선언이 아니라 실적이다 — 어떤 하이브도
+    // 로그를 적용하지 못했거나(발견 0 포함) 적용 실패가 있으면 false.
+    if let Some(recovery) = outcome.registry_recovery.as_mut() {
+        recovery.transaction_logs_applied = any_logs_applied && !any_log_apply_failed;
     }
     // 손상된 하이브는 건너뛴 것으로 취급한다(파싱 실패 == 손상 아티팩트).
     // 성공한 하이브 출력은 그대로 발행되고, 건너뛴 사실은 보고서의
@@ -1162,6 +1189,7 @@ fn parse_registry_artifact(
             recovery_permit_wait_ms: 0,
             build_recovery_ms: 0,
             iteration_and_sqlite_write_ms: 0,
+            recovery_log_apply_error: None,
             error: Some(failure.clone()),
         }));
     let storage_failures: Vec<&String> = failures

@@ -83,6 +83,9 @@ pub struct HiveParseMetrics {
     pub recovery_permit_wait_ms: u128,
     pub build_recovery_ms: u128,
     pub iteration_and_sqlite_write_ms: u128,
+    /// 발견된 트랜잭션 로그를 적용하지 못하고 기본 하이브만으로 폴백했을 때의
+    /// 실패 사유. None이면 로그가 없었거나 정상 적용된 것이다.
+    pub recovery_log_apply_error: Option<String>,
 }
 
 /// Deleted-cell discovery is the costly part of a Registry hive parse.  The
@@ -277,25 +280,47 @@ pub fn parse_hive_stream(primary: &Path, out: &Path) -> Result<usize> {
 
 pub fn parse_hive_stream_with_metrics(primary: &Path, out: &Path) -> Result<HiveParseMetrics> {
     let source = primary.to_string_lossy().to_string();
-    // notatin stores the path, so a borrowed &Path fails the 'static bound.
-    #[allow(clippy::unnecessary_to_owned)]
-    let mut builder = ParserBuilder::from_path(primary.to_path_buf());
     let logs = sibling_logs(primary);
     let recovery_plan = registry_recovery_plan();
     let recovery_logs_discovered = logs.len();
-    for log in transaction_logs_to_apply(&logs, recovery_plan) {
-        builder.with_transaction_log(log.clone());
-    }
-    if recovery_plan.recover_deleted_cells {
-        builder.recover_deleted(true);
-    }
+    let logs_to_apply: Vec<PathBuf> = transaction_logs_to_apply(&logs, recovery_plan).to_vec();
+    let make_builder = |with_logs: bool| {
+        // notatin stores the path, so a borrowed &Path fails the 'static bound.
+        #[allow(clippy::unnecessary_to_owned)]
+        let mut builder = ParserBuilder::from_path(primary.to_path_buf());
+        if with_logs {
+            for log in &logs_to_apply {
+                builder.with_transaction_log(log.clone());
+            }
+        }
+        if recovery_plan.recover_deleted_cells {
+            builder.recover_deleted(true);
+        }
+        builder
+    };
+    // 로그 포함 빌드가 실패해도(손상·적용 불가 .LOG1/.LOG2) 유효한 기본
+    // 하이브까지 통째로 버리지 않는다 — 정책은 "로그 문제를 기록하고 하이브
+    // 파싱은 계속". 실패 사유를 메트릭에 남기고 로그 없이 한 번 재시도한다.
+    let mut recovery_log_count = logs_to_apply.len();
+    let mut recovery_log_apply_error: Option<String> = None;
+    let mut build_parser = || match make_builder(!logs_to_apply.is_empty()).build() {
+        Ok(parser) => Ok(parser),
+        Err(error) => {
+            if logs_to_apply.is_empty() {
+                return Err(error);
+            }
+            recovery_log_apply_error = Some(error.to_string());
+            recovery_log_count = 0;
+            make_builder(false).build()
+        }
+    };
     let (parser, recovery_permit_wait_ms, build_recovery_ms) =
         if recovery_plan.recover_deleted_cells {
             let permit_wait_started = std::time::Instant::now();
             let recovery_permit = acquire_recovery_permit()?;
             let recovery_permit_wait_ms = permit_wait_started.elapsed().as_millis();
             let build_started = std::time::Instant::now();
-            let parser = builder.build()?;
+            let parser = build_parser()?;
             drop(recovery_permit);
             (
                 parser,
@@ -303,10 +328,10 @@ pub fn parse_hive_stream_with_metrics(primary: &Path, out: &Path) -> Result<Hive
                 build_started.elapsed().as_millis(),
             )
         } else {
-            // Do not acquire a recovery permit or pass transaction logs to
-            // notatin in temporary live-only mode. `build_recovery_ms` is zero so
-            // reports cannot imply that a recovery phase ran.
-            (builder.build()?, 0, 0)
+            // Do not acquire a recovery permit in temporary live-only mode.
+            // `build_recovery_ms` is zero so reports cannot imply that a
+            // recovery phase ran.
+            (build_parser()?, 0, 0)
         };
 
     let iteration_started = std::time::Instant::now();
@@ -370,12 +395,13 @@ pub fn parse_hive_stream_with_metrics(primary: &Path, out: &Path) -> Result<Hive
     Ok(HiveParseMetrics {
         row_count,
         recovery_logs_discovered,
-        recovery_log_count: transaction_logs_to_apply(&logs, recovery_plan).len(),
+        recovery_log_count,
         recovery_enabled: recovery_plan.recover_deleted_cells,
         recovered_row_count,
         recovery_permit_wait_ms,
         build_recovery_ms,
         iteration_and_sqlite_write_ms: iteration_started.elapsed().as_millis(),
+        recovery_log_apply_error,
     })
 }
 

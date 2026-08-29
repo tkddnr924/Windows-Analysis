@@ -131,10 +131,17 @@ fn debug_parse(args: &[String]) -> Result<()> {
             eprintln!("UsnJrnl: {} rows", n);
         }
         "parse-amcache" => {
-            let (p, fl) = parse_amcache(&inp)?;
-            write_table(&out, PROGRAMS_TABLE, &p, PROGRAMS_FIELD_ORDER)?;
-            write_table(&out, FILES_TABLE, &fl, FILES_FIELD_ORDER)?;
-            eprintln!("Amcache: {} programs, {} files", p.len(), fl.len());
+            let parsed = parse_amcache(&inp)?;
+            if let Some(reason) = &parsed.log_apply_error {
+                eprintln!("Amcache: log apply failed, parsed primary hive only ({reason})");
+            }
+            write_table(&out, PROGRAMS_TABLE, &parsed.programs, PROGRAMS_FIELD_ORDER)?;
+            write_table(&out, FILES_TABLE, &parsed.files, FILES_FIELD_ORDER)?;
+            eprintln!(
+                "Amcache: {} programs, {} files",
+                parsed.programs.len(),
+                parsed.files.len()
+            );
         }
         "parse-tasks" => {
             let r = parse_tasks(&inp)?;
