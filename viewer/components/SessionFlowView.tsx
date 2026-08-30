@@ -140,15 +140,15 @@ export default function SessionFlowView({
   timeRange = EMPTY_TIME_RANGE,
   accountDirectory,
 }: SessionFlowViewProps) {
+  const isSmb = fileName === "SmbHistory";
   const [dirFilter, setDirFilter] = useState<string | undefined>(undefined);
-  const [resultFilter, setResultFilter] = useState<ResultFilter>("all");
+  // RDP는 성공 세션이 분석 출발점이라 결과 필터 기본값을 성공으로 둔다. SMB는 전체 유지.
+  const [resultFilter, setResultFilter] = useState<ResultFilter>(isSmb ? "all" : "success");
   // 계정별 체크 필터 — 기본은 전체 표시, 체크 해제한 계정만 숨긴다.
   const [hiddenAccounts, setHiddenAccounts] = useState<Set<string>>(new Set());
   const [query, setQuery] = useState("");
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [selected, setSelected] = useState<Record<string, string> | null>(null);
-
-  const isSmb = fileName === "SmbHistory";
   const spec = getArtifactView(fileName);
   const allSessions = useMemo(() => clusterSessions(data, timeRange), [data, timeRange]);
   const accounts = useMemo(

@@ -314,6 +314,9 @@ function CategoryNode({ category, selectedFile, onSelectFile, displayName, pinne
     const map = new Map<string, ResultFileEntry[]>();
     for (const file of files) {
       if (hideFileName && file.name === hideFileName) continue;
+      // 뷰 백데이터 테이블(파일 시스템 정보 교차 참조 등)은 독립 화면이 없다 —
+      // 내비게이션에 노출하지 않는다.
+      if (file.fileName === "PathReferences") continue;
       if (!map.has(file.fileName)) map.set(file.fileName, []);
       map.get(file.fileName)!.push(file);
     }

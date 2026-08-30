@@ -125,9 +125,35 @@ function parseAiJson(value: unknown): { title: string; createdAt: string; update
   const title = String(object.title ?? object.name ?? "");
   const createdAt = formatAiPayloadTime(object.create_time ?? object.created_at ?? "");
   const updatedAt = formatAiPayloadTime(object.update_time ?? object.updated_at ?? "");
-  const mapping = object.mapping as Record<string, { message?: { author?: { role?: string }; content?: { parts?: unknown[]; text?: string }; create_time?: number } }> | undefined;
+  const mapping = object.mapping as Record<string, { parent?: string; message?: { author?: { role?: string }; recipient?: string; content?: { content_type?: string; parts?: unknown[]; text?: string }; create_time?: number } }> | undefined;
   if (mapping && typeof mapping === "object") {
-    Object.values(mapping).map((node) => node.message).filter((message): message is NonNullable<typeof message> => Boolean(message?.author?.role)).sort((a, b) => (a.create_time ?? 0) - (b.create_time ?? 0)).forEach((message) => {
+    // ChatGPT의 정본 순서는 mapping 트리(current_node→parent 체인)다. 원본
+    // create_time은 사용자 메시지가 그 답변보다 늦게 찍히는 경우가 있어
+    // 정렬 기준으로 쓰면 질문·답변 순서가 뒤집힌다. 체인을 못 만드는
+    // 페이로드에서만 create_time 정렬로 대신한다.
+    // 채팅 버블에는 ChatGPT 화면에 실제 표시됐던 것만 올린다 — 도구 실행
+    // 결과(role=tool), 도구로 보낸 내부 명령(recipient≠all), 텍스트가 아닌
+    // 노드(thoughts·code 등)는 숨긴다. 숨긴 내용은 원본 JSON 보기에 남는다.
+    const displayed = (message: NonNullable<NonNullable<(typeof mapping)[string]>["message"]>) => {
+      if (!message.author?.role || message.author.role === "tool") return false;
+      if (message.recipient && message.recipient !== "all") return false;
+      if (message.content?.content_type && message.content.content_type !== "text") return false;
+      return true;
+    };
+    const visited = new Set<string>();
+    const chain: NonNullable<(typeof mapping)[string]["message"]>[] = [];
+    let nodeId = typeof object.current_node === "string" ? object.current_node : "";
+    while (nodeId && mapping[nodeId] && !visited.has(nodeId)) {
+      visited.add(nodeId);
+      const nodeMessage = mapping[nodeId].message;
+      if (nodeMessage && displayed(nodeMessage)) chain.push(nodeMessage);
+      nodeId = typeof mapping[nodeId].parent === "string" ? mapping[nodeId].parent! : "";
+    }
+    chain.reverse();
+    const ordered = chain.length > 0
+      ? chain
+      : Object.values(mapping).map((node) => node.message).filter((message): message is NonNullable<typeof message> => Boolean(message && displayed(message))).sort((a, b) => (a.create_time ?? 0) - (b.create_time ?? 0));
+    ordered.forEach((message) => {
       const parts = message.content?.parts;
       const text = Array.isArray(parts) ? parts.map((part) => typeof part === "string" ? part : JSON.stringify(part)).join("\n") : (message.content?.text ?? "");
       if (text.trim()) messages.push({ role: message.author?.role || "?", text, time: formatAiPayloadTime(message.create_time) });
@@ -679,6 +705,11 @@ function DomainStatsModal({ page, data, visitTotal, sortAsc, onSortAsc, onPage, 
 
 function AiConversationModal({ conversation, onClose }: { conversation: DisplayAiConversation; onClose: () => void }) {
   const [showRaw, setShowRaw] = useState(false);
+  const [search, setSearch] = useState("");
+  const searchQuery = search.trim().toLowerCase();
+  const visibleMessages = searchQuery
+    ? conversation.messages.filter((message) => message.text.toLowerCase().includes(searchQuery))
+    : conversation.messages;
   const dialogRef = useRef<HTMLDivElement>(null);
   const closeButtonRef = useRef<HTMLButtonElement>(null);
   useEffect(() => {
@@ -714,6 +745,10 @@ function AiConversationModal({ conversation, onClose }: { conversation: DisplayA
       <header style={{ display: "flex", flexShrink: 0, alignItems: "center", gap: 10, padding: "12px 16px", borderBottom: "1px solid var(--border)", background: "var(--bg-panel)" }}>
         <ProviderMark provider={conversation.provider} />
         <span style={{ minWidth: 0, flex: 1, fontSize: 14, fontWeight: 700, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{conversation.title || "제목 없음"}</span>
+        {conversation.messages.length > 0 && !showRaw && <div style={{ display: "flex", flexShrink: 0, alignItems: "center", gap: 7 }}>
+          <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="대화 내 검색" aria-label="대화 내 검색" style={{ width: 170, padding: "5px 10px", background: "var(--bg-input)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", color: "var(--text)", fontSize: 12 }} />
+          {searchQuery && <span role="status" style={{ color: visibleMessages.length > 0 ? "var(--text-faint)" : "var(--danger)", fontSize: 11.5, whiteSpace: "nowrap" }}>{visibleMessages.length.toLocaleString()}개 일치</span>}
+        </div>}
         {conversation.messages.length > 0 && <button className="nm-btn" onClick={() => setShowRaw((value) => !value)} style={pageButton(false)}>{showRaw ? "대화 보기" : "원본 JSON"}</button>}
         <button ref={closeButtonRef} onClick={onClose} title="닫기" aria-label="닫기" style={{ display: "inline-flex", flexShrink: 0, padding: 2, background: "transparent", border: "none", color: "var(--text-faint)", cursor: "pointer" }}><CloseIcon sx={{ fontSize: 18 }} /></button>
       </header>
@@ -722,8 +757,8 @@ function AiConversationModal({ conversation, onClose }: { conversation: DisplayA
       </div>
       <div title={conversation.url} style={{ flexShrink: 0, minWidth: 0, padding: "7px 16px", borderBottom: "1px solid var(--border-subtle)", color: "var(--text-faint)", fontFamily: "var(--mono)", fontSize: 10.5, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{conversation.url}</div>
       <main aria-label="대화 메시지" style={{ minHeight: 0, overflow: "auto", padding: 16, background: "var(--bg)" }}>
-        {showRaw ? <pre style={{ margin: 0, padding: 10, maxHeight: "62vh", overflow: "auto", background: "var(--bg-input)", border: "1px solid var(--border-subtle)", borderRadius: "var(--radius-sm)", fontFamily: "var(--mono)", fontSize: 11.5, lineHeight: 1.55, whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{conversation.raw}</pre> : conversation.messages.length === 0 ? <div style={{ padding: "18px 0", color: "var(--text-faint)", fontSize: 12.5 }}>표시할 대화 메시지를 추출하지 못했습니다. 원본 JSON에서 확인할 수 있습니다.</div> : <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
-          {conversation.messages.map((message, index) => {
+        {showRaw ? <pre style={{ margin: 0, padding: 10, maxHeight: "62vh", overflow: "auto", background: "var(--bg-input)", border: "1px solid var(--border-subtle)", borderRadius: "var(--radius-sm)", fontFamily: "var(--mono)", fontSize: 11.5, lineHeight: 1.55, whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{conversation.raw}</pre> : conversation.messages.length === 0 ? <div style={{ padding: "18px 0", color: "var(--text-faint)", fontSize: 12.5 }}>표시할 대화 메시지를 추출하지 못했습니다. 원본 JSON에서 확인할 수 있습니다.</div> : visibleMessages.length === 0 ? <div style={{ padding: "18px 0", color: "var(--text-faint)", fontSize: 12.5 }}>검색어와 일치하는 메시지가 없습니다.</div> : <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+          {visibleMessages.map((message, index) => {
             const info = roleInfo(message.role);
             const roleIsUser = info.kind === "user";
             const roleIsSystem = info.kind === "system";

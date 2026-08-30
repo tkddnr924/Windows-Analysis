@@ -1255,6 +1255,7 @@ export default function Home() {
                 />
               ) : getArtifactView(activeTab.file.name)?.flowView ? (
                 <SessionFlowView
+                  key={activeTab.file.name}
                   fileName={activeTab.file.name}
                   data={activeTab.data}
                   hostIpMap={caseNetwork?.caseId === selectedCase?.id ? caseNetwork.ipToHost : {}}
