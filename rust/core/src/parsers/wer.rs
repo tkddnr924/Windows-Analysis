@@ -9,7 +9,6 @@ use anyhow::Result;
 use rayon::prelude::*;
 use serde::Serialize;
 use serde_json::{Map, Value};
-use walkdir::WalkDir;
 
 use crate::sqlite::Row;
 use crate::time::fmt_filetime;
@@ -231,22 +230,18 @@ fn parse_report(path: &Path) -> Row {
     r
 }
 
-pub fn wer_sources(root: &Path) -> Vec<std::path::PathBuf> {
-    let mut paths: Vec<_> = WalkDir::new(root)
+pub fn wer_sources(root: &Path) -> crate::finder::Found {
+    let (files, errors) = crate::finder::walk_files(root);
+    let mut paths: Vec<_> = files
         .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|entry| {
-            entry.file_type().is_file()
-                && entry
-                    .path()
-                    .extension()
-                    .map(|e| e.eq_ignore_ascii_case("wer"))
-                    .unwrap_or(false)
+        .filter(|p| {
+            p.extension()
+                .map(|e| e.eq_ignore_ascii_case("wer"))
+                .unwrap_or(false)
         })
-        .map(|entry| entry.into_path())
         .collect();
     paths.sort();
-    paths
+    crate::finder::Found { paths, errors }
 }
 
 /// Parse already-discovered Report.wer files.
@@ -257,7 +252,7 @@ pub fn parse_wer_from(paths: &[std::path::PathBuf]) -> Vec<Row> {
 }
 
 pub fn parse_wer_with_sources(root: &Path) -> Result<(Vec<std::path::PathBuf>, Vec<Row>)> {
-    let paths = wer_sources(root);
+    let paths = wer_sources(root).paths;
     let rows = parse_wer_from(&paths);
     Ok((paths, rows))
 }

@@ -10,7 +10,6 @@ use anyhow::Result;
 use encoding_rs::EUC_KR;
 use lnk::ShellLink;
 use rayon::prelude::*;
-use walkdir::WalkDir;
 
 use crate::sqlite::Row;
 use crate::time::fmt_filetime;
@@ -462,20 +461,22 @@ fn parse_custom(path: &Path, rows: &mut Vec<Row>) {
 
 /// Destination files discovered before decoding. A corrupt or empty
 /// destination file is still evidence input even when it yields no entries.
-pub fn jumplist_sources(root: &Path) -> Vec<std::path::PathBuf> {
-    let mut paths: Vec<_> = WalkDir::new(root)
+/// 순회 실패는 버리지 않고 함께 반환한다 (탐색 계약).
+pub fn jumplist_sources(root: &Path) -> crate::finder::Found {
+    let (files, errors) = crate::finder::walk_files(root);
+    let mut paths: Vec<_> = files
         .into_iter()
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.file_type().is_file())
-        .filter_map(|entry| {
-            let name = entry.file_name().to_string_lossy().to_lowercase();
-            (name.ends_with(".automaticdestinations-ms")
-                || name.ends_with(".customdestinations-ms"))
-            .then(|| entry.into_path())
+        .filter(|p| {
+            let name = p
+                .file_name()
+                .map(|n| n.to_string_lossy().to_lowercase())
+                .unwrap_or_default();
+            name.ends_with(".automaticdestinations-ms")
+                || name.ends_with(".customdestinations-ms")
         })
         .collect();
     paths.sort();
-    paths
+    crate::finder::Found { paths, errors }
 }
 
 /// Parse already-discovered destination files.
@@ -507,7 +508,7 @@ pub fn parse_jumplists_from(sources: &[std::path::PathBuf]) -> Vec<Row> {
 }
 
 pub fn parse_jumplists_with_sources(root: &Path) -> Result<(Vec<std::path::PathBuf>, Vec<Row>)> {
-    let sources = jumplist_sources(root);
+    let sources = jumplist_sources(root).paths;
     let rows = parse_jumplists_from(&sources);
     Ok((sources, rows))
 }

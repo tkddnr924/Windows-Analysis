@@ -463,12 +463,22 @@ pub fn browser_of(path: &Path) -> Option<&'static str> {
     None
 }
 
+/// 후보 검증 결과 — 유효 캐시 index(출력명 배정)와, 캐시 레이아웃에 있었지만
+/// 읽기·매직 검증에 실패해 거부된 index(사유 포함)를 구분한다. 거부 파일이
+/// "성공한 빈 캐시"로 보이지 않도록 파이프라인이 사유를 보고서에 남긴다.
+/// 레이아웃상 비대상(Cache/Cache_Data 밖, Code Cache)은 증거 입력이 아니므로
+/// 어느 쪽에도 넣지 않는다.
+#[derive(Default)]
+pub struct CacheCandidates {
+    pub outputs: Vec<(String, PathBuf)>,
+    pub rejected: Vec<(PathBuf, String)>,
+}
+
 /// Valid blockfile cache indexes among `paths`, each with its assigned output
 /// name (`<account>_<브라우저|Unknown>_Cache`, uniquified). Unreadable or
-/// non-blockfile indexes are skipped — a corrupted cache is simply not a
-/// parsable artifact.
-pub fn cache_outputs(paths: &[PathBuf]) -> Vec<(String, PathBuf)> {
-    let mut outputs: Vec<(String, PathBuf)> = Vec::new();
+/// non-blockfile indexes are returned as rejected with their reason.
+pub fn cache_outputs(paths: &[PathBuf]) -> CacheCandidates {
+    let mut result = CacheCandidates::default();
     let mut taken: HashSet<String> = HashSet::new();
     for index_path in paths {
         let parent_name = index_path
@@ -490,11 +500,24 @@ pub fn cache_outputs(paths: &[PathBuf]) -> Vec<(String, PathBuf)> {
             continue;
         }
         let mut head = [0u8; 4];
-        let readable = std::fs::File::open(index_path)
+        match std::fs::File::open(index_path)
             .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut head))
-            .is_ok();
-        if !readable || u32::from_le_bytes(head) != INDEX_MAGIC {
-            continue;
+        {
+            Ok(()) => {
+                if u32::from_le_bytes(head) != INDEX_MAGIC {
+                    result.rejected.push((
+                        index_path.clone(),
+                        "블록파일 캐시 index 매직 불일치".to_string(),
+                    ));
+                    continue;
+                }
+            }
+            Err(error) => {
+                result
+                    .rejected
+                    .push((index_path.clone(), format!("index 읽기 실패: {error}")));
+                continue;
+            }
         }
         // 브라우저를 특정할 수 없으면 Chrome으로 단정하지 않고 Unknown으로
         // 표기한다 — 증거 귀속은 근거 있을 때만(T8 확정).
@@ -510,9 +533,9 @@ pub fn cache_outputs(paths: &[PathBuf]) -> Vec<(String, PathBuf)> {
             i += 1;
         }
         taken.insert(name.clone());
-        outputs.push((name, index_path.clone()));
+        result.outputs.push((name, index_path.clone()));
     }
-    outputs
+    result
 }
 
 /// Parse one cache index, handing each entry row to `push` as it is decoded so
@@ -617,7 +640,7 @@ mod tests {
         std::fs::create_dir_all(&unknown).unwrap();
         std::fs::write(legacy_edge.join("index"), INDEX_MAGIC.to_le_bytes()).unwrap();
         std::fs::write(unknown.join("index"), INDEX_MAGIC.to_le_bytes()).unwrap();
-        let outputs = cache_outputs(&[legacy_edge.join("index"), unknown.join("index")]);
+        let outputs = cache_outputs(&[legacy_edge.join("index"), unknown.join("index")]).outputs;
         let names: Vec<&str> = outputs.iter().map(|(name, _)| name.as_str()).collect();
         assert_eq!(names, vec!["ny_Edge_Cache", "userX_Unknown_Cache"]);
         assert_eq!(browser_of(Path::new("BROWSER/a/CHROME/Default/History")), Some("Chrome"));
@@ -647,9 +670,15 @@ mod tests {
             bad.join("index"),
             root.join("BROWSER/userC/missing/index"),
         ];
-        let outputs = cache_outputs(&paths);
+        let candidates = cache_outputs(&paths);
+        let outputs = &candidates.outputs;
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].0, "userA_Chrome_Cache");
+        // 캐시 레이아웃의 매직 불일치 index는 사유와 함께 거부 목록에 남고,
+        // 레이아웃 밖(비대상) 경로는 어느 목록에도 없다.
+        assert_eq!(candidates.rejected.len(), 1);
+        assert_eq!(candidates.rejected[0].0, bad.join("index"));
+        assert!(candidates.rejected[0].1.contains("매직"));
         // The magic-only index has an empty hash table — zero rows, no error.
         let mut rows = 0usize;
         let counted = parse_cache_index(&outputs[0].1, &mut |_row| {

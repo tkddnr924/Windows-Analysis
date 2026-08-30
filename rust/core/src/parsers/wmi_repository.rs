@@ -49,15 +49,19 @@ const TYPE_TOKENS: &[&str] = &[
     "NOT_NULL", "DEPRECATED", "description", "Description",
 ];
 
-pub fn wmi_sources(target: &Path) -> Vec<PathBuf> {
+pub fn wmi_sources(target: &Path) -> finder::Found {
     finder::by_name(target, &["OBJECTS.DATA"])
 }
 
-fn find_all(data: &[u8], sig: &[u8]) -> Vec<usize> {
+/// `data[..search_end]`에서 시작하는 시그니처 위치만 찾는다 — 청크 경계에
+/// 걸친 레코드는 다음 청크의 겹침 구간에서 온전한 창으로 다시 스캔되므로,
+/// 경계 근처 시작점은 여기서 제외해 잘린 추출을 막는다.
+fn find_all(data: &[u8], search_end: usize, sig: &[u8]) -> Vec<usize> {
+    let end = search_end.min(data.len());
     let mut offs = Vec::new();
     let mut from = 0;
-    while from + sig.len() <= data.len() {
-        match data[from..].windows(sig.len()).position(|w| w == sig) {
+    while from + sig.len() <= end {
+        match data[from..end].windows(sig.len()).position(|w| w == sig) {
             Some(rel) => {
                 offs.push(from + rel);
                 from += rel + 1;
@@ -150,8 +154,14 @@ fn name_refs(window: &str, class_suffix: &str) -> Vec<(String, String)> {
     found
 }
 
-fn scan_bindings(data: &[u8], source: &str, rows: &mut Vec<Row>, seen: &mut BTreeSet<String>) {
-    for off in find_all(data, b"__FilterToConsumerBinding\x00") {
+fn scan_bindings(
+    data: &[u8],
+    search_end: usize,
+    source: &str,
+    push: &mut dyn FnMut(Row) -> Result<()>,
+    seen: &mut BTreeSet<String>,
+) -> Result<()> {
+    for off in find_all(data, search_end, b"__FilterToConsumerBinding\x00") {
         let end = (off + 1024).min(data.len());
         let window: String = data[off..end]
             .iter()
@@ -173,14 +183,21 @@ fn scan_bindings(data: &[u8], source: &str, rows: &mut Vec<Row>, seen: &mut BTre
                 row.insert("consumer_type".into(), consumer_type.clone());
                 row.insert("consumer_name".into(), consumer_name.clone());
                 row.insert("filter_name".into(), filter_name.clone());
-                rows.push(row);
+                push(row)?;
             }
         }
     }
+    Ok(())
 }
 
-fn scan_filters(data: &[u8], source: &str, rows: &mut Vec<Row>, seen: &mut BTreeSet<String>) {
-    for off in find_all(data, b"__EventFilter\x00") {
+fn scan_filters(
+    data: &[u8],
+    search_end: usize,
+    source: &str,
+    push: &mut dyn FnMut(Row) -> Result<()>,
+    seen: &mut BTreeSet<String>,
+) -> Result<()> {
+    for off in find_all(data, search_end, b"__EventFilter\x00") {
         let tokens = tokens_from(data, off + b"__EventFilter\x00".len(), 2048);
         if is_definition(&tokens) {
             continue;
@@ -215,14 +232,21 @@ fn scan_filters(data: &[u8], source: &str, rows: &mut Vec<Row>, seen: &mut BTree
         row.insert("query".into(), query);
         row.insert("query_language".into(), language);
         row.insert("namespace".into(), namespace);
-        rows.push(row);
+        push(row)?;
     }
+    Ok(())
 }
 
-fn scan_consumers(data: &[u8], source: &str, rows: &mut Vec<Row>, seen: &mut BTreeSet<String>) {
+fn scan_consumers(
+    data: &[u8],
+    search_end: usize,
+    source: &str,
+    push: &mut dyn FnMut(Row) -> Result<()>,
+    seen: &mut BTreeSet<String>,
+) -> Result<()> {
     for class in CONSUMER_CLASSES {
         let sig = format!("{class}\0");
-        for off in find_all(data, sig.as_bytes()) {
+        for off in find_all(data, search_end, sig.as_bytes()) {
             let tokens = tokens_from(data, off + sig.len(), 4096);
             if tokens.is_empty() || is_definition(&tokens) {
                 continue;
@@ -250,31 +274,130 @@ fn scan_consumers(data: &[u8], source: &str, rows: &mut Vec<Row>, seen: &mut BTr
             row.insert("consumer_type".into(), (*class).into());
             row.insert("consumer_name".into(), name);
             row.insert("details".into(), details);
-            rows.push(row);
+            push(row)?;
         }
+    }
+    Ok(())
+}
+
+/// 원본 파일 하나의 파싱 결과 — 읽기 실패가 "0건 성공"으로 보이지 않게
+/// 사유를 파이프라인 보고서까지 가져간다.
+pub struct WmiFileReport {
+    pub path: PathBuf,
+    pub rows: usize,
+    pub error: Option<String>,
+}
+
+/// 청크 스캔 창 — 파일 전체를 메모리에 올리지 않는다. 겹침 구간은 시그니처
+/// 최대 길이 + 레코드 창(4096) + 여유를 덮어, 경계에 걸친 레코드도 다음
+/// 청크에서 온전히 추출된다 (중복은 내용 키 `seen`으로 제거).
+const SCAN_CHUNK: usize = 4 * 1024 * 1024;
+const SCAN_OVERLAP: usize = 8 * 1024;
+
+/// 청크 스캔 콜백 — (버퍼, 시그니처 탐색 상한, 행 수신자).
+type ChunkScan<'a> = &'a mut dyn FnMut(&[u8], usize, &mut dyn FnMut(Row) -> Result<()>) -> Result<()>;
+
+/// 한 파일을 kind 하나에 대해 청크 단위로 스캔한다. kind별로 파일을 다시
+/// 읽어(총 3회) "바인딩 → 필터 → 컨슈머" 표 순서를 유지한다.
+fn scan_file_chunked(
+    path: &Path,
+    source: &str,
+    scan: ChunkScan<'_>,
+    push: &mut dyn FnMut(Row) -> Result<()>,
+) -> std::result::Result<(), String> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let mut buf: Vec<u8> = Vec::with_capacity(SCAN_CHUNK + SCAN_OVERLAP);
+    loop {
+        let carry = buf.len();
+        buf.resize(carry + SCAN_CHUNK, 0);
+        let mut filled = carry;
+        while filled < buf.len() {
+            let n = file.read(&mut buf[filled..]).map_err(|e| e.to_string())?;
+            if n == 0 {
+                break;
+            }
+            filled += n;
+        }
+        buf.truncate(filled);
+        let eof = filled < carry + SCAN_CHUNK;
+        // 경계에 걸친 시작점은 다음 청크의 겹침 구간에서 온전한 창으로 다시
+        // 스캔된다 — 마지막 청크에서만 끝까지 탐색.
+        let search_end = if eof {
+            buf.len()
+        } else {
+            buf.len().saturating_sub(SCAN_OVERLAP)
+        };
+        scan(&buf, search_end, push).map_err(|e| e.to_string())?;
+        let _ = source;
+        if eof {
+            return Ok(());
+        }
+        let keep_from = buf.len().saturating_sub(SCAN_OVERLAP);
+        buf.copy_within(keep_from.., 0);
+        buf.truncate(buf.len() - keep_from);
     }
 }
 
-pub fn parse_wmi_from(paths: &[PathBuf]) -> Result<Vec<Row>> {
-    let mut rows = Vec::new();
+/// 발견 행을 즉시 `push`로 넘긴다(스트리밍). 파일별 성공 행 수·실패 사유를
+/// 반환해 파이프라인이 `parse_report.json`에 기록한다. 한 파일의 실패는 다른
+/// 파일 파싱을 막지 않는다.
+pub fn parse_wmi_stream(
+    paths: &[PathBuf],
+    push: &mut dyn FnMut(Row) -> Result<()>,
+) -> Result<Vec<WmiFileReport>> {
+    let mut reports = Vec::new();
     for path in paths {
-        let data = match std::fs::read(path) {
-            Ok(bytes) => bytes,
-            Err(_) => continue,
-        };
         let source = path.to_string_lossy().into_owned();
         let mut seen = BTreeSet::new();
+        let mut count = 0usize;
+        let mut failed: Option<String> = None;
         // 바인딩 → 필터 → 컨슈머 순서로 쌓인다 (스캔 순서가 곧 표 순서).
-        scan_bindings(&data, &source, &mut rows, &mut seen);
-        scan_filters(&data, &source, &mut rows, &mut seen);
-        scan_consumers(&data, &source, &mut rows, &mut seen);
+        type ScanFn = fn(&[u8], usize, &str, &mut dyn FnMut(Row) -> Result<()>, &mut BTreeSet<String>) -> Result<()>;
+        let passes: [ScanFn; 3] = [scan_bindings, scan_filters, scan_consumers];
+        for pass in passes {
+            let src = source.clone();
+            let seen_ref = &mut seen;
+            let counted = &mut count;
+            let result = scan_file_chunked(
+                path,
+                &source,
+                &mut |data, search_end, sink| pass(data, search_end, &src, sink, seen_ref),
+                &mut |row| {
+                    *counted += 1;
+                    push(row)
+                },
+            );
+            if let Err(error) = result {
+                failed = Some(error);
+                break;
+            }
+        }
+        reports.push(WmiFileReport {
+            path: path.clone(),
+            rows: count,
+            error: failed,
+        });
     }
-    Ok(rows)
+    Ok(reports)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 테스트 편의: 스트림 결과를 모아 행 목록으로 돌려준다.
+    fn parse_wmi_from(paths: &[PathBuf]) -> Result<Vec<Row>> {
+        let mut rows = Vec::new();
+        let reports = parse_wmi_stream(paths, &mut |row| {
+            rows.push(row);
+            Ok(())
+        })?;
+        for report in reports {
+            assert!(report.error.is_none(), "unexpected file error: {:?}", report.error);
+        }
+        Ok(rows)
+    }
 
 fn blob(parts: &[&[u8]]) -> Vec<u8> {
         let mut out = Vec::new();
@@ -328,6 +451,52 @@ fn blob(parts: &[&[u8]]) -> Vec<u8> {
         assert_eq!(rows[1]["namespace"], "root\\cimv2");
         assert_eq!(rows[2]["name"], "BadConsumer");
         assert!(rows[2]["details"].contains("cmd.exe /c evil.bat"));
+    }
+
+    /// 청크 경계 회귀: 시그니처·레코드가 4MiB 청크 끝에 걸쳐도 겹침 재스캔으로
+    /// 온전히 1건 추출된다 (중복 없이).
+    #[test]
+    fn record_across_chunk_boundary_is_extracted_once() {
+        let mut data = vec![0u8; super::SCAN_CHUNK - 40];
+        data.extend_from_slice(
+            b"__EventFilter\x00\x15\x01\x02\x00\x00root\\cimv2\x00\x00EdgeFilter\x00\x00select * from __InstanceModificationEvent\x00\x00WQL\x00",
+        );
+        data.extend(hash_tail());
+        let dir = std::env::temp_dir().join(format!("wina-wmi-edge-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("OBJECTS.DATA");
+        std::fs::write(&path, &data).unwrap();
+        let rows = parse_wmi_from(&[path]).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(rows.len(), 1, "boundary record must appear exactly once: {rows:?}");
+        assert_eq!(rows[0]["name"], "EdgeFilter");
+    }
+
+    /// 파일별 실패 보고: 읽지 못한 원본은 사유가 남고, 다른 파일은 계속 파싱된다.
+    #[test]
+    fn unreadable_source_is_reported_and_others_continue() {
+        let dir = std::env::temp_dir().join(format!("wina-wmi-fail-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let good = dir.join("OBJECTS.DATA");
+        let data = blob(&[
+            b"CommandLineEventConsumer\x00\x00GoodConsumer\x00cmd.exe /c ok.bat\x00",
+            &hash_tail(),
+        ]);
+        std::fs::write(&good, &data).unwrap();
+        let missing = dir.join("no-such-dir").join("OBJECTS.DATA");
+        let mut rows = Vec::new();
+        let reports = parse_wmi_stream(&[missing.clone(), good.clone()], &mut |row| {
+            rows.push(row);
+            Ok(())
+        })
+        .unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(reports.len(), 2);
+        assert!(reports[0].error.is_some(), "missing file must carry a reason");
+        assert_eq!(reports[0].rows, 0);
+        assert!(reports[1].error.is_none());
+        assert_eq!(reports[1].rows, 1);
+        assert_eq!(rows.len(), 1);
     }
 
     #[test]

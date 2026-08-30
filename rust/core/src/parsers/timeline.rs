@@ -6,7 +6,6 @@
 //!   뿐이다 — 컬럼 존재 여부를 보고 동적으로 읽는다.
 //! - `-wal`/`-shm`이 함께 수집된다. immutable 모드로 열면 WAL의 행을 놓치므로
 //!   임시 폴더에 db+wal+shm을 복사한 뒤 일반 모드로 연다.
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -39,7 +38,7 @@ pub const TIMELINE_FIELD_ORDER: &[&str] = &[
     "_source_file",
 ];
 
-pub fn timeline_sources(target: &Path) -> Vec<PathBuf> {
+pub fn timeline_sources(target: &Path) -> finder::Found {
     finder::by_name(target, &["ActivitiesCache.db"])
 }
 
@@ -139,11 +138,14 @@ fn read_activity_table(
     table: &str,
     account: &str,
     source: &str,
-    rows: &mut Vec<Row>,
-) {
+    source_file: &str,
+    push: &mut dyn FnMut(Row) -> Result<()>,
+) -> Result<usize> {
     let columns = columns_of(conn, table);
     if columns.is_empty() {
-        return;
+        // 스키마 변형: ActivityOperation이 없는 DB도 있다 — 테이블 부재는
+        // 실패가 아니라 0건이다.
+        return Ok(0);
     }
     let has = |name: &str| columns.iter().any(|c| c == name);
     let opt = |name: &str| if has(name) { format!("\"{name}\"") } else { "NULL".into() };
@@ -152,9 +154,9 @@ fn read_activity_table(
         opt("StartTime"),
         opt("EndTime"),
     );
-    let Ok(mut stmt) = conn.prepare(&sql) else {
-        return;
-    };
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| anyhow::anyhow!("{table} 조회 준비 실패: {e}"))?;
     let mapped = stmt.query_map([], |r| {
         let id: Vec<u8> = r.get(0).unwrap_or_default();
         let app_id: String = r.get(1).unwrap_or_default();
@@ -167,7 +169,8 @@ fn read_activity_table(
         let end: i64 = r.get(8).unwrap_or_default();
         Ok((id, app_id, activity_type, payload, last_modified, expiration, device, start, end))
     });
-    let Ok(mapped) = mapped else { return };
+    let mapped = mapped.map_err(|e| anyhow::anyhow!("{table} 조회 실패: {e}"))?;
+    let mut count = 0usize;
     for item in mapped.flatten() {
         let (id, app_id_raw, activity_type, payload_raw, last_modified, expiration, device, start, end) = item;
         let payload_text = String::from_utf8_lossy(&payload_raw).into_owned();
@@ -213,69 +216,143 @@ fn read_activity_table(
         row.insert("activity_id".into(), guid_string(&id));
         row.insert("platform_device_id".into(), device);
         row.insert("payload".into(), payload_text);
-        rows.push(row);
+        row.insert("_source_file".into(), source_file.into());
+        push(row)?;
+        count += 1;
     }
+    Ok(count)
 }
 
-pub fn parse_timeline_from(paths: &[PathBuf]) -> Result<Vec<Row>> {
+/// 주 DB 곁의 `-wal`/`-shm` 보조 파일 — 파이프라인이 계획 단계에서 한 번만
+/// 확정해 파서에 전달한다 (Registry/Amcache 로그와 동일 계약).
+pub fn wal_siblings(path: &Path) -> Vec<PathBuf> {
+    ["-wal", "-shm"]
+        .iter()
+        .map(|suffix| PathBuf::from(format!("{}{suffix}", path.display())))
+        .filter(|side| side.exists())
+        .collect()
+}
+
+/// 원본 DB 하나의 파싱 결과. `error`는 파일 전체 실패(복사·열기·조회),
+/// `wal_note`는 주 DB는 파싱했지만 WAL/SHM을 적용하지 못한 부분 문제 —
+/// 둘 다 보고서에 남아 "0건 성공"과 구분된다.
+pub struct TimelineFileReport {
+    pub path: PathBuf,
+    pub rows: usize,
+    pub error: Option<String>,
+    pub wal_note: Option<String>,
+}
+
+/// 각 DB의 행을 읽는 즉시 `push`로 넘긴다(스트리밍) — 전체 행을 모아 정렬하지
+/// 않는다(표시 순서는 저장 후 SQLite 정렬이 맡는다). 한 파일의 실패는 다른
+/// 파일 파싱을 막지 않는다.
+pub fn parse_timeline_stream(
+    planned: &[(PathBuf, Vec<PathBuf>)],
+    push: &mut dyn FnMut(Row) -> Result<()>,
+) -> Vec<TimelineFileReport> {
     // 같은 프로세스의 동시 호출(병렬 테스트 등)이 임시 폴더를 공유하지 않게
     // 전역 카운터로 유일한 이름을 만든다.
     static STAGING_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let mut rows = Vec::new();
-    let mut seen_dirs = BTreeSet::new();
-    for path in paths {
+    let mut reports = Vec::new();
+    for (path, sides) in planned {
+        let mut report = TimelineFileReport {
+            path: path.clone(),
+            rows: 0,
+            error: None,
+            wal_note: None,
+        };
         // WAL의 행까지 읽기 위해 db+wal+shm을 임시 폴더로 복사해 일반 모드로 연다.
         let seq = STAGING_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let staging = std::env::temp_dir().join(format!(
             "wina-timeline-{}-{seq}",
             std::process::id()
         ));
-        if std::fs::create_dir_all(&staging).is_err() {
+        if let Err(e) = std::fs::create_dir_all(&staging) {
+            report.error = Some(format!("임시 작업 폴더 생성 실패: {e}"));
+            reports.push(report);
             continue;
         }
-        seen_dirs.insert(staging.clone());
         let local = staging.join("ActivitiesCache.db");
-        if std::fs::copy(path, &local).is_err() {
-            continue;
-        }
-        for suffix in ["-wal", "-shm"] {
-            let side = PathBuf::from(format!("{}{suffix}", path.display()));
-            if side.exists() {
-                let _ = std::fs::copy(&side, staging.join(format!("ActivitiesCache.db{suffix}")));
+        let parsed: std::result::Result<usize, String> = (|| {
+            std::fs::copy(path, &local).map_err(|e| format!("DB 복사 실패: {e}"))?;
+            let mut wal_failures = Vec::new();
+            for side in sides {
+                let suffix = if side.to_string_lossy().to_lowercase().ends_with("-shm") {
+                    "-shm"
+                } else {
+                    "-wal"
+                };
+                if let Err(e) =
+                    std::fs::copy(side, staging.join(format!("ActivitiesCache.db{suffix}")))
+                {
+                    wal_failures.push(format!("{}: {e}", side.display()));
+                }
             }
-        }
-        let Ok(conn) = Connection::open(&local) else {
-            continue;
-        };
-        let account = account_from_path(path);
-        let source_file = path.to_string_lossy().into_owned();
-        let before = rows.len();
-        read_activity_table(&conn, "Activity", &account, "Activity", &mut rows);
-        read_activity_table(&conn, "ActivityOperation", &account, "ActivityOperation", &mut rows);
-        for row in rows.iter_mut().skip(before) {
-            row.insert("_source_file".into(), source_file.clone());
-        }
-        drop(conn);
-    }
-    for dir in seen_dirs {
-        let _ = std::fs::remove_dir_all(dir);
-    }
-    // 계정 → 시각 순으로 정렬해 표가 바로 읽히게 한다.
-    rows.sort_by(|a, b| {
-        let key = |r: &Row| {
-            (
-                r.get("account").cloned().unwrap_or_default(),
-                r.get("timestamp").cloned().unwrap_or_default(),
+            if !wal_failures.is_empty() {
+                report.wal_note = Some(format!(
+                    "WAL/SHM 복사 실패 — 주 DB만 파싱: {}",
+                    wal_failures.join("; ")
+                ));
+            }
+            let conn = Connection::open(&local).map_err(|e| format!("SQLite 열기 실패: {e}"))?;
+            // SQLite open은 지연 검증이라 손상 파일도 열린다 — 여기서 실제로
+            // 읽어봐야 "손상 DB"가 "0건 성공"으로 위장하지 않는다.
+            conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .map_err(|e| format!("SQLite 읽기 실패: {e}"))?;
+            let account = account_from_path(path);
+            let source_file = path.to_string_lossy().into_owned();
+            let mut count = 0usize;
+            count += read_activity_table(&conn, "Activity", &account, "Activity", &source_file, push)
+                .map_err(|e| e.to_string())?;
+            count += read_activity_table(
+                &conn,
+                "ActivityOperation",
+                &account,
+                "ActivityOperation",
+                &source_file,
+                push,
             )
-        };
-        key(a).cmp(&key(b))
-    });
-    Ok(rows)
+            .map_err(|e| e.to_string())?;
+            Ok(count)
+        })();
+        match parsed {
+            Ok(count) => report.rows = count,
+            Err(reason) => report.error = Some(reason),
+        }
+        let _ = std::fs::remove_dir_all(&staging);
+        reports.push(report);
+    }
+    reports
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 테스트 편의: 스트림 결과를 모아 (계정, 시각) 순으로 돌려준다.
+    fn parse_timeline_from(paths: &[PathBuf]) -> Result<Vec<Row>> {
+        let planned: Vec<(PathBuf, Vec<PathBuf>)> =
+            paths.iter().map(|p| (p.clone(), wal_siblings(p))).collect();
+        let mut rows = Vec::new();
+        for report in parse_timeline_stream(&planned, &mut |row| {
+            rows.push(row);
+            Ok(())
+        }) {
+            assert!(report.error.is_none(), "unexpected file error: {:?}", report.error);
+        }
+        rows.sort_by(|a, b| {
+            let key = |r: &Row| {
+                (
+                    r.get("account").cloned().unwrap_or_default(),
+                    r.get("timestamp").cloned().unwrap_or_default(),
+                )
+            };
+            key(a).cmp(&key(b))
+        });
+        Ok(rows)
+    }
 
     fn make_db(dir: &Path, with_start: bool) -> PathBuf {
         let path = dir.join("ActivitiesCache.db");
@@ -333,6 +410,34 @@ mod tests {
         // timestamp는 StartTime 기준 (LastModifiedTime이 아니라)
         assert_eq!(row["timestamp"], row["start_time"]);
         assert!(!row["timestamp"].is_empty());
+    }
+
+    /// 파일별 실패 보고: 손상(비 SQLite) DB는 사유가 남고, 다른 DB는 계속
+    /// 파싱된다 — 실패가 "0건 성공"으로 위장하지 않는다.
+    #[test]
+    fn corrupt_db_is_reported_and_other_files_continue() {
+        let dir = std::env::temp_dir().join(format!("wina-tl-fail-{}", std::process::id()));
+        let good_base = dir.join("TIMELINE").join("ok").join("ConnectedDevicesPlatform");
+        std::fs::create_dir_all(&good_base).unwrap();
+        let good = make_db(&good_base, true);
+        let bad_base = dir.join("TIMELINE").join("bad").join("ConnectedDevicesPlatform");
+        std::fs::create_dir_all(&bad_base).unwrap();
+        let bad = bad_base.join("ActivitiesCache.db");
+        std::fs::write(&bad, b"this is not a sqlite database at all").unwrap();
+
+        let planned = vec![(bad.clone(), Vec::new()), (good.clone(), Vec::new())];
+        let mut rows = 0usize;
+        let reports = parse_timeline_stream(&planned, &mut |_| {
+            rows += 1;
+            Ok(())
+        });
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(reports.len(), 2);
+        assert!(reports[0].error.is_some(), "corrupt db must carry a reason");
+        assert_eq!(reports[0].rows, 0);
+        assert!(reports[1].error.is_none());
+        assert_eq!(reports[1].rows, 1);
+        assert_eq!(rows, 1);
     }
 
     #[test]

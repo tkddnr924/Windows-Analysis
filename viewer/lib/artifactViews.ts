@@ -17,6 +17,9 @@ export interface FieldSpec {
    * identifies a stable row + field (currently MFT SI/FN timestamps). */
   bookmarkable?: boolean;
   badgeColors?: Record<string, string>;
+  /** 값과 무관하게 쓰는 고정 배지 색 — 문구가 가변적인 상태 표식용
+   * (badgeColors의 정확 일치 매핑이 안 통하는 경우). */
+  badgeColor?: string;
   /** Remap a raw coded value (e.g. "1") to a human label before display —
    * badge color lookups use the remapped label, not the raw code. */
   valueLabels?: Record<string, string>;
@@ -408,6 +411,9 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     title: (r) => r.app_name || r.display_text || "(Timeline)",
     subtitle: (r) => r.kind || "",
     timelineField: "timestamp",
+    // 실행/열기(type 5)는 ExecutionHistory로 승격되어 이미 타임라인에 있다 —
+    // 여기서 제외해 한 사건이 두 번 보이지 않게 한다(사전 캐시와 동일 규칙).
+    timelineInclude: (r) => r.activity_type !== "5",
     priorityColumns: ["timestamp", "kind", "app_name", "app_path", "display_text", "content_uri", "active_duration_s", "account"],
     sections: [
       { heading: "활동 정보", fields: [
@@ -1113,7 +1119,13 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
         { key: "script_path", label: "스크립트 경로", kind: "path" },
       ]},
       { heading: "명령어", fields: [{ key: "command", kind: "code" }] },
-      { heading: "코드 블록 (ScriptBlock)", fields: [{ key: "script_block", kind: "code" }] },
+      { heading: "코드 블록 (ScriptBlock)", fields: [
+        // 분할 4104의 조각 누락·중복 불일치 표식 — 잘린 본문이 완전한 원문으로
+        // 오인되지 않도록 기본 "주요 정보" 상세에서 바로 보이게 한다.
+        // 값이 비면(온전한 재조합) 자동으로 숨는다.
+        { key: "script_block_status", label: "재조합 상태", kind: "badge", badgeColor: "#d29922" },
+        { key: "script_block", kind: "code" },
+      ] },
       { heading: "이벤트", fields: [
         { key: "event_id", label: "이벤트 ID" },
         { key: "provider", label: "공급자" },

@@ -6,7 +6,6 @@ use std::path::Path;
 use anyhow::Result;
 use chrono::{DateTime, FixedOffset, NaiveDateTime, TimeZone};
 use rayon::prelude::*;
-use walkdir::WalkDir;
 
 use crate::sqlite::Row;
 use crate::time::kst_offset;
@@ -371,18 +370,15 @@ fn parse_job(path: &Path) -> Result<Row> {
 /// Walk `root` and retain every file whose header identifies it as a task XML
 /// source. The source list is distinct from parsed rows because a valid task
 /// file can still produce zero usable fields.
-pub fn task_sources(root: &Path) -> Vec<std::path::PathBuf> {
-    let paths: Vec<_> = WalkDir::new(root)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|entry| entry.file_type().is_file())
-        .map(|entry| entry.into_path())
-        .collect();
+pub fn task_sources(root: &Path) -> crate::finder::Found {
+    let (paths, walk_errors) = crate::finder::walk_files(root);
     let utf8 = TASK_NAMESPACE.as_bytes().to_vec();
     let utf16: Vec<u8> = TASK_NAMESPACE.bytes().flat_map(|b| [b, 0]).collect();
-    let mut sources: Vec<_> = paths
+    // 판별용 헤더를 읽지 못한 파일은 "비대상"이 아니라 판정 불가 — 실패로
+    // 모아 반환한다 (탐색 계약).
+    let checked: Vec<(Option<std::path::PathBuf>, Option<String>)> = paths
         .par_iter()
-        .filter_map(|path| {
+        .map(|path| {
             // Read only the first 4 KB to test for the task namespace — never the
             // whole file. A target can hold huge unrelated files (images, dumps);
             // slurping each one just to check its header made discovery crawl.
@@ -391,20 +387,36 @@ pub fn task_sources(root: &Path) -> Vec<std::path::PathBuf> {
                 Ok(f) => {
                     use std::io::Read;
                     if Read::take(f, 4096).read_to_end(&mut head).is_err() {
-                        return None;
+                        return (
+                            None,
+                            Some(format!("{}: 내용 판별용 앞부분 읽기 실패", path.display())),
+                        );
                     }
                 }
-                Err(_) => return None,
+                Err(error) => return (None, Some(format!("{}: {error}", path.display()))),
             }
             let has = |needle: &[u8]| head.windows(needle.len()).any(|w| w == needle);
             let is_xml_task = has(&utf8) || has(&utf16);
             // XP/2003 .job은 XML 네임스페이스가 없다 — 확장자 + 헤더로 판별.
             let is_job = has_job_extension(path) && is_job_header(&head);
-            (is_xml_task || is_job).then(|| path.clone())
+            ((is_xml_task || is_job).then(|| path.clone()), None)
         })
         .collect();
+    let mut errors = walk_errors;
+    let mut sources = Vec::new();
+    for (path, error) in checked {
+        if let Some(path) = path {
+            sources.push(path);
+        }
+        if let Some(error) = error {
+            errors.push(error);
+        }
+    }
     sources.sort();
-    sources
+    crate::finder::Found {
+        paths: sources,
+        errors,
+    }
 }
 
 /// Parse already-discovered task XML files (one row per file; unreadable files
@@ -440,7 +452,7 @@ pub fn parse_tasks_from(paths: &[std::path::PathBuf]) -> Vec<Row> {
 }
 
 pub fn parse_tasks_with_sources(root: &Path) -> Result<(Vec<std::path::PathBuf>, Vec<Row>)> {
-    let sources = task_sources(root);
+    let sources = task_sources(root).paths;
     let rows = parse_tasks_from(&sources);
     Ok((sources, rows))
 }
@@ -578,7 +590,7 @@ mod job_tests {
         std::fs::write(dir.join("Real.job"), synthetic_job(0, 2004)).unwrap();
         // 확장자만 .job인 쓰레기(FileVersion != 1)는 제외돼야 한다.
         std::fs::write(dir.join("Fake.job"), vec![0xFFu8; 0x100]).unwrap();
-        let sources = task_sources(&dir);
+        let sources = task_sources(&dir).paths;
         let names: Vec<String> = sources
             .iter()
             .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))

@@ -330,9 +330,9 @@ function CategoryNode({ category, selectedFile, onSelectFile, displayName, pinne
     const map = new Map<string, ResultFileEntry[]>();
     for (const file of files) {
       if (hideFileName && file.name === hideFileName) continue;
-      // 뷰 백데이터 테이블(파일 시스템 정보 교차 참조 등)은 독립 화면이 없다 —
-      // 내비게이션에 노출하지 않는다.
-      if (file.fileName === "PathReferences") continue;
+      // 뷰 백데이터 테이블(파일 시스템 교차 참조, AI 대화 파생 등)은 독립
+      // 화면이 없다 — 내비게이션에 노출하지 않는다.
+      if (file.fileName === "PathReferences" || file.fileName === "AiConversations") continue;
       if (!map.has(file.fileName)) map.set(file.fileName, []);
       map.get(file.fileName)!.push(file);
     }
@@ -506,11 +506,12 @@ export default function Sidebar({
   const effectiveOverviewFiles = overviewFiles ?? fetchedOverviewFiles;
   const targetInfoEntry = effectiveOverviewFiles?.find((file) => file.name === "TargetInfo") ?? null;
   // 소그룹 렌더용 — 종합 분석 테이블을 파일 단위로 묶는다 (CategoryNode와
-  // 같은 규칙: TargetInfo는 승격돼 제외, PathReferences는 화면이 없어 제외).
+  // 같은 규칙: TargetInfo는 승격돼 제외, PathReferences·AiConversations는
+  // 독립 화면이 없는 백데이터라 제외).
   const overviewByFile = useMemo(() => {
     const map = new Map<string, ResultFileEntry[]>();
     for (const file of effectiveOverviewFiles ?? []) {
-      if (file.name === "TargetInfo" || file.fileName === "PathReferences") continue;
+      if (file.name === "TargetInfo" || file.fileName === "PathReferences" || file.fileName === "AiConversations") continue;
       if (!map.has(file.fileName)) map.set(file.fileName, []);
       map.get(file.fileName)!.push(file);
     }

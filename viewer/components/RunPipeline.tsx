@@ -684,9 +684,11 @@ function HostLedgerRow({
     : Math.min(99, Math.round((activeRun.completedSteps / activeRun.totalSteps) * 100));
   // 카드 타일 색 = 실행 상태 신호.
   const tileColor = activeRun ? "var(--accent)" : displayStatus === "ok" ? "var(--success)" : displayStatus === "error" ? "var(--danger)" : displayStatus ? "var(--warning)" : "var(--text-dim)";
-  {/* 로그 패널이 펼쳐져 카드가 세로로 자라도 우측 액션은 헤더 행에 머문다 —
-      중앙 정렬이면 버튼이 카드 한가운데에 떠 보인다. */}
-  return <article style={{ display: "flex", alignItems: "flex-start", gap: 14, marginBottom: 8, padding: "11px 14px", border: `1px solid ${activeRun ? "color-mix(in srgb, var(--accent) 45%, var(--border))" : "var(--border)"}`, borderRadius: "var(--radius-md)", background: activeRun ? "color-mix(in srgb, var(--accent) 5%, var(--bg-panel))" : "var(--bg-panel)", transition: "border-color .18s ease" }}>
+  {/* 카드 = 세로 구성: [헤더 행 + 우측 액션] 위, 실행 로그(요약·패널) 아래
+      전체 폭. 로그 패널을 좌측 컬럼에 가두면 펼쳤을 때 우측 액션 아래가
+      크게 비어 보인다. */}
+  return <article style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 8, padding: "11px 14px", border: `1px solid ${activeRun ? "color-mix(in srgb, var(--accent) 45%, var(--border))" : "var(--border)"}`, borderRadius: "var(--radius-md)", background: activeRun ? "color-mix(in srgb, var(--accent) 5%, var(--bg-panel))" : "var(--bg-panel)", transition: "border-color .18s ease" }}>
+    <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
     <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", alignItems: "stretch", gap: 6 }}>
     <div style={{ display: "flex", alignItems: "center", gap: 12, minWidth: 0 }}>
       <span aria-hidden="true" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 34, height: 34, flexShrink: 0, borderRadius: "var(--radius-sm)", background: `color-mix(in srgb, ${tileColor} 15%, transparent)` }}>
@@ -705,19 +707,22 @@ function HostLedgerRow({
         ) : terminalStatus ? <span style={{ color: "var(--text-faint)" }}>방금 {terminalStatusLabel(terminalStatus)} · 저장 정보 갱신 중</span> : <span style={{ color: "var(--text-faint)" }}>실행 기록 없음</span>}
       </div>
     </div>
-    {/* A host-level fallback status can belong to the previous run. Do not
-        surface it until the exact terminal manifest has passed the same
-        cache/run-id gate as the publication controls above. */}
-    {report && !activeRun && !reportSyncPending && <RunOutcomeSummary host={host} report={report} onRetryMft={() => onRetryMft(host.id)} />}
     {activeRun && !isQueued && <div style={{ gridColumn: "1 / -1" }}><InlineParseProgress stepLabel={progressLabel} percent={percent} completedSteps={activeRun.completedSteps} totalSteps={activeRun.totalSteps} /></div>}
     {activeRun?.failedArtifacts.length ? <div role="alert" style={{ gridColumn: "1 / -1", padding: "0 0 6px", color: "var(--danger)", fontSize: 12 }}>파싱 실패: {activeRun.failedArtifacts.join(", ")}</div> : null}
     </div>
-    {confirmingDelete ? <div className="host-ledger-confirm" style={{ minHeight: 40 }}><span style={{ color: "var(--danger)", fontSize: 11.5 }}>분석 결과와 이 호스트 북마크를 삭제합니다.</span><div style={{ display: "flex", gap: 7 }}><button className="nm-btn" type="button" onClick={() => onDelete(host.id)} disabled={deleting} style={{ ...dangerButtonStyle, padding: "5px 9px", fontSize: 11.5, opacity: deleting ? .5 : 1 }}><DeleteOutlineIcon sx={{ fontSize: 14 }} />삭제</button><button type="button" onClick={() => onConfirmDelete(null)} disabled={deleting} style={{ ...linkButtonStyle, marginLeft: 0 }}>취소</button></div></div> : <div className="host-ledger-actions" style={{ minHeight: 40 }}>
+    {confirmingDelete ? <div className="host-ledger-confirm"><span style={{ color: "var(--danger)", fontSize: 11.5 }}>분석 결과와 이 호스트 북마크를 삭제합니다.</span><div style={{ display: "flex", gap: 7 }}><button className="nm-btn" type="button" onClick={() => onDelete(host.id)} disabled={deleting} style={{ ...dangerButtonStyle, padding: "5px 9px", fontSize: 11.5, opacity: deleting ? .5 : 1 }}><DeleteOutlineIcon sx={{ fontSize: 14 }} />삭제</button><button type="button" onClick={() => onConfirmDelete(null)} disabled={deleting} style={{ ...linkButtonStyle, marginLeft: 0 }}>취소</button></div></div> : <div className="host-ledger-actions">
         {canOpenResult ? <button className="nm-btn" type="button" onClick={() => onOpenHost(host)} style={{ ...neutralButtonStyle, padding: "8px 14px", fontSize: 12.5 }}><VisibilityOutlinedIcon sx={{ fontSize: 16 }} />결과 보기</button> : <span aria-hidden="true" className="host-ledger-action-placeholder" />}
         {activeRun ? <button className="nm-btn" type="button" onClick={() => onCancel(activeRun.runId)} style={{ ...dangerButtonStyle, padding: "8px 14px", fontSize: 12.5 }}><CancelOutlinedIcon sx={{ fontSize: 16 }} />{isQueued ? "대기 취소" : "취소"}</button> : <button className="nm-btn" type="button" onClick={() => onRun(host.id)} disabled={hasActiveRuns || selectedArtifacts === 0} style={{ ...primaryButtonStyle, padding: "8px 14px", fontSize: 12.5, opacity: hasActiveRuns || selectedArtifacts === 0 ? .5 : 1 }}><PlayArrowIcon sx={{ fontSize: 16 }} />파싱</button>}
         <span aria-hidden="true" className="host-ledger-action-divider" />
         <button type="button" onClick={() => onRename(host)} disabled={!!activeRun} aria-label={`${host.name} 이름 변경`} title="호스트 표시 이름 변경" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 34, height: 34, padding: 0, background: "transparent", color: "var(--text-faint)", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", cursor: activeRun ? "default" : "pointer", opacity: activeRun ? .4 : 1 }}><EditOutlinedIcon sx={{ fontSize: 18 }} /></button>
         <button type="button" onClick={() => onConfirmDelete(host.id)} disabled={!!activeRun} aria-label={`${host.name} 삭제`} title="호스트 삭제 (원본 수집 데이터는 유지)" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 34, height: 34, padding: 0, background: "transparent", color: "var(--text-faint)", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", cursor: activeRun ? "default" : "pointer", opacity: activeRun ? .4 : 1 }}><DeleteOutlineIcon sx={{ fontSize: 18 }} /></button>
       </div>}
+    </div>
+    {/* A host-level fallback status can belong to the previous run. Do not
+        surface it until the exact terminal manifest has passed the same
+        cache/run-id gate as the publication controls above.
+        헤더 행 아래 전체 폭 — 로그 패널이 우측 액션 밑 빈 공간 없이 카드
+        폭을 다 쓴다. */}
+    {report && !activeRun && !reportSyncPending && <RunOutcomeSummary host={host} report={report} onRetryMft={() => onRetryMft(host.id)} />}
   </article>;
 }

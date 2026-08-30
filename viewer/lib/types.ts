@@ -135,6 +135,9 @@ export interface ParseReportArtifact {
   publicationStatus?: "published" | "withheld" | "not_published" | string;
   /** Structured parser or panic failure for this artifact only. */
   error?: string;
+  /** 탐색(순회·내용 판별) 중 접근·읽기 실패 — 발견 0건이 실제 무증거인지
+   *  접근 불가였는지 구분하는 근거. */
+  discoveryErrors?: string[];
   inputs: ParseReportInput[];
 }
 
@@ -147,6 +150,8 @@ export interface ParseReportInput {
   recordCount?: number;
   /** Registry transaction log applied to its primary hive. */
   recoveryLog?: boolean;
+  /** 이 원본 파일을 읽거나 해석하지 못한 사유 — 0건 성공과 구분된다. */
+  error?: string;
 }
 
 export interface ParseReport {
@@ -387,6 +392,16 @@ export interface AiConversationPage {
   sourceFailures: string[];
 }
 
+/** WMI-Activity 로그의 구독 이벤트(5859~5861)만 서버에서 걸러 온 결과 —
+ *  원본 EventLog 전체를 IPC로 옮기지 않는다. rows에는 __rowid가 있어 원본
+ *  EventLog 행 기준 북마크가 연결된다. 로그가 없으면 fullPath가 빈 문자열. */
+export interface WmiSubscriptionEvents {
+  columns: string[];
+  rows: Record<string, string>[];
+  fullPath: string;
+  tableName: string;
+}
+
 /** One EventLog result table used by the account-detail activity query. */
 export interface AccountEventSource {
   fullPath: string;
@@ -491,6 +506,8 @@ export interface ElectronApi {
   cacheEntryBody(hostDir: string, account: string, url: string, cacheKey: string): Promise<CacheBodyPreview>;
   /** AI conversations extracted from browser cache, filtered and paged by cache timestamp. */
   aiConversations(hostDir: string, query: { start?: string; end?: string; offset: number; limit: number }): Promise<AiConversationPage>;
+  /** WMI-Activity 로그의 구독 이벤트(5859~5861)만 서버에서 걸러 받는다. */
+  wmiSubscriptionEvents(hostDir: string): Promise<WmiSubscriptionEvents>;
 }
 
 declare global {

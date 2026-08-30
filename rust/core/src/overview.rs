@@ -338,6 +338,12 @@ impl EventLogOverviewCache {
         &self.rows
     }
 
+    /// 테스트 전용 — 파일 픽스처 없이 이벤트 행으로 캐시를 만든다.
+    #[cfg(test)]
+    pub(crate) fn from_rows_for_tests(rows: Vec<Row>) -> Self {
+        Self { rows }
+    }
+
     /// `_source_file` 스템에 `needle`(소문자)이 들어간 행만 — read_eventlog의
     /// 파일 스템 필터와 같은 의미.
     pub fn rows_from(&self, needle: &str) -> impl Iterator<Item = &Row> + '_ {
@@ -1507,9 +1513,11 @@ fn strip_client_port(addr: &str) -> String {
 pub fn build_remote_desktop_history_with_events(events: &EventLogOverviewCache) -> Vec<Row> {
     const LSM: &str = "Microsoft-Windows-TerminalServices-LocalSessionManager";
     let mut rows: Vec<Row> = Vec::new();
-    let mut sess_info: std::collections::HashMap<String, [Option<String>; 2]> =
-        std::collections::HashMap::new();
-    let mut lsm_pending: Vec<(usize, String)> = Vec::new();
+    // (행 인덱스, 로그 출처, SessionID) — 세션 상관은 (출처, SessionID)로 묶고
+    // 증거 시간순 전방 전파만 한다. Windows SessionID는 재사용되고 서로 다른
+    // 수집 로그에도 같은 값이 있으므로, 전역 최종값 역전파는 이전 세션 행에
+    // 이후 사용자의 IP·계정을 붙이는 허위 상관을 만든다.
+    let mut lsm_pending: Vec<(usize, String, String)> = Vec::new();
 
     for r in events.rows() {
         let provider = r.get("Provider").cloned().unwrap_or_default();
@@ -1563,38 +1571,59 @@ pub fn build_remote_desktop_history_with_events(events: &EventLogOverviewCache) 
             let skey = ["SessionID", "Session", "TargetSession"]
                 .iter()
                 .find_map(|k| src.get(*k).map(vstr).filter(|s| !s.is_empty()));
+            // 출처(수집 로그) = EventLog record_key의 테이블 부분. 출처가 없는
+            // 행은 세션 상관에서 제외한다(빈 값 보존).
+            let source = r
+                .get("_record_key")
+                .and_then(|key| key.split("::").next())
+                .unwrap_or("")
+                .to_string();
             if let Some(skey) = skey {
-                let info = sess_info.entry(skey.clone()).or_insert([None, None]);
-                if !addr.is_empty() {
-                    info[0] = Some(addr);
+                if !source.is_empty() {
+                    lsm_pending.push((rows.len() - 1, source, skey));
                 }
-                if !acct.is_empty() {
-                    info[1] = Some(acct);
-                }
-                lsm_pending.push((rows.len() - 1, skey));
             }
         }
     }
 
-    for (idx, skey) in lsm_pending {
-        if let Some(info) = sess_info.get(&skey) {
-            if rows[idx]
-                .get("remote_address")
-                .map(|s| s.is_empty())
-                .unwrap_or(true)
-            {
-                if let Some(a) = &info[0] {
-                    rows[idx].insert("remote_address".into(), a.clone());
+    // (출처, SessionID) 그룹별로 증거 시간순 전방 전파 — 로그온(21)/재연결(25)
+    // 등에서 얻은 IP·계정을 같은 세션 구간의 후속 이벤트에만 채우고, 세션 종료
+    // 이벤트(23/24/39/40) 뒤에는 상태를 폐기한다. 시간 없는 행은 순서를 정할 수
+    // 없어 전파 대상에서 제외한다(빈 값 보존).
+    let mut session_groups: std::collections::HashMap<(String, String), Vec<usize>> =
+        std::collections::HashMap::new();
+    for (idx, source, skey) in lsm_pending {
+        session_groups.entry((source, skey)).or_default().push(idx);
+    }
+    const SESSION_END_IDS: [&str; 4] = ["23", "24", "39", "40"];
+    for indices in session_groups.values_mut() {
+        // 같은 시각은 원본(rowid) 순서 유지 — 안정 정렬.
+        indices.sort_by(|&a, &b| {
+            rows[a]
+                .get("timestamp")
+                .cmp(&rows[b].get("timestamp"))
+                .then(a.cmp(&b))
+        });
+        let mut state: [Option<String>; 2] = [None, None];
+        for &i in indices.iter() {
+            let has_time = rows[i]
+                .get("timestamp")
+                .map(|t| !t.is_empty())
+                .unwrap_or(false);
+            if !has_time {
+                continue;
+            }
+            for (slot, field) in [(0usize, "remote_address"), (1usize, "account")] {
+                let value = rows[i].get(field).cloned().unwrap_or_default();
+                if !value.is_empty() {
+                    state[slot] = Some(value);
+                } else if let Some(known) = &state[slot] {
+                    rows[i].insert(field.into(), known.clone());
                 }
             }
-            if rows[idx]
-                .get("account")
-                .map(|s| s.is_empty())
-                .unwrap_or(true)
-            {
-                if let Some(a) = &info[1] {
-                    rows[idx].insert("account".into(), a.clone());
-                }
+            let eid = rows[i].get("event_id").cloned().unwrap_or_default();
+            if SESSION_END_IDS.contains(&eid.as_str()) {
+                state = [None, None];
             }
         }
     }
@@ -1629,6 +1658,21 @@ pub fn build_remote_desktop_history_with_events(events: &EventLogOverviewCache) 
     rows
 }
 
+/// RegBack 백업 하이브 산출물(`<이름>_RegBack[.uniq].sqlite`) 여부 — facts에는
+/// 보존하되 파생 뷰 입력에서는 제외한다. 라이브 하이브와 섞으면 오래된 값이
+/// 현재 상태처럼 이중 표시되기 때문 (2026-08-31 사용자 확정).
+fn is_regback_output(path: &Path) -> bool {
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    let trimmed = match stem.rsplit_once('_') {
+        Some((head, tail)) if tail.chars().all(|c| c.is_ascii_digit()) => head,
+        _ => stem.as_str(),
+    };
+    trimmed.ends_with("_regback")
+}
+
 // PowerShell history
 fn read_registry_all(out_dir: &Path) -> Vec<Row> {
     let dir = out_dir.join("REGISTRY");
@@ -1636,6 +1680,7 @@ fn read_registry_all(out_dir: &Path) -> Vec<Row> {
         Ok(rd) => rd
             .filter_map(|e| e.ok().map(|e| e.path()))
             .filter(|p| p.extension().map(|x| x == "sqlite").unwrap_or(false))
+            .filter(|p| !is_regback_output(p))
             .collect(),
         Err(_) => return Vec::new(),
     };
@@ -2713,7 +2758,7 @@ pub fn ti_from_hosts_file(target: &Path) -> Vec<Row> {
     use std::str::FromStr;
     let mut rows = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
-    let mut files = crate::finder::by_name(target, &["hosts"]);
+    let mut files = crate::finder::by_name(target, &["hosts"]).paths;
     files.sort();
     for path in files {
         // 이름만으로는 오탐 가능 — etc 폴더 아래의 hosts만 대상.
@@ -2934,6 +2979,7 @@ impl RegistryOverviewCache {
                     path.extension()
                         .is_some_and(|extension| extension == "sqlite")
                 })
+                .filter(|path| !is_regback_output(path))
                 .collect(),
             Err(_) => return Self { hives: Vec::new() },
         };
@@ -3627,6 +3673,7 @@ fn eh_from_userassist(out_dir: &Path) -> Vec<Row> {
         Ok(rd) => rd
             .filter_map(|e| e.ok().map(|e| e.path()))
             .filter(|p| p.extension().map(|x| x == "sqlite").unwrap_or(false))
+            .filter(|p| !is_regback_output(p))
             .collect(),
         Err(_) => return rows,
     };
@@ -6098,6 +6145,81 @@ pub fn build_registry_findings_with_registry(registry: &RegistryOverviewCache) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// RegBack 산출물은 facts로 보존하되 파생 입력에서 제외된다 — 판별 회귀.
+    #[test]
+    fn regback_outputs_are_recognized_for_derived_exclusion() {
+        assert!(is_regback_output(Path::new("/x/REGISTRY/SYSTEM_RegBack.sqlite")));
+        assert!(is_regback_output(Path::new("/x/REGISTRY/SOFTWARE_RegBack_2.sqlite")));
+        assert!(!is_regback_output(Path::new("/x/REGISTRY/SYSTEM.sqlite")));
+        assert!(!is_regback_output(Path::new("/x/REGISTRY/NTUSER.DAT.sqlite")));
+    }
+
+    /// SessionID 재사용 회귀: 세션 종료(23) 뒤 같은 SessionID로 다른 사용자가
+    /// 로그온해도, 이전 세션 행에 이후 사용자의 IP·계정이 붙지 않는다 —
+    /// 상관은 (출처, SessionID) 그룹의 시간순 전방 전파로만 이뤄진다.
+    #[test]
+    fn rdp_session_enrichment_does_not_cross_session_id_reuse() {
+        const LSM: &str = "Microsoft-Windows-TerminalServices-LocalSessionManager";
+        let mk = |eid: &str, ts: &str, user: &str, addr: &str, key: &str| {
+            let mut r = Row::new();
+            r.insert("Provider".into(), LSM.into());
+            r.insert("EventID".into(), eid.into());
+            r.insert("timestamp".into(), ts.into());
+            r.insert("_record_key".into(), key.into());
+            let ed = serde_json::json!({
+                "EventXML": {"SessionID": "3", "User": user, "Address": addr}
+            });
+            r.insert("EventData".into(), ed.to_string());
+            r
+        };
+        let rows = vec![
+            mk("21", "2026-01-01 10:00:00.000", "CORP\\alice", "10.0.0.5", "LSM_Log::1"),
+            // 값 없는 로그오프 — 같은 세션 구간이므로 alice로 채워진다.
+            mk("23", "2026-01-01 10:30:00.000", "", "", "LSM_Log::2"),
+            // 종료 후 재사용된 SessionID=3의 새 로그온 (다른 사용자).
+            mk("21", "2026-01-02 09:00:00.000", "CORP\\bob", "10.0.0.9", "LSM_Log::3"),
+            mk("22", "2026-01-02 09:00:05.000", "", "", "LSM_Log::4"),
+        ];
+        let out = build_remote_desktop_history_with_events(
+            &EventLogOverviewCache::from_rows_for_tests(rows),
+        );
+        assert_eq!(out[1]["account"], "alice", "로그오프 행은 같은 세션 값으로 채움");
+        assert_eq!(out[1]["remote_address"], "10.0.0.5");
+        // 이전 구현(전역 최종값 역전파)이라면 alice 세션 행이 bob으로 오염됐다.
+        assert_ne!(out[0]["account"], "bob");
+        assert_ne!(out[1]["account"], "bob");
+        assert_eq!(out[3]["account"], "bob", "새 세션 구간은 bob 값으로 전파");
+        assert_eq!(out[3]["remote_address"], "10.0.0.9");
+    }
+
+    /// 서로 다른 수집 로그의 같은 SessionID는 상관되지 않는다 (출처 분리).
+    #[test]
+    fn rdp_session_enrichment_is_scoped_to_the_source_log() {
+        const LSM: &str = "Microsoft-Windows-TerminalServices-LocalSessionManager";
+        let mk = |ts: &str, user: &str, addr: &str, key: &str| {
+            let mut r = Row::new();
+            r.insert("Provider".into(), LSM.into());
+            r.insert("EventID".into(), if user.is_empty() { "22" } else { "21" }.into());
+            r.insert("timestamp".into(), ts.into());
+            r.insert("_record_key".into(), key.into());
+            let ed = serde_json::json!({
+                "EventXML": {"SessionID": "7", "User": user, "Address": addr}
+            });
+            r.insert("EventData".into(), ed.to_string());
+            r
+        };
+        let rows = vec![
+            mk("2026-01-01 10:00:00.000", "CORP\\alice", "10.0.0.5", "LogA::1"),
+            // 다른 로그 파일의 같은 SessionID — 값이 채워지면 허위 상관.
+            mk("2026-01-01 11:00:00.000", "", "", "LogB::1"),
+        ];
+        let out = build_remote_desktop_history_with_events(
+            &EventLogOverviewCache::from_rows_for_tests(rows),
+        );
+        assert_eq!(out[1]["account"], "", "다른 출처의 세션에는 전파하지 않는다");
+        assert_eq!(out[1]["remote_address"], "");
+    }
 
     #[test]
     fn mpdetection_lines_become_threat_rows_in_kst() {

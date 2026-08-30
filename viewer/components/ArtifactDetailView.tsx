@@ -444,7 +444,7 @@ function FieldRow({ field, row, onFetchLinkedRows, hostDir, accountDirectory, on
   let content: React.ReactNode;
   switch (kind) {
     case "badge": {
-      const color = field.badgeColors?.[displayValue];
+      const color = field.badgeColors?.[displayValue] ?? field.badgeColor;
       content = <Badge text={displayValue} color={color} />;
       break;
     }

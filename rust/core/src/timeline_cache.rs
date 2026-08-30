@@ -140,6 +140,21 @@ pub fn build_master_timeline_cache(
         &include_all,
         &mut entries,
     )?;
+    // Windows Timeline — 실행/열기(ActivityType 5)는 ExecutionHistory로 이미
+    // 승격되어 캐시에 들어가므로 여기서 제외해 한 사건이 두 번 보이지 않게
+    // 한다. 나머지 유형(포커스·클립보드 등)은 Timeline이 유일한 공급원이다
+    // (2026-08-31 사용자 확정).
+    let timeline_filter = |row: &RowMap| {
+        row.get("activity_type").and_then(|value| value.as_str()) != Some("5")
+    };
+    collect_table(
+        &stage_dir.join("TIMELINE").join("Timeline_Activities.sqlite"),
+        "Timeline_Activities",
+        "TIMELINE",
+        &live("TIMELINE", "Timeline_Activities"),
+        &timeline_filter,
+        &mut entries,
+    )?;
     // WER: 크래시 보고서의 EventTime(크래시 발생 시각) — 악성코드 크래시·
     // 익스플로잇 실패 시각의 유일한 타임라인 공급원(T6에서 WER만 편입 확정,
     // RegistryFindings·CacheEntries·레지스트리 하이브 last_write는 제외 유지).
@@ -249,6 +264,50 @@ mod tests {
         assert_eq!(entry["rowid"], 1);
         assert!(entry.get("tags").is_none());
         assert_eq!(entry["row"]["task_name"], "MyTask");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Timeline 편입 회귀: 실행/열기(type 5)는 ExecutionHistory 승격분과의
+    /// 중복 표시를 막기 위해 캐시에서 제외하고, 나머지 유형은 포함된다.
+    #[test]
+    fn timeline_rows_join_the_cache_without_promoted_type5_duplicates() {
+        let root = std::env::temp_dir().join(format!(
+            "wina-timeline-cache-tl-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let stage = root.join("stage");
+        std::fs::create_dir_all(stage.join("TIMELINE")).unwrap();
+        let db = stage.join("TIMELINE/Timeline_Activities.sqlite");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute(
+            "CREATE TABLE \"Timeline_Activities\" (\"timestamp\" TEXT, \"kind\" TEXT, \"activity_type\" TEXT)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO Timeline_Activities VALUES
+             ('2026-08-01 10:00:00.000', '사용(포커스)', '6'),
+             ('2026-08-01 11:00:00.000', '실행/열기', '5')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let live = root.join("live");
+        let count = build_master_timeline_cache(&stage, &live, "run-at").unwrap();
+        assert_eq!(count, 1, "type 5 must be excluded, focus row included");
+        let cache: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(stage.join("_master_timeline.cache.json")).unwrap(),
+        )
+        .unwrap();
+        let entry = &cache["entries"][0];
+        assert_eq!(entry["table"], "Timeline_Activities");
+        assert_eq!(entry["category"], "TIMELINE");
+        assert_eq!(entry["row"]["activity_type"], "6");
         let _ = std::fs::remove_dir_all(root);
     }
 }

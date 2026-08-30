@@ -2707,6 +2707,55 @@ async fn ai_referrals(
     .map_err(|error| format!("AI 공유 링크 작업이 중단되었습니다: {error}"))?
 }
 
+/// WMI-Activity 이벤트 로그에서 구독 이벤트(5859~5861)만 서버에서 걸러
+/// 돌려준다 — 원본 EventLog 테이블 전체를 IPC로 옮기지 않는다(payload가 로그
+/// 크기가 아니라 구독 이벤트 수에 비례). rows에는 `__rowid`가 있어 원본
+/// EventLog 행 기준 북마크가 연결된다. 로그가 없는 호스트는 빈 결과.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WmiSubscriptionEvents {
+    columns: Vec<String>,
+    rows: Vec<Map<String, Value>>,
+    full_path: String,
+    table_name: String,
+}
+
+#[tauri::command]
+async fn wmi_subscription_events(host_dir: String) -> Result<WmiSubscriptionEvents, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = PathBuf::from(&host_dir)
+            .join("EVENTLOG")
+            .join("Microsoft-Windows-WMI-Activity%4Operational.sqlite");
+        let empty = WmiSubscriptionEvents {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            full_path: String::new(),
+            table_name: String::new(),
+        };
+        if !path.is_file() {
+            return Ok(empty);
+        }
+        let conn = open_ro(&path.to_string_lossy())?;
+        let Some(table) = first_table(&conn) else {
+            return Ok(empty);
+        };
+        let columns = table_columns(&conn, &table);
+        let sql = format!(
+            "SELECT rowid AS __rowid, * FROM {} WHERE \"EventID\" IN ('5859','5860','5861') ORDER BY timestamp ASC",
+            q(&table)
+        );
+        let rows = query_rows(&conn, &sql, &[])?;
+        Ok(WmiSubscriptionEvents {
+            columns,
+            rows,
+            full_path: path.to_string_lossy().to_string(),
+            table_name: table,
+        })
+    })
+    .await
+    .map_err(|error| format!("WMI 구독 이벤트 조회가 중단되었습니다: {error}"))?
+}
+
 #[tauri::command]
 fn read_result_file(full_path: String, table_name: Option<String>) -> Result<CsvData, String> {
     let conn = open_ro(&full_path)?;
@@ -3860,17 +3909,6 @@ async fn cache_entry_body(
     .unwrap_or_default()
 }
 
-/// AI provider hosts we look for in the cache.
-const AI_HOSTS: &[&str] = &[
-    "chatgpt.com",
-    "chat.openai.com",
-    "openai.com",
-    "claude.ai",
-    "anthropic.com",
-    "gemini.google.com",
-    "bard.google.com",
-];
-
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AiConversation {
@@ -3909,252 +3947,88 @@ struct AiConversationPage {
     source_failures: Vec<String>,
 }
 
-fn ai_provider(url: &str) -> Option<&'static str> {
-    let host = url.split('/').nth(2).unwrap_or("").to_ascii_lowercase();
-    if host == "chatgpt.com" || host == "chat.openai.com" {
-        Some("ChatGPT")
-    } else if host == "claude.ai" {
-        Some("Claude")
-    } else if host == "gemini.google.com" || host == "bard.google.com" {
-        Some("Gemini")
-    } else {
-        None
-    }
-}
 
-/// Accept only cache responses that are known to contain a complete conversation
-/// payload. AI hosts emit many JSON responses (settings, stream state, assets),
-/// which must not be presented as a conversation to an analyst.
-fn is_ai_conversation_payload(
-    provider: &str,
-    url: &str,
-    object: &serde_json::Map<String, serde_json::Value>,
-) -> bool {
-    let endpoint = url.split('?').next().unwrap_or(url).trim_end_matches('/');
-    match provider {
-        // The individual endpoint (not `/stream_status` or `/textdocs`) carries
-        // the complete ChatGPT tree under `mapping`.
-        "ChatGPT" => {
-            endpoint
-                .split("/backend-api/conversation/")
-                .nth(1)
-                .is_some_and(|id| !id.is_empty() && !id.contains('/'))
-                && object
-                    .get("mapping")
-                    .is_some_and(serde_json::Value::is_object)
-        }
-        // Claude's complete chat endpoint stores actual turn objects. Other
-        // organization/skills JSON is intentionally excluded.
-        "Claude" => {
-            endpoint.contains("/chat_conversations/")
-                && (object
-                    .get("chat_messages")
-                    .is_some_and(serde_json::Value::is_array)
-                    || object
-                        .get("messages")
-                        .is_some_and(serde_json::Value::is_array))
-        }
-        // Gemini conversations are returned by this concrete conversation API;
-        // pages, widget responses and account JSON are not conversation records.
-        "Gemini" => {
-            endpoint.contains("BardFrontendService/GetConversation")
-                && (object
-                    .get("conversation")
-                    .is_some_and(serde_json::Value::is_object)
-                    || object
-                        .get("messages")
-                        .is_some_and(serde_json::Value::is_array))
-        }
-        _ => false,
-    }
-}
-
-fn json_time_field(object: &serde_json::Map<String, serde_json::Value>, names: &[&str]) -> String {
-    names
-        .iter()
-        .find_map(|name| object.get(*name))
-        .and_then(|value| match value {
-            serde_json::Value::String(value) if !value.is_empty() => Some(value.clone()),
-            serde_json::Value::Number(value) => Some(value.to_string()),
-            _ => None,
-        })
-        .unwrap_or_default()
-}
-
-/// Scans the BROWSER cache SQLite files for AI conversation JSON bodies and
-/// returns the parsed conversations. Runs in Rust so no GB of base64 blobs
-/// are transferred over IPC — only the already-small JSON texts.
+/// 파싱 단계 파생(_OVERVIEW/AiConversations)을 기간·페이지 조건으로
+/// 조회한다. 원본 캐시 재해석·행 상한(500/2,000)은 파생 이전으로 제거됐다 —
+/// total은 기간 내 전체 건수이고 정렬(관찰 시각 내림차순 + URL)은 파생
+/// 테이블 순서와 동일해 페이지가 재현된다. 파생 테이블이 없는 이전 파싱본은
+/// 빈 결과를 돌려준다(재파싱하면 생성 — PathReferences와 같은 계약).
 fn ai_conversations_blocking(
     host_dir: String,
     query: AiConversationQuery,
 ) -> Result<AiConversationPage, String> {
-    let dir = PathBuf::from(&host_dir).join("BROWSER");
-    let mut conversations = Vec::new();
-    let files = match std::fs::read_dir(&dir) {
-        Ok(rd) => rd
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| {
-                p.file_name()
-                    .map(|n| n.to_string_lossy().ends_with("_Chrome_Cache.sqlite"))
-                    .unwrap_or(false)
-            })
-            .collect::<Vec<_>>(),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(error) => return Err(format!("AI 대화 캐시 목록을 읽을 수 없습니다: {error}")),
-    };
-    const SCAN_CAP: usize = 2_000;
-    let mut total = 0usize;
-    let mut source_failures = Vec::new();
-    let source_count = files.len();
-    let mut sources_read = 0usize;
-    for f in files {
-        if total >= SCAN_CAP {
-            break;
-        }
-        let source_name = f
-            .file_name()
-            .map(|name| name.to_string_lossy().to_string())
-            .unwrap_or_else(|| "알 수 없는 캐시 파일".to_string());
-        let conn = match open_ro(&f.to_string_lossy()) {
-            Ok(c) => c,
-            Err(_) => {
-                source_failures.push(format!("{source_name}: 캐시 파일을 열 수 없습니다"));
-                continue;
-            }
-        };
-        // Only read AI-host rows that have JSON bodies — avoid loading images/JS.
-        let ai_like: Vec<String> = AI_HOSTS.iter().map(|h| format!("%{}%", h)).collect();
-        let placeholders: String = ai_like
-            .iter()
-            .enumerate()
-            .map(|(i, _)| format!("url LIKE ?{}", i + 1))
-            .collect::<Vec<_>>()
-            .join(" OR ");
-        let sql = format!(
-            "SELECT url, account, COALESCE(NULLIF(response_time, ''), NULLIF(request_time, ''), NULLIF(creation_time, ''), ''), body_b64 FROM CacheEntries \
-             WHERE body_b64 IS NOT NULL AND body_b64 != '' \
-             AND content_type LIKE '%json%' AND ({}) LIMIT 500",
-            placeholders
-        );
-        let params: Vec<&dyn rusqlite::ToSql> =
-            ai_like.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
-        let mut stmt = match conn.prepare(&sql) {
-            Ok(s) => s,
-            Err(_) => {
-                source_failures.push(format!("{source_name}: 캐시 테이블을 읽을 수 없습니다"));
-                continue;
-            }
-        };
-        let rows = match stmt.query_map(params.as_slice(), |r| {
-            Ok((
-                r.get::<_, Option<String>>(0)?.unwrap_or_default(),
-                r.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                r.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                r.get::<_, Option<String>>(3)?.unwrap_or_default(),
-            ))
-        }) {
-            Ok(it) => it,
-            Err(_) => {
-                source_failures.push(format!("{source_name}: AI 대화 행을 읽을 수 없습니다"));
-                continue;
-            }
-        };
-        sources_read += 1;
-
-        for row in rows {
-            let (url, account, observation_time, body_b64) = match row {
-                Ok(row) => row,
-                Err(_) => {
-                    source_failures
-                        .push(format!("{source_name}: AI 대화 행 일부를 읽을 수 없습니다"));
-                    // A malformed row is source-local. Preserve results from
-                    // prior rows and other profiles, but do not silently skip
-                    // the read error as if the cache had no conversation.
-                    break;
-                }
-            };
-            if query
-                .start
-                .as_ref()
-                .is_some_and(|start| !start.is_empty() && observation_time < *start)
-                || query
-                    .end
-                    .as_ref()
-                    .is_some_and(|end| !end.is_empty() && observation_time > *end)
-            {
-                continue;
-            }
-            // Decode base64 → UTF-8 in Rust; skip if not valid JSON text.
-            let text =
-                match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &body_b64)
-                {
-                    Ok(bytes) => match String::from_utf8(bytes) {
-                        Ok(s) => s,
-                        Err(_) => continue,
-                    },
-                    Err(_) => continue,
-                };
-            // Strip anti-hijack prefix.
-            let cleaned = text.trim_start_matches(|c: char| {
-                c == ')' || c == ']' || c == '\'' || c == '\n' || c == '\r' || c == ' '
-            });
-            // Must be a concrete provider conversation endpoint with its
-            // provider-specific conversation schema; host JSON alone is not
-            // sufficient evidence of a user conversation.
-            let val: serde_json::Value = match serde_json::from_str(cleaned) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            let obj = match val.as_object() {
-                Some(o) => o,
-                None => continue,
-            };
-            let provider = match ai_provider(&url) {
-                Some(provider) => provider,
-                None => continue,
-            };
-            if !is_ai_conversation_payload(provider, &url, obj) {
-                continue;
-            }
-            let title = obj
-                .get("title")
-                .or_else(|| obj.get("name"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let created_at = json_time_field(obj, &["create_time", "created_at"]);
-            let updated_at = json_time_field(obj, &["update_time", "updated_at"]);
-            let raw_json = serde_json::to_string_pretty(&val).unwrap_or(cleaned.to_string());
-            conversations.push(AiConversation {
-                provider: provider.to_string(),
-                account,
-                title,
-                date: observation_time,
-                created_at,
-                updated_at,
-                url,
-                raw_json,
-            });
-            total += 1;
-        }
+    let db = PathBuf::from(&host_dir)
+        .join("_OVERVIEW")
+        .join("AiConversations.sqlite");
+    if !db.is_file() {
+        return Ok(AiConversationPage {
+            conversations: Vec::new(),
+            total: 0,
+            source_count: 0,
+            sources_read: 0,
+            source_failures: Vec::new(),
+        });
     }
-    conversations.sort_by(|left, right| {
-        right
-            .date
-            .cmp(&left.date)
-            .then_with(|| left.url.cmp(&right.url))
-    });
-    let page = conversations
-        .into_iter()
-        .skip(query.offset)
-        .take(query.limit.clamp(1, 100))
+    let conn = open_ro(&db.to_string_lossy())
+        .map_err(|error| format!("AI 대화 파생 테이블을 열 수 없습니다: {error}"))?;
+    let mut clauses: Vec<&str> = Vec::new();
+    let mut params: Vec<String> = Vec::new();
+    if let Some(start) = query.start.as_ref().filter(|s| !s.is_empty()) {
+        clauses.push("date >= ?");
+        params.push(start.clone());
+    }
+    if let Some(end) = query.end.as_ref().filter(|s| !s.is_empty()) {
+        clauses.push("date <= ?");
+        params.push(end.clone());
+    }
+    let where_sql = if clauses.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", clauses.join(" AND "))
+    };
+    let bind: Vec<&dyn rusqlite::ToSql> =
+        params.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
+    let total: usize = conn
+        .query_row(
+            &format!("SELECT COUNT(*) FROM \"AiConversations\"{where_sql}"),
+            bind.as_slice(),
+            |r| r.get::<_, i64>(0),
+        )
+        .map_err(|error| format!("AI 대화 건수를 읽을 수 없습니다: {error}"))? as usize;
+    let limit = query.limit.clamp(1, 100);
+    let sql = format!(
+        "SELECT date, provider, account, title, created_at, updated_at, url, raw_json FROM \"AiConversations\"{where_sql} ORDER BY date DESC, url ASC LIMIT ? OFFSET ?"
+    );
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|error| format!("AI 대화 조회를 준비할 수 없습니다: {error}"))?;
+    let mut bind_page = bind;
+    let limit_v = limit as i64;
+    let offset_v = query.offset as i64;
+    bind_page.push(&limit_v);
+    bind_page.push(&offset_v);
+    let conversations = stmt
+        .query_map(bind_page.as_slice(), |r| {
+            Ok(AiConversation {
+                date: r.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                provider: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                account: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                title: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                created_at: r.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                updated_at: r.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                url: r.get::<_, Option<String>>(6)?.unwrap_or_default(),
+                raw_json: r.get::<_, Option<String>>(7)?.unwrap_or_default(),
+            })
+        })
+        .map_err(|error| format!("AI 대화를 읽을 수 없습니다: {error}"))?
+        .filter_map(|row| row.ok())
         .collect();
     Ok(AiConversationPage {
-        conversations: page,
+        conversations,
         total,
-        source_count,
-        sources_read,
-        source_failures,
+        source_count: 1,
+        sources_read: 1,
+        source_failures: Vec::new(),
     })
 }
 
@@ -5499,17 +5373,17 @@ mod browser_activity_tests {
     fn ai_conversation_detection_excludes_chatgpt_non_conversation_json() {
         let payload = serde_json::json!({ "mapping": { "node": {} } });
         let object = payload.as_object().unwrap();
-        assert!(is_ai_conversation_payload(
+        assert!(wina_core::ai_activity::is_ai_conversation_payload(
             "ChatGPT",
             "https://chatgpt.com/backend-api/conversation/123e4567-e89b-12d3-a456-426614174000",
             object,
         ));
-        assert!(!is_ai_conversation_payload(
+        assert!(!wina_core::ai_activity::is_ai_conversation_payload(
             "ChatGPT",
             "https://chatgpt.com/backend-api/conversation/123e4567-e89b-12d3-a456-426614174000/stream_status",
             object,
         ));
-        assert!(!is_ai_conversation_payload(
+        assert!(!wina_core::ai_activity::is_ai_conversation_payload(
             "ChatGPT",
             "https://chatgpt.com/backend-api/settings/voices",
             object,
@@ -5521,29 +5395,84 @@ mod browser_activity_tests {
         let payload = serde_json::json!({ "create_time": 1_784_525_759.692_772, "updated_at": "2026-07-21T16:00:00Z" });
         let object = payload.as_object().unwrap();
         assert_eq!(
-            json_time_field(object, &["create_time", "created_at"]),
+            wina_core::ai_activity::json_time_field(object, &["create_time", "created_at"]),
             "1784525759.692772"
         );
         assert_eq!(
-            json_time_field(object, &["update_time", "updated_at"]),
+            wina_core::ai_activity::json_time_field(object, &["update_time", "updated_at"]),
             "2026-07-21T16:00:00Z"
         );
     }
 
     #[test]
-    fn ai_conversation_scan_reports_unreadable_cache_sources() {
+    fn ai_conversations_page_filters_range_and_reports_exact_total() {
         let root = std::env::temp_dir().join(format!(
-            "windows-analysis-ai-conversation-failure-{}-{}",
+            "windows-analysis-ai-derived-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_nanos(),
         ));
-        let browser_dir = root.join("BROWSER");
-        std::fs::create_dir_all(&browser_dir).unwrap();
-        std::fs::write(browser_dir.join("broken_Chrome_Cache.sqlite"), "not sqlite").unwrap();
+        let ov = root.join("_OVERVIEW");
+        std::fs::create_dir_all(&ov).unwrap();
+        let conn = Connection::open(ov.join("AiConversations.sqlite")).unwrap();
+        conn.execute_batch("CREATE TABLE AiConversations (date TEXT, provider TEXT, account TEXT, title TEXT, created_at TEXT, updated_at TEXT, url TEXT, raw_json TEXT, source_record_key TEXT, _source_file TEXT)").unwrap();
+        for (date, url) in [
+            ("2026-07-01 10:00:00.000", "https://chatgpt.com/backend-api/conversation/a"),
+            ("2026-07-02 10:00:00.000", "https://chatgpt.com/backend-api/conversation/b"),
+            ("2026-07-03 10:00:00.000", "https://chatgpt.com/backend-api/conversation/c"),
+        ] {
+            conn.execute(
+                "INSERT INTO AiConversations VALUES (?1, 'ChatGPT', 'alice', 't', '', '', ?2, '{}', '', '')",
+                rusqlite::params![date, url],
+            )
+            .unwrap();
+        }
+        drop(conn);
 
+        // 기간 필터: 2건만, total도 기간 내 전체(절단이 아님).
+        let page = ai_conversations_blocking(
+            root.to_string_lossy().to_string(),
+            AiConversationQuery {
+                start: Some("2026-07-02 00:00:00.000".into()),
+                end: None,
+                offset: 0,
+                limit: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(page.total, 2);
+        assert_eq!(page.conversations.len(), 1);
+        // 관찰 시각 내림차순 — 첫 페이지는 최신.
+        assert_eq!(page.conversations[0].date, "2026-07-03 10:00:00.000");
+        let second = ai_conversations_blocking(
+            root.to_string_lossy().to_string(),
+            AiConversationQuery {
+                start: Some("2026-07-02 00:00:00.000".into()),
+                end: None,
+                offset: 1,
+                limit: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(second.conversations[0].date, "2026-07-02 10:00:00.000");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ai_conversations_missing_derived_table_returns_empty_page() {
+        let root = std::env::temp_dir().join(format!(
+            "windows-analysis-ai-derived-missing-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        // 이전 파싱본(파생 없음) — 오류가 아니라 빈 결과 (재파싱하면 생성).
         let page = ai_conversations_blocking(
             root.to_string_lossy().to_string(),
             AiConversationQuery {
@@ -5556,59 +5485,7 @@ mod browser_activity_tests {
         .unwrap();
         assert!(page.conversations.is_empty());
         assert_eq!(page.total, 0);
-        assert_eq!(page.source_count, 1);
-        assert_eq!(page.sources_read, 0);
-        assert_eq!(page.source_failures.len(), 1);
-        assert!(page.source_failures[0].contains("broken_Chrome_Cache.sqlite"));
-
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn ai_conversation_scan_reports_cache_row_decode_errors() {
-        let root = std::env::temp_dir().join(format!(
-            "windows-analysis-ai-conversation-row-failure-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos(),
-        ));
-        let browser_dir = root.join("BROWSER");
-        std::fs::create_dir_all(&browser_dir).unwrap();
-        let path = browser_dir.join("alice_Chrome_Cache.sqlite");
-        let conn = Connection::open(&path).unwrap();
-        conn.execute_batch("CREATE TABLE CacheEntries (url TEXT, account TEXT, response_time TEXT, request_time TEXT, creation_time TEXT, content_type TEXT, body_b64 BLOB)").unwrap();
-        // The row passes the SQL predicate but cannot be decoded as a text
-        // base64 payload. It must be surfaced as a source failure, not dropped.
-        conn.execute(
-            "INSERT INTO CacheEntries (url, account, response_time, content_type, body_b64) VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![
-                "https://chatgpt.com/backend-api/conversation/abc",
-                "alice",
-                "2026-08-01 00:00:00.000",
-                "application/json",
-                vec![0_u8, 159_u8]
-            ],
-        ).unwrap();
-        drop(conn);
-
-        let page = ai_conversations_blocking(
-            root.to_string_lossy().to_string(),
-            AiConversationQuery {
-                start: None,
-                end: None,
-                offset: 0,
-                limit: 10,
-            },
-        )
-        .unwrap();
-        assert!(page.conversations.is_empty());
-        assert_eq!(page.source_count, 1);
-        assert_eq!(page.sources_read, 1);
-        assert_eq!(page.source_failures.len(), 1);
-        assert!(page.source_failures[0].contains("행 일부"));
-
+        assert_eq!(page.source_count, 0);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -6243,7 +6120,8 @@ fn main() {
             ai_referrals,
             cache_entries,
             cache_entry_body,
-            ai_conversations
+            ai_conversations,
+            wmi_subscription_events
         ])
         .setup(|_app| Ok(()))
         .run(tauri::generate_context!())

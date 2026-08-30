@@ -123,13 +123,21 @@ pub struct WebCacheCounts {
     pub downloads: usize,
 }
 
+/// 스트리밍 이벤트 — 방문 기록 컨테이너를 전부 처리한 뒤에야 다운로드 행이
+/// 나온다(컨테이너 2단계 순회 보장). 호출자는 이 순서 보장 덕에 같은 SQLite
+/// 파일에 writer를 순차로 열어 다운로드도 스트리밍 기록할 수 있다 — 다운로드
+/// 행을 메모리 배열에 모으지 않는다.
+pub enum WebCacheEvent {
+    History(Row),
+    Download(Row),
+}
+
 /// WebCacheV##.dat 하나를 파싱해 방문 기록/다운로드 행을 콜백으로 스트리밍한다.
 /// 손상·dirty ESE는 open 단계에서 Err — 파이프라인이 해당 파일만 격리한다.
 pub fn parse_webcache(
     path: &Path,
     account: &str,
-    push_history: &mut dyn FnMut(Row) -> Result<()>,
-    push_download: &mut dyn FnMut(Row) -> Result<()>,
+    sink: &mut dyn FnMut(WebCacheEvent) -> Result<()>,
 ) -> Result<WebCacheCounts> {
     let source = path.to_string_lossy().to_string();
     let db = EseDb::open(path).map_err(|e| {
@@ -174,6 +182,9 @@ pub fn parse_webcache(
         history: 0,
         downloads: 0,
     };
+    // 방문 기록 컨테이너 → 다운로드 컨테이너 2단계 순회 — 이벤트 순서 보장의
+    // 근거다 (WebCacheEvent 문서 참조).
+    targets.sort_by_key(|(_, _, is_download)| *is_download);
     for (id, container_name, is_download) in targets {
         if crate::pipeline::cancelled() {
             break;
@@ -231,7 +242,7 @@ pub fn parse_webcache(
                     None => String::new(),
                 };
                 row.insert("metadata".into(), metadata);
-                push_download(row)?;
+                sink(WebCacheEvent::Download(row))?;
                 counts.downloads += 1;
             } else {
                 row.insert("expiry_time".into(), ft(get_int(exp_i)));
@@ -239,7 +250,7 @@ pub fn parse_webcache(
                     "access_count".into(),
                     get_int(cnt_i).map(|x| x.to_string()).unwrap_or_default(),
                 );
-                push_history(row)?;
+                sink(WebCacheEvent::History(row))?;
                 counts.history += 1;
             }
         }

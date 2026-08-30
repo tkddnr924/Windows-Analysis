@@ -315,7 +315,12 @@ export default function PowerShellFlowView({
                           <span className="ps-session-child-time" style={{ color: "var(--text-time)", fontFamily: "var(--mono)", fontSize: 12.5, whiteSpace: "nowrap" }}>{formatEvidenceTimestamp(event.timestamp)}</span>
                           <span className="ps-session-child-type" style={{ justifySelf: "start", fontSize: 11.5, fontWeight: 700, color: kindColor, border: `1px solid ${kindColor}`, borderRadius: "var(--radius-sm)", padding: "1px 8px", whiteSpace: "nowrap" }}>{kindLabel}</span>
                           <span className="ps-session-child-content" style={{ minWidth: 0, display: "grid", gap: 3 }}>
-                            <span title={evidence.value} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: evidence.label === "HostApplication" ? "var(--accent)" : "var(--text)", fontFamily: "var(--mono)", fontSize: 12.5 }}>{evidence.value}</span>
+                            <span style={{ minWidth: 0, display: "flex", alignItems: "center", gap: 6 }}>
+                              {/* 분할 4104 재조합이 불완전한 행 — 잘린 본문이 완전한
+                                  원문으로 읽히지 않게 목록에서 바로 경고한다. */}
+                              {event.row.script_block_status && <span title={event.row.script_block_status} style={{ flexShrink: 0, fontSize: 10.5, fontWeight: 700, color: "var(--warning)", border: "1px solid var(--warning)", borderRadius: "var(--radius-sm)", padding: "0 6px", whiteSpace: "nowrap" }}>불완전</span>}
+                              <span title={evidence.value} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: evidence.label === "HostApplication" ? "var(--accent)" : "var(--text)", fontFamily: "var(--mono)", fontSize: 12.5 }}>{evidence.value}</span>
+                            </span>
                             {hostApplicationSecondary && <span title={event.hostApplication} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text-faint)", fontFamily: "var(--mono)", fontSize: 11 }}>HostApplication · {hostApplicationSecondary}</span>}
                           </span>
                         </button>

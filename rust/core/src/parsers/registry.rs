@@ -275,15 +275,22 @@ fn recovery_label(
 }
 
 pub fn parse_hive_stream(primary: &Path, out: &Path) -> Result<usize> {
-    Ok(parse_hive_stream_with_metrics(primary, out)?.row_count)
+    let logs = sibling_logs(primary);
+    Ok(parse_hive_stream_with_metrics(primary, &logs, out)?.row_count)
 }
 
-pub fn parse_hive_stream_with_metrics(primary: &Path, out: &Path) -> Result<HiveParseMetrics> {
+/// `logs`: 파이프라인이 계획 단계에서 고정한 이 하이브의 트랜잭션 로그 목록.
+/// 파싱 시점에 다시 발견하지 않으므로, 목록화 이후 수집 디렉터리가 변해도
+/// 계획·실제 입력·보고서가 같은 스냅샷을 쓴다 (Amcache와 동일 계약).
+pub fn parse_hive_stream_with_metrics(
+    primary: &Path,
+    logs: &[PathBuf],
+    out: &Path,
+) -> Result<HiveParseMetrics> {
     let source = primary.to_string_lossy().to_string();
-    let logs = sibling_logs(primary);
     let recovery_plan = registry_recovery_plan();
     let recovery_logs_discovered = logs.len();
-    let logs_to_apply: Vec<PathBuf> = transaction_logs_to_apply(&logs, recovery_plan).to_vec();
+    let logs_to_apply: Vec<PathBuf> = transaction_logs_to_apply(logs, recovery_plan).to_vec();
     let make_builder = |with_logs: bool| {
         // notatin stores the path, so a borrowed &Path fails the 'static bound.
         #[allow(clippy::unnecessary_to_owned)]

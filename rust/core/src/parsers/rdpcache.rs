@@ -598,37 +598,41 @@ fn tile_rows(src: &str, full: &str, tiles: &[Tile]) -> Vec<Row> {
 /// Cache files carrying the RDP bitmap signature are evidence inputs even when
 /// tile decoding yields no rows (for example, a valid but empty/corrupt cache).
 /// Only the first 4 KB of each candidate is read for the signature test.
-pub fn rdpcache_sources(root: &Path) -> Vec<std::path::PathBuf> {
+pub fn rdpcache_sources(root: &Path) -> crate::finder::Found {
+    let (files, mut errors) = crate::finder::walk_files(root);
     let mut sources = Vec::new();
-    for entry in walkdir::WalkDir::new(root)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
-        if !entry.file_type().is_file() {
-            continue;
-        }
+    for path in files {
         // 구형 bcache##.bmc는 매직이 없다 — 파일명으로 채택.
-        if is_bmc_name(entry.path()) {
-            sources.push(entry.path().to_path_buf());
+        if is_bmc_name(&path) {
+            sources.push(path);
             continue;
         }
         // located by content marker (like the Python find_files_by_content)
         let mut head = Vec::new();
-        match std::fs::File::open(entry.path()) {
+        match std::fs::File::open(&path) {
             Ok(f) => {
                 use std::io::Read;
                 if Read::take(f, 4096).read_to_end(&mut head).is_err() {
+                    // 열렸지만 판별용 앞부분을 읽지 못함 — 비대상이 아니라
+                    // 판정 불가이므로 실패로 기록한다 (탐색 계약).
+                    errors.push(format!("{}: 내용 판별용 앞부분 읽기 실패", path.display()));
                     continue;
                 }
             }
-            Err(_) => continue,
+            Err(error) => {
+                errors.push(format!("{}: {error}", path.display()));
+                continue;
+            }
         }
         if head.windows(MAGIC.len()).any(|w| w == MAGIC) {
-            sources.push(entry.path().to_path_buf());
+            sources.push(path);
         }
     }
     sources.sort();
-    sources
+    crate::finder::Found {
+        paths: sources,
+        errors,
+    }
 }
 
 /// Decode already-discovered RDP bitmap cache files, handing each row to
@@ -673,7 +677,7 @@ pub fn parse_rdpcache_from(sources: &[std::path::PathBuf]) -> Vec<Row> {
 }
 
 pub fn parse_rdpcache_with_sources(root: &Path) -> Result<(Vec<std::path::PathBuf>, Vec<Row>)> {
-    let sources = rdpcache_sources(root);
+    let sources = rdpcache_sources(root).paths;
     let rows = parse_rdpcache_from(&sources);
     Ok((sources, rows))
 }
@@ -766,7 +770,7 @@ mod bmc_tests {
         std::fs::write(cache.join("bcache24.bmc"), &data).unwrap();
         std::fs::write(cache.join("unrelated.txt"), b"noise").unwrap();
 
-        let sources = rdpcache_sources(&dir);
+        let sources = rdpcache_sources(&dir).paths;
         assert_eq!(sources.len(), 1);
         let rows = parse_rdpcache_from(&sources);
         assert!(!rows.is_empty());

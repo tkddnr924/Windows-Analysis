@@ -93,41 +93,73 @@ fn container_label(path: &Path) -> String {
 /// index.dat 하나를 파싱해 레코드 행을 콜백으로 스트리밍한다. 반환: 행 수.
 /// v5.2가 아닌 매직(4.7 등)은 레이아웃 오독 위험이 있어 명시 오류로 격리한다
 /// (T0 원칙 — 조용한 공백 금지).
+///
+/// 파일 전체를 메모리에 올리지 않는다 — 0x80 블록 정렬을 유지한 채 청크로
+/// 읽고, 청크 끝에 걸친 레코드(최대 512블록 = 64KiB)는 이월해 다음 청크에서
+/// 온전히 처리한다.
 pub fn parse_index_dat(
     path: &Path,
     account: &str,
     push: &mut dyn FnMut(Row) -> Result<()>,
 ) -> Result<usize> {
-    let data = std::fs::read(path)?;
-    if !data.starts_with(MAGIC_52) {
-        let head = String::from_utf8_lossy(&data[..data.len().min(24)]).into_owned();
+    use std::io::Read;
+    const CHUNK: usize = 4 * 1024 * 1024;
+    const MAX_REC: usize = 512 * BLOCK;
+    let mut file = std::fs::File::open(path)?;
+    let mut buf: Vec<u8> = Vec::with_capacity(CHUNK + MAX_REC);
+    let mut fill = |buf: &mut Vec<u8>| -> Result<bool> {
+        let carry = buf.len();
+        buf.resize(carry + CHUNK, 0);
+        let mut filled = carry;
+        loop {
+            let read = file.read(&mut buf[filled..])?;
+            if read == 0 {
+                break;
+            }
+            filled += read;
+            if filled == buf.len() {
+                break;
+            }
+        }
+        buf.truncate(filled);
+        Ok(filled < carry + CHUNK)
+    };
+    let mut eof = fill(&mut buf)?;
+    if !buf.starts_with(MAGIC_52) {
+        let head = String::from_utf8_lossy(&buf[..buf.len().min(24)]).into_owned();
         anyhow::bail!("unsupported index.dat format (v5.2 아님): {head:?}");
     }
     let source = path.to_string_lossy().to_string();
     let container = container_label(path);
     let mut n = 0usize;
     let mut off = BLOCK;
-    while off + 8 <= data.len() {
-        if crate::pipeline::cancelled() {
-            break;
-        }
-        let sig = &data[off..off + 4];
-        let record_type = match sig {
-            b"URL " => "URL",
-            b"LEAK" => "LEAK",
-            b"REDR" => "REDR",
-            _ => {
+    loop {
+        while off + 8 <= buf.len() {
+            if crate::pipeline::cancelled() {
+                return Ok(n);
+            }
+            let data: &[u8] = &buf;
+            let sig = &data[off..off + 4];
+            let record_type = match sig {
+                b"URL " => "URL",
+                b"LEAK" => "LEAK",
+                b"REDR" => "REDR",
+                _ => {
+                    off += BLOCK;
+                    continue;
+                }
+            };
+            let nblocks = le_u32(data, off + 4).unwrap_or(0) as usize;
+            if nblocks == 0 || nblocks > 512 {
                 off += BLOCK;
                 continue;
             }
-        };
-        let nblocks = le_u32(&data, off + 4).unwrap_or(0) as usize;
-        if nblocks == 0 || nblocks > 512 {
-            off += BLOCK;
-            continue;
-        }
-        let rec_end = (off + nblocks * BLOCK).min(data.len());
-        let rec = &data[off..rec_end];
+            if !eof && off + nblocks * BLOCK > data.len() {
+                // 레코드가 청크 끝에 걸침 — 이월해 다음 청크에서 처리.
+                break;
+            }
+            let rec_end = (off + nblocks * BLOCK).min(data.len());
+            let rec = &data[off..rec_end];
 
         let mut row = Row::new();
         row.insert("record_type".into(), record_type.into());
@@ -150,17 +182,26 @@ pub fn parse_index_dat(
             row.insert("filename".into(), zstring(rec, fn_off));
             zstring(rec, url_off)
         };
-        if url.is_empty() {
-            // URL 없는 항목(빈 슬롯/부분 덮어쓰기)은 증거 가치가 없다 — skip.
+            if url.is_empty() {
+                // URL 없는 항목(빈 슬롯/부분 덮어쓰기)은 증거 가치가 없다 — skip.
+                off += nblocks * BLOCK;
+                continue;
+            }
+            row.insert("url".into(), url);
+            push(row)?;
+            n += 1;
             off += nblocks * BLOCK;
-            continue;
         }
-        row.insert("url".into(), url);
-        push(row)?;
-        n += 1;
-        off += nblocks * BLOCK;
+        if eof {
+            return Ok(n);
+        }
+        // 남은 꼬리(진행 중 오프셋 이후)를 앞으로 옮기고 다음 청크를 채운다 —
+        // off는 항상 0x80의 배수라 블록 정렬이 유지된다.
+        buf.copy_within(off.., 0);
+        buf.truncate(buf.len() - off);
+        off = 0;
+        eof = fill(&mut buf)?;
     }
-    Ok(n)
 }
 
 #[cfg(test)]

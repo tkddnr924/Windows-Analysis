@@ -65,8 +65,16 @@ const lowerKey = (v: string) => v.toLocaleLowerCase();
 
 /** RFC1918 사설 IP — 호스트 대역과 달라도 내부로 취급한다. */
 function isPrivateIp(label: string): boolean {
-  const value = label.trim();
-  return /^10\./.test(value) || /^192\.168\./.test(value) || /^172\.(1[6-9]|2\d|3[01])\./.test(value);
+  // 네 옥텟 모두 0~255인 유효 IPv4만 RFC1918로 분류한다 — 접두사 정규식만
+  // 쓰면 10.999.1.1 같은 손상·비정상 주소가 내부 클러스터로 이동해 외부
+  // 통신 판단을 왜곡한다. 비정상 주소는 외부/미상으로 남긴다.
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(label.trim());
+  if (!m) return false;
+  const octets = [Number(m[1]), Number(m[2]), Number(m[3]), Number(m[4])];
+  if (octets.some((value) => value > 255)) return false;
+  return octets[0] === 10
+    || (octets[0] === 192 && octets[1] === 168)
+    || (octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31);
 }
 
 function networkGroupOf(label: string): string | null {
@@ -194,7 +202,7 @@ function layout3d(nodes: Graph3DNode[], edges: Graph3DEdge[], hostNets: string[]
   // 사설(RFC1918) 대역은 호스트 대역과 달라도 내부다 — 다만 망을 나눈
   // 의도를 존중해 호스트 지형과 병합하지는 않고 별도 내부 클러스터로 둔다.
   const isPrivateGroup = (g: { net: string; members: Graph3DNode[] }) =>
-    !isSameNet(g) && (g.net ? isPrivateIp(g.net.replace(/\.x$/, "")) : g.members.some((m) => isPrivateIp(m.label)));
+    !isSameNet(g) && (g.net ? isPrivateIp(g.net.replace(/\.x$/, ".0")) : g.members.some((m) => isPrivateIp(m.label)));
   const privateGroups = sortedGroups.filter(isPrivateGroup);
   const externalGroups = sortedGroups.filter((g) => !isSameNet(g) && !isPrivateGroup(g));
 

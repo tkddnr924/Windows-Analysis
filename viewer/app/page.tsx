@@ -1187,6 +1187,9 @@ export default function Home() {
                   dbPath={activeTab.file.fullPath}
                   bookmarkedRowids={activeBookmarkedRowids}
                   onToggleBookmark={(rowid) => handleToggleActiveRowBookmark(rowid)}
+                  timeRange={timeRange}
+                  bookmarkedKeys={bookmarkedKeys}
+                  onToggleEventBookmark={(fullPath, tableName, rowid, eventTime) => handleToggleBookmark(fullPath, tableName, rowid, undefined, eventTime)}
                 />
               ) : getArtifactView(activeTab.file.name)?.customView === "registryFindings" ? (
                 <RegistryFindingsView

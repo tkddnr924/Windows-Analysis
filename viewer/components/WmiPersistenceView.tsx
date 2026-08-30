@@ -16,7 +16,8 @@ import Tooltip from "@mui/material/Tooltip";
 import { HeaderSearchInput, SelectDropdown, ViewHeader } from "@/components/FilterControls";
 import PaginationControls from "@/components/PaginationControls";
 import RowDetailPanel from "./RowDetailPanel";
-import type { CsvData } from "@/lib/types";
+import type { CsvData, WmiSubscriptionEvents } from "@/lib/types";
+import { EMPTY_TIME_RANGE, inRange, type TimeRange } from "@/lib/timeRange";
 
 type Row = Record<string, string>;
 
@@ -27,6 +28,12 @@ interface Props {
   dbPath: string;
   bookmarkedRowids?: Set<number>;
   onToggleBookmark?: (rowid: number) => void;
+  /** 전역 기간 필터 — 시각이 있는 구독 이벤트 행에만 적용된다. */
+  timeRange?: TimeRange;
+  /** `${fullPath}#${rowid}` 키 — 구독 이벤트(원본 EventLog 행) 북마크 상태. */
+  bookmarkedKeys?: Set<string>;
+  /** 구독 이벤트는 원본 EventLog 행 기준으로 북마크한다. */
+  onToggleEventBookmark?: (fullPath: string, tableName: string, rowid: number, eventTime?: string) => void;
 }
 
 const PAGE = 10;
@@ -54,8 +61,11 @@ interface DisplayEntry {
   detailRow: Row;
   detailColumns: string[];
   detailFile: string;
-  /** 북마크는 WMI_Persistence 테이블 행에만 허용 (이벤트 행은 rowid가 다른 테이블 소속). */
+  /** WMI_Persistence 행은 이 파일 rowid로, 구독 이벤트는 원본 EventLog 행으로 북마크한다. */
   bookmarkable: boolean;
+  /** 구독 이벤트의 원본 위치 — 비어 있으면 WMI_Persistence 행. */
+  eventFullPath?: string;
+  eventTableName?: string;
   timestamp: string;
 }
 
@@ -93,15 +103,16 @@ function rowSideLabel(row: Row): string {
   return row.consumer_type || "";
 }
 
-export default function WmiPersistenceView({ data, dbPath, bookmarkedRowids, onToggleBookmark }: Props) {
+export default function WmiPersistenceView({ data, dbPath, bookmarkedRowids, onToggleBookmark, timeRange = EMPTY_TIME_RANGE, bookmarkedKeys, onToggleEventBookmark }: Props) {
   const [search, setSearch] = useState("");
   const [kindFilter, setKindFilter] = useState(KIND_ALL);
   const [detail, setDetail] = useState<DisplayEntry | null>(null);
   const [page, setPage] = useState(0);
-  const [eventLog, setEventLog] = useState<CsvData | null>(null);
+  const [eventLog, setEventLog] = useState<WmiSubscriptionEvents | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
 
-  // 같은 호스트의 WMI-Activity 이벤트 로그에서 구독 이벤트를 읽는다.
+  // 같은 호스트의 WMI-Activity 이벤트 로그에서 구독 이벤트(5859~5861)만
+  // 서버에서 걸러 받는다 — 원본 로그 전체를 웹뷰로 가져오지 않는다.
   // 로그가 없는 호스트면 조용히 건너뛴다.
   useEffect(() => {
     let cancelled = false;
@@ -110,7 +121,7 @@ export default function WmiPersistenceView({ data, dbPath, bookmarkedRowids, onT
     const hostDir = parts.slice(0, Math.max(0, parts.length - 2)).join("/");
     if (!hostDir) return;
     window.api
-      .readResultFile(`${hostDir}/EVENTLOG/${EVENTLOG_FILE}.sqlite`, undefined)
+      .wmiSubscriptionEvents(hostDir)
       .then((result) => {
         if (!cancelled) setEventLog(result);
       })
@@ -136,6 +147,9 @@ export default function WmiPersistenceView({ data, dbPath, bookmarkedRowids, onT
     for (const row of (eventLog?.rows ?? []) as Row[]) {
       const label = SUB_EVENT_LABELS[row.EventID || ""];
       if (!label) continue;
+      // 전역 기간 필터 — 시각이 있는 구독 이벤트에만 적용한다 (OBJECTS.DATA
+      // 추출 항목은 시각이 없어 대상 밖).
+      if (!inRange(row.timestamp || "", timeRange)) continue;
       const fields = subEventFields(row.EventData || "");
       const query = fields.Query || fields.ESS || "";
       const consumer = fields.CONSUMER || "";
@@ -157,13 +171,16 @@ export default function WmiPersistenceView({ data, dbPath, bookmarkedRowids, onT
         detailRow: row,
         detailColumns: eventLog?.columns ?? [],
         detailFile: EVENTLOG_FILE,
-        bookmarkable: false,
+        // 원본 EventLog 행 기준 북마크 — 다른 뷰(통합 타임라인 등)와 공유된다.
+        bookmarkable: !!eventLog?.fullPath,
+        eventFullPath: eventLog?.fullPath,
+        eventTableName: eventLog?.tableName,
         timestamp: row.timestamp || "",
       });
     }
     events.sort((a, b) => a.timestamp.localeCompare(b.timestamp));
     return [...persisted, ...events];
-  }, [data.rows, data.columns, eventLog]);
+  }, [data.rows, data.columns, eventLog, timeRange]);
 
   const kinds = useMemo(() => {
     const present = new Set(entries.map((entry) => entry.display.kind || ""));
@@ -209,6 +226,14 @@ export default function WmiPersistenceView({ data, dbPath, bookmarkedRowids, onT
           />
         )}
       </ViewHeader>
+      {data.rows.length > 0 && (
+        // WMI 저장소 항목은 시그니처 스캔 단서다 — 저장소 특성상 과거 제거된
+        // 구독의 잔존 데이터가 섞일 수 있어, 현재 활성으로 단정하지 않도록
+        // 성격을 화면에 고지한다 (2026-08-31 사용자 확정 방향).
+        <div style={{ flexShrink: 0, padding: "7px 16px", borderBottom: "1px solid var(--border-subtle)", color: "var(--text-faint)", fontSize: 11.5 }}>
+          바인딩 · 이벤트 필터 · 이벤트 컨슈머 항목은 WMI 저장소(OBJECTS.DATA) 스캔에서 복원한 단서로, 현재 활성 여부는 보장되지 않습니다 — 과거 제거된 구독의 잔존 기록이 포함될 수 있습니다. 구독 이벤트 항목(이벤트 로그)과 교차 확인하세요.
+        </div>
+      )}
       {!rows.length ? (
         <div style={{ minHeight: 180, display: "grid", placeItems: "center", color: "var(--text-faint)", fontSize: 13 }}>
           {entries.length === 0 ? "추출된 WMI 이벤트 구독이 없습니다." : "검색·구분 조건에 일치하는 항목 없음"}
@@ -219,8 +244,15 @@ export default function WmiPersistenceView({ data, dbPath, bookmarkedRowids, onT
             {pageRows.map((entry) => {
               const row = entry.display;
               const stableKey = rowId(entry.detailRow);
-              const canBookmark = entry.bookmarkable && !!onToggleBookmark;
-              const bookmarked = entry.bookmarkable && (bookmarkedRowids?.has(stableKey) ?? false);
+              const isEvent = !!entry.eventFullPath;
+              const canBookmark = entry.bookmarkable && (isEvent ? !!onToggleEventBookmark : !!onToggleBookmark);
+              const bookmarked = entry.bookmarkable && (isEvent
+                ? (bookmarkedKeys?.has(`${entry.eventFullPath}#${stableKey}`) ?? false)
+                : (bookmarkedRowids?.has(stableKey) ?? false));
+              const toggleBookmark = () => {
+                if (isEvent) onToggleEventBookmark?.(entry.eventFullPath!, entry.eventTableName || "", stableKey, entry.timestamp || undefined);
+                else onToggleBookmark?.(stableKey);
+              };
               const meta = KIND_META[row.kind] ?? { icon: DeviceHubOutlinedIcon, tone: "var(--text-dim)" };
               const Icon = meta.icon;
               const summary = rowSummary(row);
@@ -256,7 +288,7 @@ export default function WmiPersistenceView({ data, dbPath, bookmarkedRowids, onT
                   {canBookmark && (
                     <Tooltip title={bookmarked ? "북마크 해제" : "북마크"}>
                       <span>
-                        <IconButton className={bookmarked ? "dfir-bookmark-control" : undefined} aria-label={bookmarked ? "북마크 해제" : "북마크"} size="small" onClick={() => onToggleBookmark?.(stableKey)} sx={{ color: bookmarked ? "var(--bookmark-control)" : "var(--text-faint)", borderRadius: "var(--radius-sm)" }}>
+                        <IconButton className={bookmarked ? "dfir-bookmark-control" : undefined} aria-label={bookmarked ? "북마크 해제" : "북마크"} size="small" onClick={toggleBookmark} sx={{ color: bookmarked ? "var(--bookmark-control)" : "var(--text-faint)", borderRadius: "var(--radius-sm)" }}>
                           {bookmarked ? <BookmarkIcon sx={{ fontSize: 17 }} /> : <BookmarkBorderOutlinedIcon sx={{ fontSize: 17 }} />}
                         </IconButton>
                       </span>
@@ -285,8 +317,18 @@ export default function WmiPersistenceView({ data, dbPath, bookmarkedRowids, onT
           fileBaseName={detail.detailFile}
           onClose={() => setDetail(null)}
           onNavigate={() => {}}
-          isBookmarked={detail.bookmarkable && onToggleBookmark ? bookmarkedRowids?.has(rowId(detail.detailRow)) ?? false : undefined}
-          onToggleBookmark={detail.bookmarkable && onToggleBookmark ? () => onToggleBookmark(rowId(detail.detailRow)) : undefined}
+          isBookmarked={detail.bookmarkable
+            ? detail.eventFullPath
+              ? bookmarkedKeys?.has(`${detail.eventFullPath}#${rowId(detail.detailRow)}`) ?? false
+              : onToggleBookmark ? bookmarkedRowids?.has(rowId(detail.detailRow)) ?? false : undefined
+            : undefined}
+          onToggleBookmark={detail.bookmarkable
+            ? detail.eventFullPath
+              ? onToggleEventBookmark
+                ? () => onToggleEventBookmark(detail.eventFullPath!, detail.eventTableName || "", rowId(detail.detailRow), detail.timestamp || undefined)
+                : undefined
+              : onToggleBookmark ? () => onToggleBookmark(rowId(detail.detailRow)) : undefined
+            : undefined}
         />
       )}
     </div>
