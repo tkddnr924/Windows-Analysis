@@ -28,11 +28,13 @@ const YIELD_EVERY = 8000;
 // _OVERVIEW correlations are excluded (no timelineField) because they'd
 // double-count the raw artifacts they derive from. The one exception is
 // ExecutionHistory: it's the ONLY source of a timestamp for SRUM (first
-// sighting), AppCompatCache/ShimCache, BAM and UserAssist — none of which have
-// a raw table of their own — so it opts in, and the raw Amcache/Prefetch specs
-// drop their timelineField so they don't appear twice. EventLog is now one
-// table per source .evtx with an arbitrary name, resolved by columns after a
-// read.
+// sighting), BAM and UserAssist — none of which have a raw table of their
+// own — so it opts in, and the raw Amcache/Prefetch specs drop their
+// timelineField so they don't appear twice. AppCompatCache/ShimCache is
+// deliberately NOT here or in ExecutionHistory: its FILETIME is the target
+// file's last-modified time, not a run time (v0.9.35 decision) — it lives in
+// RegistryFindings with that caveat. EventLog is now one table per source
+// .evtx with an arbitrary name, resolved by columns after a read.
 // Thrown when the caller aborts an in-flight build (e.g. the analyst navigates
 // away from the timeline tab). Lets the caller distinguish a cancel from a real
 // failure and simply drop the partial result.

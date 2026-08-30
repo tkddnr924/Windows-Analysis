@@ -34,6 +34,19 @@ const MFT_CHILDREN_PAGE = 100;
 const ROOT_ENTRY = 5;
 const LIST_FETCH_SIZE = 200; // lazy 로딩 배치 크기
 const LIST_ROW_HEIGHT = 56;
+// 시각 기준 정렬·기간 필터 키 → 라벨/컬럼. si_* 4종에 더해 fn_*($FILE_NAME
+// 0x30)도 제공한다 — timestomping은 주로 $SI만 조작되므로 $FN 기준 정렬이
+// 조작 전 시각으로 표를 놓고 비교하는 수단이 된다(T7).
+const MFT_TIME_SORTS: Record<string, { label: string; column: string }> = {
+  created: { label: "생성 시각", column: "si_created" },
+  modified: { label: "수정 시각", column: "si_modified" },
+  accessed: { label: "접근 시각", column: "si_accessed" },
+  mft_modified: { label: "MFT 수정 시각", column: "si_mft_modified" },
+  fn_created: { label: "생성 시각 ($FN)", column: "fn_created" },
+  fn_modified: { label: "수정 시각 ($FN)", column: "fn_modified" },
+  fn_accessed: { label: "접근 시각 ($FN)", column: "fn_accessed" },
+  fn_mft_modified: { label: "MFT 수정 시각 ($FN)", column: "fn_mft_modified" },
+};
 
 interface Props {
   dbPath: string;
@@ -333,7 +346,7 @@ export default function MftView({ dbPath, tableBookmarks, onToggleBookmark, allB
   // The recursive list owns its own bounded SQLite page. It intentionally
   // does not reuse tree search results, which are capped and may omit paths.
   const listQuery = search.trim().length >= 2 ? search.trim() : "";
-  const listTimeKey = ["created", "modified", "accessed", "mft_modified"].includes(listSortKey) ? listSortKey : "created";
+  const listTimeKey = MFT_TIME_SORTS[listSortKey] ? listSortKey : "created";
   const listOptions = useMemo(
     () => ({
       sortKey: listSortKey,
@@ -436,7 +449,7 @@ export default function MftView({ dbPath, tableBookmarks, onToggleBookmark, allB
       <div className={`mft-content mft-content--${viewMode}`} style={{ flex: 1, minHeight: 0, display: "grid", gap: 10, padding: 14, background: "var(--bg)", gridTemplateColumns: stackedInspector ? "minmax(0, 1fr)" : "minmax(0, 7fr) minmax(300px, 3fr)", gridTemplateRows: stackedInspector ? "minmax(300px, 1fr) minmax(260px, .75fr)" : undefined }}>
         <aside aria-label={viewMode === "tree" ? "파일 탐색기" : "재귀 파일 시스템 목록"} style={{ minWidth: 0, minHeight: 0, overflow: "hidden", padding: viewMode === "tree" ? "8px 10px 14px" : "0", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", background: "var(--bg-panel)", display: "flex", flexDirection: "column" }}>
           {viewMode === "list" ? (
-            <MftRecordList rows={listRows} total={listTotal} loading={listLoading} error={listError} query={listQuery} bmRowids={bmRowids} selectedRowid={selectedRowid} refs={pathRefs} accountFilter={selAccounts} onSelect={setSelected} onLoadMore={loadMoreList} sortKey={listSortKey} onSortKey={setListSortKey} sortDesc={listSortDesc} onSortDesc={setListSortDesc} filesOnly={listFilesOnly} onFilesOnly={setListFilesOnly} pattern={listPattern} onPattern={setListPattern} timeStart={listTimeStart} timeEnd={listTimeEnd} onTimeRange={(next) => { setListTimeStart(next.start); setListTimeEnd(next.end); }} timeLabel={listTimeKey === "created" ? "생성 시각" : listTimeKey === "modified" ? "수정 시각" : listTimeKey === "accessed" ? "접근 시각" : "MFT 수정 시각"} />
+            <MftRecordList rows={listRows} total={listTotal} loading={listLoading} error={listError} query={listQuery} bmRowids={bmRowids} selectedRowid={selectedRowid} refs={pathRefs} accountFilter={selAccounts} onSelect={setSelected} onLoadMore={loadMoreList} sortKey={listSortKey} onSortKey={setListSortKey} sortDesc={listSortDesc} onSortDesc={setListSortDesc} filesOnly={listFilesOnly} onFilesOnly={setListFilesOnly} pattern={listPattern} onPattern={setListPattern} timeStart={listTimeStart} timeEnd={listTimeEnd} onTimeRange={(next) => { setListTimeStart(next.start); setListTimeEnd(next.end); }} timeLabel={MFT_TIME_SORTS[listTimeKey]?.label ?? "생성 시각"} />
           ) : <>
             <div style={{ flex: 1, minHeight: 0, overflow: "auto" }}>
               {results !== null ? (
@@ -535,10 +548,7 @@ function MftRecordList({ rows, total, loading, error, query, bmRowids, selectedR
   const virtualizer = useVirtualizer({ count: rows.length, getScrollElement: () => scrollRef.current, estimateSize: () => LIST_ROW_HEIGHT, overscan: 12 });
   // 시각/크기 기준 정렬이면 그 값을 열로 함께 보여준다.
   const sortValue: { label: string; column: string; mono: boolean } | null =
-    sortKey === "created" ? { label: "생성 시각", column: "si_created", mono: true }
-    : sortKey === "modified" ? { label: "수정 시각", column: "si_modified", mono: true }
-    : sortKey === "accessed" ? { label: "접근 시각", column: "si_accessed", mono: true }
-    : sortKey === "mft_modified" ? { label: "MFT 수정 시각", column: "si_mft_modified", mono: true }
+    MFT_TIME_SORTS[sortKey] ? { ...MFT_TIME_SORTS[sortKey], mono: true }
     : sortKey === "size" ? { label: "크기", column: "file_size", mono: true }
     : null;
   const grid = sortValue ? "minmax(0, 3fr) 176px minmax(108px, 1fr)" : "minmax(0, 3fr) minmax(108px, 1fr)";
@@ -568,10 +578,7 @@ function MftRecordList({ rows, total, loading, error, query, bmRowids, selectedR
         options={[
           { value: "path", label: "경로" },
           { value: "name", label: "파일 이름" },
-          { value: "created", label: "생성 시각" },
-          { value: "modified", label: "수정 시각" },
-          { value: "accessed", label: "접근 시각" },
-          { value: "mft_modified", label: "MFT 수정 시각" },
+          ...Object.entries(MFT_TIME_SORTS).map(([value, spec]) => ({ value, label: spec.label })),
           { value: "size", label: "크기" },
         ]}
         value={sortKey}

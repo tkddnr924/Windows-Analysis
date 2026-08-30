@@ -21,6 +21,7 @@ import Popover from "@mui/material/Popover";
 import Tooltip from "@mui/material/Tooltip";
 import RowDetailPanel from "./RowDetailPanel";
 import { tagsForPath, type Tag } from "@/lib/tagging";
+import { resolveKnownFolderPath } from "@/lib/knownFolders";
 import { inRange, rangeActive, type TimeRange } from "@/lib/timeRange";
 import type { CsvData, FetchLinkedRows } from "@/lib/types";
 import { resolveAccountDisplay, type AccountDirectory } from "@/lib/accountIdentity";
@@ -44,7 +45,7 @@ const EXECUTABLE_RE = /\.(exe|dll|sys|scr|com|bat|cmd|ps1|vbs|js|jse|wsf|hta|msi
 const ROW_HEIGHT = 70; // 카드 62 + 간격 8
 const SORT_LABEL: Record<SortKey, string> = { risk: "주의 항목 우선", recent: "최근순", oldest: "오래된순" };
 const SOURCE_LABELS: Record<string, string> = {
-  Amcache: "Amcache", Prefetch: "Prefetch", UserAssist: "UserAssist", SRUM: "SRUM", BAM: "BAM", AppCompatCache: "ShimCache",
+  Amcache: "Amcache", Prefetch: "Prefetch", UserAssist: "UserAssist", SRUM: "SRUM", BAM: "BAM", AppCompatCache: "ShimCache", Timeline: "Timeline",
 };
 
 interface Entry {
@@ -226,7 +227,7 @@ export default function ExecutionHistoryView({ data, onNavigate, onFetchLinkedRo
                   onMouseLeave={(event) => { if (!bookmarked) event.currentTarget.style.background = "transparent"; }}
                 >
                   <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 13, fontWeight: 650 }}>{entry.name}</span>
-                  <span title={entry.path || undefined} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text-dim)", fontSize: 12 }}>{entry.path || "경로 정보 없음"}</span>
+                  <span title={entry.path || undefined} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text-dim)", fontSize: 12 }}>{resolveKnownFolderPath(entry.path) ?? entry.path ?? "경로 정보 없음"}</span>
                   <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text-dim)", fontSize: 12 }}>{sourceLabel(entry.source)}</span>
                   <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: accountDisplayLabel(entry.row, accountDirectory) === "계정 정보 없음" ? "var(--text-faint)" : "var(--text-dim)", fontSize: 12 }}>{accountDisplayLabel(entry.row, accountDirectory)}</span>
                   <Tooltip title={bookmarked ? "북마크 해제" : "북마크"}><span><IconButton className={bookmarked ? "dfir-bookmark-control" : undefined} aria-label={bookmarked ? "북마크 해제" : "북마크"} disabled={!onToggleBookmark} size="small" onClick={(event) => { event.stopPropagation(); onToggleBookmark?.(entry.rowid); }} sx={{ color: bookmarked ? "var(--bookmark)" : "var(--text-faint)" }}>{bookmarked ? <BookmarkIcon sx={{ fontSize: 17 }} /> : <BookmarkBorderOutlinedIcon sx={{ fontSize: 17 }} />}</IconButton></span></Tooltip>
@@ -265,7 +266,7 @@ export default function ExecutionHistoryView({ data, onNavigate, onFetchLinkedRo
                         {entry.tags.map((tag) => { const tagColor = tag.severity === "danger" ? "var(--danger)" : "var(--warning)"; return <span key={tag.label} title={tag.description} style={{ ...artifactTagStyle, color: tagColor, border: `1px solid ${tagColor}` }}>{tag.label}</span>; })}
                         {executableNote(entry.name) && <span title={executableNote(entry.name)} style={{ flexShrink: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "#5bc8c0", border: "1px solid #5bc8c0", borderRadius: "var(--radius-sm)", padding: "1px 7px", fontSize: 11, fontWeight: 650 }}>{executableNote(entry.name)}</span>}
                       </span>
-                      <span title={entry.path || undefined} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: entry.path ? "var(--text-dim)" : "var(--text-faint)", fontSize: 12, fontFamily: "var(--mono)" }}>{entry.path || "경로 정보 없음"}</span>
+                      <span title={entry.path || undefined} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: entry.path ? "var(--text-dim)" : "var(--text-faint)", fontSize: 12, fontFamily: "var(--mono)" }}>{resolveKnownFolderPath(entry.path) ?? entry.path ?? "경로 정보 없음"}</span>
                     </span>
                     <span style={{ width: 96, flexShrink: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text-dim)", fontSize: 12 }}>{sourceLabel(entry.source)}</span>
                     <span style={{ width: 148, flexShrink: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: accountLabel === "계정 정보 없음" ? "var(--text-faint)" : "var(--text-dim)", fontSize: 12 }}>{accountLabel}</span>

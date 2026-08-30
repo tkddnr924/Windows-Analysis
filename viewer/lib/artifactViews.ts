@@ -1,4 +1,5 @@
 import { tagsForBoolean, tagsForDangerType, tagsForEventLevel, tagsForNameMismatch, tagsForPath, type Tag } from "./tagging";
+import { resolveKnownFolderPath } from "@/lib/knownFolders";
 import { executableNote } from "./executableCatalog";
 import { lookupEventCatalog, parseEventData, extractEventField, extractPsClassicField, tagsForSecurityEvent, EVENT_QUICK_FIELDS, LOGON_TYPE_LABELS } from "./eventCatalog";
 
@@ -130,7 +131,7 @@ export interface ArtifactViewSpec {
    * Overview correlations (TargetInfo, ...) read as summaries/dashboards, not
    * spreadsheets, so each gets a purpose-built view.
    */
-  customView?: "targetInfo" | "executionHistory" | "powershellFlow" | "defender" | "registryFindings" | "rdpCache" | "browserHistory" | "smb" | "bits" | "firewall" | "scheduledTasks" | "wer" | "mft";
+  customView?: "targetInfo" | "executionHistory" | "powershellFlow" | "defender" | "registryFindings" | "rdpCache" | "browserHistory" | "smb" | "bits" | "firewall" | "scheduledTasks" | "wer" | "mft" | "wmiPersistence" | "usnJrnl";
   /**
    * In the sidebar, present this table split by this column: instead of one
    * row for the whole table, the category lists one entry per distinct value
@@ -392,8 +393,98 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
   WER_Reports: {
     customView: "wer",
     title: (r) => r.AppName || "(WER)",
+    // timestamp = 보고서의 EventTime(크래시 발생 시각). 악성코드 크래시·
+    // 익스플로잇 실패 시각의 유일한 타임라인 공급원이라 편입한다 (T6 확정:
+    // WER만 편입, RegistryFindings·CacheEntries·하이브 last_write는 제외 유지).
+    timelineField: "timestamp",
+    timelineTitle: (r) => r.AppName || basename(r.AppPath) || "(WER)",
+    timelineSubtitle: (r) => [r.EventType, r.AppPath].filter(Boolean).join(" · "),
     priorityColumns: ["timestamp", "EventType", "AppName", "AppPath", "TargetAppId", "ReportIdentifier"],
     sections: [{ heading: "보고서", fields: [{ key: "EventType" }, { key: "AppPath" }, { key: "ReportIdentifier" }, { key: "report", kind: "json" }] }],
+  },
+  // Windows Timeline (ActivitiesCache.db) — 계정별 앱 실행·포커스·문서 활동.
+  // 실행/열기(type 5)는 실행 이력(ExecutionHistory)에도 합류한다.
+  Timeline_Activities: {
+    title: (r) => r.app_name || r.display_text || "(Timeline)",
+    subtitle: (r) => r.kind || "",
+    timelineField: "timestamp",
+    priorityColumns: ["timestamp", "kind", "app_name", "app_path", "display_text", "content_uri", "active_duration_s", "account"],
+    sections: [
+      { heading: "활동 정보", fields: [
+        { key: "kind", label: "활동 유형", kind: "badge" },
+        { key: "app_name", label: "앱 이름" },
+        { key: "resolved_app_path", label: "실행 경로 (변환)", kind: "path", compute: (r) => resolveKnownFolderPath(r.app_path || "") ?? "" },
+        { key: "app_path", label: "원본 경로", kind: "path" },
+        { key: "display_text", label: "표시 텍스트" },
+        { key: "content_uri", label: "콘텐츠 URI" },
+        { key: "active_duration_s", label: "사용 시간 (초)" },
+        { key: "account", label: "계정", kind: "account" },
+      ]},
+      { heading: "시각", fields: [
+        { key: "start_time", label: "시작" },
+        { key: "end_time", label: "종료" },
+        { key: "last_modified", label: "마지막 수정" },
+        { key: "expiration", label: "만료" },
+      ]},
+      { heading: "원본", fields: [
+        { key: "source_table", label: "원본 테이블" },
+        { key: "activity_type", label: "ActivityType" },
+        { key: "activity_id", label: "활동 ID" },
+        { key: "platform_device_id", label: "장치 ID" },
+        { key: "payload", label: "페이로드", kind: "json" },
+      ]},
+    ],
+  },
+  // $UsnJrnl:$J — NTFS 변경 저널. 수십만 행 규모라 UsnJrnlView가 서버
+  // 페이지네이션(usnjrnl_page)으로 직접 조회한다.
+  UsnJrnl_Records: {
+    customView: "usnJrnl",
+    title: (r) => r.filename || "(USN)",
+    subtitle: (r) => r.reason || "",
+    timelineField: "timestamp",
+    priorityColumns: ["timestamp", "filename", "reason", "file_attributes", "mft_entry", "parent_mft_entry", "usn"],
+    sections: [
+      { heading: "변경 이벤트", fields: [
+        { key: "filename", label: "파일명", kind: "path" },
+        { key: "renamed_from", label: "이전 이름", kind: "path" },
+        { key: "reason", label: "변경 사유", kind: "code" },
+        { key: "group_count", label: "묶인 기록 수" },
+        { key: "file_attributes", label: "파일 속성" },
+        { key: "source_info", label: "소스 정보" },
+      ]},
+      { heading: "NTFS 참조", fields: [
+        { key: "usn", label: "USN" },
+        { key: "mft_entry", label: "MFT 엔트리" },
+        { key: "parent_mft_entry", label: "부모 MFT 엔트리" },
+        { key: "file_reference", label: "파일 참조 번호" },
+        { key: "parent_file_reference", label: "부모 파일 참조 번호" },
+        { key: "security_id", label: "보안 ID" },
+      ]},
+    ],
+  },
+  // WMI Repository (OBJECTS.DATA) — 이벤트 구독 3요소(바인딩·필터·컨슈머)를
+  // 시그니처 스캔으로 추출한 findings 테이블. 시각 정보는 없다.
+  WMI_Persistence: {
+    customView: "wmiPersistence",
+    title: (r) => r.name || "(WMI)",
+    subtitle: (r) => r.kind || "",
+    priorityColumns: ["kind", "name", "consumer_type", "filter_name", "consumer_name", "query", "query_language", "namespace", "details"],
+    sections: [
+      { heading: "구독 구성", fields: [
+        { key: "kind", label: "구분", kind: "badge" },
+        { key: "filter_name", label: "필터 이름" },
+        { key: "consumer_name", label: "컨슈머 이름" },
+        { key: "consumer_type", label: "컨슈머 유형" },
+      ]},
+      { heading: "필터 조건", fields: [
+        { key: "query", label: "WQL 쿼리", kind: "code" },
+        { key: "query_language", label: "쿼리 언어" },
+        { key: "namespace", label: "네임스페이스" },
+      ]},
+      { heading: "컨슈머 값", fields: [
+        { key: "details", label: "세부 값", kind: "code" },
+      ]},
+    ],
   },
   // $MFT — Explorer-style browse (MftView queries SQLite lazily, since the
   // table can hold ~1M rows). No timelineField: each record carries eight
@@ -486,10 +577,12 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
   ExecutionHistory: {
     customView: "executionHistory",
     // Feed the master timeline from this curated stream, not the raw execution
-    // artifacts: it's the only place SRUM (first sighting), AppCompatCache/
-    // ShimCache, BAM and UserAssist get a normalized timestamp, and it already
-    // merges + dedups Amcache/Prefetch. The raw Amcache/Prefetch specs drop
-    // their own timelineField so those don't double-count here.
+    // artifacts: it's the only place SRUM (first sighting), BAM and UserAssist
+    // get a normalized timestamp, and it already merges + dedups Amcache/
+    // Prefetch. The raw Amcache/Prefetch specs drop their own timelineField so
+    // those don't double-count here. AppCompatCache/ShimCache is deliberately
+    // excluded (file-mtime, not run time — v0.9.35); it stays in
+    // RegistryFindings with that caveat.
     timelineField: "timestamp",
     title: (r) => `ExecutionHistory:${executionSourceLabel(r)}`,
     timelineTitle: (r) => r.program_name || basename(r.program_path) || "(이름 없음)",
@@ -515,6 +608,8 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
       ]},
       { heading: "UserAssist 실행 정보", fields: [
         { key: "program_name", label: "실행 항목", compute: (r) => executionValue("userAssist", "program_name", r) },
+        // KNOWNFOLDERID GUID 접두 경로는 실제 경로로 변환해 함께 보여 준다.
+        { key: "program_path", label: "실행 경로 (변환)", kind: "path", compute: (r) => resolveKnownFolderPath(executionValue("userAssist", "program_path", r)) ?? "" },
         { key: "program_path", label: "원본 경로", kind: "path", compute: (r) => executionValue("userAssist", "program_path", r) },
         { key: "user", label: "실행 계정", kind: "account", compute: (r) => executionValue("userAssist", "user", r) },
         { key: "run_count", label: "실행 횟수", compute: (r) => executionValue("userAssist", "run_count", r) },
@@ -608,6 +703,20 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
         compute: (r) => [r.trigger_types, r.trigger_start && `시작 경계 ${r.trigger_start}`].filter(Boolean).join(" · "),
       },
       { key: "description", label: "설명" },
+    ]},
+    // TaskScheduler%4Operational 이벤트(100/102/129/200 등)를 태스크 경로로
+    // 조인한 실행 요약 — "정의만 있고 실제로 언제 돌았는지 모름" 갭 해소.
+    // 수집 로그에 실행 기록이 없는 태스크는 섹션 전체가 자동으로 숨겨진다.
+    { heading: "실행 기록 (이벤트 로그)", fields: [
+      { key: "last_run_time", label: "마지막 실행 시각" },
+      { key: "run_count", label: "실행 횟수 (수집 로그 기준)" },
+      {
+        key: "last_run_result",
+        label: "마지막 실행 결과",
+        kind: "badge",
+        badgeColors: { "성공": "#3fb950", "실패": "#f85149" },
+      },
+      { key: "last_run_action", label: "실제 생성 프로세스", kind: "path" },
     ]}],
   },
 
@@ -651,6 +760,9 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
         },
       },
       { key: "visit_count", label: "방문 횟수", compute: (r) => r.kind === "visit" ? r.visit_count : "" },
+      // 주소창에 URL을 직접 입력해 이동한 횟수 — 링크 경유 방문과 달리
+      // "의도적으로 찾아간 사이트"임을 입증하는 값(T7).
+      { key: "typed_count", label: "주소창 직접 입력 횟수", compute: (r) => r.kind === "visit" ? r.typed_count : "" },
       { key: "detail", label: "저장 경로", kind: "path", compute: (r) => r.kind === "download" ? r.detail : "" },
       {
         key: "size_bytes",
@@ -707,6 +819,65 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     ],
   },
 
+  // IE10+/레거시 Edge WebCacheV##.dat 방문 기록 (컨테이너: History/MSHist…).
+  // Url은 "Visited: 사용자@URL" 원문 그대로 — 가공하지 않는다.
+  IEWebCache_History: {
+    title: (r) => r.url || "(no url)",
+    subtitle: (r) => r.container || "",
+    priorityColumns: ["accessed_time", "url", "access_count", "container", "account"],
+    sections: [
+      { heading: "상세", fields: [
+        { key: "accessed_time", label: "접근 시각" },
+        { key: "modified_time", label: "수정 시각" },
+        { key: "expiry_time", label: "만료 시각" },
+        { key: "access_count", label: "접근 횟수" },
+        { key: "url", label: "URL", kind: "path" },
+        { key: "container", label: "컨테이너" },
+        { key: "account", label: "계정", kind: "account" },
+      ]},
+    ],
+  },
+
+  // WebCache iedownload 컨테이너 — metadata는 다운로드 레코드 블롭에서 추출한
+  // UTF-16 문자열(원본 URL·저장 경로 등)이다.
+  IEWebCache_Downloads: {
+    title: (r) => r.url || "(no url)",
+    subtitle: (r) => r.metadata || "",
+    priorityColumns: ["accessed_time", "url", "metadata", "account"],
+    sections: [
+      { heading: "상세", fields: [
+        { key: "accessed_time", label: "접근 시각" },
+        { key: "modified_time", label: "수정 시각" },
+        { key: "url", label: "URL", kind: "path" },
+        { key: "metadata", label: "레코드 내 문자열(저장 경로 등)", kind: "code" },
+        { key: "container", label: "컨테이너" },
+        { key: "account", label: "계정", kind: "account" },
+      ]},
+    ],
+  },
+
+  // IE5~9 index.dat (XP/Vista/Win7). History.IE5 일별 컨테이너(MSHist…)의
+  // 시각은 로컬 시간으로 기록되는 것으로 알려져 있음 — 표기는 원시 FILETIME
+  // 기준(파서 주석 참조).
+  IEIndexDat_Records: {
+    title: (r) => r.url || "(no url)",
+    subtitle: (r) => r.container || "",
+    badges: [{ key: "record_type", kind: "badge" }],
+    priorityColumns: ["accessed_time", "record_type", "url", "hits", "container", "account"],
+    sections: [
+      { heading: "상세", fields: [
+        { key: "record_type", label: "레코드 종류" },
+        { key: "accessed_time", label: "접근 시각" },
+        { key: "modified_time", label: "수정 시각" },
+        { key: "hits", label: "접근 횟수" },
+        { key: "url", label: "URL", kind: "path" },
+        { key: "filename", label: "캐시 파일명" },
+        { key: "container", label: "컨테이너" },
+        { key: "account", label: "계정", kind: "account" },
+      ]},
+    ],
+  },
+
   RegistryFindings: {
     customView: "registryFindings",
     title: (r) => r.name || "(no name)",
@@ -747,10 +918,15 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
       { key: "category", label: "분류" },
       { key: "action", label: "조치" },
       { key: "action_time", label: "조치 시각" },
+      // Defender가 요구한 후속 조치(재부팅 필요 등) — 빌더가 만들지만
+      // 스펙에 없어 "전체 필드 보기"에만 묻혀 있던 컬럼(T7). detection_user는
+      // 빌더가 같은 값을 user에도 기록해 "사용자" 필드로 이미 표시된다.
+      { key: "additional_actions", label: "추가 조치" },
       { key: "process", label: "프로세스" },
       { key: "user", label: "사용자" },
       { key: "source", label: "탐지원" },
       { key: "detail", label: "경로/내용" },
+      { key: "raw_line", label: "원본 라인", kind: "code" },
     ]}],
   },
 
@@ -815,9 +991,11 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     ]}],
   },
 
-  // Inbound SMB / network-logon activity (SMBServer/Security 551·1009 and, when
-  // Security auditing is on, 4624/4625 LogonType 3). Same session-flow view as
-  // RDP — repeated failures from one IP collapse into a burst, which reads as a
+  // SMB / network-logon activity, both directions: inbound (SMBServer/Security
+  // 551·1009 and, when Security auditing is on, 4624/4625 LogonType 3) and
+  // outbound (SmbClient/Security 31010 etc. — this host reaching out to remote
+  // shares, the lateral-movement direction). Same session-flow view as RDP —
+  // repeated failures from one IP collapse into a burst, which reads as a
   // brute-force / lateral-movement attempt.
   SmbHistory: {
     customView: "smb",
@@ -995,15 +1173,29 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     ],
     // Filename-vs-internal-name mismatch is a classic masquerading signal
     // on top of the general suspicious-path check.
+    // 구형(Win7/2008R2, Root\File) 포맷 행은 full_path/created/last_modified
+    // 컬럼으로 식별된다(신형 스키마엔 없는 컬럼). 구형엔 HiddenArp·내부
+    // 파일명·링크 시각이 존재하지 않아 관련 배지·태그가 절대 발화하지
+    // 않으므로, "특이사항 없음"과 "판정 불가"를 화면에서 구분하게 알린다.
     tags: (r) => tagsForPath(r.lower_case_long_path).concat(executableNoteTags(r.name || basename(r.lower_case_long_path)))
       .concat(tagsForNameMismatch(r.name, r.original_file_name))
-      .concat(tagsForMissingAmcachePublisher(r.publisher)),
+      .concat(tagsForMissingAmcachePublisher(r.publisher))
+      .concat(r.full_path || r.created || r.last_modified ? [{
+        label: "구형 Amcache 포맷",
+        severity: "info" as const,
+        description: "이 하이브는 구형(Win7/2008R2, Root\\File) 포맷입니다. 신형 포맷의 내부(원본) 파일명·링크(빌드) 시각·제어판 숨김(HiddenArp) 정보는 이 포맷에 존재하지 않아 관련 배지·판정이 표시되지 않습니다 — 특이사항이 없어서가 아니라 판정 자체가 불가능한 항목입니다.",
+      }] : []),
     // No timelineField: reaches the master timeline via ExecutionHistory.
     priorityColumns: ["timestamp", "name", "lower_case_long_path", "product_name", "publisher", "size"],
     sections: [
       { heading: "시간", fields: [
         { key: "timestamp", label: "레지스트리 키 시각" },
         { key: "link_date", label: "링크(빌드) 시각" },
+        // 구형(Root\File) 포맷 전용 — 신형 데이터에는 컬럼이 없어 자동으로
+        // 숨겨진다. 파서가 FILETIME을 KST로 변환해 둔 실제 증거 시각인데
+        // 스펙 밖이라 "전체 필드 보기"에만 묻혀 있던 것을 승격.
+        { key: "created", label: "파일 생성 시각 (구형 포맷)" },
+        { key: "last_modified", label: "파일 수정 시각 (구형 포맷)" },
       ]},
       { heading: "경로", fields: [
         { key: "lower_case_long_path", kind: "path" },

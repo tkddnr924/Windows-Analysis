@@ -934,6 +934,21 @@ async fn run_host(
             }
             record_child_exit(&log_path, exit_code);
             let terminal = terminal_pipeline_status(&host_dir, exit_code);
+            // 발행이 일어난 실행(complete/partial)은 이 호스트의 테이블을 다시
+            // 썼다 — 이전 북마크의 rowid 참조가 무효라 삭제한다.
+            if terminal == "complete" || terminal == "partial" {
+                let removed = remove_host_bookmarks(&cd, &options.host_id);
+                if removed > 0 {
+                    emit_pipeline_event(
+                        &app,
+                        &run_id,
+                        &options.host_id,
+                        "running",
+                        "lifecycle",
+                        format!("[LIFECYCLE] 재파싱으로 이 호스트의 이전 북마크 {removed}건 삭제"),
+                    );
+                }
+            }
             emit_pipeline_event(
                 &app,
                 &run_id,
@@ -3036,6 +3051,182 @@ struct MftChildrenPage {
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // 검색·필터·기간·페이징 인자 — tauri command 시그니처
+fn usnjrnl_page(
+    full_path: String,
+    search: String,
+    reason: String,
+    start: String,
+    end: String,
+    ascending: bool,
+    offset: i64,
+    limit: i64,
+) -> Result<CsvData, String> {
+    let conn = open_ro(&full_path)?;
+    let table = "UsnJrnl_Records";
+    if !table_names(&conn).iter().any(|name| name == table) {
+        return Err("USN 저널 테이블을 찾을 수 없습니다".to_string());
+    }
+    let mut columns = table_columns(&conn, table);
+    columns.push("renamed_from".to_string());
+    columns.push("group_count".to_string());
+    let limit = limit.clamp(1, 500);
+    let offset = offset.max(0);
+
+    let mut clauses: Vec<String> = Vec::new();
+    let mut params: Vec<String> = Vec::new();
+    if !search.trim().is_empty() {
+        params.push(format!("%{}%", search.trim()));
+        clauses.push(format!("filename LIKE ?{}", params.len()));
+    }
+    // 상태(대표 유형) 필터 — 뷰의 배지 판정과 같은 우선순위(삭제 > 생성 >
+    // 이름 변경 > 데이터 > 정보 > 보안)로 걸어 배지와 필터 결과가 일치한다.
+    match reason.as_str() {
+        "delete" => clauses.push("reason LIKE '%FILE_DELETE%'".into()),
+        "create" => clauses.push(
+            "reason LIKE '%FILE_CREATE%' AND reason NOT LIKE '%FILE_DELETE%'".into(),
+        ),
+        "rename" => clauses.push(
+            "reason LIKE '%RENAME\\_%' ESCAPE '\\' AND reason NOT LIKE '%FILE_DELETE%' AND reason NOT LIKE '%FILE_CREATE%'".into(),
+        ),
+        "data" => clauses.push(
+            "reason LIKE '%DATA\\_%' ESCAPE '\\' AND reason NOT LIKE '%FILE_DELETE%' AND reason NOT LIKE '%FILE_CREATE%' AND reason NOT LIKE '%RENAME\\_%' ESCAPE '\\'".into(),
+        ),
+        "info" => clauses.push(
+            "reason LIKE '%BASIC\\_INFO\\_CHANGE%' ESCAPE '\\' AND reason NOT LIKE '%FILE_DELETE%' AND reason NOT LIKE '%FILE_CREATE%' AND reason NOT LIKE '%RENAME\\_%' ESCAPE '\\' AND reason NOT LIKE '%DATA\\_%' ESCAPE '\\'".into(),
+        ),
+        "security" => clauses.push(
+            "reason LIKE '%SECURITY\\_CHANGE%' ESCAPE '\\' AND reason NOT LIKE '%FILE_DELETE%' AND reason NOT LIKE '%FILE_CREATE%' AND reason NOT LIKE '%RENAME\\_%' ESCAPE '\\' AND reason NOT LIKE '%DATA\\_%' ESCAPE '\\' AND reason NOT LIKE '%BASIC\\_INFO\\_CHANGE%' ESCAPE '\\'".into(),
+        ),
+        _ => {}
+    }
+    if !start.trim().is_empty() {
+        params.push(start.trim().to_string());
+        clauses.push(format!("timestamp >= ?{}", params.len()));
+    }
+    if !end.trim().is_empty() {
+        params.push(end.trim().to_string());
+        clauses.push(format!("timestamp <= ?{}", params.len()));
+    }
+    let where_clause = if clauses.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", clauses.join(" AND "))
+    };
+
+    // USN 레코드는 파일 핸들이 닫힐 때까지 사유가 누적되며 여러 행으로
+    // 남는다. 같은 파일(참조 번호)·같은 시각의 기록을 한 행동으로 묶는다 —
+    // 누적 체인과 이름 변경(OLD/NEW 쌍)이 모두 하나로 합쳐진다.
+    let base = format!("SELECT rowid AS __rowid, * FROM {}{}", q(table), where_clause);
+    let refs: Vec<&dyn rusqlite::ToSql> =
+        params.iter().map(|value| value as &dyn rusqlite::ToSql).collect();
+
+    let count_sql = format!(
+        "SELECT COUNT(*) FROM (SELECT 1 FROM ({base}) GROUP BY file_reference, timestamp)"
+    );
+    let row_count: i64 = conn
+        .query_row(&count_sql, refs.as_slice(), |row| row.get(0))
+        .map_err(|error| format!("USN 저널 행 수를 읽지 못했습니다: {error}"))?;
+
+    let direction = if ascending { "ASC" } else { "DESC" };
+    let keys_sql = format!(
+        "SELECT file_reference, timestamp FROM ({base}) GROUP BY file_reference, timestamp ORDER BY timestamp {direction}, MAX(CAST(usn AS INTEGER)) {direction} LIMIT {limit} OFFSET {offset}"
+    );
+    let keys = query_rows(&conn, &keys_sql, refs.as_slice())?;
+    if keys.is_empty() {
+        return Ok(CsvData {
+            columns,
+            rows: Vec::new(),
+            row_count,
+        });
+    }
+
+    // 이번 페이지 묶음의 구성 기록만 다시 읽는다 (USN 오름차순 = 기록 순서).
+    let mut member_params = params.clone();
+    let mut tuples = Vec::new();
+    for key in &keys {
+        let fr = key.get("file_reference").and_then(Value::as_str).unwrap_or("");
+        let ts = key.get("timestamp").and_then(Value::as_str).unwrap_or("");
+        member_params.push(fr.to_string());
+        let a = member_params.len();
+        member_params.push(ts.to_string());
+        let b = member_params.len();
+        tuples.push(format!("(?{a}, ?{b})"));
+    }
+    let members_sql = format!(
+        "SELECT * FROM ({base}) WHERE (file_reference, timestamp) IN (VALUES {}) ORDER BY CAST(usn AS INTEGER) ASC",
+        tuples.join(", ")
+    );
+    let member_refs: Vec<&dyn rusqlite::ToSql> = member_params
+        .iter()
+        .map(|value| value as &dyn rusqlite::ToSql)
+        .collect();
+    let members = query_rows(&conn, &members_sql, member_refs.as_slice())?;
+
+    // 페이지 순서를 유지하며 묶음별로 병합한다.
+    let mut grouped: std::collections::HashMap<(String, String), Vec<Map<String, Value>>> =
+        std::collections::HashMap::new();
+    for member in members {
+        let fr = member
+            .get("file_reference")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let ts = member
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        grouped.entry((fr, ts)).or_default().push(member);
+    }
+    let mut rows = Vec::new();
+    for key in &keys {
+        let fr = key.get("file_reference").and_then(Value::as_str).unwrap_or("");
+        let ts = key.get("timestamp").and_then(Value::as_str).unwrap_or("");
+        let Some(group) = grouped.remove(&(fr.to_string(), ts.to_string())) else {
+            continue;
+        };
+        let Some(representative) = group.last().cloned() else {
+            continue;
+        };
+        // 사유 플래그 합집합 — 기록 순서대로 처음 등장한 순서를 보존한다.
+        let mut flags: Vec<String> = Vec::new();
+        let mut renamed_from = String::new();
+        let rep_name = representative
+            .get("filename")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        for member in &group {
+            let member_reason = member.get("reason").and_then(Value::as_str).unwrap_or("");
+            for flag in member_reason.split('|') {
+                if !flag.is_empty() && !flags.iter().any(|f| f == flag) {
+                    flags.push(flag.to_string());
+                }
+            }
+            if member_reason.contains("RENAME_OLD_NAME") {
+                let old = member.get("filename").and_then(Value::as_str).unwrap_or("");
+                if !old.is_empty() && old != rep_name {
+                    renamed_from = old.to_string();
+                }
+            }
+        }
+        let mut row = representative;
+        row.insert("reason".into(), Value::String(flags.join("|")));
+        row.insert("renamed_from".into(), Value::String(renamed_from));
+        row.insert(
+            "group_count".into(),
+            Value::String(group.len().to_string()),
+        );
+        rows.push(row);
+    }
+    Ok(CsvData {
+        columns,
+        rows,
+        row_count,
+    })
+}
+
+#[tauri::command]
 #[allow(clippy::too_many_arguments)] // 재귀 목록 전용 필터 인자들 — tauri command 시그니처
 fn mft_records_page(
     full_path: String,
@@ -3092,6 +3283,12 @@ fn mft_records_page(
         "modified" => "si_modified",
         "accessed" => "si_accessed",
         "mft_modified" => "si_mft_modified",
+        // $FILE_NAME(0x30) 기준 — timestomping은 주로 $SI만 조작되므로
+        // 조작 전 시각으로 표를 정렬·필터하는 수단(T7).
+        "fn_created" => "fn_created",
+        "fn_modified" => "fn_modified",
+        "fn_accessed" => "fn_accessed",
+        "fn_mft_modified" => "fn_mft_modified",
         _ => "si_created",
     };
     if let Some(start) = time_start.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
@@ -3118,12 +3315,15 @@ fn mft_records_page(
     // 정렬 키 화이트리스트 — 시간 정렬은 값 없는 레코드를 항상 뒤로 보낸다.
     let order_by = match sort_key.as_deref().unwrap_or("path") {
         "name" => "file_name COLLATE NOCASE".to_string(),
-        key @ ("created" | "modified" | "accessed" | "mft_modified") => {
+        key @ ("created" | "modified" | "accessed" | "mft_modified" | "fn_created"
+        | "fn_modified" | "fn_accessed" | "fn_mft_modified") => {
             let column = match key {
                 "created" => "si_created",
                 "modified" => "si_modified",
                 "accessed" => "si_accessed",
-                _ => "si_mft_modified",
+                "mft_modified" => "si_mft_modified",
+                // fn_* 키는 컬럼명과 동일 ($FILE_NAME 타임스탬프).
+                other => other,
             };
             format!("CASE WHEN {column} = '' THEN 1 ELSE 0 END, {column}")
         }
@@ -3311,6 +3511,12 @@ fn search_case_blocking(
                     "last_write",
                     "created_at",
                     "modified_time",
+                    // 후보에 없어 기간 검색에서 통째로 빠지던 테이블들(T7):
+                    // MFT_Records(si_created) · CacheEntries(response_time) ·
+                    // BROWSER 방문 기록 원본(urls.last_visit_time).
+                    "si_created",
+                    "response_time",
+                    "last_visit_time",
                 ]
                 .iter()
                 .find(|candidate| {
@@ -3321,8 +3527,21 @@ fn search_case_blocking(
                     cols.iter()
                         .find(|column| column.eq_ignore_ascii_case(candidate))
                 });
-                let timestamp_expr = timestamp_column
-                    .map(|column| format!("CAST({} AS TEXT)", q(column)))
+                // last_visit_time은 Chrome/WebKit 에폭(1601-01-01 기준 µs) 원시
+                // 정수라 텍스트 경계와 비교할 수 없다 — 다른 파서 출력과 같은
+                // 로컬 "YYYY-MM-DD HH:MM:SS" 문자열로 변환해 비교·표시한다.
+                let timestamp_sql = timestamp_column.map(|column| {
+                    if column.eq_ignore_ascii_case("last_visit_time") {
+                        format!(
+                            "CASE WHEN CAST({c} AS INTEGER) > 0 THEN datetime(CAST({c} AS INTEGER) / 1000000 - 11644473600, 'unixepoch', 'localtime') ELSE '' END",
+                            c = q(column)
+                        )
+                    } else {
+                        format!("CAST({} AS TEXT)", q(column))
+                    }
+                });
+                let timestamp_expr = timestamp_sql
+                    .clone()
                     .unwrap_or_else(|| "''".to_string());
                 // Overview tables retain a raw-evidence pointer. Carry only a
                 // bounded copy so the renderer can bookmark that exact source
@@ -3348,20 +3567,12 @@ fn search_case_blocking(
                 }
                 let mut conditions = vec![format!("({})", where_)];
                 let mut params: Vec<&dyn rusqlite::ToSql> = vec![&like];
-                if let (Some(bound), Some(column)) = (start.as_ref(), timestamp_column) {
-                    conditions.push(format!(
-                        "CAST({} AS TEXT) >= ?{}",
-                        q(column),
-                        params.len() + 1
-                    ));
+                if let (Some(bound), Some(expr)) = (start.as_ref(), timestamp_sql.as_ref()) {
+                    conditions.push(format!("{} >= ?{}", expr, params.len() + 1));
                     params.push(bound);
                 }
-                if let (Some(bound), Some(column)) = (end.as_ref(), timestamp_column) {
-                    conditions.push(format!(
-                        "CAST({} AS TEXT) <= ?{}",
-                        q(column),
-                        params.len() + 1
-                    ));
+                if let (Some(bound), Some(expr)) = (end.as_ref(), timestamp_sql.as_ref()) {
+                    conditions.push(format!("{} <= ?{}", expr, params.len() + 1));
                     params.push(bound);
                 }
                 // Once this page has a continuation we still execute a tiny
@@ -4244,6 +4455,34 @@ fn write_bookmarks_path(case_dir: &Path, bookmarks: &[Value]) -> Result<(), Stri
         return Err(format!("북마크 저장에 실패했습니다: {error}"));
     }
     Ok(())
+}
+
+/// 재파싱이 발행되면 그 호스트를 가리키는 북마크는 rowid가 더 이상 같은
+/// 레코드를 보장하지 않는다 — 잘못된 행으로 연결되는 것을 막기 위해 해당
+/// 호스트의 북마크만 삭제한다 (2026-08-31 사용자 확정). 다른 호스트 북마크는
+/// 유지된다.
+fn remove_host_bookmarks(cases_dir: &Path, host_id: &str) -> usize {
+    let _guard = lock_bookmarks();
+    let Ok(bookmarks) = read_bookmarks_path(cases_dir) else {
+        return 0;
+    };
+    let needle = format!("/{host_id}/");
+    let kept: Vec<Value> = bookmarks
+        .iter()
+        .filter(|bookmark| {
+            !bookmark
+                .get("fullPath")
+                .and_then(Value::as_str)
+                .map(|path| path.contains(&needle))
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect();
+    let removed = bookmarks.len() - kept.len();
+    if removed > 0 && write_bookmarks_path(cases_dir, &kept).is_err() {
+        return 0;
+    }
+    removed
 }
 
 fn read_bookmarks(case_dir: &str) -> Result<Vec<Value>, String> {
@@ -5986,6 +6225,7 @@ fn main() {
             list_column_values,
             mft_children,
             mft_search,
+            usnjrnl_page,
             mft_records_page,
             mft_row,
             search_case,

@@ -11,6 +11,7 @@ import ChevronLeftOutlinedIcon from "@mui/icons-material/ChevronLeftOutlined";
 import ChevronRightOutlinedIcon from "@mui/icons-material/ChevronRightOutlined";
 import CircularProgress from "@mui/material/CircularProgress";
 import DesktopWindowsOutlinedIcon from "@mui/icons-material/DesktopWindowsOutlined";
+import DnsOutlinedIcon from "@mui/icons-material/DnsOutlined";
 import LanOutlinedIcon from "@mui/icons-material/LanOutlined";
 import ManageAccountsOutlinedIcon from "@mui/icons-material/ManageAccountsOutlined";
 import PersonOutlineIcon from "@mui/icons-material/PersonOutlineOutlined";
@@ -187,12 +188,12 @@ export default function TargetInfoView({ data, loadAccountEvents, timeRange, onN
   const bmRowids = useMemo(() => new Set((tableBookmarks ?? []).map((b) => b.rowid)), [tableBookmarks]);
   const [selectedAccount, setSelectedAccount] = useState<Account | null>(null);
   // 좌측 범주 내비게이션(25%)에서 고른 섹션을 우측(75%)에 표시한다.
-  const [section, setSection] = useState<"accounts" | "system" | "interfaces" | "networks">("accounts");
+  const [section, setSection] = useState<"accounts" | "system" | "interfaces" | "networks" | "hosts">("accounts");
   // 시스템 값 카드 클릭 → 즉시 복사, 잠깐 "복사됨" 표시.
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [selectedInterface, setSelectedInterface] = useState<NetInterface | null>(null);
   const [selectedNetwork, setSelectedNetwork] = useState<NetworkProfile | null>(null);
-  const { system, users, services, networks, interfaces, computerName, osSummary } = useMemo(() => {
+  const { system, users, services, networks, interfaces, hostsEntries, computerName, osSummary } = useMemo(() => {
     const rows = data.rows as Row[];
 
     // The source hives are parsed once per copy, so identical facts repeat —
@@ -210,6 +211,8 @@ export default function TargetInfoView({ data, loadAccountEvents, timeRange, onN
     const accounts: Account[] = [];
     const netMap = new Map<string, NetworkProfile>(); // profile name -> latest raw registry row
     const ifaceMap = new Map<string, NetInterface>(); // ip+guid -> interface
+    // hosts 파일 수동 등록 항목 — 유효 엔트리가 없으면 섹션 자체를 숨긴다.
+    const hostsEntries: { name: string; ip: string }[] = [];
 
     for (const r of dedup) {
       const cat = r.category;
@@ -227,6 +230,8 @@ export default function TargetInfoView({ data, loadAccountEvents, timeRange, onN
         if (!existing || r.timestamp > existing.timestamp) {
           netMap.set(name, { row: r, name, timestamp: r.timestamp || "" });
         }
+      } else if (cat === "HostsFile" && r.value) {
+        hostsEntries.push({ name: r.name || "", ip: r.value });
       } else if (cat === "NetworkInterface" && r.value) {
         const key = `${r.value}|${r.name}`;
         if (!ifaceMap.has(key)) {
@@ -258,7 +263,7 @@ export default function TargetInfoView({ data, loadAccountEvents, timeRange, onN
     const build = system.get("CurrentBuild")?.value || "";
     const osSummary = [product, build && `Build ${build}`].filter(Boolean).join(" · ");
 
-    return { system, users, services, networks, interfaces, computerName, osSummary };
+    return { system, users, services, networks, interfaces, hostsEntries, computerName, osSummary };
   }, [data.rows]);
 
   const orderedSystem = useMemo(() => {
@@ -284,6 +289,7 @@ export default function TargetInfoView({ data, loadAccountEvents, timeRange, onN
     { key: "system" as const, label: "시스템", icon: DesktopWindowsOutlinedIcon },
     { key: "interfaces" as const, label: "네트워크 어댑터", icon: LanOutlinedIcon },
     { key: "networks" as const, label: "연결한 네트워크", icon: WifiOutlinedIcon },
+    ...(hostsEntries.length > 0 ? [{ key: "hosts" as const, label: "호스트 파일 (hosts)", icon: DnsOutlinedIcon }] : []),
   ];
 
   return (
@@ -306,6 +312,19 @@ export default function TargetInfoView({ data, loadAccountEvents, timeRange, onN
 
         <section style={{ minWidth: 0, minHeight: 0, overflow: "auto", overscrollBehavior: "contain", padding: 14 }}>
           {section === "accounts" && <AccountRegistry accounts={accounts} bookmarkedRowids={bmRowids} onSelect={setSelectedAccount} />}
+
+          {section === "hosts" && (
+            <div style={{ display: "grid", gridTemplateColumns: "1fr", gap: 8, alignContent: "start" }}>
+              <div style={{ color: "var(--text-faint)", fontSize: 11.5, padding: "0 2px 2px" }}>hosts 파일에 수동 등록된 이름-주소 매핑 {hostsEntries.length}건</div>
+              {hostsEntries.map((entry, index) => (
+                <div key={`${entry.ip}-${entry.name}-${index}`} style={{ display: "flex", alignItems: "center", gap: 12, minHeight: 46, padding: "0 14px", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", background: "var(--bg-panel)" }}>
+                  <DnsOutlinedIcon sx={{ fontSize: 17, color: "var(--accent)", flexShrink: 0 }} />
+                  <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 13.5, fontWeight: 700 }}>{entry.name || "이름 없음"}</span>
+                  <span style={{ flexShrink: 0, color: "var(--text-dim)", fontFamily: "var(--mono)", fontSize: 12.5 }}>{entry.ip}</span>
+                </div>
+              ))}
+            </div>
+          )}
 
           {section === "system" && (
             orderedSystem.length === 0 ? (

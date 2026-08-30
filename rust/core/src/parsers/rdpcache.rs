@@ -54,6 +54,18 @@ fn account_of(path: &std::path::Path) -> String {
             }
         }
     }
+    // 원본 이미지 경로(…\Users\<계정>\…\Terminal Server Client\Cache\bcache24.bmc)
+    // 폴백 — 수집기 배치(RDP_CACHE/<계정>)가 아닐 때 계정을 복원한다.
+    for (i, p) in parts.iter().enumerate() {
+        if (p.eq_ignore_ascii_case("Users") || p.eq_ignore_ascii_case("Documents and Settings"))
+            && i + 1 < parts.len()
+        {
+            let a = parts[i + 1].trim();
+            if !a.is_empty() {
+                return a.to_string();
+            }
+        }
+    }
     // Fallback: the folder above a "Cache" directory.
     for (i, p) in parts.iter().enumerate() {
         if p.eq_ignore_ascii_case("Cache") && i >= 1 {
@@ -107,6 +119,150 @@ fn bgra_to_rgb(bgra: &[u8], count: usize) -> Vec<u8> {
     rgb
 }
 
+// ---------------------------------------------------------------------------
+// 구형(RDP8 이전, Win7 시대 클라이언트) bcache##.bmc 컨테이너 — T5.
+// 전역 헤더 없이 엔트리 나열: key(8) + width u16 + height u16 + data_len u32 +
+// params u32 + 픽셀 데이터(top-down). bpp는 data_len/(w*h)로 판별(1/2/3/4),
+// params bit 0x08은 RLE 압축(미지원 — corrupted 행으로 표면화, T0 원칙).
+// 레이아웃·픽셀 변환은 ANSSI BMC-Tools 준거.
+// ---------------------------------------------------------------------------
+
+const BMC_TILE_HEADER: usize = 0x14;
+const BMC_RLE_FLAG: u32 = 0x08;
+
+fn is_bmc_name(path: &Path) -> bool {
+    path.file_name()
+        .map(|n| {
+            let lower = n.to_string_lossy().to_ascii_lowercase();
+            lower.starts_with("bcache") && lower.ends_with(".bmc")
+        })
+        .unwrap_or(false)
+}
+
+/// RGB565(LE u16) → RGB — BMC-Tools와 같은 시프트 확장.
+fn rgb565_to_rgb(px: &[u8], count: usize) -> Vec<u8> {
+    let mut rgb = vec![0u8; count * 3];
+    for i in 0..count {
+        let v = u16::from_le_bytes([px[i * 2], px[i * 2 + 1]]);
+        rgb[i * 3] = ((v >> 8) & 0xF8) as u8;
+        rgb[i * 3 + 1] = ((v >> 3) & 0xFC) as u8;
+        rgb[i * 3 + 2] = ((v << 3) & 0xF8) as u8;
+    }
+    rgb
+}
+
+fn bgr_to_rgb(px: &[u8], count: usize) -> Vec<u8> {
+    let mut rgb = vec![0u8; count * 3];
+    for i in 0..count {
+        rgb[i * 3] = px[i * 3 + 2];
+        rgb[i * 3 + 1] = px[i * 3 + 1];
+        rgb[i * 3 + 2] = px[i * 3];
+    }
+    rgb
+}
+
+/// 8bpp 팔레트 타일 — 팔레트가 파일에 없어 인덱스를 그레이스케일로 표기.
+fn gray_to_rgb(px: &[u8], count: usize) -> Vec<u8> {
+    let mut rgb = vec![0u8; count * 3];
+    for i in 0..count {
+        rgb[i * 3] = px[i];
+        rgb[i * 3 + 1] = px[i];
+        rgb[i * 3 + 2] = px[i];
+    }
+    rgb
+}
+
+fn decode_bmc(data: &[u8], src: &str, full: &str) -> (Vec<Tile>, Vec<Row>) {
+    let mut tiles = Vec::new();
+    let mut corrupt = Vec::new();
+    let n = data.len();
+    let mut off = 0usize;
+    let mut idx = 0usize;
+    let corrupted_row = |idx: usize, error: String| {
+        let mut r = Row::new();
+        r.insert("kind".into(), "tile".into());
+        r.insert("source_file".into(), src.to_string());
+        r.insert("tile_index".into(), idx.to_string());
+        r.insert("_source_file".into(), full.to_string());
+        r.insert("_status".into(), "corrupted".into());
+        r.insert("_error".into(), error);
+        r
+    };
+    while off + BMC_TILE_HEADER <= n {
+        let key = &data[off..off + 8];
+        let width = u16::from_le_bytes([data[off + 8], data[off + 9]]) as usize;
+        let height = u16::from_le_bytes([data[off + 10], data[off + 11]]) as usize;
+        let size = u32::from_le_bytes([
+            data[off + 12],
+            data[off + 13],
+            data[off + 14],
+            data[off + 15],
+        ]) as usize;
+        let params = u32::from_le_bytes([
+            data[off + 16],
+            data[off + 17],
+            data[off + 18],
+            data[off + 19],
+        ]);
+        // 사전 할당된 빈 꼬리(전부 0) — 정상 종료.
+        if width == 0 || height == 0 || size == 0 {
+            break;
+        }
+        let px_off = off + BMC_TILE_HEADER;
+        if width > MAX_DIM || height > MAX_DIM || px_off + size > n {
+            corrupt.push(corrupted_row(
+                idx,
+                format!(
+                    "bmc tile {}: declared {}x{} size {} at offset {} runs past end",
+                    idx, width, height, size, off
+                ),
+            ));
+            break;
+        }
+        if params & BMC_RLE_FLAG != 0 {
+            // RLE 압축 타일 — 미지원을 조용히 삼키지 않는다. 크기를 알므로
+            // 다음 엔트리로 계속 진행.
+            corrupt.push(corrupted_row(
+                idx,
+                format!("bmc tile {idx}: RLE-compressed (params=0x{params:08X}) — 미지원"),
+            ));
+            off = px_off + size;
+            idx += 1;
+            continue;
+        }
+        let pixels = width * height;
+        let px = &data[px_off..px_off + size];
+        let rgb = match size / pixels {
+            4 if size == pixels * 4 => bgra_to_rgb(px, pixels),
+            3 if size == pixels * 3 => bgr_to_rgb(px, pixels),
+            2 if size == pixels * 2 => rgb565_to_rgb(px, pixels),
+            1 if size == pixels => gray_to_rgb(px, pixels),
+            _ => {
+                corrupt.push(corrupted_row(
+                    idx,
+                    format!(
+                        "bmc tile {}: size {} not a whole 1/2/3/4 bpp of {}x{}",
+                        idx, size, width, height
+                    ),
+                ));
+                off = px_off + size;
+                idx += 1;
+                continue;
+            }
+        };
+        tiles.push(Tile {
+            i: idx,
+            w: width,
+            h: height,
+            key: hex_lower(key),
+            rgb,
+        });
+        off = px_off + size;
+        idx += 1;
+    }
+    (tiles, corrupt)
+}
+
 fn decode_file(path: &Path) -> (Vec<Tile>, Vec<Row>) {
     let src = path
         .file_name()
@@ -128,6 +284,10 @@ fn decode_file(path: &Path) -> (Vec<Tile>, Vec<Row>) {
         }
     };
     if data.len() < 8 || &data[..8] != MAGIC {
+        // RDP8bmp 매직이 없는 bcache##.bmc는 구형(RDP8 이전) 컨테이너다.
+        if is_bmc_name(path) {
+            return decode_bmc(&data, &src, &full);
+        }
         let mut r = Row::new();
         r.insert("kind".into(), "tile".into());
         r.insert("source_file".into(), src);
@@ -447,6 +607,11 @@ pub fn rdpcache_sources(root: &Path) -> Vec<std::path::PathBuf> {
         if !entry.file_type().is_file() {
             continue;
         }
+        // 구형 bcache##.bmc는 매직이 없다 — 파일명으로 채택.
+        if is_bmc_name(entry.path()) {
+            sources.push(entry.path().to_path_buf());
+            continue;
+        }
         // located by content marker (like the Python find_files_by_content)
         let mut head = Vec::new();
         match std::fs::File::open(entry.path()) {
@@ -515,4 +680,108 @@ pub fn parse_rdpcache_with_sources(root: &Path) -> Result<(Vec<std::path::PathBu
 
 pub fn parse_rdpcache(root: &Path) -> Result<Vec<Row>> {
     Ok(parse_rdpcache_with_sources(root)?.1)
+}
+
+#[cfg(test)]
+mod bmc_tests {
+    use super::*;
+
+    /// bmc 엔트리 하나: key(8)+w(2)+h(2)+size(4)+params(4)+픽셀.
+    fn entry(key: u64, w: u16, h: u16, params: u32, px: &[u8]) -> Vec<u8> {
+        let mut b = key.to_le_bytes().to_vec();
+        b.extend(w.to_le_bytes());
+        b.extend(h.to_le_bytes());
+        b.extend((px.len() as u32).to_le_bytes());
+        b.extend(params.to_le_bytes());
+        b.extend(px);
+        b
+    }
+
+    fn temp_dir(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "wina-bmc-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn decodes_32bpp_and_16bpp_tiles() {
+        // 2x2 32bpp: BGRA 픽셀 (B=1,G=2,R=3) → RGB (3,2,1).
+        let px32 = [1u8, 2, 3, 255].repeat(4);
+        // 2x2 16bpp RGB565: 0xF800(순빨강) → R=0xF8.
+        let px16 = 0xF800u16.to_le_bytes().repeat(4);
+        let mut data = entry(0x1122_3344_5566_7788, 2, 2, 0, &px32);
+        data.extend(entry(0xAABB_CCDD_EEFF_0011, 2, 2, 0, &px16));
+        data.extend(vec![0u8; 0x40]); // 사전 할당된 빈 꼬리
+
+        let (tiles, corrupt) = decode_bmc(&data, "bcache24.bmc", "/x/bcache24.bmc");
+        assert!(corrupt.is_empty(), "{corrupt:?}");
+        assert_eq!(tiles.len(), 2);
+        assert_eq!(&tiles[0].rgb[..3], &[3, 2, 1]);
+        assert_eq!(tiles[0].key, "8877665544332211"); // LE 저장 바이트 순 hex
+        assert_eq!(&tiles[1].rgb[..3], &[0xF8, 0, 0]);
+    }
+
+    #[test]
+    fn rle_tile_is_surfaced_and_next_tile_still_decodes() {
+        let px = [9u8, 9, 9, 255].repeat(4);
+        let mut data = entry(1, 2, 2, BMC_RLE_FLAG, &[0xAB; 7]); // RLE 표시
+        data.extend(entry(2, 2, 2, 0, &px));
+        let (tiles, corrupt) = decode_bmc(&data, "bcache22.bmc", "/x/bcache22.bmc");
+        assert_eq!(corrupt.len(), 1);
+        assert!(corrupt[0].get("_error").unwrap().contains("RLE"), "{corrupt:?}");
+        assert_eq!(tiles.len(), 1);
+        assert_eq!(tiles[0].i, 1);
+    }
+
+    #[test]
+    fn truncated_tile_is_corrupted_row() {
+        let mut data = entry(1, 2, 2, 0, &[0u8; 16]);
+        data.truncate(data.len() - 4); // 픽셀이 선언 크기보다 짧다
+        let (tiles, corrupt) = decode_bmc(&data, "bcache2.bmc", "/x/bcache2.bmc");
+        assert!(tiles.is_empty());
+        assert_eq!(corrupt.len(), 1);
+        assert!(corrupt[0].get("_error").unwrap().contains("runs past end"));
+    }
+
+    #[test]
+    fn discovery_and_rows_for_bmc_file() {
+        let dir = temp_dir("discover");
+        let cache = dir
+            .join("Users")
+            .join("victim")
+            .join("Terminal Server Client")
+            .join("Cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        // 64x64 32bpp 두 타일 — 프래그먼트/모자이크 경로까지 통과시킨다.
+        let px = [7u8, 8, 9, 255].repeat(64 * 64);
+        let mut data = entry(1, 64, 64, 0, &px);
+        data.extend(entry(2, 64, 64, 0, &px));
+        std::fs::write(cache.join("bcache24.bmc"), &data).unwrap();
+        std::fs::write(cache.join("unrelated.txt"), b"noise").unwrap();
+
+        let sources = rdpcache_sources(&dir);
+        assert_eq!(sources.len(), 1);
+        let rows = parse_rdpcache_from(&sources);
+        assert!(!rows.is_empty());
+        let mosaic: Vec<_> = rows
+            .iter()
+            .filter(|r| r.get("kind").map(String::as_str) == Some("mosaic"))
+            .collect();
+        assert_eq!(mosaic.len(), 1);
+        assert_eq!(
+            mosaic[0].get("source_file").map(String::as_str),
+            Some("bcache24.bmc")
+        );
+        assert!(rows
+            .iter()
+            .all(|r| r.get("account").map(String::as_str) == Some("victim")));
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

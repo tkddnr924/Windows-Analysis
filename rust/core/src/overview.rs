@@ -103,7 +103,8 @@ pub fn read_all_tables(db: &Path) -> Vec<(String, Vec<Row>)> {
 }
 
 // --- ScheduledTasks ("작업 스케줄러") ---
-const ST_KEYS: &[&str] = &[
+// pub: 0건에도 스키마를 만들 고정 컬럼 목록으로 write_ov에서도 쓴다.
+pub const ST_KEYS: &[&str] = &[
     "timestamp",
     "task_name",
     "is_microsoft",
@@ -118,11 +119,105 @@ const ST_KEYS: &[&str] = &[
     "author",
     "description",
     "uri",
+    "last_run_time",
+    "run_count",
+    "last_run_result",
+    "last_run_action",
     "_source_file",
     "_status",
     "_error",
 ];
+
+/// TaskScheduler Operational 이벤트를 태스크 경로별로 집계한 실행 요약.
+#[derive(Default)]
+struct ScheduledTaskRuns {
+    run_count: u64,
+    last_run_time: String,
+    last_result_time: String,
+    last_result: &'static str,
+    last_action_time: String,
+    last_action: String,
+    /// 129(CreatedTaskProcess)의 Path는 실제 생성된 프로세스라 200의
+    /// ActionName(정의된 액션)보다 정확하다 — 한번 잡히면 200으로 덮지 않는다.
+    last_action_exact: bool,
+}
+
+/// "\\Microsoft\\Windows\\...\\Foo"(이벤트 TaskName)와 "Microsoft\\Windows\\...\\Foo"
+/// (XML uri — 선행 역슬래시 유무가 섞여 있음)를 같은 키로 만든다.
+fn scheduled_task_key(name: &str) -> String {
+    name.trim_start_matches('\\').trim().to_lowercase()
+}
+
 pub fn build_scheduled_tasks(out_dir: &Path) -> Vec<Row> {
+    build_scheduled_tasks_with_events(out_dir, &EventLogOverviewCache::load(out_dir))
+}
+
+/// XML 정의 행에 TaskScheduler%4Operational 실행 기록을 태스크 경로로 조인해
+/// "실제로 언제·몇 번·어떤 결과로 돌았고 무슨 프로세스를 만들었나"를 병합한다
+/// — 정의(86건)와 실행 이력(수만 건)이 서로 연결되지 않던 갭(T5)의 해소.
+/// 이벤트만 있고 XML 정의가 없는 태스크(삭제됨 등)는 여기 나타나지 않는다 —
+/// 원본 이벤트는 EVENTLOG 테이블·통합 타임라인에 그대로 남는다.
+pub fn build_scheduled_tasks_with_events(out_dir: &Path, events: &EventLogOverviewCache) -> Vec<Row> {
+    let mut runs: std::collections::HashMap<String, ScheduledTaskRuns> =
+        std::collections::HashMap::new();
+    for r in events.rows() {
+        if r.get("Provider").map(String::as_str) != Some("Microsoft-Windows-TaskScheduler") {
+            continue;
+        }
+        let eid = r.get("EventID").map(String::as_str).unwrap_or("");
+        // 100 시작 / 102 성공 / 101·103·111·202·203 실패 계열 / 129 프로세스
+        // 생성 / 200 액션 시작 — 나머지(트리거·엔진 상태 등)는 요약에 불필요.
+        if !matches!(
+            eid,
+            "100" | "101" | "102" | "103" | "111" | "129" | "200" | "202" | "203"
+        ) {
+            continue;
+        }
+        let ed = parse_eventdata(r.get("EventData").map(|s| s.as_str()).unwrap_or(""));
+        let task = ed_field(&ed, &["TaskName"]);
+        if task.is_empty() {
+            continue;
+        }
+        let ts = r.get("timestamp").cloned().unwrap_or_default();
+        let entry = runs.entry(scheduled_task_key(&task)).or_default();
+        match eid {
+            "100" => {
+                entry.run_count += 1;
+                if ts > entry.last_run_time {
+                    entry.last_run_time = ts;
+                }
+            }
+            "102" => {
+                if ts >= entry.last_result_time {
+                    entry.last_result_time = ts;
+                    entry.last_result = "성공";
+                }
+            }
+            "101" | "103" | "111" | "202" | "203" => {
+                if ts >= entry.last_result_time {
+                    entry.last_result_time = ts;
+                    entry.last_result = "실패";
+                }
+            }
+            "129" => {
+                let path = ed_field(&ed, &["Path"]);
+                if !path.is_empty() && (!entry.last_action_exact || ts >= entry.last_action_time) {
+                    entry.last_action = path;
+                    entry.last_action_time = ts;
+                    entry.last_action_exact = true;
+                }
+            }
+            "200" => {
+                let action = ed_field(&ed, &["ActionName"]);
+                if !action.is_empty() && !entry.last_action_exact && ts >= entry.last_action_time {
+                    entry.last_action = action;
+                    entry.last_action_time = ts;
+                }
+            }
+            _ => {}
+        }
+    }
+
     let src = read_table(
         &out_dir
             .join("TASKSCHEDULER")
@@ -145,12 +240,48 @@ pub fn build_scheduled_tasks(out_dir: &Path) -> Vec<Row> {
             "is_microsoft".into(),
             if is_ms { "1".into() } else { String::new() },
         );
+        // uri가 비어 있는 정의는 task_name(경로 아님)으로라도 대조한다 —
+        // 루트 태스크("\Foo")는 이름과 경로가 사실상 같아 유효한 폴백.
+        let key = if uri.is_empty() {
+            scheduled_task_key(&r.get("task_name").cloned().unwrap_or_default())
+        } else {
+            scheduled_task_key(&uri)
+        };
+        if let Some(record) = runs.get(&key) {
+            if !record.last_run_time.is_empty() {
+                row.insert("last_run_time".into(), record.last_run_time.clone());
+            }
+            if record.run_count > 0 {
+                row.insert("run_count".into(), record.run_count.to_string());
+            }
+            if !record.last_result.is_empty() {
+                row.insert("last_run_result".into(), record.last_result.into());
+            }
+            if !record.last_action.is_empty() {
+                row.insert("last_run_action".into(), record.last_action.clone());
+            }
+        }
         out.push(row);
     }
     out
 }
 
 // --- RdpCache ("RDP 캐시") — the reconstructed "fragment" rows only ---
+pub const RC_KEYS: &[&str] = &[
+    "kind",
+    "account",
+    "source_file",
+    "fragment_index",
+    "tile_count",
+    "width",
+    "height",
+    "rows",
+    "cols",
+    "image",
+    "_status",
+    "_source_file",
+];
+
 pub fn build_rdp_cache(out_dir: &Path) -> Vec<Row> {
     read_table(
         &out_dir.join("RDPCACHE").join("RdpBitmapCache.sqlite"),
@@ -277,6 +408,7 @@ pub const DEF_KEYS: &[&str] = &[
     "additional_actions",
     "origin",
     "detection_user",
+    "raw_line",
 ];
 fn def_row() -> Row {
     let mut r = Row::new();
@@ -299,6 +431,77 @@ const TAMPER_KEYS: &[&str] = &[
     "puaprotection",
     "disablescriptscanning",
 ];
+
+/// MPDetection 타임스탬프("2026-03-22T17:20:21.623")는 UTC — 다른 행들과
+/// 같은 KST 표기로 변환한다 (실수집본 EVTX 대조로 +9h 확인).
+fn mp_ts_kst(raw: &str) -> String {
+    for fmt in ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S"] {
+        if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(raw, fmt) {
+            return (dt + chrono::Duration::hours(9))
+                .format("%Y-%m-%d %H:%M:%S%.3f")
+                .to_string();
+        }
+    }
+    raw.to_string()
+}
+
+/// Defender 지원 로그 MPDetection-*.log에서 DETECTION 라인만 threat 행으로
+/// 만든다 (2026-08-31 사용자 확정: MPLog 제외, DETECTION만, EVTX 중복 허용 —
+/// 다른 소스라 얻는 정보가 다르다는 판단). source 컬럼 "MPDetection"으로
+/// 출처를 구분한다. 파일은 UTF-16LE(BOM) 또는 UTF-8.
+pub fn defender_from_mpdetection(target: &Path) -> Vec<Row> {
+    let mut rows = Vec::new();
+    let mut files: Vec<std::path::PathBuf> = walkdir::WalkDir::new(target)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .map(|e| e.into_path())
+        .filter(|p| {
+            p.file_name()
+                .map(|n| {
+                    let name = n.to_string_lossy().to_lowercase();
+                    name.starts_with("mpdetection") && name.ends_with(".log")
+                })
+                .unwrap_or(false)
+        })
+        .collect();
+    files.sort();
+    for path in files {
+        let Ok(raw) = std::fs::read(&path) else {
+            continue;
+        };
+        let text = if raw.starts_with(&[0xFF, 0xFE]) {
+            let units: Vec<u16> = raw[2..]
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            String::from_utf16_lossy(&units)
+        } else {
+            String::from_utf8_lossy(&raw).into_owned()
+        };
+        for line in text.lines() {
+            let Some((ts_raw, rest)) = line.trim().split_once(" DETECTION ") else {
+                continue;
+            };
+            let (threat, resource) = match rest.trim().split_once(' ') {
+                Some((a, b)) => (a.to_string(), b.trim().to_string()),
+                None => (rest.trim().to_string(), String::new()),
+            };
+            if threat.is_empty() {
+                continue;
+            }
+            let mut rec = def_row();
+            rec.insert("section".into(), "threat".into());
+            rec.insert("timestamp".into(), mp_ts_kst(ts_raw.trim()));
+            rec.insert("title".into(), threat);
+            rec.insert("detail".into(), resource);
+            rec.insert("source".into(), "MPDetection".into());
+            rec.insert("raw_line".into(), line.trim().to_string());
+            rows.push(rec);
+        }
+    }
+    rows
+}
 
 pub fn build_defender(out_dir: &Path) -> Vec<Row> {
     build_defender_with_events(&EventLogOverviewCache::load(out_dir))
@@ -636,9 +839,45 @@ fn smb_client_ip(client_name: &str) -> String {
     client_name.trim_start_matches('\\').trim().to_string()
 }
 
+/// SmbClient 이벤트의 대상 "\\server\share" 또는 "\\server"에서 서버 부분만
+/// 뽑는다 — SmbHistory의 remote_address(연결 상대)로 쓴다.
+fn smb_target_server(name: &str) -> String {
+    name.trim_start_matches('\\')
+        .split('\\')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+/// SmbClient 이벤트 NTSTATUS 중 분석에서 판별 가치가 있는 값만 이름을 붙인다
+/// — 나머지는 원문 숫자 없이 이벤트 설명만 남긴다(미주석 코드 나열 방지).
+fn ntstatus_note(status: u64) -> Option<&'static str> {
+    match status {
+        0xC000_0022 => Some("접근 거부"),
+        0xC000_006D => Some("로그온 실패"),
+        0xC000_006A => Some("잘못된 비밀번호"),
+        0xC000_0064 => Some("존재하지 않는 계정"),
+        0xC000_0234 => Some("계정 잠김"),
+        _ => None,
+    }
+}
+
 pub fn build_smb_history(out_dir: &Path) -> Vec<Row> {
     build_smb_history_with_events(&EventLogOverviewCache::load(out_dir))
 }
+
+pub const SMB_KEYS: &[&str] = &[
+    "timestamp",
+    "direction",
+    "remote_address",
+    "account",
+    "result",
+    "description",
+    "event_id",
+    "provider",
+    "record_key",
+];
 
 pub fn build_smb_history_with_events(events: &EventLogOverviewCache) -> Vec<Row> {
     let mut rows = Vec::new();
@@ -646,8 +885,9 @@ pub fn build_smb_history_with_events(events: &EventLogOverviewCache) -> Vec<Row>
         let provider = r.get("Provider").cloned().unwrap_or_default();
         let eid = r.get("EventID").cloned().unwrap_or_default();
         let ed = parse_eventdata(r.get("EventData").map(|s| s.as_str()).unwrap_or(""));
-        let (mut remote, mut account, result, description);
+        let (mut remote, mut account, result, description, direction);
         if provider == "Microsoft-Windows-Security-Auditing" && (eid == "4624" || eid == "4625") {
+            direction = "inbound";
             if ed_field(&ed, &["LogonType"]) != "3" {
                 continue;
             }
@@ -661,6 +901,7 @@ pub fn build_smb_history_with_events(events: &EventLogOverviewCache) -> Vec<Row>
             }
             .to_string();
         } else if provider == "Microsoft-Windows-SMBServer" && (eid == "551" || eid == "1009") {
+            direction = "inbound";
             let inner = match ed.get("EventData") {
                 Some(serde_json::Value::Object(m)) => m.clone(),
                 _ => ed.clone(),
@@ -674,6 +915,42 @@ pub fn build_smb_history_with_events(events: &EventLogOverviewCache) -> Vec<Row>
                 result = "실패".into();
                 description = "SMB 세션 인증 실패".into();
             }
+        } else if provider.eq_ignore_ascii_case("Microsoft-Windows-SMBClient") {
+            // SmbClient%4Security — 이 호스트가 클라이언트로서 원격 서버·공유에
+            // 접근한 기록(아웃바운드). 이 채널에는 실패 계열만 남지만 "이
+            // 호스트가 어디로 SMB 접속을 시도했는가"라는 횡적 이동의 방향
+            // 정보를 준다. 대상(ShareName/ServerName)이 없는 행은 연결 상대를
+            // 특정할 수 없어 아래 remote 공백 검사에서 걸러진다.
+            direction = "outbound";
+            let inner = match ed.get("EventData") {
+                Some(serde_json::Value::Object(m)) => m.clone(),
+                _ => ed.clone(),
+            };
+            let target = {
+                let share = inner.get("ShareName").map(vstr).unwrap_or_default();
+                if share.is_empty() {
+                    inner.get("ServerName").map(vstr).unwrap_or_default()
+                } else {
+                    share
+                }
+            };
+            remote = smb_target_server(&target);
+            account = inner.get("UserName").map(vstr).unwrap_or_default();
+            result = "실패".into();
+            let what = match eid.as_str() {
+                "31010" => "SMB 공유 접근 실패",
+                "31001" => "SMB 서버 인증 실패",
+                _ => "SMB 클라이언트 연결 실패",
+            };
+            let status_note = inner
+                .get("Status")
+                .map(vstr)
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .and_then(ntstatus_note);
+            description = match status_note {
+                Some(note) => format!("{what} ({target} — {note})"),
+                None => format!("{what} ({target})"),
+            };
         } else {
             continue;
         }
@@ -685,7 +962,7 @@ pub fn build_smb_history_with_events(events: &EventLogOverviewCache) -> Vec<Row>
             "timestamp".into(),
             r.get("timestamp").cloned().unwrap_or_default(),
         );
-        row.insert("direction".into(), "inbound".into());
+        row.insert("direction".into(), direction.into());
         row.insert("remote_address".into(), std::mem::take(&mut remote));
         row.insert(
             "account".into(),
@@ -710,6 +987,22 @@ pub fn build_smb_history_with_events(events: &EventLogOverviewCache) -> Vec<Row>
 pub fn build_bits_history(out_dir: &Path) -> Vec<Row> {
     build_bits_history_with_events(&EventLogOverviewCache::load(out_dir))
 }
+
+pub const BITS_KEYS: &[&str] = &[
+    "timestamp",
+    "job_name",
+    "job_id",
+    "url",
+    "account",
+    "process",
+    "bytes_transferred",
+    "bytes_total",
+    "status",
+    "result",
+    "description",
+    "event_id",
+    "record_key",
+];
 
 pub fn build_bits_history_with_events(events: &EventLogOverviewCache) -> Vec<Row> {
     // bytesTotal이 이 값이면 전체 크기를 알 수 없다는 뜻 (u64::MAX 센티널).
@@ -796,11 +1089,11 @@ fn fw_direction(raw: &str) -> String {
 }
 
 fn fw_action(raw: &str) -> String {
-    // MS-FASP FW_RULE_ACTION: 1 AllowBypass, 2 Allow, 3 Block.
+    // MS-FASP FW_RULE_ACTION: 1 AllowBypass, 2 Block, 3 Allow.
     match raw {
         "1" => "보안 허용".into(),
-        "2" => "허용".into(),
-        "3" => "차단".into(),
+        "2" => "차단".into(),
+        "3" => "허용".into(),
         "" => String::new(),
         other => other.to_string(),
     }
@@ -857,6 +1150,27 @@ fn fw_profile_name(raw: &str) -> String {
 pub fn build_firewall_history(out_dir: &Path) -> Vec<Row> {
     build_firewall_history_with_events(out_dir, &EventLogOverviewCache::load(out_dir))
 }
+
+pub const FW_KEYS: &[&str] = &[
+    "timestamp",
+    "kind",
+    "rule_name",
+    "rule_id",
+    "app_path",
+    "service",
+    "direction",
+    "action",
+    "protocol",
+    "local_ports",
+    "remote_ports",
+    "profiles",
+    "account",
+    "modifying_app",
+    "detail",
+    "event_id",
+    "provider",
+    "record_key",
+];
 
 pub fn build_firewall_history_with_events(
     out_dir: &Path,
@@ -1019,7 +1333,18 @@ fn rdp_spec(provider: &str, eid: &str) -> Option<RdpSpec> {
     const RCM: &str = "Microsoft-Windows-TerminalServices-RemoteConnectionManager";
     const LSM: &str = "Microsoft-Windows-TerminalServices-LocalSessionManager";
     const AX: &str = "Microsoft-Windows-TerminalServices-ClientActiveXCore";
+    const CORE: &str = "Microsoft-Windows-RemoteDesktopServices-RdpCoreTS";
     match (provider, eid) {
+        // RdpCoreTS 131 — 전송 계층 연결 수립. ClientIP에 소스 IP·포트가
+        // 인증 이전 단계부터 남아 기존 TerminalServices 로그보다 상세하다.
+        (CORE, "131") => s(
+            "inbound",
+            "성공",
+            "RDP 전송 계층 연결 수립",
+            &["ClientIP"],
+            &[],
+            false,
+        ),
         (SEC, "4624") => s(
             "inbound",
             "성공",
@@ -1163,6 +1488,22 @@ pub fn build_remote_desktop_history(out_dir: &Path) -> Vec<Row> {
     build_remote_desktop_history_with_events(&EventLogOverviewCache::load(out_dir))
 }
 
+/// RdpCoreTS ClientIP는 "ip:port" 또는 "[ip]:port" 형태다. 원격 접근
+/// 이력·호스트 연결 그래프의 피어 매칭은 IP 문자열 기준이라 포트를 떼어낸다.
+/// 대괄호 없는 IPv6(콜론 여러 개)는 그대로 둔다.
+fn strip_client_port(addr: &str) -> String {
+    let addr = addr.trim();
+    if let Some(rest) = addr.strip_prefix('[') {
+        if let Some(end) = rest.find(']') {
+            return rest[..end].to_string();
+        }
+    }
+    if addr.matches(':').count() == 1 {
+        return addr.split(':').next().unwrap_or("").to_string();
+    }
+    addr.to_string()
+}
+
 pub fn build_remote_desktop_history_with_events(events: &EventLogOverviewCache) -> Vec<Row> {
     const LSM: &str = "Microsoft-Windows-TerminalServices-LocalSessionManager";
     let mut rows: Vec<Row> = Vec::new();
@@ -1185,6 +1526,11 @@ pub fn build_remote_desktop_history_with_events(events: &EventLogOverviewCache) 
             ed_field(&ed, spec.addr)
         } else {
             String::new()
+        };
+        let addr = if provider == "Microsoft-Windows-RemoteDesktopServices-RdpCoreTS" {
+            strip_client_port(&addr)
+        } else {
+            addr
         };
         let acct = if !spec.acct.is_empty() {
             bare_account(&ed_field(&ed, spec.acct))
@@ -1808,6 +2154,54 @@ pub fn build_powershell_history_with_events(
         }
         rows.push(row);
     }
+
+    // PSReadLine ConsoleHost_history — 사용자가 콘솔에 입력한 명령 원문.
+    // 파일에 시각이 없으므로 timestamp는 비워 두고(뷰의 "시간 정보 없음"
+    // 구역으로 분리 표시) 입력 순서는 line_number로 보존한다.
+    let console_db = out_dir
+        .join("POWERSHELL")
+        .join("PowerShell_ConsoleHistory.sqlite");
+    let mut console_rows = read_table_with_rowid(&console_db, "PowerShell_ConsoleHistory");
+    console_rows.sort_by(|a, b| {
+        let user_a = a.get("user").map(String::as_str).unwrap_or("");
+        let user_b = b.get("user").map(String::as_str).unwrap_or("");
+        let line = |r: &Row| {
+            r.get("line_number")
+                .and_then(|v| v.parse::<i64>().ok())
+                .unwrap_or(i64::MAX)
+        };
+        user_a.cmp(user_b).then(line(a).cmp(&line(b)))
+    });
+    for r in console_rows {
+        let command = r.get("command").cloned().unwrap_or_default();
+        if command.trim().is_empty() {
+            continue;
+        }
+        let account = r.get("user").cloned().unwrap_or_default();
+        let record_key = r
+            .get("__source_rowid")
+            .map(|rowid| format!("PowerShell_ConsoleHistory::{rowid}"))
+            .unwrap_or_default();
+        let mut row = ps_row(
+            "",
+            &account,
+            "powershell.exe",
+            "",
+            &first_line(&command, 400),
+            "",
+            "",
+            "콘솔 히스토리",
+            "",
+            "PSReadLine",
+            "",
+            &record_key,
+        );
+        row.insert(
+            "line_number".into(),
+            r.get("line_number").cloned().unwrap_or_default(),
+        );
+        rows.push(row);
+    }
     rows
 }
 
@@ -1911,10 +2305,13 @@ fn human_bytes(value: &str) -> String {
     format!("{} B", n)
 }
 
+/// 파일 stem에서 첫 번째로 맞는 접미를 떼어 계정명을 복원한다 — 산출물
+/// 이름이 `<계정>[_<브라우저>][_Cache]` 꼴이므로(T8 브라우저 표기), 접미
+/// 목록에는 브라우저 변형 전부가 들어온다.
 fn browser_sources(
     out_dir: &Path,
     category: &str,
-    suffix: &str,
+    suffixes: &[&str],
 ) -> Vec<(String, std::path::PathBuf)> {
     let dir = out_dir.join(category);
     let mut files: Vec<_> = match std::fs::read_dir(&dir) {
@@ -1932,7 +2329,11 @@ fn browser_sources(
                 .file_stem()
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_default();
-            let account = stem.strip_suffix(suffix).unwrap_or(&stem).to_string();
+            let account = suffixes
+                .iter()
+                .find_map(|suffix| stem.strip_suffix(suffix))
+                .unwrap_or(&stem)
+                .to_string();
             (account, p)
         })
         .collect()
@@ -2008,10 +2409,40 @@ fn read_cache_entry_meta(db: &Path) -> Vec<Row> {
     out
 }
 
+/// IE 방문 URL은 "Visited: <계정>@<URL>" 또는 "<계정>@<URL>" 형태로
+/// 저장된다 — 표시·도메인 집계용 url은 실제 URL만 남긴다 (원문은 url_raw).
+/// ftp://user@host 처럼 '@' 앞에 스킴·경로가 있는 정상 URL은 건드리지 않는다.
+fn ie_visit_url(raw: &str) -> String {
+    let s = raw.trim();
+    let s = s.strip_prefix("Visited:").map(str::trim).unwrap_or(s);
+    match s.split_once('@') {
+        Some((head, rest)) if !head.contains('/') && !head.contains(':') => rest.to_string(),
+        _ => s.to_string(),
+    }
+}
+
+/// iedownload 메타데이터(" | " 구분 세그먼트)에서 원본 URL을 찾는다.
+/// http(s) 세그먼트가 없으면 원래 값(iedownload:{GUID})을 그대로 쓴다.
+fn ie_download_url(metadata: &str, fallback: &str) -> String {
+    match metadata.rfind("http") {
+        Some(at) => metadata[at..]
+            .split(" | ")
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string(),
+        None => fallback.to_string(),
+    }
+}
+
 pub fn build_browser_history(out_dir: &Path) -> Vec<Row> {
     let mut rows: Vec<Row> = Vec::new();
     // Cached HTTP responses (BrowserCache) — empty when no cache artifact present.
-    for (account, db) in browser_sources(out_dir, "BROWSER", "_Chrome_Cache") {
+    for (account, db) in browser_sources(
+        out_dir,
+        "BROWSER",
+        &["_Chrome_Cache", "_Edge_Cache", "_Whale_Cache", "_Unknown_Cache"],
+    ) {
         for c in read_cache_entry_meta(&db) {
             let g = |k: &str| c.get(k).cloned().unwrap_or_default();
             let ts = {
@@ -2074,7 +2505,12 @@ pub fn build_browser_history(out_dir: &Path) -> Vec<Row> {
             ]));
         }
     }
-    for (account, db) in browser_sources(out_dir, "BROWSER", "_Chrome_History") {
+    // "_Chrome_History"는 Python 시절 산출물 접미(하위 호환).
+    for (account, db) in browser_sources(
+        out_dir,
+        "BROWSER",
+        &["_Chrome_History", "_Chrome", "_Edge", "_Whale"],
+    ) {
         for u in read_table(&db, "urls") {
             let g = |k: &str| u.get(k).cloned().unwrap_or_default();
             let raw = g("url");
@@ -2149,6 +2585,93 @@ pub fn build_browser_history(out_dir: &Path) -> Vec<Row> {
             ]));
         }
     }
+    // IE10+/구형 Edge WebCache — History 컨테이너의 방문과 iedownload 항목.
+    for (account, db) in browser_sources(out_dir, "BROWSER", &["_IE_WebCache"]) {
+        for h in read_table(&db, "IEWebCache_History") {
+            let g = |k: &str| h.get(k).cloned().unwrap_or_default();
+            let raw = g("url");
+            let url = ie_visit_url(&raw);
+            let ts = g("accessed_time");
+            if url.is_empty() || ts.is_empty() {
+                continue;
+            }
+            let acct = {
+                let a = g("account");
+                if !a.is_empty() { a } else { account.clone() }
+            };
+            let count = g("access_count");
+            rows.push(bh_row(&[
+                ("account", acct),
+                ("kind", "visit".into()),
+                ("timestamp", ts),
+                ("url", url_decode(&url)),
+                ("url_raw", raw),
+                (
+                    "visit_count",
+                    if count.is_empty() || count == "0" { String::new() } else { count },
+                ),
+            ]));
+        }
+        for d in read_table(&db, "IEWebCache_Downloads") {
+            let g = |k: &str| d.get(k).cloned().unwrap_or_default();
+            let ts = {
+                let a = g("accessed_time");
+                if !a.is_empty() { a } else { g("modified_time") }
+            };
+            if ts.is_empty() {
+                continue;
+            }
+            let acct = {
+                let a = g("account");
+                if !a.is_empty() { a } else { account.clone() }
+            };
+            let url = ie_download_url(&g("metadata"), &g("url"));
+            rows.push(bh_row(&[
+                ("account", acct),
+                ("kind", "download".into()),
+                ("timestamp", ts),
+                ("title", basename_win(&url_decode(&url))),
+                ("url", url_decode(&url)),
+                ("url_raw", g("url")),
+                ("source_url", url_decode(&url)),
+            ]));
+        }
+    }
+    // IE5~9 index.dat — History 컨테이너(MSHist·History.IE5)의 방문 기록.
+    // Content(캐시)·Cookies 컨테이너는 원본 테이블에서 본다.
+    for (account, db) in browser_sources(out_dir, "BROWSER", &["_IE_IndexDat"]) {
+        for r in read_table(&db, "IEIndexDat_Records") {
+            let g = |k: &str| r.get(k).cloned().unwrap_or_default();
+            if !g("container").to_lowercase().contains("hist") {
+                continue;
+            }
+            let raw = g("url");
+            let url = ie_visit_url(&raw);
+            let ts = {
+                let a = g("accessed_time");
+                if !a.is_empty() { a } else { g("modified_time") }
+            };
+            if url.is_empty() || ts.is_empty() {
+                continue;
+            }
+            let acct = {
+                let a = g("account");
+                if !a.is_empty() { a } else { account.clone() }
+            };
+            let hits = g("hits");
+            rows.push(bh_row(&[
+                ("account", acct),
+                ("kind", "visit".into()),
+                ("timestamp", ts),
+                ("url", url_decode(&url)),
+                ("url_raw", raw),
+                (
+                    "visit_count",
+                    if hits.is_empty() || hits == "0" { String::new() } else { hits },
+                ),
+            ]));
+        }
+    }
     rows
 }
 
@@ -2183,6 +2706,60 @@ pub const TI_KEYS: &[&str] = &[
     "lease_obtained",
     "lease_terminates",
 ];
+/// 수집본의 hosts 파일(drivers/etc/hosts)에서 수동 등록 항목을 읽어
+/// TargetInfo 행으로 만든다 — 호스트 간 관계 파악에 바로 쓰인다.
+/// 유효 엔트리(IP + 이름, 주석 제외)가 없으면 빈 목록을 돌려 섹션이 숨는다.
+pub fn ti_from_hosts_file(target: &Path) -> Vec<Row> {
+    use std::str::FromStr;
+    let mut rows = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut files = crate::finder::by_name(target, &["hosts"]);
+    files.sort();
+    for path in files {
+        // 이름만으로는 오탐 가능 — etc 폴더 아래의 hosts만 대상.
+        let in_etc = path
+            .parent()
+            .map(|p| {
+                p.components().any(|c| {
+                    c.as_os_str()
+                        .to_string_lossy()
+                        .eq_ignore_ascii_case("etc")
+                })
+            })
+            .unwrap_or(false);
+        if !in_etc {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for line in text.lines() {
+            // '#' 이후는 주석 — 줄 중간 주석도 잘라낸다.
+            let line = line.split('#').next().unwrap_or("").trim();
+            if line.is_empty() {
+                continue;
+            }
+            let mut parts = line.split_whitespace();
+            let Some(ip) = parts.next() else { continue };
+            if std::net::IpAddr::from_str(ip).is_err() {
+                continue;
+            }
+            for name in parts {
+                if !seen.insert((ip.to_string(), name.to_string())) {
+                    continue;
+                }
+                rows.push(ti_row(&[
+                    ("category", "HostsFile".into()),
+                    ("name", name.into()),
+                    ("value", ip.into()),
+                    ("source_artifact", "hosts".into()),
+                ]));
+            }
+        }
+    }
+    rows
+}
+
 fn ti_row(pairs: &[(&str, String)]) -> Row {
     let mut r = Row::new();
     for k in TI_KEYS {
@@ -3256,7 +3833,44 @@ pub fn build_execution_history_with_registry(
     rows.extend(eh_from_userassist(out_dir));
     rows.extend(eh_from_srum(out_dir));
     rows.extend(eh_from_bam_registry(registry));
+    // ShimCache(AppCompatCache)는 여기 넣지 않는다 — 항목의 FILETIME은 대상
+    // 파일의 수정 시각이지 실행 시각이 아니므로 실행 이력·타임라인 증거로
+    // 부적합(v0.9.35 확정 결정). RegistryFindings(기타 레지스트리/ShimCache)
+    // 에서 그 단서와 함께 표시한다.
     rows.extend(eh_from_prefetch(out_dir));
+    rows.extend(eh_from_timeline(out_dir));
+    rows
+}
+
+/// Windows Timeline의 실행/열기(ActivityType 5) 활동을 실행 이력에 합류시킨다.
+/// 포커스(6)·클립보드 등 나머지 유형은 실행 기록이 아니므로 원본 테이블
+/// (TIMELINE/Timeline_Activities)에서만 본다.
+fn eh_from_timeline(out_dir: &Path) -> Vec<Row> {
+    let mut rows = Vec::new();
+    let db = out_dir
+        .join("TIMELINE")
+        .join("Timeline_Activities.sqlite");
+    for r in read_table_with_rowid(&db, "Timeline_Activities") {
+        if r.get("activity_type").map(String::as_str) != Some("5") {
+            continue;
+        }
+        let path = r.get("app_path").cloned().unwrap_or_default();
+        let name = {
+            let named = r.get("app_name").cloned().unwrap_or_default();
+            if named.is_empty() { basename_win(&path) } else { named }
+        };
+        if name.is_empty() && path.is_empty() {
+            continue;
+        }
+        rows.push(eh_row(&[
+            ("timestamp", r.get("timestamp").cloned().unwrap_or_default()),
+            ("program_name", name),
+            ("program_path", path),
+            ("user", r.get("account").cloned().unwrap_or_default()),
+            ("source_artifact", "Timeline".into()),
+            ("record_key", source_record_key(&db, "Timeline_Activities", &r)),
+        ]));
+    }
     rows
 }
 
@@ -3325,20 +3939,100 @@ fn find_sub_local(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
-fn parse_shimcache(data: &[u8]) -> Vec<(String, u64)> {
-    let mut entries = Vec::new();
-    if data.len() < 4 {
-        return entries;
+/// ShimCache 헤더 매직으로 미지원 구포맷을 추정한다 — 파싱 불가 사유를
+/// "아티팩트 없음"과 구분해 보고하기 위한 식별 전용(T0). Win7·Win8.x는
+/// T1에서 지원 경로로 빠지므로 여기 도달하지 않는다.
+fn shimcache_format_guess(magic: u32) -> &'static str {
+    match magic {
+        0xDEAD_BEEF => "Windows XP",
+        0xBADC_0FFE => "Windows Vista/Server 2003",
+        _ => "알 수 없는 구포맷",
     }
-    let header = le_u32(data, 0) as usize;
-    let mut off: Option<usize> =
-        if header > 0 && header < data.len() && data.get(header..header + 4) == Some(b"10ts") {
-            Some(header)
+}
+
+struct ShimcacheParse {
+    entries: Vec<(String, u64)>,
+    /// 데이터는 있으나 지원 포맷으로 해석하지 못한 경우의 포맷 식별 문구.
+    /// None이면 지원 포맷(엔트리 0개 포함) 또는 빈 데이터.
+    unsupported: Option<String>,
+    /// 구포맷(Win7/Win8.x)에서 해석된 경우의 포맷 표기 — 파생 행 detail용.
+    /// Win10/11 경로는 None(기존 출력 불변).
+    format_note: Option<&'static str>,
+}
+
+impl ShimcacheParse {
+    fn empty() -> Self {
+        ShimcacheParse {
+            entries: Vec::new(),
+            unsupported: None,
+            format_note: None,
+        }
+    }
+}
+
+const SHIM_NT61_HEADER: usize = 0x80; // Win7/Win8.x 공통 헤더 크기
+
+/// Win7/2008R2 (매직 0xBADC0FEE). 헤더 0x80 + 고정 크기 엔트리 배열
+/// (x86 32B / x64 48B), 경로는 블롭 절대 오프셋의 UTF-16LE.
+/// 레이아웃(Mandiant ShimCacheParser 준거):
+///   x86: Length(2) MaxLength(2) Offset(4) FILETIME(8) InsertFlags(4)
+///        ShimFlags(4) BlobSize(4) BlobOffset(4)
+///   x64: Length(2) MaxLength(2) 패딩(4) Offset(8) FILETIME(8) InsertFlags(4)
+///        ShimFlags(4) BlobSize(8) BlobOffset(8)
+fn parse_shimcache_win7(data: &[u8]) -> ShimcacheParse {
+    let mut out = ShimcacheParse::empty();
+    let count = le_u32(data, 4) as usize;
+    if data.len() < SHIM_NT61_HEADER + 8 || count == 0 {
+        return out;
+    }
+    // x64 판별: 엔트리+4..8은 x64에서 정렬 패딩(0), x86에서는 경로 오프셋
+    // (헤더 크기 0x80 이상의 값)이라 0이 될 수 없다.
+    let is64 = le_u32(data, SHIM_NT61_HEADER + 4) == 0;
+    let (esize, note) = if is64 {
+        (48usize, "Windows 7/Server 2008 R2 x64")
+    } else {
+        (32usize, "Windows 7/Server 2008 R2 x86")
+    };
+    for i in 0..count {
+        let o = SHIM_NT61_HEADER + i * esize;
+        if o + esize > data.len() {
+            break;
+        }
+        let path_len = le_u16(data, o) as usize;
+        let (path_off, ft) = if is64 {
+            (le_u64(data, o + 8) as usize, le_u64(data, o + 16))
         } else {
-            find_sub_local(data, b"10ts")
+            (le_u32(data, o + 4) as usize, le_u64(data, o + 8))
         };
+        if path_len >= 2 && path_off >= SHIM_NT61_HEADER && path_off + path_len <= data.len() {
+            let u16s: Vec<u16> = data[path_off..path_off + path_len]
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            let path = String::from_utf16_lossy(&u16s);
+            if !path.is_empty() && (path.contains('\\') || path.contains(':')) {
+                out.entries.push((path, ft));
+            }
+        }
+    }
+    if out.entries.is_empty() {
+        // 매직은 Win7인데 엔트리를 하나도 못 읽었다면 조용히 넘기지 않는다.
+        out.unsupported = Some("헤더 0xBADC0FEE(Windows 7/Server 2008 R2)이나 엔트리 해석 실패".into());
+    } else {
+        out.format_note = Some(note);
+    }
+    out
+}
+
+/// 'NNts' 태그 엔트리 나열 공용 워커 (Win8.x/Win10 계열).
+/// 엔트리: 태그(4) + unknown(4) + ce_size(4) + 데이터[ce_size].
+/// 데이터: 경로길이 u16 + UTF-16LE 경로 + (ft_gap 바이트 건너뜀) + FILETIME.
+/// ft_gap: Win10/11은 0, Win8.x는 8(InsertFlags·ShimFlags가 시각 앞에 온다).
+fn walk_ts_entries(data: &[u8], start: usize, tag: &[u8; 4], ft_gap: usize) -> Vec<(String, u64)> {
+    let mut entries = Vec::new();
+    let mut off = Some(start);
     while let Some(o) = off {
-        if o + 12 > data.len() || data.get(o..o + 4) != Some(b"10ts") {
+        if o + 12 > data.len() || data.get(o..o + 4) != Some(tag.as_slice()) {
             break;
         }
         let ce_size = le_u32(data, o + 8) as usize;
@@ -3347,14 +4041,14 @@ fn parse_shimcache(data: &[u8]) -> Vec<(String, u64)> {
         let entry = &data[estart..eend];
         if entry.len() >= 2 {
             let path_len = le_u16(entry, 0) as usize;
-            if 2 + path_len + 8 <= entry.len() {
+            if 2 + path_len + ft_gap + 8 <= entry.len() {
                 let path_bytes = &entry[2..2 + path_len];
                 let u16s: Vec<u16> = path_bytes
                     .chunks_exact(2)
                     .map(|c| u16::from_le_bytes([c[0], c[1]]))
                     .collect();
                 let path = String::from_utf16_lossy(&u16s);
-                let ft = le_u64(entry, 2 + path_len);
+                let ft = le_u64(entry, 2 + path_len + ft_gap);
                 if !path.is_empty() && (path.contains('\\') || path.contains(':')) {
                     entries.push((path, ft));
                 }
@@ -3363,6 +4057,73 @@ fn parse_shimcache(data: &[u8]) -> Vec<(String, u64)> {
         off = Some(o + 12 + ce_size);
     }
     entries
+}
+
+/// Win8.0('00ts')/Win8.1('10ts') — 헤더 u32가 헤더 크기(0x80)이고 엔트리가
+/// 0x80에서 시작. Win10과 달리 FILETIME 앞에 InsertFlags(4)+ShimFlags(4)가 있다.
+fn parse_shimcache_win8(data: &[u8]) -> ShimcacheParse {
+    let mut out = ShimcacheParse::empty();
+    let (tag, note): (&[u8; 4], &'static str) =
+        if data.get(SHIM_NT61_HEADER..SHIM_NT61_HEADER + 4) == Some(b"00ts") {
+            (b"00ts", "Windows 8.0/Server 2012")
+        } else {
+            (b"10ts", "Windows 8.1/Server 2012 R2")
+        };
+    out.entries = walk_ts_entries(data, SHIM_NT61_HEADER, tag, 8);
+    if out.entries.is_empty() {
+        out.unsupported = Some(format!(
+            "헤더 0x80({note})이나 엔트리 해석 실패"
+        ));
+    } else {
+        out.format_note = Some(note);
+    }
+    out
+}
+
+/// AppCompatCache 값 블롭 파서 — 헤더 매직으로 포맷을 디스패치한다.
+/// Win7/2008R2·Win8.x·Win10/11 지원, XP·Vista/2003은 식별 문구만 보고(T0).
+fn parse_shimcache(data: &[u8]) -> ShimcacheParse {
+    let mut out = ShimcacheParse::empty();
+    if data.is_empty() {
+        return out;
+    }
+    if data.len() < 4 {
+        out.unsupported = Some("손상 데이터 (4바이트 미만)".into());
+        return out;
+    }
+    let magic = le_u32(data, 0);
+    if magic == 0xBADC_0FEE {
+        return parse_shimcache_win7(data);
+    }
+    if magic == 0x80
+        && matches!(
+            data.get(SHIM_NT61_HEADER..SHIM_NT61_HEADER + 4),
+            Some(b"00ts") | Some(b"10ts")
+        )
+    {
+        return parse_shimcache_win8(data);
+    }
+    // Win10/11: 헤더 u32가 첫 '10ts' 엔트리의 오프셋(0x30/0x34), FILETIME이
+    // 경로 바로 뒤. 헤더가 어긋난 블롭은 종전대로 시그니처 스캔으로 복원.
+    let header = magic as usize;
+    let start =
+        if header > 0 && header < data.len() && data.get(header..header + 4) == Some(b"10ts") {
+            Some(header)
+        } else {
+            find_sub_local(data, b"10ts")
+        };
+    match start {
+        Some(s) => {
+            out.entries = walk_ts_entries(data, s, b"10ts", 0);
+        }
+        None => {
+            out.unsupported = Some(format!(
+                "헤더 0x{magic:08X} — {} 포맷 추정",
+                shimcache_format_guess(magic)
+            ));
+        }
+    }
+    out
 }
 
 fn rf_credential_protection(system: &[Row]) -> Vec<Row> {
@@ -5010,7 +5771,36 @@ fn rf_shimcache(hives: &[RegistryOverviewHive]) -> Vec<Row> {
                 continue;
             }
             let data = unhex(&r.get("value_data").cloned().unwrap_or_default());
-            for (path, ft) in parse_shimcache(&data) {
+            let parsed = parse_shimcache(&data);
+            if let Some(reason) = &parsed.unsupported {
+                // "아티팩트 없음"과 "포맷 미지원"을 구분해 표면화한다(T0) —
+                // 구포맷 하이브에서 실행 흔적이 0행인 이유를 화면에서 알 수 있게.
+                let dedup_key = format!("__unsupported__{reason}");
+                if seen.insert(dedup_key) {
+                    rows.push(rf_row(&[
+                        ("category", "기타 레지스트리".into()),
+                        ("subtype", "ShimCache".into()),
+                        ("name", "ShimCache (AppcompatCache)".into()),
+                        ("value", format!("미지원 포맷: {reason}")),
+                        ("status", "정보".into()),
+                        ("detail", "AppCompatCache 값이 존재하지만 현재 파서는 Windows 8.1/10/11 포맷('10ts')만 해석함 — 구버전 포맷이라 실행 흔적 경로가 표시되지 않음".into()),
+                        (
+                            "key_path",
+                            "…\\Control\\Session Manager\\AppCompatCache".into(),
+                        ),
+                        ("source", "SYSTEM".into()),
+                        ("record_key", reg_record_key(r)),
+                    ]));
+                }
+                continue;
+            }
+            // 구포맷(Win7/Win8.x)에서 해석된 행은 포맷을 detail에 남긴다 —
+            // Win10/11 행은 종전과 동일하게 detail 없음(기존 출력 불변).
+            let detail = parsed
+                .format_note
+                .map(|note| format!("포맷: {note}"))
+                .unwrap_or_default();
+            for (path, ft) in parsed.entries {
                 if seen.contains(&path) {
                     continue;
                 }
@@ -5021,6 +5811,7 @@ fn rf_shimcache(hives: &[RegistryOverviewHive]) -> Vec<Row> {
                     ("name", "ShimCache (AppcompatCache)".into()),
                     ("value", path),
                     ("status", "정보".into()),
+                    ("detail", detail.clone()),
                     ("timestamp", filetime(ft)),
                     (
                         "key_path",
@@ -5309,6 +6100,104 @@ mod tests {
     use super::*;
 
     #[test]
+    fn mpdetection_lines_become_threat_rows_in_kst() {
+        assert_eq!(mp_ts_kst("2026-03-22T17:20:21.623"), "2026-03-23 02:20:21.623");
+        assert_eq!(mp_ts_kst("junk"), "junk");
+
+        let root = std::env::temp_dir().join(format!("wina-mpdet-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("Support")).unwrap();
+        // UTF-16LE + BOM, DETECTION 외 라인 섞임
+        let text = "\u{feff}2026-03-22T17:20:00.000 Service started - Windows Defender\n2026-03-22T17:20:21.623 DETECTION Ransom:Win32/Test!X file:C:\\evil.exe\n2026-03-22T17:21:00.000 Version: Product 4.18\n";
+        let mut bytes = vec![0xFF, 0xFE];
+        for unit in text.trim_start_matches('\u{feff}').encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        std::fs::write(root.join("Support/MPDetection-20260322-172000.log"), &bytes).unwrap();
+
+        let rows = defender_from_mpdetection(&root);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["section"], "threat");
+        assert_eq!(rows[0]["title"], "Ransom:Win32/Test!X");
+        assert_eq!(rows[0]["detail"], "file:C:\\evil.exe");
+        assert_eq!(rows[0]["timestamp"], "2026-03-23 02:20:21.623");
+        assert_eq!(rows[0]["source"], "MPDetection");
+        assert!(rows[0]["raw_line"].contains(" DETECTION "));
+    }
+
+    #[test]
+    fn ie_webcache_rows_join_browser_activity() {
+        assert_eq!(ie_visit_url("Visited: Administrator@file:///E:/a.txt"), "file:///E:/a.txt");
+        assert_eq!(ie_visit_url("user@http://x.example/"), "http://x.example/");
+        assert_eq!(ie_visit_url("http://plain.example/"), "http://plain.example/");
+        assert_eq!(ie_download_url("garbage | NAVER Corp. | https://dl.example/f.exe", "iedownload:{X}"), "https://dl.example/f.exe");
+        assert_eq!(ie_download_url("no url here", "iedownload:{X}"), "iedownload:{X}");
+
+        let root = std::env::temp_dir().join(format!("wina-ie-bh-{}", std::process::id()));
+        let browser = root.join("BROWSER");
+        std::fs::create_dir_all(&browser).unwrap();
+        let conn = Connection::open(browser.join("Admin_IE_WebCache.sqlite")).unwrap();
+        conn.execute(
+            "CREATE TABLE IEWebCache_History (accessed_time TEXT, url TEXT, container TEXT, access_count TEXT, account TEXT)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO IEWebCache_History VALUES ('2026-03-26 13:32:29.295', 'Visited: Admin@file:///C:/x.pbl', 'History', '1', 'Admin')",
+            [],
+        ).unwrap();
+        conn.execute(
+            "CREATE TABLE IEWebCache_Downloads (accessed_time TEXT, modified_time TEXT, url TEXT, metadata TEXT, account TEXT)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO IEWebCache_Downloads VALUES ('2025-05-21 10:38:56.389', '', 'iedownload:{G}', 'a | https://dl.example/setup.exe', 'Admin')",
+            [],
+        ).unwrap();
+        drop(conn);
+
+        let rows = build_browser_history(&root);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(rows.len(), 2);
+        let visit = rows.iter().find(|r| r["kind"] == "visit").unwrap();
+        assert_eq!(visit["url"], "file:///C:/x.pbl");
+        assert_eq!(visit["account"], "Admin");
+        assert_eq!(visit["visit_count"], "1");
+        let dl = rows.iter().find(|r| r["kind"] == "download").unwrap();
+        assert_eq!(dl["url"], "https://dl.example/setup.exe");
+        assert_eq!(dl["title"], "setup.exe");
+    }
+
+    #[test]
+    fn rdpcorets_131_joins_remote_desktop_history_with_bare_ip() {
+        assert_eq!(strip_client_port("10.0.0.1:59151"), "10.0.0.1");
+        assert_eq!(strip_client_port("[10.0.0.1]:52550"), "10.0.0.1");
+        assert_eq!(strip_client_port("fe80::1"), "fe80::1");
+        let spec = rdp_spec("Microsoft-Windows-RemoteDesktopServices-RdpCoreTS", "131");
+        assert!(spec.is_some());
+        assert_eq!(spec.unwrap().direction, "inbound");
+    }
+
+    #[test]
+    fn hosts_file_entries_join_target_info() {
+        let root = std::env::temp_dir().join(format!("wina-hosts-ti-{}", std::process::id()));
+        let etc = root.join("NonVolatile").join("ETC").join("etc");
+        std::fs::create_dir_all(&etc).unwrap();
+        std::fs::write(
+            etc.join("hosts"),
+            "# comment\n#\t127.0.0.1 localhost\n10.0.0.5\tBACKUP\n10.0.0.5 SECOND # tail comment\nnot-an-ip name\n",
+        )
+        .unwrap();
+        let rows = ti_from_hosts_file(&root);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].get("category").map(String::as_str), Some("HostsFile"));
+        assert_eq!(rows[0].get("name").map(String::as_str), Some("BACKUP"));
+        assert_eq!(rows[0].get("value").map(String::as_str), Some("10.0.0.5"));
+        assert_eq!(rows[1].get("name").map(String::as_str), Some("SECOND"));
+        assert_eq!(rows[0].get("source_artifact").map(String::as_str), Some("hosts"));
+    }
+
+    #[test]
     fn powershell_event_800_keeps_host_application_and_eventdata_account() {
         let root =
             std::env::temp_dir().join(format!("wina-powershell-overview-{}", std::process::id()));
@@ -5394,6 +6283,40 @@ mod tests {
         let props: serde_json::Value =
             serde_json::from_str(row.get("properties").unwrap()).unwrap();
         assert_eq!(props["InstallSource"], "C:\\Users\\a\\Downloads\\");
+    }
+
+    #[test]
+    fn console_history_rows_join_powershell_overview_without_timestamp() {
+        let root =
+            std::env::temp_dir().join(format!("wina-psconsole-overview-{}", std::process::id()));
+        let ps_dir = root.join("POWERSHELL");
+        std::fs::create_dir_all(&ps_dir).unwrap();
+        let db_path = ps_dir.join("PowerShell_ConsoleHistory.sqlite");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "CREATE TABLE PowerShell_ConsoleHistory (line_number TEXT, command TEXT, user TEXT, _source_file TEXT)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO PowerShell_ConsoleHistory VALUES ('2', 'whoami', 'analyst', 'ConsoleHost_history.txt')",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO PowerShell_ConsoleHistory VALUES ('1', 'Get-Process', 'analyst', 'ConsoleHost_history.txt')",
+            [],
+        ).unwrap();
+        drop(conn);
+
+        let rows = build_powershell_history(&root);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].get("kind").map(String::as_str), Some("콘솔 히스토리"));
+        assert_eq!(rows[0].get("timestamp").map(String::as_str), Some(""));
+        // line_number 순서 보존
+        assert_eq!(rows[0].get("command").map(String::as_str), Some("Get-Process"));
+        assert_eq!(rows[1].get("command").map(String::as_str), Some("whoami"));
+        assert_eq!(rows[0].get("account").map(String::as_str), Some("analyst"));
+        assert!(rows[0].get("record_key").map(String::as_str).unwrap_or("").starts_with("PowerShell_ConsoleHistory::"));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -5533,7 +6456,7 @@ mod tests {
             rusqlite::params![
                 FIREWALL_PROVIDER,
                 "2004",
-                r#"{"RuleName":"Evil Ingress","RuleId":"{11111111-2222}","Direction":"1","Action":"2","Protocol":"6","LocalPorts":"4444","Profiles":"2147483647","ApplicationPath":"C:\\tools\\nc.exe","ModifyingApplication":"C:\\Windows\\System32\\netsh.exe"}"#,
+                r#"{"RuleName":"Evil Ingress","RuleId":"{11111111-2222}","Direction":"1","Action":"3","Protocol":"6","LocalPorts":"4444","Profiles":"2147483647","ApplicationPath":"C:\\tools\\nc.exe","ModifyingApplication":"C:\\Windows\\System32\\netsh.exe"}"#,
                 "2026-08-21 11:00:00.000",
                 "Firewall.evtx::7",
             ],
@@ -5590,6 +6513,142 @@ mod tests {
             row.get("description").map(String::as_str),
             Some("SMB 세션 인증 실패")
         );
+        assert_eq!(row.get("direction").map(String::as_str), Some("inbound"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// SmbClient%4Security(31010 등)는 이 호스트가 클라이언트로서 원격 공유에
+    /// 접근한 기록 — outbound로 채택돼야 한다. EventData는 실측 그대로 평탄
+    /// JSON이고 Status 0xC0000022(접근 거부)는 설명에 이름으로 풀린다.
+    #[test]
+    fn smb_client_share_failure_is_retained_as_outbound() {
+        let root = std::env::temp_dir().join(format!("wina-smbclient-overview-{}", std::process::id()));
+        let event_dir = root.join("EVENTLOG");
+        std::fs::create_dir_all(&event_dir).unwrap();
+        let db_path = event_dir.join("SmbClientSecurity.sqlite");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "CREATE TABLE SmbClientSecurity (Provider TEXT, EventID TEXT, EventData TEXT, timestamp TEXT, _record_key TEXT)",
+            [],
+        ).unwrap();
+        for (eid, data, key) in [
+            (
+                "31010",
+                r#"{"Reason": 12, "Status": 3221225506, "ShareNameLength": 24, "ShareName": "\\192.168.10.199\\dbbackup", "ObjectNameLength": 0, "ObjectName": ""}"#,
+                "SmbClient.evtx::1",
+            ),
+            // ShareName 없이 ServerName만 있는 이벤트(31013 등)도 서버 주소로 채택.
+            (
+                "31013",
+                r#"{"Smb2Command": 11, "ServerName": "\\192.168.10.63", "Status": 3221266432}"#,
+                "SmbClient.evtx::2",
+            ),
+            // 대상 정보가 없는 행은 연결 상대를 특정할 수 없어 제외.
+            ("31017", r#"{"Status": 0}"#, "SmbClient.evtx::3"),
+        ] {
+            conn.execute(
+                "INSERT INTO SmbClientSecurity VALUES (?1, ?2, ?3, '2026-08-21 12:00:00.000', ?4)",
+                rusqlite::params!["Microsoft-Windows-SMBClient", eid, data, key],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let rows = build_smb_history(&root);
+        assert_eq!(rows.len(), 2);
+        let share = &rows[0];
+        assert_eq!(share.get("direction").map(String::as_str), Some("outbound"));
+        assert_eq!(
+            share.get("remote_address").map(String::as_str),
+            Some("192.168.10.199")
+        );
+        assert_eq!(share.get("result").map(String::as_str), Some("실패"));
+        assert_eq!(
+            share.get("description").map(String::as_str),
+            Some("SMB 공유 접근 실패 (\\192.168.10.199\\dbbackup — 접근 거부)")
+        );
+        let server = &rows[1];
+        assert_eq!(server.get("direction").map(String::as_str), Some("outbound"));
+        assert_eq!(
+            server.get("remote_address").map(String::as_str),
+            Some("192.168.10.63")
+        );
+        assert_eq!(
+            server.get("description").map(String::as_str),
+            Some("SMB 클라이언트 연결 실패 (\\192.168.10.63)")
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// T5: XML 정의에 Operational 이벤트 실행 요약이 병합된다 — 키는 선행
+    /// 역슬래시 유무(uri vs TaskName)를 무시하고, 129의 실제 프로세스 경로가
+    /// 200의 정의된 액션보다 우선하며, 실행 기록 없는 태스크는 빈 값으로 남는다.
+    #[test]
+    fn scheduled_tasks_merge_operational_run_summary() {
+        let root = std::env::temp_dir().join(format!("wina-schtask-overview-{}", std::process::id()));
+        let task_dir = root.join("TASKSCHEDULER");
+        std::fs::create_dir_all(&task_dir).unwrap();
+        let conn = Connection::open(task_dir.join("TaskScheduler_Tasks.sqlite")).unwrap();
+        conn.execute(
+            "CREATE TABLE TaskScheduler_Tasks (timestamp TEXT, task_name TEXT, uri TEXT, author TEXT, actions TEXT)",
+            [],
+        ).unwrap();
+        // 실측처럼 uri에 선행 역슬래시가 없는 형태 + 실행 기록 없는 MS 태스크.
+        for (name, uri) in [("WhaleUpdateD", "WhaleUpdateD"), ("Idle", "\\Microsoft\\Windows\\Idle")] {
+            conn.execute(
+                "INSERT INTO TaskScheduler_Tasks VALUES ('2026-01-01 00:00:00.000', ?1, ?2, 'CORP', 'C:\\x.exe')",
+                rusqlite::params![name, uri],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let event_dir = root.join("EVENTLOG");
+        std::fs::create_dir_all(&event_dir).unwrap();
+        let conn = Connection::open(event_dir.join("TaskSchedulerOperational.sqlite")).unwrap();
+        conn.execute(
+            "CREATE TABLE TaskSchedulerOperational (Provider TEXT, EventID TEXT, EventData TEXT, timestamp TEXT, _record_key TEXT)",
+            [],
+        ).unwrap();
+        for (eid, data, ts) in [
+            ("100", r##"{"#attributes": {"Name": "TaskStartEvent"}, "TaskName": "\\WhaleUpdateD"}"##, "2026-02-01 10:00:00.000"),
+            ("200", r##"{"#attributes": {"Name": "ActionStart"}, "TaskName": "\\WhaleUpdateD", "ActionName": "C:\\defined\\action.exe"}"##, "2026-02-01 10:00:00.100"),
+            ("129", r##"{"#attributes": {"Name": "CreatedTaskProcess"}, "TaskName": "\\WhaleUpdateD", "Path": "C:\\real\\whale_update.exe", "ProcessID": 4856}"##, "2026-02-01 10:00:00.200"),
+            ("102", r##"{"#attributes": {"Name": "TaskSuccessEvent"}, "TaskName": "\\WhaleUpdateD"}"##, "2026-02-01 10:00:01.000"),
+            ("100", r#"{"TaskName": "\\WhaleUpdateD"}"#, "2026-03-01 09:00:00.000"),
+            ("103", r#"{"TaskName": "\\WhaleUpdateD"}"#, "2026-03-01 09:00:01.000"),
+        ] {
+            conn.execute(
+                "INSERT INTO TaskSchedulerOperational VALUES ('Microsoft-Windows-TaskScheduler', ?1, ?2, ?3, 'ts.evtx::1')",
+                rusqlite::params![eid, data, ts],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let rows = build_scheduled_tasks(&root);
+        assert_eq!(rows.len(), 2);
+        let whale = rows
+            .iter()
+            .find(|row| row.get("task_name").map(String::as_str) == Some("WhaleUpdateD"))
+            .expect("whale task");
+        assert_eq!(
+            whale.get("last_run_time").map(String::as_str),
+            Some("2026-03-01 09:00:00.000")
+        );
+        assert_eq!(whale.get("run_count").map(String::as_str), Some("2"));
+        // 마지막 완료 이벤트는 103(실패) — 이전 102(성공)를 덮는다.
+        assert_eq!(whale.get("last_run_result").map(String::as_str), Some("실패"));
+        assert_eq!(
+            whale.get("last_run_action").map(String::as_str),
+            Some("C:\\real\\whale_update.exe")
+        );
+        let idle = rows
+            .iter()
+            .find(|row| row.get("task_name").map(String::as_str) == Some("Idle"))
+            .expect("idle task");
+        assert!(idle.get("last_run_time").is_none());
+        assert!(idle.get("run_count").is_none());
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -6388,6 +7447,153 @@ mod tests {
         );
         assert_eq!(shim[0].get("timestamp").cloned(), Some(filetime(FT_NEW)));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// T0: 미지원 구포맷 AppCompatCache(XP 0xDEADBEEF 등)는 조용히 0행으로
+    /// 끝나지 않고 "미지원 포맷" 정보 행으로 표면화돼야 한다 — 지원 포맷의 빈
+    /// 데이터와 구분되게.
+    #[test]
+    fn shimcache_unsupported_legacy_format_is_reported() {
+        // 파서 단위: XP 매직 + 임의 본문 → 엔트리 0, 미지원 사유에 매직 표기.
+        let mut legacy = 0xDEAD_BEEFu32.to_le_bytes().to_vec();
+        legacy.extend([0u8; 60]);
+        let parsed = parse_shimcache(&legacy);
+        assert!(parsed.entries.is_empty());
+        let reason = parsed.unsupported.expect("구포맷은 unsupported여야 한다");
+        assert!(reason.contains("0xDEADBEEF"), "{reason}");
+        assert!(reason.contains("Windows XP"), "{reason}");
+        // 빈 데이터는 포맷 문제가 아니므로 표면화하지 않는다.
+        assert!(parse_shimcache(&[]).unsupported.is_none());
+
+        // 파생 행: RegistryFindings에 status=정보 행이 하나 나온다.
+        let root = std::env::temp_dir().join(format!(
+            "wina-shim-legacy-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        ));
+        let registry_dir = root.join("REGISTRY");
+        std::fs::create_dir_all(&registry_dir).unwrap();
+        let conn = Connection::open(registry_dir.join("SYSTEM.sqlite")).unwrap();
+        conn.execute("CREATE TABLE Registry (key_path TEXT, value_name TEXT, value_data TEXT, last_write TEXT, _recovery TEXT, _source_file TEXT)", []).unwrap();
+        for row in [
+            ("\\Select", "Current", "1".to_string()),
+            (
+                "\\ControlSet001\\Control\\Session Manager\\AppCompatCache",
+                "AppCompatCache",
+                to_hex(&legacy),
+            ),
+        ] {
+            conn.execute(
+                "INSERT INTO Registry VALUES (?1, ?2, ?3, '2026-01-01 00:00:00.000', 'live', 'evidence/SYSTEM')",
+                rusqlite::params![row.0, row.1, row.2],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let registry = RegistryOverviewCache::load(&root);
+        let findings = build_registry_findings_with_registry(&registry);
+        let shim: Vec<_> = findings
+            .iter()
+            .filter(|row| row.get("subtype").map(String::as_str) == Some("ShimCache"))
+            .collect();
+        assert_eq!(shim.len(), 1, "미지원 안내 행 하나만 나와야 한다");
+        assert_eq!(shim[0].get("status").map(String::as_str), Some("정보"));
+        let value = shim[0].get("value").cloned().unwrap_or_default();
+        assert!(value.starts_with("미지원 포맷"), "{value}");
+        assert!(value.contains("0xDEADBEEF"), "{value}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// T1: Win7/2008R2(0xBADC0FEE) x86/x64 고정 엔트리 배열 해석.
+    fn shim_blob_win7(paths: &[(&str, u64)], is64: bool) -> Vec<u8> {
+        let esize = if is64 { 48 } else { 32 };
+        let hdr = 0x80usize;
+        let mut b = vec![0u8; hdr + paths.len() * esize];
+        b[0..4].copy_from_slice(&0xBADC_0FEEu32.to_le_bytes());
+        b[4..8].copy_from_slice(&(paths.len() as u32).to_le_bytes());
+        let mut strings: Vec<u8> = Vec::new();
+        for (i, (p, ft)) in paths.iter().enumerate() {
+            let utf16: Vec<u8> = p.encode_utf16().flat_map(u16::to_le_bytes).collect();
+            let off = hdr + paths.len() * esize + strings.len();
+            let o = hdr + i * esize;
+            b[o..o + 2].copy_from_slice(&(utf16.len() as u16).to_le_bytes());
+            b[o + 2..o + 4].copy_from_slice(&((utf16.len() + 2) as u16).to_le_bytes());
+            if is64 {
+                // o+4..8은 정렬 패딩(0) — x64 판별 근거.
+                b[o + 8..o + 16].copy_from_slice(&(off as u64).to_le_bytes());
+                b[o + 16..o + 24].copy_from_slice(&ft.to_le_bytes());
+            } else {
+                b[o + 4..o + 8].copy_from_slice(&(off as u32).to_le_bytes());
+                b[o + 8..o + 16].copy_from_slice(&ft.to_le_bytes());
+            }
+            strings.extend(utf16);
+        }
+        b.extend(strings);
+        b
+    }
+
+    /// Win8.x 'NNts' 블롭: 헤더 u32=0x80, 엔트리 데이터는 경로 뒤에
+    /// InsertFlags(4)+ShimFlags(4)가 오고 그 다음이 FILETIME.
+    fn shim_blob_win8(tag: &[u8; 4], path: &str, ft: u64) -> Vec<u8> {
+        let path_utf16: Vec<u8> = path.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let ce_size = 2 + path_utf16.len() + 4 + 4 + 8;
+        let mut b = 0x80u32.to_le_bytes().to_vec();
+        b.resize(0x80, 0);
+        b.extend(tag);
+        b.extend([0, 0, 0, 0]);
+        b.extend((ce_size as u32).to_le_bytes());
+        b.extend((path_utf16.len() as u16).to_le_bytes());
+        b.extend(path_utf16);
+        b.extend(2u32.to_le_bytes()); // InsertFlags
+        b.extend(0u32.to_le_bytes()); // ShimFlags
+        b.extend(ft.to_le_bytes());
+        b
+    }
+
+    #[test]
+    fn shimcache_parses_win7_x64_and_x86() {
+        const FT: u64 = 129_600_000_000_000_000;
+        for is64 in [true, false] {
+            let blob = shim_blob_win7(
+                &[("\\??\\C:\\tools\\a.exe", FT), ("\\??\\C:\\tools\\b.exe", FT + 1)],
+                is64,
+            );
+            let parsed = parse_shimcache(&blob);
+            assert!(parsed.unsupported.is_none(), "is64={is64}");
+            let note = parsed.format_note.expect("구포맷 표기 필요");
+            assert!(note.contains(if is64 { "x64" } else { "x86" }), "{note}");
+            assert_eq!(
+                parsed.entries,
+                vec![
+                    ("\\??\\C:\\tools\\a.exe".to_string(), FT),
+                    ("\\??\\C:\\tools\\b.exe".to_string(), FT + 1),
+                ],
+                "is64={is64}"
+            );
+        }
+    }
+
+    #[test]
+    fn shimcache_parses_win8_tags_with_flag_gap() {
+        const FT: u64 = 130_100_000_000_000_000;
+        // 8.0('00ts')과 8.1('10ts') 모두 FILETIME이 플래그 8바이트 뒤에 있다 —
+        // 8.1을 Win10 레이아웃으로 읽으면 플래그가 시각으로 오독되는 회귀 방지.
+        for (tag, ver) in [(b"00ts", "8.0"), (b"10ts", "8.1")] {
+            let blob = shim_blob_win8(tag, "C:\\apps\\run.exe", FT);
+            let parsed = parse_shimcache(&blob);
+            assert!(parsed.unsupported.is_none(), "{ver}");
+            assert_eq!(
+                parsed.entries,
+                vec![("C:\\apps\\run.exe".to_string(), FT)],
+                "{ver}"
+            );
+            let note = parsed.format_note.expect("구포맷 표기 필요");
+            assert!(note.contains(ver), "{note}");
+        }
     }
 
     #[test]

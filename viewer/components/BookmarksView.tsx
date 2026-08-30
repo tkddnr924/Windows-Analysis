@@ -273,7 +273,7 @@ export function isLocalLoopbackPeer(value: string): boolean {
   const raw = value.trim().toLocaleLowerCase();
   if (!raw) return false;
   const hostName = /^[a-z][a-z0-9.-]*:\d+$/.test(raw) ? raw.replace(/:\d+$/, "") : raw;
-  if (hostName === "localhost" || hostName === "localhost.localdomain") return true;
+  if (hostName === "localhost" || hostName === "localhost.localdomain" || hostName === "local") return true;
   const bracketed = raw.match(/^\[([^\]]+)](?::\d+)?$/)?.[1] ?? raw;
   const withoutZone = bracketed.replace(/%[\w.-]+$/, "");
   const address = /^\d{1,3}(?:\.\d{1,3}){3}:\d+$/.test(withoutZone)

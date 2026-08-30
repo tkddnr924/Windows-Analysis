@@ -75,6 +75,45 @@ function formatDurationMs(value: string): string {
   return `${(minutes / 60).toFixed(1)}시간`;
 }
 
+// JSON.stringify가 되돌려 놓는 \r \n \t 이스케이프를 실제 줄바꿈·들여쓰기로
+// 풀어 사람이 읽게 만든다. 경로의 "C:\\Windows" 같은 진짜 역슬래시(\\)는
+// 짝으로 건너뛰어 훼손하지 않는다.
+function unescapeControlSequences(text: string): string {
+  let out = "";
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i];
+    if (ch !== "\\") {
+      out += ch;
+      continue;
+    }
+    const next = text[i + 1];
+    if (next === "\\") {
+      out += "\\\\";
+      i += 1;
+      continue;
+    }
+    if (next === "r") {
+      // \r\n 은 한 번의 줄바꿈으로 합친다.
+      if (text[i + 2] === "\\" && text[i + 3] === "n") i += 2;
+      out += "\n";
+      i += 1;
+      continue;
+    }
+    if (next === "n") {
+      out += "\n";
+      i += 1;
+      continue;
+    }
+    if (next === "t") {
+      out += "    ";
+      i += 1;
+      continue;
+    }
+    out += ch;
+  }
+  return out;
+}
+
 function prettyJsonOrNull(value: string): string | null {
   const trimmed = value.trim();
   if (!trimmed || (trimmed[0] !== "{" && trimmed[0] !== "[")) return null;
@@ -98,7 +137,9 @@ function CodeOrJsonBlock({ raw, expandTitle }: { raw: string; expandTitle?: stri
   const [copied, setCopied] = useState(false);
   const [copyError, setCopyError] = useState(false);
   const isJson = pretty !== null;
-  const shown = isJson && beautified ? (pretty as string) : raw;
+  // 보기 좋게 정렬 모드에서는 제어문자 이스케이프도 실제 줄바꿈으로 풀어
+  // 보여준다 (복사는 항상 원본 그대로).
+  const shown = isJson && beautified ? unescapeControlSequences(pretty as string) : raw;
 
   async function copy() {
     try {

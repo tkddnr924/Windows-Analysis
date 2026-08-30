@@ -159,6 +159,7 @@ export default function DefenderView({ data, onNavigate, onFetchLinkedRows, book
               <span style={{ display: "flex", alignItems: "center", gap: 7, minWidth: 0 }}>
                 <span style={cellStyle({ fontSize: 13.5, fontWeight: 700, color: "var(--text)" })}>{entry.title}</span>
                 <span style={{ flexShrink: 0, fontSize: 11.5, fontWeight: 700, color: tone, border: `1px solid ${tone}`, borderRadius: "var(--radius-sm)", padding: "1px 8px", whiteSpace: "nowrap" }}>{FILTER_LABELS[entry.section]}</span>
+                {entry.row.source && <span style={{ flexShrink: 0, fontSize: 11, fontWeight: 700, color: "var(--text-dim)", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", padding: "1px 7px", whiteSpace: "nowrap" }}>{entry.row.source}</span>}
               </span>
               {entry.detail && <span title={entry.detail} style={cellStyle({ fontSize: 12, color: "var(--text-dim)", fontFamily: "var(--mono)" })}>{entry.detail}</span>}
             </span>

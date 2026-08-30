@@ -71,6 +71,14 @@ fn fmt_kst_secs_ms(secs: i64, ms: u32) -> String {
     unsafe { String::from_utf8_unchecked(out) }
 }
 
+/// Unix epoch 초 -> KST 문자열. 0 이하(미설정)는 빈 문자열.
+pub fn fmt_unix(secs: i64) -> String {
+    if secs <= 0 {
+        return String::new();
+    }
+    fmt_kst_secs_ms(secs, 0)
+}
+
 /// Plain KST millisecond string (truncating). Kept for non-FILETIME sources.
 pub fn fmt_kst(dt: DateTime<Utc>) -> String {
     fmt_kst_secs_ms(dt.timestamp(), dt.timestamp_subsec_millis())

@@ -14,8 +14,9 @@ use crate::case_store::{self};
 use crate::finder;
 use crate::overview;
 use crate::parsers::{
-    amcache, browser_cache, browser_history, eventlog, jumplist, mft, powershell_history, prefetch,
-    rdpcache, registry, srum, taskscheduler, usnjrnl, wer,
+    amcache, browser_cache, browser_history, eventlog, ie_indexdat, ie_webcache, jumplist, mft,
+    powershell_history, prefetch, rdpcache, registry, srum, taskscheduler, timeline, usnjrnl,
+    wer, wmi_repository,
 };
 use crate::sqlite::{write_table, Row};
 
@@ -105,7 +106,7 @@ fn artifact_output_categories(only: Option<&HashSet<String>>) -> HashSet<&'stati
             "RdpCache" => {
                 categories.insert("RDPCACHE");
             }
-            "BrowserHistory" | "BrowserCache" => {
+            "BrowserHistory" | "BrowserCache" | "IEWebCache" | "IEIndexDat" => {
                 categories.insert("BROWSER");
             }
             "Prefetch" => {
@@ -116,6 +117,12 @@ fn artifact_output_categories(only: Option<&HashSet<String>>) -> HashSet<&'stati
             }
             "WER" => {
                 categories.insert("WER");
+            }
+            "WmiRepository" => {
+                categories.insert("WMI");
+            }
+            "Timeline" => {
+                categories.insert("TIMELINE");
             }
             _ => {}
         }
@@ -181,13 +188,38 @@ fn clear_previous_results(live_dir: &Path, only: Option<&HashSet<String>>) -> Re
     Ok(())
 }
 
+/// `_OVERVIEW` 안에 파서가 직접 기록하는 원본(raw) 산출물. write_ov 파생이
+/// 아니므로 파생 리셋에서 지우면 안 된다 — status=="ok" 발행은 seal본
+/// (`.artifact-committed`)을 건너뛰고 스테이징 트리를 그대로 발행하므로,
+/// 여기서 지워진 파일은 어디서도 복구되지 않은 채 보고서에만 published로
+/// 남는다(전체 실행에서 파일 시스템 뷰가 비는 실제 사고 원인).
+const OVERVIEW_PARSER_OUTPUTS: &[&str] = &["MFT_Records.sqlite"];
+
 /// 범위 재파싱 스테이지에는 이전 실행의 _OVERVIEW 복사본이 들어 있다.
-/// skip_empty 파생이 0건이면 write_ov가 파일을 만들지도 지우지도 않아 이전
-/// 파일이 그대로 발행된다 — 파생 생성 직전에 비워, 발행되는 파생은 항상
-/// 이번 실행 facts에서 만든 것만 남긴다 (facts/derived 동일 시점 보장).
+/// 파생 생성 직전에 비워, 발행되는 파생은 항상 이번 실행 facts에서 만든
+/// 것만 남긴다 (facts/derived 동일 시점 보장). 모든 write_ov 파생은 0건에도
+/// 스키마와 함께 다시 쓰이므로 리셋 후 빈자리가 남지 않는다.
+/// 단 파서 원본 산출물(OVERVIEW_PARSER_OUTPUTS)은 보존한다: 전체 실행에서는
+/// 이번 실행 파서가 방금 쓴 파일이고, 범위 재파싱에서는 스테이지 준비가
+/// 복사해 온 마지막 발행본이라 어느 쪽이든 facts와 같은 시점이다.
 fn reset_stage_overview(ov: &Path) -> Result<()> {
     if ov.exists() {
-        std::fs::remove_dir_all(ov)?;
+        for entry in std::fs::read_dir(ov)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            if OVERVIEW_PARSER_OUTPUTS
+                .iter()
+                .any(|keep| name.to_string_lossy() == *keep)
+            {
+                continue;
+            }
+            let path = entry.path();
+            if path.is_dir() {
+                std::fs::remove_dir_all(&path)?;
+            } else {
+                std::fs::remove_file(&path)?;
+            }
+        }
     }
     std::fs::create_dir_all(ov)?;
     Ok(())
@@ -726,9 +758,13 @@ pub const ARTIFACT_NAMES: &[&str] = &[
     "RdpCache",
     "BrowserHistory",
     "BrowserCache",
+    "IEWebCache",
+    "IEIndexDat",
     "PowerShell",
     "Prefetch",
     "WER",
+    "WmiRepository",
+    "Timeline",
 ];
 
 /// A parser section with neither discovered evidence nor staged output is not
@@ -913,7 +949,12 @@ impl ArtifactOutcome {
 fn discover_artifact_files(name: &str, target: &Path) -> Vec<PathBuf> {
     match name {
         "Amcache" => finder::by_name(target, &["Amcache.hve"]),
-        "EventLog" => finder::by_name(target, eventlog::ALLOWLIST),
+        "EventLog" => {
+            let mut all = finder::by_name(target, eventlog::ALLOWLIST);
+            // XP/2003 구형 .evt(SecEvent/SysEvent/AppEvent)도 같은 아티팩트로.
+            all.extend(finder::by_name(target, eventlog::EVT_ALLOWLIST));
+            all
+        }
         "Registry" => {
             let mut all = finder::by_name(target, registry::REG_FILENAMES);
             all.extend(finder::by_suffix(target, registry::REG_SUFFIXES));
@@ -951,9 +992,23 @@ fn discover_artifact_files(name: &str, target: &Path) -> Vec<PathBuf> {
         "RdpCache" => rdpcache::rdpcache_sources(target),
         "BrowserHistory" => finder::by_name(target, &["History"]),
         "BrowserCache" => finder::by_name(target, &["index"]),
+        // WebCacheV##.dat — 버전 숫자는 빌드에 따라 다르다(01이 일반적).
+        "IEWebCache" => finder::by_name(
+            target,
+            &[
+                "WebCacheV01.dat",
+                "WebCacheV02.dat",
+                "WebCacheV16.dat",
+                "WebCacheV24.dat",
+            ],
+        ),
+        // 파일명만으로는 오탐 가능 — 매직("Client UrlCache MMF") 검사는 파서가 한다.
+        "IEIndexDat" => finder::by_name(target, &["index.dat"]),
         "PowerShell" => finder::by_name(target, &["ConsoleHost_history.txt"]),
         "Prefetch" => finder::by_extension(target, &[".pf"]),
         "WER" => wer::wer_sources(target),
+        "WmiRepository" => wmi_repository::wmi_sources(target),
+        "Timeline" => timeline::timeline_sources(target),
         _ => Vec::new(),
     }
 }
@@ -1187,8 +1242,16 @@ fn parse_eventlog_artifact(
         let name = uniq_name(&base, &mut taken);
         let relative = format!("EVENTLOG/{}.sqlite", name);
         let out = out_dir.join(&relative);
+        let is_evt = p
+            .extension()
+            .map(|e| e.to_string_lossy().eq_ignore_ascii_case("evt"))
+            .unwrap_or(false);
         if let Some(n) = run_unit_or_skip(&p.display().to_string(), &[&out], || {
-            eventlog::parse_evtx_stream(p, &out, &name)
+            if is_evt {
+                eventlog::parse_evt_stream(p, &out, &name)
+            } else {
+                eventlog::parse_evtx_stream(p, &out, &name)
+            }
         })? {
             entry_record_input_count(entry, p, n);
             if n > 0 {
@@ -1549,6 +1612,64 @@ fn parse_rdpcache_artifact(
     Ok(outputs)
 }
 
+fn parse_timeline_artifact(
+    paths: &[PathBuf],
+    out_dir: &Path,
+    entry: &mut ParseArtifactReport,
+) -> Result<Vec<String>> {
+    entry_record_inputs(entry, paths);
+    let rows = timeline::parse_timeline_from(paths)?;
+    entry_record_rows_by_source(entry, &rows);
+    let mut outputs = Vec::new();
+    if !rows.is_empty() {
+        let relative = "TIMELINE/Timeline_Activities.sqlite".to_string();
+        let out = out_dir.join(&relative);
+        if run_unit_or_skip("Timeline", &[&out], || {
+            write_table(
+                &out,
+                timeline::TIMELINE_TABLE,
+                &rows,
+                timeline::TIMELINE_FIELD_ORDER,
+            )
+        })?
+        .is_some()
+        {
+            emit(&format!("[+] {} rows -> {}", rows.len(), out.display()));
+            outputs.push(relative);
+        }
+    }
+    Ok(outputs)
+}
+
+fn parse_wmi_repository_artifact(
+    paths: &[PathBuf],
+    out_dir: &Path,
+    entry: &mut ParseArtifactReport,
+) -> Result<Vec<String>> {
+    entry_record_inputs(entry, paths);
+    let rows = wmi_repository::parse_wmi_from(paths)?;
+    entry_record_rows_by_source(entry, &rows);
+    let mut outputs = Vec::new();
+    if !rows.is_empty() {
+        let relative = "WMI/WMI_Persistence.sqlite".to_string();
+        let out = out_dir.join(&relative);
+        if run_unit_or_skip("WmiRepository", &[&out], || {
+            write_table(
+                &out,
+                wmi_repository::WMI_TABLE,
+                &rows,
+                wmi_repository::WMI_FIELD_ORDER,
+            )
+        })?
+        .is_some()
+        {
+            emit(&format!("[+] {} rows -> {}", rows.len(), out.display()));
+            outputs.push(relative);
+        }
+    }
+    Ok(outputs)
+}
+
 fn parse_wer_artifact(
     paths: &[PathBuf],
     out_dir: &Path,
@@ -1573,6 +1694,34 @@ fn parse_wer_artifact(
     Ok(outputs)
 }
 
+/// History 내용에서 브라우저를 판별한다 — 해당 브라우저만 만들 수 있는 내부
+/// 스킴 방문(chrome:// · edge:// · whale://)이 정확히 한 종류 있을 때만 Some.
+/// 경로에 단서가 없을 때의 2차 판별이며, 열기 실패·근거 혼재 시 None(미상).
+fn history_content_browser(path: &Path) -> Option<&'static str> {
+    let conn = rusqlite::Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .ok()?;
+    let mut hits: Vec<&'static str> = Vec::new();
+    for (scheme, browser) in [("chrome", "Chrome"), ("edge", "Edge"), ("whale", "Whale")] {
+        let found: bool = conn
+            .query_row(
+                &format!("SELECT 1 FROM urls WHERE url LIKE '{scheme}://%' LIMIT 1"),
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        if found {
+            hits.push(browser);
+        }
+    }
+    match hits.as_slice() {
+        [one] => Some(one),
+        _ => None,
+    }
+}
+
 fn parse_browser_history_artifact(
     paths: &[PathBuf],
     out_dir: &Path,
@@ -1585,7 +1734,15 @@ fn parse_browser_history_artifact(
     // 아티팩트). 이미 저장 완료된 다른 계정 결과는 그대로 발행된다.
     for p in paths {
         let acct = browser_account(p);
-        let name = uniq_name(&acct, &mut taken);
+        // 브라우저 판별: 경로 세그먼트 → 내용(내부 스킴) → 미상. 미상이면
+        // 브라우저를 주장하지 않고 종전처럼 계정명만 쓴다 — 같은 계정에
+        // 여러 History가 있을 때 어느 브라우저인지 산출물 이름에 남기기
+        // 위한 것(T8). 원본 경로는 parse_report 입력 목록에 보존된다.
+        let base = match browser_cache::browser_of(p).or_else(|| history_content_browser(p)) {
+            Some(browser) => format!("{}_{}", acct, browser),
+            None => acct,
+        };
+        let name = uniq_name(&base, &mut taken);
         let relative = format!("BROWSER/{}.sqlite", name);
         let out = out_dir.join(&relative);
         let unit = run_unit_or_skip(&p.display().to_string(), &[&out], || -> Result<(usize, bool)> {
@@ -1636,6 +1793,124 @@ fn parse_browser_cache_artifact(
             Some(count) => {
                 entry_record_input_count(entry, &index_path, count);
                 emit(&format!("[+] {} rows -> {}", count, out.display()));
+                outputs.push(relative);
+            }
+            None => {}
+        }
+    }
+    Ok(outputs)
+}
+
+fn parse_ie_webcache_artifact(
+    paths: &[PathBuf],
+    out_dir: &Path,
+    entry: &mut ParseArtifactReport,
+) -> Result<Vec<String>> {
+    entry_record_inputs(entry, paths);
+    let mut outputs = Vec::new();
+    let mut taken = HashSet::new();
+    // WebCache 파일 하나 = 출력 SQLite 하나(계정별). 손상/dirty ESE는 해당
+    // 파일만 건너뛴다(파싱 실패 == 손상 아티팩트).
+    for p in paths {
+        let acct = ie_webcache::ie_account(p);
+        let name = uniq_name(&format!("{acct}_IE_WebCache"), &mut taken);
+        let relative = format!("BROWSER/{name}.sqlite");
+        let out = out_dir.join(&relative);
+        let unit = run_unit_or_skip(&p.display().to_string(), &[&out], || -> Result<usize> {
+            let mut history = crate::sqlite::StreamWriter::create(
+                &out,
+                ie_webcache::HISTORY_TABLE,
+                ie_webcache::HISTORY_FIELD_ORDER,
+                ie_webcache::HISTORY_FIELD_ORDER,
+            )?;
+            // 다운로드 행은 소수 — 같은 SQLite 파일에 writer 둘을 동시에 열면
+            // 잠금이 충돌하므로 메모리에 모았다가 history 종료 후 기록한다.
+            let mut downloads: Vec<Row> = Vec::new();
+            ie_webcache::parse_webcache(
+                p,
+                &acct,
+                &mut |row| history.push(row),
+                &mut |row| {
+                    downloads.push(row);
+                    Ok(())
+                },
+            )?;
+            let mut total = history.finish()?;
+            if !downloads.is_empty() {
+                write_table(
+                    &out,
+                    ie_webcache::DOWNLOADS_TABLE,
+                    &downloads,
+                    ie_webcache::DOWNLOADS_FIELD_ORDER,
+                )?;
+                total += downloads.len();
+            }
+            Ok(total)
+        })?;
+        match unit {
+            Some(0) => {
+                let _ = std::fs::remove_file(&out);
+            }
+            Some(count) => {
+                entry_record_input_count(entry, p, count);
+                emit(&format!("[+] {} rows -> {}", count, out.display()));
+                outputs.push(relative);
+            }
+            None => {}
+        }
+    }
+    Ok(outputs)
+}
+
+fn parse_ie_indexdat_artifact(
+    paths: &[PathBuf],
+    out_dir: &Path,
+    entry: &mut ParseArtifactReport,
+) -> Result<Vec<String>> {
+    entry_record_inputs(entry, paths);
+    let mut outputs = Vec::new();
+    // 계정 하나에 index.dat가 여러 개(History.IE5/Content.IE5/Cookies/일별
+    // 컨테이너) — 계정별 출력 SQLite 하나로 모은다. 미지원 버전·손상 파일은
+    // 그 파일만 건너뛰고 경고를 남긴다.
+    let mut by_account: std::collections::BTreeMap<String, Vec<&PathBuf>> =
+        std::collections::BTreeMap::new();
+    for p in paths {
+        by_account
+            .entry(ie_webcache::ie_account(p))
+            .or_default()
+            .push(p);
+    }
+    for (acct, files) in by_account {
+        let relative = format!("BROWSER/{acct}_IE_IndexDat.sqlite");
+        let out = out_dir.join(&relative);
+        type Unit = (usize, Vec<(PathBuf, usize)>);
+        let unit = run_unit_or_skip(&format!("index.dat[{acct}]"), &[&out], || -> Result<Unit> {
+            let mut writer = crate::sqlite::StreamWriter::create(
+                &out,
+                ie_indexdat::TABLE,
+                ie_indexdat::FIELD_ORDER,
+                ie_indexdat::FIELD_ORDER,
+            )?;
+            let mut per_source: Vec<(PathBuf, usize)> = Vec::new();
+            for p in &files {
+                match ie_indexdat::parse_index_dat(p, &acct, &mut |row| writer.push(row)) {
+                    Ok(nrows) => per_source.push(((*p).clone(), nrows)),
+                    Err(error) => {
+                        emit(&format!("[!] index.dat 건너뜀 {}: {}", p.display(), error));
+                    }
+                }
+            }
+            Ok((writer.finish()?, per_source))
+        })?;
+        match unit {
+            Some((0, _)) => {
+                let _ = std::fs::remove_file(&out);
+            }
+            Some((total, per_source)) => {
+                for (source, count) in per_source {
+                    entry_record_input_count(entry, &source, count);
+                }
+                emit(&format!("[+] {} rows -> {}", total, out.display()));
                 outputs.push(relative);
             }
             None => {}
@@ -1728,9 +2003,13 @@ fn parse_artifact_sources(
         "RdpCache" => parse_rdpcache_artifact(paths, out_dir, &mut outcome.entry),
         "BrowserHistory" => parse_browser_history_artifact(paths, out_dir, &mut outcome.entry),
         "BrowserCache" => parse_browser_cache_artifact(paths, out_dir, &mut outcome.entry),
+        "IEWebCache" => parse_ie_webcache_artifact(paths, out_dir, &mut outcome.entry),
+        "IEIndexDat" => parse_ie_indexdat_artifact(paths, out_dir, &mut outcome.entry),
         "PowerShell" => parse_powershell_artifact(paths, out_dir, &mut outcome.entry),
         "Prefetch" => parse_prefetch_artifact(paths, out_dir, &mut outcome.entry),
         "WER" => parse_wer_artifact(paths, out_dir, &mut outcome.entry),
+        "WmiRepository" => parse_wmi_repository_artifact(paths, out_dir, &mut outcome.entry),
+        "Timeline" => parse_timeline_artifact(paths, out_dir, &mut outcome.entry),
         other => anyhow::bail!("unknown artifact {other}"),
     }
 }
@@ -2031,12 +2310,10 @@ pub fn run_host_with_log_id(
         // the same recovered Registry SQLite rows.  Keep one in-memory cache
         // for this overview pass only, preserving rowids/source identities.
         let registry_overview = overview::RegistryOverviewCache::load(&out_dir);
-        // columns: 0건에도 스키마를 만들 고정 컬럼 목록. skip_empty 뷰는
-        // 0건이면 파일 자체를 만들지 않으므로 빈 목록을 넘긴다.
-        let mut write_ov = |name: &str, rows: Vec<Row>, skip_empty: bool, columns: &[&str]| -> Result<()> {
-            if rows.is_empty() && skip_empty {
-                return Ok(());
-            }
+        // columns: 0건에도 스키마를 만들 고정 컬럼 목록. 모든 개요 테이블은
+        // 0건이어도 스키마와 함께 발행한다 — "해당 활동 없음"이 그 자체로
+        // 확인 가능한 정보로 남는다 (2026-08-31 사용자 확정, 통일).
+        let mut write_ov = |name: &str, rows: Vec<Row>, columns: &[&str]| -> Result<()> {
             let out = ov.join(format!("{}.sqlite", name));
             write_table(&out, name, &rows, columns)?;
             emit(&format!("[+] {} rows -> {}", rows.len(), out.display()));
@@ -2047,80 +2324,79 @@ pub fn run_host_with_log_id(
             Ok(())
         };
         let overview_result = (|| -> Result<()> {
-            write_ov(
-                "ScheduledTasks",
-                overview::build_scheduled_tasks(&out_dir),
-                true,
-                &[],
-            )?;
-            write_ov("RdpCache", overview::build_rdp_cache(&out_dir), true, &[])?;
-            // 이벤트 로그 행은 4개 빌더가 공유한다 — 한 번만 로드.
+            // 이벤트 로그 행은 여러 빌더가 공유한다 — 한 번만 로드.
             let events = overview::EventLogOverviewCache::load(&out_dir);
             write_ov(
+                "ScheduledTasks",
+                overview::build_scheduled_tasks_with_events(&out_dir, &events),
+                overview::ST_KEYS,
+            )?;
+            write_ov("RdpCache", overview::build_rdp_cache(&out_dir), overview::RC_KEYS)?;
+            write_ov(
                 "Defender",
-                overview::build_defender_with_events(&events),
-                false,
+                {
+                    let mut defender_rows = overview::build_defender_with_events(&events);
+                    // MPDetection-*.log의 DETECTION 라인 합류 (source=MPDetection).
+                    defender_rows.extend(overview::defender_from_mpdetection(&target));
+                    defender_rows
+                },
                 overview::DEF_KEYS,
             )?;
             write_ov(
                 "RemoteDesktopHistory",
                 overview::build_remote_desktop_history_with_events(&events),
-                false,
                 overview::RDP_KEYS,
             )?;
             write_ov(
                 "SmbHistory",
                 overview::build_smb_history_with_events(&events),
-                true,
-                &[],
+                overview::SMB_KEYS,
             )?;
             write_ov(
                 "BitsHistory",
                 overview::build_bits_history_with_events(&events),
-                true,
-                &[],
+                overview::BITS_KEYS,
             )?;
             write_ov(
                 "FirewallHistory",
                 overview::build_firewall_history_with_events(&out_dir, &events),
-                true,
-                &[],
+                overview::FW_KEYS,
             )?;
             write_ov(
                 "PowerShellHistory",
                 overview::build_powershell_history_with_events(&out_dir, &events),
-                false,
                 overview::PS_KEYS,
             )?;
             drop(events);
             write_ov(
                 "BrowserActivity",
                 overview::build_browser_history(&out_dir),
-                false,
                 overview::BH_KEYS,
             )?;
             write_ov(
                 "TargetInfo",
-                overview::build_target_info_with_registry(&registry_overview),
-                false,
+                {
+                    let mut ti_rows =
+                        overview::build_target_info_with_registry(&registry_overview);
+                    // hosts 파일 수동 등록 항목 합류 (유효 엔트리 없으면 0행).
+                    ti_rows.extend(overview::ti_from_hosts_file(&target));
+                    ti_rows
+                },
                 overview::TI_KEYS,
             )?;
             write_ov(
                 "ExecutionHistory",
                 overview::build_execution_history_with_registry(&out_dir, &registry_overview),
-                false,
                 overview::ROW_KEYS,
             )?;
             write_ov(
                 "RegistryFindings",
                 overview::build_registry_findings_with_registry(&registry_overview),
-                false,
                 overview::RF_KEYS,
             )?;
             write_ov(
                 "PathReferences",
                 overview::build_path_references(&out_dir, &registry_overview),
-                false,
                 overview::PR_KEYS,
             )?;
             Ok(())
@@ -2499,6 +2775,37 @@ mod persistent_log_tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// T8: 경로에 단서가 없는 History는 내부 스킴 방문으로 브라우저를
+    /// 판별하고, 근거가 없거나 혼재하면 미상(None)으로 남긴다.
+    #[test]
+    fn history_content_browser_detects_only_unambiguous_internal_schemes() {
+        let root = temporary_directory("history-content-browser");
+        std::fs::create_dir_all(&root).unwrap();
+        let make = |name: &str, urls: &[&str]| {
+            let path = root.join(name);
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute("CREATE TABLE urls (url TEXT)", []).unwrap();
+            for url in urls {
+                conn.execute("INSERT INTO urls VALUES (?1)", rusqlite::params![url])
+                    .unwrap();
+            }
+            path
+        };
+        let edge = make("edge.sqlite", &["https://x.test/", "edge://settings/profiles"]);
+        let plain = make("plain.sqlite", &["https://x.test/"]);
+        let mixed = make(
+            "mixed.sqlite",
+            &["chrome://version", "edge://settings", "https://x.test/"],
+        );
+        assert_eq!(history_content_browser(&edge), Some("Edge"));
+        assert_eq!(history_content_browser(&plain), None);
+        assert_eq!(history_content_browser(&mixed), None);
+        // urls 테이블이 없거나 sqlite가 아니면 판별하지 않는다.
+        std::fs::write(root.join("junk.sqlite"), b"not sqlite").unwrap();
+        assert_eq!(history_content_browser(&root.join("junk.sqlite")), None);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn stage_overview_reset_drops_copied_prior_derived_files() {
         let root = temporary_directory("stage-ov-reset");
@@ -2508,6 +2815,9 @@ mod persistent_log_tests {
         // 안 하므로, 리셋 없이는 이 복사본이 그대로 재발행된다.
         std::fs::create_dir_all(live.join("_OVERVIEW")).unwrap();
         std::fs::write(live.join("_OVERVIEW/ScheduledTasks.sqlite"), b"prior").unwrap();
+        // 파서 원본 산출물은 파생이 아니다 — 범위 재파싱에서 복사돼 온
+        // 마지막 발행본이 리셋에서 지워지면 어디서도 복구되지 않는다.
+        std::fs::write(live.join("_OVERVIEW/MFT_Records.sqlite"), b"committed-mft").unwrap();
         let mut only = HashSet::new();
         only.insert("TaskScheduler".to_string());
         let stage = prepare_staging_output(&live, "scoped-ov", Some(&only)).unwrap();
@@ -2515,6 +2825,45 @@ mod persistent_log_tests {
         reset_stage_overview(&stage.join("_OVERVIEW")).unwrap();
         assert!(!stage.join("_OVERVIEW/ScheduledTasks.sqlite").exists());
         assert!(stage.join("_OVERVIEW").exists());
+        assert_eq!(
+            std::fs::read(stage.join("_OVERVIEW/MFT_Records.sqlite")).unwrap(),
+            b"committed-mft"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ok_publish_retains_parser_staged_mft_records_after_overview_reset() {
+        let root = temporary_directory("ok-publish-mft");
+        let live = root.join("host");
+        // 이전 실행의 발행본 — ok 발행은 전부 이번 실행 결과로 대체한다.
+        std::fs::create_dir_all(live.join("_OVERVIEW")).unwrap();
+        std::fs::write(live.join("_OVERVIEW/MFT_Records.sqlite"), b"prior-mft").unwrap();
+        std::fs::write(live.join("_OVERVIEW/TargetInfo.sqlite"), b"prior-derived").unwrap();
+
+        // 전체 실행 재현: MFT 파서가 스테이징 _OVERVIEW에 기록·seal → 파생
+        // 생성 직전 리셋 → 파생 기록 → ok 발행. 리셋이 파서 산출물을 지우면
+        // ok 발행(publish_staging_output)은 seal본을 건너뛰므로 소실된다.
+        let stage = prepare_staging_output(&live, "ok-run", None).unwrap();
+        std::fs::create_dir_all(stage.join("_OVERVIEW")).unwrap();
+        std::fs::write(stage.join("_OVERVIEW/MFT_Records.sqlite"), b"fresh-mft").unwrap();
+        let mft_outputs = vec!["_OVERVIEW/MFT_Records.sqlite".to_string()];
+        seal_artifact_outputs(&stage, "MFT", &mft_outputs).unwrap();
+
+        reset_stage_overview(&stage.join("_OVERVIEW")).unwrap();
+        std::fs::write(stage.join("_OVERVIEW/TargetInfo.sqlite"), b"fresh-derived").unwrap();
+
+        clear_previous_results(&live, None).unwrap();
+        publish_staging_output(&live, &stage, "ok-run").unwrap();
+
+        assert_eq!(
+            std::fs::read(live.join("_OVERVIEW/MFT_Records.sqlite")).unwrap(),
+            b"fresh-mft"
+        );
+        assert_eq!(
+            std::fs::read(live.join("_OVERVIEW/TargetInfo.sqlite")).unwrap(),
+            b"fresh-derived"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

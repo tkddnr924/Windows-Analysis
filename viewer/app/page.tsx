@@ -22,6 +22,8 @@ import ScheduledTasksView from "@/components/ScheduledTasksView";
 import DefenderView from "@/components/DefenderView";
 import RegistryFindingsView from "@/components/RegistryFindingsView";
 import WerView from "@/components/WerView";
+import WmiPersistenceView from "@/components/WmiPersistenceView";
+import UsnJrnlView from "@/components/UsnJrnlView";
 import MftView from "@/components/MftView";
 import BrowserHistoryView from "@/components/BrowserHistoryView";
 import GlobalProgress from "@/components/GlobalProgress";
@@ -292,7 +294,9 @@ export default function Home() {
         // the exact same record fields as the ExecutionHistory view.
         if (refreshed) setMasterTimeline(null);
       }
-      const isBrowserActivity = getArtifactView(file.name)?.customView === "browserHistory";
+      const fileCustomView = getArtifactView(file.name)?.customView;
+      // 서버 페이지네이션 전용 뷰 — 행을 IPC로 싣지 않고 뷰가 직접 조회한다.
+      const isBrowserActivity = fileCustomView === "browserHistory" || fileCustomView === "usnJrnl";
       // 전용 뷰(customView)가 없는 원본 테이블은 DataTable로 렌더된다. 원본
       // EventLog처럼 수십만 행짜리 테이블을 통째로 IPC에 싣지 않도록 이
       // 경로만 청크 단위로 받고, 스크롤 시 이어 받는다. 개요 뷰들은 전체
@@ -1177,6 +1181,13 @@ export default function Home() {
                   onToggleBookmark={(rowid) => handleToggleActiveRowBookmark(rowid)}
                   timeRange={timeRange}
                 />
+              ) : getArtifactView(activeTab.file.name)?.customView === "wmiPersistence" ? (
+                <WmiPersistenceView
+                  data={activeTab.data}
+                  dbPath={activeTab.file.fullPath}
+                  bookmarkedRowids={activeBookmarkedRowids}
+                  onToggleBookmark={(rowid) => handleToggleActiveRowBookmark(rowid)}
+                />
               ) : getArtifactView(activeTab.file.name)?.customView === "registryFindings" ? (
                 <RegistryFindingsView
                   data={activeTab.data}
@@ -1184,6 +1195,13 @@ export default function Home() {
                   onToggleBookmark={(rowid) => handleToggleActiveRowBookmark(rowid)}
                   timeRange={timeRange}
                   accountDirectory={currentAccountDirectory}
+                />
+              ) : getArtifactView(activeTab.file.name)?.customView === "usnJrnl" ? (
+                <UsnJrnlView
+                  dbPath={activeTab.file.fullPath}
+                  timeRange={timeRange}
+                  bookmarkedRowids={new Set(activeTableBookmarks.map((bookmark) => bookmark.rowid))}
+                  onToggleBookmark={(rowid) => handleToggleBookmark(activeTab.file.fullPath, activeTab.file.tableName, rowid)}
                 />
               ) : getArtifactView(activeTab.file.name)?.customView === "browserHistory" ? (
                 <BrowserHistoryView

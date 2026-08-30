@@ -63,6 +63,12 @@ interface Props {
 
 const lowerKey = (v: string) => v.toLocaleLowerCase();
 
+/** RFC1918 사설 IP — 호스트 대역과 달라도 내부로 취급한다. */
+function isPrivateIp(label: string): boolean {
+  const value = label.trim();
+  return /^10\./.test(value) || /^192\.168\./.test(value) || /^172\.(1[6-9]|2\d|3[01])\./.test(value);
+}
+
 function networkGroupOf(label: string): string | null {
   const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.\d{1,3}$/.exec(label.trim());
   return m ? `${m[1]}.${m[2]}.${m[3]}` : null;
@@ -185,12 +191,19 @@ function layout3d(nodes: Graph3DNode[], edges: Graph3DEdge[], hostNets: string[]
     return Boolean(prefix) && hostNetSet.has(prefix);
   };
   const sameNetGroups = sortedGroups.filter(isSameNet);
-  const externalGroups = sortedGroups.filter((g) => !isSameNet(g));
+  // 사설(RFC1918) 대역은 호스트 대역과 달라도 내부다 — 다만 망을 나눈
+  // 의도를 존중해 호스트 지형과 병합하지는 않고 별도 내부 클러스터로 둔다.
+  const isPrivateGroup = (g: { net: string; members: Graph3DNode[] }) =>
+    !isSameNet(g) && (g.net ? isPrivateIp(g.net.replace(/\.x$/, "")) : g.members.some((m) => isPrivateIp(m.label)));
+  const privateGroups = sortedGroups.filter(isPrivateGroup);
+  const externalGroups = sortedGroups.filter((g) => !isSameNet(g) && !isPrivateGroup(g));
 
   // 중앙 지형: 등록 호스트 + 같은 대역 상대를 하나의 벌집 나선으로 —
   // 격자가 이어져 면이 맞닿으므로 같은 네트워크임이 그림 자체로 보인다.
   const sameNetKeys = new Set<string>();
   sameNetGroups.forEach((g) => g.members.forEach((m) => sameNetKeys.add(m.key)));
+  const privateKeys = new Set<string>();
+  privateGroups.forEach((g) => g.members.forEach((m) => privateKeys.add(m.key)));
   const hostTone = new Map<string, string>();
   let hostRadius = 0;
   if (mode === "external") {
@@ -232,6 +245,11 @@ function layout3d(nodes: Graph3DNode[], edges: Graph3DEdge[], hostNets: string[]
         ?? [...terrains.values()].find((t) => t.hostList.some((h) => netsOf(h.key).includes(prefix)))
         ?? [...terrains.values()][0];
       owner?.peerGroups.push(g);
+    });
+    // 사설 대역: 호스트 지형과 병합하지 않는 자기만의 내부 지형.
+    privateGroups.forEach((g) => {
+      const prefix = g.net ? g.net.replace(/\.x$/, "") : g.label;
+      terrains.set(`private:${prefix}`, { net: prefix, hostList: [], peerGroups: [g] });
     });
     const terrainSize = (t: Terrain) => t.hostList.length + t.peerGroups.reduce((acc, g) => acc + g.members.length, 0);
     const terrainList = [...terrains.values()].sort((a, b) => terrainSize(b) - terrainSize(a));
@@ -312,7 +330,7 @@ function layout3d(nodes: Graph3DNode[], edges: Graph3DEdge[], hostNets: string[]
   ];
   const scatterGroups = mode === "external"
     ? externalGroups
-    : sameNetGroups.flatMap((g) => g.members.map((m) => ({ label: m.label, net: g.net, network: true, members: [m] })));
+    : [...sameNetGroups, ...privateGroups].flatMap((g) => g.members.map((m) => ({ label: m.label, net: g.net, network: true, members: [m] })));
   scatterGroups.forEach((g, gi) => {
     const members = [...g.members].sort(byWeight);
     const offsets = hexSpiralOffsets(members.length, TILE_PEER + 0.8);
@@ -370,7 +388,7 @@ function layout3d(nodes: Graph3DNode[], edges: Graph3DEdge[], hostNets: string[]
   });
   const hostKeySet = new Set(hosts.map((h) => h.key));
   let visiblePairs = [...pairMap.values()].filter((pair) => {
-    const internal = (sameNetKeys.has(pair.source) || sameNetKeys.has(pair.target) || loopbackKeys.has(pair.source) || loopbackKeys.has(pair.target) || (hostKeySet.has(pair.source) && hostKeySet.has(pair.target)));
+    const internal = (sameNetKeys.has(pair.source) || sameNetKeys.has(pair.target) || privateKeys.has(pair.source) || privateKeys.has(pair.target) || loopbackKeys.has(pair.source) || loopbackKeys.has(pair.target) || (hostKeySet.has(pair.source) && hostKeySet.has(pair.target)));
     return mode === "external" ? !internal : internal;
   });
   if (mode === "external") {
@@ -460,6 +478,11 @@ export default function HostConnection3D({ nodes, edges, hostNets, hostNetInfo, 
     setPinnedKey(null);
     setHoverKey(null);
   }, [mode]);
+  // 목록으로 돌아가는 등 부모 선택이 비워지면 핀도 함께 해제한다 —
+  // 핀만 남아 강조·정보 패널이 유지되는 것을 막는다.
+  useEffect(() => {
+    if (selected === null) setPinnedKey(null);
+  }, [selected]);
   // 강조 기준점: 호버 > 클릭 고정(핀) > 선택된 노드 — 셋 다 같은
   // 하이라이트와 정보 패널을 띄운다. selected는 노드 키다.
   const activeKey = hoverKey ?? pinnedKey ?? selected;
@@ -638,7 +661,7 @@ export default function HostConnection3D({ nodes, edges, hostNets, hostNetInfo, 
           </span>
           <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
             <span aria-hidden="true" style={{ width: 12, height: 12, borderRadius: 3, background: "color-mix(in srgb, #5f8fd8 45%, transparent)", border: "1px solid #5f8fd8" }} />
-            같은 네트워크 대역 (미등록)
+            내부 대역 (미등록)
           </span>
           <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
             <span aria-hidden="true" style={{ width: 12, height: 12, borderRadius: 3, background: "color-mix(in srgb, #9aa4b0 40%, transparent)", border: "1px solid #9aa4b0" }} />

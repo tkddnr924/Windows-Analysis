@@ -447,9 +447,26 @@ fn account_of(path: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// 수집 경로에서 브라우저를 판별한다 — 경로 세그먼트가 결정적일 때만 Some.
+/// 수집 레이아웃(BROWSER/<계정>/CHROME/…)과 원본 프로필 경로(Google\Chrome,
+/// Microsoft\Edge, Naver\Whale)의 세그먼트를 모두 커버한다. 단서가 없으면
+/// None — 호출부는 브라우저를 추측하지 않고 미상으로 처리한다(T8 확정).
+pub fn browser_of(path: &Path) -> Option<&'static str> {
+    for part in path.components() {
+        match part.as_os_str().to_string_lossy().to_lowercase().as_str() {
+            "chrome" => return Some("Chrome"),
+            "edge" => return Some("Edge"),
+            "whale" => return Some("Whale"),
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Valid blockfile cache indexes among `paths`, each with its assigned output
-/// name (`<account>_Chrome_Cache`, uniquified). Unreadable or non-blockfile
-/// indexes are skipped — a corrupted cache is simply not a parsable artifact.
+/// name (`<account>_<브라우저|Unknown>_Cache`, uniquified). Unreadable or
+/// non-blockfile indexes are skipped — a corrupted cache is simply not a
+/// parsable artifact.
 pub fn cache_outputs(paths: &[PathBuf]) -> Vec<(String, PathBuf)> {
     let mut outputs: Vec<(String, PathBuf)> = Vec::new();
     let mut taken: HashSet<String> = HashSet::new();
@@ -459,7 +476,12 @@ pub fn cache_outputs(paths: &[PathBuf]) -> Vec<(String, PathBuf)> {
             .and_then(|p| p.file_name())
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
-        if parent_name != "Cache_Data"
+        // 신형 레이아웃(Cache/Cache_Data/index)과 구형 레이아웃(Cache/index,
+        // f_* 동거 — 구 Edge·구 Chrome)을 모두 허용한다. 뒤의 블록파일 매직
+        // 검사가 엉뚱한 파일의 통과를 막는 안전망이다(T8).
+        let layout_ok = parent_name.eq_ignore_ascii_case("Cache_Data")
+            || parent_name.eq_ignore_ascii_case("Cache");
+        if !layout_ok
             || index_path
                 .to_string_lossy()
                 .to_lowercase()
@@ -474,7 +496,13 @@ pub fn cache_outputs(paths: &[PathBuf]) -> Vec<(String, PathBuf)> {
         if !readable || u32::from_le_bytes(head) != INDEX_MAGIC {
             continue;
         }
-        let base = format!("{}_Chrome_Cache", account_of(index_path));
+        // 브라우저를 특정할 수 없으면 Chrome으로 단정하지 않고 Unknown으로
+        // 표기한다 — 증거 귀속은 근거 있을 때만(T8 확정).
+        let base = format!(
+            "{}_{}_Cache",
+            account_of(index_path),
+            browser_of(index_path).unwrap_or("Unknown")
+        );
         let mut name = base.clone();
         let mut i = 2;
         while taken.contains(&name) {
@@ -566,6 +594,35 @@ mod tests {
         assert_eq!(cache.read(addr, 100).len(), 100);
         assert_eq!(cache.read(addr, 0).len(), RAW_CAP);
         assert_eq!(cache.read(addr, usize::MAX).len(), RAW_CAP);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// T8: 구형 레이아웃(Cache/ 바로 밑 index)도 채택되고, 출력명은 경로에서
+    /// 판별한 브라우저를 쓰며, 단서 없으면 Chrome 단정 대신 Unknown이 된다.
+    #[test]
+    fn cache_outputs_name_browser_and_accept_legacy_layout() {
+        let root = std::env::temp_dir().join(format!(
+            "wina-cache-browser-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        // 구형 Edge: Cache/ 바로 밑 index (Cache_Data 폴더 없음 — NY/PC1 ny 계정형).
+        let legacy_edge = root.join("BROWSER/ny/EDGE/Cache");
+        // 브라우저 단서가 전혀 없는 경로.
+        let unknown = root.join("BROWSER/userX/Cache/Cache_Data");
+        std::fs::create_dir_all(&legacy_edge).unwrap();
+        std::fs::create_dir_all(&unknown).unwrap();
+        std::fs::write(legacy_edge.join("index"), INDEX_MAGIC.to_le_bytes()).unwrap();
+        std::fs::write(unknown.join("index"), INDEX_MAGIC.to_le_bytes()).unwrap();
+        let outputs = cache_outputs(&[legacy_edge.join("index"), unknown.join("index")]);
+        let names: Vec<&str> = outputs.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names, vec!["ny_Edge_Cache", "userX_Unknown_Cache"]);
+        assert_eq!(browser_of(Path::new("BROWSER/a/CHROME/Default/History")), Some("Chrome"));
+        assert_eq!(browser_of(Path::new("C:/Users/x/AppData/Local/Naver/Whale/User Data")), Some("Whale"));
+        assert_eq!(browser_of(Path::new("BROWSER/a/History")), None);
         let _ = std::fs::remove_dir_all(root);
     }
 

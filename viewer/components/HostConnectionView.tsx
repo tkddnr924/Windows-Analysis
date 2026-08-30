@@ -73,6 +73,11 @@ const graphLabelWidth = (width: number) =>
   Math.max(1, Math.min(NODE_LABEL_WIDTH, Math.max(1, width - 16)));
 const graphLabelHalf = (width: number) => graphLabelWidth(width) / 2;
 const key = (v: string) => v.toLocaleLowerCase();
+/** RFC1918 사설 IP — 호스트 대역과 달라도 내부로 취급한다. */
+const isPrivateIp = (label: string): boolean =>
+  /^10\./.test(label.trim()) ||
+  /^192\.168\./.test(label.trim()) ||
+  /^172\.(1[6-9]|2\d|3[01])\./.test(label.trim());
 const dir = (v: ConnDirection) =>
   v === "inbound"
     ? "인바운드"
@@ -280,6 +285,8 @@ export default function HostConnectionView(
   const internalNets = useMemo(() => new Set(hostNets), [hostNets]);
   const isInternalRecord = useCallback((r: ConnRecord) => {
     if (r.peerIsHost || r.peerKind === "local" || r.peerKind === "loopback") return true;
+    // RFC1918 사설 대역은 호스트 대역과 달라도 사실상 내부다.
+    if (isPrivateIp(r.peerLabel)) return true;
     const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.\d{1,3}$/.exec(r.peerLabel.trim());
     return Boolean(m) && internalNets.has(`${m![1]}.${m![2]}.${m![3]}`);
   }, [internalNets]);
@@ -316,6 +323,7 @@ export default function HostConnectionView(
       return (e: Edge) => {
         const kind = e.rows[0]?.peerKind;
         if (e.rows[0]?.peerIsHost || kind === "local" || kind === "loopback") return true;
+        if (isPrivateIp(e.peer)) return true;
         const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.\d{1,3}$/.exec(e.peer.trim());
         return Boolean(m) && nets.has(`${m![1]}.${m![2]}.${m![3]}`);
       };

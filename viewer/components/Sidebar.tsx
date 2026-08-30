@@ -21,6 +21,8 @@ import SecurityOutlinedIcon from "@mui/icons-material/SecurityOutlined";
 import TaskOutlinedIcon from "@mui/icons-material/TaskOutlined";
 import LanguageOutlinedIcon from "@mui/icons-material/LanguageOutlined";
 import PhotoLibraryOutlinedIcon from "@mui/icons-material/PhotoLibraryOutlined";
+import DeviceHubOutlinedIcon from "@mui/icons-material/DeviceHubOutlined";
+import HistoryOutlinedIcon from "@mui/icons-material/HistoryOutlined";
 import ReportProblemOutlinedIcon from "@mui/icons-material/ReportProblemOutlined";
 import ShieldOutlinedIcon from "@mui/icons-material/ShieldOutlined";
 import type { Case, Host, CategoryEntry, ResultFileEntry } from "@/lib/types";
@@ -54,6 +56,9 @@ const ARTIFACT_CATEGORY: Record<string, string> = {
   // BrowserCache show as empty "데이터 없음" rows next to the real BROWSER folder.
   BrowserHistory: "BROWSER",
   BrowserCache: "BROWSER",
+  IEWebCache: "BROWSER",
+  IEIndexDat: "BROWSER",
+  WmiRepository: "WMI",
 };
 
 function categoryForArtifact(name: string): string {
@@ -124,6 +129,17 @@ const OVERVIEW_TABLE_NAMES: Record<string, string> = {
   ScheduledTasks: "작업 스케줄러",
   MFT_Records: "파일 시스템 정보",
 };
+
+// 호스트 분석 소그룹 — 분석 관점별 묶음 (2026-08-31 사용자 확정, RDP Cache는
+// 네트워크 그룹 맨 아래). "@USN"/"@WER"/"@WMI"는 승격된 개별 항목이고
+// 나머지는 _OVERVIEW 테이블 이름. 목록에 없는 테이블은 그룹 뒤에 그대로
+// 나열되는 안전망을 둔다 (새 테이블이 추가돼도 사라지지 않게).
+const ANALYSIS_GROUPS: { title: string; items: string[] }[] = [
+  { title: "실행 흔적", items: ["ExecutionHistory", "PowerShellHistory", "ScheduledTasks", "@WMI"] },
+  { title: "파일 시스템", items: ["MFT_Records", "@USN"] },
+  { title: "네트워크 · 원격", items: ["RemoteDesktopHistory", "SmbHistory", "BitsHistory", "FirewallHistory", "BrowserActivity", "RdpCache"] },
+  { title: "시스템 · 보안", items: ["RegistryFindings", "Defender", "@WER"] },
+];
 
 function OverviewTableIcon({ name }: { name: string }) {
   const props = { sx: { fontSize: 18, color: "var(--text-faint)", flexShrink: 0 } };
@@ -472,24 +488,40 @@ export default function Sidebar({
   const overviewCategory = categories.find((c) => c.name === "_OVERVIEW");
   // 호스트 정보(TargetInfo)는 호스트 분석 최상단 고정 항목으로 승격 —
   // 종합 분석 목록에서는 숨겨 중복 표시를 피한다.
-  const [fetchedTargetInfo, setFetchedTargetInfo] = useState<ResultFileEntry | null>(null);
+  const [fetchedOverviewFiles, setFetchedOverviewFiles] = useState<ResultFileEntry[] | null>(null);
   useEffect(() => {
     if (overviewFiles || !overviewCategory) {
-      setFetchedTargetInfo(null);
+      setFetchedOverviewFiles(null);
       return;
     }
     let cancelled = false;
     window.api.listResultFiles(overviewCategory.fullPath).then((files) => {
-      if (!cancelled) setFetchedTargetInfo(files.find((file) => file.name === "TargetInfo") ?? null);
+      if (!cancelled) setFetchedOverviewFiles(files);
     });
     return () => {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [overviewFiles, overviewCategory?.fullPath]);
-  const targetInfoEntry = overviewFiles
-    ? overviewFiles.find((file) => file.name === "TargetInfo") ?? null
-    : fetchedTargetInfo;
+  const effectiveOverviewFiles = overviewFiles ?? fetchedOverviewFiles;
+  const targetInfoEntry = effectiveOverviewFiles?.find((file) => file.name === "TargetInfo") ?? null;
+  // 소그룹 렌더용 — 종합 분석 테이블을 파일 단위로 묶는다 (CategoryNode와
+  // 같은 규칙: TargetInfo는 승격돼 제외, PathReferences는 화면이 없어 제외).
+  const overviewByFile = useMemo(() => {
+    const map = new Map<string, ResultFileEntry[]>();
+    for (const file of effectiveOverviewFiles ?? []) {
+      if (file.name === "TargetInfo" || file.fileName === "PathReferences") continue;
+      if (!map.has(file.fileName)) map.set(file.fileName, []);
+      map.get(file.fileName)!.push(file);
+    }
+    return map;
+  }, [effectiveOverviewFiles]);
+  const groupedNames = useMemo(() => new Set(ANALYSIS_GROUPS.flatMap((group) => group.items)), []);
+  const leftoverOverview = [...overviewByFile.keys()].filter((name) => !groupedNames.has(name)).sort((a, b) => a.localeCompare(b));
+  // 소그룹 접힘 상태 — 시작 시 전부 접힘 (2026-08-31 사용자 확정).
+  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(
+    () => new Set(ANALYSIS_GROUPS.map((group) => group.title)),
+  );
   // WER(오류 보고)은 전용 뷰가 있는 분석 항목이라 호스트 분석 목록으로 승격 —
   // 원본 데이터 목록에서는 빼서 중복 표시를 피한다.
   const werCategory = categories.find((c) => c.name === "WER");
@@ -508,7 +540,42 @@ export default function Sidebar({
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [werCategory?.fullPath]);
-  const rawCategories = categories.filter((c) => c.name !== "_OVERVIEW" && c.name !== "WER");
+  // USN 저널(FILESYSTEM/UsnJrnl_Records)도 전용 뷰가 있는 분석 항목이라
+  // 호스트 분석 목록으로 승격한다.
+  const fsCategory = categories.find((c) => c.name === "FILESYSTEM");
+  const [usnEntry, setUsnEntry] = useState<ResultFileEntry | null>(null);
+  useEffect(() => {
+    if (!fsCategory) {
+      setUsnEntry(null);
+      return;
+    }
+    let cancelled = false;
+    window.api.listResultFiles(fsCategory.fullPath).then((files) => {
+      if (!cancelled) setUsnEntry(files.find((file) => file.name === "UsnJrnl_Records") ?? files[0] ?? null);
+    });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fsCategory?.fullPath]);
+  // WMI 이벤트 구독도 전용 뷰가 있는 분석 항목이라 같은 방식으로 승격한다.
+  const wmiCategory = categories.find((c) => c.name === "WMI");
+  const [wmiEntry, setWmiEntry] = useState<ResultFileEntry | null>(null);
+  useEffect(() => {
+    if (!wmiCategory) {
+      setWmiEntry(null);
+      return;
+    }
+    let cancelled = false;
+    window.api.listResultFiles(wmiCategory.fullPath).then((files) => {
+      if (!cancelled) setWmiEntry(files.find((file) => file.name === "WMI_Persistence") ?? files[0] ?? null);
+    });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [wmiCategory?.fullPath]);
+  const rawCategories = categories.filter((c) => c.name !== "_OVERVIEW" && c.name !== "WER" && c.name !== "WMI" && c.name !== "FILESYSTEM");
 
   // Every artifact that ran, mapped to its category, in run order — so the
   // "원본 데이터" list is 1:1 with the run list. Categories with real output
@@ -520,7 +587,7 @@ export default function Sidebar({
   const seenNames = new Set<string>();
   for (const artifact of activeHost.artifactsRun ?? []) {
     const cat = categoryForArtifact(artifact);
-    if (cat === "_OVERVIEW" || cat === "WER" || seenNames.has(cat)) continue;
+    if (cat === "_OVERVIEW" || cat === "WER" || cat === "WMI" || cat === "FILESYSTEM" || seenNames.has(cat)) continue;
     seenNames.add(cat);
     orderedNames.push(cat);
   }
@@ -636,25 +703,55 @@ export default function Sidebar({
               selected={activeVirtualTab === "timeline"}
               onClick={onSelectTimeline}
             />
-            {overviewCategory && (
-              <CategoryNode
-                category={overviewCategory}
-                pinned
-                hideHeader
-                hideFileName="TargetInfo"
-                preloadedFiles={overviewFiles ?? undefined}
-                selectedFile={selectedFile}
-                onSelectFile={onSelectFile}
-              />
-            )}
-            {werEntry && (
-              <PinnedNavRow
-                icon={<ReportProblemOutlinedIcon sx={{ fontSize: 19 }} />}
-                label="오류 보고 (WER)"
-                selected={sameEntry(selectedFile, werEntry)}
-                onClick={() => onSelectFile(werEntry)}
-              />
-            )}
+            {ANALYSIS_GROUPS.map((group) => {
+              const rows: React.ReactNode[] = [];
+              for (const item of group.items) {
+                if (item === "@USN") {
+                  if (usnEntry) rows.push(<PinnedNavRow key="usn" icon={<HistoryOutlinedIcon sx={{ fontSize: 19 }} />} label="USN 저널" selected={sameEntry(selectedFile, usnEntry)} onClick={() => onSelectFile(usnEntry)} />);
+                  continue;
+                }
+                if (item === "@WER") {
+                  if (werEntry) rows.push(<PinnedNavRow key="wer" icon={<ReportProblemOutlinedIcon sx={{ fontSize: 19 }} />} label="오류 보고 (WER)" selected={sameEntry(selectedFile, werEntry)} onClick={() => onSelectFile(werEntry)} />);
+                  continue;
+                }
+                if (item === "@WMI") {
+                  if (wmiEntry) rows.push(<PinnedNavRow key="wmi" icon={<DeviceHubOutlinedIcon sx={{ fontSize: 19 }} />} label="WMI 이벤트 구독" selected={sameEntry(selectedFile, wmiEntry)} onClick={() => onSelectFile(wmiEntry)} />);
+                  continue;
+                }
+                const tables = overviewByFile.get(item);
+                if (tables?.length) {
+                  rows.push(<FileNode key={item} fileName={item} label={OVERVIEW_TABLE_NAMES[item] ?? item} tables={tables} selectedFile={selectedFile} indent={12} leading={<OverviewTableIcon name={item} />} prominent onSelectFile={onSelectFile} />);
+                }
+              }
+              if (rows.length === 0) return null;
+              const open = !collapsedGroups.has(group.title);
+              return (
+                <div key={group.title}>
+                  <button
+                    type="button"
+                    onClick={() => setCollapsedGroups((previous) => { const next = new Set(previous); if (next.has(group.title)) next.delete(group.title); else next.add(group.title); return next; })}
+                    aria-expanded={open}
+                    style={{ width: "100%", minHeight: 40, display: "flex", alignItems: "center", gap: 8, padding: "10px 12px 10px 9px", border: "none", borderLeft: "3px solid transparent", borderRadius: 0, background: "transparent", color: open ? "var(--text)" : "var(--text-dim)", cursor: "pointer", fontSize: 13.5, fontWeight: 650, letterSpacing: 0.2, textAlign: "left" }}
+                    onMouseEnter={(event) => { event.currentTarget.style.background = "var(--bg-hover)"; }}
+                    onMouseLeave={(event) => { event.currentTarget.style.background = "transparent"; }}
+                  >
+                    {open ? <KeyboardArrowDownIcon sx={{ fontSize: 18, color: "var(--text-faint)", flexShrink: 0 }} /> : <KeyboardArrowRightIcon sx={{ fontSize: 18, color: "var(--text-faint)", flexShrink: 0 }} />}
+                    <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{group.title}</span>
+                    <span style={{ color: "var(--text-faint)", fontWeight: 400, fontSize: 11.5 }}>{rows.length}</span>
+                  </button>
+                  {open && (
+                    <div style={{ margin: "0 0 6px 17px", paddingLeft: 3, borderLeft: "1px solid var(--border)" }}>{rows}</div>
+                  )}
+                </div>
+              );
+            })}
+            {leftoverOverview.map((name) => {
+              const tables = overviewByFile.get(name);
+              return tables?.length ? (
+                <FileNode key={name} fileName={name} label={OVERVIEW_TABLE_NAMES[name] ?? name} tables={tables} selectedFile={selectedFile} indent={12} leading={<OverviewTableIcon name={name} />} prominent onSelectFile={onSelectFile} />
+              ) : null;
+            })}
+            <div style={{ height: 4 }} />
           </div>
         </>
         {hasRawSection && (

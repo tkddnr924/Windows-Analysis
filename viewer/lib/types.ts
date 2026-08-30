@@ -477,6 +477,7 @@ export interface ElectronApi {
   mftSearch(fullPath: string, query: string, limit: number): Promise<Record<string, string>[]>;
   mftRow(fullPath: string, rowid: number): Promise<Record<string, string> | null>;
   mftRecordsPage(fullPath: string, query: string, offset: number, limit: number, options?: { sortKey?: string; sortDesc?: boolean; filesOnly?: boolean; namePattern?: string; timeKey?: string; timeStart?: string; timeEnd?: string }): Promise<MftRecordsPage>;
+  usnJrnlPage(fullPath: string, query: { search?: string; reason?: string; start?: string; end?: string; ascending?: boolean; offset: number; limit: number }): Promise<CsvData>;
   listColumnValues(fullPath: string, column: string, tableName?: string): Promise<{ value: string; count: number }[]>;
   searchCase(query: string, hosts: { id: string; name: string; dir: string }[], offset: number, limit: number, range?: { start?: string; end?: string }): Promise<SearchCasePage>;
   listBookmarks(hostDir: string): Promise<Bookmark[]>;

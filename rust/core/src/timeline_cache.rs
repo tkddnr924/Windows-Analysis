@@ -1,11 +1,11 @@
 //! 통합 타임라인 캐시 — 가공 단계에서 뷰어가 그대로 읽는
 //! `_master_timeline.cache.json`을 만든다. 뷰어의 buildMasterTimeline과 같은
-//! 구성(타임라인 대상 5종)과 필터를 적용하고, 표시 문구(summary/subtitle)와
+//! 구성(타임라인 대상 6종)과 필터를 적용하고, 표시 문구(summary/subtitle)와
 //! 태그는 뷰어가 로드 시 스펙 함수로 채운다(문구·태그 정의는 TS 한 곳 유지).
 //!
 //! 대상: _OVERVIEW/ExecutionHistory · _OVERVIEW/ScheduledTasks ·
 //! _OVERVIEW/BrowserActivity(visit/download만) · JUMPLIST/JumpList_Entries ·
-//! EVENTLOG/*(EventID != "0"). 시각 없는 행은 제외, 최신순 정렬.
+//! WER/WER_Reports · EVENTLOG/*(EventID != "0"). 시각 없는 행은 제외, 최신순 정렬.
 use std::io::Write;
 use std::path::Path;
 
@@ -137,6 +137,17 @@ pub fn build_master_timeline_cache(
         "JumpList_Entries",
         "JUMPLIST",
         &live("JUMPLIST", "JumpList_Entries"),
+        &include_all,
+        &mut entries,
+    )?;
+    // WER: 크래시 보고서의 EventTime(크래시 발생 시각) — 악성코드 크래시·
+    // 익스플로잇 실패 시각의 유일한 타임라인 공급원(T6에서 WER만 편입 확정,
+    // RegistryFindings·CacheEntries·레지스트리 하이브 last_write는 제외 유지).
+    collect_table(
+        &stage_dir.join("WER").join("WER_Reports.sqlite"),
+        "WER_Reports",
+        "WER",
+        &live("WER", "WER_Reports"),
         &include_all,
         &mut entries,
     )?;

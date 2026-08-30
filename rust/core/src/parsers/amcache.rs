@@ -13,7 +13,7 @@ use notatin::parser_builder::ParserBuilder;
 
 use crate::hex::hex_lower;
 use crate::sqlite::Row;
-use crate::time::fmt_kst;
+use crate::time::{fmt_filetime, fmt_kst};
 
 pub const PROGRAMS_TABLE: &str = "Amcache_Programs";
 pub const FILES_TABLE: &str = "Amcache_Files";
@@ -53,6 +53,40 @@ pub const FILES_FIELD_ORDER: &[&str] = &[
     "_recovery",
     "_source_file",
 ];
+
+// Legacy (Win7/2008R2) \Root\File numeric value-name mapping — value names
+// are hex ids. Mapped to the modern snake_case columns so the execution
+// history overview and views read legacy rows identically.
+fn map_legacy_file(name: &str) -> String {
+    let lowered = name.to_ascii_lowercase();
+    match lowered.as_str() {
+        "0" => "product_name",
+        "1" => "publisher",
+        "2" => "file_version_number",
+        "3" => "language",
+        "5" => "version",
+        "6" => "size",
+        "c" => "file_description",
+        "11" => "last_modified",
+        "12" => "created",
+        "15" => "full_path",
+        "17" => "last_modified_2",
+        "100" => "program_id",
+        "101" => "file_id",
+        _ => return lowered,
+    }
+    .to_string()
+}
+
+/// FILETIME 정수 문자열이면 KST 표기로 바꾼다 (구형 File 항목 11/12/17).
+fn legacy_filetime(value: &str) -> Option<String> {
+    let ticks: i64 = value.trim().parse().ok()?;
+    if ticks <= 0 {
+        return None;
+    }
+    let formatted = fmt_filetime(ticks);
+    if formatted.is_empty() { None } else { Some(formatted) }
+}
 
 // Legacy Win8 \Root\Programs numeric value-name mapping (high-confidence subset).
 fn map_legacy_program(name: &str) -> &str {
@@ -209,7 +243,31 @@ pub fn parse_amcache(hive: &Path, logs: &[PathBuf]) -> Result<AmcacheParse> {
             let mut row = Row::new();
             for v in key.value_iter() {
                 let (cv, _) = v.get_content();
-                row.insert(underscore(&v.get_pretty_name()), render(&cv));
+                let pretty = v.get_pretty_name();
+                let column = if is_file_legacy {
+                    map_legacy_file(&pretty)
+                } else {
+                    underscore(&pretty)
+                };
+                row.insert(column, render(&cv));
+            }
+            if is_file_legacy {
+                // 경로에서 파일명·소문자 경로 파생 + FILETIME 값 변환 —
+                // 신형 스키마(name/lower_case_long_path)와 같은 모양으로 만든다.
+                if let Some(full) = row.get("full_path").cloned() {
+                    let base = full.rsplit(['\\', '/']).next().unwrap_or("").to_string();
+                    if !base.is_empty() {
+                        row.entry("name".into()).or_insert(base);
+                    }
+                    row.insert("lower_case_long_path".into(), full.to_lowercase());
+                }
+                for column in ["last_modified", "created", "last_modified_2"] {
+                    if let Some(raw) = row.get(column).cloned() {
+                        if let Some(formatted) = legacy_filetime(&raw) {
+                            row.insert(column.into(), formatted);
+                        }
+                    }
+                }
             }
             // regipy AmCachePlugin post-processing: strip the 4-char prefix on
             // file_id / program_id, derive sha1 from file_id, size hex->int.
@@ -233,9 +291,11 @@ pub fn parse_amcache(hive: &Path, logs: &[PathBuf]) -> Result<AmcacheParse> {
                     row.insert("program_id".into(), pid[4..].to_string());
                 }
             }
-            if let Some(sz) = row.get("size").cloned() {
-                if let Ok(n) = i64::from_str_radix(sz.trim_start_matches("0x"), 16) {
-                    row.insert("size".into(), n.to_string());
+            if !is_file_legacy {
+                if let Some(sz) = row.get("size").cloned() {
+                    if let Ok(n) = i64::from_str_radix(sz.trim_start_matches("0x"), 16) {
+                        row.insert("size".into(), n.to_string());
+                    }
                 }
             }
             // rename sha1 -> SHA1 (Python column name)
@@ -257,7 +317,27 @@ pub fn parse_amcache(hive: &Path, logs: &[PathBuf]) -> Result<AmcacheParse> {
 
 #[cfg(test)]
 mod tests {
-    use super::{after_root, classify_key, AmcacheKeyKind};
+    use super::{after_root, classify_key, legacy_filetime, map_legacy_file, AmcacheKeyKind};
+
+    #[test]
+    fn legacy_file_value_ids_map_to_modern_columns() {
+        assert_eq!(map_legacy_file("15"), "full_path");
+        assert_eq!(map_legacy_file("17"), "last_modified_2");
+        assert_eq!(map_legacy_file("101"), "file_id");
+        assert_eq!(map_legacy_file("100"), "program_id");
+        assert_eq!(map_legacy_file("1"), "publisher");
+        assert_eq!(map_legacy_file("0"), "product_name");
+        // 미지의 ID는 소문자 원문 그대로 보존한다.
+        assert_eq!(map_legacy_file("16"), "16");
+    }
+
+    #[test]
+    fn legacy_filetime_formats_ticks_and_rejects_junk() {
+        let formatted = legacy_filetime("128992604620000512").expect("filetime");
+        assert!(formatted.starts_with("2009-"), "{formatted}");
+        assert!(legacy_filetime("0").is_none());
+        assert!(legacy_filetime("not-a-number").is_none());
+    }
 
     #[test]
     fn key_classification_ignores_case() {

@@ -53,6 +53,7 @@ function makeApi(): ElectronApi {
     mftChildren: (fullPath, parentEntry, offset, limit) => invoke<import("./types").MftChildrenPage>("mft_children", { fullPath, parentEntry, offset, limit }),
     mftSearch: (fullPath, query, limit) => invoke<Record<string, string>[]>("mft_search", { fullPath, query, limit }),
     mftRow: (fullPath, rowid) => invoke<Record<string, string> | null>("mft_row", { fullPath, rowid }),
+    usnJrnlPage: (fullPath, query) => invoke<CsvData>("usnjrnl_page", { fullPath, search: query.search ?? "", reason: query.reason ?? "", start: query.start ?? "", end: query.end ?? "", ascending: query.ascending ?? false, offset: query.offset, limit: query.limit }),
     mftRecordsPage: (fullPath, query, offset, limit, options) => invoke<MftRecordsPage>("mft_records_page", { fullPath, query, offset, limit, sortKey: options?.sortKey ?? null, sortDesc: options?.sortDesc ?? null, filesOnly: options?.filesOnly ?? null, namePattern: options?.namePattern ?? null, timeKey: options?.timeKey ?? null, timeStart: options?.timeStart ?? null, timeEnd: options?.timeEnd ?? null }),
     listColumnValues: (fullPath, column, tableName) =>
       invoke<{ value: string; count: number }[]>("list_column_values", { fullPath, column, tableName: tableName ?? null }),
