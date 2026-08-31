@@ -151,7 +151,9 @@ export default function UsnJrnlView({ dbPath, timeRange, bookmarkedRowids, onTog
                 <div
                   key={stableKey || `${safePage}-${index}`}
                   className={bookmarked ? "dfir-bookmarked-row" : undefined}
-                  style={{ borderRadius: "var(--radius-md)", minHeight: 56, marginBottom: 8, display: "flex", alignItems: "center", gap: 12, padding: "0 14px", border: "1px solid var(--border)", background: "var(--bg-panel)", color: "var(--text)", transition: "background .15s ease, border-color .15s ease" }}
+                  // 행 전체(여백 포함)가 상세 열기 클릭 대상 — 북마크는 전파 차단.
+                  onClick={() => setDetail(row)}
+                  style={{ borderRadius: "var(--radius-md)", minHeight: 56, marginBottom: 8, display: "flex", alignItems: "center", gap: 12, padding: "0 14px", border: "1px solid var(--border)", background: "var(--bg-panel)", color: "var(--text)", cursor: "pointer", transition: "background .15s ease, border-color .15s ease" }}
                   onMouseEnter={(event) => { if (!bookmarked) event.currentTarget.style.background = "var(--bg-hover)"; }}
                   onMouseLeave={(event) => { if (!bookmarked) event.currentTarget.style.background = "var(--bg-panel)"; }}
                 >
@@ -179,7 +181,7 @@ export default function UsnJrnlView({ dbPath, timeRange, bookmarkedRowids, onTog
                   </div>
                   <Tooltip title={bookmarked ? "북마크 해제" : "북마크"}>
                     <span>
-                      <IconButton className={bookmarked ? "dfir-bookmark-control" : undefined} aria-label={bookmarked ? "북마크 해제" : "북마크"} disabled={!onToggleBookmark} size="small" onClick={() => onToggleBookmark?.(rowId(row))} sx={{ color: bookmarked ? "var(--bookmark-control)" : "var(--text-faint)", borderRadius: "var(--radius-sm)" }}>
+                      <IconButton className={bookmarked ? "dfir-bookmark-control" : undefined} aria-label={bookmarked ? "북마크 해제" : "북마크"} disabled={!onToggleBookmark} size="small" onClick={(clickEvent) => { clickEvent.stopPropagation(); onToggleBookmark?.(rowId(row)); }} sx={{ color: bookmarked ? "var(--bookmark-control)" : "var(--text-faint)", borderRadius: "var(--radius-sm)" }}>
                         {bookmarked ? <BookmarkIcon sx={{ fontSize: 17 }} /> : <BookmarkBorderOutlinedIcon sx={{ fontSize: 17 }} />}
                       </IconButton>
                     </span>

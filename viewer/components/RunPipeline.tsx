@@ -18,6 +18,7 @@ import SelectAllIcon from "@mui/icons-material/SelectAll";
 import TaskAltIcon from "@mui/icons-material/TaskAlt";
 import TimerOutlinedIcon from "@mui/icons-material/TimerOutlined";
 import VisibilityOutlinedIcon from "@mui/icons-material/VisibilityOutlined";
+import { FaWindows } from "react-icons/fa";
 import CircularProgress from "@mui/material/CircularProgress";
 import type { Case, Host, ParseReport } from "@/lib/types";
 import { isHostReportSyncPending, selectVisibleHostReport, shouldLoadHostReport, type HostReportCacheEntry } from "@/lib/hostReportCache";
@@ -550,8 +551,8 @@ export default function RunPipeline({ activeCase, onChanged, onOpenHost, run }: 
   return (
     <div className="dfir-view" style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", padding: "18px 20px", gap: 12, overflow: "hidden", width: "100%" }}>
       <header style={{ display: "flex", alignItems: "center", gap: 9, minHeight: 30, flexShrink: 0 }}>
+        <FaWindows size={17} style={{ color: "var(--accent)", flexShrink: 0 }} aria-hidden="true" />
         <strong className="dfir-page-title" style={{ fontSize: 17 }}>호스트 등록</strong>
-    <span style={{ color: "var(--text-faint)", fontSize: 12 }}>등록된 호스트의 증거 원본과 파싱 상태를 관리합니다.</span>
         <span style={{ display: "inline-flex", alignItems: "center", gap: 4, marginLeft: "auto", color: "var(--text-dim)", fontSize: 12 }}><DnsOutlinedIcon sx={{ fontSize: 16 }} />{hosts.length.toLocaleString()}개 등록됨</span>
       </header>
 

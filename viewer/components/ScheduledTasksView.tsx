@@ -182,7 +182,8 @@ export default function ScheduledTasksView({ data, onNavigate, onFetchLinkedRows
           const canBookmark = onToggleBookmark && Number.isFinite(entry.rowid);
           const tileColor = entryColor(entry);
           return (
-            <div key={Number.isFinite(entry.rowid) ? entry.rowid : entry.name} className={bookmarked ? "dfir-bookmarked-row" : undefined} style={{ borderRadius: "var(--radius-md)", display: "flex", alignItems: "center", gap: 12, minHeight: 62, marginBottom: 8, padding: "10px 14px", border: "1px solid var(--border)", background: "var(--bg-panel)", transition: "background .15s ease, border-color .15s ease" }}
+            // 행 전체(여백 포함)가 상세 열기 클릭 대상 — 북마크는 전파 차단.
+            <div key={Number.isFinite(entry.rowid) ? entry.rowid : entry.name} className={bookmarked ? "dfir-bookmarked-row" : undefined} onClick={() => setSelected(entry)} style={{ borderRadius: "var(--radius-md)", display: "flex", alignItems: "center", gap: 12, minHeight: 62, marginBottom: 8, padding: "10px 14px", border: "1px solid var(--border)", background: "var(--bg-panel)", cursor: "pointer", transition: "background .15s ease, border-color .15s ease" }}
               onMouseEnter={(event) => { if (!bookmarked) event.currentTarget.style.background = "var(--bg-hover)"; }}
               onMouseLeave={(event) => { if (!bookmarked) event.currentTarget.style.background = "var(--bg-panel)"; }}>
               <button type="button" onClick={() => setSelected(entry)} aria-label={`${entry.name} 상세 보기`} style={{ flex: 1, display: "flex", alignItems: "center", gap: 12, minWidth: 0, padding: 0, border: 0, background: "transparent", color: "inherit", textAlign: "left", cursor: "pointer", outlineOffset: 2 }}>
@@ -200,7 +201,7 @@ export default function ScheduledTasksView({ data, onNavigate, onFetchLinkedRows
                 <span title={entry.trigger || "트리거 정보 없음"} style={cellStyle({ width: 138, flexShrink: 0, color: entry.trigger ? "var(--text-dim)" : "var(--text-faint)", fontSize: 12 })}>{entry.trigger || "트리거 정보 없음"}</span>
                 <time style={cellStyle({ width: 176, flexShrink: 0, textAlign: "right", color: entry.row.timestamp ? "var(--text-time)" : "var(--text-faint)", fontSize: 12, fontFamily: "var(--mono)" })}>{entry.row.timestamp || "시간 정보 없음"}</time>
               </button>
-              {canBookmark && <button type="button" className={bookmarked ? "dfir-bookmark-control" : undefined} onClick={() => onToggleBookmark(entry.rowid)} aria-label={bookmarked ? "북마크 해제" : "북마크"} title={bookmarked ? "북마크 해제" : "북마크"} style={{ flexShrink: 0, width: 28, height: 28, display: "grid", placeItems: "center", border: 0, background: "transparent", color: bookmarked ? "var(--bookmark-control)" : "var(--text-faint)", cursor: "pointer" }}>{bookmarked ? <BookmarkOutlinedIcon sx={{ fontSize: 18 }} /> : <BookmarkBorderOutlinedIcon sx={{ fontSize: 18 }} />}</button>}
+              {canBookmark && <button type="button" className={bookmarked ? "dfir-bookmark-control" : undefined} onClick={(clickEvent) => { clickEvent.stopPropagation(); onToggleBookmark(entry.rowid); }} aria-label={bookmarked ? "북마크 해제" : "북마크"} title={bookmarked ? "북마크 해제" : "북마크"} style={{ flexShrink: 0, width: 28, height: 28, display: "grid", placeItems: "center", border: 0, background: "transparent", color: bookmarked ? "var(--bookmark-control)" : "var(--text-faint)", cursor: "pointer" }}>{bookmarked ? <BookmarkOutlinedIcon sx={{ fontSize: 18 }} /> : <BookmarkBorderOutlinedIcon sx={{ fontSize: 18 }} />}</button>}
             </div>
           );
   };

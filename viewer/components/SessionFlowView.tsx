@@ -286,7 +286,11 @@ export default function SessionFlowView({
                     <div
                       key={i}
                       className={bm ? "dfir-bookmarked-row" : undefined}
-                      style={{ borderRadius: 0, display: "flex", alignItems: "center", gap: 10, minHeight: 44, padding: "8px 14px 8px 60px", borderTop: i === 0 ? "none" : "1px solid var(--border-subtle)", fontSize: 13, background: "transparent", transition: "background .15s ease" }}
+                      // 행 전체(여백 포함)가 상세 열기 클릭 대상 — 안쪽 버튼만
+                      // 클릭되면 패딩 영역이 죽은 공간이 된다. 북마크 버튼은
+                      // 전파를 끊어 행 클릭과 겹치지 않는다.
+                      onClick={() => setSelected(ev.row)}
+                      style={{ borderRadius: 0, display: "flex", alignItems: "center", gap: 10, minHeight: 44, padding: "8px 14px 8px 60px", borderTop: i === 0 ? "none" : "1px solid var(--border-subtle)", fontSize: 13, background: "transparent", cursor: "pointer", transition: "background .15s ease" }}
                       onMouseEnter={(e) => { if (!bm) e.currentTarget.style.background = "var(--bg-hover)"; }}
                       onMouseLeave={(e) => { if (!bm) e.currentTarget.style.background = "transparent"; }}
                     >
@@ -305,7 +309,7 @@ export default function SessionFlowView({
                       {onToggleBookmark && Number.isFinite(ev.rowid) && (
                         <button
                           type="button"
-                          onClick={() => onToggleBookmark(ev.rowid)}
+                          onClick={(clickEvent) => { clickEvent.stopPropagation(); onToggleBookmark(ev.rowid); }}
                           title={bookmarkedRowids?.has(ev.rowid) ? "북마크 해제" : "북마크에 추가"}
                           aria-label={bookmarkedRowids?.has(ev.rowid) ? "북마크 해제" : "북마크"}
                           className={bookmarkedRowids?.has(ev.rowid) ? "dfir-bookmark-control" : undefined}

@@ -403,9 +403,23 @@ export default function RowDetailPanel({ row, columns, focusedColumn, fileBaseNa
               )}
             </>
           ) : (
-            effCols.map((col) => (
-              <RawFieldValue key={col} column={col} value={effRow[col] ?? ""} focused={col === focusedColumn} />
-            ))
+            <>
+              {/* 출처 고정 표시 — 이 행이 어떤 원본 파일에서 나왔는지.
+                  _source_file(수집 원본 경로) → record_key의 파일 부분(파생
+                  행의 원본 결과 파일명) → 결과 파일명 순으로 있는 값만
+                  그대로 보여준다. */}
+              <div style={{ padding: "10px 16px", borderBottom: "1px solid var(--border-subtle)", display: "grid", gap: 3 }}>
+                <div className="dfir-section-label">원본 파일</div>
+                <div style={{ fontFamily: "var(--mono)", fontSize: 11.5, color: "var(--text-dim)", wordBreak: "break-all" }}>
+                  {effRow._source_file
+                    || (effRow.record_key || effRow.source_record_key || effRow._record_key || "").split("::")[0]
+                    || fileBaseName}
+                </div>
+              </div>
+              {effCols.map((col) => (
+                <RawFieldValue key={col} column={col} value={effRow[col] ?? ""} focused={col === focusedColumn} />
+              ))}
+            </>
           )}
         </div>
       </div>

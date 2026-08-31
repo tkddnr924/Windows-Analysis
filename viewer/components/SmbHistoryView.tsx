@@ -115,7 +115,11 @@ export default function SmbHistoryView({
 
     return [...byIp.values()]
       .map((peer) => ({ ...peer, events: peer.events.sort((left, right) => (left.timestamp ?? "").localeCompare(right.timestamp ?? "")) }))
-      .sort((left, right) => right.attempts - left.attempts || left.ip.localeCompare(right.ip));
+      // 첫 이벤트 시각 오름차순 — RDP 세션 목록과 같은 시간순 정렬 (건수
+      // 내림차순은 시간 흐름을 읽을 수 없어 교체, 2026-08-31 사용자 지적).
+      .sort((left, right) =>
+        (left.events[0]?.timestamp ?? "").localeCompare(right.events[0]?.timestamp ?? "")
+        || left.ip.localeCompare(right.ip));
   }, [data.rows, timeRange, hiddenAccounts]);
 
   const allAccounts = useMemo(
@@ -214,7 +218,8 @@ export default function SmbHistoryView({
                     const bookmarked = Number.isFinite(rowid) && (bookmarkedRowids?.has(rowid) ?? false);
                     const resultColor = RESULT_COLOR[event.result ?? ""] ?? "var(--text-faint)";
                     return (
-                      <div key={`${rowid}-${event.timestamp}-${index}`} className={bookmarked ? "dfir-bookmarked-row" : undefined} style={{ borderRadius: 0, display: "flex", alignItems: "center", gap: 8, minHeight: 42, padding: "7px 14px 7px 60px", borderTop: index === 0 ? "none" : "1px solid var(--border-subtle)", background: "transparent", transition: "background .15s ease" }} onMouseEnter={(mouseEvent) => { if (!bookmarked) mouseEvent.currentTarget.style.background = "var(--bg-hover)"; }} onMouseLeave={(mouseEvent) => { if (!bookmarked) mouseEvent.currentTarget.style.background = "transparent"; }}>
+                      // 행 전체(여백 포함)가 상세 열기 클릭 대상 — 북마크는 전파 차단.
+                      <div key={`${rowid}-${event.timestamp}-${index}`} className={bookmarked ? "dfir-bookmarked-row" : undefined} onClick={() => setSelected(event as Record<string, string>)} style={{ borderRadius: 0, display: "flex", alignItems: "center", gap: 8, minHeight: 42, padding: "7px 14px 7px 60px", borderTop: index === 0 ? "none" : "1px solid var(--border-subtle)", background: "transparent", cursor: "pointer", transition: "background .15s ease" }} onMouseEnter={(mouseEvent) => { if (!bookmarked) mouseEvent.currentTarget.style.background = "var(--bg-hover)"; }} onMouseLeave={(mouseEvent) => { if (!bookmarked) mouseEvent.currentTarget.style.background = "transparent"; }}>
                         <div role="button" tabIndex={0} onClick={() => setSelected(event as Record<string, string>)} onKeyDown={(keyboardEvent) => { if (keyboardEvent.key === "Enter" || keyboardEvent.key === " ") { keyboardEvent.preventDefault(); setSelected(event as Record<string, string>); } }} style={{ flex: 1, display: "flex", alignItems: "center", gap: 10, minWidth: 0, color: "var(--text)", cursor: "pointer", outlineOffset: 2 }}>
                           <span style={{ color: "var(--text-time)", fontFamily: "var(--mono)", fontSize: 12.5, width: 176, flexShrink: 0, whiteSpace: "nowrap" }}>{event.timestamp || "시간 정보 없음"}</span>
                           <span aria-hidden="true" style={{ width: 8, height: 8, borderRadius: "50%", flexShrink: 0, background: resultColor }} />
@@ -223,7 +228,7 @@ export default function SmbHistoryView({
                           <span title={event.description || "상세 정보 없음"} style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text)", fontSize: 12.5 }}>{event.description || "상세 정보 없음"}</span>
                           <span style={{ flexShrink: 0, color: "var(--text-faint)", fontFamily: "var(--mono)", fontSize: 11.5 }}>{event.event_id ? `EID ${event.event_id}` : ""}</span>
                         </div>
-                        {onToggleBookmark && Number.isFinite(rowid) && <button type="button" className={bookmarked ? "dfir-bookmark-control" : undefined} onClick={() => onToggleBookmark(rowid)} aria-label={bookmarked ? "북마크 해제" : "북마크 추가"} title={bookmarked ? "북마크 해제" : "북마크 추가"} style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 28, height: 28, padding: 0, border: "none", background: "transparent", color: bookmarked ? "var(--bookmark-control)" : "var(--text-faint)", cursor: "pointer" }}>{bookmarked ? <BookmarkOutlinedIcon sx={{ fontSize: 16 }} /> : <BookmarkBorderOutlinedIcon sx={{ fontSize: 16 }} />}</button>}
+                        {onToggleBookmark && Number.isFinite(rowid) && <button type="button" className={bookmarked ? "dfir-bookmark-control" : undefined} onClick={(clickEvent) => { clickEvent.stopPropagation(); onToggleBookmark(rowid); }} aria-label={bookmarked ? "북마크 해제" : "북마크 추가"} title={bookmarked ? "북마크 해제" : "북마크 추가"} style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 28, height: 28, padding: 0, border: "none", background: "transparent", color: bookmarked ? "var(--bookmark-control)" : "var(--text-faint)", cursor: "pointer" }}>{bookmarked ? <BookmarkOutlinedIcon sx={{ fontSize: 16 }} /> : <BookmarkBorderOutlinedIcon sx={{ fontSize: 16 }} />}</button>}
                       </div>
                     );
                   })}

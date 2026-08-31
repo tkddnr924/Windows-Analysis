@@ -249,7 +249,8 @@ export default function WmiPersistenceView({ data, dbPath, bookmarkedRowids, onT
               const bookmarked = entry.bookmarkable && (isEvent
                 ? (bookmarkedKeys?.has(`${entry.eventFullPath}#${stableKey}`) ?? false)
                 : (bookmarkedRowids?.has(stableKey) ?? false));
-              const toggleBookmark = () => {
+              const toggleBookmark = (clickEvent: React.MouseEvent) => {
+                clickEvent.stopPropagation();
                 if (isEvent) onToggleEventBookmark?.(entry.eventFullPath!, entry.eventTableName || "", stableKey, entry.timestamp || undefined);
                 else onToggleBookmark?.(stableKey);
               };
@@ -261,7 +262,9 @@ export default function WmiPersistenceView({ data, dbPath, bookmarkedRowids, onT
                 <div
                   key={entry.key}
                   className={bookmarked ? "dfir-bookmarked-row" : undefined}
-                  style={{ borderRadius: "var(--radius-md)", minHeight: 62, marginBottom: 8, display: "flex", alignItems: "center", gap: 12, padding: "0 14px", border: "1px solid var(--border)", background: "var(--bg-panel)", color: "var(--text)", transition: "background .15s ease, border-color .15s ease" }}
+                  // 행 전체(여백 포함)가 상세 열기 클릭 대상 — 북마크는 전파 차단.
+                  onClick={() => setDetail(entry)}
+                  style={{ borderRadius: "var(--radius-md)", minHeight: 62, marginBottom: 8, display: "flex", alignItems: "center", gap: 12, padding: "0 14px", border: "1px solid var(--border)", background: "var(--bg-panel)", color: "var(--text)", cursor: "pointer", transition: "background .15s ease, border-color .15s ease" }}
                   onMouseEnter={(event) => { if (!bookmarked) event.currentTarget.style.background = "var(--bg-hover)"; }}
                   onMouseLeave={(event) => { if (!bookmarked) event.currentTarget.style.background = "var(--bg-panel)"; }}
                 >

@@ -222,7 +222,9 @@ export default function PowerShellFlowView({
                     <div
                       key={`${rowid}-${index}`}
                       className={bookmarked ? "dfir-bookmarked-row" : undefined}
-                      style={{ display: "flex", alignItems: "center", gap: 10, minHeight: 38, padding: "0 12px", borderBottom: "1px solid var(--border-subtle)", borderRadius: 0 }}
+                      // 행 전체(여백 포함)가 상세 열기 클릭 대상 — 북마크는 전파 차단.
+                      onClick={() => setSelected(row)}
+                      style={{ display: "flex", alignItems: "center", gap: 10, minHeight: 38, padding: "0 12px", borderBottom: "1px solid var(--border-subtle)", borderRadius: 0, cursor: "pointer" }}
                       onMouseEnter={(event) => { if (!bookmarked) event.currentTarget.style.background = "var(--bg-hover)"; }}
                       onMouseLeave={(event) => { if (!bookmarked) event.currentTarget.style.background = "transparent"; }}
                     >
@@ -233,7 +235,7 @@ export default function PowerShellFlowView({
                         <span title={row.account} style={{ flexShrink: 0, maxWidth: 130, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: row.account ? "var(--text-dim)" : "var(--text-faint)", fontSize: 12 }}>{row.account || "계정 정보 없음"}</span>
                       </div>
                       {onToggleBookmark && Number.isFinite(rowid) && (
-                        <button type="button" className={bookmarked ? "dfir-bookmark-control" : undefined} onClick={() => onToggleBookmark(rowid)} aria-label={bookmarked ? "북마크 해제" : "북마크 추가"} title={bookmarked ? "북마크 해제" : "북마크 추가"} style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 28, height: 28, padding: 0, border: "none", background: "transparent", color: bookmarked ? "var(--bookmark-control)" : "var(--text-faint)", cursor: "pointer" }}>
+                        <button type="button" className={bookmarked ? "dfir-bookmark-control" : undefined} onClick={(clickEvent) => { clickEvent.stopPropagation(); onToggleBookmark(rowid); }} aria-label={bookmarked ? "북마크 해제" : "북마크 추가"} title={bookmarked ? "북마크 해제" : "북마크 추가"} style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 28, height: 28, padding: 0, border: "none", background: "transparent", color: bookmarked ? "var(--bookmark-control)" : "var(--text-faint)", cursor: "pointer" }}>
                           {bookmarked ? <BookmarkOutlinedIcon sx={{ fontSize: 16 }} /> : <BookmarkBorderOutlinedIcon sx={{ fontSize: 16 }} />}
                         </button>
                       )}
@@ -310,7 +312,8 @@ export default function PowerShellFlowView({
                     const kindLabel = event.kind || evidence.label;
                     const kindColor = kindLabel === "스크립트 블록" ? "var(--accent)" : kindLabel === "파이프라인" ? "var(--warning)" : kindLabel === "명령 실행" ? "var(--success)" : "var(--text-dim)";
                     return (
-                      <div key={`${event.rowid}-${event.timestamp}`} className={bookmarked ? "dfir-bookmarked-row ps-session-event" : "ps-session-event"} style={{ borderRadius: 0, display: "flex", alignItems: "center", gap: 8, minHeight: 46, padding: "8px 14px 8px 60px", borderTop: eventIndex === 0 ? "none" : "1px solid var(--border-subtle)", background: "transparent", transition: "background .15s ease" }} onMouseEnter={(mouseEvent) => { if (!bookmarked) mouseEvent.currentTarget.style.background = "var(--bg-hover)"; }} onMouseLeave={(mouseEvent) => { if (!bookmarked) mouseEvent.currentTarget.style.background = "transparent"; }}>
+                      // 행 전체(여백 포함)가 상세 열기 클릭 대상 — 북마크는 전파 차단.
+                      <div key={`${event.rowid}-${event.timestamp}`} className={bookmarked ? "dfir-bookmarked-row ps-session-event" : "ps-session-event"} onClick={() => setSelected(event.row)} style={{ borderRadius: 0, display: "flex", alignItems: "center", gap: 8, minHeight: 46, padding: "8px 14px 8px 60px", borderTop: eventIndex === 0 ? "none" : "1px solid var(--border-subtle)", background: "transparent", cursor: "pointer", transition: "background .15s ease" }} onMouseEnter={(mouseEvent) => { if (!bookmarked) mouseEvent.currentTarget.style.background = "var(--bg-hover)"; }} onMouseLeave={(mouseEvent) => { if (!bookmarked) mouseEvent.currentTarget.style.background = "transparent"; }}>
                         <button type="button" className="ps-session-child" onClick={() => setSelected(event.row)} aria-label={`${formatEvidenceTimestamp(event.timestamp)} ${kindLabel} 상세 보기`} style={{ flex: 1, display: "grid", gridTemplateColumns: "158px 104px minmax(0, 1fr)", gap: 10, alignItems: "center", minWidth: 0, padding: 0, color: "var(--text)", cursor: "pointer", border: "none", background: "transparent", textAlign: "left", outlineOffset: 2 }}>
                           <span className="ps-session-child-time" style={{ color: "var(--text-time)", fontFamily: "var(--mono)", fontSize: 12.5, whiteSpace: "nowrap" }}>{formatEvidenceTimestamp(event.timestamp)}</span>
                           <span className="ps-session-child-type" style={{ justifySelf: "start", fontSize: 11.5, fontWeight: 700, color: kindColor, border: `1px solid ${kindColor}`, borderRadius: "var(--radius-sm)", padding: "1px 8px", whiteSpace: "nowrap" }}>{kindLabel}</span>
