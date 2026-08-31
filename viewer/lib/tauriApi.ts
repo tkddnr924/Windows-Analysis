@@ -66,7 +66,7 @@ function makeApi(): ElectronApi {
     pathReferences: (hostDir, paths) => invoke<PathReference[]>("path_references", { hostDir, paths }),
     pathReferenceAccounts: (hostDir) => invoke<string[]>("path_reference_accounts", { hostDir }),
     cacheEntryBody: (hostDir, account, url, cacheKey) => invoke<CacheBodyPreview>("cache_entry_body", { hostDir, account, url, cacheKey }),
-    browserVisitFlow: (hostDir, account, url, cacheKey) => invoke<BrowserVisitFlow>("browser_visit_flow", { hostDir, account, url, cacheKey: cacheKey ?? null }),
+    browserVisitFlow: (hostDir, account, url, cacheKey, sourceFile) => invoke<BrowserVisitFlow>("browser_visit_flow", { hostDir, account, url, cacheKey: cacheKey ?? null, sourceFile: sourceFile ?? null }),
     aiConversations: (hostDir, query) => invoke<AiConversationPage>("ai_conversations", { hostDir, query }),
     wmiSubscriptionEvents: (hostDir) => invoke<WmiSubscriptionEvents>("wmi_subscription_events", { hostDir }),
   };

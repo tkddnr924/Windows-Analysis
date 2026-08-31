@@ -549,7 +549,9 @@ export interface ElectronApi {
   cacheEntryBody(hostDir: string, account: string, url: string, cacheKey: string): Promise<CacheBodyPreview>;
   /** Reconstruct the visit inflow chain for a browser visit (pass its URL) or a
    *  cache record (also pass its cacheKey) from the raw History DB on demand. */
-  browserVisitFlow(hostDir: string, account: string, url: string, cacheKey?: string): Promise<BrowserVisitFlow>;
+  /** sourceFile: 행의 `_source_file` — 같은 브라우저의 History만 조회하는 출처
+   *  고정에 쓰인다. 없으면(구 파싱본) 흐름 복원 대신 안내가 반환된다. */
+  browserVisitFlow(hostDir: string, account: string, url: string, cacheKey?: string, sourceFile?: string): Promise<BrowserVisitFlow>;
   /** AI conversations extracted from browser cache, filtered and paged by cache timestamp. */
   aiConversations(hostDir: string, query: { start?: string; end?: string; offset: number; limit: number }): Promise<AiConversationPage>;
   /** WMI-Activity 로그의 구독 이벤트(5859~5861)만 서버에서 걸러 받는다. */

@@ -2269,7 +2269,18 @@ pub const BH_KEYS: &[&str] = &[
     "status",
     "cache_key",
     "cache_body_recovered",
+    "_source_file",
 ];
+/// BrowserActivity 행의 출처 표기·유입 흐름 출처 고정에 쓰는 호스트 상대
+/// 경로("BROWSER/<파일>.sqlite"). 파생은 스테이징 트리에서 만들어지므로 절대
+/// 경로를 남기면 발행 후 사라지는 임시 경로가 증거 표기에 남는다.
+fn browser_rel(db: &Path) -> String {
+    format!(
+        "BROWSER/{}",
+        db.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()
+    )
+}
+
 fn bh_row(pairs: &[(&str, String)]) -> Row {
     let mut r = Row::new();
     for k in BH_KEYS {
@@ -2398,6 +2409,7 @@ fn read_cache_entry_meta(db: &Path) -> Vec<Row> {
         "content_type",
         "status",
         "cache_key",
+        "_source_file",
     ];
     if !db.exists() {
         return Vec::new();
@@ -2547,6 +2559,11 @@ pub fn build_browser_history(out_dir: &Path) -> Vec<Row> {
                 ("status", g("status")),
                 ("cache_key", g("cache_key")),
                 ("cache_body_recovered", cache_body_recovered),
+                // 출처 — 수집 원본 경로가 있으면 그것, 없으면 결과 파일(상대).
+                ("_source_file", {
+                    let src = g("_source_file");
+                    if src.is_empty() { browser_rel(&db) } else { src }
+                }),
             ]));
         }
     }
@@ -2576,6 +2593,8 @@ pub fn build_browser_history(out_dir: &Path) -> Vec<Row> {
                 ("url_raw", raw.clone()),
                 ("visit_count", count(g("visit_count"))),
                 ("typed_count", count(g("typed_count"))),
+                // History 원본 테이블에는 경로 컬럼이 없다 — 1:1 결과 파일로 표기.
+                ("_source_file", browser_rel(&db)),
             ]));
         }
         for d in read_table(&db, "downloads") {
@@ -2627,6 +2646,7 @@ pub fn build_browser_history(out_dir: &Path) -> Vec<Row> {
                 ("size_bytes", size_raw),
                 ("mime", g("mime_type")),
                 ("danger", danger),
+                ("_source_file", browser_rel(&db)),
             ]));
         }
     }
@@ -2655,6 +2675,10 @@ pub fn build_browser_history(out_dir: &Path) -> Vec<Row> {
                     "visit_count",
                     if count.is_empty() || count == "0" { String::new() } else { count },
                 ),
+                ("_source_file", {
+                    let src = g("_source_file");
+                    if src.is_empty() { browser_rel(&db) } else { src }
+                }),
             ]));
         }
         for d in read_table(&db, "IEWebCache_Downloads") {
@@ -2679,6 +2703,10 @@ pub fn build_browser_history(out_dir: &Path) -> Vec<Row> {
                 ("url", url_decode(&url)),
                 ("url_raw", g("url")),
                 ("source_url", url_decode(&url)),
+                ("_source_file", {
+                    let src = g("_source_file");
+                    if src.is_empty() { browser_rel(&db) } else { src }
+                }),
             ]));
         }
     }
@@ -2714,6 +2742,10 @@ pub fn build_browser_history(out_dir: &Path) -> Vec<Row> {
                     "visit_count",
                     if hits.is_empty() || hits == "0" { String::new() } else { hits },
                 ),
+                ("_source_file", {
+                    let src = g("_source_file");
+                    if src.is_empty() { browser_rel(&db) } else { src }
+                }),
             ]));
         }
     }

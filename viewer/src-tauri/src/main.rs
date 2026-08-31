@@ -2776,8 +2776,24 @@ fn read_result_file(full_path: String, table_name: Option<String>) -> Result<Csv
     if is_cache {
         columns.retain(|c| c != "body_b64");
     }
+    // 4104 ScriptBlock 본문은 행당 수 KB~수백 KB — 대량 스크립트 블록 로깅
+    // 호스트에서 전량 직렬화하면 웹뷰 메모리가 고갈돼 앱이 강제 종료된다.
+    // 목록/세션 묶음에는 앞부분 미리보기만 싣고, 상세 패널은 result_row로
+    // 전체 원문을 다시 받는다 (증거 원문은 절단 없이 유지).
+    let is_powershell = table == "PowerShellHistory";
     let select = if is_cache {
         columns.iter().map(|c| q(c)).collect::<Vec<_>>().join(", ")
+    } else if is_powershell {
+        columns
+            .iter()
+            .map(|c| match c.as_str() {
+                "script_block" | "host_application" => {
+                    format!("substr({q}, 1, 1000) AS {q}", q = q(c))
+                }
+                _ => q(c),
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
     } else {
         "*".into()
     };
@@ -2792,6 +2808,8 @@ fn read_result_file(full_path: String, table_name: Option<String>) -> Result<Csv
             select,
             q(&table)
         )
+    } else if is_powershell {
+        format!("SELECT rowid AS __rowid, {} FROM {}", select, q(&table))
     } else {
         format!("SELECT rowid AS __rowid, * FROM {}", q(&table))
     };
@@ -4255,9 +4273,66 @@ fn browser_visit_flow_blocking(
     account: String,
     url: String,
     cache_key: Option<String>,
+    source_file: Option<String>,
 ) -> BrowserVisitFlow {
     let is_cache = cache_key.as_deref().is_some_and(|k| !k.trim().is_empty());
-    for db in browser_history_dbs(&host_dir, &account) {
+    // 행이 가리키는 원본과 같은 브라우저의 History만 조회한다 — 같은 계정에
+    // 여러 브라우저 프로필이 있을 때 먼저 일치한 다른 브라우저의 체인을
+    // 증거처럼 연결하지 않기 위한 출처 고정이다.
+    //  - `BROWSER/<계정_브라우저>.sqlite` (BrowserActivity 방문 행) → 그 DB 하나만.
+    //  - 수집 원본 경로(캐시 index 등) → 경로에서 브라우저를 판별해 같은
+    //    계정·같은 브라우저의 History만 후보.
+    //  - 출처가 없거나(구 파싱본) 판별 불가면 임의 선택 대신 안내로 비활성.
+    let source = source_file
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let candidates: Vec<PathBuf> = match source {
+        None => {
+            return BrowserVisitFlow {
+                note: "이 행에는 원본 파일 정보가 없어 유입 흐름을 연결하지 않습니다 — 재파싱하면 사용할 수 있습니다.".to_string(),
+                ..Default::default()
+            };
+        }
+        Some(value) => {
+            let name = Path::new(value)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if name.ends_with(".sqlite") {
+                vec![PathBuf::from(&host_dir).join("BROWSER").join(name)]
+            } else {
+                match wina_core::parsers::browser_cache::browser_of(Path::new(value)) {
+                    Some(browser) => {
+                        let account_prefix = format!("{account}_");
+                        let browser_token = format!("_{browser}");
+                        browser_history_dbs(&host_dir, &account)
+                            .into_iter()
+                            .filter(|path| {
+                                path.file_name().is_some_and(|n| {
+                                    let n = n.to_string_lossy();
+                                    n.starts_with(&account_prefix) && n.contains(&browser_token)
+                                })
+                            })
+                            .collect()
+                    }
+                    None => {
+                        return BrowserVisitFlow {
+                            note: "크로미움 계열(Chrome·Edge·Whale) 방문 기록이 아닌 원본이라 유입 흐름을 복원할 수 없습니다.".to_string(),
+                            ..Default::default()
+                        };
+                    }
+                }
+            }
+        }
+    };
+    if candidates.is_empty() {
+        return BrowserVisitFlow {
+            note: "같은 브라우저의 방문 기록 결과가 없어 유입 흐름을 연결하지 않습니다.".to_string(),
+            ..Default::default()
+        };
+    }
+    for db in candidates {
         let conn = match open_ro(&db.to_string_lossy()) {
             Ok(c) => c,
             Err(_) => continue,
@@ -4292,16 +4367,28 @@ fn browser_visit_flow_blocking(
                 .or_else(|| url_origin(&url));
             if let Some(origin) = origin {
                 matched_page = origin.clone();
+                // LIKE는 사전 필터일 뿐 — 접두어 일치만으로는
+                // `https://example.com.evil/…`·`https://example.com:8443/…`까지
+                // 같은 출처로 오인한다. 각 후보 URL의 origin을 파싱해
+                // 완전 일치(포트 포함)할 때만 기준 페이지로 채택한다.
                 let like = format!(
                     "{}%",
                     origin.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
                 );
                 if let Ok(mut stmt) = conn.prepare(
-                    "SELECT id FROM urls WHERE url LIKE ?1 ESCAPE '\\' ORDER BY CAST(visit_count AS INTEGER) DESC LIMIT 6",
+                    "SELECT id, url FROM urls WHERE url LIKE ?1 ESCAPE '\\' ORDER BY CAST(visit_count AS INTEGER) DESC LIMIT 60",
                 ) {
                     if let Ok(mut rows) = stmt.query([like]) {
                         while let Ok(Some(r)) = rows.next() {
-                            if let Ok(id) = r.get::<_, String>(0) {
+                            if url_ids.len() >= 6 {
+                                break;
+                            }
+                            let (Ok(id), Ok(candidate)) =
+                                (r.get::<_, String>(0), r.get::<_, String>(1))
+                            else {
+                                continue;
+                            };
+                            if url_origin(&candidate).as_deref() == Some(origin.as_str()) {
                                 url_ids.push(id);
                             }
                         }
@@ -4348,10 +4435,10 @@ fn browser_visit_flow_blocking(
             // them avoids near-identical chains that differ only by a trailing
             // "clientRedirect" step.
             let mut entry_visits: Vec<String> = Vec::new();
-            let mut reloads = 0usize;
+            let mut reload_visits: Vec<String> = Vec::new();
             for vid in &visit_ids {
                 if is_same_url_redirect(&conn, vid, &url_id) {
-                    reloads += 1;
+                    reload_visits.push(vid.clone());
                 } else {
                     entry_visits.push(vid.clone());
                 }
@@ -4361,7 +4448,43 @@ fn browser_visit_flow_blocking(
             if entry_visits.is_empty() {
                 if let Some(oldest) = visit_ids.last() {
                     entry_visits.push(oldest.clone());
-                    reloads = reloads.saturating_sub(1);
+                    reload_visits.retain(|vid| vid != oldest);
+                }
+            }
+            // 각 reload를 부모 연결(from/opener)로 같은 URL 체인을 따라
+            // 역추적해 그 체인을 시작한 entry에만 귀속한다 — URL 전체 집계를
+            // 모든 체인에 대입하면 다른 유입 뒤의 리다이렉트까지 현재 경로의
+            // 일로 주장하게 된다. 역추적이 entry에 닿지 않으면 어느 체인에도
+            // 세지 않는다.
+            let entry_set: std::collections::HashSet<&str> =
+                entry_visits.iter().map(String::as_str).collect();
+            let mut reloads_by_entry: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
+            for vid in &reload_visits {
+                let mut cursor = vid.clone();
+                let mut hops = 0usize;
+                let attributed = loop {
+                    if hops > VISIT_FLOW_DEPTH_CAP {
+                        break None;
+                    }
+                    match parent_visit_id(&conn, &cursor) {
+                        Some(parent) => {
+                            if entry_set.contains(parent.as_str()) {
+                                break Some(parent);
+                            }
+                            // 같은 URL로의 재이동 사슬 안에서만 계속 거슬러간다.
+                            if visit_url_id(&conn, &parent).as_deref() == Some(url_id.as_str()) {
+                                cursor = parent;
+                                hops += 1;
+                            } else {
+                                break None;
+                            }
+                        }
+                        None => break None,
+                    }
+                };
+                if let Some(entry) = attributed {
+                    *reloads_by_entry.entry(entry).or_default() += 1;
                 }
             }
             for vid in entry_visits {
@@ -4371,7 +4494,7 @@ fn browser_visit_flow_blocking(
                 if let Some(mut chain) = build_visit_chain(&conn, &vid) {
                     // A lone step with no referrer/opener is not an inflow story.
                     if chain.steps.len() > 1 || !chain.external_referrer.is_empty() {
-                        chain.reloads = reloads;
+                        chain.reloads = reloads_by_entry.get(&vid).copied().unwrap_or(0);
                         chains.push(chain);
                     }
                 }
@@ -4435,9 +4558,10 @@ async fn browser_visit_flow(
     account: String,
     url: String,
     cache_key: Option<String>,
+    source_file: Option<String>,
 ) -> BrowserVisitFlow {
     tauri::async_runtime::spawn_blocking(move || {
-        browser_visit_flow_blocking(host_dir, account, url, cache_key)
+        browser_visit_flow_blocking(host_dir, account, url, cache_key, source_file)
     })
     .await
     .unwrap_or_default()
@@ -5950,6 +6074,7 @@ mod browser_activity_tests {
             "user".to_string(),
             "https://c.test/page".to_string(),
             None,
+            Some("BROWSER/user_Chrome.sqlite".to_string()),
         );
         assert_eq!(flow.source_file, "user_Chrome.sqlite");
         // The page has two visits (entry + a self-redirect), but only the one
@@ -5970,6 +6095,7 @@ mod browser_activity_tests {
             "user".to_string(),
             "https://c.test/asset/app.js".to_string(),
             Some("1/0/_dk_https://c.test https://c.test https://c.test/asset/app.js".to_string()),
+            Some("/case/BROWSER/user/Chrome/Cache/Cache_Data/index".to_string()),
         );
         assert_eq!(cache_flow.matched_page, "https://c.test");
         assert_eq!(cache_flow.chains.len(), 1);
@@ -5984,9 +6110,21 @@ mod browser_activity_tests {
             "user".to_string(),
             "https://nowhere.test/x".to_string(),
             None,
+            Some("BROWSER/user_Chrome.sqlite".to_string()),
         );
         assert!(none.chains.is_empty());
         assert!(!none.note.is_empty());
+
+        // 출처가 없는 행(구 파싱본)은 임의 DB를 고르지 않는다 — 안내로 비활성.
+        let unsourced = browser_visit_flow_blocking(
+            root.to_string_lossy().to_string(),
+            "user".to_string(),
+            "https://c.test/page".to_string(),
+            None,
+            None,
+        );
+        assert!(unsourced.chains.is_empty());
+        assert!(unsourced.note.contains("재파싱"));
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -6035,6 +6173,7 @@ mod browser_activity_tests {
             "user".to_string(),
             "https://t.test/p".to_string(),
             None,
+            Some("BROWSER/user_Chrome.sqlite".to_string()),
         );
         // Two distinct paths (X→T and Y→T); the duplicate X→T entry is merged.
         assert_eq!(flow.chains.len(), 2);
@@ -6045,6 +6184,175 @@ mod browser_activity_tests {
         for chain in &flow.chains {
             assert_eq!(chain.steps.last().unwrap().url, "https://t.test/p");
         }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// 캐시 출처 origin은 접두어가 아니라 완전 일치 — `example.com.evil`·다른
+    /// 포트의 방문이 기준 페이지로 오인되면 안 된다.
+    #[test]
+    fn cache_origin_match_rejects_lookalike_hosts_and_other_ports() {
+        let root = std::env::temp_dir().join(format!(
+            "windows-analysis-visitflow-origin-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        ));
+        let dir = root.join("BROWSER");
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = Connection::open(dir.join("user_Chrome.sqlite")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE urls (id TEXT, url TEXT, title TEXT, visit_count TEXT);\
+             CREATE TABLE visits (id TEXT, url TEXT, from_visit TEXT, opener_visit TEXT, transition TEXT, external_referrer_url TEXT, visit_time TEXT);",
+        )
+        .unwrap();
+        // 미끼 호스트·다른 포트만 방문 기록에 있다 — 방문 횟수도 더 높다.
+        for (id, url, count) in [
+            ("1", "https://c.test.evil/lure", "9"),
+            ("2", "https://c.test:8443/admin", "8"),
+            ("3", "https://c.test/page", "1"),
+            ("4", "https://o.test/", "1"),
+        ] {
+            conn.execute("INSERT INTO urls VALUES (?1,?2,'',?3)", rusqlite::params![id, url, count]).unwrap();
+        }
+        let rows = [
+            ("10", "1", "0", "0", "1", "", "13427941143000000"),
+            ("11", "1", "10", "0", "0", "", "13427941143100000"),
+            ("20", "2", "0", "0", "1", "", "13427941143200000"),
+            ("21", "2", "20", "0", "0", "", "13427941143300000"),
+            ("30", "4", "0", "0", "1", "", "13427941143400000"),
+            ("31", "3", "30", "0", "0", "", "13427941143500000"),
+        ];
+        for (id, url, fv, op, tr, ext, t) in rows {
+            conn.execute(
+                "INSERT INTO visits (id,url,from_visit,opener_visit,transition,external_referrer_url,visit_time) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                rusqlite::params![id, url, fv, op, tr, ext, t],
+            ).unwrap();
+        }
+        drop(conn);
+
+        let flow = browser_visit_flow_blocking(
+            root.to_string_lossy().to_string(),
+            "user".to_string(),
+            "https://c.test/asset/app.js".to_string(),
+            Some("1/0/_dk_https://c.test https://c.test https://c.test/asset/app.js".to_string()),
+            Some("/case/BROWSER/user/Chrome/Cache/Cache_Data/index".to_string()),
+        );
+        assert_eq!(flow.matched_page, "https://c.test");
+        // 미끼·타 포트 페이지가 아니라 정확한 origin의 페이지만 채택된다.
+        for chain in &flow.chains {
+            let target = &chain.steps.last().unwrap().url;
+            assert!(target.starts_with("https://c.test/"), "wrong page attributed: {target}");
+        }
+        assert!(!flow.chains.is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// 출처 고정: 같은 계정에 같은 URL을 가진 두 브라우저 DB가 있어도, 행의
+    /// 원본 DB(Edge)만 조회한다 — 먼저 정렬된 Chrome 체인이 새면 안 된다.
+    #[test]
+    fn visit_flow_reads_only_the_source_browser_db() {
+        let root = std::env::temp_dir().join(format!(
+            "windows-analysis-visitflow-src-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        ));
+        let dir = root.join("BROWSER");
+        std::fs::create_dir_all(&dir).unwrap();
+        // 같은 URL이 두 브라우저 모두에 있고, 유입 출발지만 다르다.
+        for (file, origin) in [
+            ("user_Chrome.sqlite", "https://from-chrome.test/"),
+            ("user_Edge.sqlite", "https://from-edge.test/"),
+        ] {
+            let conn = Connection::open(dir.join(file)).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE urls (id TEXT, url TEXT, title TEXT, visit_count TEXT);\
+                 CREATE TABLE visits (id TEXT, url TEXT, from_visit TEXT, opener_visit TEXT, transition TEXT, external_referrer_url TEXT, visit_time TEXT);",
+            )
+            .unwrap();
+            conn.execute("INSERT INTO urls VALUES ('1', ?1, '', '1')", [origin]).unwrap();
+            conn.execute("INSERT INTO urls VALUES ('2', 'https://t.test/p', '', '1')", []).unwrap();
+            conn.execute(
+                "INSERT INTO visits (id,url,from_visit,opener_visit,transition,external_referrer_url,visit_time) VALUES ('10','1','0','0','1','','13427941143000000')",
+                [],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO visits (id,url,from_visit,opener_visit,transition,external_referrer_url,visit_time) VALUES ('11','2','10','0','0','','13427941143100000')",
+                [],
+            ).unwrap();
+        }
+
+        let flow = browser_visit_flow_blocking(
+            root.to_string_lossy().to_string(),
+            "user".to_string(),
+            "https://t.test/p".to_string(),
+            None,
+            Some("BROWSER/user_Edge.sqlite".to_string()),
+        );
+        assert_eq!(flow.source_file, "user_Edge.sqlite");
+        assert_eq!(flow.chains.len(), 1);
+        assert_eq!(flow.chains[0].steps[0].url, "https://from-edge.test/");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// reload 귀속: 독립 유입 두 개 중 리다이렉트가 이어진 entry에만 세고,
+    /// 다른 유입 체인에는 0으로 남는다.
+    #[test]
+    fn reloads_are_attributed_per_entry_chain() {
+        let root = std::env::temp_dir().join(format!(
+            "windows-analysis-visitflow-reload-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        ));
+        let dir = root.join("BROWSER");
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = Connection::open(dir.join("user_Chrome.sqlite")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE urls (id TEXT, url TEXT, title TEXT, visit_count TEXT);\
+             CREATE TABLE visits (id TEXT, url TEXT, from_visit TEXT, opener_visit TEXT, transition TEXT, external_referrer_url TEXT, visit_time TEXT);",
+        )
+        .unwrap();
+        for (id, url) in [("1", "https://x.test/"), ("2", "https://y.test/"), ("3", "https://t.test/p")] {
+            conn.execute("INSERT INTO urls VALUES (?1,?2,'','1')", rusqlite::params![id, url]).unwrap();
+        }
+        // X→T(101) 뒤에 self-redirect 2회(102→103), Y→T(201)는 리다이렉트 없음.
+        let rows = [
+            ("100", "1", "0", "0", "1", "", "13427941143000000"),
+            ("101", "3", "100", "0", "0", "", "13427941143100000"),
+            ("102", "3", "101", "0", "1610612736", "", "13427941143200000"),
+            ("103", "3", "102", "0", "1610612736", "", "13427941143300000"),
+            ("200", "2", "0", "0", "1", "", "13427941143400000"),
+            ("201", "3", "200", "0", "0", "", "13427941143500000"),
+        ];
+        for (id, url, fv, op, tr, ext, t) in rows {
+            conn.execute(
+                "INSERT INTO visits (id,url,from_visit,opener_visit,transition,external_referrer_url,visit_time) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                rusqlite::params![id, url, fv, op, tr, ext, t],
+            ).unwrap();
+        }
+        drop(conn);
+
+        let flow = browser_visit_flow_blocking(
+            root.to_string_lossy().to_string(),
+            "user".to_string(),
+            "https://t.test/p".to_string(),
+            None,
+            Some("BROWSER/user_Chrome.sqlite".to_string()),
+        );
+        assert_eq!(flow.chains.len(), 2);
+        let mut by_origin: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for chain in &flow.chains {
+            by_origin.insert(chain.steps[0].url.clone(), chain.reloads);
+        }
+        assert_eq!(by_origin.get("https://x.test/"), Some(&2), "X 유입에만 재이동 2회 귀속");
+        assert_eq!(by_origin.get("https://y.test/"), Some(&0), "Y 유입은 재이동 0회");
         let _ = std::fs::remove_dir_all(root);
     }
 

@@ -781,7 +781,8 @@ function VisitFlowLauncher({ row, hostDir }: { row: Record<string, string>; host
     setOpen(true);
     const url = isCache ? row.url || "" : row.url_raw || row.url || "";
     const cacheKey = isCache ? row.cache_key || "" : undefined;
-    window.api.browserVisitFlow(hostDir, row.account, url, cacheKey)
+    // 출처 고정 — 같은 브라우저의 History만 조회한다 (없으면 서버가 안내 반환).
+    window.api.browserVisitFlow(hostDir, row.account, url, cacheKey, row._source_file || undefined)
       .then((result) => { setFlow(result); setState("ready"); })
       .catch(() => setState("error"));
   }

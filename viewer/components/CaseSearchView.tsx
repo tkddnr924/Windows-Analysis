@@ -305,6 +305,11 @@ function ArtifactCategoryFilter({ categories, hidden, onToggle, onShowAll, onHid
           <button type="button" onClick={onHideAll} style={{ fontSize: 11.5, background: "transparent", border: "none", color: "var(--text-dim)", cursor: "pointer", fontWeight: 650 }}>전체 해제</button>
         </div>
       </div>
+      {/* 필터 의미 명시 — 원본 데이터 범위만 거르고, 종합 분석(파생) 결과는
+          어떤 원본을 해제해도 항상 포함된다 (의도된 설계, 2026-08-31 확정). */}
+      <div style={{ padding: "6px 4px 0", color: "var(--text-faint)", fontSize: 11, lineHeight: 1.5 }}>
+        원본 데이터 기준 필터입니다 — 종합 분석 결과는 항상 검색에 포함됩니다.
+      </div>
       <div style={{ display: "grid", gap: 2, paddingTop: 7 }}>
         {categories.length === 0 && <div style={{ padding: "8px 10px", color: "var(--text-faint)", fontSize: 12 }}>선택할 아티팩트가 없습니다.</div>}
         {categories.map((name) => (

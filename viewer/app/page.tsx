@@ -296,7 +296,11 @@ export default function Home() {
       }
       const fileCustomView = getArtifactView(file.name)?.customView;
       // 서버 페이지네이션 전용 뷰 — 행을 IPC로 싣지 않고 뷰가 직접 조회한다.
-      const isBrowserActivity = fileCustomView === "browserHistory" || fileCustomView === "usnJrnl";
+      // MFT도 여기 속한다: MftView는 dbPath만 받아 mft_children/mft_search로
+      // 페이지 조회하는데, 여기서 MFT_Records 전체를 전량 적재하면 수백만 행
+      // 호스트에서 웹뷰 메모리가 고갈돼 앱이 강제 종료된다.
+      const isBrowserActivity =
+        fileCustomView === "browserHistory" || fileCustomView === "usnJrnl" || fileCustomView === "mft";
       // 전용 뷰(customView)가 없는 원본 테이블은 DataTable로 렌더된다. 원본
       // EventLog처럼 수십만 행짜리 테이블을 통째로 IPC에 싣지 않도록 이
       // 경로만 청크 단위로 받고, 스크롤 시 이어 받는다. 개요 뷰들은 전체
@@ -1266,6 +1270,7 @@ export default function Home() {
                 <RdpCacheView data={activeTab.data} mode={activeTab.file.name === "RdpBitmapCache" ? "tiles" : "fragments"} />
               ) : getArtifactView(activeTab.file.name)?.customView === "powershellFlow" ? (
                 <PowerShellFlowView
+                  dbPath={activeTab.file.fullPath}
                   data={activeTab.data}
                   onNavigate={handleNavigate}
                   onFetchLinkedRows={fetchLinkedRows}

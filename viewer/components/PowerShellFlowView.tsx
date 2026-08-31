@@ -115,6 +115,8 @@ interface PowerShellFlowViewProps {
   onToggleBookmark?: (rowid: number) => void;
   timeRange?: TimeRange;
   accountDirectory?: AccountDirectory;
+  /** PowerShellHistory.sqlite 경로 — 상세 열람 시 절단 없는 전체 행을 다시 받는다. */
+  dbPath?: string;
 }
 
 const FILTERS: { label: string; value?: PsKind }[] = [
@@ -130,7 +132,7 @@ const FILTERS: { label: string; value?: PsKind }[] = [
 ];
 
 export default function PowerShellFlowView({
-  data, onNavigate, onFetchLinkedRows, bookmarkedRowids, onToggleBookmark, timeRange = EMPTY_TIME_RANGE, accountDirectory,
+  data, onNavigate, onFetchLinkedRows, bookmarkedRowids, onToggleBookmark, timeRange = EMPTY_TIME_RANGE, accountDirectory, dbPath,
 }: PowerShellFlowViewProps) {
   const [kindFilter, setKindFilter] = useState<PsKind | undefined>();
   // 계정별 체크 필터 — 기본은 전체 표시, 체크 해제한 계정만 숨긴다.
@@ -138,6 +140,19 @@ export default function PowerShellFlowView({
   const [query, setQuery] = useState("");
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [selected, setSelected] = useState<Record<string, string> | null>(null);
+  // 목록 로드는 script_block/host_application을 앞부분 미리보기로만 받는다
+  // (대량 4104 호스트의 웹뷰 메모리 보호). 상세는 원본 행 전체를 다시 받아
+  // 코드 블록이 절단 없이 표시되게 한다 — 실패하면 미리보기 행으로 연다.
+  const openDetail = (row: Record<string, string>) => {
+    const rowid = Number((row as Record<string, unknown>).__rowid);
+    if (dbPath && Number.isFinite(rowid)) {
+      window.api.resultRow(dbPath, TABLE_NAME, rowid)
+        .then((full) => setSelected(full.row ? { ...full.row, __rowid: String(rowid) } as Record<string, string> : row))
+        .catch(() => setSelected(row));
+    } else {
+      setSelected(row);
+    }
+  };
   // 시간 정보가 없는 기록(ConsoleHost_history 등)은 세션 묶음과 분리해
   // 실행 이력 뷰와 같은 접이식 구역으로 보여준다.
   const [untimedOpen, setUntimedOpen] = useState(false);
@@ -223,12 +238,12 @@ export default function PowerShellFlowView({
                       key={`${rowid}-${index}`}
                       className={bookmarked ? "dfir-bookmarked-row" : undefined}
                       // 행 전체(여백 포함)가 상세 열기 클릭 대상 — 북마크는 전파 차단.
-                      onClick={() => setSelected(row)}
+                      onClick={() => openDetail(row)}
                       style={{ display: "flex", alignItems: "center", gap: 10, minHeight: 38, padding: "0 12px", borderBottom: "1px solid var(--border-subtle)", borderRadius: 0, cursor: "pointer" }}
                       onMouseEnter={(event) => { if (!bookmarked) event.currentTarget.style.background = "var(--bg-hover)"; }}
                       onMouseLeave={(event) => { if (!bookmarked) event.currentTarget.style.background = "transparent"; }}
                     >
-                      <div role="button" tabIndex={0} onClick={() => setSelected(row)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); setSelected(row); } }} style={{ flex: 1, display: "flex", alignItems: "center", gap: 10, minWidth: 0, cursor: "pointer", outlineOffset: 2 }}>
+                      <div role="button" tabIndex={0} onClick={() => openDetail(row)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); openDetail(row); } }} style={{ flex: 1, display: "flex", alignItems: "center", gap: 10, minWidth: 0, cursor: "pointer", outlineOffset: 2 }}>
                         <span style={{ width: 44, flexShrink: 0, textAlign: "right", color: "var(--text-faint)", fontFamily: "var(--mono)", fontSize: 11.5 }}>{row.line_number || "-"}</span>
                         <span style={{ flexShrink: 0, fontSize: 11.5, fontWeight: 700, color: "var(--text-dim)", border: "1px solid var(--text-dim)", borderRadius: "var(--radius-sm)", padding: "1px 8px", whiteSpace: "nowrap" }}>{row.kind || "콘솔 히스토리"}</span>
                         <span title={row.command} style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontFamily: "var(--mono)", fontSize: 12.5 }}>{row.command || "(명령 없음)"}</span>
@@ -313,8 +328,8 @@ export default function PowerShellFlowView({
                     const kindColor = kindLabel === "스크립트 블록" ? "var(--accent)" : kindLabel === "파이프라인" ? "var(--warning)" : kindLabel === "명령 실행" ? "var(--success)" : "var(--text-dim)";
                     return (
                       // 행 전체(여백 포함)가 상세 열기 클릭 대상 — 북마크는 전파 차단.
-                      <div key={`${event.rowid}-${event.timestamp}`} className={bookmarked ? "dfir-bookmarked-row ps-session-event" : "ps-session-event"} onClick={() => setSelected(event.row)} style={{ borderRadius: 0, display: "flex", alignItems: "center", gap: 8, minHeight: 46, padding: "8px 14px 8px 60px", borderTop: eventIndex === 0 ? "none" : "1px solid var(--border-subtle)", background: "transparent", cursor: "pointer", transition: "background .15s ease" }} onMouseEnter={(mouseEvent) => { if (!bookmarked) mouseEvent.currentTarget.style.background = "var(--bg-hover)"; }} onMouseLeave={(mouseEvent) => { if (!bookmarked) mouseEvent.currentTarget.style.background = "transparent"; }}>
-                        <button type="button" className="ps-session-child" onClick={() => setSelected(event.row)} aria-label={`${formatEvidenceTimestamp(event.timestamp)} ${kindLabel} 상세 보기`} style={{ flex: 1, display: "grid", gridTemplateColumns: "158px 104px minmax(0, 1fr)", gap: 10, alignItems: "center", minWidth: 0, padding: 0, color: "var(--text)", cursor: "pointer", border: "none", background: "transparent", textAlign: "left", outlineOffset: 2 }}>
+                      <div key={`${event.rowid}-${event.timestamp}`} className={bookmarked ? "dfir-bookmarked-row ps-session-event" : "ps-session-event"} onClick={() => openDetail(event.row)} style={{ borderRadius: 0, display: "flex", alignItems: "center", gap: 8, minHeight: 46, padding: "8px 14px 8px 60px", borderTop: eventIndex === 0 ? "none" : "1px solid var(--border-subtle)", background: "transparent", cursor: "pointer", transition: "background .15s ease" }} onMouseEnter={(mouseEvent) => { if (!bookmarked) mouseEvent.currentTarget.style.background = "var(--bg-hover)"; }} onMouseLeave={(mouseEvent) => { if (!bookmarked) mouseEvent.currentTarget.style.background = "transparent"; }}>
+                        <button type="button" className="ps-session-child" onClick={() => openDetail(event.row)} aria-label={`${formatEvidenceTimestamp(event.timestamp)} ${kindLabel} 상세 보기`} style={{ flex: 1, display: "grid", gridTemplateColumns: "158px 104px minmax(0, 1fr)", gap: 10, alignItems: "center", minWidth: 0, padding: 0, color: "var(--text)", cursor: "pointer", border: "none", background: "transparent", textAlign: "left", outlineOffset: 2 }}>
                           <span className="ps-session-child-time" style={{ color: "var(--text-time)", fontFamily: "var(--mono)", fontSize: 12.5, whiteSpace: "nowrap" }}>{formatEvidenceTimestamp(event.timestamp)}</span>
                           <span className="ps-session-child-type" style={{ justifySelf: "start", fontSize: 11.5, fontWeight: 700, color: kindColor, border: `1px solid ${kindColor}`, borderRadius: "var(--radius-sm)", padding: "1px 8px", whiteSpace: "nowrap" }}>{kindLabel}</span>
                           <span className="ps-session-child-content" style={{ minWidth: 0, display: "grid", gap: 3 }}>
