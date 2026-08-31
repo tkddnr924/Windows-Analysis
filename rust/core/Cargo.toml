@@ -22,11 +22,6 @@ serde_json = { version = "1", features = ["preserve_order"] }
 serde = { version = "1", features = ["derive"] }
 anyhow = "1"
 prefetch-core = "0.1.1"
-md-5 = "0.10"
-aes = "0.8"
-cbc = { version = "0.1", features = ["alloc", "block-padding"] }
-des = "0.8"
-rc4 = "0.1"
 flate2 = "1"
 brotli = "6"
 rayon = "1.12.0"

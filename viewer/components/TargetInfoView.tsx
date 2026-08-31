@@ -95,8 +95,6 @@ interface Account {
   /** RID embedded in the SAM F record — differs from `rid` (the key/folder RID)
    * under RID hijacking. */
   ridSam: string;
-  ntlmHash: string;
-  ntlmHashStatus: string;
   homeDir: string;
   created: string;
   lastLogin: string;
@@ -129,8 +127,6 @@ function buildAccount(r: Row): Account {
     fullName: r.full_name || "",
     rid: r.rid || (Number.isFinite(ridNum) ? String(ridNum) : ""),
     ridSam: r.rid_sam || "",
-    ntlmHash: r.ntlm_hash || "",
-    ntlmHashStatus: r.ntlm_hash_status || "",
     homeDir: r.home_directory || r.value || "",
     created: r.created || "",
     lastLogin: r.last_login || "",
@@ -749,16 +745,12 @@ function AccountDetailPage({ account, onBack, loadEvents, timeRange, onNavigate,
           <DetailGroup title="식별">
             {identityRows.filter(([, value]) => Boolean(value)).map(([label, value, mono]) => <DetailRow key={label} label={label} value={value} mono={mono} />)}
           </DetailGroup>
-      {(account.rid || account.ridSam || stateRows.some(([, value]) => Boolean(value))) && <DetailGroup title="인증 및 상태">
+          {(account.rid || account.ridSam || stateRows.some(([, value]) => Boolean(value))) && <DetailGroup title="인증 및 상태">
             {sameRid && <DetailRow label="RID" value={account.rid} mono />}
             {!sameRid && account.rid && <DetailRow label="RID (SAM 키 / 폴더)" value={account.rid} mono />}
             {!sameRid && account.ridSam && <DetailRow label="RID (SAM F 레코드)" value={account.ridSam} mono />}
-        {stateRows.filter(([, value]) => Boolean(value)).map(([label, value]) => <DetailRow key={label} label={label} value={value} />)}
-      </DetailGroup>}
-      <DetailGroup title="NTLM 해시">
-        <DetailRow label="NTLM 해시" value={account.ntlmHash} mono />
-        {account.ntlmHashStatus && <DetailRow label="추출 상태" value={account.ntlmHashStatus} />}
-      </DetailGroup>
+            {stateRows.filter(([, value]) => Boolean(value)).map(([label, value]) => <DetailRow key={label} label={label} value={value} />)}
+          </DetailGroup>}
           <DetailGroup title="시간 정보">
             {timeRows.map(([label, value, field]) => <DetailRow key={field} label={label} value={value} mono bm={mkBm(field)} />)}
           </DetailGroup>

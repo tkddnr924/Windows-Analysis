@@ -5,15 +5,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use aes::Aes128;
-use cbc::cipher::{block_padding::NoPadding, BlockDecryptMut, KeyIvInit};
-use cbc::Decryptor;
-use des::Des;
-use des::cipher::{BlockDecrypt, KeyInit as DesKeyInit};
-use md5::Md5;
-use md5::Digest;
-use rc4::{Rc4, StreamCipher};
-
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OpenFlags};
 
@@ -2740,8 +2731,6 @@ pub const TI_KEYS: &[&str] = &[
     "full_name",
     "rid",
     "rid_sam",
-    "ntlm_hash",
-    "ntlm_hash_status",
     "home_directory",
     "created",
     "last_login",
@@ -2873,103 +2862,6 @@ fn unhex(s: &str) -> Vec<u8> {
             _ => return Vec::new(),
         }
         i += 2;
-    }
-    out
-}
-
-const BOOTKEY_PERMUTE: [usize; 16] = [0x8, 0x5, 0x4, 0x2, 0xB, 0x9, 0xD, 0x3, 0x0, 0x6, 0x1, 0xC, 0xE, 0xA, 0xF, 0x7];
-const QWERTY: &[u8] = b"!@#$%^&*()qwertyUIOPAzxcvbnmQQQQQQQQQQQQ)(*@&%\0";
-const DIGITS: &[u8] = b"0123456789012345678901234567890123456789\0";
-const NTPASSWORD: &[u8] = b"NTPASSWORD\0";
-const V_DATA_OFFSET: usize = 0xCC;
-
-fn to_hex_lower(b: &[u8]) -> String {
-    b.iter().map(|byte| format!("{:02x}", byte)).collect()
-}
-
-fn set_odd_parity(key: u8) -> u8 {
-    let mut ones = 0u8;
-    let mut v = key;
-    v &= 0xfe;
-    for _ in 0..7 {
-        ones ^= v & 1;
-        v >>= 1;
-    }
-    key & 0xfe | (ones ^ 1)
-}
-
-fn des_transform_key(input: &[u8; 7]) -> [u8; 8] {
-    let mut out = [0u8; 8];
-    out[0] = input[0] >> 1;
-    out[1] = ((input[0] & 0x01) << 6) | (input[1] >> 2);
-    out[2] = ((input[1] & 0x03) << 5) | (input[2] >> 3);
-    out[3] = ((input[2] & 0x07) << 4) | (input[3] >> 4);
-    out[4] = ((input[3] & 0x0f) << 3) | (input[4] >> 5);
-    out[5] = ((input[4] & 0x1f) << 2) | (input[5] >> 6);
-    out[6] = ((input[5] & 0x3f) << 1) | (input[6] >> 7);
-    out[7] = input[6] & 0x7f;
-    for item in &mut out {
-        *item = set_odd_parity(*item);
-    }
-    out
-}
-
-fn derive_des_keys(base_key: &[u8]) -> Option<([u8; 8], [u8; 8])> {
-    if base_key.len() < 4 {
-        return None;
-    }
-    let rid = base_key.get(0..4)?;
-    let i = [rid[0], rid[1], rid[2], rid[3]];
-    let key1 = [i[0], i[1], i[2], i[3], i[0], i[1], i[2]];
-    let key2 = [i[3], i[0], i[1], i[2], i[3], i[0], i[1]];
-    Some((des_transform_key(&key1), des_transform_key(&key2)))
-}
-
-fn rc4_xor(mut data: Vec<u8>, key: &[u8]) -> Vec<u8> {
-    // SAM/NTLM 경로의 RC4 키는 항상 md5_16 출력(16바이트)이라 U16으로 고정한다.
-    let Ok(mut cipher) = Rc4::<rc4::consts::U16>::new_from_slice(key) else {
-        return Vec::new();
-    };
-    cipher.apply_keystream(&mut data);
-    data
-}
-
-fn md5_16(data: &[u8]) -> Vec<u8> {
-    let mut h = Md5::new();
-    h.update(data);
-    h.finalize().to_vec()
-}
-
-fn aes_cbc_decrypt(key: &[u8], data: &[u8], iv: &[u8]) -> Vec<u8> {
-    if key.len() != 16 || iv.len() != 16 || !data.len().is_multiple_of(16) {
-        return Vec::new();
-    }
-    let Ok(cipher) = Decryptor::<Aes128>::new_from_slices(key, iv) else {
-        return Vec::new();
-    };
-    let mut buf = data.to_vec();
-    let Ok(plain) = cipher.decrypt_padded_mut::<NoPadding>(&mut buf) else {
-        return Vec::new();
-    };
-    plain.to_vec()
-}
-
-fn des_ecb_decrypt(key: &[u8; 8], data: &[u8]) -> Vec<u8> {
-    if data.len() != 8 {
-        return Vec::new();
-    }
-    let Ok(c) = Des::new_from_slice(key) else {
-        return Vec::new();
-    };
-    let mut block = des::cipher::generic_array::GenericArray::clone_from_slice(data);
-    c.decrypt_block(&mut block);
-    block.to_vec()
-}
-
-fn bootkey_permute(raw: [u8; 16]) -> [u8; 16] {
-    let mut out = [0u8; 16];
-    for i in 0..16 {
-        out[i] = raw[BOOTKEY_PERMUTE[i]];
     }
     out
 }
@@ -3309,237 +3201,6 @@ fn sam_v(b: &[u8]) -> (String, String) {
     (field(1), field(2))
 }
 
-fn nt_hash_from_v(v: &[u8], hashed_boot_key: &[u8], rid: u32) -> (String, String) {
-    if v.len() < V_DATA_OFFSET + 0xB4 {
-        return (String::new(), "V 블롭 크기 부족".to_string());
-    }
-    let lm_offset = le_u32(v, V_DATA_OFFSET + 0xA0) as usize;
-    let lm_len = le_u32(v, V_DATA_OFFSET + 0xA4) as usize;
-    let nt_offset = le_u32(v, V_DATA_OFFSET + 0xAC) as usize;
-    let nt_len = le_u32(v, V_DATA_OFFSET + 0xB0) as usize;
-    let nt_start = V_DATA_OFFSET + nt_offset;
-    let nt_end = nt_start.saturating_add(nt_len);
-    if nt_len < 20 || nt_start >= v.len() || nt_end > v.len() {
-        return (String::new(), "NTHash 범위 오류".to_string());
-    }
-    // 유효한 파싱 상태인지 확인하기 위해 LMHash 길이도 확인한다(항목 동기성 유지).
-    if lm_len > 0 && lm_offset >= v.len() {
-        return (String::new(), "LMHash 범위 오류".to_string());
-    }
-    let nt_blob = &v[nt_start..nt_end];
-    if nt_blob.len() < 20 {
-        return (String::new(), "NTHash 블롭 길이 부족".to_string());
-    }
-    if hashed_boot_key.len() < 16 {
-        return (String::new(), "hashedBootKey 미확인".to_string());
-    }
-
-    let is_new_style = if nt_blob.len() > 2 {
-        nt_blob[2] != 0x01
-    } else {
-        false
-    };
-
-    let mut key = if !is_new_style {
-        let hash = nt_blob.get(4..20).unwrap_or_default();
-        if hash.len() != 16 {
-            return (String::new(), "SAM_HASH 크기 오류".to_string());
-        }
-        let mut hash = hash.to_vec();
-        let rc4_key = md5_16(&[
-            &hashed_boot_key[..16],
-            &rid.to_le_bytes(),
-            NTPASSWORD,
-        ]
-        .concat());
-        hash = rc4_xor(hash, &rc4_key);
-        hash
-    } else {
-        if nt_blob.len() < 20 {
-            return (String::new(), "NTHASH new-style 블롭 부족".to_string());
-        }
-        let salt = &nt_blob[12..28];
-        let data_offset = le_u32(nt_blob, 8) as usize;
-        let data_start = 8 + data_offset;
-        if data_start >= nt_blob.len() {
-            return (String::new(), "NTHASH new-style 오프셋 오류".to_string());
-        }
-        let dec = aes_cbc_decrypt(&hashed_boot_key[..16], &nt_blob[data_start..], salt);
-        if dec.len() < 16 {
-            return (String::new(), "NTHASH new-style AES 복호화 실패".to_string());
-        }
-        dec
-    };
-    if key.len() < 16 {
-        return (String::new(), "복호화 키 생성 실패".to_string());
-    }
-    key.truncate(16);
-    let (k1, k2) = match derive_des_keys(&rid.to_le_bytes()) {
-        Some(v) => v,
-        None => return (String::new(), "RID 기반 DES 키 생성 실패".to_string()),
-    };
-    let d1 = des_ecb_decrypt(&k1, &key[0..8]);
-    let d2 = des_ecb_decrypt(&k2, &key[8..16]);
-    if d1.len() != 8 || d2.len() != 8 {
-        return (String::new(), "NTHash DES 복호화 실패".to_string());
-    }
-    (to_hex_lower(&[d1, d2].concat()), "복호화 완료".to_string())
-}
-
-fn get_bootkey_from_system(system: &[Row]) -> [u8; 16] {
-    let cs = active_control_set(system);
-    let mut chunks: Vec<u8> = Vec::new();
-    let mut keys = Vec::new();
-    for p in [
-        ("\\control\\lsa\\jd", 0usize),
-        ("\\control\\lsa\\skew1", 1),
-        ("\\control\\lsa\\gbg", 2),
-        ("\\control\\lsa\\data", 3),
-    ] {
-        let rows = reg_pick_exact_path(
-            system,
-            &(cs.to_lowercase() + p.0),
-            &[
-                "(default)",
-                "",
-                "jd",
-                "skew1",
-                "gbg",
-                "data",
-                "skewmatrix",
-                "lookup",
-                "grafblumgroup",
-                "pattern",
-            ],
-        );
-        let mut part = None;
-        for r in rows {
-            if let Some(v) = r.get("value_data") {
-                let bytes = unhex(v);
-                if bytes.len() >= 4 {
-                    part = Some(bytes[..4.min(bytes.len())].to_vec());
-                    break;
-                }
-            }
-        }
-        if let Some(v) = part {
-            keys.push((p.1, v));
-        } else {
-            return [0u8; 16];
-        }
-    }
-    keys.sort_by_key(|(i, _)| *i);
-    for (_, b) in keys {
-        chunks.extend_from_slice(&b);
-    }
-    if chunks.len() != 64 {
-        return [0u8; 16];
-    }
-    let mut raw = [0u8; 16];
-    raw.copy_from_slice(&chunks[..16]);
-    bootkey_permute(raw)
-}
-
-fn get_hashed_boot_key(system: &[Row], sam: &[Row]) -> Vec<u8> {
-    let boot_key = get_bootkey_from_system(system);
-    if boot_key == [0u8; 16] {
-        return Vec::new();
-    }
-    let f = pick_sam_f(sam);
-    if f.is_empty() || f.len() < 0x6c + 1 {
-        return Vec::new();
-    }
-    let key0 = &f[0x6c..];
-    if key0.is_empty() {
-        return Vec::new();
-    }
-    let (hbk, _) = parse_sam_hashed_bootkey(&boot_key, key0);
-    hbk
-}
-
-fn reg_pick_exact_path<'a>(rows: &'a [Row], key_suffix: &str, value_names: &[&str]) -> Vec<&'a Row> {
-    let ks = key_suffix.to_lowercase();
-    rows.iter()
-        .filter(|r| {
-            let kp = r.get("key_path").map(String::as_str).unwrap_or("");
-            let vn = r.get("value_name").map(String::as_str).unwrap_or("");
-            kp.to_lowercase().ends_with(&ks)
-                && !r.get("value_data").map(String::as_str).unwrap_or("").is_empty()
-                && value_names
-                    .iter()
-                    .any(|n| vn.eq_ignore_ascii_case(n) || (vn.is_empty() && n.is_empty()))
-        })
-        .collect()
-}
-
-fn pick_sam_f(sam: &[Row]) -> Vec<u8> {
-    let mark = "\\sam\\domains\\account\\f";
-    reg_pick_row(sam, mark, "(default)")
-        .or_else(|| reg_pick_row(sam, mark, ""))
-        .or_else(|| reg_pick_row(sam, mark, "F"))
-        .and_then(|r| r.get("value_data").map(|v| unhex(v)))
-        .unwrap_or_default()
-}
-
-fn parse_sam_hashed_bootkey(boot_key: &[u8], key0: &[u8]) -> (Vec<u8>, String) {
-    if key0.is_empty() {
-        return (Vec::new(), "Key0 없음".to_string());
-    }
-    if key0[0] == 0x01 {
-        if key0.len() < 0x3C {
-            return (Vec::new(), "Key0 v1 길이 부족".to_string());
-        }
-        let salt = &key0[8..24];
-        let key = &key0[24..40];
-        let checksum = &key0[40..56];
-        let rc4_key = md5_16(&[salt, QWERTY, boot_key, DIGITS].concat());
-        let crypt = {
-            let mut merged = Vec::new();
-            merged.extend_from_slice(key);
-            merged.extend_from_slice(checksum);
-            rc4_xor(merged, &rc4_key)
-        };
-        if crypt.len() < 32 {
-            return (Vec::new(), "Key0 v1 복호화 실패".to_string());
-        }
-        let expect = md5_16(&[
-            &crypt[0..16],
-            DIGITS,
-            &crypt[0..16],
-            QWERTY,
-        ]
-        .concat());
-        if expect.as_slice() != &crypt[16..32] {
-            return (
-                Vec::new(),
-                "hashedBootKey checksum mismatch(시작 암호 여부 후보)".to_string(),
-            );
-        }
-        (crypt[..16].to_vec(), String::new())
-    } else if key0[0] == 0x02 {
-        if key0.len() < 0x24 {
-            return (Vec::new(), "Key0 v2 헤더 부족".to_string());
-        }
-        let data_len = le_u32(key0, 12) as usize;
-        if boot_key.len() < 16 {
-            return (Vec::new(), "SYSTEM bootkey 부족".to_string());
-        }
-        let salt = &key0[16..32];
-        let key_data = if key0.len() < 32 + data_len {
-            return (Vec::new(), "Key0 v2 데이터 길이 부족".to_string());
-        } else {
-            &key0[32..32 + data_len]
-        };
-        let dec = aes_cbc_decrypt(&boot_key[..16], key_data, salt);
-        if dec.is_empty() {
-            return (Vec::new(), "Key0 v2 AES 복호화 실패".to_string());
-        }
-        (dec[..16.min(dec.len())].to_vec(), String::new())
-    } else {
-        (Vec::new(), "지원되지 않는 Key0 타입".to_string())
-    }
-}
-
 fn special_accounts(software: &[Row]) -> HashMap<String, String> {
     let mark = "\\microsoft\\windows nt\\currentversion\\winlogon\\specialaccounts\\userlist";
     let mut out = HashMap::new();
@@ -3569,8 +3230,7 @@ fn well_known_sid(sid: &str) -> Option<&'static str> {
     }
 }
 
-fn ti_accounts(sam: &[Row], software: &[Row], system: &[Row], _security: &[Row]) -> Vec<Row> {
-    let hashed_boot_key = get_hashed_boot_key(system, sam);
+fn ti_accounts(sam: &[Row], software: &[Row]) -> Vec<Row> {
     let hidden = special_accounts(software);
     let mut prefix = String::new();
     let mut profile_keys: Vec<String> = Vec::new();
@@ -3662,15 +3322,6 @@ fn ti_accounts(sam: &[Row], software: &[Row], system: &[Row], _security: &[Row])
                 .cloned()
                 .unwrap_or_default()
         };
-        let (ntlm_hash, ntlm_hash_status) = if hashed_boot_key.is_empty() {
-            (
-                String::new(),
-                "hashedBootKey 미확인".to_string(),
-            )
-        } else {
-            let rid = rid.to_le_bytes();
-            nt_hash_from_v(vb, &hashed_boot_key, u32::from_le_bytes(rid))
-        };
         let last_login = g("last_login");
         if !sid.is_empty() {
             emitted.insert(sid.clone());
@@ -3684,8 +3335,6 @@ fn ti_accounts(sam: &[Row], software: &[Row], system: &[Row], _security: &[Row])
             ("full_name", full_name),
             ("rid", rid.to_string()),
             ("rid_sam", g("rid")),
-            ("ntlm_hash", ntlm_hash),
-            ("ntlm_hash_status", ntlm_hash_status),
             ("home_directory", path.clone()),
             ("created", created.clone()),
             ("last_login", last_login.clone()),
@@ -3887,10 +3536,9 @@ pub fn build_target_info_with_registry(registry: &RegistryOverviewCache) -> Vec<
     let software = registry.rows("SOFTWARE");
     let system = registry.rows("SYSTEM");
     let sam = registry.rows("SAM");
-    let security = registry.rows("SECURITY");
     let mut rows = Vec::new();
     rows.extend(ti_system_info(software, system));
-    rows.extend(ti_accounts(sam, software, system, security));
+    rows.extend(ti_accounts(sam, software));
     rows.extend(ti_networks(software));
     rows.extend(ti_network_interfaces(system));
     rows
