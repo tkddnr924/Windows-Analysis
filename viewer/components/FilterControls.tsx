@@ -69,6 +69,62 @@ export function FilterDropdown({
   );
 }
 
+/** 다중 선택 팝오버 — ✓ 표시된 옵션을 여러 개 켤 수 있다. 빈 선택은 "전체"로
+ * 취급하며, 옵션을 눌러도 팝오버는 닫히지 않는다. */
+export function MultiSelectDropdown({
+  icon,
+  label,
+  options,
+  selected,
+  onChange,
+  align = "left",
+  ariaLabel,
+  allLabel = "전체",
+}: {
+  icon?: React.ReactNode;
+  label: string;
+  options: FilterOption<string>[];
+  /** 켜진 값들. 빈 배열이면 전체(필터 없음). */
+  selected: string[];
+  onChange: (next: string[]) => void;
+  align?: "left" | "right";
+  ariaLabel?: string;
+  allLabel?: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const active = selected.length > 0;
+  const toggle = (value: string) => {
+    onChange(selected.includes(value) ? selected.filter((entry) => entry !== value) : [...selected, value]);
+  };
+  const rowStyle = (on: boolean): React.CSSProperties => ({ width: "100%", display: "flex", alignItems: "center", gap: 7, minHeight: 32, padding: "4px 9px", background: on ? "var(--accent-subtle)" : "transparent", border: "none", borderRadius: "var(--radius-sm)", color: on ? "var(--accent)" : "var(--text)", cursor: "pointer", fontSize: 12.5, fontWeight: on ? 700 : 550, textAlign: "left" });
+  return (
+    <FilterDropdown icon={icon} label={label} valueLabel={active ? `· ${selected.length}개` : `· ${allLabel}`} active={active} align={align} ariaLabel={ariaLabel ?? label} open={open} onToggle={setOpen}>
+      {options.length === 0 && <div style={{ padding: "8px 10px", color: "var(--text-faint)", fontSize: 12 }}>선택할 항목이 없습니다.</div>}
+      {options.length > 0 && <>
+        <button type="button" role="option" aria-selected={!active} onClick={() => onChange([])} style={rowStyle(!active)}
+          onMouseEnter={(event) => { if (active) event.currentTarget.style.background = "var(--bg-hover)"; }}
+          onMouseLeave={(event) => { event.currentTarget.style.background = !active ? "var(--accent-subtle)" : "transparent"; }}>
+          <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{allLabel}</span>
+          {!active && <CheckIcon sx={{ fontSize: 15, flexShrink: 0 }} />}
+        </button>
+        <div style={{ height: 1, background: "var(--border-subtle)", margin: "4px 2px" }} />
+        {options.map((option) => {
+          const on = selected.includes(option.value);
+          return (
+            <button key={option.value} type="button" role="option" aria-selected={on} onClick={() => toggle(option.value)} style={rowStyle(on)}
+              onMouseEnter={(event) => { if (!on) event.currentTarget.style.background = "var(--bg-hover)"; }}
+              onMouseLeave={(event) => { event.currentTarget.style.background = on ? "var(--accent-subtle)" : "transparent"; }}>
+              <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: option.color ?? "inherit" }}>{option.label}</span>
+              {option.count !== undefined && <span style={{ flexShrink: 0, color: "var(--text-faint)", fontSize: 11.5, fontFamily: "var(--mono)" }}>{option.count.toLocaleString()}</span>}
+              {on && <CheckIcon sx={{ fontSize: 15, flexShrink: 0 }} />}
+            </button>
+          );
+        })}
+      </>}
+    </FilterDropdown>
+  );
+}
+
 /** 단일 선택 팝오버 — ✓ 표시된 옵션 목록. */
 export function SelectDropdown<T extends string>({
   icon,

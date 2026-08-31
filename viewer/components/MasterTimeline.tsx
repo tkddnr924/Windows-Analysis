@@ -34,7 +34,7 @@ const BOOKMARK_TEXT = "var(--text)";
 const BOOKMARK_MUTED_TEXT = "var(--text-dim)";
 const BOOKMARK_ACCENT = "var(--bookmark-control)";
 
-type ArtifactChipTone = {
+export type ArtifactChipTone = {
   border: string;
   background: string;
   color: string;
@@ -112,7 +112,7 @@ function normalizedArtifactKey(value: string): string {
  * exception: Security/System/Application and every other source log share one
  * recognizable EventLog colour.
  */
-function artifactChipTone(category: string, table: string): ArtifactChipTone {
+export function artifactChipTone(category: string, table: string): ArtifactChipTone {
   const categoryKey = normalizedArtifactKey(category);
   const key = categoryKey === "EVENTLOG"
     ? "EVENTLOG"

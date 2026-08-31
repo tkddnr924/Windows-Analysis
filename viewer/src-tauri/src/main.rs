@@ -3451,6 +3451,7 @@ fn search_case_blocking(
     limit: usize,
     start: Option<String>,
     end: Option<String>,
+    categories: Option<Vec<String>>,
 ) -> SearchCasePage {
     const MAX_PAGE_SIZE: usize = 100;
     const MATCH_PREVIEW_CHARS: usize = 512;
@@ -3466,6 +3467,17 @@ fn search_case_blocking(
     let start = start.filter(|value| !value.trim().is_empty());
     let end = end.filter(|value| !value.trim().is_empty());
     let range_active = start.is_some() || end.is_some();
+    // Case-fold the requested category folders once. An empty selection means
+    // "no category filter" (search everything) rather than "match nothing", so
+    // the analyst clearing every checkbox never silently returns zero rows.
+    let category_filter: Option<std::collections::HashSet<String>> = categories
+        .map(|list| {
+            list.into_iter()
+                .map(|name| name.trim().to_lowercase())
+                .filter(|name| !name.is_empty())
+                .collect::<std::collections::HashSet<String>>()
+        })
+        .filter(|set| !set.is_empty());
     let scan_target = offset.saturating_add(page_size).saturating_add(1);
     let like = format!(
         "%{}%",
@@ -3484,6 +3496,28 @@ fn search_case_blocking(
         collect_sqlite(Path::new(&host.dir), &mut files);
         files.sort();
         for fp in files {
+            // Restrict to the selected category folders. The category is the
+            // first path segment under the host directory (BROWSER, EVENTLOG,
+            // …); files that cannot be placed under a category are skipped when
+            // a filter is active.
+            //
+            // `_OVERVIEW` is exempt: it is not a raw artifact bucket but the
+            // derived 종합 분석 layer (BrowserActivity, ExecutionHistory,
+            // RegistryFindings, …) re-composed from every artifact. The UI
+            // deliberately omits it from the selectable categories, so it must
+            // always be searched — otherwise unchecking any single artifact
+            // would silently drop all correlated results.
+            if let Some(ref allow) = category_filter {
+                let category = fp
+                    .strip_prefix(&host.dir)
+                    .ok()
+                    .and_then(|rel| rel.components().next())
+                    .map(|segment| segment.as_os_str().to_string_lossy().to_lowercase());
+                match category {
+                    Some(name) if name == "_overview" || allow.contains(&name) => {}
+                    _ => continue,
+                }
+            }
             let conn = match open_ro(&fp.to_string_lossy()) {
                 Ok(c) => c,
                 Err(_) => {
@@ -3713,9 +3747,10 @@ async fn search_case(
     limit: usize,
     start: Option<String>,
     end: Option<String>,
+    categories: Option<Vec<String>>,
 ) -> Result<SearchCasePage, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        search_case_blocking(query, hosts, offset, limit, start, end)
+        search_case_blocking(query, hosts, offset, limit, start, end, categories)
     })
     .await
     .map_err(|_| "케이스 검색 작업을 완료하지 못했습니다.".to_string())
@@ -3748,7 +3783,7 @@ fn cache_entries(host_dir: String) -> Vec<CacheMeta> {
             .filter_map(|e| e.ok().map(|e| e.path()))
             .filter(|p| {
                 p.file_name()
-                    .map(|n| n.to_string_lossy().ends_with("_Chrome_Cache.sqlite"))
+                    .map(|n| n.to_string_lossy().ends_with("_Cache.sqlite"))
                     .unwrap_or(false)
             })
             .collect::<Vec<_>>(),
@@ -3842,25 +3877,28 @@ fn cache_entry_body_blocking(
             .filter_map(|e| e.ok().map(|e| e.path()))
             .filter(|p| {
                 p.file_name()
-                    .map(|n| n.to_string_lossy().ends_with("_Chrome_Cache.sqlite"))
+                    .map(|n| n.to_string_lossy().ends_with("_Cache.sqlite"))
                     .unwrap_or(false)
             })
             .collect::<Vec<_>>(),
         Err(_) => return CacheBodyPreview::default(),
     };
-    // A BrowserActivity account is derived from this exact source filename.
-    // Check it first rather than scanning every account database for every
-    // drawer open. Keep the remaining databases as a correctness fallback for
-    // older data where the recorded account and filename do not agree.
-    let expected = format!("{}_Chrome_Cache.sqlite", account);
+    // A BrowserActivity account is derived from this source filename's prefix
+    // (`<account>_<browser>_Cache.sqlite`). Check the account's own databases
+    // first rather than scanning every account for every drawer open. The
+    // browser is not part of the evidence identity, so match on the account
+    // prefix (Chrome/Edge/Whale/Unknown all qualify). Remaining databases stay
+    // as a correctness fallback for older data whose recorded account and
+    // filename do not agree.
+    let expected_prefix = format!("{}_", account);
     files.sort_by(|left, right| {
-        let left_exact = left
+        let left_owned = left
             .file_name()
-            .is_some_and(|name| name.to_string_lossy() == expected);
-        let right_exact = right
+            .is_some_and(|name| name.to_string_lossy().starts_with(&expected_prefix));
+        let right_owned = right
             .file_name()
-            .is_some_and(|name| name.to_string_lossy() == expected);
-        right_exact.cmp(&left_exact).then_with(|| left.cmp(right))
+            .is_some_and(|name| name.to_string_lossy().starts_with(&expected_prefix));
+        right_owned.cmp(&left_owned).then_with(|| left.cmp(right))
     });
     for f in files {
         let conn = match open_ro(&f.to_string_lossy()) {
@@ -3904,6 +3942,502 @@ async fn cache_entry_body(
 ) -> CacheBodyPreview {
     tauri::async_runtime::spawn_blocking(move || {
         cache_entry_body_blocking(host_dir, account, url, cache_key)
+    })
+    .await
+    .unwrap_or_default()
+}
+
+// --- Browser visit inflow chain (referrer / opener reconstruction) ----------
+//
+// The BrowserActivity overview intentionally keeps only per-URL metadata (it
+// reads `urls`, never `visits`), so "어디서 이 페이지로 왔나" is not in it. This
+// command reconstructs the inflow chain on demand from the *raw* browser
+// History database that is already collected under BROWSER/, so it works on
+// existing cases with no re-parse. Read-only, bounded, and blocking work runs
+// on Tauri's worker pool.
+
+#[derive(Serialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct VisitFlowStep {
+    url: String,
+    title: String,
+    time: String,
+    transition: String,
+    /// This step was opened as a *new tab/window* from its parent (its own
+    /// `from_visit` is empty but an `opener_visit` links it), rather than a
+    /// same-tab navigation. Surfaced because ClickFix-style lures often open in
+    /// a fresh tab, which a plain referrer chain would show as a dead end.
+    opened_in_new_tab: bool,
+    /// The last step of the chain — the record the analyst opened.
+    is_target: bool,
+    // --- Raw provenance so the edge is provable, not asserted -------------
+    /// `visits.id` of this step.
+    visit_id: String,
+    /// Raw `visits.transition` integer (decoded form is in `transition`).
+    transition_raw: String,
+    /// Which column links this step to its parent (the step above it):
+    /// "from_visit" (same tab) or "opener_visit" (new tab); empty for the
+    /// oldest step, which has no captured parent.
+    parent_link: String,
+    /// The parent's `visits.id` that `parent_link` points to — matches the
+    /// `visit_id` of the step above, so the reader can verify the join.
+    parent_visit_id: String,
+}
+
+#[derive(Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct VisitFlowChain {
+    visit_time: String,
+    /// Ordered oldest → target.
+    steps: Vec<VisitFlowStep>,
+    /// Raw cross-site referrer recorded on the target visit (may be a site the
+    /// visits table has no row for, e.g. `https://chatgpt.com/`).
+    external_referrer: String,
+    /// How many *additional* visits of the same target URL are same-URL
+    /// redirects/reloads of this entry (client/server redirect or refresh). The
+    /// page re-navigating to itself is one visit story, not a separate inflow,
+    /// so those are collapsed into this count instead of duplicate chains.
+    reloads: usize,
+}
+
+#[derive(Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct BrowserVisitFlow {
+    chains: Vec<VisitFlowChain>,
+    source_file: String,
+    /// For a cache resource: the navigated page we attributed it to.
+    matched_page: String,
+    note: String,
+}
+
+/// Decode a Chromium page-transition integer into a short Korean label.
+fn decode_transition(raw: i64) -> String {
+    let v = raw as u32;
+    let core = match v & 0xff {
+        0 => "링크 클릭",
+        1 => "주소창 직접 입력",
+        2 => "북마크",
+        3 => "자동 하위프레임",
+        4 => "수동 하위프레임",
+        5 => "주소창 추천 이동",
+        6 => "시작 페이지",
+        7 => "폼 제출",
+        8 => "새로고침",
+        9 => "키워드 검색",
+        10 => "키워드 생성",
+        _ => "기타",
+    };
+    let mut quals: Vec<&str> = Vec::new();
+    if v & 0x0100_0000 != 0 {
+        quals.push("앞/뒤 이동");
+    }
+    if v & 0x0200_0000 != 0 {
+        quals.push("주소창");
+    }
+    if v & 0x0800_0000 != 0 {
+        quals.push("API");
+    }
+    if v & 0x4000_0000 != 0 {
+        quals.push("클라이언트 리다이렉트");
+    }
+    if v & 0x8000_0000 != 0 {
+        quals.push("서버 리다이렉트");
+    }
+    if quals.is_empty() {
+        core.to_string()
+    } else {
+        format!("{} · {}", core, quals.join(", "))
+    }
+}
+
+/// `scheme://host` of a URL, or None when it is not http(s).
+fn url_origin(u: &str) -> Option<String> {
+    let u = u.trim();
+    let (scheme, rest) = u
+        .strip_prefix("https://")
+        .map(|r| ("https://", r))
+        .or_else(|| u.strip_prefix("http://").map(|r| ("http://", r)))?;
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if host.is_empty() {
+        None
+    } else {
+        Some(format!("{scheme}{host}"))
+    }
+}
+
+/// The top-frame document origin encoded in a Chromium cache key (the first
+/// http(s) token, i.e. the `_dk_<site>` entry), used to attribute a cached
+/// subresource back to the page that loaded it.
+fn cache_key_document_origin(cache_key: &str) -> Option<String> {
+    cache_key
+        .split_whitespace()
+        .find(|tok| tok.starts_with("http://") || tok.starts_with("https://"))
+        .and_then(url_origin)
+}
+
+const VISIT_FLOW_DEPTH_CAP: usize = 25;
+const VISIT_FLOW_MAX_CHAINS: usize = 10;
+/// Upper bound on genuinely distinct inflow paths returned to the UI.
+const VISIT_FLOW_MAX_DISTINCT: usize = 5;
+
+/// Resolve one visit id into its stored fields, or None when absent. The
+/// collected browser History copy stores every column as TEXT (ids and the
+/// integer-typed `from_visit`/`opener_visit`/`transition`/`visit_time` all come
+/// back as strings), so ids are threaded as strings and the numeric fields are
+/// parsed explicitly.
+struct VisitRow {
+    from_visit: String,
+    opener_visit: String,
+    transition: i64,
+    external_referrer: String,
+    time: String,
+    url: String,
+    title: String,
+}
+
+/// A visit id that references an actual row — a blank or "0" link is a chain
+/// terminator, not a real ancestor.
+fn nonzero_visit_id(id: &str) -> Option<String> {
+    let trimmed = id.trim();
+    if trimmed.is_empty() || trimmed == "0" {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn read_visit(conn: &Connection, visit_id: &str) -> Option<VisitRow> {
+    let sql = "SELECT COALESCE(v.from_visit, ''), COALESCE(v.opener_visit, ''), COALESCE(v.transition, '0'), \
+               COALESCE(v.external_referrer_url, ''), \
+               CASE WHEN CAST(v.visit_time AS INTEGER) > 0 THEN datetime(CAST(v.visit_time AS INTEGER)/1000000 - 11644473600, 'unixepoch', 'localtime') ELSE '' END, \
+               u.url, COALESCE(u.title, '') \
+               FROM visits v JOIN urls u ON u.id = v.url WHERE v.id = ?1";
+    conn.query_row(sql, [visit_id], |r| {
+        let transition: String = r.get(2).unwrap_or_default();
+        Ok(VisitRow {
+            from_visit: r.get(0).unwrap_or_default(),
+            opener_visit: r.get(1).unwrap_or_default(),
+            transition: transition.trim().parse::<i64>().unwrap_or(0),
+            external_referrer: r.get(3).unwrap_or_default(),
+            time: r.get(4).unwrap_or_default(),
+            url: r.get(5).unwrap_or_default(),
+            title: r.get(6).unwrap_or_default(),
+        })
+    })
+    .ok()
+}
+
+/// The url id (FK, stored as TEXT) a visit belongs to.
+fn visit_url_id(conn: &Connection, visit_id: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT COALESCE(url, '') FROM visits WHERE id = ?1",
+        [visit_id],
+        |r| r.get::<_, String>(0),
+    )
+    .ok()
+}
+
+/// The visit this one navigated from: `from_visit` (same tab), else the
+/// `opener_visit` (spawning tab). None when neither links to a real row.
+fn parent_visit_id(conn: &Connection, visit_id: &str) -> Option<String> {
+    let v = read_visit(conn, visit_id)?;
+    nonzero_visit_id(&v.from_visit).or_else(|| nonzero_visit_id(&v.opener_visit))
+}
+
+/// True when a visit is just the page re-navigating to *itself* (client/server
+/// redirect or reload) rather than a fresh inflow: its parent visit resolves to
+/// the same url id.
+fn is_same_url_redirect(conn: &Connection, visit_id: &str, own_url_id: &str) -> bool {
+    parent_visit_id(conn, visit_id)
+        .and_then(|parent| visit_url_id(conn, &parent))
+        .map(|parent_url| parent_url == own_url_id)
+        .unwrap_or(false)
+}
+
+/// Walk backward from `start_visit` following `from_visit` (same-tab referrer)
+/// or, when that is empty, `opener_visit` (the tab/window that spawned this
+/// one). Returns steps ordered oldest → target.
+fn build_visit_chain(conn: &Connection, start_visit: &str) -> Option<VisitFlowChain> {
+    let mut steps: Vec<VisitFlowStep> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut cursor = nonzero_visit_id(start_visit);
+    let mut external = String::new();
+    let mut visit_time = String::new();
+    let mut is_first = true;
+    while let Some(id) = cursor {
+        if !seen.insert(id.clone()) || steps.len() >= VISIT_FLOW_DEPTH_CAP {
+            break;
+        }
+        let v = match read_visit(conn, &id) {
+            Some(v) => v,
+            None => break,
+        };
+        let from = nonzero_visit_id(&v.from_visit);
+        let opener = nonzero_visit_id(&v.opener_visit);
+        let opened_in_new_tab = from.is_none() && opener.is_some();
+        // How this step links to its parent — the exact join the chain is built
+        // on, kept as raw evidence so the edge can be re-verified against the DB.
+        let (parent_link, parent_visit_id) = match (&from, &opener) {
+            (Some(f), _) => ("from_visit".to_string(), f.clone()),
+            (None, Some(o)) => ("opener_visit".to_string(), o.clone()),
+            (None, None) => (String::new(), String::new()),
+        };
+        if is_first {
+            external = v.external_referrer.clone();
+            visit_time = v.time.clone();
+            is_first = false;
+        }
+        steps.push(VisitFlowStep {
+            url: v.url,
+            title: v.title,
+            time: v.time,
+            transition: decode_transition(v.transition),
+            opened_in_new_tab,
+            is_target: false,
+            visit_id: id.clone(),
+            transition_raw: v.transition.to_string(),
+            parent_link,
+            parent_visit_id,
+        });
+        cursor = from.or(opener);
+    }
+    if steps.is_empty() {
+        return None;
+    }
+    steps.reverse();
+    if let Some(last) = steps.last_mut() {
+        last.is_target = true;
+    }
+    Some(VisitFlowChain {
+        visit_time,
+        steps,
+        external_referrer: external,
+        reloads: 0,
+    })
+}
+
+/// The `_Cache`/`_IE_WebCache` outputs have no `visits` table; every other
+/// `*.sqlite` under BROWSER is a candidate History database.
+fn browser_history_dbs(host_dir: &str, account: &str) -> Vec<PathBuf> {
+    let dir = PathBuf::from(host_dir).join("BROWSER");
+    let mut files: Vec<PathBuf> = match std::fs::read_dir(&dir) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                let name = p.file_name().map(|n| n.to_string_lossy().to_string());
+                match name {
+                    Some(n) => {
+                        n.ends_with(".sqlite")
+                            && !n.ends_with("_Cache.sqlite")
+                            && !n.ends_with("_IE_WebCache.sqlite")
+                    }
+                    None => false,
+                }
+            })
+            .collect(),
+        Err(_) => return Vec::new(),
+    };
+    let prefix = format!("{account}_");
+    files.sort_by(|left, right| {
+        let l = left
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with(&prefix));
+        let r = right
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with(&prefix));
+        r.cmp(&l).then_with(|| left.cmp(right))
+    });
+    files
+}
+
+fn browser_visit_flow_blocking(
+    host_dir: String,
+    account: String,
+    url: String,
+    cache_key: Option<String>,
+) -> BrowserVisitFlow {
+    let is_cache = cache_key.as_deref().is_some_and(|k| !k.trim().is_empty());
+    for db in browser_history_dbs(&host_dir, &account) {
+        let conn = match open_ro(&db.to_string_lossy()) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        // Require both tables — a truncated copy is skipped, not reported empty.
+        let has_tables = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('urls','visits')",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+            == 2;
+        if !has_tables {
+            continue;
+        }
+        let source_file = db
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        // Resolve the navigated page URL id(s) whose chain we reconstruct.
+        // ids are TEXT in the collected copy, so they are kept as strings.
+        let mut matched_page = String::new();
+        let mut url_ids: Vec<String> = Vec::new();
+        if is_cache {
+            // A cached subresource is not itself a navigated page; attribute it
+            // to pages under the cache key's top-frame document origin.
+            let origin = cache_key
+                .as_deref()
+                .and_then(cache_key_document_origin)
+                .or_else(|| url_origin(&url));
+            if let Some(origin) = origin {
+                matched_page = origin.clone();
+                let like = format!(
+                    "{}%",
+                    origin.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+                );
+                if let Ok(mut stmt) = conn.prepare(
+                    "SELECT id FROM urls WHERE url LIKE ?1 ESCAPE '\\' ORDER BY CAST(visit_count AS INTEGER) DESC LIMIT 6",
+                ) {
+                    if let Ok(mut rows) = stmt.query([like]) {
+                        while let Ok(Some(r)) = rows.next() {
+                            if let Ok(id) = r.get::<_, String>(0) {
+                                url_ids.push(id);
+                            }
+                        }
+                    }
+                }
+            }
+        } else if let Ok(mut stmt) = conn.prepare("SELECT id FROM urls WHERE url = ?1 LIMIT 4") {
+            if let Ok(mut rows) = stmt.query([&url]) {
+                while let Ok(Some(r)) = rows.next() {
+                    if let Ok(id) = r.get::<_, String>(0) {
+                        url_ids.push(id);
+                    }
+                }
+            }
+        }
+        if url_ids.is_empty() {
+            continue;
+        }
+
+        // For each matching page, one chain per visit of that page.
+        let mut chains: Vec<VisitFlowChain> = Vec::new();
+        for url_id in url_ids {
+            if chains.len() >= VISIT_FLOW_MAX_CHAINS {
+                break;
+            }
+            let mut visit_ids: Vec<String> = Vec::new();
+            if let Ok(mut stmt) = conn.prepare(
+                "SELECT id FROM visits WHERE url = ?1 ORDER BY CAST(visit_time AS INTEGER) DESC LIMIT ?2",
+            ) {
+                if let Ok(mut rows) =
+                    stmt.query(rusqlite::params![url_id, VISIT_FLOW_MAX_CHAINS as i64])
+                {
+                    while let Ok(Some(r)) = rows.next() {
+                        if let Ok(id) = r.get::<_, String>(0) {
+                            visit_ids.push(id);
+                        }
+                    }
+                }
+            }
+            // Split the page's visits into genuine inflows vs. same-URL
+            // redirects/reloads. Every visit whose parent is this same page is
+            // the page re-navigating to itself; those are one story with the
+            // entry that started them, not separate inflow chains. Collapsing
+            // them avoids near-identical chains that differ only by a trailing
+            // "clientRedirect" step.
+            let mut entry_visits: Vec<String> = Vec::new();
+            let mut reloads = 0usize;
+            for vid in &visit_ids {
+                if is_same_url_redirect(&conn, vid, &url_id) {
+                    reloads += 1;
+                } else {
+                    entry_visits.push(vid.clone());
+                }
+            }
+            // A page reached only via self-redirects (no captured entry) still
+            // deserves one chain — keep the oldest visit as the representative.
+            if entry_visits.is_empty() {
+                if let Some(oldest) = visit_ids.last() {
+                    entry_visits.push(oldest.clone());
+                    reloads = reloads.saturating_sub(1);
+                }
+            }
+            for vid in entry_visits {
+                if chains.len() >= VISIT_FLOW_MAX_CHAINS {
+                    break;
+                }
+                if let Some(mut chain) = build_visit_chain(&conn, &vid) {
+                    // A lone step with no referrer/opener is not an inflow story.
+                    if chain.steps.len() > 1 || !chain.external_referrer.is_empty() {
+                        chain.reloads = reloads;
+                        chains.push(chain);
+                    }
+                }
+            }
+        }
+        if chains.is_empty() {
+            continue;
+        }
+        // Keep only *genuinely distinct* inflow paths. Near-identical chains —
+        // the same page entered again through the same ancestry — are one story,
+        // not several: sort longest-first, then drop any chain whose full page
+        // sequence is a prefix of an already-kept (longer) one. Two paths that
+        // diverge (a different origin/referrer) both survive, so the UI can show
+        // them side by side instead of stacking look-alikes.
+        chains.sort_by(|a, b| {
+            b.steps
+                .len()
+                .cmp(&a.steps.len())
+                .then_with(|| b.visit_time.cmp(&a.visit_time))
+        });
+        let mut distinct: Vec<VisitFlowChain> = Vec::new();
+        for chain in chains {
+            let seq: Vec<String> = chain.steps.iter().map(|s| s.url.clone()).collect();
+            let redundant = distinct.iter().any(|kept| {
+                kept.steps.len() >= seq.len()
+                    && kept
+                        .steps
+                        .iter()
+                        .zip(seq.iter())
+                        .all(|(k, s)| &k.url == s)
+            });
+            if !redundant {
+                distinct.push(chain);
+            }
+            if distinct.len() >= VISIT_FLOW_MAX_DISTINCT {
+                break;
+            }
+        }
+        let chains = distinct;
+        let note = if is_cache {
+            "이 캐시 리소스를 로드한 것으로 추정되는 페이지(캐시 키의 최상위 문서 출처)의 방문 유입 흐름입니다.".to_string()
+        } else {
+            String::new()
+        };
+        return BrowserVisitFlow {
+            chains,
+            source_file,
+            matched_page,
+            note,
+        };
+    }
+    BrowserVisitFlow {
+        note: "이 항목에 대한 방문 유입 흐름을 원본 History에서 찾지 못했습니다 (새 탭·리다이렉트 없이 직접 접근했거나, 원본 방문 기록이 남아있지 않을 수 있습니다).".to_string(),
+        ..Default::default()
+    }
+}
+
+#[tauri::command]
+async fn browser_visit_flow(
+    host_dir: String,
+    account: String,
+    url: String,
+    cache_key: Option<String>,
+) -> BrowserVisitFlow {
+    tauri::async_runtime::spawn_blocking(move || {
+        browser_visit_flow_blocking(host_dir, account, url, cache_key)
     })
     .await
     .unwrap_or_default()
@@ -5237,7 +5771,7 @@ mod search_case_tests {
             dir: root.to_string_lossy().to_string(),
         }];
 
-        let first = search_case_blocking("needle".to_string(), hosts.clone(), 0, 1, None, None);
+        let first = search_case_blocking("needle".to_string(), hosts.clone(), 0, 1, None, None, None);
         assert_eq!(
             first.hits.len(),
             1,
@@ -5257,7 +5791,7 @@ mod search_case_tests {
             .iter()
             .any(|failure| failure == "HOST-1: results"));
 
-        let second = search_case_blocking("needle".to_string(), hosts.clone(), 1, 1, None, None);
+        let second = search_case_blocking("needle".to_string(), hosts.clone(), 1, 1, None, None, None);
         assert_eq!(second.hits.len(), 1);
         assert_eq!(second.hits[0].match_value, "needle second");
         assert_eq!(second.next_offset, None);
@@ -5270,15 +5804,84 @@ mod search_case_tests {
             10,
             Some("2026-01-02 00:00:00.000".to_string()),
             Some("2026-01-02 23:59:59.999".to_string()),
+            None,
         );
         assert_eq!(ranged.hits.len(), 1);
         assert_eq!(ranged.hits[0].match_value, "needle second");
 
         let bounded_preview =
-            search_case_blocking("verylong".to_string(), hosts, 0, 10, None, None);
+            search_case_blocking("verylong".to_string(), hosts, 0, 10, None, None, None);
         assert_eq!(bounded_preview.hits.len(), 1);
         assert_eq!(bounded_preview.hits[0].match_value.chars().count(), 512);
         assert_eq!(bounded_preview.hits[0].record_key.chars().count(), 512);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn search_case_restricts_to_selected_categories() {
+        let root = std::env::temp_dir().join(format!(
+            "windows-analysis-search-cat-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        ));
+        // Two raw artifact folders plus the derived _OVERVIEW layer, each with
+        // one matching row. The category is the first path segment under the
+        // host directory.
+        for category in ["BROWSER", "EVENTLOG", "_OVERVIEW"] {
+            let dir = root.join(category);
+            std::fs::create_dir_all(&dir).unwrap();
+            let conn = Connection::open(dir.join("results.sqlite")).unwrap();
+            conn.execute_batch("CREATE TABLE Rows (timestamp TEXT, detail TEXT);")
+                .unwrap();
+            conn.execute(
+                "INSERT INTO Rows VALUES (?1, ?2)",
+                rusqlite::params!["2026-01-01 00:00:00.000", format!("needle {category}")],
+            )
+            .unwrap();
+        }
+        let hosts = vec![SearchHost {
+            id: "host-1".to_string(),
+            name: "HOST-1".to_string(),
+            dir: root.to_string_lossy().to_string(),
+        }];
+
+        // No filter → every folder searched (both artifacts + the overview).
+        let all = search_case_blocking("needle".to_string(), hosts.clone(), 0, 10, None, None, None);
+        assert_eq!(all.hits.len(), 3);
+
+        // Only BROWSER → the BROWSER row, plus the always-on _OVERVIEW row. The
+        // derived 종합 분석 layer must never be filtered out, so narrowing to a
+        // single artifact still surfaces its correlated overview results.
+        let browser = search_case_blocking(
+            "needle".to_string(),
+            hosts.clone(),
+            0,
+            10,
+            None,
+            None,
+            Some(vec!["browser".to_string()]),
+        );
+        let browser_values: std::collections::HashSet<&str> =
+            browser.hits.iter().map(|h| h.match_value.as_str()).collect();
+        assert_eq!(browser.hits.len(), 2);
+        assert!(browser_values.contains("needle BROWSER"));
+        assert!(browser_values.contains("needle _OVERVIEW"));
+        assert!(!browser_values.contains("needle EVENTLOG"));
+
+        // An empty selection is treated as "no filter", not "match nothing".
+        let empty = search_case_blocking(
+            "needle".to_string(),
+            hosts,
+            0,
+            10,
+            None,
+            None,
+            Some(vec![]),
+        );
+        assert_eq!(empty.hits.len(), 3);
         let _ = std::fs::remove_dir_all(root);
     }
 }
@@ -5286,6 +5889,164 @@ mod search_case_tests {
 #[cfg(test)]
 mod browser_activity_tests {
     use super::*;
+
+    // Build a minimal browser History copy the way the collector writes it:
+    // one `urls`/`visits` pair with *every* column typed TEXT (ids and the
+    // integer-like link/time fields included).
+    fn write_history_fixture(dir: &Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        let conn = Connection::open(dir.join("user_Chrome.sqlite")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE urls (id TEXT, url TEXT, title TEXT, visit_count TEXT);\
+             CREATE TABLE visits (id TEXT, url TEXT, from_visit TEXT, opener_visit TEXT, transition TEXT, external_referrer_url TEXT, visit_time TEXT);",
+        )
+        .unwrap();
+        // A (typed) → B (link, same tab) → C (opened in a new tab from B).
+        for (id, url, title) in [
+            ("1", "https://a.test/", "A"),
+            ("2", "https://b.test/", "B"),
+            ("3", "https://c.test/page", "C"),
+        ] {
+            conn.execute(
+                "INSERT INTO urls VALUES (?1, ?2, ?3, '1')",
+                rusqlite::params![id, url, title],
+            )
+            .unwrap();
+        }
+        // transitions: TYPED (1) for A, LINK (0) for B, LINK (0x30000000) for C.
+        // Visit 13 is C re-navigating to *itself* (client redirect, 0x60000000,
+        // from_visit=12) — a reload of the same page, not a new inflow.
+        // visit_time: microseconds since 1601 (arbitrary increasing values).
+        let rows = [
+            ("10", "1", "0", "0", "1", "", "13427941143000000"),
+            ("11", "2", "10", "0", "0", "", "13427941143100000"),
+            ("12", "3", "0", "11", "805306368", "https://ext.test/", "13427941143200000"),
+            ("13", "3", "12", "0", "1610612736", "", "13427941143300000"),
+        ];
+        for (id, url, from_visit, opener, transition, ext, time) in rows {
+            conn.execute(
+                "INSERT INTO visits (id, url, from_visit, opener_visit, transition, external_referrer_url, visit_time) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                rusqlite::params![id, url, from_visit, opener, transition, ext, time],
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn visit_flow_reconstructs_referrer_and_opener_chain() {
+        let root = std::env::temp_dir().join(format!(
+            "windows-analysis-visitflow-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        ));
+        write_history_fixture(&root.join("BROWSER"));
+
+        // A navigated page: chain walks from_visit then opener → A, B, C.
+        let flow = browser_visit_flow_blocking(
+            root.to_string_lossy().to_string(),
+            "user".to_string(),
+            "https://c.test/page".to_string(),
+            None,
+        );
+        assert_eq!(flow.source_file, "user_Chrome.sqlite");
+        // The page has two visits (entry + a self-redirect), but only the one
+        // genuine inflow chain is returned; the reload is collapsed into a count.
+        assert_eq!(flow.chains.len(), 1);
+        let chain = &flow.chains[0];
+        assert_eq!(chain.reloads, 1);
+        let urls: Vec<&str> = chain.steps.iter().map(|s| s.url.as_str()).collect();
+        assert_eq!(urls, vec!["https://a.test/", "https://b.test/", "https://c.test/page"]);
+        assert!(chain.steps.last().unwrap().is_target);
+        assert!(chain.steps.last().unwrap().opened_in_new_tab, "C was opened via opener_visit");
+        assert_eq!(chain.external_referrer, "https://ext.test/");
+        assert_eq!(chain.steps[0].transition, "주소창 직접 입력");
+
+        // A cached subresource is attributed to its document origin's page.
+        let cache_flow = browser_visit_flow_blocking(
+            root.to_string_lossy().to_string(),
+            "user".to_string(),
+            "https://c.test/asset/app.js".to_string(),
+            Some("1/0/_dk_https://c.test https://c.test https://c.test/asset/app.js".to_string()),
+        );
+        assert_eq!(cache_flow.matched_page, "https://c.test");
+        assert_eq!(cache_flow.chains.len(), 1);
+        assert_eq!(
+            cache_flow.chains[0].steps.last().unwrap().url,
+            "https://c.test/page"
+        );
+
+        // An unknown URL yields no chain but a non-empty explanatory note.
+        let none = browser_visit_flow_blocking(
+            root.to_string_lossy().to_string(),
+            "user".to_string(),
+            "https://nowhere.test/x".to_string(),
+            None,
+        );
+        assert!(none.chains.is_empty());
+        assert!(!none.note.is_empty());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn visit_flow_keeps_distinct_paths_and_merges_duplicates() {
+        let root = std::env::temp_dir().join(format!(
+            "windows-analysis-visitflow-distinct-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        ));
+        let dir = root.join("BROWSER");
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = Connection::open(dir.join("user_Chrome.sqlite")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE urls (id TEXT, url TEXT, title TEXT, visit_count TEXT);\
+             CREATE TABLE visits (id TEXT, url TEXT, from_visit TEXT, opener_visit TEXT, transition TEXT, external_referrer_url TEXT, visit_time TEXT);",
+        )
+        .unwrap();
+        // urls: 1 = source X, 2 = source Y, 3 = the target T.
+        for (id, url) in [("1", "https://x.test/"), ("2", "https://y.test/"), ("3", "https://t.test/p")] {
+            conn.execute("INSERT INTO urls VALUES (?1,?2,'',' 1')", rusqlite::params![id, url]).unwrap();
+        }
+        // Three genuine entries of T: two via X (same ancestry → duplicates, one
+        // must be merged), one via Y (a different origin → a distinct 2nd path).
+        let rows = [
+            ("100", "1", "0", "0", "1", "", "13427941143000000"),
+            ("101", "3", "100", "0", "0", "", "13427941143100000"),
+            ("200", "2", "0", "0", "1", "", "13427941143200000"),
+            ("201", "3", "200", "0", "0", "", "13427941143300000"),
+            ("102", "3", "100", "0", "0", "", "13427941143400000"),
+        ];
+        for (id, url, fv, op, tr, ext, t) in rows {
+            conn.execute(
+                "INSERT INTO visits (id,url,from_visit,opener_visit,transition,external_referrer_url,visit_time) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                rusqlite::params![id, url, fv, op, tr, ext, t],
+            ).unwrap();
+        }
+        drop(conn);
+
+        let flow = browser_visit_flow_blocking(
+            root.to_string_lossy().to_string(),
+            "user".to_string(),
+            "https://t.test/p".to_string(),
+            None,
+        );
+        // Two distinct paths (X→T and Y→T); the duplicate X→T entry is merged.
+        assert_eq!(flow.chains.len(), 2);
+        let origins: std::collections::HashSet<&str> =
+            flow.chains.iter().map(|c| c.steps[0].url.as_str()).collect();
+        assert!(origins.contains("https://x.test/"));
+        assert!(origins.contains("https://y.test/"));
+        for chain in &flow.chains {
+            assert_eq!(chain.steps.last().unwrap().url, "https://t.test/p");
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     fn browser_domain_cache_test_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -5365,6 +6126,54 @@ mod browser_activity_tests {
             String::new(),
         );
         assert!(no_key.body_b64.is_empty());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cache_body_preview_recovers_non_chrome_browsers() {
+        // The BrowserActivity overview ingests Chrome/Edge/Whale/Unknown caches
+        // and marks any entry with a stored body as recoverable. The body fetch
+        // must open those same databases — a body living in `*_Edge_Cache.sqlite`
+        // used to be unreachable because the lookup only scanned Chrome files,
+        // so the "복구 데이터 열기" button opened onto "복구 데이터 확인 불가".
+        let root = std::env::temp_dir().join(format!(
+            "windows-analysis-cache-edge-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        ));
+        let browser_dir = root.join("BROWSER");
+        std::fs::create_dir_all(&browser_dir).unwrap();
+        let path = browser_dir.join("profile1_Edge_Cache.sqlite");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE CacheEntries (account TEXT, url TEXT, cache_key TEXT, body_b64 TEXT)",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO CacheEntries (account, url, cache_key, body_b64) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                "profile1",
+                "https://example.test/js/app.min.js",
+                "edge-entry-key",
+                "SGVsbG8="
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let preview = cache_entry_body_blocking(
+            root.to_string_lossy().to_string(),
+            "profile1".to_string(),
+            "https://example.test/js/app.min.js".to_string(),
+            "edge-entry-key".to_string(),
+        );
+        assert_eq!(preview.body_b64, "SGVsbG8=");
+        assert_eq!(preview.decoded_size, 5);
+        assert!(!preview.truncated);
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -6120,6 +6929,7 @@ fn main() {
             ai_referrals,
             cache_entries,
             cache_entry_body,
+            browser_visit_flow,
             ai_conversations,
             wmi_subscription_events
         ])

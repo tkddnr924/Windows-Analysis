@@ -1,7 +1,11 @@
 "use client";
 import PaginationControls from "@/components/PaginationControls";
-import { ViewHeader } from "@/components/FilterControls";
+import { ViewHeader, MultiSelectDropdown, FilterDropdown } from "@/components/FilterControls";
+import { artifactChipTone, type ArtifactChipTone } from "@/components/MasterTimeline";
 import SearchOutlinedIcon from "@mui/icons-material/SearchOutlined";
+import DnsOutlinedIcon from "@mui/icons-material/DnsOutlined";
+import ViewListOutlinedIcon from "@mui/icons-material/ViewListOutlined";
+import Checkbox from "@mui/material/Checkbox";
 
 import { useEffect, useRef, useState } from "react";
 import OpenInNewOutlinedIcon from "@mui/icons-material/OpenInNewOutlined";
@@ -26,6 +30,13 @@ interface Props {
 
 type DetailState = { hit: SearchHit; result?: ResultRow; error?: "fetch" | "missing" };
 const PAGE_SIZE = 10;
+
+// A few raw category folder names read awkwardly on their own (mirrors the
+// sidebar's mapping); everything else uses the folder name verbatim.
+const CATEGORY_LABELS: Record<string, string> = { POWERSHELL: "ConsoleHistory" };
+function categoryLabel(name: string): string {
+  return CATEGORY_LABELS[name.toUpperCase()] ?? name;
+}
 
 
 function hostDirForHit(hit: SearchHit, hosts: Host[]): string | undefined {
@@ -53,11 +64,43 @@ export default function CaseSearchView({ hosts, currentHostId, timeRange, isBook
   const [error, setError] = useState<string | null>(null);
   const [errorRangeKey, setErrorRangeKey] = useState<string | null>(null);
   const [detail, setDetail] = useState<DetailState | null>(null);
+  // Empty host selection means "all hosts". Categories use the timeline's
+  // hidden-set model: everything is shown until a category is unchecked.
+  const [selectedHostIds, setSelectedHostIds] = useState<string[]>([]);
+  const [hiddenCategories, setHiddenCategories] = useState<Set<string>>(new Set());
+  const [availableCategories, setAvailableCategories] = useState<string[]>([]);
   const requestId = useRef(0);
   const detailRequestId = useRef(0);
 
   const searchRange = rangeActive(timeRange) ? { start: timeRange.start, end: timeRange.end } : undefined;
   const rangeKey = `${timeRange.start || ""}\u0000${timeRange.end || ""}`;
+
+  // Restart a running query from its first page whenever the host/category
+  // scope changes, so paging never mixes results from different scopes.
+  const filterKey = `${[...selectedHostIds].sort().join(",")}|${[...hiddenCategories].sort().join(",")}`;
+
+  // The category options are the union of every host's category folders, so the
+  // list stays stable regardless of which hosts are currently selected.
+  useEffect(() => {
+    let cancelled = false;
+    void Promise.all(hosts.map((host) => window.api.listCategories(host.dir).catch(() => [])))
+      .then((lists) => {
+        if (cancelled) return;
+        const names = new Set<string>();
+        // _OVERVIEW holds derived 종합 분석 tables (re-composed from the raw
+        // artifacts), so it is not a meaningful artifact filter on its own.
+        for (const list of lists) for (const entry of list) {
+          if (entry.name.toUpperCase() !== "_OVERVIEW") names.add(entry.name);
+        }
+        setAvailableCategories([...names].sort((a, b) => a.localeCompare(b)));
+      });
+    return () => { cancelled = true; };
+  }, [hosts]);
+
+  // Drop a stale hidden category if the underlying case no longer offers it.
+  useEffect(() => {
+    setHiddenCategories((prev) => new Set([...prev].filter((name) => availableCategories.includes(name))));
+  }, [availableCategories]);
 
   async function runSearch(searchText: string, targetPage = 0) {
     const normalized = searchText.trim();
@@ -67,8 +110,24 @@ export default function CaseSearchView({ hosts, currentHostId, timeRange, isBook
     setLoading(true);
     setError(null);
     setErrorRangeKey(null);
+    // Categories the analyst left checked. All checked → send undefined (search
+    // everything); some hidden → send the remainder; all hidden → nothing to
+    // search, so show an empty result rather than silently searching all.
+    const includeCategories = availableCategories.filter((name) => !hiddenCategories.has(name));
+    if (availableCategories.length > 0 && includeCategories.length === 0) {
+      setHits([]);
+      setNextOffset(null);
+      setSourceFailures([]);
+      setRan(normalized);
+      setPage(targetPage);
+      setResultRangeKey(requestedRangeKey);
+      setLoading(false);
+      return;
+    }
+    const categoryArg = includeCategories.length === availableCategories.length ? undefined : includeCategories;
     try {
-      const result = await window.api.searchCase(normalized, hosts.map((host) => ({ id: host.id, name: host.name, dir: host.dir })), targetPage * PAGE_SIZE, PAGE_SIZE, searchRange);
+      const targetHosts = selectedHostIds.length ? hosts.filter((host) => selectedHostIds.includes(host.id)) : hosts;
+      const result = await window.api.searchCase(normalized, targetHosts.map((host) => ({ id: host.id, name: host.name, dir: host.dir })), targetPage * PAGE_SIZE, PAGE_SIZE, searchRange, categoryArg);
       if (request !== requestId.current) return;
       setHits(result.hits);
       setNextOffset(result.nextOffset);
@@ -101,6 +160,14 @@ export default function CaseSearchView({ hosts, currentHostId, timeRange, isBook
     void runSearch(ran, 0);
   }, [rangeKey, ran, resultRangeKey]);
 
+  // Re-run the last query from page 0 when the host/category scope changes.
+  const appliedFilterKey = useRef(filterKey);
+  useEffect(() => {
+    if (appliedFilterKey.current === filterKey) return;
+    appliedFilterKey.current = filterKey;
+    if (ran) void runSearch(ran, 0);
+  }, [filterKey, ran]);
+
   async function openDetail(hit: SearchHit) {
     const request = ++detailRequestId.current;
     setDetail({ hit });
@@ -129,7 +196,25 @@ export default function CaseSearchView({ hosts, currentHostId, timeRange, isBook
       <ViewHeader icon={SearchOutlinedIcon} title="케이스 전체 검색" titleId="case-search-title" right={<span style={{ color: "var(--text-faint)", fontSize: 11.5 }}>{rangeActive(timeRange) ? "전역 기간 필터 적용" : "전체 기간"}</span>}>
         <label style={{ flex: "0 1 380px", minWidth: 230 }}><input value={query} autoFocus onChange={(event) => setQuery(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") startSearch(); }} aria-label="케이스 전체 검색어" placeholder="IP · 계정 · 파일명 · 명령 검색 (2자 이상)" style={{ width: "100%", minHeight: 31, padding: "5px 10px", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", background: "var(--bg-elevated)", color: "var(--text)", fontFamily: "var(--mono)", fontSize: 12.5 }} /></label>
         <Button onClick={startSearch} disabled={loading || query.trim().length < 2} primary>{loading ? <CircularProgress size={14} thickness={5} aria-label="검색 중" /> : "검색"}</Button>
-      
+        <MultiSelectDropdown
+          icon={<DnsOutlinedIcon sx={{ fontSize: 15 }} />}
+          label="호스트"
+          ariaLabel="호스트 필터"
+          options={hosts.map((host) => ({ value: host.id, label: host.name }))}
+          selected={selectedHostIds}
+          onChange={setSelectedHostIds}
+        />
+        <ArtifactCategoryFilter
+          categories={availableCategories}
+          hidden={hiddenCategories}
+          onToggle={(name) => setHiddenCategories((prev) => {
+            const next = new Set(prev);
+            if (next.has(name)) next.delete(name); else next.add(name);
+            return next;
+          })}
+          onShowAll={() => setHiddenCategories(new Set())}
+          onHideAll={() => setHiddenCategories(new Set(availableCategories))}
+        />
       </ViewHeader>
 
       {visibleSourceFailures.length > 0 && <div role="alert" style={{ padding: "8px 14px", borderBottom: "1px solid color-mix(in srgb, var(--warning) 42%, var(--border))", background: "color-mix(in srgb, var(--warning) 7%, var(--bg-panel))", color: "var(--text-dim)", fontSize: 12 }}>일부 원본을 검색하지 못했습니다: {visibleSourceFailures.join(", ")}. 표시된 결과는 성공적으로 읽은 원본만 포함합니다.</div>}
@@ -183,6 +268,51 @@ function DetailStatus({ detail, onClose, onRetry }: { detail: DetailState; onClo
   // Keep this non-modal: a source-row fetch must not block the rest of the
   // analysis workspace. The common RowDetailPanel opens as soon as it resolves.
   return <aside role={loading ? "status" : "alert"} aria-live="polite" aria-label="검색 결과 상세 불러오기" style={{ position: "fixed", zIndex: 70, right: 18, bottom: 18, width: "min(420px, calc(100vw - 36px))", padding: 14, border: "1px solid var(--border)", borderRadius: "var(--radius-lg)", background: "var(--bg-panel)", boxShadow: "var(--shadow-panel)" }}><div style={{ display: "flex", alignItems: "center", gap: 8, color: "var(--text-dim)", fontSize: 12.5 }}>{loading && <CircularProgress size={17} thickness={5} aria-label="원본 행 로딩" />}{message}</div><div style={{ display: "flex", justifyContent: "flex-end", gap: 6, marginTop: 14 }}>{!loading && <Button onClick={onRetry}><RefreshOutlinedIcon sx={{ fontSize: 15 }} />다시 시도</Button>}<Button onClick={onClose}>닫기</Button></div></aside>;
+}
+
+// Mirrors the master timeline's artifact filter: a color-dotted checkbox per
+// category, shown until unchecked. Category tone comes from the shared palette.
+function ArtifactCheckRow({ label, checked, tone, onChange }: { label: string; checked: boolean; tone: ArtifactChipTone; onChange: () => void }) {
+  return (
+    <label
+      style={{ display: "flex", alignItems: "center", gap: 8, minHeight: 32, padding: "4px 7px 4px 9px", borderRadius: "var(--radius-sm)", background: "transparent", color: checked ? "var(--text)" : "var(--text-faint)", width: "100%", minWidth: 0, cursor: "pointer", userSelect: "none", transition: "background .12s ease" }}
+      onMouseEnter={(event) => { event.currentTarget.style.background = "var(--bg-hover)"; }}
+      onMouseLeave={(event) => { event.currentTarget.style.background = "transparent"; }}
+    >
+      <span aria-hidden="true" style={{ width: 9, height: 9, flexShrink: 0, borderRadius: "50%", background: checked ? tone.border : "transparent", border: `2px solid ${tone.border}`, opacity: checked ? 1 : 0.45, boxSizing: "border-box" }} />
+      <span style={{ minWidth: 0, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 12.5, fontWeight: 650 }}>{label}</span>
+      <Checkbox size="small" checked={checked} onChange={onChange} sx={{ p: "2px", mr: "1px", color: "var(--text-faint)", "&.Mui-checked": { color: tone.border } }} />
+    </label>
+  );
+}
+
+function ArtifactCategoryFilter({ categories, hidden, onToggle, onShowAll, onHideAll }: {
+  categories: string[];
+  hidden: Set<string>;
+  onToggle: (name: string) => void;
+  onShowAll: () => void;
+  onHideAll: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const active = hidden.size > 0;
+  const shown = categories.length - hidden.size;
+  return (
+    <FilterDropdown icon={<ViewListOutlinedIcon sx={{ fontSize: 15 }} />} label="아티팩트" valueLabel={active ? `· ${shown}/${categories.length}` : "· 전체"} active={active} align="left" ariaLabel="아티팩트 필터" open={open} onToggle={setOpen} minWidth={264}>
+      <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "3px 4px 8px", borderBottom: "1px solid var(--border-subtle)" }}>
+        <span style={{ fontSize: 12, fontWeight: 700, color: "var(--text-dim)" }}>표시할 아티팩트</span>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginLeft: "auto" }}>
+          <button type="button" onClick={onShowAll} style={{ fontSize: 11.5, background: "transparent", border: "none", color: "var(--accent)", cursor: "pointer", fontWeight: 650 }}>전체 선택</button>
+          <button type="button" onClick={onHideAll} style={{ fontSize: 11.5, background: "transparent", border: "none", color: "var(--text-dim)", cursor: "pointer", fontWeight: 650 }}>전체 해제</button>
+        </div>
+      </div>
+      <div style={{ display: "grid", gap: 2, paddingTop: 7 }}>
+        {categories.length === 0 && <div style={{ padding: "8px 10px", color: "var(--text-faint)", fontSize: 12 }}>선택할 아티팩트가 없습니다.</div>}
+        {categories.map((name) => (
+          <ArtifactCheckRow key={name} label={categoryLabel(name)} checked={!hidden.has(name)} tone={artifactChipTone(name, "")} onChange={() => onToggle(name)} />
+        ))}
+      </div>
+    </FilterDropdown>
+  );
 }
 
 function EmptyState({ children }: { children: React.ReactNode }) {

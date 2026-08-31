@@ -48,6 +48,49 @@ export interface CacheBodyPreview {
   truncated: boolean;
 }
 
+/** One step of a reconstructed browser visit inflow chain (oldest → target). */
+export interface VisitFlowStep {
+  url: string;
+  title: string;
+  time: string;
+  /** Decoded page-transition label (e.g. "링크 클릭 · 서버 리다이렉트"). */
+  transition: string;
+  /** This page was opened in a new tab/window from the step above it. */
+  openedInNewTab: boolean;
+  /** The record the analyst opened — the last step of the chain. */
+  isTarget: boolean;
+  /** Raw provenance so each edge can be re-verified against the DB. */
+  visitId: string;
+  /** Raw visits.transition integer (decoded form is in `transition`). */
+  transitionRaw: string;
+  /** Column that links this step to its parent (the step above it):
+   *  "from_visit" (same tab) or "opener_visit" (new tab); empty for the oldest. */
+  parentLink: string;
+  /** The parent's visits.id this step points to — equals the step above's visitId. */
+  parentVisitId: string;
+}
+
+/** One inflow chain: the ordered visits leading up to one visit of the target. */
+export interface VisitFlowChain {
+  visitTime: string;
+  steps: VisitFlowStep[];
+  /** Cross-site referrer recorded on the target visit (may not be a page in
+   *  the visits table, e.g. https://chatgpt.com/). */
+  externalReferrer: string;
+  /** Additional same-URL redirects/reloads of this entry that were collapsed
+   *  into this chain instead of shown as duplicate near-identical chains. */
+  reloads: number;
+}
+
+/** Reconstructed inflow ("어디서 왔나") for a browser visit or cache record. */
+export interface BrowserVisitFlow {
+  chains: VisitFlowChain[];
+  sourceFile: string;
+  /** For a cache resource: the navigated page it was attributed to. */
+  matchedPage: string;
+  note: string;
+}
+
 /** A server-paginated page of host-normalised browser visit domains. */
 export interface BrowserDomainStatsPage {
   domains: BrowserVisitedDomainStat[];
@@ -494,7 +537,7 @@ export interface ElectronApi {
   mftRecordsPage(fullPath: string, query: string, offset: number, limit: number, options?: { sortKey?: string; sortDesc?: boolean; filesOnly?: boolean; namePattern?: string; timeKey?: string; timeStart?: string; timeEnd?: string }): Promise<MftRecordsPage>;
   usnJrnlPage(fullPath: string, query: { search?: string; reason?: string; start?: string; end?: string; ascending?: boolean; offset: number; limit: number }): Promise<CsvData>;
   listColumnValues(fullPath: string, column: string, tableName?: string): Promise<{ value: string; count: number }[]>;
-  searchCase(query: string, hosts: { id: string; name: string; dir: string }[], offset: number, limit: number, range?: { start?: string; end?: string }): Promise<SearchCasePage>;
+  searchCase(query: string, hosts: { id: string; name: string; dir: string }[], offset: number, limit: number, range?: { start?: string; end?: string }, categories?: string[]): Promise<SearchCasePage>;
   listBookmarks(hostDir: string): Promise<Bookmark[]>;
   toggleBookmark(hostDir: string, entry: BookmarkInput): Promise<Bookmark[]>;
   updateBookmarkNote(hostDir: string, id: string, note: string): Promise<Bookmark[]>;
@@ -504,6 +547,9 @@ export interface ElectronApi {
   /** Fetch an IPC-bounded preview for one exact cache record. An empty bodyB64
    * means the parser did not retain a recoverable response body. */
   cacheEntryBody(hostDir: string, account: string, url: string, cacheKey: string): Promise<CacheBodyPreview>;
+  /** Reconstruct the visit inflow chain for a browser visit (pass its URL) or a
+   *  cache record (also pass its cacheKey) from the raw History DB on demand. */
+  browserVisitFlow(hostDir: string, account: string, url: string, cacheKey?: string): Promise<BrowserVisitFlow>;
   /** AI conversations extracted from browser cache, filtered and paged by cache timestamp. */
   aiConversations(hostDir: string, query: { start?: string; end?: string; offset: number; limit: number }): Promise<AiConversationPage>;
   /** WMI-Activity 로그의 구독 이벤트(5859~5861)만 서버에서 걸러 받는다. */

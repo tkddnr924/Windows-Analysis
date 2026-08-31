@@ -13,7 +13,13 @@ import ContentCopyOutlinedIcon from "@mui/icons-material/ContentCopyOutlined";
 import CheckIcon from "@mui/icons-material/Check";
 import type { ArtifactViewSpec, DetailSectionSpec, FieldKind, FieldSpec, LinkSpec } from "@/lib/artifactViews";
 import { getArtifactView } from "@/lib/artifactViews";
-import type { CacheBodyPreview, FetchLinkedRows } from "@/lib/types";
+import type { BrowserVisitFlow, CacheBodyPreview, FetchLinkedRows } from "@/lib/types";
+import AccountTreeOutlinedIcon from "@mui/icons-material/AccountTreeOutlined";
+import CloseIcon from "@mui/icons-material/Close";
+import NorthEastOutlinedIcon from "@mui/icons-material/NorthEastOutlined";
+import SouthOutlinedIcon from "@mui/icons-material/SouthOutlined";
+import ReplayOutlinedIcon from "@mui/icons-material/ReplayOutlined";
+import OpenInNewOutlinedIcon from "@mui/icons-material/OpenInNewOutlined";
 import { isExactSid, resolveAccountDisplay, type AccountDirectory } from "@/lib/accountIdentity";
 import { parsePrivileges, lookupPrivilege } from "@/lib/privileges";
 import TagList from "./TagList";
@@ -760,6 +766,186 @@ interface ArtifactDetailViewProps {
   isFieldBookmarked?: (field: string) => boolean;
 }
 
+// "어디서 이 페이지로 왔나" — reconstructs the browser visit inflow chain
+// (referrer + new-tab opener) on demand from the raw History DB and shows it as
+// a modal timeline. Only meaningful for browser visit/cache records.
+function VisitFlowLauncher({ row, hostDir }: { row: Record<string, string>; hostDir?: string }) {
+  const [state, setState] = useState<"idle" | "loading" | "ready" | "error">("idle");
+  const [flow, setFlow] = useState<BrowserVisitFlow | null>(null);
+  const [open, setOpen] = useState(false);
+  const isCache = row.kind === "cache";
+
+  function load() {
+    if (!hostDir || !row.account) return;
+    setState("loading");
+    setOpen(true);
+    const url = isCache ? row.url || "" : row.url_raw || row.url || "";
+    const cacheKey = isCache ? row.cache_key || "" : undefined;
+    window.api.browserVisitFlow(hostDir, row.account, url, cacheKey)
+      .then((result) => { setFlow(result); setState("ready"); })
+      .catch(() => setState("error"));
+  }
+
+  return (
+    <div>
+      <button
+        type="button"
+        onClick={load}
+        style={{ display: "inline-flex", alignItems: "center", gap: 7, padding: "8px 13px", borderRadius: "var(--radius-md)", border: "1px solid var(--accent)", background: "var(--accent-subtle)", color: "var(--accent)", cursor: "pointer", fontSize: 12.5, fontWeight: 650 }}
+      >
+        <AccountTreeOutlinedIcon sx={{ fontSize: 16 }} />유입 흐름 보기
+      </button>
+      {open && <VisitFlowModal state={state} flow={flow} isCache={isCache} onRetry={load} onClose={() => setOpen(false)} />}
+    </div>
+  );
+}
+
+function VisitFlowModal({ state, flow, isCache, onRetry, onClose }: { state: "idle" | "loading" | "ready" | "error"; flow: BrowserVisitFlow | null; isCache: boolean; onRetry: () => void; onClose: () => void }) {
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const closeRef = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    closeRef.current?.focus();
+    const onKey = (event: KeyboardEvent) => { if (event.key === "Escape") onClose(); };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [onClose]);
+  const hasChains = state === "ready" && flow && flow.chains.length > 0;
+  return (
+    <div onClick={onClose} style={{ position: "fixed", inset: 0, zIndex: 1100, display: "flex", alignItems: "center", justifyContent: "center", padding: 20, background: "rgba(1,4,9,0.6)" }}>
+      <div ref={dialogRef} role="dialog" aria-modal="true" aria-label="브라우저 유입 흐름" onClick={(event) => event.stopPropagation()} style={{ display: "flex", flexDirection: "column", width: 860, maxWidth: "100%", maxHeight: "85vh", minHeight: 0, overflow: "hidden", background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", boxShadow: "var(--shadow-panel)" }}>
+        <header style={{ display: "flex", flexShrink: 0, alignItems: "center", gap: 10, padding: "12px 16px", borderBottom: "1px solid var(--border)" }}>
+          <AccountTreeOutlinedIcon sx={{ fontSize: 18, color: "var(--accent)" }} />
+          <span style={{ fontSize: 14, fontWeight: 700 }}>유입 흐름 · 이 페이지로 온 경로</span>
+          {flow?.sourceFile && <span style={{ fontSize: 11, color: "var(--text-faint)", fontFamily: "var(--mono)" }}>{flow.sourceFile}</span>}
+          <button ref={closeRef} type="button" onClick={onClose} aria-label="닫기" style={{ marginLeft: "auto", display: "inline-flex", padding: 4, border: "none", background: "transparent", color: "var(--text-faint)", cursor: "pointer" }}><CloseIcon sx={{ fontSize: 18 }} /></button>
+        </header>
+        <div style={{ flex: 1, minHeight: 0, overflow: "auto", padding: "14px 16px" }}>
+          {state === "loading" && <div style={{ display: "flex", alignItems: "center", gap: 8, color: "var(--text-dim)", fontSize: 12.5, padding: 16 }}><CircularProgress size={16} thickness={4} sx={{ color: "var(--accent)" }} />원본 방문 기록에서 유입 흐름 복원 중…</div>}
+          {state === "error" && <div role="alert" style={{ display: "flex", flexDirection: "column", gap: 10, padding: 16, color: "var(--text-dim)", fontSize: 12.5 }}>유입 흐름을 불러오지 못했습니다.<button type="button" onClick={onRetry} style={{ alignSelf: "flex-start", padding: "5px 10px", borderRadius: "var(--radius-sm)", border: "1px solid var(--border)", background: "var(--bg-elevated)", color: "var(--text)", cursor: "pointer", fontSize: 12 }}>다시 시도</button></div>}
+          {state === "ready" && !hasChains && <div role="status" style={{ padding: 20, color: "var(--text-faint)", fontSize: 12.5, lineHeight: 1.6 }}>{flow?.note || "이 항목에 대한 방문 유입 흐름을 찾지 못했습니다."}</div>}
+          {hasChains && (
+            <>
+              {isCache && flow?.matchedPage && <div style={{ marginBottom: 12, padding: "8px 11px", borderRadius: "var(--radius-sm)", background: "var(--bg-elevated)", border: "1px solid var(--border-subtle)", color: "var(--text-dim)", fontSize: 12, lineHeight: 1.55 }}>{flow.note}<div style={{ marginTop: 4, fontFamily: "var(--mono)", fontSize: 11.5, color: "var(--text-faint)", wordBreak: "break-all" }}>기준 페이지: {flow.matchedPage}</div></div>}
+              <VisitFlowPaths chains={flow!.chains} />
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// A thin connector between two visit nodes, coloured by how the child linked to
+// its parent (same-tab from_visit vs new-tab opener). Purely visual — the raw
+// join value lives on the node itself.
+function VisitFlowConnector({ newTab }: { newTab: boolean }) {
+  const color = newTab ? "var(--warning)" : "var(--accent)";
+  return (
+    <div aria-hidden="true" style={{ display: "flex", justifyContent: "center", padding: "2px 0" }}>
+      <span style={{ width: 2, height: 15, borderRadius: 2, background: color, opacity: 0.55 }} />
+    </div>
+  );
+}
+
+// One visit = one `visits` row. The node prints that row's own raw fields
+// (visits.id, its from_visit/opener_visit link to the visit above, transition),
+// so the reader verifies the join by eye — no derived "match" claim, because the
+// chain is *built* from those links and could not connect otherwise.
+function VisitFlowNode({ step, order }: { step: BrowserVisitFlow["chains"][number]["steps"][number]; order: number }) {
+  const target = step.isTarget;
+  const accent = target ? "var(--danger)" : "var(--accent)";
+  const newTab = step.parentLink === "opener_visit";
+  const linkColor = newTab ? "var(--warning)" : "var(--accent)";
+  return (
+    <div style={{ position: "relative", display: "flex", gap: 11, padding: "10px 12px 11px", borderRadius: "var(--radius-md)", border: `1px solid ${target ? "color-mix(in srgb, var(--danger) 55%, var(--border))" : "var(--border)"}`, background: target ? "color-mix(in srgb, var(--danger) 7%, var(--bg-elevated))" : "var(--bg-elevated)", boxShadow: target ? "0 0 0 1px color-mix(in srgb, var(--danger) 22%, transparent)" : "none" }}>
+      <div style={{ flexShrink: 0, paddingTop: 1 }}>
+        <span aria-hidden="true" style={{ display: "flex", alignItems: "center", justifyContent: "center", width: 22, height: 22, borderRadius: "50%", background: `color-mix(in srgb, ${accent} 16%, transparent)`, color: accent, fontSize: 11, fontWeight: 800, fontFamily: "var(--mono)" }}>{order}</span>
+      </div>
+      <div style={{ minWidth: 0, flex: 1 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+          <span style={{ fontFamily: "var(--mono)", fontSize: 11, fontWeight: 700, color: accent, padding: "1px 6px", borderRadius: "var(--radius-sm)", background: `color-mix(in srgb, ${accent} 12%, transparent)` }}>visits.id {step.visitId || "?"}</span>
+          <span style={{ fontFamily: "var(--mono)", fontSize: 11.5, color: "var(--text-time)" }}>{step.time || "시간 미상"}</span>
+          {target && <span style={{ fontSize: 10.5, fontWeight: 800, letterSpacing: 0.3, color: "var(--danger)", padding: "1px 6px", borderRadius: "var(--radius-sm)", background: "color-mix(in srgb, var(--danger) 14%, transparent)" }}>이 항목 · 도착</span>}
+        </div>
+        {step.title && <div style={{ marginTop: 5, fontSize: 13, fontWeight: target ? 700 : 600, color: "var(--text)", overflowWrap: "anywhere" }}>{step.title}</div>}
+        <div style={{ marginTop: 3, display: "flex", alignItems: "flex-start", gap: 5, fontFamily: "var(--mono)", fontSize: 11.5, color: "var(--text-dim)", overflowWrap: "anywhere", wordBreak: "break-all" }}>
+          <OpenInNewOutlinedIcon sx={{ fontSize: 12, flexShrink: 0, marginTop: "2px", opacity: 0.6 }} />{step.url}
+        </div>
+        <div style={{ marginTop: 7, display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", fontSize: 10.5 }}>
+          {step.parentLink ? (
+            <span title="이 방문 레코드의 링크 컬럼 값 — 바로 위 노드의 visits.id를 가리킵니다" style={{ display: "inline-flex", alignItems: "center", gap: 4, padding: "1px 7px", borderRadius: 999, color: linkColor, background: `color-mix(in srgb, ${linkColor} 12%, transparent)`, border: `1px solid color-mix(in srgb, ${linkColor} 35%, var(--border))`, fontWeight: 650 }}>
+              {newTab ? <NorthEastOutlinedIcon sx={{ fontSize: 12 }} /> : <SouthOutlinedIcon sx={{ fontSize: 12 }} />}
+              <span style={{ fontFamily: "var(--mono)" }}>{step.parentLink}={step.parentVisitId}</span>
+              <span style={{ color: "var(--text-faint)", fontWeight: 550 }}>{newTab ? "새 탭에서 열림" : "같은 탭 이동"}</span>
+            </span>
+          ) : (
+            <span style={{ display: "inline-flex", alignItems: "center", padding: "1px 7px", borderRadius: 999, color: "var(--text-faint)", background: "var(--bg-input)", border: "1px solid var(--border-subtle)" }}>유입 시작점 · from_visit·opener 없음</span>
+          )}
+          <span style={{ color: "var(--text-faint)", fontFamily: "var(--mono)" }}>transition={step.transitionRaw}</span>
+          <span style={{ color: "var(--text-faint)" }}>· {step.transition}</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function visitFlowDomain(url: string): string {
+  try { return new URL(url).hostname; } catch { return (url || "").replace(/^https?:\/\//, "").split("/")[0] || url; }
+}
+
+// When the browser recorded more than one *distinct* way the analyst reached
+// this page, show the paths as switchable tabs — not stacked timelines — so it
+// is unmistakable that these are alternative routes, not one long trail.
+function VisitFlowPaths({ chains }: { chains: BrowserVisitFlow["chains"] }) {
+  const [selected, setSelected] = useState(0);
+  if (chains.length <= 1) return chains[0] ? <VisitFlowChainView chain={chains[0]} /> : null;
+  const active = chains[Math.min(selected, chains.length - 1)];
+  return (
+    <div>
+      <div style={{ fontSize: 11.5, color: "var(--text-faint)", marginBottom: 7 }}>서로 다른 유입 경로 <b style={{ color: "var(--text-dim)" }}>{chains.length}개</b>가 확인됩니다 — 탭으로 전환해서 각각 확인하세요.</div>
+      <div role="tablist" aria-label="유입 경로 선택" style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 13 }}>
+        {chains.map((chain, i) => {
+          const on = i === Math.min(selected, chains.length - 1);
+          const origin = visitFlowDomain(chain.steps[0]?.url || "");
+          return (
+            <button key={i} type="button" role="tab" aria-selected={on} onClick={() => setSelected(i)}
+              style={{ display: "flex", flexDirection: "column", alignItems: "flex-start", gap: 1, padding: "6px 12px", borderRadius: "var(--radius-md)", border: `1px solid ${on ? "var(--accent)" : "var(--border)"}`, background: on ? "var(--accent-subtle)" : "var(--bg-elevated)", color: on ? "var(--accent)" : "var(--text-dim)", cursor: "pointer", textAlign: "left" }}>
+              <span style={{ fontSize: 12, fontWeight: 700 }}>경로 {i + 1}</span>
+              <span style={{ fontSize: 10.5, fontFamily: "var(--mono)", color: on ? "var(--accent)" : "var(--text-faint)", maxWidth: 180, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{origin} 경유 · {(chain.visitTime.split(" ")[1]) || chain.visitTime}</span>
+            </button>
+          );
+        })}
+      </div>
+      <VisitFlowChainView chain={active} />
+    </div>
+  );
+}
+
+function VisitFlowChainView({ chain }: { chain: BrowserVisitFlow["chains"][number] }) {
+  return (
+    <section>
+      {chain.externalReferrer && (
+        <div style={{ display: "inline-flex", alignItems: "center", gap: 6, marginBottom: 10, padding: "4px 10px", borderRadius: 999, background: "color-mix(in srgb, var(--warning) 12%, transparent)", border: "1px solid color-mix(in srgb, var(--warning) 40%, var(--border))", color: "var(--warning)", fontSize: 11.5, fontWeight: 700 }}>
+          외부 referrer <span style={{ fontFamily: "var(--mono)", fontWeight: 550, color: "var(--text-dim)" }}>external_referrer_url = {chain.externalReferrer}</span>
+        </div>
+      )}
+      <div>
+        {chain.steps.map((step, si) => (
+          <div key={si}>
+            {si > 0 && <VisitFlowConnector newTab={step.parentLink === "opener_visit"} />}
+            <VisitFlowNode step={step} order={si + 1} />
+            {step.isTarget && chain.reloads > 0 && (
+              <div style={{ marginTop: 8, display: "inline-flex", alignItems: "center", gap: 5, padding: "3px 9px", borderRadius: 999, background: "var(--bg-input)", border: "1px solid var(--border-subtle)", color: "var(--text-faint)", fontSize: 11 }}>
+                <ReplayOutlinedIcon sx={{ fontSize: 12 }} />이후 같은 URL로 {chain.reloads}회 재이동(리다이렉트·리로드) · 별도 방문으로 기록됨
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
 export default function ArtifactDetailView({ spec, row, onNavigate, onFetchLinkedRows, hostDir, accountDirectory, onToggleFieldBookmark, isFieldBookmarked }: ArtifactDetailViewProps) {
   const title = spec.title(row);
   const subtitle = spec.subtitle?.(row);
@@ -844,6 +1030,12 @@ export default function ArtifactDetailView({ spec, row, onNavigate, onFetchLinke
         <div style={{ padding: "14px 16px 18px", borderBottom: "1px solid var(--border-subtle)" }}>
           <div className="dfir-section-label" style={{ marginBottom: 7 }}>분석 주의</div>
           <TagList tags={tags} />
+        </div>
+      )}
+
+      {hostDir && row.account && (row.kind === "visit" || row.kind === "cache") && (
+        <div style={{ padding: "14px 16px 18px" }}>
+          <VisitFlowLauncher row={row} hostDir={hostDir} />
         </div>
       )}
     </div>
