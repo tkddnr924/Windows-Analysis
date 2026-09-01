@@ -61,7 +61,17 @@ function makeApi(): ElectronApi {
     listBookmarks: (caseDir) => invoke<Bookmark[]>("list_bookmarks", { caseDir }),
     toggleBookmark: (caseDir, entry: BookmarkInput) => invoke<Bookmark[]>("toggle_bookmark", { caseDir, entry }),
     updateBookmarkNote: (caseDir, id, note) => invoke<Bookmark[]>("update_bookmark_note", { caseDir, id, note }),
-    saveMasterTimeline: (hostDir, payload) => invoke<void>("save_master_timeline", { hostDir, payload }),
+    // 수백 MB 캐시를 JSON 인자로 보내면 요청 직렬화·파싱이 메인 스레드를
+    // 수 초 막는다 — raw 바이트("호스트경로\n" + JSON 본문)로 전송한다.
+    saveMasterTimeline: (hostDir, payload) => {
+      const encoder = new TextEncoder();
+      const head = encoder.encode(`${hostDir}\n`);
+      const body = encoder.encode(payload);
+      const bytes = new Uint8Array(head.length + body.length);
+      bytes.set(head, 0);
+      bytes.set(body, head.length);
+      return invoke<void>("save_master_timeline", bytes);
+    },
     loadMasterTimeline: (hostDir) => invoke<ArrayBuffer>("load_master_timeline", { hostDir }),
     pathReferences: (hostDir, paths) => invoke<PathReference[]>("path_references", { hostDir, paths }),
     pathReferenceAccounts: (hostDir) => invoke<string[]>("path_reference_accounts", { hostDir }),

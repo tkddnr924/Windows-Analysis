@@ -426,12 +426,18 @@ fn delete_case(case_id: String) -> bool {
 }
 
 #[tauri::command]
-fn delete_host(case_id: String, host_id: String) -> bool {
-    if !valid_id(&case_id) || !valid_id(&host_id) {
-        return false;
-    }
-    let case_dir = case_store::case_dir(&cases_dir(), &case_id);
-    delete_host_dir_and_bookmarks(&case_dir, &host_id)
+async fn delete_host(case_id: String, host_id: String) -> bool {
+    // 수 GB 호스트 폴더의 remove_dir_all — 메인 스레드에서 돌리면 삭제가
+    // 끝날 때까지 창이 멈춘다.
+    tauri::async_runtime::spawn_blocking(move || {
+        if !valid_id(&case_id) || !valid_id(&host_id) {
+            return false;
+        }
+        let case_dir = case_store::case_dir(&cases_dir(), &case_id);
+        delete_host_dir_and_bookmarks(&case_dir, &host_id)
+    })
+    .await
+    .unwrap_or(false)
 }
 
 fn delete_host_dir_and_bookmarks(case_dir: &Path, host_id: &str) -> bool {
@@ -1112,10 +1118,30 @@ fn master_timeline_cache_path(host_dir: &str) -> PathBuf {
     Path::new(host_dir).join("_master_timeline.cache.json")
 }
 
+// 재빌드 직후 저장되는 캐시는 수백 MB다. String 인자로 받으면 요청 JSON
+// 파싱(이스케이프 해제)이 메인 스레드에서 돌아 저장 동안 창이 멈춘다 —
+// load와 대칭으로 raw 바이트 본문("호스트경로\n" + JSON)으로 받는다.
+// 쓰기는 blocking 풀에서 수행하고 결과는 기다리지 않는다(호출부가 원래
+// best-effort — 쓰기 실패는 캐시 미스로 자연 복구되며, 실패는 stderr에 남긴다).
 #[tauri::command]
-fn save_master_timeline(host_dir: String, payload: String) -> Result<(), String> {
-    let path = master_timeline_cache_path(&host_dir);
-    std::fs::write(&path, payload).map_err(|e| e.to_string())
+fn save_master_timeline(request: tauri::ipc::Request<'_>) -> Result<(), String> {
+    let tauri::ipc::InvokeBody::Raw(body) = request.body() else {
+        return Err("타임라인 캐시 저장 본문 형식이 잘못되었습니다".to_string());
+    };
+    let split = body
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .ok_or_else(|| "타임라인 캐시 저장 본문에 경로 구분자가 없습니다".to_string())?;
+    let host_dir = String::from_utf8(body[..split].to_vec())
+        .map_err(|_| "타임라인 캐시 저장 경로 인코딩이 잘못되었습니다".to_string())?;
+    let payload = body[split + 1..].to_vec();
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = master_timeline_cache_path(&host_dir);
+        if let Err(error) = std::fs::write(&path, payload) {
+            eprintln!("master timeline cache write failed ({}): {error}", path.display());
+        }
+    });
+    Ok(())
 }
 
 // 수백 MB급 캐시를 동기 커맨드의 String으로 돌려주면 메인 스레드(창 이벤트
@@ -1231,7 +1257,15 @@ async fn list_result_files(category_dir: String) -> Vec<ResultFileEntry> {
 /// expensive evidence reparse while making existing saved hosts participate in
 /// cross-view bookmark synchronization and full Prefetch detail.
 #[tauri::command]
-fn refresh_execution_history_overview(host_dir: String) -> Result<bool, String> {
+async fn refresh_execution_history_overview(host_dir: String) -> Result<bool, String> {
+    // 구버전 호스트에서는 파생 테이블 재빌드+쓰기까지 돌아 무겁다 — 메인
+    // 스레드 밖에서 수행한다 (최신 호스트는 컬럼 확인 후 즉시 반환).
+    tauri::async_runtime::spawn_blocking(move || refresh_execution_history_overview_blocking(host_dir))
+        .await
+        .map_err(|error| format!("실행 이력 개요 갱신 작업이 중단되었습니다: {error}"))?
+}
+
+fn refresh_execution_history_overview_blocking(host_dir: String) -> Result<bool, String> {
     let out_dir = PathBuf::from(host_dir);
     let overview_path = out_dir.join("_OVERVIEW").join("ExecutionHistory.sqlite");
     if !overview_path.exists() {
@@ -2820,7 +2854,15 @@ async fn powershell_search_rowids(
 }
 
 #[tauri::command]
-fn read_result_file(full_path: String, table_name: Option<String>) -> Result<CsvData, String> {
+async fn read_result_file(full_path: String, table_name: Option<String>) -> Result<CsvData, String> {
+    // 개요 테이블 전량 로드 — 큰 테이블의 조회·응답 직렬화가 메인 스레드를
+    // 막지 않게 blocking 풀에서 돈다.
+    tauri::async_runtime::spawn_blocking(move || read_result_file_blocking(full_path, table_name))
+        .await
+        .map_err(|error| format!("결과 테이블 조회 작업이 중단되었습니다: {error}"))?
+}
+
+fn read_result_file_blocking(full_path: String, table_name: Option<String>) -> Result<CsvData, String> {
     let conn = open_ro(&full_path)?;
     let table = match table_name.or_else(|| first_table(&conn)) {
         Some(t) => t,
@@ -2889,7 +2931,22 @@ fn read_result_file(full_path: String, table_name: Option<String>) -> Result<Csv
 /// 행짜리 테이블을 웹뷰 메모리에 통째로 올리지 않기 위한 경로. row_count는
 /// 전체 건수라 호출 측이 남은 분량을 스크롤 시점에 이어 받는다.
 #[tauri::command]
-fn read_result_file_page(
+async fn read_result_file_page(
+    full_path: String,
+    table_name: Option<String>,
+    offset: i64,
+    limit: i64,
+) -> Result<CsvData, String> {
+    // 원본 대형 테이블의 청크(2만 행) 조회·직렬화 — 열람·스크롤 이어받기가
+    // 메인 스레드를 막지 않게 blocking 풀에서 돈다.
+    tauri::async_runtime::spawn_blocking(move || {
+        read_result_file_page_blocking(full_path, table_name, offset, limit)
+    })
+    .await
+    .map_err(|error| format!("결과 테이블 페이지 조회 작업이 중단되었습니다: {error}"))?
+}
+
+fn read_result_file_page_blocking(
     full_path: String,
     table_name: Option<String>,
     offset: i64,
@@ -2943,7 +3000,26 @@ fn read_result_file_page(
 /// parameters, so a long Prefetch loaded-file list never needs to be copied
 /// into the webview just to render the first five rows.
 #[tauri::command]
-fn linked_result_rows(
+async fn linked_result_rows(
+    full_path: String,
+    table_name: String,
+    match_column: String,
+    match_value: String,
+    search: String,
+    offset: i64,
+    limit: i64,
+) -> Result<LinkedRowsPage, String> {
+    // 비인덱스 컬럼 WHERE는 대형 테이블에서 풀스캔이다 — 상세 패널의 연결
+    // 증거 조회가 메인 스레드를 막지 않게 blocking 풀에서 돈다.
+    tauri::async_runtime::spawn_blocking(move || {
+        linked_result_rows_blocking(full_path, table_name, match_column, match_value, search, offset, limit)
+    })
+    .await
+    .map_err(|error| format!("연결 기록 조회 작업이 중단되었습니다: {error}"))?
+}
+
+#[allow(clippy::too_many_arguments)]
+fn linked_result_rows_blocking(
     full_path: String,
     table_name: String,
     match_column: String,
@@ -3039,7 +3115,21 @@ struct ColumnValue {
 }
 
 #[tauri::command]
-fn list_column_values(
+async fn list_column_values(
+    full_path: String,
+    column: String,
+    table_name: Option<String>,
+) -> Vec<ColumnValue> {
+    // 필터 드롭다운의 고유값 집계는 대형 테이블 GROUP BY 풀스캔이다 — 메인
+    // 스레드 밖에서 수행한다.
+    tauri::async_runtime::spawn_blocking(move || {
+        list_column_values_blocking(full_path, column, table_name)
+    })
+    .await
+    .unwrap_or_default()
+}
+
+fn list_column_values_blocking(
     full_path: String,
     column: String,
     table_name: Option<String>,
@@ -3148,7 +3238,15 @@ fn mft_children_blocking(
 }
 
 #[tauri::command]
-fn mft_search(full_path: String, query: String, limit: i64) -> Result<Vec<Map<String, Value>>, String> {
+async fn mft_search(full_path: String, query: String, limit: i64) -> Result<Vec<Map<String, Value>>, String> {
+    // 수백만 행 MFT의 LIKE 풀스캔 — 검색이 메인 스레드를 막지 않게 blocking
+    // 풀에서 돈다.
+    tauri::async_runtime::spawn_blocking(move || mft_search_blocking(full_path, query, limit))
+        .await
+        .map_err(|error| format!("MFT 검색 작업이 중단되었습니다: {error}"))?
+}
+
+fn mft_search_blocking(full_path: String, query: String, limit: i64) -> Result<Vec<Map<String, Value>>, String> {
     // DB 열기·쿼리 실패를 빈 결과로 위장하지 않는다 — "일치 없음"과
     // "조회 실패"는 분석 판단이 달라지는 별개의 상태다.
     let conn = open_ro(&full_path)?;
@@ -3181,7 +3279,28 @@ struct MftChildrenPage {
 
 #[tauri::command]
 #[allow(clippy::too_many_arguments)] // 검색·필터·기간·페이징 인자 — tauri command 시그니처
-fn usnjrnl_page(
+async fn usnjrnl_page(
+    full_path: String,
+    search: String,
+    reason: String,
+    start: String,
+    end: String,
+    ascending: bool,
+    offset: i64,
+    limit: i64,
+) -> Result<CsvData, String> {
+    // 20만+ 행 테이블을 세 번 훑는 조회라, 메인 스레드에서 돌리면 탭 진입·
+    // 검색·페이지 이동마다 창이 멈춘다 — blocking executor로 분리한다
+    // (MFT 탐색·Browser Activity와 같은 규칙).
+    tauri::async_runtime::spawn_blocking(move || {
+        usnjrnl_page_blocking(full_path, search, reason, start, end, ascending, offset, limit)
+    })
+    .await
+    .map_err(|error| format!("USN 저널 조회 작업이 중단되었습니다: {error}"))?
+}
+
+#[allow(clippy::too_many_arguments)]
+fn usnjrnl_page_blocking(
     full_path: String,
     search: String,
     reason: String,
@@ -3357,7 +3476,33 @@ fn usnjrnl_page(
 
 #[tauri::command]
 #[allow(clippy::too_many_arguments)] // 재귀 목록 전용 필터 인자들 — tauri command 시그니처
-fn mft_records_page(
+async fn mft_records_page(
+    full_path: String,
+    query: String,
+    offset: i64,
+    limit: i64,
+    sort_key: Option<String>,
+    sort_desc: Option<bool>,
+    files_only: Option<bool>,
+    name_pattern: Option<String>,
+    time_key: Option<String>,
+    time_start: Option<String>,
+    time_end: Option<String>,
+) -> Result<MftRecordsPage, String> {
+    // 수백만 행 MFT의 비인덱스 정렬·필터 페이지 조회 — 메인 스레드 밖에서
+    // 수행한다.
+    tauri::async_runtime::spawn_blocking(move || {
+        mft_records_page_blocking(
+            full_path, query, offset, limit, sort_key, sort_desc, files_only, name_pattern,
+            time_key, time_start, time_end,
+        )
+    })
+    .await
+    .map_err(|error| format!("MFT 목록 조회 작업이 중단되었습니다: {error}"))?
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mft_records_page_blocking(
     full_path: String,
     query: String,
     offset: i64,
@@ -3855,7 +4000,14 @@ struct CacheMeta {
 /// Callers fetch the body on-demand via `cache_entry_body`.
 /// Capped at 20 000 rows to keep IPC snappy even for large caches.
 #[tauri::command]
-fn cache_entries(host_dir: String) -> Vec<CacheMeta> {
+async fn cache_entries(host_dir: String) -> Vec<CacheMeta> {
+    // 캐시 sqlite 여러 개를 훑는 메타 수집 — 메인 스레드 밖에서 수행한다.
+    tauri::async_runtime::spawn_blocking(move || cache_entries_blocking(host_dir))
+        .await
+        .unwrap_or_default()
+}
+
+fn cache_entries_blocking(host_dir: String) -> Vec<CacheMeta> {
     let dir = PathBuf::from(&host_dir).join("BROWSER");
     let mut out = Vec::new();
     let files = match std::fs::read_dir(&dir) {

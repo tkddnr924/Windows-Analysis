@@ -4,6 +4,7 @@
 // (usnjrnl_page)으로 필터·검색·기간을 SQLite 쪽에서 처리한다.
 import { useEffect, useMemo, useRef, useState } from "react";
 import AddCircleOutlineOutlinedIcon from "@mui/icons-material/AddCircleOutlineOutlined";
+import CircularProgress from "@mui/material/CircularProgress";
 import BookmarkBorderOutlinedIcon from "@mui/icons-material/BookmarkBorderOutlined";
 import BookmarkIcon from "@mui/icons-material/Bookmark";
 import DeleteOutlineOutlinedIcon from "@mui/icons-material/DeleteOutlineOutlined";
@@ -131,6 +132,13 @@ export default function UsnJrnlView({ dbPath, timeRange, bookmarkedRowids, onTog
       </ViewHeader>
       {error ? (
         <div style={{ minHeight: 180, display: "grid", placeItems: "center", color: "var(--danger)", fontSize: 13 }}>{error}</div>
+      ) : loading && !rows.length ? (
+        // 첫 조회(보여줄 이전 행이 없는 상태) — 아래의 흐림 처리는 기존 행이
+        // 있어야 보이므로, 통합 타임라인과 같은 로딩 표시를 띄운다.
+        <div style={{ flex: 1, minHeight: 180, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 10, color: "var(--text-dim)", fontSize: 14 }}>
+          <CircularProgress size={19} thickness={4.5} aria-label="USN 저널을 불러오는 중" sx={{ color: "var(--accent)" }} />
+          <span>USN 저널 기록을 불러오는 중...</span>
+        </div>
       ) : !loading && !rows.length ? (
         <div style={{ minHeight: 180, display: "grid", placeItems: "center", color: "var(--text-faint)", fontSize: 13 }}>
           검색·유형·기간 조건에 일치하는 변경 기록 없음
