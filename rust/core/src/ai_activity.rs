@@ -130,11 +130,16 @@ fn cache_fact_files(out_dir: &Path) -> Vec<PathBuf> {
     files
 }
 
-/// 캐시 facts를 훑어 유효한 AI 대화 행을 `push`로 스트리밍한다(전량 — 상한
-/// 없음). 개별 파일·행의 문제는 대화가 아닌 것으로 건너뛴다(facts는 이미
-/// 검증·발행된 산출물이라 여기서의 실패는 판별 탈락이지 증거 손실이 아니다).
-pub fn build_ai_conversations(out_dir: &Path) -> Vec<Row> {
-    let mut rows = Vec::new();
+/// 캐시 facts를 훑어 유효한 AI 대화 행을 `push`로 즉시 넘긴다(전량 — 상한
+/// 없음, 원문 JSON을 메모리에 모으지 않는 스트리밍). 표시 순서(관찰 시각
+/// 내림차순 + URL)는 저장 후 SQLite 정렬 재작성이 맡는다. 개별 파일·행의
+/// 문제는 대화가 아닌 것으로 건너뛴다(facts는 이미 검증·발행된 산출물이라
+/// 여기서의 실패는 판별 탈락이지 증거 손실이 아니다). 반환: 넘긴 행 수.
+pub fn build_ai_conversations_stream(
+    out_dir: &Path,
+    push: &mut dyn FnMut(Row) -> anyhow::Result<()>,
+) -> anyhow::Result<usize> {
+    let mut count = 0usize;
     for db in cache_fact_files(out_dir) {
         let Ok(conn) = rusqlite::Connection::open_with_flags(
             &db,
@@ -177,7 +182,7 @@ pub fn build_ai_conversations(out_dir: &Path) -> Vec<Row> {
         let Ok(mapped) = mapped else { continue };
         for item in mapped.flatten() {
             if crate::pipeline::cancelled() {
-                return rows;
+                return Ok(count);
             }
             let (rowid, url, account, observed, body_b64) = item;
             let Ok(bytes) =
@@ -227,16 +232,11 @@ pub fn build_ai_conversations(out_dir: &Path) -> Vec<Row> {
                 format!("{file_stem}::CacheEntries::{rowid}"),
             );
             row.insert("_source_file".into(), db.to_string_lossy().to_string());
-            rows.push(row);
+            push(row)?;
+            count += 1;
         }
     }
-    // 관찰 시각 내림차순 + URL 안정 정렬 — 조회 페이지네이션의 재현성 근거.
-    rows.sort_by(|a, b| {
-        b.get("date")
-            .cmp(&a.get("date"))
-            .then_with(|| a.get("url").cmp(&b.get("url")))
-    });
-    rows
+    Ok(count)
 }
 
 #[cfg(test)]
@@ -295,7 +295,18 @@ mod tests {
                 ("https://chatgpt.com/backend-api/settings", "2026-07-08 14:30:00.000", r#"{"ok":true}"#),
             ],
         );
-        let rows = build_ai_conversations(&root);
+        let mut rows: Vec<Row> = Vec::new();
+        build_ai_conversations_stream(&root, &mut |row| {
+            rows.push(row);
+            Ok(())
+        })
+        .unwrap();
+        // 저장 단계의 SQL 정렬과 같은 규칙으로 정렬해 기존 검증을 유지한다.
+        rows.sort_by(|a, b| {
+            b.get("date")
+                .cmp(&a.get("date"))
+                .then_with(|| a.get("url").cmp(&b.get("url")))
+        });
         std::fs::remove_dir_all(&root).unwrap();
         assert_eq!(rows.len(), 3);
         // 관찰 시각 내림차순 정렬.

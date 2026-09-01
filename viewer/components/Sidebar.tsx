@@ -72,6 +72,35 @@ const CATEGORY_LABELS: Record<string, string> = {
   POWERSHELL: "ConsoleHistory",
 };
 
+/// 승격 분석 항목(WER·WMI·USN)의 결과 없음 표시 — 개요 테이블의 "0건에도
+/// 스키마 발행" 통일 정책(2026-08-31)과 같은 취지로, 결과가 없어도 항목이
+/// 사라지지 않고 "해당 활동 없음"이 확인 가능한 정보로 남는다 (2026-09-01
+/// 사용자 확정).
+function EmptyPinnedRow({ icon, label }: { icon: React.ReactNode; label: string }) {
+  return (
+    <div
+      title="이번 파싱에서 이 항목의 결과가 없습니다"
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: 10,
+        padding: "10px 12px",
+        fontSize: 14,
+        fontWeight: 600,
+        color: "var(--text-faint)",
+        opacity: 0.5,
+        userSelect: "none",
+        cursor: "default",
+        borderLeft: "3px solid transparent",
+      }}
+    >
+      {icon}
+      <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{label}</span>
+      <span style={{ fontSize: 10.5, fontWeight: 500 }}>데이터 없음</span>
+    </div>
+  );
+}
+
 function EmptyCategoryRow({ name, label }: { name: string; label?: string }) {
   return (
     <div
@@ -135,8 +164,8 @@ const OVERVIEW_TABLE_NAMES: Record<string, string> = {
 // 나머지는 _OVERVIEW 테이블 이름. 목록에 없는 테이블은 그룹 뒤에 그대로
 // 나열되는 안전망을 둔다 (새 테이블이 추가돼도 사라지지 않게).
 const ANALYSIS_GROUPS: { title: string; items: string[] }[] = [
-  { title: "실행 흔적", items: ["ExecutionHistory", "PowerShellHistory", "ScheduledTasks", "@WMI"] },
   { title: "파일 시스템", items: ["MFT_Records", "@USN"] },
+  { title: "실행 흔적", items: ["ExecutionHistory", "PowerShellHistory", "ScheduledTasks", "@WMI"] },
   { title: "네트워크 · 원격", items: ["RemoteDesktopHistory", "SmbHistory", "BitsHistory", "FirewallHistory", "BrowserActivity", "RdpCache"] },
   { title: "시스템 · 보안", items: ["RegistryFindings", "Defender", "@WER"] },
 ];
@@ -190,6 +219,9 @@ function FileRow({
   prominent?: boolean;
   onSelectFile: (file: ResultFileEntry) => void;
 }) {
+  // 0건 항목도 목록에 남되(0건 스키마 정책) 흐림 + "데이터 없음"으로 상태를
+  // 보여준다 — 열람(빈 화면 확인)은 그대로 가능하다 (2026-09-01 사용자 확정).
+  const empty = entry.rowCount === 0;
   return (
     <div
       onClick={() => onSelectFile(entry)}
@@ -219,10 +251,11 @@ function FileRow({
         if (!selected) e.currentTarget.style.background = "transparent";
       }}
     >
-      <span style={{ display: "flex", alignItems: "center", gap: 7, overflow: "hidden", textOverflow: "ellipsis", color: selected ? "var(--text)" : "var(--text-dim)", fontSize: prominent ? 14 : 13.5, fontWeight: selected ? 700 : prominent ? 600 : 400 }}>
+      <span style={{ display: "flex", alignItems: "center", gap: 7, overflow: "hidden", textOverflow: "ellipsis", color: selected ? "var(--text)" : empty ? "var(--text-faint)" : "var(--text-dim)", opacity: empty && !selected ? 0.55 : 1, fontSize: prominent ? 14 : 13.5, fontWeight: selected ? 700 : prominent ? 600 : 400 }}>
         {leading}
         <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>{label}</span>
       </span>
+      {empty && <span style={{ flexShrink: 0, color: "var(--text-faint)", opacity: selected ? 1 : 0.7, fontSize: 10.5, fontWeight: 500 }}>데이터 없음</span>}
     </div>
   );
 }
@@ -707,16 +740,21 @@ export default function Sidebar({
             {ANALYSIS_GROUPS.map((group) => {
               const rows: React.ReactNode[] = [];
               for (const item of group.items) {
+                // 결과가 없어도 항목은 남긴다(회색 "데이터 없음") — 개요
+                // 테이블 0건 스키마 정책과 표시 일관성 (2026-09-01 확정).
                 if (item === "@USN") {
                   if (usnEntry) rows.push(<PinnedNavRow key="usn" icon={<HistoryOutlinedIcon sx={{ fontSize: 19 }} />} label="USN 저널" selected={sameEntry(selectedFile, usnEntry)} onClick={() => onSelectFile(usnEntry)} />);
+                  else rows.push(<EmptyPinnedRow key="usn" icon={<HistoryOutlinedIcon sx={{ fontSize: 19 }} />} label="USN 저널" />);
                   continue;
                 }
                 if (item === "@WER") {
                   if (werEntry) rows.push(<PinnedNavRow key="wer" icon={<ReportProblemOutlinedIcon sx={{ fontSize: 19 }} />} label="오류 보고 (WER)" selected={sameEntry(selectedFile, werEntry)} onClick={() => onSelectFile(werEntry)} />);
+                  else rows.push(<EmptyPinnedRow key="wer" icon={<ReportProblemOutlinedIcon sx={{ fontSize: 19 }} />} label="오류 보고 (WER)" />);
                   continue;
                 }
                 if (item === "@WMI") {
                   if (wmiEntry) rows.push(<PinnedNavRow key="wmi" icon={<DeviceHubOutlinedIcon sx={{ fontSize: 19 }} />} label="WMI 이벤트 구독" selected={sameEntry(selectedFile, wmiEntry)} onClick={() => onSelectFile(wmiEntry)} />);
+                  else rows.push(<EmptyPinnedRow key="wmi" icon={<DeviceHubOutlinedIcon sx={{ fontSize: 19 }} />} label="WMI 이벤트 구독" />);
                   continue;
                 }
                 const tables = overviewByFile.get(item);

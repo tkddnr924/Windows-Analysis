@@ -1839,6 +1839,18 @@ fn parse_browser_history_artifact(
         if let Some((record_count, wrote)) = unit {
             entry_record_input_count(entry, p, record_count);
             if wrote {
+                // 결과 DB ↔ 수집 원본 경로 1:1 매핑을 산출물 안에 보존한다 —
+                // 유입 흐름이 캐시 행의 프로필 루트와 대조해 같은 브라우저
+                // 프로필의 History만 정확히 고를 근거 (다중 프로필 혼입 차단).
+                if let Ok(conn) = rusqlite::Connection::open(&out) {
+                    let _ = conn.execute_batch(
+                        "DROP TABLE IF EXISTS \"_wina_source\";\n                         CREATE TABLE \"_wina_source\" (source_path TEXT);",
+                    );
+                    let _ = conn.execute(
+                        "INSERT INTO \"_wina_source\" VALUES (?1)",
+                        [p.to_string_lossy().to_string()],
+                    );
+                }
                 outputs.push(relative);
             }
         }
@@ -2433,6 +2445,9 @@ pub fn run_host_with_log_id(
         // columns: 0건에도 스키마를 만들 고정 컬럼 목록. 모든 개요 테이블은
         // 0건이어도 스키마와 함께 발행한다 — "해당 활동 없음"이 그 자체로
         // 확인 가능한 정보로 남는다 (2026-08-31 사용자 확정, 통일).
+        // 스트리밍으로 쓰는 파생(write_ov 밖 경로)의 보고 항목 — report가
+        // write_ov 클로저에 이미 가변 차용돼 있어 별도 목록에 모았다가 합친다.
+        let mut extra_overview: Vec<OverviewTableReport> = Vec::new();
         let mut write_ov = |name: &str, rows: Vec<Row>, columns: &[&str]| -> Result<()> {
             let out = ov.join(format!("{}.sqlite", name));
             write_table(&out, name, &rows, columns)?;
@@ -2519,15 +2534,39 @@ pub fn run_host_with_log_id(
                 overview::build_path_references(&out_dir, &registry_overview),
                 overview::PR_KEYS,
             )?;
-            // AI 대화 — 지원 브라우저 캐시 facts 전량 판별(상한 없음). 뷰어는
-            // 이 파생 테이블만 기간·페이지 조건으로 조회한다.
-            write_ov(
-                "AiConversations",
-                crate::ai_activity::build_ai_conversations(&out_dir),
-                crate::ai_activity::AI_KEYS,
-            )?;
+            // AI 대화 — 지원 브라우저 캐시 facts 전량 판별(상한 없음). 원문
+            // JSON을 메모리에 모으지 않도록 스트리밍 기록하고, 표시 순서
+            // (관찰 시각 내림차순 + URL)는 저장 후 SQLite 정렬로 만든다.
+            // 뷰어는 이 파생 테이블만 기간·페이지 조건으로 조회한다.
+            {
+                let name = crate::ai_activity::AI_TABLE;
+                let out = ov.join(format!("{}.sqlite", name));
+                let mut writer = crate::sqlite::StreamWriter::create(
+                    &out,
+                    name,
+                    crate::ai_activity::AI_KEYS,
+                    crate::ai_activity::AI_KEYS,
+                )?;
+                crate::ai_activity::build_ai_conversations_stream(&out_dir, &mut |row| {
+                    writer.push(row)
+                })?;
+                let total = writer.finish()?;
+                if total > 0 {
+                    let conn = rusqlite::Connection::open(&out)?;
+                    let table = crate::sqlite::quote_ident(name);
+                    conn.execute_batch(&format!(
+                        "CREATE TABLE \"__wina_sorted\" AS SELECT * FROM {table} ORDER BY date DESC, url ASC;\n                         DROP TABLE {table};\n                         ALTER TABLE \"__wina_sorted\" RENAME TO {table};"
+                    ))?;
+                }
+                emit(&format!("[+] {} rows -> {}", total, out.display()));
+                extra_overview.push(OverviewTableReport {
+                    name: name.to_string(),
+                    row_count: total,
+                });
+            }
             Ok(())
         })();
+        report.overview.append(&mut extra_overview);
         match overview_result {
             Ok(()) => append_current_log_lifecycle("overview_finished status=completed"),
             Err(error) => {

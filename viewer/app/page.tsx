@@ -30,7 +30,6 @@ import GlobalProgress from "@/components/GlobalProgress";
 import { usePipelineRun } from "@/lib/usePipelineRun";
 import CircularProgress from "@mui/material/CircularProgress";
 import { buildMasterTimeline, enrichCachedTimeline, loadCachedTimelineInWorker, TimelineBuildAborted } from "@/lib/masterTimeline";
-import { convertFileSrc } from "@tauri-apps/api/core";
 import { getArtifactView } from "@/lib/artifactViews";
 import { EMPTY_TIME_RANGE, type TimeRange } from "@/lib/timeRange";
 import { searchHitHostMatchesSourceBookmark } from "@/lib/searchBookmark";
@@ -230,6 +229,9 @@ export default function Home() {
   // _OVERVIEW 파일 목록은 조회가 비싸다(테이블별 COUNT, MFT 수백만 행 포함).
   // 호스트를 열 때 한 번만 읽어 사이드바와 기본 뷰 선택이 공유한다.
   const [overviewFiles, setOverviewFiles] = useState<ResultFileEntry[] | null>(null);
+  // 결과 보기 진입 프리로더 — 초기 데이터(카테고리·북마크·개요 파일·첫 화면인
+  // 호스트 정보)가 준비될 때까지 작업 화면 대신 대기 UI를 보여준다.
+  const [hostOpening, setHostOpening] = useState(false);
 
   const openHost = useCallback(async (h: Host) => {
     setSelectedHost(h);
@@ -237,18 +239,23 @@ export default function Home() {
     setActivePath(null);
     setActiveVirtualTab(null);
     setMasterTimeline(null);
-    const [found, hostBookmarks] = await Promise.all([window.api.listCategories(h.dir), window.api.listBookmarks(parentDir(h.dir))]);
-    setCategories(found);
-    setBookmarks(hostBookmarks);
-    // 결과 보기의 첫 화면은 호스트 정보다. 없으면(파싱 전 등) 빈 상태 유지.
-    const overview = found.find((category) => category.name === "_OVERVIEW");
-    if (overview) {
-      const files = await window.api.listResultFiles(overview.fullPath);
-      setOverviewFiles(files);
-      const targetInfo = files.find((file) => file.name === "TargetInfo");
-      if (targetInfo) void handleSelectFile(targetInfo);
-    } else {
-      setOverviewFiles([]);
+    setHostOpening(true);
+    try {
+      const [found, hostBookmarks] = await Promise.all([window.api.listCategories(h.dir), window.api.listBookmarks(parentDir(h.dir))]);
+      setCategories(found);
+      setBookmarks(hostBookmarks);
+      // 결과 보기의 첫 화면은 호스트 정보다. 없으면(파싱 전 등) 빈 상태 유지.
+      const overview = found.find((category) => category.name === "_OVERVIEW");
+      if (overview) {
+        const files = await window.api.listResultFiles(overview.fullPath);
+        setOverviewFiles(files);
+        const targetInfo = files.find((file) => file.name === "TargetInfo");
+        if (targetInfo) await handleSelectFile(targetInfo);
+      } else {
+        setOverviewFiles([]);
+      }
+    } finally {
+      setHostOpening(false);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -434,32 +441,32 @@ export default function Home() {
     ): Promise<TimelineEntry[] | null> => {
       const builtForRunAt = host.lastRunAt ?? "";
       if (allowCache) {
-        // 1순위: asset 프로토콜로 파일을 받아 워커에서 파싱·보강 — JSON.parse와
+        // 캐시는 raw 바이트(IPC)로 받아 워커에서 파싱·보강한다 — JSON.parse와
         // 태그 계산이 워커 스레드에서 돌아 메인 윈도우가 멈추지 않는다.
+        // (기존 문자열 IPC 경로는 응답 JSON 이스케이프가 메인 스레드에서 돌아
+        // 수백 MB 캐시에서 창이 수십 초 멈췄고, asset 프로토콜 fetch는 이
+        // 환경에서 실패해 매번 그 경로로 떨어졌다 — 결과 보기 진입 멈춤의
+        // 실제 원인.)
         try {
-          const url = convertFileSrc(`${host.dir}/_master_timeline.cache.json`);
-          const response = await fetch(url);
-          if (response.ok) {
-            // ArrayBuffer는 워커로 zero-copy 이동한다 — 메인 스레드에서
-            // 대형 문자열을 만들거나 복사하지 않는다.
-            const buffer = await response.arrayBuffer();
+          const buffer = await window.api.loadMasterTimeline(host.dir);
+          if (buffer.byteLength > 0) {
             if (signal.aborted) throw new TimelineBuildAborted();
-            const entries = await loadCachedTimelineInWorker(buffer, builtForRunAt, signal);
-            if (entries) return entries;
+            try {
+              const entries = await loadCachedTimelineInWorker(buffer, builtForRunAt, signal);
+              if (entries) return entries;
+            } catch (workerError) {
+              if (workerError instanceof TimelineBuildAborted) throw workerError;
+              // 워커를 만들 수 없는 환경 — 마지막 수단: 메인 스레드에서 파싱.
+              // (버퍼가 워커로 이전된 뒤 실패한 경우 디코드가 빈 문자열이 되어
+              // 아래 catch로 빠지고, 클릭 시 빌드 경로가 다시 처리한다.)
+              const cached = JSON.parse(new TextDecoder().decode(buffer)) as { builtForRunAt?: string; entries?: TimelineEntry[] };
+              if (cached.builtForRunAt === builtForRunAt && Array.isArray(cached.entries)) {
+                return await enrichCachedTimeline(cached.entries, signal);
+              }
+            }
           }
         } catch (error) {
           if (error instanceof TimelineBuildAborted) throw error;
-          // asset 프로토콜/워커를 쓸 수 없는 환경 — 아래 IPC 경로로 폴백.
-        }
-        try {
-          const raw = await window.api.loadMasterTimeline(host.dir);
-          if (raw) {
-            const cached = JSON.parse(raw) as { builtForRunAt?: string; entries?: TimelineEntry[] };
-            if (cached.builtForRunAt === builtForRunAt && Array.isArray(cached.entries)) {
-              return await enrichCachedTimeline(cached.entries, signal);
-            }
-          }
-        } catch {
           // Missing/corrupt cache is not an error — fall through and rebuild.
         }
       }
@@ -1034,6 +1041,21 @@ export default function Home() {
     return (
       <main className="dfir-app" style={{ display: "flex", flexDirection: "column", height: "100%" }}>
         <RunPipeline activeCase={selectedCase} onChanged={refreshCases} onOpenHost={openHost} run={run} />
+      </main>
+    );
+  }
+
+  // 결과 보기 진입 직후: 초기 데이터가 준비될 때까지 반쯤 빈 작업 화면 대신
+  // 대기 화면을 보여준다. 완료되면 곧바로 작업 화면으로 전환된다.
+  if (hostOpening) {
+    return (
+      <main className="dfir-app" style={{ display: "flex", flexDirection: "column", height: "100%" }}>
+        <div className="dfir-view" style={{ flex: 1, display: "grid", placeItems: "center", padding: 24 }}>
+          <div role="status" aria-live="polite" style={{ display: "inline-flex", alignItems: "center", gap: 8, color: "var(--text-dim)", fontSize: 13 }}>
+            <CircularProgress size={16} thickness={5} aria-hidden="true" />{selectedHost.name}의 분석 결과를 불러오는 중
+          </div>
+        </div>
+        {globalProgress}
       </main>
     );
   }

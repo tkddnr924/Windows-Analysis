@@ -501,7 +501,9 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     subtitle: (r) => r.path || "",
     priorityColumns: ["path", "file_name", "file_size", "extension", "is_directory", "in_use", "entry", "seq", "parent_entry", "owner_id", "security_id"],
     sections: [{ heading: "MFT 레코드", fields: [
-      { key: "path", label: "경로", kind: "path" }, { key: "file_size", label: "크기", kind: "bytes" },
+      // 크기는 기본 Bytes로 표기하고 상세에서 KB/MB/GB 토글 변환 (브라우저
+      // 다운로드 크기와 동일 위젯, 2026-09-01 사용자 요청).
+      { key: "path", label: "경로", kind: "path" }, { key: "file_size", label: "크기 (Bytes)", kind: "byteSize" },
       { key: "extension", label: "확장자" }, { key: "is_directory", label: "디렉터리" }, { key: "in_use", label: "할당 상태" },
       { key: "entry", label: "엔트리" }, { key: "seq", label: "시퀀스" }, { key: "parent_entry", label: "부모 엔트리" },
     ]}, { heading: "$STANDARD_INFORMATION (0x10)", fields: [

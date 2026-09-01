@@ -827,6 +827,7 @@ function VisitFlowModal({ state, flow, isCache, onRetry, onClose }: { state: "id
           {hasChains && (
             <>
               {isCache && flow?.matchedPage && <div style={{ marginBottom: 12, padding: "8px 11px", borderRadius: "var(--radius-sm)", background: "var(--bg-elevated)", border: "1px solid var(--border-subtle)", color: "var(--text-dim)", fontSize: 12, lineHeight: 1.55 }}>{flow.note}<div style={{ marginTop: 4, fontFamily: "var(--mono)", fontSize: 11.5, color: "var(--text-faint)", wordBreak: "break-all" }}>기준 페이지: {flow.matchedPage}</div></div>}
+              {flow?.truncated && <div role="status" style={{ marginBottom: 12, padding: "7px 11px", borderRadius: "var(--radius-sm)", border: "1px solid var(--warning)", color: "var(--warning)", fontSize: 12 }}>방문 기록이 많아 최근 일부 방문만 분석했습니다 — 더 오래된 유입 경로가 있을 수 있습니다.</div>}
               <VisitFlowPaths chains={flow!.chains} />
             </>
           )}

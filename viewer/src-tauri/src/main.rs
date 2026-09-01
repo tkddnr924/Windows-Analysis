@@ -181,7 +181,15 @@ fn table_names(conn: &Connection) -> Vec<String> {
     conn.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY rowid")
         .and_then(|mut s| {
             s.query_map([], |r| r.get::<_, String>(0))
-                .map(|m| m.filter_map(|x| x.ok()).collect())
+                .map(|m| m.filter_map(|x| x.ok()).collect::<Vec<String>>())
+        })
+        .map(|names: Vec<String>| {
+            // `_wina_*`는 파이프라인 내부 메타(출처 매핑 등) — 증거 테이블이
+            // 아니므로 목록·기본 테이블 선택 어디에도 노출하지 않는다.
+            names
+                .into_iter()
+                .filter(|name| !name.starts_with("_wina_"))
+                .collect()
         })
         .unwrap_or_default()
 }
@@ -193,8 +201,12 @@ fn checked_table_names(conn: &Connection) -> Result<Vec<String>, String> {
     let rows = stmt
         .query_map([], |row| row.get::<_, String>(0))
         .map_err(|error| error.to_string())?;
-    rows.collect::<Result<Vec<_>, _>>()
-        .map_err(|error| error.to_string())
+    Ok(rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .filter(|name: &String| !name.starts_with("_wina_"))
+        .collect())
 }
 
 fn first_table(conn: &Connection) -> Option<String> {
@@ -1106,9 +1118,20 @@ fn save_master_timeline(host_dir: String, payload: String) -> Result<(), String>
     std::fs::write(&path, payload).map_err(|e| e.to_string())
 }
 
+// 수백 MB급 캐시를 동기 커맨드의 String으로 돌려주면 메인 스레드(창 이벤트
+// 루프)가 ① 파일을 읽고 ② 응답 전체를 JSON 이스케이프 직렬화하느라 수십 초
+// 멈춘다 — 결과 보기 진입 멈춤의 실제 원인(스택 샘플로 확인). raw 바이트
+// 응답은 JSON 직렬화를 거치지 않고, 읽기는 blocking 풀에서 수행한다.
+// 캐시가 없으면 빈 바이트를 돌려준다.
 #[tauri::command]
-fn load_master_timeline(host_dir: String) -> Option<String> {
-    std::fs::read_to_string(master_timeline_cache_path(&host_dir)).ok()
+async fn load_master_timeline(host_dir: String) -> tauri::ipc::Response {
+    tauri::async_runtime::spawn_blocking(move || {
+        tauri::ipc::Response::new(
+            std::fs::read(master_timeline_cache_path(&host_dir)).unwrap_or_default(),
+        )
+    })
+    .await
+    .unwrap_or_else(|_| tauri::ipc::Response::new(Vec::new()))
 }
 
 #[derive(Serialize)]
@@ -1177,23 +1200,30 @@ fn find_result_files(dir: &Path, base: &Path, out: &mut Vec<ResultFileEntry>) {
     }
 }
 
+// 동기 커맨드는 Tauri 메인 스레드(창 이벤트 루프)에서 실행된다. 이 목록은
+// 테이블별 COUNT(MFT 수백만 행 포함)를 도는 무거운 스캔이라, 메인 스레드에
+// 두면 조회가 끝날 때까지 창 전체가 입력을 못 받는다(결과 보기 진입 멈춤).
 #[tauri::command]
-fn list_result_files(category_dir: String) -> Vec<ResultFileEntry> {
-    let base = PathBuf::from(&category_dir);
-    // This command is also callable directly. Do not rely on the category
-    // list UI to hide staging/log directories: a supplied nested path must
-    // never expose work-in-progress SQLite files.
-    if has_internal_pipeline_path_component(&base) {
-        return Vec::new();
-    }
-    let mut out = Vec::new();
-    find_result_files(&base, &base, &mut out);
-    out.sort_by(|a, b| {
-        a.relative_path
-            .cmp(&b.relative_path)
-            .then(a.table_name.cmp(&b.table_name))
-    });
-    out
+async fn list_result_files(category_dir: String) -> Vec<ResultFileEntry> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let base = PathBuf::from(&category_dir);
+        // This command is also callable directly. Do not rely on the category
+        // list UI to hide staging/log directories: a supplied nested path must
+        // never expose work-in-progress SQLite files.
+        if has_internal_pipeline_path_component(&base) {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        find_result_files(&base, &base, &mut out);
+        out.sort_by(|a, b| {
+            a.relative_path
+                .cmp(&b.relative_path)
+                .then(a.table_name.cmp(&b.table_name))
+        });
+        out
+    })
+    .await
+    .unwrap_or_default()
 }
 
 /// Upgrade only the derived ExecutionHistory table when it predates source
@@ -2756,6 +2786,39 @@ async fn wmi_subscription_events(host_dir: String) -> Result<WmiSubscriptionEven
     .map_err(|error| format!("WMI 구독 이벤트 조회가 중단되었습니다: {error}"))?
 }
 
+/// PowerShellHistory 원문 검색 — 목록 IPC는 script_block/host_application을
+/// 미리보기(1,000자)로만 싣기 때문에, 그 뒤의 IOC·명령 문자열은 서버에서
+/// 원문 컬럼을 대상으로 찾아 일치 rowid를 돌려준다. 뷰는 이 집합을 화면
+/// 필터에 합류시켜 절단 없이 검색 정확성을 유지한다.
+#[tauri::command]
+async fn powershell_search_rowids(
+    full_path: String,
+    query: String,
+) -> Result<Vec<i64>, String> {
+    tauri::async_runtime::spawn_blocking(move || -> Result<Vec<i64>, String> {
+        let needle = query.trim().to_lowercase();
+        if needle.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = open_ro(&full_path)?;
+        let like = format!(
+            "%{}%",
+            needle
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_")
+        );
+        let sql = "SELECT rowid FROM \"PowerShellHistory\" WHERE lower(COALESCE(command,'')) LIKE ?1 ESCAPE '\\' OR lower(COALESCE(script_block,'')) LIKE ?1 ESCAPE '\\' OR lower(COALESCE(host_application,'')) LIKE ?1 ESCAPE '\\'";
+        let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([&like], |r| r.get::<_, i64>(0))
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|error| format!("파워셸 검색 작업이 중단되었습니다: {error}"))?
+}
+
 #[tauri::command]
 fn read_result_file(full_path: String, table_name: Option<String>) -> Result<CsvData, String> {
     let conn = open_ro(&full_path)?;
@@ -3085,16 +3148,15 @@ fn mft_children_blocking(
 }
 
 #[tauri::command]
-fn mft_search(full_path: String, query: String, limit: i64) -> Vec<Map<String, Value>> {
-    let conn = match open_ro(&full_path) {
-        Ok(c) => c,
-        Err(_) => return vec![],
-    };
+fn mft_search(full_path: String, query: String, limit: i64) -> Result<Vec<Map<String, Value>>, String> {
+    // DB 열기·쿼리 실패를 빈 결과로 위장하지 않는다 — "일치 없음"과
+    // "조회 실패"는 분석 판단이 달라지는 별개의 상태다.
+    let conn = open_ro(&full_path)?;
     // 호출자 값에 의존하지 않는 서버 측 상한.
     let limit = limit.clamp(1, 500);
     let like = format!("%{}%", query);
     let sql = format!("SELECT rowid AS __rowid, * FROM {} WHERE file_name LIKE ?1 OR path LIKE ?1 ORDER BY is_directory DESC, path COLLATE NOCASE LIMIT ?2", q(MFT_TABLE));
-    query_rows(&conn, &sql, &[&like, &limit]).unwrap_or_default()
+    query_rows(&conn, &sql, &[&like, &limit])
 }
 
 /// A bounded, recursive MFT record page for the file-system ledger. Unlike
@@ -4026,6 +4088,8 @@ struct BrowserVisitFlow {
     /// For a cache resource: the navigated page we attributed it to.
     matched_page: String,
     note: String,
+    /// 방문 검사 상한(VISIT_FLOW_SCAN_VISITS)에 걸려 최근 일부만 분석한 경우.
+    truncated: bool,
 }
 
 /// Decode a Chromium page-transition integer into a short Korean label.
@@ -4093,10 +4157,57 @@ fn cache_key_document_origin(cache_key: &str) -> Option<String> {
         .and_then(url_origin)
 }
 
+/// 경로 비교용 정규화 — 소문자화 + 구분자 통일.
+fn normalize_fs_path(p: &str) -> String {
+    p.trim().to_lowercase().replace('\\', "/")
+}
+
+/// 캐시 index 수집 경로의 브라우저 프로필 루트 —
+/// `.../<프로필>/Cache[/Cache_Data]/index` → `.../<프로필>`.
+fn cache_profile_root(index_path: &str) -> Option<String> {
+    let norm = normalize_fs_path(index_path);
+    let mut parts: Vec<&str> = norm.split('/').filter(|s| !s.is_empty()).collect();
+    parts.pop()?; // index 파일명
+    if parts.last().copied() == Some("cache_data") {
+        parts.pop();
+    }
+    if parts.last().copied() == Some("cache") {
+        parts.pop();
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("/"))
+    }
+}
+
+/// History 결과 DB에 파이프라인이 남긴 수집 원본 경로(_wina_source)의
+/// 프로필 루트(부모 폴더). 매핑이 없는 구 파싱본은 None.
+fn history_profile_root(db: &Path) -> Option<String> {
+    let conn = open_ro(&db.to_string_lossy()).ok()?;
+    let source: String = conn
+        .query_row("SELECT source_path FROM \"_wina_source\" LIMIT 1", [], |r| {
+            r.get(0)
+        })
+        .ok()?;
+    let norm = normalize_fs_path(&source);
+    let mut parts: Vec<&str> = norm.split('/').filter(|s| !s.is_empty()).collect();
+    parts.pop()?; // History 파일명
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("/"))
+    }
+}
+
 const VISIT_FLOW_DEPTH_CAP: usize = 25;
 const VISIT_FLOW_MAX_CHAINS: usize = 10;
 /// Upper bound on genuinely distinct inflow paths returned to the UI.
 const VISIT_FLOW_MAX_DISTINCT: usize = 5;
+/// URL 하나에서 검사하는 최근 방문 수의 상한 — 최신 몇 건이 같은 유입의
+/// 리다이렉트로 채워져도 그 뒤의 다른 유입 경로가 조사되도록 충분히 넓게
+/// 잡는다. 이 상한에 걸리면 결과에 truncated로 표시한다.
+const VISIT_FLOW_SCAN_VISITS: usize = 400;
 
 /// Resolve one visit id into its stored fields, or None when absent. The
 /// collected browser History copy stores every column as TEXT (ids and the
@@ -4306,7 +4417,7 @@ fn browser_visit_flow_blocking(
                     Some(browser) => {
                         let account_prefix = format!("{account}_");
                         let browser_token = format!("_{browser}");
-                        browser_history_dbs(&host_dir, &account)
+                        let filtered: Vec<PathBuf> = browser_history_dbs(&host_dir, &account)
                             .into_iter()
                             .filter(|path| {
                                 path.file_name().is_some_and(|n| {
@@ -4314,7 +4425,33 @@ fn browser_visit_flow_blocking(
                                     n.starts_with(&account_prefix) && n.contains(&browser_token)
                                 })
                             })
-                            .collect()
+                            .collect();
+                        // 같은 브라우저 다중 프로필 구분: History 산출물의 수집
+                        // 원본(_wina_source) 프로필 루트와 캐시 index의 프로필
+                        // 루트가 일치하는 DB만 채택한다. 매핑이 없고(구 파싱본)
+                        // 후보가 여럿이면 임의 선택 대신 비활성 — Default 캐시에
+                        // Profile 1 체인이 붙는 오귀속을 차단한다.
+                        let cache_root = cache_profile_root(value);
+                        let matched: Vec<PathBuf> = match cache_root.as_deref() {
+                            Some(root) => filtered
+                                .iter()
+                                .filter(|db| history_profile_root(db).as_deref() == Some(root))
+                                .cloned()
+                                .collect(),
+                            None => Vec::new(),
+                        };
+                        if matched.len() == 1 {
+                            matched
+                        } else if filtered.len() <= 1 {
+                            // 후보가 하나뿐이면 프로필 모호성이 없고, 0개면
+                            // 아래 공통 빈 후보 안내로 떨어진다.
+                            filtered
+                        } else {
+                            return BrowserVisitFlow {
+                                note: "같은 브라우저 프로필이 여러 개라 이 캐시의 원본 프로필을 특정할 수 없습니다 — 재파싱하면 사용할 수 있습니다.".to_string(),
+                                ..Default::default()
+                            };
+                        }
                     }
                     None => {
                         return BrowserVisitFlow {
@@ -4332,10 +4469,21 @@ fn browser_visit_flow_blocking(
             ..Default::default()
         };
     }
+    // 원본 접근·스키마 실패는 "직접 확인 결과 유입 없음"과 구분해 남긴다 —
+    // 손상·잠금이 빈 흐름으로 위장하면 분석가가 증거 부재로 오판한다.
+    let mut source_failures: Vec<String> = Vec::new();
+    let mut truncated = false;
     for db in candidates {
+        let db_name = db
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
         let conn = match open_ro(&db.to_string_lossy()) {
             Ok(c) => c,
-            Err(_) => continue,
+            Err(error) => {
+                source_failures.push(format!("{db_name}: 열기 실패 ({error})"));
+                continue;
+            }
         };
         // Require both tables — a truncated copy is skipped, not reported empty.
         let has_tables = conn
@@ -4347,6 +4495,7 @@ fn browser_visit_flow_blocking(
             .unwrap_or(0)
             == 2;
         if !has_tables {
+            source_failures.push(format!("{db_name}: urls/visits 테이블 없음"));
             continue;
         }
         let source_file = db
@@ -4367,18 +4516,23 @@ fn browser_visit_flow_blocking(
                 .or_else(|| url_origin(&url));
             if let Some(origin) = origin {
                 matched_page = origin.clone();
-                // LIKE는 사전 필터일 뿐 — 접두어 일치만으로는
-                // `https://example.com.evil/…`·`https://example.com:8443/…`까지
-                // 같은 출처로 오인한다. 각 후보 URL의 origin을 파싱해
-                // 완전 일치(포트 포함)할 때만 기준 페이지로 채택한다.
-                let like = format!(
-                    "{}%",
-                    origin.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
-                );
+                // 접두어 LIKE만으로는 `https://example.com.evil/…`·다른 포트가
+                // 후보 상한(60)을 점유해 실제 origin 페이지가 밀릴 수 있다 —
+                // SQL 단계에서 origin 경계(정확 일치 / '/', '?', '#' 뒤따름)로
+                // 후보를 제한하고, Rust에서 origin 완전 일치를 재검증한다.
+                let escaped = origin
+                    .replace('\\', "\\\\")
+                    .replace('%', "\\%")
+                    .replace('_', "\\_");
                 if let Ok(mut stmt) = conn.prepare(
-                    "SELECT id, url FROM urls WHERE url LIKE ?1 ESCAPE '\\' ORDER BY CAST(visit_count AS INTEGER) DESC LIMIT 60",
+                    "SELECT id, url FROM urls WHERE (url = ?1 OR url LIKE ?2 ESCAPE '\\' OR url LIKE ?3 ESCAPE '\\' OR url LIKE ?4 ESCAPE '\\') ORDER BY CAST(visit_count AS INTEGER) DESC LIMIT 60",
                 ) {
-                    if let Ok(mut rows) = stmt.query([like]) {
+                    if let Ok(mut rows) = stmt.query(rusqlite::params![
+                        origin,
+                        format!("{escaped}/%"),
+                        format!("{escaped}?%"),
+                        format!("{escaped}#%"),
+                    ]) {
                         while let Ok(Some(r)) = rows.next() {
                             if url_ids.len() >= 6 {
                                 break;
@@ -4415,11 +4569,14 @@ fn browser_visit_flow_blocking(
                 break;
             }
             let mut visit_ids: Vec<String> = Vec::new();
+            // 체인 상한(10)으로 방문 조회를 자르면 최신 방문들이 한 유입의
+            // 리다이렉트일 때 그 뒤의 다른 유입 경로가 조사되지 못한다 —
+            // 충분히 넓게(400) 읽고, 상한 도달은 truncated로 화면에 알린다.
             if let Ok(mut stmt) = conn.prepare(
                 "SELECT id FROM visits WHERE url = ?1 ORDER BY CAST(visit_time AS INTEGER) DESC LIMIT ?2",
             ) {
                 if let Ok(mut rows) =
-                    stmt.query(rusqlite::params![url_id, VISIT_FLOW_MAX_CHAINS as i64])
+                    stmt.query(rusqlite::params![url_id, VISIT_FLOW_SCAN_VISITS as i64])
                 {
                     while let Ok(Some(r)) = rows.next() {
                         if let Ok(id) = r.get::<_, String>(0) {
@@ -4427,6 +4584,9 @@ fn browser_visit_flow_blocking(
                         }
                     }
                 }
+            }
+            if visit_ids.len() >= VISIT_FLOW_SCAN_VISITS {
+                truncated = true;
             }
             // Split the page's visits into genuine inflows vs. same-URL
             // redirects/reloads. Every visit whose parent is this same page is
@@ -4544,6 +4704,17 @@ fn browser_visit_flow_blocking(
             source_file,
             matched_page,
             note,
+            truncated,
+        };
+    }
+    // 모든 후보에서 체인을 만들지 못함 — 실패가 있으면 오류로 구분해 안내.
+    if !source_failures.is_empty() {
+        return BrowserVisitFlow {
+            note: format!(
+                "원본 방문 기록을 읽지 못해 유입 흐름을 확인할 수 없습니다 — {}",
+                source_failures.join("; ")
+            ),
+            ..Default::default()
         };
     }
     BrowserVisitFlow {
@@ -4564,7 +4735,10 @@ async fn browser_visit_flow(
         browser_visit_flow_blocking(host_dir, account, url, cache_key, source_file)
     })
     .await
-    .unwrap_or_default()
+    .unwrap_or_else(|error| BrowserVisitFlow {
+        note: format!("유입 흐름 작업이 중단되었습니다: {error}"),
+        ..Default::default()
+    })
 }
 
 #[derive(Serialize)]
@@ -6356,6 +6530,84 @@ mod browser_activity_tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// 같은 계정·같은 브라우저의 다중 프로필: 캐시 행은 _wina_source의 프로필
+    /// 루트가 일치하는 History만 연결되고, 매핑이 없는 산출물이 여럿이면
+    /// 임의 선택 대신 비활성 안내가 반환된다.
+    #[test]
+    fn cache_flow_matches_only_the_same_browser_profile() {
+        let root = std::env::temp_dir().join(format!(
+            "windows-analysis-visitflow-profile-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        ));
+        let dir = root.join("BROWSER");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Default / Profile 1 — 같은 URL, 유입 출발지만 다르다.
+        for (file, origin, source) in [
+            (
+                "user_Chrome.sqlite",
+                "https://from-default.test/",
+                "/img/Users/user/AppData/Local/Google/Chrome/User Data/Default/History",
+            ),
+            (
+                "user_Chrome_2.sqlite",
+                "https://from-profile1.test/",
+                "/img/Users/user/AppData/Local/Google/Chrome/User Data/Profile 1/History",
+            ),
+        ] {
+            let conn = Connection::open(dir.join(file)).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE urls (id TEXT, url TEXT, title TEXT, visit_count TEXT);\
+                 CREATE TABLE visits (id TEXT, url TEXT, from_visit TEXT, opener_visit TEXT, transition TEXT, external_referrer_url TEXT, visit_time TEXT);\
+                 CREATE TABLE \"_wina_source\" (source_path TEXT);",
+            )
+            .unwrap();
+            conn.execute("INSERT INTO \"_wina_source\" VALUES (?1)", [source]).unwrap();
+            conn.execute("INSERT INTO urls VALUES ('1', ?1, '', '1')", [origin]).unwrap();
+            conn.execute("INSERT INTO urls VALUES ('2', 'https://t.test/p', '', '1')", []).unwrap();
+            conn.execute(
+                "INSERT INTO visits (id,url,from_visit,opener_visit,transition,external_referrer_url,visit_time) VALUES ('10','1','0','0','1','','13427941143000000')",
+                [],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO visits (id,url,from_visit,opener_visit,transition,external_referrer_url,visit_time) VALUES ('11','2','10','0','0','','13427941143100000')",
+                [],
+            ).unwrap();
+        }
+
+        // Profile 1의 캐시 index → Profile 1 History 체인만 연결된다.
+        let flow = browser_visit_flow_blocking(
+            root.to_string_lossy().to_string(),
+            "user".to_string(),
+            "https://t.test/asset/app.js".to_string(),
+            Some("1/0/_dk_https://t.test https://t.test https://t.test/asset/app.js".to_string()),
+            Some("/img/Users/user/AppData/Local/Google/Chrome/User Data/Profile 1/Cache/Cache_Data/index".to_string()),
+        );
+        assert_eq!(flow.source_file, "user_Chrome_2.sqlite");
+        assert_eq!(flow.chains.len(), 1);
+        assert_eq!(flow.chains[0].steps[0].url, "https://from-profile1.test/");
+
+        // 프로필 매핑이 없는 산출물(구 파싱본)에서 후보가 여럿이면 비활성.
+        for file in ["user_Chrome.sqlite", "user_Chrome_2.sqlite"] {
+            let conn = Connection::open(dir.join(file)).unwrap();
+            conn.execute_batch("DROP TABLE \"_wina_source\";").unwrap();
+        }
+        let ambiguous = browser_visit_flow_blocking(
+            root.to_string_lossy().to_string(),
+            "user".to_string(),
+            "https://t.test/asset/app.js".to_string(),
+            Some("1/0/_dk_https://t.test https://t.test https://t.test/asset/app.js".to_string()),
+            Some("/img/Users/user/AppData/Local/Google/Chrome/User Data/Profile 1/Cache/Cache_Data/index".to_string()),
+        );
+        assert!(ambiguous.chains.is_empty());
+        assert!(ambiguous.note.contains("프로필"), "note: {}", ambiguous.note);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     fn browser_domain_cache_test_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
@@ -7107,7 +7359,10 @@ mod pipeline_log_supervision_tests {
         let internal = root.join("host").join(".parse-staging").join("run-1");
         std::fs::create_dir_all(&internal).unwrap();
         assert!(has_internal_pipeline_path_component(&internal));
-        assert!(list_result_files(internal.to_string_lossy().to_string()).is_empty());
+        assert!(tauri::async_runtime::block_on(list_result_files(
+            internal.to_string_lossy().to_string()
+        ))
+        .is_empty());
         let _ = std::fs::remove_dir_all(root);
     }
 }
@@ -7239,7 +7494,8 @@ fn main() {
             cache_entry_body,
             browser_visit_flow,
             ai_conversations,
-            wmi_subscription_events
+            wmi_subscription_events,
+            powershell_search_rowids
         ])
         .setup(|_app| Ok(()))
         .run(tauri::generate_context!())

@@ -4,7 +4,7 @@ import PaginationControls from "@/components/PaginationControls";
 import AccountFilterChips from "@/components/AccountFilterChips";
 import { HeaderSearchInput, SelectDropdown, ViewHeader } from "@/components/FilterControls";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import BookmarkBorderOutlinedIcon from "@mui/icons-material/BookmarkBorderOutlined";
 import BookmarkOutlinedIcon from "@mui/icons-material/BookmarkOutlined";
 import CloseOutlinedIcon from "@mui/icons-material/CloseOutlined";
@@ -143,12 +143,15 @@ export default function PowerShellFlowView({
   // 목록 로드는 script_block/host_application을 앞부분 미리보기로만 받는다
   // (대량 4104 호스트의 웹뷰 메모리 보호). 상세는 원본 행 전체를 다시 받아
   // 코드 블록이 절단 없이 표시되게 한다 — 실패하면 미리보기 행으로 연다.
+  // 늦게 도착한 이전 요청 응답이 더 최근 선택을 덮지 않도록 최신 요청만 반영.
+  const detailSeq = useRef(0);
   const openDetail = (row: Record<string, string>) => {
     const rowid = Number((row as Record<string, unknown>).__rowid);
+    const seq = ++detailSeq.current;
     if (dbPath && Number.isFinite(rowid)) {
       window.api.resultRow(dbPath, TABLE_NAME, rowid)
-        .then((full) => setSelected(full.row ? { ...full.row, __rowid: String(rowid) } as Record<string, string> : row))
-        .catch(() => setSelected(row));
+        .then((full) => { if (seq === detailSeq.current) setSelected(full.row ? { ...full.row, __rowid: String(rowid) } as Record<string, string> : row); })
+        .catch(() => { if (seq === detailSeq.current) setSelected(row); });
     } else {
       setSelected(row);
     }
@@ -157,6 +160,26 @@ export default function PowerShellFlowView({
   // 실행 이력 뷰와 같은 접이식 구역으로 보여준다.
   const [untimedOpen, setUntimedOpen] = useState(false);
   const [untimedPage, setUntimedPage] = useState(0);
+
+  // 목록 IPC의 script_block/host_application은 앞 1,000자 미리보기 — 그 뒤의
+  // IOC까지 놓치지 않도록, 검색어가 있으면 서버에서 원문 컬럼을 매칭한 rowid
+  // 집합을 받아 화면 필터에 합류시킨다.
+  const [serverMatches, setServerMatches] = useState<Set<number> | null>(null);
+  const searchSeq = useRef(0);
+  useEffect(() => {
+    const needle = query.trim();
+    const seq = ++searchSeq.current;
+    if (!needle || !dbPath) {
+      setServerMatches(null);
+      return;
+    }
+    const timer = setTimeout(() => {
+      window.api.powershellSearchRowids(dbPath, needle)
+        .then((rowids) => { if (seq === searchSeq.current) setServerMatches(new Set(rowids)); })
+        .catch(() => { if (seq === searchSeq.current) setServerMatches(new Set()); });
+    }, 250);
+    return () => clearTimeout(timer);
+  }, [query, dbPath]);
 
   const allSessions = useMemo(() => clusterSessions(data, timeRange), [data, timeRange]);
   const untimed = useMemo(() => {
@@ -167,10 +190,11 @@ export default function PowerShellFlowView({
         if (kindFilter && (row.kind ?? "") !== kindFilter) return false;
         if (hiddenAccounts.has(row.account ?? "")) return false;
         if (!needle) return true;
+        if (serverMatches?.has(Number((row as Record<string, unknown>).__rowid))) return true;
         return [row.account, row.command, row.kind].some((value) => (value ?? "").toLowerCase().includes(needle));
       })
       .sort((a, b) => (a.account ?? "").localeCompare(b.account ?? "") || (Number(a.line_number) || 0) - (Number(b.line_number) || 0));
-  }, [data.rows, kindFilter, hiddenAccounts, query]);
+  }, [data.rows, kindFilter, hiddenAccounts, query, serverMatches]);
   useEffect(() => setUntimedPage(0), [untimed.length]);
   const sessions = useMemo(() => {
     const needle = query.trim().toLowerCase();
@@ -179,12 +203,13 @@ export default function PowerShellFlowView({
         if (kindFilter && event.kind !== kindFilter) return false;
         if (hiddenAccounts.has(event.account)) return false;
         if (!needle) return true;
+        if (serverMatches?.has(event.rowid)) return true;
         return [event.account, event.process, event.processId, event.command, event.scriptBlock, event.hostApplication]
           .some((value) => value.toLowerCase().includes(needle));
       });
       return events.length ? [{ ...session, events, start: events[0].timestamp, end: events[events.length - 1].timestamp }] : [];
     });
-  }, [allSessions, hiddenAccounts, kindFilter, query]);
+  }, [allSessions, hiddenAccounts, kindFilter, query, serverMatches]);
   const eventCount = useMemo(() => sessions.reduce((count, session) => count + session.events.length, 0), [sessions]);
   const allAccounts = useMemo(
     () => [...new Set(allSessions.flatMap((session) => session.events.map((event) => event.account)))].sort((a, b) => a.localeCompare(b)),
@@ -243,7 +268,7 @@ export default function PowerShellFlowView({
                       onMouseEnter={(event) => { if (!bookmarked) event.currentTarget.style.background = "var(--bg-hover)"; }}
                       onMouseLeave={(event) => { if (!bookmarked) event.currentTarget.style.background = "transparent"; }}
                     >
-                      <div role="button" tabIndex={0} onClick={() => openDetail(row)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); openDetail(row); } }} style={{ flex: 1, display: "flex", alignItems: "center", gap: 10, minWidth: 0, cursor: "pointer", outlineOffset: 2 }}>
+                      <div role="button" tabIndex={0} onClick={(clickEvent) => { clickEvent.stopPropagation(); openDetail(row); }} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); openDetail(row); } }} style={{ flex: 1, display: "flex", alignItems: "center", gap: 10, minWidth: 0, cursor: "pointer", outlineOffset: 2 }}>
                         <span style={{ width: 44, flexShrink: 0, textAlign: "right", color: "var(--text-faint)", fontFamily: "var(--mono)", fontSize: 11.5 }}>{row.line_number || "-"}</span>
                         <span style={{ flexShrink: 0, fontSize: 11.5, fontWeight: 700, color: "var(--text-dim)", border: "1px solid var(--text-dim)", borderRadius: "var(--radius-sm)", padding: "1px 8px", whiteSpace: "nowrap" }}>{row.kind || "콘솔 히스토리"}</span>
                         <span title={row.command} style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontFamily: "var(--mono)", fontSize: 12.5 }}>{row.command || "(명령 없음)"}</span>
@@ -329,7 +354,7 @@ export default function PowerShellFlowView({
                     return (
                       // 행 전체(여백 포함)가 상세 열기 클릭 대상 — 북마크는 전파 차단.
                       <div key={`${event.rowid}-${event.timestamp}`} className={bookmarked ? "dfir-bookmarked-row ps-session-event" : "ps-session-event"} onClick={() => openDetail(event.row)} style={{ borderRadius: 0, display: "flex", alignItems: "center", gap: 8, minHeight: 46, padding: "8px 14px 8px 60px", borderTop: eventIndex === 0 ? "none" : "1px solid var(--border-subtle)", background: "transparent", cursor: "pointer", transition: "background .15s ease" }} onMouseEnter={(mouseEvent) => { if (!bookmarked) mouseEvent.currentTarget.style.background = "var(--bg-hover)"; }} onMouseLeave={(mouseEvent) => { if (!bookmarked) mouseEvent.currentTarget.style.background = "transparent"; }}>
-                        <button type="button" className="ps-session-child" onClick={() => openDetail(event.row)} aria-label={`${formatEvidenceTimestamp(event.timestamp)} ${kindLabel} 상세 보기`} style={{ flex: 1, display: "grid", gridTemplateColumns: "158px 104px minmax(0, 1fr)", gap: 10, alignItems: "center", minWidth: 0, padding: 0, color: "var(--text)", cursor: "pointer", border: "none", background: "transparent", textAlign: "left", outlineOffset: 2 }}>
+                        <button type="button" className="ps-session-child" onClick={(clickEvent) => { clickEvent.stopPropagation(); openDetail(event.row); }} aria-label={`${formatEvidenceTimestamp(event.timestamp)} ${kindLabel} 상세 보기`} style={{ flex: 1, display: "grid", gridTemplateColumns: "158px 104px minmax(0, 1fr)", gap: 10, alignItems: "center", minWidth: 0, padding: 0, color: "var(--text)", cursor: "pointer", border: "none", background: "transparent", textAlign: "left", outlineOffset: 2 }}>
                           <span className="ps-session-child-time" style={{ color: "var(--text-time)", fontFamily: "var(--mono)", fontSize: 12.5, whiteSpace: "nowrap" }}>{formatEvidenceTimestamp(event.timestamp)}</span>
                           <span className="ps-session-child-type" style={{ justifySelf: "start", fontSize: 11.5, fontWeight: 700, color: kindColor, border: `1px solid ${kindColor}`, borderRadius: "var(--radius-sm)", padding: "1px 8px", whiteSpace: "nowrap" }}>{kindLabel}</span>
                           <span className="ps-session-child-content" style={{ minWidth: 0, display: "grid", gap: 3 }}>
@@ -342,7 +367,7 @@ export default function PowerShellFlowView({
                             {hostApplicationSecondary && <span title={event.hostApplication} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text-faint)", fontFamily: "var(--mono)", fontSize: 11 }}>HostApplication · {hostApplicationSecondary}</span>}
                           </span>
                         </button>
-                        {onToggleBookmark && Number.isFinite(event.rowid) && <button type="button" className={bookmarked ? "dfir-bookmark-control" : undefined} onClick={() => onToggleBookmark(event.rowid)} aria-label={bookmarked ? "북마크 해제" : "북마크 추가"} title={bookmarked ? "북마크 해제" : "북마크 추가"} style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 28, height: 28, padding: 0, border: "none", background: "transparent", color: bookmarked ? "var(--bookmark-control)" : "var(--text-faint)", cursor: "pointer" }}>{bookmarked ? <BookmarkOutlinedIcon sx={{ fontSize: 16 }} /> : <BookmarkBorderOutlinedIcon sx={{ fontSize: 16 }} />}</button>}
+                        {onToggleBookmark && Number.isFinite(event.rowid) && <button type="button" className={bookmarked ? "dfir-bookmark-control" : undefined} onClick={(clickEvent) => { clickEvent.stopPropagation(); onToggleBookmark(event.rowid); }} aria-label={bookmarked ? "북마크 해제" : "북마크 추가"} title={bookmarked ? "북마크 해제" : "북마크 추가"} style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 28, height: 28, padding: 0, border: "none", background: "transparent", color: bookmarked ? "var(--bookmark-control)" : "var(--text-faint)", cursor: "pointer" }}>{bookmarked ? <BookmarkOutlinedIcon sx={{ fontSize: 16 }} /> : <BookmarkBorderOutlinedIcon sx={{ fontSize: 16 }} />}</button>}
                       </div>
                     );
                   })}

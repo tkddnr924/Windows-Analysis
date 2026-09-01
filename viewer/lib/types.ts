@@ -89,6 +89,8 @@ export interface BrowserVisitFlow {
   /** For a cache resource: the navigated page it was attributed to. */
   matchedPage: string;
   note: string;
+  /** 방문 검사 상한에 걸려 최근 일부 방문만 분석한 경우. */
+  truncated: boolean;
 }
 
 /** A server-paginated page of host-normalised browser visit domains. */
@@ -509,8 +511,10 @@ export interface ElectronApi {
   listCategories(hostDir: string): Promise<CategoryEntry[]>;
   // Persisted master-timeline cache. The payload is opaque JSON authored by the
   // frontend ({ builtForRunAt, entries }); the backend just stores/returns it.
+  // 읽기는 raw 바이트다 — 수백 MB 캐시를 문자열 IPC로 나르면 응답 JSON
+  // 직렬화만으로 메인 스레드가 수십 초 멈춘다. 캐시가 없으면 빈 버퍼.
   saveMasterTimeline(hostDir: string, payload: string): Promise<void>;
-  loadMasterTimeline(hostDir: string): Promise<string | null>;
+  loadMasterTimeline(hostDir: string): Promise<ArrayBuffer>;
   listResultFiles(categoryDir: string): Promise<ResultFileEntry[]>;
   /** Rebuilds only a legacy ExecutionHistory overview to add raw record links. */
   refreshExecutionHistoryOverview(hostDir: string): Promise<boolean>;
@@ -556,6 +560,8 @@ export interface ElectronApi {
   aiConversations(hostDir: string, query: { start?: string; end?: string; offset: number; limit: number }): Promise<AiConversationPage>;
   /** WMI-Activity 로그의 구독 이벤트(5859~5861)만 서버에서 걸러 받는다. */
   wmiSubscriptionEvents(hostDir: string): Promise<WmiSubscriptionEvents>;
+  /** PowerShellHistory 원문(절단 없는 컬럼) 검색 — 일치 rowid 집합 반환. */
+  powershellSearchRowids(fullPath: string, query: string): Promise<number[]>;
 }
 
 declare global {
