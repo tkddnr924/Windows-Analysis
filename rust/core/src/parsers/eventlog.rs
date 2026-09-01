@@ -40,6 +40,10 @@ pub const ALLOWLIST: &[&str] = &[
     "Microsoft-Windows-RemoteDesktopServices-RdpCoreTS%4Operational.evtx",
     // Run 키 실행 결과(9707/9708) — 영속성 발동 여부.
     "Microsoft-Windows-Shell-Core%4Operational.evtx",
+    // 오류 보고(WER) 전용 채널 — 크래시 진단·보고 업로드 흔적.
+    "Microsoft-Windows-WER-Diag%4Operational.evtx",
+    "Microsoft-Windows-WER-PayloadHealth%4Operational.evtx",
+    "Microsoft-Windows-WerKernel%4Operational.evtx",
 ];
 
 /// XP/2003 구형 이벤트 로그(.evt) 기본 파일명 — Vista+에서 .evtx로 대체됐다.

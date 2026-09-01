@@ -11,3 +11,8 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# Win11 SRUM(SRUDB.dat)의 신형 ESE 페이지 태그 플래그를 처리하는 다운스트림
+# 패치(vendor/libesedb-sys/patches/fix-win11_page_tag_flags.patch) 적용본.
+[patch.crates-io]
+libesedb-sys = { path = "vendor/libesedb-sys" }

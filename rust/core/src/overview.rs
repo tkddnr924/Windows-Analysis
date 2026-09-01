@@ -869,6 +869,116 @@ fn ntstatus_note(status: u64) -> Option<&'static str> {
     }
 }
 
+// --- 오류 보고(WER) 통합 — Report.wer 산출물 + EventLog 오류 보고(1001) ---
+
+// Report.wer 파싱 산출물(WER_FIELD_ORDER)과 같은 컬럼 이름을 유지해 WER 뷰가
+// 두 출처를 구분 없이 렌더링한다. source가 출처를, record_key가 원본 행을 남긴다.
+pub const WER_OV_KEYS: &[&str] = &[
+    "timestamp",
+    "EventType",
+    "AppName",
+    "AppPath",
+    "TargetAppId",
+    "ReportIdentifier",
+    "report",
+    "source",
+    "record_key",
+    "_source_file",
+];
+
+fn wer_ov_row() -> Row {
+    let mut r = Row::new();
+    for k in WER_OV_KEYS {
+        r.insert((*k).to_string(), String::new());
+    }
+    r
+}
+
+/// 1001 P-필드에서 결함 모듈의 전체 경로를 찾는다 — WER 임시 보관 폴더
+/// (…\WER\…) 경로는 프로그램이 아니라 보고서 부속 파일 위치라 제외한다.
+fn wer_p_field_path(d: &serde_json::Map<String, serde_json::Value>) -> String {
+    for i in 1..=10 {
+        let v = jget(d, &format!("P{i}"));
+        let b = v.as_bytes();
+        let drive_path = b.len() > 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'\\';
+        let lower = v.to_lowercase();
+        let module = lower.ends_with(".exe") || lower.ends_with(".dll") || lower.ends_with(".sys");
+        if drive_path && module && !lower.contains("\\wer\\") {
+            return v;
+        }
+    }
+    String::new()
+}
+
+pub fn build_wer_reports(out_dir: &Path) -> Vec<Row> {
+    build_wer_reports_with_events(out_dir, &EventLogOverviewCache::load(out_dir))
+}
+
+pub fn build_wer_reports_with_events(out_dir: &Path, events: &EventLogOverviewCache) -> Vec<Row> {
+    let mut rows = Vec::new();
+    // 1) Report.wer 파싱 산출물 — 컬럼 그대로, record_key로 원본 행을 고정한다.
+    let db = out_dir.join("WER").join("WER_Reports.sqlite");
+    for r in read_table_with_rowid(&db, "WER_Reports") {
+        let mut rec = wer_ov_row();
+        for k in [
+            "timestamp",
+            "EventType",
+            "AppName",
+            "AppPath",
+            "TargetAppId",
+            "ReportIdentifier",
+            "report",
+            "_source_file",
+        ] {
+            if let Some(v) = r.get(k) {
+                rec.insert(k.to_string(), v.clone());
+            }
+        }
+        rec.insert("source".into(), "Report.wer".into());
+        rec.insert("record_key".into(), source_record_key(&db, "WER_Reports", &r));
+        rows.push(rec);
+    }
+    // 2) EventLog의 Windows Error Reporting 보고(1001) — 앱 정보가 있는 오류
+    //    보고만 편입한다. WER 채널의 업로드 상태 텔레메트리(PayloadHealth 등)는
+    //    보고서가 아니라 전송 기록이므로 EVENTLOG 원본으로만 남긴다.
+    for r in events.rows() {
+        if r.get("Provider").map(String::as_str) != Some("Windows Error Reporting")
+            || r.get("EventID").map(String::as_str) != Some("1001")
+        {
+            continue;
+        }
+        let raw = r.get("EventData").map(String::as_str).unwrap_or("");
+        let d = parse_eventdata(raw);
+        let mut rec = wer_ov_row();
+        rec.insert(
+            "timestamp".into(),
+            r.get("timestamp").cloned().unwrap_or_default(),
+        );
+        rec.insert("EventType".into(), jget(&d, "EventName"));
+        rec.insert("AppName".into(), jget(&d, "P1"));
+        rec.insert("AppPath".into(), wer_p_field_path(&d));
+        rec.insert("ReportIdentifier".into(), jget(&d, "ReportId"));
+        rec.insert("report".into(), raw.to_string());
+        rec.insert("source".into(), "EventLog".into());
+        rec.insert(
+            "record_key".into(),
+            r.get("_record_key").cloned().unwrap_or_default(),
+        );
+        rec.insert(
+            "_source_file".into(),
+            r.get("_source_file").cloned().unwrap_or_default(),
+        );
+        rows.push(rec);
+    }
+    // 시각 문자열 오름차순(빈 시각은 뒤) — 뷰 기본 정렬과 같은 안정 순서.
+    rows.sort_by(|a, b| {
+        let ta = a.get("timestamp").map(String::as_str).unwrap_or("");
+        let tb = b.get("timestamp").map(String::as_str).unwrap_or("");
+        (ta.is_empty(), ta).cmp(&(tb.is_empty(), tb))
+    });
+    rows
+}
+
 pub fn build_smb_history(out_dir: &Path) -> Vec<Row> {
     build_smb_history_with_events(&EventLogOverviewCache::load(out_dir))
 }
@@ -6185,6 +6295,65 @@ mod tests {
         assert!(is_regback_output(Path::new("/x/REGISTRY/SOFTWARE_RegBack_2.sqlite")));
         assert!(!is_regback_output(Path::new("/x/REGISTRY/SYSTEM.sqlite")));
         assert!(!is_regback_output(Path::new("/x/REGISTRY/NTUSER.DAT.sqlite")));
+    }
+
+    /// EventLog의 오류 보고(1001)만 WER 통합에 편입되고, 필드가 P-필드에서
+    /// 매핑되며, 업로드 텔레메트리·타 제공자 이벤트는 제외된다.
+    #[test]
+    fn wer_reports_merge_eventlog_error_reports_only() {
+        let mk = |provider: &str, eid: &str, ed: serde_json::Value, key: &str| {
+            let mut r = Row::new();
+            r.insert("Provider".into(), provider.into());
+            r.insert("EventID".into(), eid.into());
+            r.insert("timestamp".into(), "2026-07-22 09:45:33.795".into());
+            r.insert("_record_key".into(), key.into());
+            r.insert("_source_file".into(), "Application.evtx".into());
+            r.insert("EventData".into(), ed.to_string());
+            r
+        };
+        let rows = vec![
+            mk(
+                "Windows Error Reporting",
+                "1001",
+                serde_json::json!({
+                    "EventName": "APPCRASH",
+                    "P1": "chrome.exe",
+                    "P2": "138.0.0.0",
+                    // WER 보관 폴더 경로는 AppPath 후보에서 제외돼야 한다.
+                    "P4": "C:\\ProgramData\\Microsoft\\Windows\\WER\\Temp\\x.dll",
+                    "P5": "C:\\Program Files\\Google\\Chrome\\chrome_elf.dll",
+                    "ReportId": "aaaa-bbbb",
+                }),
+                "Application::10",
+            ),
+            // 같은 제공자라도 1001이 아니면 제외.
+            mk(
+                "Windows Error Reporting",
+                "1000",
+                serde_json::json!({"EventName": "x"}),
+                "Application::11",
+            ),
+            // WER 채널 업로드 텔레메트리(다른 제공자) 제외.
+            mk(
+                "Microsoft-Windows-WER-PayloadHealth",
+                "2",
+                serde_json::json!({"Protocol": "Watson"}),
+                "Microsoft-Windows-WER-PayloadHealth%4Operational::1",
+            ),
+        ];
+        let out = build_wer_reports_with_events(
+            Path::new("/nonexistent-wer-overview-fixture"),
+            &EventLogOverviewCache::from_rows_for_tests(rows),
+        );
+        assert_eq!(out.len(), 1);
+        let r = &out[0];
+        assert_eq!(r["EventType"], "APPCRASH");
+        assert_eq!(r["AppName"], "chrome.exe");
+        assert_eq!(r["AppPath"], "C:\\Program Files\\Google\\Chrome\\chrome_elf.dll");
+        assert_eq!(r["ReportIdentifier"], "aaaa-bbbb");
+        assert_eq!(r["source"], "EventLog");
+        assert_eq!(r["record_key"], "Application::10");
+        assert!(r["report"].contains("APPCRASH"));
     }
 
     /// SessionID 재사용 회귀: 세션 종료(23) 뒤 같은 SessionID로 다른 사용자가

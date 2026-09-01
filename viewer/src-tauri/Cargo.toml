@@ -1,6 +1,6 @@
 [package]
 name = "windows-analysis-gui"
-version = "1.3.10"
+version = "1.3.11"
 edition = "2021"
 description = "Windows-Analysis Tauri viewer"
 default-run = "windows-analysis-gui"
@@ -29,3 +29,7 @@ url = "2"
 opt-level = "s"
 lto = true
 strip = true
+
+# rust/ 워크스페이스와 동일한 libesedb Win11 패치 적용 (SRUM 파싱).
+[patch.crates-io]
+libesedb-sys = { path = "../../rust/vendor/libesedb-sys" }

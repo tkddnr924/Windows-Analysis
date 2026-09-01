@@ -544,7 +544,8 @@ export default function Sidebar({
   const overviewByFile = useMemo(() => {
     const map = new Map<string, ResultFileEntry[]>();
     for (const file of effectiveOverviewFiles ?? []) {
-      if (file.name === "TargetInfo" || file.fileName === "PathReferences" || file.fileName === "AiConversations") continue;
+      // WerReports는 "@WER"(오류 보고) 승격 항목이 열므로 일반 목록에서 제외.
+      if (file.name === "TargetInfo" || file.fileName === "PathReferences" || file.fileName === "AiConversations" || file.fileName === "WerReports") continue;
       if (!map.has(file.fileName)) map.set(file.fileName, []);
       map.get(file.fileName)!.push(file);
     }
@@ -574,6 +575,13 @@ export default function Sidebar({
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [werCategory?.fullPath]);
+  // 재파싱본은 통합 파생(_OVERVIEW/WerReports: Report.wer + EventLog 오류
+  // 보고 1001)을 우선해 연다. 파생이 없는 구 파싱본은 WER 카테고리 산출물로
+  // 열어 기존 동작을 유지한다.
+  const werOverviewEntry = effectiveOverviewFiles?.find((file) => file.fileName === "WerReports") ?? null;
+  const effectiveWerEntry =
+    (werOverviewEntry && werOverviewEntry.rowCount > 0 ? werOverviewEntry : null) ??
+    (werEntry && werEntry.rowCount > 0 ? werEntry : null);
   // USN 저널(FILESYSTEM/UsnJrnl_Records)도 전용 뷰가 있는 분석 항목이라
   // 호스트 분석 목록으로 승격한다.
   const fsCategory = categories.find((c) => c.name === "FILESYSTEM");
@@ -748,7 +756,8 @@ export default function Sidebar({
                   continue;
                 }
                 if (item === "@WER") {
-                  if (werEntry) rows.push(<PinnedNavRow key="wer" icon={<ReportProblemOutlinedIcon sx={{ fontSize: 19 }} />} label="오류 보고 (WER)" selected={sameEntry(selectedFile, werEntry)} onClick={() => onSelectFile(werEntry)} />);
+                  const entry = effectiveWerEntry;
+                  if (entry) rows.push(<PinnedNavRow key="wer" icon={<ReportProblemOutlinedIcon sx={{ fontSize: 19 }} />} label="오류 보고 (WER)" selected={sameEntry(selectedFile, entry)} onClick={() => onSelectFile(entry)} />);
                   else rows.push(<EmptyPinnedRow key="wer" icon={<ReportProblemOutlinedIcon sx={{ fontSize: 19 }} />} label="오류 보고 (WER)" />);
                   continue;
                 }

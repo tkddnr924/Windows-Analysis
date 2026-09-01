@@ -1068,9 +1068,19 @@ fn run_unit_or_skip<T>(
     outputs_to_clean: &[&Path],
     unit: impl FnOnce() -> Result<T>,
 ) -> Result<Option<T>> {
+    Ok(run_unit_or_skip_reason(label, outputs_to_clean, unit)?.ok())
+}
+
+/// run_unit_or_skip과 동일하되 건너뛴 사유 문자열을 돌려준다 — 호출자가
+/// parse_report 입력 항목에 실패 사유를 남겨 "0건 성공"과 구분되게 한다.
+fn run_unit_or_skip_reason<T>(
+    label: &str,
+    outputs_to_clean: &[&Path],
+    unit: impl FnOnce() -> Result<T>,
+) -> Result<std::result::Result<T, String>> {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(unit));
     match result {
-        Ok(Ok(value)) => Ok(Some(value)),
+        Ok(Ok(value)) => Ok(Ok(value)),
         Ok(Err(error)) => {
             for output in outputs_to_clean {
                 let _ = std::fs::remove_file(output);
@@ -1079,14 +1089,14 @@ fn run_unit_or_skip<T>(
                 return Err(error);
             }
             emit(&format!("[*] 손상된 데이터 건너뜀: {} ({})", label, error));
-            Ok(None)
+            Ok(Err(error.to_string()))
         }
         Err(_) => {
             for output in outputs_to_clean {
                 let _ = std::fs::remove_file(output);
             }
             emit(&format!("[*] 손상된 데이터 건너뜀: {}", label));
-            Ok(None)
+            Ok(Err(format!("파싱 중 내부 오류: {label}")))
         }
     }
 }
@@ -1520,16 +1530,18 @@ fn parse_srum_artifact(
         let name = uniq_name(&base, &mut taken);
         let relative = format!("SRUM/{}.sqlite", name);
         let out = out_dir.join(&relative);
-        let unit = run_unit_or_skip(&p.display().to_string(), &[&out], || {
+        match run_unit_or_skip_reason(&p.display().to_string(), &[&out], || {
             srum::parse_srum_stream(p, &out)
-        })?;
-        if let Some(tables) = unit {
-            let record_count = tables.iter().map(|(_, count)| *count).sum();
-            entry_record_input_count(entry, p, record_count);
-            for (t, n) in tables {
-                emit(&format!("[+] {} rows -> {} [{}]", n, out.display(), t));
+        })? {
+            Ok(tables) => {
+                let record_count = tables.iter().map(|(_, count)| *count).sum();
+                entry_record_input_count(entry, p, record_count);
+                for (t, n) in tables {
+                    emit(&format!("[+] {} rows -> {} [{}]", n, out.display(), t));
+                }
+                outputs.push(relative);
             }
-            outputs.push(relative);
+            Err(reason) => entry_record_input_error(entry, p, &reason),
         }
     }
     Ok(outputs)
@@ -2514,6 +2526,11 @@ pub fn run_host_with_log_id(
                 overview::build_powershell_history_with_events(&out_dir, &events),
                 overview::PS_KEYS,
             )?;
+            write_ov(
+                "WerReports",
+                overview::build_wer_reports_with_events(&out_dir, &events),
+                overview::WER_OV_KEYS,
+            )?;
             drop(events);
             write_ov(
                 "BrowserActivity",
@@ -3343,6 +3360,20 @@ mod persistent_log_tests {
             );
             assert!(entry.get("outputs").is_none() || entry["outputs"].as_array().unwrap().is_empty());
         }
+        // 건너뛴 SRUM 원본은 입력 항목에 실패 사유가 남아 0건 성공과 구분된다.
+        let srum_entry = artifacts
+            .iter()
+            .find(|entry| entry["name"] == "SRUM")
+            .expect("srum entry");
+        let srum_input = srum_entry["inputs"]
+            .as_array()
+            .and_then(|inputs| {
+                inputs
+                    .iter()
+                    .find(|input| input["name"] == "SRUDB.dat")
+            })
+            .expect("srum input report");
+        assert!(srum_input["error"].as_str().is_some_and(|e| !e.is_empty()));
         // The skipped hive stays visible in the per-hive report data.
         assert!(report["registryHives"]
             .as_array()

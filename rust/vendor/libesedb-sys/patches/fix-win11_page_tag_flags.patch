@@ -1,0 +1,13 @@
+--- libesedb/libesedb_page.c
++++ libesedb/libesedb_page.c
+@@ -630,1 +630,9 @@
+-	number_of_page_tags = page->header->available_page_tag;
++	number_of_page_tags = page->header->available_page_tag;
++
++	/* Windows 11 ESE stores flag bits in the upper bits of the available
++	 * page tag value; the tag count itself is the lower 12 bits.
++	 */
++	if( ( (size_t) 4 * (size_t) number_of_page_tags ) > page_data_size )
++	{
++		number_of_page_tags &= 0x0fff;
++	}

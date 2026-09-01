@@ -405,6 +405,15 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     priorityColumns: ["timestamp", "EventType", "AppName", "AppPath", "TargetAppId", "ReportIdentifier"],
     sections: [{ heading: "보고서", fields: [{ key: "EventType" }, { key: "AppPath" }, { key: "ReportIdentifier" }, { key: "report", kind: "json" }] }],
   },
+  // 오류 보고 통합 파생(_OVERVIEW/WerReports) — Report.wer 산출물과 EventLog
+  // 오류 보고(1001)를 한 화면으로 합친다. 구성 원본(WER_Reports·EventLog)이
+  // 각자 타임라인에 이미 편입돼 있으므로 여기서는 편입하지 않는다(중복 방지).
+  WerReports: {
+    customView: "wer",
+    title: (r) => r.AppName || "(WER)",
+    priorityColumns: ["timestamp", "EventType", "AppName", "AppPath", "TargetAppId", "ReportIdentifier", "source"],
+    sections: [{ heading: "보고서", fields: [{ key: "EventType" }, { key: "AppPath" }, { key: "ReportIdentifier" }, { key: "source", label: "출처" }, { key: "report", kind: "json" }] }],
+  },
   // Windows Timeline (ActivitiesCache.db) — 계정별 앱 실행·포커스·문서 활동.
   // 실행/열기(type 5)는 실행 이력(ExecutionHistory)에도 합류한다.
   Timeline_Activities: {
