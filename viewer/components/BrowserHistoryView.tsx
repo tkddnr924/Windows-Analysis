@@ -583,7 +583,9 @@ function ActivityRow({ row, final: _final, bookmarked, onOpen, onToggleBookmark 
   const kindLabel = isDownload ? "다운로드" : isCache ? "캐시" : "방문";
   const title = row.title || (isDownload ? "파일 이름 없음" : row.url) || "제목 없음";
   const url = isDownload ? row.source_url || row.url : row.url;
-  const facts = isDownload && row.size ? row.size : isCache ? [row.status, row.mime, row.size].filter(Boolean).join(" · ") : row.visit_count ? `${row.visit_count}회` : "";
+  // 부가 표기: 다운로드=크기, 캐시=MIME 타입만(상태·크기·charset·방문 횟수는
+  // 행에서 생략 — 상세에서 확인).
+  const facts = isDownload && row.size ? row.size : isCache ? (row.mime || "").split(";")[0].trim() : "";
   const activate = (event: React.KeyboardEvent<HTMLDivElement>) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); onOpen(event.currentTarget); } };
   // 행 전체(여백 포함)가 상세 열기 클릭 대상 — 북마크는 전파 차단.
   return <div className={bookmarked ? "dfir-bookmarked-row" : undefined} onClick={(event) => onOpen(event.currentTarget)} onMouseEnter={(event) => { if (!bookmarked) event.currentTarget.style.background = "var(--bg-hover)"; }} onMouseLeave={(event) => { if (!bookmarked) event.currentTarget.style.background = "var(--bg-panel)"; }} style={{ borderRadius: "var(--radius-md)", display: "flex", alignItems: "center", gap: 10, minHeight: 58, marginBottom: 8, padding: "8px 12px", border: "1px solid var(--border)", background: "var(--bg-panel)", cursor: "pointer", transition: "background .15s ease, border-color .15s ease" }}>
@@ -593,11 +595,14 @@ function ActivityRow({ row, final: _final, bookmarked, onOpen, onToggleBookmark 
       </span>
       <span style={{ flex: 1, minWidth: 0, display: "grid", gap: 2 }}>
         <span style={{ display: "flex", alignItems: "center", gap: 7, minWidth: 0 }}>
-          <span title={title} style={{ minWidth: 0, fontSize: 13, fontWeight: isCache ? 550 : 700, color: isCache ? "var(--text-dim)" : "var(--text)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{title}</span>
-          {facts && <span title={facts} style={{ flexShrink: 0, maxWidth: 220, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 11, color: "var(--text-faint)", fontFamily: "var(--mono)" }}>{facts}</span>}
+          {/* 제목·URL은 50ch에서 조기 말줄임 — 긴 값이 행을 꽉 채워 오른쪽
+              계정·시각과 붙는 것을 막고 사이 여백을 확보한다(전문은 title 툴팁). */}
+          <span title={title} style={{ minWidth: 0, maxWidth: "50ch", fontSize: 13, fontWeight: isCache ? 550 : 700, color: isCache ? "var(--text-dim)" : "var(--text)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{title}</span>
         </span>
-        <span title={row.url_raw || url} style={{ minWidth: 0, fontSize: 11.5, color: isCache ? "var(--text-faint)" : "var(--accent)", fontFamily: "var(--mono)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{url || "주소 정보 없음"}</span>
+        <span title={row.url_raw || url} style={{ minWidth: 0, maxWidth: "50ch", fontSize: 11.5, color: isCache ? "var(--text-faint)" : "var(--accent)", fontFamily: "var(--mono)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{url || "주소 정보 없음"}</span>
       </span>
+      {/* 부가 표기(MIME·횟수·크기)는 행 오른쪽, 계정 앞에 정렬. */}
+      {facts && <span title={facts} style={{ flexShrink: 0, maxWidth: 220, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 11, color: "var(--text-faint)", fontFamily: "var(--mono)" }}>{facts}</span>}
       <span title={row.account} style={{ flexShrink: 0, maxWidth: 120, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 12, color: row.account ? "var(--text-dim)" : "var(--text-faint)" }}>{row.account || "계정 정보 없음"}</span>
       <span title={row.timestamp || "시간 정보 없음"} style={{ flexShrink: 0, width: 168, textAlign: "right", fontSize: 12.5, color: row.timestamp ? "var(--text-time)" : "var(--text-faint)", fontFamily: "var(--mono)", whiteSpace: "nowrap" }}>{formatAiPayloadTime(row.timestamp) || "시간 정보 없음"}</span>
     </div>
