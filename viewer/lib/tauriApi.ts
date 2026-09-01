@@ -63,8 +63,10 @@ function makeApi(): ElectronApi {
     updateBookmarkNote: (caseDir, id, note) => invoke<Bookmark[]>("update_bookmark_note", { caseDir, id, note }),
     // 수백 MB 캐시를 JSON 인자로 보내면 요청 직렬화·파싱이 메인 스레드를
     // 수 초 막고, 단발 raw 전송도 백엔드에서 전량 복사가 남는다 — 8MB raw
-    // 청크를 순차 append(begin → chunk* → finish, 원자 rename)해 메인 스레드
-    // 작업과 메모리 피크를 상수로 유지한다.
+    // 청크를 순차 전송한다(begin → [chunk → drain]* → finish, 원자 rename).
+    // 청크 커맨드는 소유 복사까지만 메인에서 수행하고 쓰기는 세션 워커가
+    // 맡으며, 매 청크 후 drain await로 in-flight를 1청크로 묶어 느린 저장
+    // 매체에서도 메인 스레드·메모리 피크가 상수로 유지된다.
     saveMasterTimeline: async (hostDir, payload) => {
       const CHUNK = 8 * 1024 * 1024;
       const token = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
@@ -78,6 +80,7 @@ function makeApi(): ElectronApi {
         bytes.set(head, 0);
         bytes.set(piece, head.length);
         await invoke<void>("save_master_timeline_chunk", bytes);
+        await invoke<void>("save_master_timeline_drain", { token });
       }
       await invoke<void>("save_master_timeline_finish", { hostDir, token });
     },

@@ -1136,33 +1136,177 @@ fn valid_saving_token(token: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
+/// 저장 세션 진행 상태 — 쓰기는 워커 스레드에서 수행되고, 메인 커맨드는
+/// 소유 복사와 진행 카운트만 만진다. 프런트가 매 청크 후 drain을 await해
+/// 동시 in-flight 쓰기는 1청크로 유지된다(순서·메모리 상한 보장).
+struct TimelineSaveSession {
+    host_dir: String,
+    pending: usize,
+    error: Option<String>,
+}
+
+type TimelineSaveHandle = std::sync::Arc<(Mutex<TimelineSaveSession>, std::sync::Condvar)>;
+
+fn timeline_save_sessions() -> &'static Mutex<std::collections::HashMap<String, TimelineSaveHandle>> {
+    static SESSIONS: OnceLock<Mutex<std::collections::HashMap<String, TimelineSaveHandle>>> =
+        OnceLock::new();
+    SESSIONS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+fn timeline_save_begin_impl(host_dir: &str, token: &str) -> Result<(), String> {
+    // 중단된 이전 저장의 임시 파일·세션 정리 (호스트당 단일 저장자 전제).
+    if let Ok(rd) = std::fs::read_dir(host_dir) {
+        for e in rd.flatten() {
+            if e.file_name()
+                .to_string_lossy()
+                .starts_with("_master_timeline.cache.json.saving-")
+            {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+    if let Ok(mut sessions) = timeline_save_sessions().lock() {
+        sessions.retain(|_, handle| {
+            handle
+                .0
+                .lock()
+                .map(|session| session.host_dir != host_dir)
+                .unwrap_or(true)
+        });
+        sessions.insert(
+            token.to_string(),
+            std::sync::Arc::new((
+                Mutex::new(TimelineSaveSession {
+                    host_dir: host_dir.to_string(),
+                    pending: 0,
+                    error: None,
+                }),
+                std::sync::Condvar::new(),
+            )),
+        );
+    }
+    std::fs::write(master_timeline_saving_path(host_dir, token), b"")
+        .map_err(|error| format!("타임라인 캐시 임시 파일 생성 실패: {error}"))
+}
+
+/// 프로토콜 자원 상한 — 프런트 구현이 아니라 명령 경계에서 강제한다.
+/// 초과 청크는 복사 전에 거부되고, drain 없는 연속 전송(진행 중 쓰기 1개
+/// 초과)은 스레드·메모리가 쌓이기 전에 거부된다.
+const TIMELINE_SAVE_MAX_CHUNK: usize = 8 * 1024 * 1024;
+
+/// 동기 커맨드에서 호출되는 부분 — 세션 확인·카운트 증가까지만 하고, 실제
+/// 파일 append는 워커 스레드로 넘긴다. 이전 청크의 쓰기 오류는 여기서
+/// 조기 반환된다. `host_dir`은 세션 저장값과 대조해 토큰-경로 소유 관계를
+/// 검증한다.
+fn timeline_save_append_impl(host_dir: &str, token: &str, bytes: Vec<u8>) -> Result<(), String> {
+    if bytes.len() > TIMELINE_SAVE_MAX_CHUNK {
+        return Err("타임라인 캐시 청크가 허용 크기를 초과했습니다".to_string());
+    }
+    let handle = timeline_save_sessions()
+        .lock()
+        .ok()
+        .and_then(|sessions| sessions.get(token).cloned())
+        .ok_or_else(|| "타임라인 캐시 저장 세션이 없습니다".to_string())?;
+    let path = {
+        let mut session = handle.0.lock().map_err(|_| "저장 세션 잠금 실패".to_string())?;
+        if session.host_dir != host_dir {
+            return Err("타임라인 캐시 저장 세션의 호스트 경로가 일치하지 않습니다".to_string());
+        }
+        if let Some(error) = &session.error {
+            return Err(error.clone());
+        }
+        if session.pending > 0 {
+            return Err("이전 청크 쓰기가 끝나지 않았습니다 — drain 후 전송해야 합니다".to_string());
+        }
+        session.pending += 1;
+        master_timeline_saving_path(&session.host_dir, token)
+    };
+    let worker = handle.clone();
+    std::thread::spawn(move || {
+        use std::io::Write;
+        let result = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .and_then(|mut file| file.write_all(&bytes));
+        if let Ok(mut session) = worker.0.lock() {
+            session.pending = session.pending.saturating_sub(1);
+            if let Err(error) = result {
+                session.error.get_or_insert(format!("타임라인 캐시 청크 쓰기 실패: {error}"));
+            }
+        }
+        worker.1.notify_all();
+    });
+    Ok(())
+}
+
+/// 잔여 쓰기 완료 대기 — 청크 사이(in-flight 1 유지)와 finish 직전에 쓴다.
+fn timeline_save_wait_impl(token: &str) -> Result<(), String> {
+    let handle = timeline_save_sessions()
+        .lock()
+        .ok()
+        .and_then(|sessions| sessions.get(token).cloned())
+        .ok_or_else(|| "타임라인 캐시 저장 세션이 없습니다".to_string())?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    let mut session = handle.0.lock().map_err(|_| "저장 세션 잠금 실패".to_string())?;
+    while session.pending > 0 && session.error.is_none() {
+        if std::time::Instant::now() >= deadline {
+            return Err("타임라인 캐시 저장 시간 초과".to_string());
+        }
+        let (next, _) = handle
+            .1
+            .wait_timeout(session, std::time::Duration::from_millis(500))
+            .map_err(|_| "저장 세션 잠금 실패".to_string())?;
+        session = next;
+    }
+    match &session.error {
+        Some(error) => Err(error.clone()),
+        None => Ok(()),
+    }
+}
+
+fn timeline_save_finish_impl(host_dir: &str, token: &str) -> Result<(), String> {
+    // 세션 폐기 전에 토큰-호스트 소유 관계를 검증한다 — 불일치 상태에서
+    // 세션을 먼저 지우면 실제 저장의 임시 파일이 남고 재시도도 불가능해진다.
+    {
+        let handle = timeline_save_sessions()
+            .lock()
+            .ok()
+            .and_then(|sessions| sessions.get(token).cloned())
+            .ok_or_else(|| "타임라인 캐시 저장 세션이 없습니다".to_string())?;
+        let session = handle.0.lock().map_err(|_| "저장 세션 잠금 실패".to_string())?;
+        if session.host_dir != host_dir {
+            return Err("타임라인 캐시 저장 세션의 호스트 경로가 일치하지 않습니다".to_string());
+        }
+    }
+    let wait = timeline_save_wait_impl(token);
+    if let Ok(mut sessions) = timeline_save_sessions().lock() {
+        sessions.remove(token);
+    }
+    let saving = master_timeline_saving_path(host_dir, token);
+    match wait {
+        Ok(()) => std::fs::rename(&saving, master_timeline_cache_path(host_dir))
+            .map_err(|error| format!("타임라인 캐시 확정 실패: {error}")),
+        Err(error) => {
+            let _ = std::fs::remove_file(&saving);
+            Err(error)
+        }
+    }
+}
+
 #[tauri::command]
 async fn save_master_timeline_begin(host_dir: String, token: String) -> Result<(), String> {
     if !valid_saving_token(&token) {
         return Err("타임라인 캐시 저장 토큰이 잘못되었습니다".to_string());
     }
-    tauri::async_runtime::spawn_blocking(move || {
-        // 중단된 이전 저장의 임시 파일 정리 (호스트당 단일 저장자 전제).
-        if let Ok(rd) = std::fs::read_dir(&host_dir) {
-            for e in rd.flatten() {
-                if e.file_name()
-                    .to_string_lossy()
-                    .starts_with("_master_timeline.cache.json.saving-")
-                {
-                    let _ = std::fs::remove_file(e.path());
-                }
-            }
-        }
-        std::fs::write(master_timeline_saving_path(&host_dir, &token), b"")
-            .map_err(|error| format!("타임라인 캐시 임시 파일 생성 실패: {error}"))
-    })
-    .await
-    .map_err(|error| format!("타임라인 캐시 저장 작업이 중단되었습니다: {error}"))?
+    tauri::async_runtime::spawn_blocking(move || timeline_save_begin_impl(&host_dir, &token))
+        .await
+        .map_err(|error| format!("타임라인 캐시 저장 작업이 중단되었습니다: {error}"))?
 }
 
-/// raw 본문: "호스트경로\n토큰\n" + 청크 바이트. 프런트가 청크를 순차
-/// await하므로 append 순서가 보장된다 (동기 커맨드라 여기서 바로 쓴다 —
-/// 8MB 페이지 캐시 append는 수 ms로 이벤트 루프를 유의미하게 막지 않는다).
+/// raw 본문: "호스트경로\n토큰\n" + 청크 바이트. 메인에서는 헤더 파싱과
+/// 소유 복사(청크 상한 크기, memcpy 수 ms)까지만 수행하고, 파일 쓰기는
+/// 세션 워커로 넘긴다 — 느린 저장 매체의 append 지연이 이벤트 루프를 막지
+/// 않는다. 순서는 프런트의 청크당 drain await가 보장한다.
 #[tauri::command]
 fn save_master_timeline_chunk(request: tauri::ipc::Request<'_>) -> Result<(), String> {
     let tauri::ipc::InvokeBody::Raw(body) = request.body() else {
@@ -1184,14 +1328,24 @@ fn save_master_timeline_chunk(request: tauri::ipc::Request<'_>) -> Result<(), St
     if !valid_saving_token(&token) {
         return Err("타임라인 캐시 저장 토큰이 잘못되었습니다".to_string());
     }
-    let path = master_timeline_saving_path(&host_dir, &token);
-    use std::io::Write;
-    let mut file = std::fs::OpenOptions::new()
-        .append(true)
-        .open(&path)
-        .map_err(|error| format!("타임라인 캐시 임시 파일 열기 실패: {error}"))?;
-    file.write_all(&body[second + 1..])
-        .map_err(|error| format!("타임라인 캐시 청크 쓰기 실패: {error}"))
+    let payload = &body[second + 1..];
+    // 상한 검사는 소유 복사(to_vec) 전에 — 초과 요청이 메모리를 잡지 않는다.
+    if payload.len() > TIMELINE_SAVE_MAX_CHUNK {
+        return Err("타임라인 캐시 청크가 허용 크기를 초과했습니다".to_string());
+    }
+    timeline_save_append_impl(&host_dir, &token, payload.to_vec())
+}
+
+/// 직전 청크들의 쓰기 완료를 워커에서 대기 — 프런트가 매 청크 후 await해
+/// in-flight를 1청크로 묶는다(메모리 상한·append 순서 보장).
+#[tauri::command]
+async fn save_master_timeline_drain(token: String) -> Result<(), String> {
+    if !valid_saving_token(&token) {
+        return Err("타임라인 캐시 저장 토큰이 잘못되었습니다".to_string());
+    }
+    tauri::async_runtime::spawn_blocking(move || timeline_save_wait_impl(&token))
+        .await
+        .map_err(|error| format!("타임라인 캐시 저장 작업이 중단되었습니다: {error}"))?
 }
 
 #[tauri::command]
@@ -1199,15 +1353,9 @@ async fn save_master_timeline_finish(host_dir: String, token: String) -> Result<
     if !valid_saving_token(&token) {
         return Err("타임라인 캐시 저장 토큰이 잘못되었습니다".to_string());
     }
-    tauri::async_runtime::spawn_blocking(move || {
-        std::fs::rename(
-            master_timeline_saving_path(&host_dir, &token),
-            master_timeline_cache_path(&host_dir),
-        )
-        .map_err(|error| format!("타임라인 캐시 확정 실패: {error}"))
-    })
-    .await
-    .map_err(|error| format!("타임라인 캐시 저장 작업이 중단되었습니다: {error}"))?
+    tauri::async_runtime::spawn_blocking(move || timeline_save_finish_impl(&host_dir, &token))
+        .await
+        .map_err(|error| format!("타임라인 캐시 저장 작업이 중단되었습니다: {error}"))?
 }
 
 // 수백 MB급 캐시를 동기 커맨드의 String으로 돌려주면 메인 스레드(창 이벤트
@@ -6419,6 +6567,96 @@ mod search_case_tests {
 }
 
 #[cfg(test)]
+mod timeline_save_tests {
+    use super::*;
+
+    /// begin → append×N(각각 drain으로 완료 대기) → finish가 이어붙인 내용을
+    /// 원자적으로 확정하고, 세션 없는 append와 실패 후 finish가 오류를 낸다.
+    #[test]
+    fn chunked_save_appends_in_order_and_finishes_atomically() {
+        let root = std::env::temp_dir().join(format!(
+            "windows-analysis-tl-save-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let host = root.to_string_lossy().to_string();
+        let token = "test-token-1";
+
+        timeline_save_begin_impl(&host, token).unwrap();
+        for piece in [b"abc".as_slice(), b"def", b"ghi"] {
+            timeline_save_append_impl(&host, token, piece.to_vec()).unwrap();
+            timeline_save_wait_impl(token).unwrap();
+        }
+        // 정확히 허용 크기인 청크는 통과, 1바이트 초과는 복사 전에 거부.
+        timeline_save_append_impl(&host, token, vec![b'!'; TIMELINE_SAVE_MAX_CHUNK]).unwrap();
+        timeline_save_wait_impl(token).unwrap();
+        assert!(
+            timeline_save_append_impl(&host, token, vec![0u8; TIMELINE_SAVE_MAX_CHUNK + 1]).is_err(),
+            "oversized chunk must be rejected"
+        );
+        timeline_save_finish_impl(&host, token).unwrap();
+        let written = std::fs::read(master_timeline_cache_path(&host)).unwrap();
+        assert_eq!(&written[..9], b"abcdefghi");
+        assert_eq!(written.len(), 9 + TIMELINE_SAVE_MAX_CHUNK);
+        // 임시 파일은 남지 않는다.
+        assert!(!master_timeline_saving_path(&host, token).exists());
+
+        // 세션이 끝난 뒤의 append는 오류.
+        assert!(timeline_save_append_impl(&host, token, b"x".to_vec()).is_err());
+
+        // begin이 이전 임시 파일을 정리한다.
+        std::fs::write(master_timeline_saving_path(&host, "stale-1"), b"junk").unwrap();
+        timeline_save_begin_impl(&host, "test-token-2").unwrap();
+        assert!(!master_timeline_saving_path(&host, "stale-1").exists());
+        // 호스트-토큰 소유 불일치: append/finish 모두 거부되고 세션은 유지된다.
+        assert!(timeline_save_append_impl("/wrong/host", "test-token-2", b"a".to_vec()).is_err());
+        assert!(timeline_save_finish_impl("/wrong/host", "test-token-2").is_err());
+        // 실패 경로: 임시 파일을 지워 쓰기 실패 유도 → drain/finish가 오류 전파.
+        std::fs::remove_file(master_timeline_saving_path(&host, "test-token-2")).unwrap();
+        timeline_save_append_impl(&host, "test-token-2", b"zzz".to_vec()).unwrap();
+        assert!(timeline_save_wait_impl("test-token-2").is_err());
+        assert!(timeline_save_finish_impl(&host, "test-token-2").is_err());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// drain 없이 연속 전송하면 진행 중 쓰기 1개 상한에서 거부된다 —
+    /// 쓰기 스레드·대기 메모리가 무제한으로 쌓이지 않는다.
+    #[test]
+    fn consecutive_chunks_without_drain_are_rejected() {
+        let root = std::env::temp_dir().join(format!(
+            "windows-analysis-tl-save-flood-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let host = root.to_string_lossy().to_string();
+        let token = "flood-token";
+        timeline_save_begin_impl(&host, token).unwrap();
+        // 큰 청크로 쓰기 시간을 벌고, 완료 대기 없이 곧바로 다음 청크 전송을
+        // 반복하면 최소 한 번은 in-flight 상한 거부가 발생해야 한다. 워커가
+        // 그 사이 완료되어 통과한 전송은 정상 동작이다.
+        let mut rejected = 0usize;
+        for _ in 0..8 {
+            if timeline_save_append_impl(&host, token, vec![b'x'; 4 * 1024 * 1024]).is_err() {
+                rejected += 1;
+            }
+        }
+        assert!(rejected > 0, "in-flight limit must reject drain-less floods");
+        timeline_save_wait_impl(token).unwrap();
+        timeline_save_finish_impl(&host, token).unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(test)]
 mod browser_activity_tests {
     use super::*;
 
@@ -7694,6 +7932,7 @@ fn main() {
             list_categories,
             save_master_timeline_begin,
             save_master_timeline_chunk,
+            save_master_timeline_drain,
             save_master_timeline_finish,
             load_master_timeline,
             list_result_files,
