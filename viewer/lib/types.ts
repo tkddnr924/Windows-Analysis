@@ -48,48 +48,47 @@ export interface CacheBodyPreview {
   truncated: boolean;
 }
 
-/** One step of a reconstructed browser visit inflow chain (oldest → target). */
-export interface VisitFlowStep {
+/** One visit node of the reconstructed navigation graph. */
+export interface VisitGraphNode {
+  /** visits.id — the entry visit when same-URL re-navigations were collapsed. */
+  visitId: string;
   url: string;
   title: string;
   time: string;
   /** Decoded page-transition label (e.g. "링크 클릭 · 서버 리다이렉트"). */
   transition: string;
-  /** This page was opened in a new tab/window from the step above it. */
-  openedInNewTab: boolean;
-  /** The record the analyst opened — the last step of the chain. */
-  isTarget: boolean;
-  /** Raw provenance so each edge can be re-verified against the DB. */
-  visitId: string;
   /** Raw visits.transition integer (decoded form is in `transition`). */
   transitionRaw: string;
-  /** Column that links this step to its parent (the step above it):
-   *  "from_visit" (same tab) or "opener_visit" (new tab); empty for the oldest. */
-  parentLink: string;
-  /** The parent's visits.id this step points to — equals the step above's visitId. */
-  parentVisitId: string;
-}
-
-/** One inflow chain: the ordered visits leading up to one visit of the target. */
-export interface VisitFlowChain {
-  visitTime: string;
-  steps: VisitFlowStep[];
-  /** Cross-site referrer recorded on the target visit (may not be a page in
-   *  the visits table, e.g. https://chatgpt.com/). */
-  externalReferrer: string;
-  /** Additional same-URL redirects/reloads of this entry that were collapsed
-   *  into this chain instead of shown as duplicate near-identical chains. */
+  /** A visit of the looked-up page itself (or its cache document origin). */
+  isTarget: boolean;
+  /** Same-URL 재이동(리다이렉트·리로드)으로 이 노드에 접힌 방문 수. */
   reloads: number;
+  /** Cross-site referrer recorded on this visit (may not be a page in the
+   *  visits table, e.g. https://chatgpt.com/). */
+  externalReferrer: string;
 }
 
-/** Reconstructed inflow ("어디서 왔나") for a browser visit or cache record. */
-export interface BrowserVisitFlow {
-  chains: VisitFlowChain[];
+/** One navigation edge, provable against the DB via the child's link column. */
+export interface VisitGraphEdge {
+  /** Parent (navigation source) node's visits.id. */
+  from: string;
+  /** Child (navigation destination) node's visits.id. */
+  to: string;
+  /** "from_visit" (same tab) | "opener_visit" (new tab). */
+  kind: string;
+}
+
+/** The navigation neighbourhood of a browser visit/cache record: ancestors
+ *  (where it came from), descendants (where the user went next) and sibling
+ *  branches off shared ancestors, as one graph. */
+export interface BrowserVisitGraph {
+  nodes: VisitGraphNode[];
+  edges: VisitGraphEdge[];
   sourceFile: string;
   /** For a cache resource: the navigated page it was attributed to. */
   matchedPage: string;
   note: string;
-  /** 방문 검사 상한에 걸려 최근 일부 방문만 분석한 경우. */
+  /** 방문·노드 상한에 걸려 일부 연결만 표시한 경우. */
   truncated: boolean;
 }
 
@@ -551,11 +550,12 @@ export interface ElectronApi {
   /** Fetch an IPC-bounded preview for one exact cache record. An empty bodyB64
    * means the parser did not retain a recoverable response body. */
   cacheEntryBody(hostDir: string, account: string, url: string, cacheKey: string): Promise<CacheBodyPreview>;
-  /** Reconstruct the visit inflow chain for a browser visit (pass its URL) or a
-   *  cache record (also pass its cacheKey) from the raw History DB on demand. */
+  /** Reconstruct the visit navigation graph (ancestors + descendants +
+   *  sibling branches) for a browser visit (pass its URL) or a cache record
+   *  (also pass its cacheKey) from the raw History DB on demand. */
   /** sourceFile: 행의 `_source_file` — 같은 브라우저의 History만 조회하는 출처
-   *  고정에 쓰인다. 없으면(구 파싱본) 흐름 복원 대신 안내가 반환된다. */
-  browserVisitFlow(hostDir: string, account: string, url: string, cacheKey?: string, sourceFile?: string): Promise<BrowserVisitFlow>;
+   *  고정에 쓰인다. 없으면(구 파싱본) 계정 후보 전체에서 조회한다. */
+  browserVisitGraph(hostDir: string, account: string, url: string, cacheKey?: string, sourceFile?: string): Promise<BrowserVisitGraph>;
   /** AI conversations extracted from browser cache, filtered and paged by cache timestamp. */
   aiConversations(hostDir: string, query: { start?: string; end?: string; offset: number; limit: number }): Promise<AiConversationPage>;
   /** WMI-Activity 로그의 구독 이벤트(5859~5861)만 서버에서 걸러 받는다. */

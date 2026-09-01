@@ -4420,57 +4420,54 @@ async fn cache_entry_body(
 
 #[derive(Serialize, Clone, Default)]
 #[serde(rename_all = "camelCase")]
-struct VisitFlowStep {
+struct VisitGraphNode {
+    /// `visits.id` of this node — the *entry* visit when same-URL re-navigations
+    /// were collapsed into it (see `reloads`).
+    visit_id: String,
     url: String,
     title: String,
     time: String,
     transition: String,
-    /// This step was opened as a *new tab/window* from its parent (its own
-    /// `from_visit` is empty but an `opener_visit` links it), rather than a
-    /// same-tab navigation. Surfaced because ClickFix-style lures often open in
-    /// a fresh tab, which a plain referrer chain would show as a dead end.
-    opened_in_new_tab: bool,
-    /// The last step of the chain — the record the analyst opened.
-    is_target: bool,
-    // --- Raw provenance so the edge is provable, not asserted -------------
-    /// `visits.id` of this step.
-    visit_id: String,
     /// Raw `visits.transition` integer (decoded form is in `transition`).
     transition_raw: String,
-    /// Which column links this step to its parent (the step above it):
-    /// "from_visit" (same tab) or "opener_visit" (new tab); empty for the
-    /// oldest step, which has no captured parent.
-    parent_link: String,
-    /// The parent's `visits.id` that `parent_link` points to — matches the
-    /// `visit_id` of the step above, so the reader can verify the join.
-    parent_visit_id: String,
-}
-
-#[derive(Serialize, Default)]
-#[serde(rename_all = "camelCase")]
-struct VisitFlowChain {
-    visit_time: String,
-    /// Ordered oldest → target.
-    steps: Vec<VisitFlowStep>,
-    /// Raw cross-site referrer recorded on the target visit (may be a site the
+    /// A visit of the looked-up page itself — the record the analyst opened
+    /// (or, for a cache record, a page under the cache key's document origin).
+    is_target: bool,
+    /// Same-URL re-navigations (client/server redirect·reload) collapsed into
+    /// this node — the page re-navigating to itself is one visit story, not
+    /// separate nodes.
+    reloads: usize,
+    /// Raw cross-site referrer recorded on this visit (may be a site the
     /// visits table has no row for, e.g. `https://chatgpt.com/`).
     external_referrer: String,
-    /// How many *additional* visits of the same target URL are same-URL
-    /// redirects/reloads of this entry (client/server redirect or refresh). The
-    /// page re-navigating to itself is one visit story, not a separate inflow,
-    /// so those are collapsed into this count instead of duplicate chains.
-    reloads: usize,
 }
 
+#[derive(Serialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct VisitGraphEdge {
+    /// Parent (navigation source) node's `visits.id`.
+    from: String,
+    /// Child (navigation destination) node's `visits.id`.
+    to: String,
+    /// Column on the child's row that names the parent — the raw join the edge
+    /// is built on: "from_visit" (same tab) or "opener_visit" (new tab).
+    kind: String,
+}
+
+/// The navigation neighbourhood of the looked-up page: every visit reachable
+/// from its visits through referrer/opener links in *both* directions —
+/// ancestors (where the analyst came from), descendants (where they went next)
+/// and sibling branches off shared ancestors.
 #[derive(Serialize, Default)]
 #[serde(rename_all = "camelCase")]
-struct BrowserVisitFlow {
-    chains: Vec<VisitFlowChain>,
+struct BrowserVisitGraph {
+    nodes: Vec<VisitGraphNode>,
+    edges: Vec<VisitGraphEdge>,
     source_file: String,
     /// For a cache resource: the navigated page we attributed it to.
     matched_page: String,
     note: String,
-    /// 방문 검사 상한(VISIT_FLOW_SCAN_VISITS)에 걸려 최근 일부만 분석한 경우.
+    /// 방문·노드 상한에 걸려 일부 연결만 표시한 경우.
     truncated: bool,
 }
 
@@ -4582,10 +4579,15 @@ fn history_profile_root(db: &Path) -> Option<String> {
     }
 }
 
-const VISIT_FLOW_DEPTH_CAP: usize = 25;
-const VISIT_FLOW_MAX_CHAINS: usize = 10;
-/// Upper bound on genuinely distinct inflow paths returned to the UI.
-const VISIT_FLOW_MAX_DISTINCT: usize = 5;
+/// 대상 방문에서 양방향(선행·후행)으로 따라가는 최대 홉 수.
+const VISIT_GRAPH_DEPTH_CAP: usize = 30;
+/// 그래프에 담는 최대 노드 수 — 넘으면 truncated로 표시. BFS라 대상에서
+/// 가까운(홉 수가 작은) 연결부터 채워진다.
+const VISIT_GRAPH_MAX_NODES: usize = 200;
+/// 그래프 출발점으로 삼는 대상 URL 방문(리다이렉트 접기 후) 상한 — 자주
+/// 방문한 페이지에서 대상 방문만으로 노드 상한을 다 쓰면 맥락(조상·후행)
+/// 노드가 전혀 못 들어가므로 훨씬 작게 잡는다.
+const VISIT_GRAPH_MAX_TARGETS: usize = 40;
 /// URL 하나에서 검사하는 최근 방문 수의 상한 — 최신 몇 건이 같은 유입의
 /// 리다이렉트로 채워져도 그 뒤의 다른 유입 경로가 조사되도록 충분히 넓게
 /// 잡는다. 이 상한에 걸리면 결과에 truncated로 표시한다.
@@ -4597,8 +4599,6 @@ const VISIT_FLOW_SCAN_VISITS: usize = 400;
 /// back as strings), so ids are threaded as strings and the numeric fields are
 /// parsed explicitly.
 struct VisitRow {
-    from_visit: String,
-    opener_visit: String,
     transition: i64,
     external_referrer: String,
     time: String,
@@ -4618,113 +4618,103 @@ fn nonzero_visit_id(id: &str) -> Option<String> {
 }
 
 fn read_visit(conn: &Connection, visit_id: &str) -> Option<VisitRow> {
-    let sql = "SELECT COALESCE(v.from_visit, ''), COALESCE(v.opener_visit, ''), COALESCE(v.transition, '0'), \
+    let sql = "SELECT COALESCE(v.transition, '0'), \
                COALESCE(v.external_referrer_url, ''), \
                CASE WHEN CAST(v.visit_time AS INTEGER) > 0 THEN datetime(CAST(v.visit_time AS INTEGER)/1000000 - 11644473600, 'unixepoch', 'localtime') ELSE '' END, \
                u.url, COALESCE(u.title, '') \
                FROM visits v JOIN urls u ON u.id = v.url WHERE v.id = ?1";
     conn.query_row(sql, [visit_id], |r| {
-        let transition: String = r.get(2).unwrap_or_default();
+        let transition: String = r.get(0).unwrap_or_default();
         Ok(VisitRow {
-            from_visit: r.get(0).unwrap_or_default(),
-            opener_visit: r.get(1).unwrap_or_default(),
             transition: transition.trim().parse::<i64>().unwrap_or(0),
-            external_referrer: r.get(3).unwrap_or_default(),
-            time: r.get(4).unwrap_or_default(),
-            url: r.get(5).unwrap_or_default(),
-            title: r.get(6).unwrap_or_default(),
+            external_referrer: r.get(1).unwrap_or_default(),
+            time: r.get(2).unwrap_or_default(),
+            url: r.get(3).unwrap_or_default(),
+            title: r.get(4).unwrap_or_default(),
         })
     })
     .ok()
 }
 
-/// The url id (FK, stored as TEXT) a visit belongs to.
-fn visit_url_id(conn: &Connection, visit_id: &str) -> Option<String> {
-    conn.query_row(
-        "SELECT COALESCE(url, '') FROM visits WHERE id = ?1",
-        [visit_id],
-        |r| r.get::<_, String>(0),
-    )
-    .ok()
+/// One `visits` row in the in-memory navigation map: its url id and the parent
+/// it navigated from — `from_visit` (same tab) taking priority over
+/// `opener_visit` (the tab/window that spawned this one), the same rule the
+/// old linear chain walked. The whole table is loaded in one scan because the
+/// graph also needs the *forward* direction (children), which per-row queries
+/// would turn into full-table scans per node.
+struct VisitLinkRow {
+    url_id: String,
+    /// (parent `visits.id`, linking column: "from_visit" | "opener_visit").
+    parent: Option<(String, &'static str)>,
 }
 
-/// The visit this one navigated from: `from_visit` (same tab), else the
-/// `opener_visit` (spawning tab). None when neither links to a real row.
-fn parent_visit_id(conn: &Connection, visit_id: &str) -> Option<String> {
-    let v = read_visit(conn, visit_id)?;
-    nonzero_visit_id(&v.from_visit).or_else(|| nonzero_visit_id(&v.opener_visit))
+fn load_visit_links(conn: &Connection) -> std::collections::HashMap<String, VisitLinkRow> {
+    let mut links: std::collections::HashMap<String, VisitLinkRow> =
+        std::collections::HashMap::new();
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT id, COALESCE(url, ''), COALESCE(from_visit, ''), COALESCE(opener_visit, '') FROM visits",
+    ) else {
+        return links;
+    };
+    let Ok(mut rows) = stmt.query([]) else {
+        return links;
+    };
+    while let Ok(Some(r)) = rows.next() {
+        let (Ok(id), Ok(url_id), Ok(from), Ok(opener)) = (
+            r.get::<_, String>(0),
+            r.get::<_, String>(1),
+            r.get::<_, String>(2),
+            r.get::<_, String>(3),
+        ) else {
+            continue;
+        };
+        let parent = nonzero_visit_id(&from)
+            .map(|f| (f, "from_visit"))
+            .or_else(|| nonzero_visit_id(&opener).map(|o| (o, "opener_visit")));
+        links.insert(id, VisitLinkRow { url_id, parent });
+    }
+    links
 }
 
-/// True when a visit is just the page re-navigating to *itself* (client/server
-/// redirect or reload) rather than a fresh inflow: its parent visit resolves to
-/// the same url id.
-fn is_same_url_redirect(conn: &Connection, visit_id: &str, own_url_id: &str) -> bool {
-    parent_visit_id(conn, visit_id)
-        .and_then(|parent| visit_url_id(conn, &parent))
-        .map(|parent_url| parent_url == own_url_id)
-        .unwrap_or(false)
-}
-
-/// Walk backward from `start_visit` following `from_visit` (same-tab referrer)
-/// or, when that is empty, `opener_visit` (the tab/window that spawned this
-/// one). Returns steps ordered oldest → target.
-fn build_visit_chain(conn: &Connection, start_visit: &str) -> Option<VisitFlowChain> {
-    let mut steps: Vec<VisitFlowStep> = Vec::new();
+/// The representative (entry) visit of a same-URL re-navigation run: walk up
+/// the chosen parent link while the parent is a visit of the *same* url id.
+/// The page re-navigating to itself (client/server redirect, reload) is one
+/// visit story — those runs collapse into their entry node, with the member
+/// count surfaced as `reloads`. Memoised; cycle-safe on corrupt data.
+fn collapse_rep(
+    id: &str,
+    links: &std::collections::HashMap<String, VisitLinkRow>,
+    memo: &mut std::collections::HashMap<String, String>,
+) -> String {
+    if let Some(rep) = memo.get(id) {
+        return rep.clone();
+    }
+    let mut path: Vec<String> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut cursor = nonzero_visit_id(start_visit);
-    let mut external = String::new();
-    let mut visit_time = String::new();
-    let mut is_first = true;
-    while let Some(id) = cursor {
-        if !seen.insert(id.clone()) || steps.len() >= VISIT_FLOW_DEPTH_CAP {
-            break;
+    let mut cursor = id.to_string();
+    let rep = loop {
+        if let Some(rep) = memo.get(&cursor) {
+            break rep.clone();
         }
-        let v = match read_visit(conn, &id) {
-            Some(v) => v,
-            None => break,
-        };
-        let from = nonzero_visit_id(&v.from_visit);
-        let opener = nonzero_visit_id(&v.opener_visit);
-        let opened_in_new_tab = from.is_none() && opener.is_some();
-        // How this step links to its parent — the exact join the chain is built
-        // on, kept as raw evidence so the edge can be re-verified against the DB.
-        let (parent_link, parent_visit_id) = match (&from, &opener) {
-            (Some(f), _) => ("from_visit".to_string(), f.clone()),
-            (None, Some(o)) => ("opener_visit".to_string(), o.clone()),
-            (None, None) => (String::new(), String::new()),
-        };
-        if is_first {
-            external = v.external_referrer.clone();
-            visit_time = v.time.clone();
-            is_first = false;
+        if !seen.insert(cursor.clone()) {
+            break cursor;
         }
-        steps.push(VisitFlowStep {
-            url: v.url,
-            title: v.title,
-            time: v.time,
-            transition: decode_transition(v.transition),
-            opened_in_new_tab,
-            is_target: false,
-            visit_id: id.clone(),
-            transition_raw: v.transition.to_string(),
-            parent_link,
-            parent_visit_id,
-        });
-        cursor = from.or(opener);
+        let Some(row) = links.get(&cursor) else {
+            break cursor;
+        };
+        match &row.parent {
+            Some((p, _)) if links.get(p).is_some_and(|pr| pr.url_id == row.url_id) => {
+                path.push(cursor.clone());
+                cursor = p.clone();
+            }
+            _ => break cursor,
+        }
+    };
+    for member in path {
+        memo.insert(member, rep.clone());
     }
-    if steps.is_empty() {
-        return None;
-    }
-    steps.reverse();
-    if let Some(last) = steps.last_mut() {
-        last.is_target = true;
-    }
-    Some(VisitFlowChain {
-        visit_time,
-        steps,
-        external_referrer: external,
-        reloads: 0,
-    })
+    memo.insert(id.to_string(), rep.clone());
+    rep
 }
 
 /// The `_Cache`/`_IE_WebCache` outputs have no `visits` table; every other
@@ -4761,13 +4751,13 @@ fn browser_history_dbs(host_dir: &str, account: &str) -> Vec<PathBuf> {
     files
 }
 
-fn browser_visit_flow_blocking(
+fn browser_visit_graph_blocking(
     host_dir: String,
     account: String,
     url: String,
     cache_key: Option<String>,
     source_file: Option<String>,
-) -> BrowserVisitFlow {
+) -> BrowserVisitGraph {
     let is_cache = cache_key.as_deref().is_some_and(|k| !k.trim().is_empty());
     // 행이 가리키는 원본과 같은 브라우저의 History만 조회한다 — 같은 계정에
     // 여러 브라우저 프로필이 있을 때 먼저 일치한 다른 브라우저의 체인을
@@ -4775,18 +4765,16 @@ fn browser_visit_flow_blocking(
     //  - `BROWSER/<계정_브라우저>.sqlite` (BrowserActivity 방문 행) → 그 DB 하나만.
     //  - 수집 원본 경로(캐시 index 등) → 경로에서 브라우저를 판별해 같은
     //    계정·같은 브라우저의 History만 후보.
-    //  - 출처가 없거나(구 파싱본) 판별 불가면 임의 선택 대신 안내로 비활성.
+    //  - 출처가 없으면(구 파싱본, `_source_file` 컬럼 도입 전) 고정을 포기하고
+    //    이전 동작대로 계정의 History 후보 전체를 조회한다 — 재파싱 전
+    //    케이스에서 기능을 끄지 않기 위한 완화이며, 체인을 낸 DB 파일명이
+    //    결과(source_file)에 남아 어느 원본인지는 확인 가능하다.
     let source = source_file
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
     let candidates: Vec<PathBuf> = match source {
-        None => {
-            return BrowserVisitFlow {
-                note: "이 행에는 원본 파일 정보가 없어 유입 흐름을 연결하지 않습니다 — 재파싱하면 사용할 수 있습니다.".to_string(),
-                ..Default::default()
-            };
-        }
+        None => browser_history_dbs(&host_dir, &account),
         Some(value) => {
             let name = Path::new(value)
                 .file_name()
@@ -4829,14 +4817,14 @@ fn browser_visit_flow_blocking(
                             // 아래 공통 빈 후보 안내로 떨어진다.
                             filtered
                         } else {
-                            return BrowserVisitFlow {
+                            return BrowserVisitGraph {
                                 note: "같은 브라우저 프로필이 여러 개라 이 캐시의 원본 프로필을 특정할 수 없습니다 — 재파싱하면 사용할 수 있습니다.".to_string(),
                                 ..Default::default()
                             };
                         }
                     }
                     None => {
-                        return BrowserVisitFlow {
+                        return BrowserVisitGraph {
                             note: "크로미움 계열(Chrome·Edge·Whale) 방문 기록이 아닌 원본이라 유입 흐름을 복원할 수 없습니다.".to_string(),
                             ..Default::default()
                         };
@@ -4846,7 +4834,7 @@ fn browser_visit_flow_blocking(
         }
     };
     if candidates.is_empty() {
-        return BrowserVisitFlow {
+        return BrowserVisitGraph {
             note: "같은 브라우저의 방문 기록 결과가 없어 유입 흐름을 연결하지 않습니다.".to_string(),
             ..Default::default()
         };
@@ -4944,16 +4932,45 @@ fn browser_visit_flow_blocking(
             continue;
         }
 
-        // For each matching page, one chain per visit of that page.
-        let mut chains: Vec<VisitFlowChain> = Vec::new();
-        for url_id in url_ids {
-            if chains.len() >= VISIT_FLOW_MAX_CHAINS {
-                break;
+        // ---- 전체 방문 연결 지도(한 번의 스캔) + 재이동 접기 ----------------
+        let links = load_visit_links(&conn);
+        let mut rep_memo: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        // 접힌 그래프의 인접 관계. 노드는 각 같은-URL 재이동 사슬의 entry 방문
+        // (rep)이고, 간선은 서로 다른 URL 사이의 이동만 남는다. reload 수는
+        // 사슬을 따라 접힌 구성원 수 — 기존 체인 뷰의 entry별 귀속과 같다.
+        let mut reloads_of: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let mut parent_edge: std::collections::HashMap<String, (String, &'static str)> =
+            std::collections::HashMap::new();
+        let mut children_of: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        let all_ids: Vec<String> = links.keys().cloned().collect();
+        for id in &all_ids {
+            let rep = collapse_rep(id, &links, &mut rep_memo);
+            if rep != *id {
+                *reloads_of.entry(rep).or_default() += 1;
+                continue;
             }
+            // rep(entry) 방문의 교차-URL 부모만 간선이 된다. 부모가 재이동
+            // 사슬의 중간이면 그 사슬의 entry로 다시 접는다.
+            let row = &links[id];
+            if let Some((p, kind)) = &row.parent {
+                if links.get(p).is_some_and(|pr| pr.url_id != row.url_id) {
+                    let prep = collapse_rep(p, &links, &mut rep_memo);
+                    parent_edge.insert(rep.clone(), (prep.clone(), kind));
+                    children_of.entry(prep).or_default().push(rep.clone());
+                }
+            }
+        }
+
+        // ---- 대상 방문(시드) 수집 ------------------------------------------
+        let target_url_ids: std::collections::HashSet<&str> =
+            url_ids.iter().map(String::as_str).collect();
+        let mut seeds: Vec<String> = Vec::new();
+        let mut seed_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        'urls: for url_id in &url_ids {
             let mut visit_ids: Vec<String> = Vec::new();
-            // 체인 상한(10)으로 방문 조회를 자르면 최신 방문들이 한 유입의
-            // 리다이렉트일 때 그 뒤의 다른 유입 경로가 조사되지 못한다 —
-            // 충분히 넓게(400) 읽고, 상한 도달은 truncated로 화면에 알린다.
             if let Ok(mut stmt) = conn.prepare(
                 "SELECT id FROM visits WHERE url = ?1 ORDER BY CAST(visit_time AS INTEGER) DESC LIMIT ?2",
             ) {
@@ -4970,119 +4987,111 @@ fn browser_visit_flow_blocking(
             if visit_ids.len() >= VISIT_FLOW_SCAN_VISITS {
                 truncated = true;
             }
-            // Split the page's visits into genuine inflows vs. same-URL
-            // redirects/reloads. Every visit whose parent is this same page is
-            // the page re-navigating to itself; those are one story with the
-            // entry that started them, not separate inflow chains. Collapsing
-            // them avoids near-identical chains that differ only by a trailing
-            // "clientRedirect" step.
-            let mut entry_visits: Vec<String> = Vec::new();
-            let mut reload_visits: Vec<String> = Vec::new();
-            for vid in &visit_ids {
-                if is_same_url_redirect(&conn, vid, &url_id) {
-                    reload_visits.push(vid.clone());
-                } else {
-                    entry_visits.push(vid.clone());
+            for vid in visit_ids {
+                let rep = collapse_rep(&vid, &links, &mut rep_memo);
+                if !seed_seen.insert(rep.clone()) {
+                    continue;
                 }
-            }
-            // A page reached only via self-redirects (no captured entry) still
-            // deserves one chain — keep the oldest visit as the representative.
-            if entry_visits.is_empty() {
-                if let Some(oldest) = visit_ids.last() {
-                    entry_visits.push(oldest.clone());
-                    reload_visits.retain(|vid| vid != oldest);
+                if seeds.len() >= VISIT_GRAPH_MAX_TARGETS {
+                    truncated = true;
+                    break 'urls;
                 }
-            }
-            // 각 reload를 부모 연결(from/opener)로 같은 URL 체인을 따라
-            // 역추적해 그 체인을 시작한 entry에만 귀속한다 — URL 전체 집계를
-            // 모든 체인에 대입하면 다른 유입 뒤의 리다이렉트까지 현재 경로의
-            // 일로 주장하게 된다. 역추적이 entry에 닿지 않으면 어느 체인에도
-            // 세지 않는다.
-            let entry_set: std::collections::HashSet<&str> =
-                entry_visits.iter().map(String::as_str).collect();
-            let mut reloads_by_entry: std::collections::HashMap<String, usize> =
-                std::collections::HashMap::new();
-            for vid in &reload_visits {
-                let mut cursor = vid.clone();
-                let mut hops = 0usize;
-                let attributed = loop {
-                    if hops > VISIT_FLOW_DEPTH_CAP {
-                        break None;
-                    }
-                    match parent_visit_id(&conn, &cursor) {
-                        Some(parent) => {
-                            if entry_set.contains(parent.as_str()) {
-                                break Some(parent);
-                            }
-                            // 같은 URL로의 재이동 사슬 안에서만 계속 거슬러간다.
-                            if visit_url_id(&conn, &parent).as_deref() == Some(url_id.as_str()) {
-                                cursor = parent;
-                                hops += 1;
-                            } else {
-                                break None;
-                            }
-                        }
-                        None => break None,
-                    }
-                };
-                if let Some(entry) = attributed {
-                    *reloads_by_entry.entry(entry).or_default() += 1;
-                }
-            }
-            for vid in entry_visits {
-                if chains.len() >= VISIT_FLOW_MAX_CHAINS {
-                    break;
-                }
-                if let Some(mut chain) = build_visit_chain(&conn, &vid) {
-                    // A lone step with no referrer/opener is not an inflow story.
-                    if chain.steps.len() > 1 || !chain.external_referrer.is_empty() {
-                        chain.reloads = reloads_by_entry.get(&vid).copied().unwrap_or(0);
-                        chains.push(chain);
-                    }
-                }
+                seeds.push(rep);
             }
         }
-        if chains.is_empty() {
+        if seeds.is_empty() {
             continue;
         }
-        // Keep only *genuinely distinct* inflow paths. Near-identical chains —
-        // the same page entered again through the same ancestry — are one story,
-        // not several: sort longest-first, then drop any chain whose full page
-        // sequence is a prefix of an already-kept (longer) one. Two paths that
-        // diverge (a different origin/referrer) both survive, so the UI can show
-        // them side by side instead of stacking look-alikes.
-        chains.sort_by(|a, b| {
-            b.steps
-                .len()
-                .cmp(&a.steps.len())
-                .then_with(|| b.visit_time.cmp(&a.visit_time))
-        });
-        let mut distinct: Vec<VisitFlowChain> = Vec::new();
-        for chain in chains {
-            let seq: Vec<String> = chain.steps.iter().map(|s| s.url.clone()).collect();
-            let redundant = distinct.iter().any(|kept| {
-                kept.steps.len() >= seq.len()
-                    && kept
-                        .steps
-                        .iter()
-                        .zip(seq.iter())
-                        .all(|(k, s)| &k.url == s)
-            });
-            if !redundant {
-                distinct.push(chain);
-            }
-            if distinct.len() >= VISIT_FLOW_MAX_DISTINCT {
-                break;
+
+        // ---- 시드에서 양방향 BFS — 조상(유입)·후행 이동·형제 분기까지 ------
+        let mut in_graph: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut order: Vec<String> = Vec::new();
+        let mut queue: std::collections::VecDeque<(String, usize)> =
+            std::collections::VecDeque::new();
+        for seed in &seeds {
+            if in_graph.insert(seed.clone()) {
+                order.push(seed.clone());
+                queue.push_back((seed.clone(), 0));
             }
         }
-        let chains = distinct;
+        while let Some((id, hop)) = queue.pop_front() {
+            let mut neighbors: Vec<String> = Vec::new();
+            if let Some((p, _)) = parent_edge.get(&id) {
+                neighbors.push(p.clone());
+            }
+            if let Some(kids) = children_of.get(&id) {
+                neighbors.extend(kids.iter().cloned());
+            }
+            for n in neighbors {
+                if in_graph.contains(&n) {
+                    continue;
+                }
+                if hop >= VISIT_GRAPH_DEPTH_CAP || in_graph.len() >= VISIT_GRAPH_MAX_NODES {
+                    truncated = true;
+                    continue;
+                }
+                in_graph.insert(n.clone());
+                order.push(n.clone());
+                queue.push_back((n, hop + 1));
+            }
+        }
+
+        // ---- 노드·간선 구체화 ----------------------------------------------
+        let visit_id_num = |s: &str| s.trim().parse::<i64>().unwrap_or(i64::MAX);
+        let mut nodes: Vec<VisitGraphNode> = Vec::new();
+        for id in &order {
+            let Some(v) = read_visit(&conn, id) else {
+                continue;
+            };
+            nodes.push(VisitGraphNode {
+                visit_id: id.clone(),
+                url: v.url,
+                title: v.title,
+                time: v.time,
+                transition: decode_transition(v.transition),
+                transition_raw: v.transition.to_string(),
+                is_target: links
+                    .get(id)
+                    .is_some_and(|r| target_url_ids.contains(r.url_id.as_str())),
+                reloads: reloads_of.get(id).copied().unwrap_or(0),
+                external_referrer: v.external_referrer,
+            });
+        }
+        nodes.sort_by(|a, b| {
+            a.time
+                .cmp(&b.time)
+                .then_with(|| visit_id_num(&a.visit_id).cmp(&visit_id_num(&b.visit_id)))
+        });
+        let mut edges: Vec<VisitGraphEdge> = Vec::new();
+        for id in &order {
+            if let Some((p, kind)) = parent_edge.get(id) {
+                if in_graph.contains(p) {
+                    edges.push(VisitGraphEdge {
+                        from: p.clone(),
+                        to: id.clone(),
+                        kind: (*kind).to_string(),
+                    });
+                }
+            }
+        }
+        edges.sort_by_key(|e| visit_id_num(&e.to));
+        // 연결도 재이동도 외부 referrer도 없는 외톨이 대상뿐이면 이 DB에는
+        // 이동 이야기가 없다 — 기존 체인 뷰의 "유입 없음" 판정과 동일.
+        let has_story = !edges.is_empty()
+            || nodes
+                .iter()
+                .any(|n| !n.external_referrer.is_empty() || n.reloads > 0);
+        if !has_story {
+            continue;
+        }
         let note = if is_cache {
-            "이 캐시 리소스를 로드한 것으로 추정되는 페이지(캐시 키의 최상위 문서 출처)의 방문 유입 흐름입니다.".to_string()
+            "이 캐시 리소스를 로드한 것으로 추정되는 페이지(캐시 키의 최상위 문서 출처)를 기준으로 한 방문 이동 그래프입니다.".to_string()
         } else {
             String::new()
         };
-        return BrowserVisitFlow {
-            chains,
+        return BrowserVisitGraph {
+            nodes,
+            edges,
             source_file,
             matched_page,
             note,
@@ -5091,7 +5100,7 @@ fn browser_visit_flow_blocking(
     }
     // 모든 후보에서 체인을 만들지 못함 — 실패가 있으면 오류로 구분해 안내.
     if !source_failures.is_empty() {
-        return BrowserVisitFlow {
+        return BrowserVisitGraph {
             note: format!(
                 "원본 방문 기록을 읽지 못해 유입 흐름을 확인할 수 없습니다 — {}",
                 source_failures.join("; ")
@@ -5099,25 +5108,25 @@ fn browser_visit_flow_blocking(
             ..Default::default()
         };
     }
-    BrowserVisitFlow {
+    BrowserVisitGraph {
         note: "이 항목에 대한 방문 유입 흐름을 원본 History에서 찾지 못했습니다 (새 탭·리다이렉트 없이 직접 접근했거나, 원본 방문 기록이 남아있지 않을 수 있습니다).".to_string(),
         ..Default::default()
     }
 }
 
 #[tauri::command]
-async fn browser_visit_flow(
+async fn browser_visit_graph(
     host_dir: String,
     account: String,
     url: String,
     cache_key: Option<String>,
     source_file: Option<String>,
-) -> BrowserVisitFlow {
+) -> BrowserVisitGraph {
     tauri::async_runtime::spawn_blocking(move || {
-        browser_visit_flow_blocking(host_dir, account, url, cache_key, source_file)
+        browser_visit_graph_blocking(host_dir, account, url, cache_key, source_file)
     })
     .await
-    .unwrap_or_else(|error| BrowserVisitFlow {
+    .unwrap_or_else(|error| BrowserVisitGraph {
         note: format!("유입 흐름 작업이 중단되었습니다: {error}"),
         ..Default::default()
     })
@@ -6671,11 +6680,15 @@ mod browser_activity_tests {
              CREATE TABLE visits (id TEXT, url TEXT, from_visit TEXT, opener_visit TEXT, transition TEXT, external_referrer_url TEXT, visit_time TEXT);",
         )
         .unwrap();
-        // A (typed) → B (link, same tab) → C (opened in a new tab from B).
+        // A (typed) → B (link, same tab) → C (opened in a new tab from B),
+        // then onward: C → D (a later move off the reload), and A → E (a
+        // sibling branch off the shared ancestor).
         for (id, url, title) in [
             ("1", "https://a.test/", "A"),
             ("2", "https://b.test/", "B"),
             ("3", "https://c.test/page", "C"),
+            ("4", "https://d.test/next", "D"),
+            ("5", "https://e.test/side", "E"),
         ] {
             conn.execute(
                 "INSERT INTO urls VALUES (?1, ?2, ?3, '1')",
@@ -6685,13 +6698,17 @@ mod browser_activity_tests {
         }
         // transitions: TYPED (1) for A, LINK (0) for B, LINK (0x30000000) for C.
         // Visit 13 is C re-navigating to *itself* (client redirect, 0x60000000,
-        // from_visit=12) — a reload of the same page, not a new inflow.
+        // from_visit=12) — a reload of the same page, not a new inflow. Visit 14
+        // leaves C *from that reload* (from_visit=13), and visit 15 branches off
+        // A (from_visit=10) — a sibling path next to the target's ancestry.
         // visit_time: microseconds since 1601 (arbitrary increasing values).
         let rows = [
             ("10", "1", "0", "0", "1", "", "13427941143000000"),
             ("11", "2", "10", "0", "0", "", "13427941143100000"),
             ("12", "3", "0", "11", "805306368", "https://ext.test/", "13427941143200000"),
             ("13", "3", "12", "0", "1610612736", "", "13427941143300000"),
+            ("14", "4", "13", "0", "0", "", "13427941143400000"),
+            ("15", "5", "10", "0", "0", "", "13427941143500000"),
         ];
         for (id, url, from_visit, opener, transition, ext, time) in rows {
             conn.execute(
@@ -6703,7 +6720,7 @@ mod browser_activity_tests {
     }
 
     #[test]
-    fn visit_flow_reconstructs_referrer_and_opener_chain() {
+    fn visit_graph_covers_ancestors_descendants_and_siblings() {
         let root = std::env::temp_dir().join(format!(
             "windows-analysis-visitflow-{}-{}",
             std::process::id(),
@@ -6714,8 +6731,8 @@ mod browser_activity_tests {
         ));
         write_history_fixture(&root.join("BROWSER"));
 
-        // A navigated page: chain walks from_visit then opener → A, B, C.
-        let flow = browser_visit_flow_blocking(
+        // 대상 C에서 조상(A→B→C), 후행(C→D), 형제 분기(A→E)까지 한 그래프로.
+        let flow = browser_visit_graph_blocking(
             root.to_string_lossy().to_string(),
             "user".to_string(),
             "https://c.test/page".to_string(),
@@ -6723,20 +6740,29 @@ mod browser_activity_tests {
             Some("BROWSER/user_Chrome.sqlite".to_string()),
         );
         assert_eq!(flow.source_file, "user_Chrome.sqlite");
-        // The page has two visits (entry + a self-redirect), but only the one
-        // genuine inflow chain is returned; the reload is collapsed into a count.
-        assert_eq!(flow.chains.len(), 1);
-        let chain = &flow.chains[0];
-        assert_eq!(chain.reloads, 1);
-        let urls: Vec<&str> = chain.steps.iter().map(|s| s.url.as_str()).collect();
-        assert_eq!(urls, vec!["https://a.test/", "https://b.test/", "https://c.test/page"]);
-        assert!(chain.steps.last().unwrap().is_target);
-        assert!(chain.steps.last().unwrap().opened_in_new_tab, "C was opened via opener_visit");
-        assert_eq!(chain.external_referrer, "https://ext.test/");
-        assert_eq!(chain.steps[0].transition, "주소창 직접 입력");
+        let by_id: std::collections::HashMap<&str, &VisitGraphNode> =
+            flow.nodes.iter().map(|n| (n.visit_id.as_str(), n)).collect();
+        // reload 방문(13)은 entry(12)에 접혀 노드가 아니다.
+        assert_eq!(flow.nodes.len(), 5, "nodes: {:?}", flow.nodes.iter().map(|n| &n.visit_id).collect::<Vec<_>>());
+        for id in ["10", "11", "12", "14", "15"] {
+            assert!(by_id.contains_key(id), "missing node {id}");
+        }
+        let target = by_id["12"];
+        assert!(target.is_target);
+        assert_eq!(target.reloads, 1, "self-redirect 13 collapses into 12");
+        assert_eq!(target.external_referrer, "https://ext.test/");
+        assert_eq!(by_id["10"].transition, "주소창 직접 입력");
+        assert!(!by_id["14"].is_target && !by_id["10"].is_target);
+        // 간선: 조상 연결 그대로, 후행 이동은 reload가 아니라 entry에 붙는다.
+        let edge = |from: &str, to: &str| flow.edges.iter().find(|e| e.from == from && e.to == to);
+        assert_eq!(flow.edges.len(), 4);
+        assert_eq!(edge("10", "11").unwrap().kind, "from_visit");
+        assert_eq!(edge("11", "12").unwrap().kind, "opener_visit");
+        assert!(edge("12", "14").is_some(), "C→D는 reload(13)를 접은 entry(12)에 연결");
+        assert!(edge("10", "15").is_some(), "형제 분기 A→E 포함");
 
         // A cached subresource is attributed to its document origin's page.
-        let cache_flow = browser_visit_flow_blocking(
+        let cache_flow = browser_visit_graph_blocking(
             root.to_string_lossy().to_string(),
             "user".to_string(),
             "https://c.test/asset/app.js".to_string(),
@@ -6744,39 +6770,39 @@ mod browser_activity_tests {
             Some("/case/BROWSER/user/Chrome/Cache/Cache_Data/index".to_string()),
         );
         assert_eq!(cache_flow.matched_page, "https://c.test");
-        assert_eq!(cache_flow.chains.len(), 1);
-        assert_eq!(
-            cache_flow.chains[0].steps.last().unwrap().url,
-            "https://c.test/page"
-        );
+        assert!(cache_flow
+            .nodes
+            .iter()
+            .any(|n| n.is_target && n.url == "https://c.test/page"));
 
-        // An unknown URL yields no chain but a non-empty explanatory note.
-        let none = browser_visit_flow_blocking(
+        // An unknown URL yields no graph but a non-empty explanatory note.
+        let none = browser_visit_graph_blocking(
             root.to_string_lossy().to_string(),
             "user".to_string(),
             "https://nowhere.test/x".to_string(),
             None,
             Some("BROWSER/user_Chrome.sqlite".to_string()),
         );
-        assert!(none.chains.is_empty());
+        assert!(none.nodes.is_empty());
         assert!(!none.note.is_empty());
 
-        // 출처가 없는 행(구 파싱본)은 임의 DB를 고르지 않는다 — 안내로 비활성.
-        let unsourced = browser_visit_flow_blocking(
+        // 출처가 없는 행(구 파싱본)은 고정을 포기하고 계정 후보 전체를
+        // 조회한다 — 그래프를 낸 원본은 source_file로 남는다.
+        let unsourced = browser_visit_graph_blocking(
             root.to_string_lossy().to_string(),
             "user".to_string(),
             "https://c.test/page".to_string(),
             None,
             None,
         );
-        assert!(unsourced.chains.is_empty());
-        assert!(unsourced.note.contains("재파싱"));
+        assert!(!unsourced.nodes.is_empty());
+        assert_eq!(unsourced.source_file, "user_Chrome.sqlite");
 
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
-    fn visit_flow_keeps_distinct_paths_and_merges_duplicates() {
+    fn visit_graph_keeps_every_entry_and_distinct_origins() {
         let root = std::env::temp_dir().join(format!(
             "windows-analysis-visitflow-distinct-{}-{}",
             std::process::id(),
@@ -6797,8 +6823,8 @@ mod browser_activity_tests {
         for (id, url) in [("1", "https://x.test/"), ("2", "https://y.test/"), ("3", "https://t.test/p")] {
             conn.execute("INSERT INTO urls VALUES (?1,?2,'',' 1')", rusqlite::params![id, url]).unwrap();
         }
-        // Three genuine entries of T: two via X (same ancestry → duplicates, one
-        // must be merged), one via Y (a different origin → a distinct 2nd path).
+        // Three genuine entries of T: two via X (both real visits — the graph
+        // keeps each), one via Y (a different origin, in the same picture).
         let rows = [
             ("100", "1", "0", "0", "1", "", "13427941143000000"),
             ("101", "3", "100", "0", "0", "", "13427941143100000"),
@@ -6814,22 +6840,28 @@ mod browser_activity_tests {
         }
         drop(conn);
 
-        let flow = browser_visit_flow_blocking(
+        let flow = browser_visit_graph_blocking(
             root.to_string_lossy().to_string(),
             "user".to_string(),
             "https://t.test/p".to_string(),
             None,
             Some("BROWSER/user_Chrome.sqlite".to_string()),
         );
-        // Two distinct paths (X→T and Y→T); the duplicate X→T entry is merged.
-        assert_eq!(flow.chains.len(), 2);
-        let origins: std::collections::HashSet<&str> =
-            flow.chains.iter().map(|c| c.steps[0].url.as_str()).collect();
+        // 그래프는 T의 진짜 entry 방문을 전부 노드로 남긴다(101·102·201) —
+        // 서로 다른 출발지 X·Y가 한 그림에서 같이 보인다.
+        assert_eq!(flow.nodes.len(), 5);
+        assert_eq!(flow.edges.len(), 3);
+        assert_eq!(flow.nodes.iter().filter(|n| n.is_target).count(), 3);
+        let origins: std::collections::HashSet<&str> = flow
+            .nodes
+            .iter()
+            .filter(|n| !n.is_target)
+            .map(|n| n.url.as_str())
+            .collect();
         assert!(origins.contains("https://x.test/"));
         assert!(origins.contains("https://y.test/"));
-        for chain in &flow.chains {
-            assert_eq!(chain.steps.last().unwrap().url, "https://t.test/p");
-        }
+        let edge = |from: &str, to: &str| flow.edges.iter().any(|e| e.from == from && e.to == to);
+        assert!(edge("100", "101") && edge("100", "102") && edge("200", "201"));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -6878,7 +6910,7 @@ mod browser_activity_tests {
         }
         drop(conn);
 
-        let flow = browser_visit_flow_blocking(
+        let flow = browser_visit_graph_blocking(
             root.to_string_lossy().to_string(),
             "user".to_string(),
             "https://c.test/asset/app.js".to_string(),
@@ -6886,12 +6918,17 @@ mod browser_activity_tests {
             Some("/case/BROWSER/user/Chrome/Cache/Cache_Data/index".to_string()),
         );
         assert_eq!(flow.matched_page, "https://c.test");
-        // 미끼·타 포트 페이지가 아니라 정확한 origin의 페이지만 채택된다.
-        for chain in &flow.chains {
-            let target = &chain.steps.last().unwrap().url;
-            assert!(target.starts_with("https://c.test/"), "wrong page attributed: {target}");
+        // 미끼·타 포트 페이지가 아니라 정확한 origin의 페이지만 대상이 된다.
+        let targets: Vec<&VisitGraphNode> = flow.nodes.iter().filter(|n| n.is_target).collect();
+        assert!(!targets.is_empty());
+        for node in &targets {
+            assert!(node.url.starts_with("https://c.test/"), "wrong page attributed: {}", node.url);
         }
-        assert!(!flow.chains.is_empty());
+        // 미끼 호스트·타 포트의 컴포넌트는 그래프에 연결되지 않는다.
+        assert!(flow
+            .nodes
+            .iter()
+            .all(|n| !n.url.contains(".evil") && !n.url.contains(":8443")));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -6932,7 +6969,7 @@ mod browser_activity_tests {
             ).unwrap();
         }
 
-        let flow = browser_visit_flow_blocking(
+        let flow = browser_visit_graph_blocking(
             root.to_string_lossy().to_string(),
             "user".to_string(),
             "https://t.test/p".to_string(),
@@ -6940,8 +6977,8 @@ mod browser_activity_tests {
             Some("BROWSER/user_Edge.sqlite".to_string()),
         );
         assert_eq!(flow.source_file, "user_Edge.sqlite");
-        assert_eq!(flow.chains.len(), 1);
-        assert_eq!(flow.chains[0].steps[0].url, "https://from-edge.test/");
+        assert!(flow.nodes.iter().any(|n| n.url == "https://from-edge.test/"));
+        assert!(flow.nodes.iter().all(|n| n.url != "https://from-chrome.test/"));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -6985,20 +7022,20 @@ mod browser_activity_tests {
         }
         drop(conn);
 
-        let flow = browser_visit_flow_blocking(
+        let flow = browser_visit_graph_blocking(
             root.to_string_lossy().to_string(),
             "user".to_string(),
             "https://t.test/p".to_string(),
             None,
             Some("BROWSER/user_Chrome.sqlite".to_string()),
         );
-        assert_eq!(flow.chains.len(), 2);
-        let mut by_origin: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-        for chain in &flow.chains {
-            by_origin.insert(chain.steps[0].url.clone(), chain.reloads);
-        }
-        assert_eq!(by_origin.get("https://x.test/"), Some(&2), "X 유입에만 재이동 2회 귀속");
-        assert_eq!(by_origin.get("https://y.test/"), Some(&0), "Y 유입은 재이동 0회");
+        // reload 방문(102·103)은 노드가 아니라 자기 entry(101)의 접힌 수다.
+        let by_id: std::collections::HashMap<&str, &VisitGraphNode> =
+            flow.nodes.iter().map(|n| (n.visit_id.as_str(), n)).collect();
+        assert_eq!(flow.nodes.len(), 4);
+        assert!(!by_id.contains_key("102") && !by_id.contains_key("103"));
+        assert_eq!(by_id["101"].reloads, 2, "X 유입 entry에만 재이동 2회 귀속");
+        assert_eq!(by_id["201"].reloads, 0, "Y 유입 entry는 재이동 0회");
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -7050,8 +7087,8 @@ mod browser_activity_tests {
             ).unwrap();
         }
 
-        // Profile 1의 캐시 index → Profile 1 History 체인만 연결된다.
-        let flow = browser_visit_flow_blocking(
+        // Profile 1의 캐시 index → Profile 1 History 그래프만 연결된다.
+        let flow = browser_visit_graph_blocking(
             root.to_string_lossy().to_string(),
             "user".to_string(),
             "https://t.test/asset/app.js".to_string(),
@@ -7059,22 +7096,22 @@ mod browser_activity_tests {
             Some("/img/Users/user/AppData/Local/Google/Chrome/User Data/Profile 1/Cache/Cache_Data/index".to_string()),
         );
         assert_eq!(flow.source_file, "user_Chrome_2.sqlite");
-        assert_eq!(flow.chains.len(), 1);
-        assert_eq!(flow.chains[0].steps[0].url, "https://from-profile1.test/");
+        assert!(flow.nodes.iter().any(|n| n.url == "https://from-profile1.test/"));
+        assert!(flow.nodes.iter().all(|n| n.url != "https://from-default.test/"));
 
         // 프로필 매핑이 없는 산출물(구 파싱본)에서 후보가 여럿이면 비활성.
         for file in ["user_Chrome.sqlite", "user_Chrome_2.sqlite"] {
             let conn = Connection::open(dir.join(file)).unwrap();
             conn.execute_batch("DROP TABLE \"_wina_source\";").unwrap();
         }
-        let ambiguous = browser_visit_flow_blocking(
+        let ambiguous = browser_visit_graph_blocking(
             root.to_string_lossy().to_string(),
             "user".to_string(),
             "https://t.test/asset/app.js".to_string(),
             Some("1/0/_dk_https://t.test https://t.test https://t.test/asset/app.js".to_string()),
             Some("/img/Users/user/AppData/Local/Google/Chrome/User Data/Profile 1/Cache/Cache_Data/index".to_string()),
         );
-        assert!(ambiguous.chains.is_empty());
+        assert!(ambiguous.nodes.is_empty());
         assert!(ambiguous.note.contains("프로필"), "note: {}", ambiguous.note);
 
         let _ = std::fs::remove_dir_all(root);
@@ -7967,7 +8004,7 @@ fn main() {
             ai_referrals,
             cache_entries,
             cache_entry_body,
-            browser_visit_flow,
+            browser_visit_graph,
             ai_conversations,
             wmi_subscription_events,
             powershell_search_rowids
