@@ -1850,6 +1850,18 @@ fn parse_browser_history_artifact(
                         "INSERT INTO \"_wina_source\" VALUES (?1)",
                         [p.to_string_lossy().to_string()],
                     );
+                    // 방문 이동 그래프의 요구식 조회(id·부모·자식·URL 탐색)용
+                    // 인덱스 — idx_mft_children과 같은 파싱 시점 인덱스 선례.
+                    // 대상 테이블이 없는 산출물(스키마 변형)에서는 실패해도
+                    // 조회가 테이블 스캔으로 동작하므로 best-effort.
+                    if let Err(error) = conn.execute_batch(
+                        "CREATE INDEX IF NOT EXISTS idx_visits_id ON visits(id);\n                         CREATE INDEX IF NOT EXISTS idx_visits_from ON visits(from_visit);\n                         CREATE INDEX IF NOT EXISTS idx_visits_opener ON visits(opener_visit);\n                         CREATE INDEX IF NOT EXISTS idx_visits_url ON visits(url);\n                         CREATE INDEX IF NOT EXISTS idx_urls_id ON urls(id);\n                         CREATE INDEX IF NOT EXISTS idx_urls_url ON urls(url);",
+                    ) {
+                        emit(&format!(
+                            "[*] History 인덱스 생성 건너뜀 {}: {error}",
+                            out.display()
+                        ));
+                    }
                 }
                 outputs.push(relative);
             }

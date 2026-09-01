@@ -4636,101 +4636,275 @@ fn read_visit(conn: &Connection, visit_id: &str) -> Option<VisitRow> {
     .ok()
 }
 
-/// One `visits` row in the in-memory navigation map: its url id and the parent
-/// it navigated from — `from_visit` (same tab) taking priority over
-/// `opener_visit` (the tab/window that spawned this one), the same rule the
-/// old linear chain walked. The whole table is loaded in one scan because the
-/// graph also needs the *forward* direction (children), which per-row queries
-/// would turn into full-table scans per node.
+/// 한 `visits` 행의 연결 정보 — url id와, 이동해 온 부모(`from_visit`가
+/// `opener_visit`보다 우선, 기존 선형 체인과 같은 규칙)와 그 연결 컬럼명.
+#[derive(Clone)]
 struct VisitLinkRow {
     url_id: String,
     /// (parent `visits.id`, linking column: "from_visit" | "opener_visit").
-    parent: Option<(String, &'static str)>,
+    parent: Option<(String, String)>,
 }
 
-fn load_visit_links(conn: &Connection) -> std::collections::HashMap<String, VisitLinkRow> {
-    let mut links: std::collections::HashMap<String, VisitLinkRow> =
-        std::collections::HashMap::new();
-    let Ok(mut stmt) = conn.prepare(
-        "SELECT id, COALESCE(url, ''), COALESCE(from_visit, ''), COALESCE(opener_visit, '') FROM visits",
-    ) else {
-        return links;
-    };
-    let Ok(mut rows) = stmt.query([]) else {
-        return links;
-    };
-    while let Ok(Some(r)) = rows.next() {
-        let (Ok(id), Ok(url_id), Ok(from), Ok(opener)) = (
-            r.get::<_, String>(0),
-            r.get::<_, String>(1),
-            r.get::<_, String>(2),
-            r.get::<_, String>(3),
-        ) else {
-            continue;
-        };
+/// 방문 연결 정보의 요구식(bounded) 저장소 — visits 테이블 전체를 적재하는
+/// 대신 시드와 그 이웃만 단건/배치 SQL로 읽고 캐시한다. 읽은 행 수는 전역
+/// 예산(VISIT_GRAPH_ROW_BUDGET)으로 상한되어, 메모리·I/O가 테이블 크기가
+/// 아니라 탐색 상한에 비례한다 (표시 상한 200노드는 결과 상한이지 입력
+/// 상한이 아니라는 리뷰 지적의 반영). 예산 소진은 truncated로 표면화된다.
+struct VisitStore<'c> {
+    conn: &'c Connection,
+    rows: std::collections::HashMap<String, Option<VisitLinkRow>>,
+    children: std::collections::HashMap<String, Vec<String>>,
+    children_fetched: std::collections::HashSet<String>,
+    rep_memo: std::collections::HashMap<String, String>,
+    fetched_rows: usize,
+}
+
+/// 그래프 조회 한 번이 원본 History에서 읽을 수 있는 방문 행 수의 상한.
+const VISIT_GRAPH_ROW_BUDGET: usize = 5_000;
+
+impl<'c> VisitStore<'c> {
+    fn new(conn: &'c Connection) -> Self {
+        Self {
+            conn,
+            rows: std::collections::HashMap::new(),
+            children: std::collections::HashMap::new(),
+            children_fetched: std::collections::HashSet::new(),
+            rep_memo: std::collections::HashMap::new(),
+            fetched_rows: 0,
+        }
+    }
+
+    fn budget_exhausted(&self) -> bool {
+        self.fetched_rows >= VISIT_GRAPH_ROW_BUDGET
+    }
+
+    fn link_of(url_id: String, from: String, opener: String) -> VisitLinkRow {
         let parent = nonzero_visit_id(&from)
-            .map(|f| (f, "from_visit"))
-            .or_else(|| nonzero_visit_id(&opener).map(|o| (o, "opener_visit")));
-        links.insert(id, VisitLinkRow { url_id, parent });
+            .map(|f| (f, "from_visit".to_string()))
+            .or_else(|| nonzero_visit_id(&opener).map(|o| (o, "opener_visit".to_string())));
+        VisitLinkRow { url_id, parent }
     }
-    links
-}
 
-/// The representative (entry) visit of a same-URL re-navigation run: walk up
-/// the chosen parent link while the parent is a visit of the *same* url id.
-/// The page re-navigating to itself (client/server redirect, reload) is one
-/// visit story — those runs collapse into their entry node, with the member
-/// count surfaced as `reloads`. Memoised; cycle-safe on corrupt data.
-fn collapse_rep(
-    id: &str,
-    links: &std::collections::HashMap<String, VisitLinkRow>,
-    memo: &mut std::collections::HashMap<String, String>,
-) -> String {
-    if let Some(rep) = memo.get(id) {
-        return rep.clone();
+    /// 방문 하나의 연결 행 — 캐시 미스면 단건 조회(예산 소진 시 None).
+    fn get_row(&mut self, id: &str) -> Option<VisitLinkRow> {
+        if let Some(cached) = self.rows.get(id) {
+            return cached.clone();
+        }
+        if self.budget_exhausted() {
+            return None;
+        }
+        let fetched = self
+            .conn
+            .query_row(
+                "SELECT COALESCE(url, ''), COALESCE(from_visit, ''), COALESCE(opener_visit, '') FROM visits WHERE id = ?1",
+                [id],
+                |r| {
+                    Ok(Self::link_of(
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .ok();
+        self.fetched_rows += 1;
+        self.rows.insert(id.to_string(), fetched.clone());
+        fetched
     }
-    let mut path: Vec<String> = Vec::new();
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut cursor = id.to_string();
-    let rep = loop {
-        if let Some(rep) = memo.get(&cursor) {
-            break rep.clone();
+
+    /// `parents`의 (유효 부모 기준) 자식들을 배치 조회해 캐시에 채운다.
+    fn fetch_children(&mut self, parents: &[String]) {
+        let missing: Vec<String> = parents
+            .iter()
+            .filter(|p| !self.children_fetched.contains(*p))
+            .cloned()
+            .collect();
+        if missing.is_empty() || self.budget_exhausted() {
+            return;
         }
-        if !seen.insert(cursor.clone()) {
-            break cursor;
-        }
-        let Some(row) = links.get(&cursor) else {
-            break cursor;
-        };
-        match &row.parent {
-            Some((p, _)) if links.get(p).is_some_and(|pr| pr.url_id == row.url_id) => {
-                path.push(cursor.clone());
-                cursor = p.clone();
+        for chunk in missing.chunks(100) {
+            if self.budget_exhausted() {
+                break;
             }
-            _ => break cursor,
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT id, COALESCE(url, ''), COALESCE(from_visit, ''), COALESCE(opener_visit, '') FROM visits WHERE from_visit IN ({placeholders}) OR opener_visit IN ({placeholders})"
+            );
+            let params: Vec<&dyn rusqlite::ToSql> = chunk
+                .iter()
+                .chain(chunk.iter())
+                .map(|p| p as &dyn rusqlite::ToSql)
+                .collect();
+            let chunk_set: std::collections::HashSet<&str> =
+                chunk.iter().map(String::as_str).collect();
+            let Ok(mut stmt) = self.conn.prepare(&sql) else {
+                continue;
+            };
+            let Ok(mut rows) = stmt.query(params.as_slice()) else {
+                continue;
+            };
+            while let Ok(Some(r)) = rows.next() {
+                if self.budget_exhausted() {
+                    break;
+                }
+                let (Ok(id), Ok(url_id), Ok(from), Ok(opener)) = (
+                    r.get::<_, String>(0),
+                    r.get::<_, String>(1),
+                    r.get::<_, String>(2),
+                    r.get::<_, String>(3),
+                ) else {
+                    continue;
+                };
+                let link = Self::link_of(url_id, from, opener);
+                // 유효 부모(from 우선)가 이 배치의 부모일 때만 자식으로 연결 —
+                // 전량 스캔 버전과 같은 간선 의미를 유지한다.
+                if let Some((parent, _)) = &link.parent {
+                    if chunk_set.contains(parent.as_str()) {
+                        self.children
+                            .entry(parent.clone())
+                            .or_default()
+                            .push(id.clone());
+                    }
+                }
+                if !self.rows.contains_key(&id) {
+                    self.fetched_rows += 1;
+                    self.rows.insert(id, Some(link));
+                }
+            }
+            for parent in chunk {
+                self.children_fetched.insert(parent.clone());
+            }
         }
-    };
-    for member in path {
-        memo.insert(member, rep.clone());
     }
-    memo.insert(id.to_string(), rep.clone());
-    rep
+
+    /// 같은-URL 재이동 사슬의 entry 방문 — 부모가 같은 url인 동안 위로 걷는다
+    /// (전량 스캔 버전의 collapse_rep과 동일 의미, 메모·순환 안전).
+    fn rep_of(&mut self, id: &str) -> String {
+        if let Some(rep) = self.rep_memo.get(id) {
+            return rep.clone();
+        }
+        let mut path: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut cursor = id.to_string();
+        let rep = loop {
+            if let Some(rep) = self.rep_memo.get(&cursor) {
+                break rep.clone();
+            }
+            if !seen.insert(cursor.clone()) || path.len() >= VISIT_FLOW_SCAN_VISITS {
+                break cursor;
+            }
+            let Some(row) = self.get_row(&cursor) else {
+                break cursor;
+            };
+            let same_url_parent = match &row.parent {
+                Some((p, _)) => self
+                    .get_row(p)
+                    .is_some_and(|pr| pr.url_id == row.url_id)
+                    .then(|| p.clone()),
+                None => None,
+            };
+            match same_url_parent {
+                Some(p) => {
+                    path.push(cursor.clone());
+                    cursor = p;
+                }
+                None => break cursor,
+            }
+        };
+        for member in path {
+            self.rep_memo.insert(member, rep.clone());
+        }
+        self.rep_memo.insert(id.to_string(), rep.clone());
+        rep
+    }
+
+    /// entry(rep)의 같은-URL 재이동 사슬 구성원(rep 포함)을 아래로 확장한다.
+    /// 반환: (구성원 목록, 상한 도달 여부). 구성원 수·예산으로 상한된다.
+    fn members_of(&mut self, rep: &str) -> (Vec<String>, bool) {
+        let mut members = vec![rep.to_string()];
+        let Some(rep_row) = self.get_row(rep) else {
+            return (members, false);
+        };
+        let rep_url = rep_row.url_id;
+        let mut frontier = vec![rep.to_string()];
+        let mut capped = false;
+        while !frontier.is_empty() {
+            if members.len() >= VISIT_FLOW_SCAN_VISITS || self.budget_exhausted() {
+                capped = true;
+                break;
+            }
+            self.fetch_children(&frontier);
+            let mut next: Vec<String> = Vec::new();
+            for parent in frontier {
+                let kids = self.children.get(&parent).cloned().unwrap_or_default();
+                for kid in kids {
+                    let same = self
+                        .rows
+                        .get(&kid)
+                        .and_then(|r| r.as_ref())
+                        .is_some_and(|r| r.url_id == rep_url);
+                    if same {
+                        members.push(kid.clone());
+                        next.push(kid);
+                    }
+                }
+            }
+            frontier = next;
+        }
+        (members, capped)
+    }
+
+    /// 사슬 구성원들에 붙은 교차-URL 자식(각자 자기 사슬의 entry)과, 그 자식이
+    /// 부모를 가리키는 연결 컬럼명을 돌려준다.
+    fn cross_children_of(&mut self, members: &[String], rep_url: &str) -> Vec<(String, String)> {
+        self.fetch_children(members);
+        let mut out: Vec<(String, String)> = Vec::new();
+        for member in members {
+            let kids = self.children.get(member).cloned().unwrap_or_default();
+            for kid in kids {
+                let Some(Some(row)) = self.rows.get(&kid).cloned() else {
+                    continue;
+                };
+                if row.url_id != rep_url {
+                    let kind = row
+                        .parent
+                        .as_ref()
+                        .map(|(_, k)| k.clone())
+                        .unwrap_or_else(|| "from_visit".to_string());
+                    out.push((kid, kind));
+                }
+            }
+        }
+        out
+    }
 }
 
 /// The `_Cache`/`_IE_WebCache` outputs have no `visits` table; every other
 /// `*.sqlite` under BROWSER is a candidate History database.
+///
+/// 후보는 **같은 계정의 산출물로 한정**한다(스템이 `계정` 또는 `계정_` 접두) —
+/// 계정은 출처 컬럼이 없는 구 파싱본에도 남아 있는 최소 귀속 근거라, 다른
+/// 계정의 History가 이동 그래프의 근거로 연결되면 안 된다.
 fn browser_history_dbs(host_dir: &str, account: &str) -> Vec<PathBuf> {
     let dir = PathBuf::from(host_dir).join("BROWSER");
+    let prefix = format!("{account}_");
     let mut files: Vec<PathBuf> = match std::fs::read_dir(&dir) {
         Ok(rd) => rd
             .filter_map(|e| e.ok().map(|e| e.path()))
             .filter(|p| {
                 let name = p.file_name().map(|n| n.to_string_lossy().to_string());
+                let stem = p
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default();
                 match name {
                     Some(n) => {
                         n.ends_with(".sqlite")
                             && !n.ends_with("_Cache.sqlite")
                             && !n.ends_with("_IE_WebCache.sqlite")
+                            && (stem == account || stem.starts_with(&prefix))
                     }
                     None => false,
                 }
@@ -4738,16 +4912,7 @@ fn browser_history_dbs(host_dir: &str, account: &str) -> Vec<PathBuf> {
             .collect(),
         Err(_) => return Vec::new(),
     };
-    let prefix = format!("{account}_");
-    files.sort_by(|left, right| {
-        let l = left
-            .file_name()
-            .is_some_and(|n| n.to_string_lossy().starts_with(&prefix));
-        let r = right
-            .file_name()
-            .is_some_and(|n| n.to_string_lossy().starts_with(&prefix));
-        r.cmp(&l).then_with(|| left.cmp(right))
-    });
+    files.sort();
     files
 }
 
@@ -4932,41 +5097,13 @@ fn browser_visit_graph_blocking(
             continue;
         }
 
-        // ---- 전체 방문 연결 지도(한 번의 스캔) + 재이동 접기 ----------------
-        let links = load_visit_links(&conn);
-        let mut rep_memo: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
-        // 접힌 그래프의 인접 관계. 노드는 각 같은-URL 재이동 사슬의 entry 방문
-        // (rep)이고, 간선은 서로 다른 URL 사이의 이동만 남는다. reload 수는
-        // 사슬을 따라 접힌 구성원 수 — 기존 체인 뷰의 entry별 귀속과 같다.
-        let mut reloads_of: std::collections::HashMap<String, usize> =
-            std::collections::HashMap::new();
-        let mut parent_edge: std::collections::HashMap<String, (String, &'static str)> =
-            std::collections::HashMap::new();
-        let mut children_of: std::collections::HashMap<String, Vec<String>> =
-            std::collections::HashMap::new();
-        let all_ids: Vec<String> = links.keys().cloned().collect();
-        for id in &all_ids {
-            let rep = collapse_rep(id, &links, &mut rep_memo);
-            if rep != *id {
-                *reloads_of.entry(rep).or_default() += 1;
-                continue;
-            }
-            // rep(entry) 방문의 교차-URL 부모만 간선이 된다. 부모가 재이동
-            // 사슬의 중간이면 그 사슬의 entry로 다시 접는다.
-            let row = &links[id];
-            if let Some((p, kind)) = &row.parent {
-                if links.get(p).is_some_and(|pr| pr.url_id != row.url_id) {
-                    let prep = collapse_rep(p, &links, &mut rep_memo);
-                    parent_edge.insert(rep.clone(), (prep.clone(), kind));
-                    children_of.entry(prep).or_default().push(rep.clone());
-                }
-            }
-        }
+        // ---- 요구식(bounded) 방문 연결 저장소 -------------------------------
+        // visits 전체를 적재하지 않고 시드·이웃만 배치 조회한다 — 읽기·메모리가
+        // 테이블 크기가 아니라 탐색 상한(노드·깊이·행 예산)에 비례한다.
+        let mut store = VisitStore::new(&conn);
 
         // ---- 대상 방문(시드) 수집 ------------------------------------------
-        let target_url_ids: std::collections::HashSet<&str> =
-            url_ids.iter().map(String::as_str).collect();
+        let target_url_ids: std::collections::HashSet<String> = url_ids.iter().cloned().collect();
         let mut seeds: Vec<String> = Vec::new();
         let mut seed_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         'urls: for url_id in &url_ids {
@@ -4988,7 +5125,7 @@ fn browser_visit_graph_blocking(
                 truncated = true;
             }
             for vid in visit_ids {
-                let rep = collapse_rep(&vid, &links, &mut rep_memo);
+                let rep = store.rep_of(&vid);
                 if !seed_seen.insert(rep.clone()) {
                     continue;
                 }
@@ -5003,9 +5140,16 @@ fn browser_visit_graph_blocking(
             continue;
         }
 
-        // ---- 시드에서 양방향 BFS — 조상(유입)·후행 이동·형제 분기까지 ------
+        // ---- 시드에서 양방향 BFS(접힌 노드 단위) ---------------------------
+        // 노드는 같은-URL 재이동 사슬의 entry(rep), 간선은 서로 다른 URL 사이
+        // 이동만. reload 수는 사슬 구성원 수 — 전량 스캔 버전과 같은 의미이되
+        // 확장은 in-graph 노드 주변으로만 일어난다.
         let mut in_graph: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut order: Vec<String> = Vec::new();
+        let mut reloads_of: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let mut parent_edge: std::collections::HashMap<String, (String, String)> =
+            std::collections::HashMap::new();
         let mut queue: std::collections::VecDeque<(String, usize)> =
             std::collections::VecDeque::new();
         for seed in &seeds {
@@ -5015,18 +5159,41 @@ fn browser_visit_graph_blocking(
             }
         }
         while let Some((id, hop)) = queue.pop_front() {
-            let mut neighbors: Vec<String> = Vec::new();
-            if let Some((p, _)) = parent_edge.get(&id) {
-                neighbors.push(p.clone());
+            let Some(row) = store.get_row(&id) else {
+                continue;
+            };
+            let (members, member_capped) = store.members_of(&id);
+            if member_capped {
+                truncated = true;
             }
-            if let Some(kids) = children_of.get(&id) {
-                neighbors.extend(kids.iter().cloned());
+            reloads_of.insert(id.clone(), members.len().saturating_sub(1));
+            let mut neighbors: Vec<String> = Vec::new();
+            // 조상: 이 entry의 교차-URL 부모 → 그 부모 사슬의 entry.
+            if let Some((p, kind)) = &row.parent {
+                let parent_is_cross = store
+                    .get_row(p)
+                    .is_some_and(|pr| pr.url_id != row.url_id);
+                if parent_is_cross {
+                    let prep = store.rep_of(p);
+                    parent_edge.insert(id.clone(), (prep.clone(), kind.clone()));
+                    neighbors.push(prep);
+                }
+            }
+            // 후행·형제: 사슬 구성원에 붙은 교차-URL 자식(각자 자기 사슬 entry).
+            for (child, kind) in store.cross_children_of(&members, &row.url_id) {
+                parent_edge
+                    .entry(child.clone())
+                    .or_insert((id.clone(), kind));
+                neighbors.push(child);
             }
             for n in neighbors {
                 if in_graph.contains(&n) {
                     continue;
                 }
-                if hop >= VISIT_GRAPH_DEPTH_CAP || in_graph.len() >= VISIT_GRAPH_MAX_NODES {
+                if hop >= VISIT_GRAPH_DEPTH_CAP
+                    || in_graph.len() >= VISIT_GRAPH_MAX_NODES
+                    || store.budget_exhausted()
+                {
                     truncated = true;
                     continue;
                 }
@@ -5034,6 +5201,9 @@ fn browser_visit_graph_blocking(
                 order.push(n.clone());
                 queue.push_back((n, hop + 1));
             }
+        }
+        if store.budget_exhausted() {
+            truncated = true;
         }
 
         // ---- 노드·간선 구체화 ----------------------------------------------
@@ -5050,9 +5220,9 @@ fn browser_visit_graph_blocking(
                 time: v.time,
                 transition: decode_transition(v.transition),
                 transition_raw: v.transition.to_string(),
-                is_target: links
-                    .get(id)
-                    .is_some_and(|r| target_url_ids.contains(r.url_id.as_str())),
+                is_target: store
+                    .get_row(id)
+                    .is_some_and(|r| target_url_ids.contains(&r.url_id)),
                 reloads: reloads_of.get(id).copied().unwrap_or(0),
                 external_referrer: v.external_referrer,
             });
@@ -5069,7 +5239,7 @@ fn browser_visit_graph_blocking(
                     edges.push(VisitGraphEdge {
                         from: p.clone(),
                         to: id.clone(),
-                        kind: (*kind).to_string(),
+                        kind: kind.clone(),
                     });
                 }
             }
@@ -6668,6 +6838,113 @@ mod timeline_save_tests {
 #[cfg(test)]
 mod browser_activity_tests {
     use super::*;
+
+    /// 계정 경계 회귀: 출처 없는(구 파싱본) A 계정 행의 그래프가 같은 URL을
+    /// 가진 B 계정 History를 절대 후보로 삼지 않는다 — 계정은 남아 있는
+    /// 최소 귀속 근거다.
+    #[test]
+    fn sourceless_graph_never_crosses_account_boundary() {
+        let root = std::env::temp_dir().join(format!(
+            "windows-analysis-graph-acct-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        ));
+        let dir = root.join("BROWSER");
+        std::fs::create_dir_all(&dir).unwrap();
+        // B 계정 History에만 대상 URL의 이동 이력이 있다.
+        let conn = Connection::open(dir.join("bob_Chrome.sqlite")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE urls (id TEXT, url TEXT, title TEXT, visit_count TEXT);\
+             CREATE TABLE visits (id TEXT, url TEXT, from_visit TEXT, opener_visit TEXT, transition TEXT, external_referrer_url TEXT, visit_time TEXT);",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO urls VALUES ('1','https://from-bob.test/','','1')", []).unwrap();
+        conn.execute("INSERT INTO urls VALUES ('2','https://t.test/p','','1')", []).unwrap();
+        conn.execute(
+            "INSERT INTO visits (id,url,from_visit,opener_visit,transition,external_referrer_url,visit_time) VALUES ('10','1','0','0','1','','13427941143000000')",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO visits (id,url,from_visit,opener_visit,transition,external_referrer_url,visit_time) VALUES ('11','2','10','0','0','','13427941143100000')",
+            [],
+        ).unwrap();
+        drop(conn);
+
+        // alice 계정 행(출처 없음) → bob DB가 후보에 들어가면 안 된다.
+        let graph = browser_visit_graph_blocking(
+            root.to_string_lossy().to_string(),
+            "alice".to_string(),
+            "https://t.test/p".to_string(),
+            None,
+            None,
+        );
+        assert!(graph.nodes.is_empty(), "다른 계정 DB의 그래프가 연결되면 안 된다: {:?}",
+            graph.nodes.iter().map(|n| n.url.clone()).collect::<Vec<_>>());
+        assert!(!graph.note.is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// 입력 상한 회귀: 대상과 무관한 대량 방문이 있어도 그래프 결과·truncated에
+    /// 영향이 없다 — 전량 적재가 아니라 시드 주변만 읽는다는 계약의 관측 지점.
+    #[test]
+    fn unrelated_visit_mass_does_not_affect_graph_or_budget() {
+        let root = std::env::temp_dir().join(format!(
+            "windows-analysis-graph-budget-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        ));
+        let dir = root.join("BROWSER");
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = Connection::open(dir.join("user_Chrome.sqlite")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE urls (id TEXT, url TEXT, title TEXT, visit_count TEXT);\
+             CREATE TABLE visits (id TEXT, url TEXT, from_visit TEXT, opener_visit TEXT, transition TEXT, external_referrer_url TEXT, visit_time TEXT);",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO urls VALUES ('1','https://x.test/','','1')", []).unwrap();
+        conn.execute("INSERT INTO urls VALUES ('2','https://t.test/p','','1')", []).unwrap();
+        conn.execute("INSERT INTO urls VALUES ('3','https://noise.test/','','1')", []).unwrap();
+        conn.execute(
+            "INSERT INTO visits (id,url,from_visit,opener_visit,transition,external_referrer_url,visit_time) VALUES ('10','1','0','0','1','','13427941143000000')",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO visits (id,url,from_visit,opener_visit,transition,external_referrer_url,visit_time) VALUES ('11','2','10','0','0','','13427941143100000')",
+            [],
+        ).unwrap();
+        // 행 예산(5,000)을 넘는 무관 방문 — 연결이 없어 그래프가 읽을 이유가 없다.
+        {
+            let tx = conn.unchecked_transaction().unwrap();
+            for i in 0..6_000i64 {
+                tx.execute(
+                    "INSERT INTO visits (id,url,from_visit,opener_visit,transition,external_referrer_url,visit_time) VALUES (?1,'3','0','0','0','', '13427941200000000')",
+                    [format!("{}", 1_000 + i)],
+                ).unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        drop(conn);
+
+        let graph = browser_visit_graph_blocking(
+            root.to_string_lossy().to_string(),
+            "user".to_string(),
+            "https://t.test/p".to_string(),
+            None,
+            Some("BROWSER/user_Chrome.sqlite".to_string()),
+        );
+        let urls: Vec<&str> = graph.nodes.iter().map(|n| n.url.as_str()).collect();
+        assert!(urls.contains(&"https://x.test/"));
+        assert!(urls.contains(&"https://t.test/p"));
+        assert_eq!(graph.nodes.len(), 2, "무관 방문이 그래프에 끼면 안 된다: {urls:?}");
+        assert!(!graph.truncated, "무관 방문 대량이 예산을 소모하면 안 된다");
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     // Build a minimal browser History copy the way the collector writes it:
     // one `urls`/`visits` pair with *every* column typed TEXT (ids and the
