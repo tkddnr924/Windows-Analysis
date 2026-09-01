@@ -1118,30 +1118,96 @@ fn master_timeline_cache_path(host_dir: &str) -> PathBuf {
     Path::new(host_dir).join("_master_timeline.cache.json")
 }
 
-// 재빌드 직후 저장되는 캐시는 수백 MB다. String 인자로 받으면 요청 JSON
-// 파싱(이스케이프 해제)이 메인 스레드에서 돌아 저장 동안 창이 멈춘다 —
-// load와 대칭으로 raw 바이트 본문("호스트경로\n" + JSON)으로 받는다.
-// 쓰기는 blocking 풀에서 수행하고 결과는 기다리지 않는다(호출부가 원래
-// best-effort — 쓰기 실패는 캐시 미스로 자연 복구되며, 실패는 stderr에 남긴다).
+// 재빌드 직후 저장되는 캐시는 수백 MB다. 단발 raw 커맨드로 받으면 tauri
+// Request가 차용만 허용해 페이로드 전체를 메인 스레드에서 한 번 복사해야
+// 하고(순간 메모리 피크 2배), String 인자는 요청 JSON 파싱으로 더 심하게
+// 멈춘다 — 청크 프로토콜로 나눈다: begin(임시 파일) → 8MB 단위 raw 청크
+// 순차 append(청크당 메인 스레드 작업은 소량 복사 + 페이지 캐시 쓰기 수 ms)
+// → finish(원자 rename). 실패한 저장의 임시 파일은 다음 begin이 정리한다.
+fn master_timeline_saving_path(host_dir: &str, token: &str) -> PathBuf {
+    Path::new(host_dir).join(format!("_master_timeline.cache.json.saving-{token}"))
+}
+
+fn valid_saving_token(token: &str) -> bool {
+    !token.is_empty()
+        && token.len() <= 64
+        && token
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
 #[tauri::command]
-fn save_master_timeline(request: tauri::ipc::Request<'_>) -> Result<(), String> {
+async fn save_master_timeline_begin(host_dir: String, token: String) -> Result<(), String> {
+    if !valid_saving_token(&token) {
+        return Err("타임라인 캐시 저장 토큰이 잘못되었습니다".to_string());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        // 중단된 이전 저장의 임시 파일 정리 (호스트당 단일 저장자 전제).
+        if let Ok(rd) = std::fs::read_dir(&host_dir) {
+            for e in rd.flatten() {
+                if e.file_name()
+                    .to_string_lossy()
+                    .starts_with("_master_timeline.cache.json.saving-")
+                {
+                    let _ = std::fs::remove_file(e.path());
+                }
+            }
+        }
+        std::fs::write(master_timeline_saving_path(&host_dir, &token), b"")
+            .map_err(|error| format!("타임라인 캐시 임시 파일 생성 실패: {error}"))
+    })
+    .await
+    .map_err(|error| format!("타임라인 캐시 저장 작업이 중단되었습니다: {error}"))?
+}
+
+/// raw 본문: "호스트경로\n토큰\n" + 청크 바이트. 프런트가 청크를 순차
+/// await하므로 append 순서가 보장된다 (동기 커맨드라 여기서 바로 쓴다 —
+/// 8MB 페이지 캐시 append는 수 ms로 이벤트 루프를 유의미하게 막지 않는다).
+#[tauri::command]
+fn save_master_timeline_chunk(request: tauri::ipc::Request<'_>) -> Result<(), String> {
     let tauri::ipc::InvokeBody::Raw(body) = request.body() else {
         return Err("타임라인 캐시 저장 본문 형식이 잘못되었습니다".to_string());
     };
-    let split = body
+    let first = body
         .iter()
         .position(|byte| *byte == b'\n')
         .ok_or_else(|| "타임라인 캐시 저장 본문에 경로 구분자가 없습니다".to_string())?;
-    let host_dir = String::from_utf8(body[..split].to_vec())
+    let second = body[first + 1..]
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map(|at| first + 1 + at)
+        .ok_or_else(|| "타임라인 캐시 저장 본문에 토큰 구분자가 없습니다".to_string())?;
+    let host_dir = String::from_utf8(body[..first].to_vec())
         .map_err(|_| "타임라인 캐시 저장 경로 인코딩이 잘못되었습니다".to_string())?;
-    let payload = body[split + 1..].to_vec();
+    let token = String::from_utf8(body[first + 1..second].to_vec())
+        .map_err(|_| "타임라인 캐시 저장 토큰 인코딩이 잘못되었습니다".to_string())?;
+    if !valid_saving_token(&token) {
+        return Err("타임라인 캐시 저장 토큰이 잘못되었습니다".to_string());
+    }
+    let path = master_timeline_saving_path(&host_dir, &token);
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .map_err(|error| format!("타임라인 캐시 임시 파일 열기 실패: {error}"))?;
+    file.write_all(&body[second + 1..])
+        .map_err(|error| format!("타임라인 캐시 청크 쓰기 실패: {error}"))
+}
+
+#[tauri::command]
+async fn save_master_timeline_finish(host_dir: String, token: String) -> Result<(), String> {
+    if !valid_saving_token(&token) {
+        return Err("타임라인 캐시 저장 토큰이 잘못되었습니다".to_string());
+    }
     tauri::async_runtime::spawn_blocking(move || {
-        let path = master_timeline_cache_path(&host_dir);
-        if let Err(error) = std::fs::write(&path, payload) {
-            eprintln!("master timeline cache write failed ({}): {error}", path.display());
-        }
-    });
-    Ok(())
+        std::fs::rename(
+            master_timeline_saving_path(&host_dir, &token),
+            master_timeline_cache_path(&host_dir),
+        )
+        .map_err(|error| format!("타임라인 캐시 확정 실패: {error}"))
+    })
+    .await
+    .map_err(|error| format!("타임라인 캐시 저장 작업이 중단되었습니다: {error}"))?
 }
 
 // 수백 MB급 캐시를 동기 커맨드의 String으로 돌려주면 메인 스레드(창 이벤트
@@ -3093,8 +3159,11 @@ struct ResultRow {
     row: Option<Map<String, Value>>,
 }
 
-#[tauri::command]
-fn result_row(full_path: String, table_name: String, rowid: i64) -> Result<ResultRow, String> {
+fn result_row_blocking(
+    full_path: String,
+    table_name: String,
+    rowid: i64,
+) -> Result<ResultRow, String> {
     let conn = open_ro(&full_path)?;
     let columns = table_columns(&conn, &table_name);
     if columns.is_empty() {
@@ -3106,6 +3175,19 @@ fn result_row(full_path: String, table_name: String, rowid: i64) -> Result<Resul
     );
     let row = query_rows(&conn, &sql, &[&rowid])?.into_iter().next();
     Ok(ResultRow { columns, row })
+}
+
+/// 대용량 원문 행(4104 ScriptBlock 등)을 상세에서 여는 경로 — SQLite I/O와
+/// 행 변환을 메인 명령 경로에 두면 클릭 처리와 창 이벤트가 멈춘다.
+#[tauri::command]
+async fn result_row(
+    full_path: String,
+    table_name: String,
+    rowid: i64,
+) -> Result<ResultRow, String> {
+    tauri::async_runtime::spawn_blocking(move || result_row_blocking(full_path, table_name, rowid))
+        .await
+        .map_err(|error| format!("행 조회 작업이 중단되었습니다: {error}"))?
 }
 
 #[derive(Serialize)]
@@ -7610,7 +7692,9 @@ fn main() {
             run_host,
             cancel_pipeline,
             list_categories,
-            save_master_timeline,
+            save_master_timeline_begin,
+            save_master_timeline_chunk,
+            save_master_timeline_finish,
             load_master_timeline,
             list_result_files,
             refresh_execution_history_overview,

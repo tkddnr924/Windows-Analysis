@@ -62,15 +62,24 @@ function makeApi(): ElectronApi {
     toggleBookmark: (caseDir, entry: BookmarkInput) => invoke<Bookmark[]>("toggle_bookmark", { caseDir, entry }),
     updateBookmarkNote: (caseDir, id, note) => invoke<Bookmark[]>("update_bookmark_note", { caseDir, id, note }),
     // 수백 MB 캐시를 JSON 인자로 보내면 요청 직렬화·파싱이 메인 스레드를
-    // 수 초 막는다 — raw 바이트("호스트경로\n" + JSON 본문)로 전송한다.
-    saveMasterTimeline: (hostDir, payload) => {
+    // 수 초 막고, 단발 raw 전송도 백엔드에서 전량 복사가 남는다 — 8MB raw
+    // 청크를 순차 append(begin → chunk* → finish, 원자 rename)해 메인 스레드
+    // 작업과 메모리 피크를 상수로 유지한다.
+    saveMasterTimeline: async (hostDir, payload) => {
+      const CHUNK = 8 * 1024 * 1024;
+      const token = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
       const encoder = new TextEncoder();
-      const head = encoder.encode(`${hostDir}\n`);
+      const head = encoder.encode(`${hostDir}\n${token}\n`);
       const body = encoder.encode(payload);
-      const bytes = new Uint8Array(head.length + body.length);
-      bytes.set(head, 0);
-      bytes.set(body, head.length);
-      return invoke<void>("save_master_timeline", bytes);
+      await invoke<void>("save_master_timeline_begin", { hostDir, token });
+      for (let offset = 0; offset < body.length; offset += CHUNK) {
+        const piece = body.subarray(offset, Math.min(offset + CHUNK, body.length));
+        const bytes = new Uint8Array(head.length + piece.length);
+        bytes.set(head, 0);
+        bytes.set(piece, head.length);
+        await invoke<void>("save_master_timeline_chunk", bytes);
+      }
+      await invoke<void>("save_master_timeline_finish", { hostDir, token });
     },
     loadMasterTimeline: (hostDir) => invoke<ArrayBuffer>("load_master_timeline", { hostDir }),
     pathReferences: (hostDir, paths) => invoke<PathReference[]>("path_references", { hostDir, paths }),
