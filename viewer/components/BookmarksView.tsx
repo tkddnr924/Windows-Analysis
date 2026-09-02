@@ -36,7 +36,7 @@ import { getArtifactView, resolveArtifactView } from "@/lib/artifactViews";
 import { formatEvidenceTimestamp, type TimeRange } from "@/lib/timeRange";
 import TagList from "./TagList";
 import RowDetailPanel from "./RowDetailPanel";
-import { resolveAccountDisplay, type AccountDirectory } from "@/lib/accountIdentity";
+import { resolveUserDisplay, type AccountDirectory } from "@/lib/accountIdentity";
 import { pathBelongsToHost, visuallyHidden } from "@/lib/viewShared";
 
 interface BookmarksViewProps {
@@ -432,7 +432,7 @@ function SequenceCanvasEvent({ entry, index, participants, onOpen, accountDirect
   const lineWidth = Math.abs(end - start);
   const labelLeft = hasDirectedPeer ? Math.min(94, lineLeft + Math.max(2, lineWidth / 2)) : Math.min(94, start + 2);
   const rawAccount = entry.row?.account || entry.row?.user || entry.row?.username || "";
-  const account = resolveAccountDisplay(rawAccount, accountDirectory);
+  const account = resolveUserDisplay(rawAccount, accountDirectory);
   const result = entry.row?.result || entry.row?.status || "";
   const eventLabel = [eventTitle(entry), account, result].filter((value, position, all) => Boolean(value) && all.indexOf(value) === position).join(" · ");
   const top = 48 + index * 64;

@@ -17,15 +17,17 @@ import ManageSearchOutlinedIcon from "@mui/icons-material/ManageSearchOutlined";
 import PlayCircleOutlineOutlinedIcon from "@mui/icons-material/PlayCircleOutlineOutlined";
 import SearchOutlinedIcon from "@mui/icons-material/SearchOutlined";
 import StorageOutlinedIcon from "@mui/icons-material/StorageOutlined";
+import TerminalOutlinedIcon from "@mui/icons-material/TerminalOutlined";
 import VpnKeyOutlinedIcon from "@mui/icons-material/VpnKeyOutlined";
 import IconButton from "@mui/material/IconButton";
 import Tooltip from "@mui/material/Tooltip";
 import RowDetailPanel from "./RowDetailPanel";
 import PaginationControls from "@/components/PaginationControls";
 import { tagsForPath } from "@/lib/tagging";
+import { displayRegistryKeyPath } from "@/lib/registryPath";
 import { inRange, rangeActive, EMPTY_TIME_RANGE, type TimeRange } from "@/lib/timeRange";
 import type { CsvData } from "@/lib/types";
-import { resolveAccountDisplay, type AccountDirectory } from "@/lib/accountIdentity";
+import { MACHINE_SCOPE_LABEL, MACHINE_SCOPE_USER, resolveUserDisplay, type AccountDirectory } from "@/lib/accountIdentity";
 import { visuallyHidden } from "@/lib/viewShared";
 
 type Row = Record<string, string>;
@@ -43,7 +45,7 @@ interface Props {
 const ALL_ITEMS = "전체 항목";
 const PAGE = 10;
 const TAB_FIELD: Record<string, string> = { "자동 실행": "user", "보안 설정": "subtype", "원격 접속": "subtype", "기타 레지스트리": "subtype" };
-const CATEGORY_ORDER = ["자격 증명 보호", "보안 설정", "공유 폴더", "SQL 인증", "자동 실행", "원격 접속", "설치 프로그램 (MSI)", "기타 레지스트리"];
+const CATEGORY_ORDER = ["자격 증명 보호", "보안 설정", "공유 폴더", "SQL 인증", "자동 실행", "원격 접속", "Sysinternals 도구", "설치 프로그램 (MSI)", "기타 레지스트리"];
 const CATEGORY_META: Record<string, CategoryMeta> = {
   [ALL_ITEMS]: { icon: ManageSearchOutlinedIcon, label: ALL_ITEMS },
   "자격 증명 보호": { icon: VpnKeyOutlinedIcon, label: "자격 증명 보호" },
@@ -52,6 +54,7 @@ const CATEGORY_META: Record<string, CategoryMeta> = {
   "SQL 인증": { icon: StorageOutlinedIcon, label: "SQL 인증" },
   "자동 실행": { icon: PlayCircleOutlineOutlinedIcon, label: "자동 실행" },
   "원격 접속": { icon: SettingsRemoteOutlinedIcon, label: "원격 접속" },
+  "Sysinternals 도구": { icon: TerminalOutlinedIcon, label: "Sysinternals 도구" },
   "설치 프로그램 (MSI)": { icon: Inventory2OutlinedIcon, label: "설치 프로그램" },
   "기타 레지스트리": { icon: ManageSearchOutlinedIcon, label: "실행 흔적" },
 };
@@ -153,7 +156,7 @@ export default function RegistryFindingsView({ data, bookmarkedRowids, onToggleB
     const filtered = currentGroup.rows.filter((row) => {
       if (hiddenAccounts.has((row.user || "").trim())) return false;
       if (tabField && selectedTab !== "전체" && (row[tabField] || "(기타)") !== selectedTab) return false;
-      return !needle || [row.name, row.value, row.key_path, row.command, row.detail, row.source, row.user, row.subtype]
+      return !needle || [row.name, row.value, row.key_path, displayRegistryKeyPath(row.key_path, row.source), row.command, row.detail, row.source, row.user, row.subtype]
         .some((value) => (value || "").toLowerCase().includes(needle));
     });
     const untimedExcluded = rangeOn
@@ -174,7 +177,7 @@ export default function RegistryFindingsView({ data, bookmarkedRowids, onToggleB
           <SelectDropdown
             icon={<FormatListBulletedOutlinedIcon sx={{ fontSize: 15 }} />}
             label="하위 항목"
-            options={["전체", ...tabs].map((tab) => ({ value: tab, label: tab === "(시스템)" ? "시스템" : tab }))}
+            options={["전체", ...tabs].map((tab) => ({ value: tab, label: tab === MACHINE_SCOPE_USER ? MACHINE_SCOPE_LABEL : tab }))}
             value={selectedTab}
             onChange={setSelectedTab}
           />
@@ -228,7 +231,9 @@ function RegistryLedger({ rows, untimedExcluded, category, onSelect, bookmarkedR
         const bookmarked = bookmarkedRowids?.has(rowId(row)) ?? false;
         const tone = statusColor(row.status);
         const value = row.command || row.value;
-        const userLabel = resolveAccountDisplay(row.user, accountDirectory) || "계정 정보 없음";
+        const userLabel = resolveUserDisplay(row.user, accountDirectory) || "계정 정보 없음";
+        // 하이브 루트 키 이름 대신 라이브 마운트 지점(HKLM\SOFTWARE·HKCU…)으로 보여준다.
+        const keyPath = displayRegistryKeyPath(row.key_path, row.source);
         // 행 전체(여백 포함)가 상세 열기 클릭 대상 — 북마크는 전파 차단.
         return <div key={stableKey || `${safePage}-${index}`} className={bookmarked ? "dfir-bookmarked-row" : undefined} onClick={() => onSelect(row)} style={{ borderRadius: "var(--radius-md)", minHeight: 62, marginBottom: 8, display: "flex", alignItems: "center", gap: 12, padding: "0 14px", border: "1px solid var(--border)", background: "var(--bg-panel)", color: "var(--text)", cursor: "pointer", transition: "background .15s ease, border-color .15s ease" }} onMouseEnter={(event) => { if (!bookmarked) event.currentTarget.style.background = "var(--bg-hover)"; }} onMouseLeave={(event) => { if (!bookmarked) event.currentTarget.style.background = "var(--bg-panel)"; }}>
           <div role="button" tabIndex={0} aria-label={`${row.name || "레지스트리 항목"} 상세 보기`} onClick={() => onSelect(row)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); onSelect(row); } }} style={{ flex: 1, minWidth: 0, display: "flex", alignItems: "center", gap: 12, padding: "10px 0", cursor: "pointer", outlineOffset: -3 }}>
@@ -243,8 +248,7 @@ function RegistryLedger({ rows, untimedExcluded, category, onSelect, bookmarkedR
               <span title={value || undefined} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: value ? (looksLikePath(value) ? "var(--accent)" : "var(--text-dim)") : "var(--text-faint)", fontFamily: "var(--mono)", fontSize: 12 }}>{value || "값 없음"}</span>
             </span>
             <span style={{ width: 122, flexShrink: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: userLabel === "계정 정보 없음" ? "var(--text-faint)" : "var(--text-dim)", fontSize: 12 }}>{userLabel}</span>
-            <span title={row.key_path || undefined} style={{ width: 230, flexShrink: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text-faint)", fontFamily: "var(--mono)", fontSize: 11.5, direction: "rtl", textAlign: "left" }}>{row.key_path || "키 경로 없음"}</span>
-            <span style={{ width: 172, flexShrink: 0, textAlign: "right", color: row.timestamp ? "var(--text-time)" : "var(--text-faint)", fontSize: 12, fontFamily: "var(--mono)", fontVariantNumeric: "tabular-nums", whiteSpace: "nowrap" }}>{row.timestamp || "시간 정보 없음"}</span>
+            <span title={keyPath || undefined} style={{ width: 230, flexShrink: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text-faint)", fontFamily: "var(--mono)", fontSize: 11.5, direction: "rtl", textAlign: "left" }}>{keyPath || "키 경로 없음"}</span>
           </div>
           <Tooltip title={bookmarked ? "북마크 해제" : "북마크"}><span><IconButton className={bookmarked ? "dfir-bookmark-control" : undefined} aria-label={bookmarked ? "북마크 해제" : "북마크"} disabled={!onToggleBookmark} size="small" onClick={(clickEvent) => { clickEvent.stopPropagation(); onToggleBookmark?.(rowId(row)); }} sx={{ color: bookmarked ? "var(--bookmark-control)" : "var(--text-faint)", borderRadius: "var(--radius-sm)" }}>{bookmarked ? <BookmarkIcon sx={{ fontSize: 17 }} /> : <BookmarkBorderOutlinedIcon sx={{ fontSize: 17 }} />}</IconButton></span></Tooltip>
         </div>;

@@ -5,7 +5,7 @@
 // 기본은 전체 표시, 체크 해제한 계정만 숨긴다.
 import { useState } from "react";
 import PersonOutlineOutlinedIcon from "@mui/icons-material/PersonOutlineOutlined";
-import { resolveAccountDisplay, type AccountDirectory } from "@/lib/accountIdentity";
+import { resolveUserDisplay, type AccountDirectory } from "@/lib/accountIdentity";
 
 export default function AccountFilterChips({
   accounts,
@@ -63,7 +63,7 @@ export default function AccountFilterChips({
             </div>
             {accounts.map((account) => {
               const checked = !hidden.has(account);
-              const label = account ? resolveAccountDisplay(account, accountDirectory) || account : emptyLabel;
+              const label = account ? resolveUserDisplay(account, accountDirectory) || account : emptyLabel;
               return (
                 <button
                   key={account || "(없음)"}

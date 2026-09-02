@@ -5637,7 +5637,8 @@ fn rf_security_config(software: &[Row]) -> Vec<Row> {
     rows
 }
 
-/// 원격제어(RMM) 도구 설치 흔적과 Sysinternals EULA 수락 키.
+/// 원격제어(RMM) 도구 설치 흔적("원격 접속")과 Sysinternals EULA 수락 키
+/// ("Sysinternals 도구") — 같은 하이브 순회에서 뽑되 범주는 분리한다.
 /// RMM은 정상 서명 도구라 백신에 안 걸려 C2 대용으로 선호된다 —
 /// "조직이 쓰지 않는 도구의 존재" 자체가 침해 지표. Sysinternals EULA
 /// 키는 해당 계정에서 그 도구가 실행됐다는 증거로, 실행파일을 지워도 남는다.
@@ -5694,7 +5695,9 @@ fn rf_remote_tools(hives: &[RegistryOverviewHive]) -> Vec<Row> {
                         "psexec" | "psexec64" | "procdump" | "procdump64" | "sdelete" | "sdelete64"
                     );
                     rows.push(rf_row(&[
-                        ("category", "원격 접속".into()),
+                        // 원격제어(RMM)와 달리 EULA 키는 "이 계정에서 도구를
+                        // 실행했다"는 실행 증거다 — 원격 접속과 섞지 않는다.
+                        ("category", "Sysinternals 도구".into()),
                         ("subtype", "Sysinternals".into()),
                         ("name", format!("Sysinternals {}", tool)),
                         ("value", "EulaAccepted=1".into()),

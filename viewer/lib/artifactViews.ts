@@ -1,5 +1,7 @@
 import { tagsForBoolean, tagsForDangerType, tagsForEventLevel, tagsForNameMismatch, tagsForPath, type Tag } from "./tagging";
 import { resolveKnownFolderPath } from "@/lib/knownFolders";
+import { MACHINE_SCOPE_LABEL, MACHINE_SCOPE_USER } from "@/lib/accountIdentity";
+import { displayRegistryKeyPath } from "@/lib/registryPath";
 import { executableNote } from "./executableCatalog";
 import { lookupEventCatalog, parseEventData, extractEventField, extractPsClassicField, tagsForSecurityEvent, EVENT_QUICK_FIELDS, LOGON_TYPE_LABELS } from "./eventCatalog";
 
@@ -917,8 +919,10 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
       { key: "properties", label: "InstallProperties 전체", kind: "json" },
       { key: "value", label: "값", compute: (r) => r.subtype === "MsiInstall" ? "" : r.value },
       { key: "command", label: "명령" },
-      { key: "user", label: "사용자" },
-      { key: "key_path", label: "키 경로" },
+      // SOFTWARE·SYSTEM 하이브 항목은 사용자 계정이 아니라 컴퓨터 전역 설정이다.
+      { key: "user", label: "사용자", compute: (r) => (r.user === MACHINE_SCOPE_USER ? `${MACHINE_SCOPE_LABEL} (HKLM)` : r.user) },
+      // 하이브 루트 키 이름을 라이브 마운트 지점으로 바꿔 읽히게 한다.
+      { key: "key_path", label: "키 경로", compute: (r) => displayRegistryKeyPath(r.key_path, r.source) },
       { key: "source", label: "하이브" },
     ]}],
   },
@@ -1294,7 +1298,7 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
       { heading: "레지스트리 원본 레코드", fields: [
         { key: "_ua_program", label: "실행 프로그램 (UserAssist 해독)", kind: "path", compute: (r) => userAssistProgram(r) || undefined },
         { key: "last_write", label: "마지막 기록 시각" },
-        { key: "key_path", label: "키 경로", kind: "path" },
+        { key: "key_path", label: "키 경로", kind: "path", compute: (r) => displayRegistryKeyPath(r.key_path, r._source_file) },
         { key: "value_name", label: "값 이름" },
         { key: "value_type", label: "값 유형", kind: "badge" },
         { key: "value_data", label: "값 데이터", kind: "code" },
