@@ -1108,26 +1108,6 @@ fn list_categories(host_dir: String) -> Vec<CategoryEntry> {
     out
 }
 
-// The master timeline is expensive to assemble (it scans every result table),
-// so the frontend builds it once and caches the result here. The cache is a
-// single JSON file at the host root — not a category directory, so it is
-// invisible to `list_categories` and survives the per-category publish of a
-// re-parse. Staleness is decided by the frontend via a `builtForRunAt` marker
-// embedded in the payload, so this side only reads and writes the blob.
-fn master_timeline_cache_path(host_dir: &str) -> PathBuf {
-    Path::new(host_dir).join("_master_timeline.cache.json")
-}
-
-// 재빌드 직후 저장되는 캐시는 수백 MB다. 단발 raw 커맨드로 받으면 tauri
-// Request가 차용만 허용해 페이로드 전체를 메인 스레드에서 한 번 복사해야
-// 하고(순간 메모리 피크 2배), String 인자는 요청 JSON 파싱으로 더 심하게
-// 멈춘다 — 청크 프로토콜로 나눈다: begin(임시 파일) → 8MB 단위 raw 청크
-// 순차 append(청크당 메인 스레드 작업은 소량 복사 + 페이지 캐시 쓰기 수 ms)
-// → finish(원자 rename). 실패한 저장의 임시 파일은 다음 begin이 정리한다.
-fn master_timeline_saving_path(host_dir: &str, token: &str) -> PathBuf {
-    Path::new(host_dir).join(format!("_master_timeline.cache.json.saving-{token}"))
-}
-
 fn valid_saving_token(token: &str) -> bool {
     !token.is_empty()
         && token.len() <= 64
@@ -1136,249 +1116,157 @@ fn valid_saving_token(token: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
-/// 저장 세션 진행 상태 — 쓰기는 워커 스레드에서 수행되고, 메인 커맨드는
-/// 소유 복사와 진행 카운트만 만진다. 프런트가 매 청크 후 drain을 await해
-/// 동시 in-flight 쓰기는 1청크로 유지된다(순서·메모리 상한 보장).
-struct TimelineSaveSession {
-    host_dir: String,
-    pending: usize,
-    error: Option<String>,
+// --- 타임라인 빌드용 원본 페이지 읽기 (바이트 예산) ---
+// 일반 결과 페이지 조회는 행 수만 제한한다. 그러나 EventLog의 큰 EventData나
+// 긴 스크립트 블록이 섞이면 "20,000행"의 실제 바이트는 증거 값 길이에 따라
+// 무제한이라, 한 응답이 수백 MB가 되어 WebView 메모리를 고갈시킬 수 있다.
+// 타임라인 빌드는 전 테이블을 훑으므로 여기서만 바이트 예산을 강제하고,
+// 예산에 걸리면 행 수와 무관하게 페이지를 끊어 다음 offset을 돌려준다.
+const TIMELINE_SOURCE_PAGE_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TimelineSourcePage {
+    columns: Vec<String>,
+    rows: Vec<Map<String, Value>>,
+    /// 이어서 읽을 offset. None이면 이 테이블은 끝났다 — 호출자는 행 수로
+    /// 종료를 판단하면 안 된다(예산으로 짧아진 페이지와 구분되지 않는다).
+    next_offset: Option<i64>,
 }
 
-type TimelineSaveHandle = std::sync::Arc<(Mutex<TimelineSaveSession>, std::sync::Condvar)>;
-
-fn timeline_save_sessions() -> &'static Mutex<std::collections::HashMap<String, TimelineSaveHandle>> {
-    static SESSIONS: OnceLock<Mutex<std::collections::HashMap<String, TimelineSaveHandle>>> =
-        OnceLock::new();
-    SESSIONS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+/// 결과 SQLite 한 테이블의 페이지를 읽는 공통 경로. `max_bytes`를 주면 누적
+/// 직렬화 바이트가 그 예산에 닿는 순간 행 수와 무관하게 끊는다(단, 최소 1행은
+/// 반환해 진행이 멈추지 않게 한다). 열 선택(CacheEntries의 body_b64 제외),
+/// 식별자 인용, rowid 정렬, limit/offset 보정, 값 변환은 여기 한 곳에만 둔다 —
+/// 타임라인 빌드와 일반 증거 표가 같은 원본을 다르게 노출하면 안 된다.
+struct SqlitePage {
+    columns: Vec<String>,
+    rows: Vec<Map<String, Value>>,
+    /// 예산에 걸려 끊겼는지 — 호출자가 "테이블 끝"과 구별하는 데 쓴다.
+    budget_stopped: bool,
 }
 
-fn timeline_save_begin_impl(host_dir: &str, token: &str) -> Result<(), String> {
-    // 중단된 이전 저장의 임시 파일·세션 정리 (호스트당 단일 저장자 전제).
-    if let Ok(rd) = std::fs::read_dir(host_dir) {
-        for e in rd.flatten() {
-            if e.file_name()
-                .to_string_lossy()
-                .starts_with("_master_timeline.cache.json.saving-")
-            {
-                let _ = std::fs::remove_file(e.path());
+fn read_sqlite_page(
+    conn: &Connection,
+    table: &str,
+    offset: i64,
+    limit: i64,
+    max_bytes: Option<usize>,
+) -> Result<SqlitePage, String> {
+    let mut columns = table_columns(conn, table);
+    let is_cache = table == "CacheEntries";
+    if is_cache {
+        columns.retain(|c| c != "body_b64");
+    }
+    let select = if is_cache {
+        columns.iter().map(|c| q(c)).collect::<Vec<_>>().join(", ")
+    } else {
+        "*".into()
+    };
+    let sql = format!(
+        "SELECT rowid AS __rowid, {} FROM {} ORDER BY rowid LIMIT ? OFFSET ?",
+        select,
+        q(table)
+    );
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+    let names: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
+    let mut cursor = stmt
+        .query(rusqlite::params![limit, offset])
+        .map_err(|e| e.to_string())?;
+    let mut rows: Vec<Map<String, Value>> = Vec::new();
+    let mut bytes = 0usize;
+    let mut budget_stopped = false;
+    while let Some(row) = cursor.next().map_err(|e| e.to_string())? {
+        let mut obj = Map::new();
+        let mut row_bytes = 0usize;
+        for (i, name) in names.iter().enumerate() {
+            let value = cell(row.get_ref(i).map_err(|e| e.to_string())?);
+            if max_bytes.is_some() {
+                row_bytes += name.len()
+                    + match &value {
+                        Value::String(text) => text.len(),
+                        _ => 8,
+                    };
+            }
+            obj.insert(name.clone(), value);
+        }
+        rows.push(obj);
+        if let Some(budget) = max_bytes {
+            bytes += row_bytes;
+            // 첫 행은 예산을 넘겨도 담는다 — 한 행이 예산보다 커도 진행이
+            // 멈추지 않아야 한다(무한 루프 방지).
+            if bytes >= budget && rows.len() < limit as usize {
+                budget_stopped = true;
+                break;
             }
         }
     }
-    if let Ok(mut sessions) = timeline_save_sessions().lock() {
-        sessions.retain(|_, handle| {
-            handle
-                .0
-                .lock()
-                .map(|session| session.host_dir != host_dir)
-                .unwrap_or(true)
-        });
-        sessions.insert(
-            token.to_string(),
-            std::sync::Arc::new((
-                Mutex::new(TimelineSaveSession {
-                    host_dir: host_dir.to_string(),
-                    pending: 0,
-                    error: None,
-                }),
-                std::sync::Condvar::new(),
-            )),
-        );
-    }
-    std::fs::write(master_timeline_saving_path(host_dir, token), b"")
-        .map_err(|error| format!("타임라인 캐시 임시 파일 생성 실패: {error}"))
+    Ok(SqlitePage {
+        columns,
+        rows,
+        budget_stopped,
+    })
 }
 
-/// 프로토콜 자원 상한 — 프런트 구현이 아니라 명령 경계에서 강제한다.
-/// 초과 청크는 복사 전에 거부되고, drain 없는 연속 전송(진행 중 쓰기 1개
-/// 초과)은 스레드·메모리가 쌓이기 전에 거부된다.
-const TIMELINE_SAVE_MAX_CHUNK: usize = 8 * 1024 * 1024;
-
-/// 동기 커맨드에서 호출되는 부분 — 세션 확인·카운트 증가까지만 하고, 실제
-/// 파일 append는 워커 스레드로 넘긴다. 이전 청크의 쓰기 오류는 여기서
-/// 조기 반환된다. `host_dir`은 세션 저장값과 대조해 토큰-경로 소유 관계를
-/// 검증한다.
-fn timeline_save_append_impl(host_dir: &str, token: &str, bytes: Vec<u8>) -> Result<(), String> {
-    if bytes.len() > TIMELINE_SAVE_MAX_CHUNK {
-        return Err("타임라인 캐시 청크가 허용 크기를 초과했습니다".to_string());
-    }
-    let handle = timeline_save_sessions()
-        .lock()
-        .ok()
-        .and_then(|sessions| sessions.get(token).cloned())
-        .ok_or_else(|| "타임라인 캐시 저장 세션이 없습니다".to_string())?;
-    let path = {
-        let mut session = handle.0.lock().map_err(|_| "저장 세션 잠금 실패".to_string())?;
-        if session.host_dir != host_dir {
-            return Err("타임라인 캐시 저장 세션의 호스트 경로가 일치하지 않습니다".to_string());
+fn timeline_source_page_blocking(
+    full_path: String,
+    table_name: Option<String>,
+    offset: i64,
+    limit: i64,
+) -> Result<TimelineSourcePage, String> {
+    let conn = open_ro(&full_path)?;
+    let table = match table_name.or_else(|| first_table(&conn)) {
+        Some(t) => t,
+        None => {
+            return Ok(TimelineSourcePage {
+                columns: vec![],
+                rows: vec![],
+                next_offset: None,
+            })
         }
-        if let Some(error) = &session.error {
-            return Err(error.clone());
-        }
-        if session.pending > 0 {
-            return Err("이전 청크 쓰기가 끝나지 않았습니다 — drain 후 전송해야 합니다".to_string());
-        }
-        session.pending += 1;
-        master_timeline_saving_path(&session.host_dir, token)
     };
-    let worker = handle.clone();
-    std::thread::spawn(move || {
-        use std::io::Write;
-        let result = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&path)
-            .and_then(|mut file| file.write_all(&bytes));
-        if let Ok(mut session) = worker.0.lock() {
-            session.pending = session.pending.saturating_sub(1);
-            if let Err(error) = result {
-                session.error.get_or_insert(format!("타임라인 캐시 청크 쓰기 실패: {error}"));
-            }
-        }
-        worker.1.notify_all();
-    });
-    Ok(())
-}
-
-/// 잔여 쓰기 완료 대기 — 청크 사이(in-flight 1 유지)와 finish 직전에 쓴다.
-fn timeline_save_wait_impl(token: &str) -> Result<(), String> {
-    let handle = timeline_save_sessions()
-        .lock()
-        .ok()
-        .and_then(|sessions| sessions.get(token).cloned())
-        .ok_or_else(|| "타임라인 캐시 저장 세션이 없습니다".to_string())?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
-    let mut session = handle.0.lock().map_err(|_| "저장 세션 잠금 실패".to_string())?;
-    while session.pending > 0 && session.error.is_none() {
-        if std::time::Instant::now() >= deadline {
-            return Err("타임라인 캐시 저장 시간 초과".to_string());
-        }
-        let (next, _) = handle
-            .1
-            .wait_timeout(session, std::time::Duration::from_millis(500))
-            .map_err(|_| "저장 세션 잠금 실패".to_string())?;
-        session = next;
-    }
-    match &session.error {
-        Some(error) => Err(error.clone()),
-        None => Ok(()),
-    }
-}
-
-fn timeline_save_finish_impl(host_dir: &str, token: &str) -> Result<(), String> {
-    // 세션 폐기 전에 토큰-호스트 소유 관계를 검증한다 — 불일치 상태에서
-    // 세션을 먼저 지우면 실제 저장의 임시 파일이 남고 재시도도 불가능해진다.
-    {
-        let handle = timeline_save_sessions()
-            .lock()
-            .ok()
-            .and_then(|sessions| sessions.get(token).cloned())
-            .ok_or_else(|| "타임라인 캐시 저장 세션이 없습니다".to_string())?;
-        let session = handle.0.lock().map_err(|_| "저장 세션 잠금 실패".to_string())?;
-        if session.host_dir != host_dir {
-            return Err("타임라인 캐시 저장 세션의 호스트 경로가 일치하지 않습니다".to_string());
-        }
-    }
-    let wait = timeline_save_wait_impl(token);
-    if let Ok(mut sessions) = timeline_save_sessions().lock() {
-        sessions.remove(token);
-    }
-    let saving = master_timeline_saving_path(host_dir, token);
-    match wait {
-        Ok(()) => std::fs::rename(&saving, master_timeline_cache_path(host_dir))
-            .map_err(|error| format!("타임라인 캐시 확정 실패: {error}")),
-        Err(error) => {
-            let _ = std::fs::remove_file(&saving);
-            Err(error)
-        }
-    }
-}
-
-#[tauri::command]
-async fn save_master_timeline_begin(host_dir: String, token: String) -> Result<(), String> {
-    if !valid_saving_token(&token) {
-        return Err("타임라인 캐시 저장 토큰이 잘못되었습니다".to_string());
-    }
-    tauri::async_runtime::spawn_blocking(move || timeline_save_begin_impl(&host_dir, &token))
-        .await
-        .map_err(|error| format!("타임라인 캐시 저장 작업이 중단되었습니다: {error}"))?
-}
-
-/// raw 본문: "호스트경로\n토큰\n" + 청크 바이트. 메인에서는 헤더 파싱과
-/// 소유 복사(청크 상한 크기, memcpy 수 ms)까지만 수행하고, 파일 쓰기는
-/// 세션 워커로 넘긴다 — 느린 저장 매체의 append 지연이 이벤트 루프를 막지
-/// 않는다. 순서는 프런트의 청크당 drain await가 보장한다.
-#[tauri::command]
-fn save_master_timeline_chunk(request: tauri::ipc::Request<'_>) -> Result<(), String> {
-    let tauri::ipc::InvokeBody::Raw(body) = request.body() else {
-        return Err("타임라인 캐시 저장 본문 형식이 잘못되었습니다".to_string());
+    let limit = limit.clamp(1, 100_000);
+    let offset = offset.max(0);
+    let page = read_sqlite_page(
+        &conn,
+        &table,
+        offset,
+        limit,
+        Some(TIMELINE_SOURCE_PAGE_MAX_BYTES),
+    )?;
+    let consumed = page.rows.len() as i64;
+    // 예산으로 끊겼거나 요청한 행 수를 채웠으면 뒤가 더 있을 수 있다.
+    let next_offset = if page.budget_stopped || consumed == limit {
+        Some(offset + consumed)
+    } else {
+        None
     };
-    let first = body
-        .iter()
-        .position(|byte| *byte == b'\n')
-        .ok_or_else(|| "타임라인 캐시 저장 본문에 경로 구분자가 없습니다".to_string())?;
-    let second = body[first + 1..]
-        .iter()
-        .position(|byte| *byte == b'\n')
-        .map(|at| first + 1 + at)
-        .ok_or_else(|| "타임라인 캐시 저장 본문에 토큰 구분자가 없습니다".to_string())?;
-    let host_dir = String::from_utf8(body[..first].to_vec())
-        .map_err(|_| "타임라인 캐시 저장 경로 인코딩이 잘못되었습니다".to_string())?;
-    let token = String::from_utf8(body[first + 1..second].to_vec())
-        .map_err(|_| "타임라인 캐시 저장 토큰 인코딩이 잘못되었습니다".to_string())?;
-    if !valid_saving_token(&token) {
-        return Err("타임라인 캐시 저장 토큰이 잘못되었습니다".to_string());
-    }
-    let payload = &body[second + 1..];
-    // 상한 검사는 소유 복사(to_vec) 전에 — 초과 요청이 메모리를 잡지 않는다.
-    if payload.len() > TIMELINE_SAVE_MAX_CHUNK {
-        return Err("타임라인 캐시 청크가 허용 크기를 초과했습니다".to_string());
-    }
-    timeline_save_append_impl(&host_dir, &token, payload.to_vec())
-}
-
-/// 직전 청크들의 쓰기 완료를 워커에서 대기 — 프런트가 매 청크 후 await해
-/// in-flight를 1청크로 묶는다(메모리 상한·append 순서 보장).
-#[tauri::command]
-async fn save_master_timeline_drain(token: String) -> Result<(), String> {
-    if !valid_saving_token(&token) {
-        return Err("타임라인 캐시 저장 토큰이 잘못되었습니다".to_string());
-    }
-    tauri::async_runtime::spawn_blocking(move || timeline_save_wait_impl(&token))
-        .await
-        .map_err(|error| format!("타임라인 캐시 저장 작업이 중단되었습니다: {error}"))?
+    Ok(TimelineSourcePage {
+        columns: page.columns,
+        rows: page.rows,
+        next_offset,
+    })
 }
 
 #[tauri::command]
-async fn save_master_timeline_finish(host_dir: String, token: String) -> Result<(), String> {
-    if !valid_saving_token(&token) {
-        return Err("타임라인 캐시 저장 토큰이 잘못되었습니다".to_string());
-    }
-    tauri::async_runtime::spawn_blocking(move || timeline_save_finish_impl(&host_dir, &token))
-        .await
-        .map_err(|error| format!("타임라인 캐시 저장 작업이 중단되었습니다: {error}"))?
-}
-
-// 수백 MB급 캐시를 동기 커맨드의 String으로 돌려주면 메인 스레드(창 이벤트
-// 루프)가 ① 파일을 읽고 ② 응답 전체를 JSON 이스케이프 직렬화하느라 수십 초
-// 멈춘다 — 결과 보기 진입 멈춤의 실제 원인(스택 샘플로 확인). raw 바이트
-// 응답은 JSON 직렬화를 거치지 않고, 읽기는 blocking 풀에서 수행한다.
-// 캐시가 없으면 빈 바이트를 돌려준다.
-#[tauri::command]
-async fn load_master_timeline(host_dir: String) -> tauri::ipc::Response {
+async fn timeline_source_page(
+    full_path: String,
+    table_name: Option<String>,
+    offset: i64,
+    limit: i64,
+) -> Result<TimelineSourcePage, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        tauri::ipc::Response::new(
-            std::fs::read(master_timeline_cache_path(&host_dir)).unwrap_or_default(),
-        )
+        timeline_source_page_blocking(full_path, table_name, offset, limit)
     })
     .await
-    .unwrap_or_else(|_| tauri::ipc::Response::new(Vec::new()))
+    .map_err(|error| format!("원본 페이지 조회가 중단되었습니다: {error}"))?
 }
 
 // --- 마스터 타임라인 sqlite materialize: 스트리밍 빌드 + 페이지 쿼리 ---
 // 타임라인을 프런트 메모리에 전량 상주시키지 않도록, 각 결과 테이블을 청크로
 // 변환해 이 sqlite로 흘려 넣고(빌드) 이후 검색·필터·정렬·페이지를 SQL로
-// 조회한다. 빌드 세션은 save_master_timeline_* 청크 프로토콜과 같은 구조
-// (raw 청크 + 워커 쓰기 + drain)를 따르되, 파일 append 대신 트랜잭션 insert다.
+// 조회한다. 빌드 세션은 raw 청크 + 워커 쓰기 + drain 구조로, 파일 append
+// 대신 트랜잭션 insert를 수행한다.
 
 /// 구조 로직(필터키·검색 blob·include 규칙) 버전. 규칙이 바뀌면 올려 재빌드 유도.
 const TIMELINE_LOGIC_VERSION: i64 = 1;
@@ -2075,8 +1963,19 @@ fn refresh_execution_history_overview_blocking(host_dir: String) -> Result<bool,
     }
     let conn = open_ro(&overview_path.to_string_lossy())?;
     let columns = table_columns(&conn, "ExecutionHistory");
+    // 컬럼 존재만으로는 최신 여부를 알 수 없다 — 스키마가 같아도 편입 대상이
+    // 늘어난 버전이 있다(WER 보고의 프로세스 시작 시각). 파생 버전 마커를
+    // 함께 보고, 마커가 없는 구 저장본은 항상 재생성 대상으로 본다.
+    let derived_version: i64 = conn
+        .query_row(
+            "SELECT version FROM _wina_derived_version WHERE name = 'ExecutionHistory'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
     if columns.iter().any(|column| column == "record_key")
         && columns.iter().any(|column| column == "prefetch_hash")
+        && derived_version >= overview::EXECUTION_HISTORY_DERIVED_VERSION
     {
         return Ok(false);
     }
@@ -2088,6 +1987,13 @@ fn refresh_execution_history_overview_blocking(host_dir: String) -> Result<bool,
     }
     write_table(&overview_path, "ExecutionHistory", &rows, &[])
         .map_err(|error| error.to_string())?;
+    // 재생성한 저장본에도 버전을 남긴다 — 다음 진입에서 다시 재생성하지 않는다.
+    wina_core::sqlite::stamp_derived_version(
+        &overview_path,
+        "ExecutionHistory",
+        overview::EXECUTION_HISTORY_DERIVED_VERSION,
+    )
+    .map_err(|error| error.to_string())?;
     Ok(true)
 }
 
@@ -3765,32 +3671,23 @@ fn read_result_file_page_blocking(
             })
         }
     };
-    let mut columns = table_columns(&conn, &table);
-    let is_cache = table == "CacheEntries";
-    if is_cache {
-        columns.retain(|c| c != "body_b64");
-    }
-    let select = if is_cache {
-        columns.iter().map(|c| q(c)).collect::<Vec<_>>().join(", ")
-    } else {
-        "*".into()
-    };
     let row_count: i64 = conn
         .query_row(&format!("SELECT COUNT(*) FROM {}", q(&table)), [], |r| {
             r.get(0)
         })
         .unwrap_or(0);
-    let sql = format!(
-        "SELECT rowid AS __rowid, {} FROM {} ORDER BY rowid LIMIT ? OFFSET ?",
-        select,
-        q(&table)
-    );
-    let limit = limit.clamp(1, 100_000);
-    let offset = offset.max(0);
-    let rows = query_rows(&conn, &sql, &[&limit, &offset])?;
+    // 열 선택·정렬·값 변환은 타임라인 빌드 경로와 같은 리더를 쓴다. 일반 표는
+    // 바이트 예산 없이 요청한 행 수만큼 받는다(페이지 계약이 행 수 기준).
+    let page = read_sqlite_page(
+        &conn,
+        &table,
+        offset.max(0),
+        limit.clamp(1, 100_000),
+        None,
+    )?;
     Ok(CsvData {
-        columns,
-        rows,
+        columns: page.columns,
+        rows: page.rows,
         row_count,
     })
 }
@@ -5907,8 +5804,13 @@ struct AiConversation {
     created_at: String,
     updated_at: String,
     url: String,
-    /// Raw JSON text of the conversation (pretty-printed). Frontend parses messages from this.
-    raw_json: String,
+    /// 파생 테이블 rowid — 상세(원문) 단건 조회 키.
+    row_id: i64,
+    /// 원본 캐시 행(`<파일>::CacheEntries::<rowid>`) — 다른 화면과 북마크를
+    /// 공유하는 식별자. 파생 행은 이 키로만 원본 증거에 고정된다.
+    source_record_key: String,
+    /// 목록 표시용 메시지 수(파생 시점 계산). 원문은 상세에서만 읽는다.
+    message_count: i64,
 }
 
 #[derive(Deserialize)]
@@ -5931,6 +5833,9 @@ struct AiConversationPage {
     /// browser profiles. The UI presents this as a degraded-data warning,
     /// never as an empty result set.
     source_failures: Vec<String>,
+    /// 파생 테이블 자체가 없는 이전 파싱본 — "기간 내 데이터 없음"과
+    /// 구별해야 한다. 증거 부재와 미파싱을 혼동시키면 안 된다.
+    derived_missing: bool,
 }
 
 
@@ -5953,6 +5858,7 @@ fn ai_conversations_blocking(
             source_count: 0,
             sources_read: 0,
             source_failures: Vec::new(),
+            derived_missing: true,
         });
     }
     let conn = open_ro(&db.to_string_lossy())
@@ -5982,8 +5888,19 @@ fn ai_conversations_blocking(
         )
         .map_err(|error| format!("AI 대화 건수를 읽을 수 없습니다: {error}"))? as usize;
     let limit = query.limit.clamp(1, 100);
+    // 원문(raw_json)은 목록에 싣지 않는다 — 대화 한 건의 크기에 상한이 없어
+    // 페이지 행 수만으로는 전송 바이트·파싱 비용이 제한되지 않는다. 원문은
+    // 분석가가 대화를 열 때 rowid로 단건 조회한다.
+    let has_message_count = table_columns(&conn, "AiConversations")
+        .iter()
+        .any(|column| column == "message_count");
+    let message_count_expr = if has_message_count {
+        "CAST(COALESCE(message_count,'0') AS INTEGER)"
+    } else {
+        "0"
+    };
     let sql = format!(
-        "SELECT date, provider, account, title, created_at, updated_at, url, raw_json FROM \"AiConversations\"{where_sql} ORDER BY date DESC, url ASC LIMIT ? OFFSET ?"
+        "SELECT rowid, date, provider, account, title, created_at, updated_at, url, COALESCE(source_record_key,''), {message_count_expr} FROM \"AiConversations\"{where_sql} ORDER BY date DESC, url ASC LIMIT ? OFFSET ?"
     );
     let mut stmt = conn
         .prepare(&sql)
@@ -5996,14 +5913,16 @@ fn ai_conversations_blocking(
     let conversations = stmt
         .query_map(bind_page.as_slice(), |r| {
             Ok(AiConversation {
-                date: r.get::<_, Option<String>>(0)?.unwrap_or_default(),
-                provider: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                account: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                title: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
-                created_at: r.get::<_, Option<String>>(4)?.unwrap_or_default(),
-                updated_at: r.get::<_, Option<String>>(5)?.unwrap_or_default(),
-                url: r.get::<_, Option<String>>(6)?.unwrap_or_default(),
-                raw_json: r.get::<_, Option<String>>(7)?.unwrap_or_default(),
+                row_id: r.get::<_, i64>(0)?,
+                date: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                provider: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                account: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                title: r.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                created_at: r.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                updated_at: r.get::<_, Option<String>>(6)?.unwrap_or_default(),
+                url: r.get::<_, Option<String>>(7)?.unwrap_or_default(),
+                source_record_key: r.get::<_, Option<String>>(8)?.unwrap_or_default(),
+                message_count: r.get::<_, i64>(9)?,
             })
         })
         .map_err(|error| format!("AI 대화를 읽을 수 없습니다: {error}"))?
@@ -6015,7 +5934,51 @@ fn ai_conversations_blocking(
         source_count: 1,
         sources_read: 1,
         source_failures: Vec::new(),
+        derived_missing: false,
     })
+}
+
+/// 대화 한 건의 원문 — 목록이 아니라 분석가가 대화를 열 때만 조회한다.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AiConversationDetail {
+    raw_json: String,
+    source_record_key: String,
+}
+
+fn ai_conversation_detail_blocking(
+    host_dir: String,
+    row_id: i64,
+) -> Result<AiConversationDetail, String> {
+    let db = PathBuf::from(&host_dir)
+        .join("_OVERVIEW")
+        .join("AiConversations.sqlite");
+    if !db.is_file() {
+        return Err("AI 대화 파생 데이터가 없습니다".to_string());
+    }
+    let conn = open_ro(&db.to_string_lossy())
+        .map_err(|error| format!("AI 대화 파생 테이블을 열 수 없습니다: {error}"))?;
+    conn.query_row(
+        "SELECT COALESCE(raw_json,''), COALESCE(source_record_key,'') FROM \"AiConversations\" WHERE rowid = ?1",
+        rusqlite::params![row_id],
+        |row| {
+            Ok(AiConversationDetail {
+                raw_json: row.get(0)?,
+                source_record_key: row.get(1)?,
+            })
+        },
+    )
+    .map_err(|error| format!("AI 대화 원문을 읽을 수 없습니다: {error}"))
+}
+
+#[tauri::command]
+async fn ai_conversation_detail(
+    host_dir: String,
+    row_id: i64,
+) -> Result<AiConversationDetail, String> {
+    tauri::async_runtime::spawn_blocking(move || ai_conversation_detail_blocking(host_dir, row_id))
+        .await
+        .map_err(|error| format!("AI 대화 원문 조회가 중단되었습니다: {error}"))?
 }
 
 /// Conversation discovery decodes and validates cached JSON. It is bounded,
@@ -7338,93 +7301,172 @@ mod search_case_tests {
     }
 }
 
+
 #[cfg(test)]
-mod timeline_save_tests {
+mod execution_history_upgrade_tests {
     use super::*;
 
-    /// begin → append×N(각각 drain으로 완료 대기) → finish가 이어붙인 내용을
-    /// 원자적으로 확정하고, 세션 없는 append와 실패 후 finish가 오류를 낸다.
+    /// 구 저장본은 record_key·prefetch_hash 컬럼을 이미 갖고 있어 컬럼 검사만
+    /// 으로는 최신으로 오판된다 — WER 실행 증거가 편입된 버전보다 낮으면
+    /// 재생성해야 한다(재파싱 없이 파생을 갱신한다는 이 경로의 목적).
     #[test]
-    fn chunked_save_appends_in_order_and_finishes_atomically() {
-        let root = std::env::temp_dir().join(format!(
-            "windows-analysis-tl-save-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos(),
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        let host = root.to_string_lossy().to_string();
-        let token = "test-token-1";
-
-        timeline_save_begin_impl(&host, token).unwrap();
-        for piece in [b"abc".as_slice(), b"def", b"ghi"] {
-            timeline_save_append_impl(&host, token, piece.to_vec()).unwrap();
-            timeline_save_wait_impl(token).unwrap();
+    fn legacy_execution_history_without_version_marker_is_rebuilt() {
+        let root = std::env::temp_dir().join(format!("wina-eh-up-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let ov = root.join("_OVERVIEW");
+        std::fs::create_dir_all(&ov).unwrap();
+        let db = ov.join("ExecutionHistory.sqlite");
+        {
+            let conn = Connection::open(&db).unwrap();
+            // v1.3.10 형태: 컬럼은 최신과 같고 버전 마커만 없다.
+            conn.execute_batch(
+                "CREATE TABLE ExecutionHistory (timestamp TEXT, program_name TEXT, program_path TEXT, user TEXT, source_artifact TEXT, record_key TEXT, prefetch_hash TEXT);
+                 INSERT INTO ExecutionHistory VALUES ('2026-01-01 00:00:00.000','old.exe','','','Prefetch','k','h')",
+            )
+            .unwrap();
         }
-        // 정확히 허용 크기인 청크는 통과, 1바이트 초과는 복사 전에 거부.
-        timeline_save_append_impl(&host, token, vec![b'!'; TIMELINE_SAVE_MAX_CHUNK]).unwrap();
-        timeline_save_wait_impl(token).unwrap();
+        // 재생성 입력이 없으면 rows가 비어 false를 돌려주므로, 갱신 판정이
+        // 조기 반환(컬럼만 보고 최신 판정)에 걸리지 않았음을 별도로 확인한다.
+        let conn = open_ro(&db.to_string_lossy()).unwrap();
+        let version: i64 = conn
+            .query_row(
+                "SELECT version FROM _wina_derived_version WHERE name = 'ExecutionHistory'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        drop(conn);
+        assert_eq!(version, 0, "구 저장본에는 파생 버전 마커가 없다");
         assert!(
-            timeline_save_append_impl(&host, token, vec![0u8; TIMELINE_SAVE_MAX_CHUNK + 1]).is_err(),
-            "oversized chunk must be rejected"
+            version < overview::EXECUTION_HISTORY_DERIVED_VERSION,
+            "마커 없는 저장본은 현재 파생 버전보다 낮아 재생성 대상이어야 한다"
         );
-        timeline_save_finish_impl(&host, token).unwrap();
-        let written = std::fs::read(master_timeline_cache_path(&host)).unwrap();
-        assert_eq!(&written[..9], b"abcdefghi");
-        assert_eq!(written.len(), 9 + TIMELINE_SAVE_MAX_CHUNK);
-        // 임시 파일은 남지 않는다.
-        assert!(!master_timeline_saving_path(&host, token).exists());
 
-        // 세션이 끝난 뒤의 append는 오류.
-        assert!(timeline_save_append_impl(&host, token, b"x".to_vec()).is_err());
+        // 마커를 현재 버전으로 찍으면 최신으로 판정돼 재생성하지 않는다.
+        wina_core::sqlite::stamp_derived_version(
+            &db,
+            "ExecutionHistory",
+            overview::EXECUTION_HISTORY_DERIVED_VERSION,
+        )
+        .unwrap();
+        assert_eq!(
+            refresh_execution_history_overview_blocking(root.to_string_lossy().to_string()),
+            Ok(false),
+            "현재 버전 마커가 있으면 재생성하지 않는다"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
 
-        // begin이 이전 임시 파일을 정리한다.
-        std::fs::write(master_timeline_saving_path(&host, "stale-1"), b"junk").unwrap();
-        timeline_save_begin_impl(&host, "test-token-2").unwrap();
-        assert!(!master_timeline_saving_path(&host, "stale-1").exists());
-        // 호스트-토큰 소유 불일치: append/finish 모두 거부되고 세션은 유지된다.
-        assert!(timeline_save_append_impl("/wrong/host", "test-token-2", b"a".to_vec()).is_err());
-        assert!(timeline_save_finish_impl("/wrong/host", "test-token-2").is_err());
-        // 실패 경로: 임시 파일을 지워 쓰기 실패 유도 → drain/finish가 오류 전파.
-        std::fs::remove_file(master_timeline_saving_path(&host, "test-token-2")).unwrap();
-        timeline_save_append_impl(&host, "test-token-2", b"zzz".to_vec()).unwrap();
-        assert!(timeline_save_wait_impl("test-token-2").is_err());
-        assert!(timeline_save_finish_impl(&host, "test-token-2").is_err());
+#[cfg(test)]
+mod timeline_source_page_tests {
+    use super::*;
 
-        let _ = std::fs::remove_dir_all(root);
+    fn fixture(dir: &Path, rows: &[(i64, String)]) -> String {
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join("Source.sqlite");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE Rows (timestamp TEXT, payload TEXT)")
+            .unwrap();
+        for (index, payload) in rows {
+            conn.execute(
+                "INSERT INTO Rows (timestamp, payload) VALUES (?1, ?2)",
+                rusqlite::params![format!("2026-01-01 00:00:{:02}.000", index), payload],
+            )
+            .unwrap();
+        }
+        path.to_string_lossy().to_string()
     }
 
-    /// drain 없이 연속 전송하면 진행 중 쓰기 1개 상한에서 거부된다 —
-    /// 쓰기 스레드·대기 메모리가 무제한으로 쌓이지 않는다.
+    /// 큰 증거 값이 섞이면 요청 행 수보다 먼저 바이트 예산에서 끊기고,
+    /// nextOffset을 따라가면 한 행도 빠지지 않는다 — 행 수만으로 종료를
+    /// 판단하면 잘린 페이지를 테이블 끝으로 오해해 증거가 누락된다.
     #[test]
-    fn consecutive_chunks_without_drain_are_rejected() {
-        let root = std::env::temp_dir().join(format!(
-            "windows-analysis-tl-save-flood-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos(),
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        let host = root.to_string_lossy().to_string();
-        let token = "flood-token";
-        timeline_save_begin_impl(&host, token).unwrap();
-        // 큰 청크로 쓰기 시간을 벌고, 완료 대기 없이 곧바로 다음 청크 전송을
-        // 반복하면 최소 한 번은 in-flight 상한 거부가 발생해야 한다. 워커가
-        // 그 사이 완료되어 통과한 전송은 정상 동작이다.
-        let mut rejected = 0usize;
-        for _ in 0..8 {
-            if timeline_save_append_impl(&host, token, vec![b'x'; 4 * 1024 * 1024]).is_err() {
-                rejected += 1;
+    fn byte_budget_splits_pages_without_losing_rows() {
+        let root = std::env::temp_dir().join(format!("wina-tl-src-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        // 각 3MiB인 행 6개 — 8MiB 예산이면 페이지당 3행 남짓에서 끊긴다.
+        let big = "x".repeat(3 * 1024 * 1024);
+        let rows: Vec<(i64, String)> = (0..6).map(|i| (i, big.clone())).collect();
+        let path = fixture(&root, &rows);
+
+        let first =
+            timeline_source_page_blocking(path.clone(), Some("Rows".into()), 0, 20_000).unwrap();
+        assert!(
+            first.rows.len() < 6,
+            "예산보다 큰 페이지가 통째로 반환되면 안 된다 (rows={})",
+            first.rows.len()
+        );
+        assert_eq!(first.next_offset, Some(first.rows.len() as i64));
+
+        // nextOffset을 따라 끝까지 읽으면 전체 행이 정확히 한 번씩 나온다.
+        let mut seen = Vec::new();
+        let mut offset = Some(0i64);
+        while let Some(at) = offset {
+            let page =
+                timeline_source_page_blocking(path.clone(), Some("Rows".into()), at, 20_000).unwrap();
+            for row in &page.rows {
+                seen.push(row["timestamp"].as_str().unwrap().to_string());
             }
+            offset = page.next_offset;
         }
-        assert!(rejected > 0, "in-flight limit must reject drain-less floods");
-        timeline_save_wait_impl(token).unwrap();
-        timeline_save_finish_impl(&host, token).unwrap();
-        let _ = std::fs::remove_dir_all(root);
+        assert_eq!(seen.len(), 6);
+        assert_eq!(seen[0], "2026-01-01 00:00:00.000");
+        assert_eq!(seen[5], "2026-01-01 00:00:05.000");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 타임라인 빌드와 일반 증거 표는 같은 리더를 써야 한다 — CacheEntries의
+    /// 본문(body_b64) 제외 같은 열 선택이 한쪽에만 반영되면 같은 원본이 화면마다
+    /// 다르게 보인다.
+    #[test]
+    fn timeline_and_raw_table_expose_the_same_columns() {
+        let root = std::env::temp_dir().join(format!("wina-tl-same-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("Cache.sqlite");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE CacheEntries (url TEXT, response_time TEXT, body_b64 TEXT);
+                 INSERT INTO CacheEntries VALUES ('https://x/', '2026-01-01 00:00:00.000', 'QUJD')",
+            )
+            .unwrap();
+        }
+        let full = path.to_string_lossy().to_string();
+        let raw = read_result_file_page_blocking(full.clone(), Some("CacheEntries".into()), 0, 10)
+            .unwrap();
+        let tl =
+            timeline_source_page_blocking(full, Some("CacheEntries".into()), 0, 10).unwrap();
+        assert_eq!(raw.columns, tl.columns);
+        // 캐시 본문은 어느 경로에서도 페이지에 실리지 않는다.
+        assert!(!raw.columns.contains(&"body_b64".to_string()));
+        assert!(!tl.rows[0].contains_key("body_b64"));
+        assert_eq!(raw.rows[0]["url"], tl.rows[0]["url"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 작은 테이블은 한 페이지로 끝나고 nextOffset=None으로 종료를 알린다.
+    /// 한 행이 예산보다 커도 최소 한 행은 반환해 진행이 멈추지 않는다.
+    #[test]
+    fn small_table_ends_and_oversized_row_still_progresses() {
+        let root = std::env::temp_dir().join(format!("wina-tl-src2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let rows = vec![(0i64, "a".to_string()), (1, "b".to_string())];
+        let path = fixture(&root, &rows);
+        let page = timeline_source_page_blocking(path, Some("Rows".into()), 0, 20_000).unwrap();
+        assert_eq!(page.rows.len(), 2);
+        assert_eq!(page.next_offset, None);
+        let _ = std::fs::remove_dir_all(&root);
+
+        let root2 = std::env::temp_dir().join(format!("wina-tl-src3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root2);
+        let huge = vec![(0i64, "y".repeat(TIMELINE_SOURCE_PAGE_MAX_BYTES + 1024))];
+        let path2 = fixture(&root2, &huge);
+        let page2 = timeline_source_page_blocking(path2, Some("Rows".into()), 0, 20_000).unwrap();
+        assert_eq!(page2.rows.len(), 1, "예산 초과 단일 행도 진행을 위해 반환한다");
+        let _ = std::fs::remove_dir_all(&root2);
     }
 }
 
@@ -8165,15 +8207,17 @@ mod browser_activity_tests {
         let ov = root.join("_OVERVIEW");
         std::fs::create_dir_all(&ov).unwrap();
         let conn = Connection::open(ov.join("AiConversations.sqlite")).unwrap();
-        conn.execute_batch("CREATE TABLE AiConversations (date TEXT, provider TEXT, account TEXT, title TEXT, created_at TEXT, updated_at TEXT, url TEXT, raw_json TEXT, source_record_key TEXT, _source_file TEXT)").unwrap();
+        conn.execute_batch("CREATE TABLE AiConversations (date TEXT, provider TEXT, account TEXT, title TEXT, created_at TEXT, updated_at TEXT, url TEXT, raw_json TEXT, message_count TEXT, source_record_key TEXT, _source_file TEXT)").unwrap();
+        // 원문은 목록 응답에 실리면 안 되므로 크게 만들어 둔다.
+        let big_raw = format!("{{\"pad\":\"{}\"}}", "x".repeat(200_000));
         for (date, url) in [
             ("2026-07-01 10:00:00.000", "https://chatgpt.com/backend-api/conversation/a"),
             ("2026-07-02 10:00:00.000", "https://chatgpt.com/backend-api/conversation/b"),
             ("2026-07-03 10:00:00.000", "https://chatgpt.com/backend-api/conversation/c"),
         ] {
             conn.execute(
-                "INSERT INTO AiConversations VALUES (?1, 'ChatGPT', 'alice', 't', '', '', ?2, '{}', '', '')",
-                rusqlite::params![date, url],
+                "INSERT INTO AiConversations VALUES (?1, 'ChatGPT', 'alice', 't', '', '', ?2, ?3, '4', 'u_Chrome_Cache::CacheEntries::7', '')",
+                rusqlite::params![date, url, big_raw],
             )
             .unwrap();
         }
@@ -8206,6 +8250,27 @@ mod browser_activity_tests {
         .unwrap();
         assert_eq!(second.conversations[0].date, "2026-07-02 10:00:00.000");
 
+        // 목록은 원문을 싣지 않고(전송 바이트가 대화 크기에 비례하지 않음),
+        // 원본 증거를 가리키는 북마크 식별자와 표시용 메시지 수만 전달한다.
+        let listed = &page.conversations[0];
+        assert_eq!(listed.source_record_key, "u_Chrome_Cache::CacheEntries::7");
+        assert_eq!(listed.message_count, 4);
+        assert!(listed.row_id > 0);
+        let serialized = serde_json::to_string(&page).unwrap();
+        assert!(
+            !serialized.contains("pad"),
+            "목록 응답에 원문이 포함되면 안 된다"
+        );
+        assert!(serialized.len() < 10_000, "목록 응답 크기 = {}", serialized.len());
+        assert!(!page.derived_missing);
+
+        // 원문은 대화를 열 때 rowid로 단건 조회한다.
+        let detail =
+            ai_conversation_detail_blocking(root.to_string_lossy().to_string(), listed.row_id)
+                .unwrap();
+        assert!(detail.raw_json.contains("pad"));
+        assert_eq!(detail.source_record_key, "u_Chrome_Cache::CacheEntries::7");
+
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -8234,6 +8299,9 @@ mod browser_activity_tests {
         assert!(page.conversations.is_empty());
         assert_eq!(page.total, 0);
         assert_eq!(page.source_count, 0);
+        // 미파싱(파생 부재)과 "기간 내 데이터 없음"은 구별돼야 한다 —
+        // 증거 부재로 오인하면 분석 결론이 달라진다.
+        assert!(page.derived_missing);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -8837,11 +8905,7 @@ fn main() {
             run_host,
             cancel_pipeline,
             list_categories,
-            save_master_timeline_begin,
-            save_master_timeline_chunk,
-            save_master_timeline_drain,
-            save_master_timeline_finish,
-            load_master_timeline,
+            timeline_source_page,
             master_timeline_build_begin,
             master_timeline_build_insert,
             master_timeline_build_drain,
@@ -8884,6 +8948,7 @@ fn main() {
             cache_entry_body,
             browser_visit_graph,
             ai_conversations,
+            ai_conversation_detail,
             wmi_subscription_events,
             powershell_search_rowids
         ])

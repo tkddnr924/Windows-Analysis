@@ -159,6 +159,11 @@ export default function PowerShellFlowView({
   // 시간 정보가 없는 기록(ConsoleHost_history 등)은 세션 묶음과 분리해
   // 실행 이력 뷰와 같은 접이식 구역으로 보여준다.
   const [untimedOpen, setUntimedOpen] = useState(false);
+  // PSReadLine 히스토리는 수만 줄이 될 수 있다 — 접었다 펴는 것만으로 모든
+  // 줄을 DOM에 만들면 통합 타임라인에서 없앤 UI 멈춤이 여기서 재현된다.
+  // 처음에는 일정 줄만 렌더하고 필요할 때 이어서 붙인다.
+  const UNTIMED_RENDER_STEP = 500;
+  const [untimedShown, setUntimedShown] = useState(UNTIMED_RENDER_STEP);
   const [page, setPage] = useState(0);
 
   // 목록 IPC의 script_block/host_application은 앞 1,000자 미리보기 — 그 뒤의
@@ -266,7 +271,7 @@ export default function PowerShellFlowView({
               <div style={{ borderTop: "1px solid var(--border-subtle)", maxHeight: 560, overflow: "auto", background: "var(--bg-input)", padding: "6px 0" }}>
                 {/* 읽기 전용 히스토리 — 클릭 상세·북마크 없이 줄번호 + 명령만
                     보여주고, 명령 텍스트는 드래그로 복사할 수 있게 한다. */}
-                {untimed.map((row, index) => (
+                {untimed.slice(0, untimedShown).map((row, index) => (
                   <div
                     key={`${Number((row as Record<string, unknown>).__rowid)}-${index}`}
                     style={{ display: "flex", alignItems: "flex-start", gap: 12, padding: "1px 12px", lineHeight: 1.6 }}
@@ -275,6 +280,21 @@ export default function PowerShellFlowView({
                     <span style={{ flex: 1, minWidth: 0, fontFamily: "var(--mono)", fontSize: 12.5, color: "var(--text)", whiteSpace: "pre-wrap", wordBreak: "break-word", userSelect: "text" }}>{row.command || "(명령 없음)"}</span>
                   </div>
                 ))}
+                {untimed.length > untimedShown && (
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 10, padding: "10px 12px" }}>
+                    <span style={{ color: "var(--text-faint)", fontSize: 11.5, fontFamily: "var(--mono)" }}>
+                      {untimedShown.toLocaleString()} / {untimed.length.toLocaleString()}줄
+                    </span>
+                    <button className="nm-btn" type="button" onClick={() => setUntimedShown((value) => value + UNTIMED_RENDER_STEP)}
+                      style={{ padding: "3px 10px", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", background: "var(--bg-elevated)", color: "var(--text-dim)", cursor: "pointer", fontSize: 11.5 }}>
+                      {Math.min(UNTIMED_RENDER_STEP, untimed.length - untimedShown).toLocaleString()}줄 더 보기
+                    </button>
+                    <button className="nm-btn" type="button" onClick={() => setUntimedShown(untimed.length)}
+                      style={{ padding: "3px 10px", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", background: "var(--bg-elevated)", color: "var(--text-dim)", cursor: "pointer", fontSize: 11.5 }}>
+                      전체 보기
+                    </button>
+                  </div>
+                )}
               </div>
             )}
           </section>

@@ -21,9 +21,28 @@ pub const AI_KEYS: &[&str] = &[
     "updated_at",
     "url",
     "raw_json",
+    // 목록은 raw_json을 전송하지 않는다 — 메시지 수만 파생 시점에 세어 둔다.
+    "message_count",
     "source_record_key",
     "_source_file",
 ];
+
+/// 대화 payload의 메시지 개수 — 목록은 원문을 받지 않으므로 파생 시점에
+/// 세어 둔다. 제공자마다 배열 키가 달라 알려진 키를 순서대로 본다.
+fn count_ai_messages(value: &serde_json::Value) -> usize {
+    let object = match value.as_object() {
+        Some(object) => object,
+        None => return 0,
+    };
+    for key in ["messages", "chat_messages", "conversation", "mapping"] {
+        match object.get(key) {
+            Some(serde_json::Value::Array(items)) => return items.len(),
+            Some(serde_json::Value::Object(map)) => return map.len(),
+            _ => {}
+        }
+    }
+    0
+}
 
 /// AI provider hosts we look for in the cache.
 pub const AI_HOSTS: &[&str] = &[
@@ -226,6 +245,7 @@ pub fn build_ai_conversations_stream(
             row.insert("created_at".into(), created_at);
             row.insert("updated_at".into(), updated_at);
             row.insert("url".into(), url);
+            row.insert("message_count".into(), count_ai_messages(&value).to_string());
             row.insert("raw_json".into(), raw_json);
             row.insert(
                 "source_record_key".into(),

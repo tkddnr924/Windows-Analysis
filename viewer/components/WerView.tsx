@@ -38,6 +38,7 @@ type Parsed = {
   eventType: string;
   friendly: string;
   timestamp: string;
+  source: string;
 };
 
 function safeParse(s: string): Record<string, unknown> {
@@ -109,6 +110,9 @@ export default function WerView({ data, bookmarkedRowids, onToggleBookmark, time
           eventType: row.EventType || str(report.EventType),
           friendly: str(report.FriendlyEventName),
           timestamp: row.timestamp || "",
+          // 통합 파생이 남긴 구성 원본 — Report.wer 산출물인지 EventLog
+          // 오류 보고(1001)인지 목록에서 바로 구분한다.
+          source: row.source || "",
         };
       }),
     [data.rows],
@@ -150,7 +154,7 @@ export default function WerView({ data, bookmarkedRowids, onToggleBookmark, time
 
   return (
     <div className="dfir-view" style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", background: "var(--bg)", overflow: "hidden" }}>
-      <ViewHeader icon={ReportProblemOutlinedIcon} title="Windows 오류 보고 (WER)" meta={`${ranged.length.toLocaleString()}건`} right={<span style={{ color: "var(--text-faint)", fontSize: 11.5 }}>{rangeOn ? "전역 기간 필터 적용" : "전체 기간"}</span>}>
+      <ViewHeader icon={ReportProblemOutlinedIcon} title="오류 보고" meta={`${ranged.length.toLocaleString()}건`} right={<span style={{ color: "var(--text-faint)", fontSize: 11.5 }}>{rangeOn ? "전역 기간 필터 적용" : "전체 기간"}</span>}>
           <HeaderSearchInput value={search} onChange={(value) => { setSearch(value); setPage(0); }} placeholder="앱 이름 · 경로 · 이벤트 유형 검색" width={300} />
           <SortDropdown value={sortDir} onChange={(next) => { setSortDir(next as "asc" | "desc"); setPage(0); }} />
           {types.length > 1 && (
@@ -187,6 +191,7 @@ export default function WerView({ data, bookmarkedRowids, onToggleBookmark, time
                 <span style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
                   <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 13.5, fontWeight: 700, color: "var(--text)" }}>{p.appName || p.friendly || p.eventType || "(이름 없음)"}</span>
                   <Pill text={p.eventType || "?"} color={tone} />
+                  {p.source && <span className="dfir-tag" style={{ flexShrink: 0 }}>{p.source}</span>}
                   {p.friendly && <span style={{ flexShrink: 0, fontSize: 12, color: "var(--text-faint)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 260 }}>{p.friendly}</span>}
                 </span>
                 <span title={p.appPath || undefined} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 12, color: p.appPath ? "var(--text-dim)" : "var(--text-faint)", fontFamily: "var(--mono)" }}>{p.appPath || "경로 정보 없음"}</span>

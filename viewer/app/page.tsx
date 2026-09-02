@@ -13,6 +13,7 @@ import HostConnectionView, { type HostGraph, type ConnRecord } from "@/component
 import SessionFlowView from "@/components/SessionFlowView";
 import SmbHistoryView from "@/components/SmbHistoryView";
 import BitsView from "@/components/BitsView";
+import ServiceView from "@/components/ServiceView";
 import FirewallView from "@/components/FirewallView";
 import PowerShellFlowView from "@/components/PowerShellFlowView";
 import TargetInfoView from "@/components/TargetInfoView";
@@ -110,6 +111,9 @@ export default function Home() {
   const [bookmarkError, setBookmarkError] = useState<string | null>(null);
   const [masterTimeline, setMasterTimeline] = useState<{ hostId: string } | null>(null);
   const [masterTimelineLoading, setMasterTimelineLoading] = useState(false);
+  // 타임라인 빌드·조회 실패를 화면에 남긴다 — 증거 조회 실패를 "데이터 없음"
+  // 이나 빈 화면으로 보여주면 분석 범위가 누락된 채로 오인된다.
+  const [masterTimelineError, setMasterTimelineError] = useState<string | null>(null);
   // Cancels an in-flight master-timeline build. Building scans every result
   // table (EventLog alone can be hundreds of thousands of rows), so once the
   // analyst leaves the timeline tab or switches host the work must stop rather
@@ -456,6 +460,7 @@ export default function Home() {
     const controller = new AbortController();
     timelineBuildRef.current = controller;
     setMasterTimelineLoading(true);
+    setMasterTimelineError(null);
     try {
       const builtForRunAt = host.lastRunAt ?? "";
       const meta = await window.api.masterTimelineMeta(host.dir);
@@ -473,7 +478,11 @@ export default function Home() {
       }
       if (!controller.signal.aborted) setMasterTimeline({ hostId: host.id });
     } catch (error) {
-      if (!(error instanceof TimelineBuildAborted)) throw error;
+      // 중단(다른 화면으로 이동)은 오류가 아니다. 나머지는 클릭 핸들러 밖으로
+      // 던지면 처리되지 않은 거부로 사라지므로, 원인과 재시도를 화면에 남긴다.
+      if (!(error instanceof TimelineBuildAborted)) {
+        setMasterTimelineError(error instanceof Error ? error.message : String(error));
+      }
     } finally {
       if (timelineBuildRef.current === controller) {
         timelineBuildRef.current = null;
@@ -887,6 +896,17 @@ export default function Home() {
         .map((row) => Number((row as Record<string, unknown>).__rowid)),
     );
   }, [activeTab, bookmarkedSourceKeys, bookmarksForCurrentHost]);
+  // 파생 행(AI 대화 등)이 가리키는 원본 증거 레코드의 북마크 상태 —
+  // 파생 화면과 원본 화면이 같은 강조 상태를 공유해야 교차 검증이 끊기지
+  // 않는다. 키는 반드시 원본 파일·테이블·rowid다.
+  const isSourceRecordBookmarked = (recordKey: string) => {
+    const source = sourceRecordRef(recordKey);
+    return Boolean(source && bookmarkedSourceKeys.has(sourceBookmarkKey(source.tableName, source.rowid, source.fileName)));
+  };
+  const handleToggleSourceRecordBookmark = async (recordKey: string) => {
+    if (!sourceRecordRef(recordKey)) return;
+    await handleToggleSourceAwareBookmark({ record_key: recordKey }, "", "", 0);
+  };
   // Timeline rows span many files, so a per-file rowid set isn't enough —
   // key on fullPath+rowid to tell which timeline entries are bookmarked.
   const bookmarkedKeys = new Set(bookmarksForCurrentHost.map((b) => `${b.fullPath}#${b.rowid}`));
@@ -1005,6 +1025,13 @@ export default function Home() {
               masterTimelineLoading ? (
                 <div role="status" aria-live="polite" style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100%", color: "var(--text-dim)", gap: 10, fontSize: 14 }}>
                   <span>모든 아티팩트를 시간순으로 모으는 중...</span>
+                </div>
+              ) : masterTimelineError ? (
+                <div role="alert" style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 12, height: "100%", padding: 24, color: "var(--text)", fontSize: 13, textAlign: "center" }}>
+                  <span style={{ fontWeight: 700 }}>통합 타임라인을 만들지 못했습니다</span>
+                  <span style={{ color: "var(--text-dim)", fontSize: 12.5, maxWidth: 560, wordBreak: "break-word" }}>{masterTimelineError}</span>
+                  <span style={{ color: "var(--text-faint)", fontSize: 12 }}>이 화면은 &quot;시간순 데이터가 없다&quot;는 뜻이 아닙니다 — 조회에 실패한 상태입니다.</span>
+                  <button type="button" onClick={() => { void handleSelectTimeline(); }} style={{ padding: "5px 12px", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", background: "var(--bg-elevated)", color: "var(--text)", cursor: "pointer", fontSize: 12.5 }}>다시 시도</button>
                 </div>
               ) : masterTimeline?.hostId === selectedHost.id ? (
                 <MasterTimeline
@@ -1159,6 +1186,8 @@ export default function Home() {
                   // so use the table-scoped bookmark records directly.
                   bookmarkedRowids={new Set(activeTableBookmarks.map((bookmark) => bookmark.rowid))}
                   onToggleBookmark={(rowid) => handleToggleBookmark(activeTab.file.fullPath, activeTab.file.tableName, rowid)}
+                  isSourceRecordBookmarked={isSourceRecordBookmarked}
+                  onToggleSourceRecordBookmark={handleToggleSourceRecordBookmark}
                 />
               ) : getArtifactView(activeTab.file.name)?.customView === "firewall" ? (
                 <FirewallView
@@ -1179,6 +1208,15 @@ export default function Home() {
                   onToggleBookmark={(rowid) => handleToggleActiveRowBookmark(rowid)}
                   timeRange={timeRange}
                   accountDirectory={currentAccountDirectory}
+                />
+              ) : getArtifactView(activeTab.file.name)?.customView === "service" ? (
+                <ServiceView
+                  data={activeTab.data}
+                  onNavigate={handleNavigate}
+                  onFetchLinkedRows={fetchLinkedRows}
+                  bookmarkedRowids={activeBookmarkedRowids}
+                  onToggleBookmark={(rowid) => handleToggleActiveRowBookmark(rowid)}
+                  timeRange={timeRange}
                 />
               ) : getArtifactView(activeTab.file.name)?.customView === "smb" ? (
                 <SmbHistoryView

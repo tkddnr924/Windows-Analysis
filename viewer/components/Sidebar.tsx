@@ -19,6 +19,7 @@ import DnsOutlinedIcon from "@mui/icons-material/DnsOutlined";
 import CloudDownloadOutlinedIcon from "@mui/icons-material/CloudDownloadOutlined";
 import SecurityOutlinedIcon from "@mui/icons-material/SecurityOutlined";
 import TaskOutlinedIcon from "@mui/icons-material/TaskOutlined";
+import MiscellaneousServicesOutlinedIcon from "@mui/icons-material/MiscellaneousServicesOutlined";
 import LanguageOutlinedIcon from "@mui/icons-material/LanguageOutlined";
 import PhotoLibraryOutlinedIcon from "@mui/icons-material/PhotoLibraryOutlined";
 import DeviceHubOutlinedIcon from "@mui/icons-material/DeviceHubOutlined";
@@ -138,6 +139,7 @@ const OVERVIEW_ORDER: string[] = [
   "SmbHistory",
   "BitsHistory",
   "FirewallHistory",
+  "ServiceHistory",
   "ScheduledTasks",
   "RdpCache",
 ];
@@ -156,6 +158,7 @@ const OVERVIEW_TABLE_NAMES: Record<string, string> = {
   PowerShellHistory: "파워셸 실행 이력",
   RdpCache: "RDP Cache",
   ScheduledTasks: "작업 스케줄러",
+  ServiceHistory: "서비스 이력",
   MFT_Records: "파일 시스템 정보",
 };
 
@@ -165,7 +168,7 @@ const OVERVIEW_TABLE_NAMES: Record<string, string> = {
 // 나열되는 안전망을 둔다 (새 테이블이 추가돼도 사라지지 않게).
 const ANALYSIS_GROUPS: { title: string; items: string[] }[] = [
   { title: "파일 시스템", items: ["MFT_Records", "@USN"] },
-  { title: "실행 흔적", items: ["ExecutionHistory", "PowerShellHistory", "ScheduledTasks", "@WMI"] },
+  { title: "실행 흔적", items: ["ExecutionHistory", "PowerShellHistory", "ServiceHistory", "ScheduledTasks", "@WMI"] },
   { title: "네트워크 · 원격", items: ["RemoteDesktopHistory", "SmbHistory", "BitsHistory", "FirewallHistory", "BrowserActivity", "RdpCache"] },
   { title: "시스템 · 보안", items: ["RegistryFindings", "Defender", "@WER"] },
 ];
@@ -187,6 +190,8 @@ function OverviewTableIcon({ name }: { name: string }) {
     case "BitsHistory": return <CloudDownloadOutlinedIcon {...props} />;
     case "FirewallHistory": return <SecurityOutlinedIcon {...props} />;
     case "ScheduledTasks": return <TaskOutlinedIcon {...props} />;
+    // 서비스 이력 뷰 헤더와 같은 글리프.
+    case "ServiceHistory": return <MiscellaneousServicesOutlinedIcon {...props} />;
     // Keep the navigation glyph identical to the RDP Cache view header; the
     // remote session ledger itself uses the desktop glyph above.
     case "RdpCache": return <PhotoLibraryOutlinedIcon {...props} />;
@@ -220,24 +225,29 @@ function FileRow({
   onSelectFile: (file: ResultFileEntry) => void;
 }) {
   // 0건 항목도 목록에 남되(0건 스키마 정책) 흐림 + "데이터 없음"으로 상태를
-  // 보여준다 — 열람(빈 화면 확인)은 그대로 가능하다 (2026-09-01 사용자 확정).
+  // 보여준다. 선택은 되지 않는다 — 같은 "데이터 없음" 표기인데 원본 파일이
+  // 없는 항목(EmptyPinnedRow·EmptyCategoryRow)은 눌리지 않고 0건 테이블만
+  // 눌리던 차이를 없앤다 (2026-09-03 사용자 확정 — 2026-09-01의 "열람은
+  // 그대로 가능" 결정을 대체).
   const empty = entry.rowCount === 0;
+  const active = selected && !empty;
   return (
     <div
-      onClick={() => onSelectFile(entry)}
-      title={`${entry.relativePath} · ${entry.tableName}`}
+      onClick={empty ? undefined : () => onSelectFile(entry)}
+      title={empty ? "데이터 없음 — 추출된 레코드가 없습니다" : `${entry.relativePath} · ${entry.tableName}`}
       style={{
         display: "flex",
         alignItems: "center",
         justifyContent: "space-between",
         gap: 6,
         padding: `${prominent ? 10 : 7}px 10px ${prominent ? 10 : 7}px ${indent}px`,
-        cursor: "pointer",
-        background: selected
+        cursor: empty ? "default" : "pointer",
+        userSelect: empty ? "none" : undefined,
+        background: active
           ? "linear-gradient(135deg, rgba(74, 146, 218, 0.31), rgba(37, 78, 118, 0.38))"
           : "transparent",
-        borderLeft: `3px solid ${selected ? "var(--accent)" : "transparent"}`,
-        boxShadow: selected
+        borderLeft: `3px solid ${active ? "var(--accent)" : "transparent"}`,
+        boxShadow: active
           ? "inset 3px 3px 7px rgba(3, 8, 14, 0.45), inset -2px -2px 6px rgba(142, 188, 230, 0.12), 0 1px 0 rgba(142, 188, 230, 0.12)"
           : "none",
         whiteSpace: "nowrap",
@@ -245,17 +255,17 @@ function FileRow({
         textOverflow: "ellipsis",
       }}
       onMouseEnter={(e) => {
-        if (!selected) e.currentTarget.style.background = "var(--bg-hover)";
+        if (!active && !empty) e.currentTarget.style.background = "var(--bg-hover)";
       }}
       onMouseLeave={(e) => {
-        if (!selected) e.currentTarget.style.background = "transparent";
+        if (!active) e.currentTarget.style.background = "transparent";
       }}
     >
-      <span style={{ display: "flex", alignItems: "center", gap: 7, overflow: "hidden", textOverflow: "ellipsis", color: selected ? "var(--text)" : empty ? "var(--text-faint)" : "var(--text-dim)", opacity: empty && !selected ? 0.55 : 1, fontSize: prominent ? 14 : 13.5, fontWeight: selected ? 700 : prominent ? 600 : 400 }}>
+      <span style={{ display: "flex", alignItems: "center", gap: 7, overflow: "hidden", textOverflow: "ellipsis", color: active ? "var(--text)" : empty ? "var(--text-faint)" : "var(--text-dim)", opacity: empty ? 0.55 : 1, fontSize: prominent ? 14 : 13.5, fontWeight: active ? 700 : prominent ? 600 : 400 }}>
         {leading}
         <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>{label}</span>
       </span>
-      {empty && <span style={{ flexShrink: 0, color: "var(--text-faint)", opacity: selected ? 1 : 0.7, fontSize: 10.5, fontWeight: 500 }}>데이터 없음</span>}
+      {empty && <span style={{ flexShrink: 0, color: "var(--text-faint)", opacity: 0.7, fontSize: 10.5, fontWeight: 500 }}>데이터 없음</span>}
     </div>
   );
 }
@@ -757,8 +767,8 @@ export default function Sidebar({
                 }
                 if (item === "@WER") {
                   const entry = effectiveWerEntry;
-                  if (entry) rows.push(<PinnedNavRow key="wer" icon={<ReportProblemOutlinedIcon sx={{ fontSize: 19 }} />} label="오류 보고 (WER)" selected={sameEntry(selectedFile, entry)} onClick={() => onSelectFile(entry)} />);
-                  else rows.push(<EmptyPinnedRow key="wer" icon={<ReportProblemOutlinedIcon sx={{ fontSize: 19 }} />} label="오류 보고 (WER)" />);
+                  if (entry) rows.push(<PinnedNavRow key="wer" icon={<ReportProblemOutlinedIcon sx={{ fontSize: 19 }} />} label="오류 보고" selected={sameEntry(selectedFile, entry)} onClick={() => onSelectFile(entry)} />);
+                  else rows.push(<EmptyPinnedRow key="wer" icon={<ReportProblemOutlinedIcon sx={{ fontSize: 19 }} />} label="오류 보고" />);
                   continue;
                 }
                 if (item === "@WMI") {

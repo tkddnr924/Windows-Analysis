@@ -28,6 +28,86 @@ pub const REG_FIELD_ORDER: &[&str] = &[
     "_source_file",
 ];
 
+/// 산출물 SQLite의 기본 이름. 사용자 하이브(NTUSER.DAT/UsrClass.dat)는 계정마다
+/// 하나씩 수집되므로 `<계정>_<하이브>`로 발행한다 — 파생 계층(hive_user,
+/// UserAssist 실행 이력, Shellbag 계정)이 이 규칙으로 어느 계정의 값인지
+/// 복원하기 때문이다. 머신 하이브(SYSTEM/SOFTWARE/SAM/SECURITY/DEFAULT)는
+/// 파생이 이름을 그대로 조회하므로 접두를 붙이지 않는다.
+pub fn output_base_name(primary: &Path) -> String {
+    let fname = primary
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "hive".to_string());
+    let Some(canonical) = canonical_user_hive_name(&fname) else {
+        return fname;
+    };
+    match hive_account(primary) {
+        // 케이스 편차(ntuser.dat)도 정규 표기로 통일한다 — 대소문자를 구분하지
+        // 않는 파일시스템에서 같은 하이브가 두 이름으로 갈리지 않게.
+        Some(account) => format!("{account}_{canonical}"),
+        None => canonical.to_string(),
+    }
+}
+
+/// 파일명이 사용자 하이브 그 자체일 때만 정규 표기를 돌려준다. 수집기가 이미
+/// `<계정>_NTUSER.DAT`처럼 접두를 붙여 둔 이름은 그대로 보존한다.
+fn canonical_user_hive_name(fname: &str) -> Option<&'static str> {
+    if fname.eq_ignore_ascii_case("NTUSER.DAT") {
+        return Some("NTUSER.DAT");
+    }
+    if fname.eq_ignore_ascii_case("UsrClass.dat") {
+        return Some("UsrClass.dat");
+    }
+    None
+}
+
+/// 하이브 경로에서 계정명을 복원한다. `AppData` 아래 깊이 놓이는 UsrClass.dat은
+/// 그 바로 앞 컴포넌트가 계정이고, 그 밖에는 하이브가 놓인 디렉터리명이 계정이다
+/// (`Users\<계정>\NTUSER.DAT`, 수집기가 계정별로 모아 둔 `REGISTRY/<계정>/` 모두
+/// 이 규칙으로 풀린다). 증거 경로 자체가 `Users` 아래 있을 수 있으므로 경로에서
+/// `Users` 컴포넌트를 찾아 올라가지는 않는다 — 분석 호스트의 계정을 증거의 계정으로
+/// 오인하게 된다.
+fn hive_account(primary: &Path) -> Option<String> {
+    let parts: Vec<String> = primary
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().to_string())
+        .collect();
+    // 파일명 자신은 계정 후보가 아니다.
+    let dirs = &parts[..parts.len().saturating_sub(1)];
+    // 하이브에 가장 가까운 AppData를 기준으로 삼는다 — 증거를 담아 둔 분석
+    // 호스트 경로에 AppData가 들어 있어도 그쪽을 계정으로 잡지 않게.
+    let account = dirs
+        .iter()
+        .rposition(|part| part.eq_ignore_ascii_case("AppData"))
+        .and_then(|i| i.checked_sub(1))
+        .and_then(|i| dirs.get(i))
+        .or_else(|| dirs.last())?;
+    let account = sanitize_name_component(account);
+    // 루트(`/`, `C:\\`)처럼 계정으로 볼 수 없는 컴포넌트는 접두를 만들지 않는다.
+    if account.is_empty() || account.chars().all(|c| c == '_' || c == '.') {
+        None
+    } else {
+        Some(account)
+    }
+}
+
+/// 계정명을 파일명 한 조각으로 쓸 수 있게 다듬는다. 계정은 원본 경로에서 오므로
+/// 보통 그대로 안전하지만, 산출물 이름은 `record_key`(`<이름>::<테이블>::<rowid>`)의
+/// 앞부분이기도 해서 구분자를 깨뜨릴 수 있는 문자는 남기지 않는다.
+fn sanitize_name_component(raw: &str) -> String {
+    raw.chars()
+        .map(|c| {
+            if c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
 /// Temporary incident-response performance switch.  Keep this explicit rather
 /// than deleting recovery code: normal, allocated Registry records continue to
 /// be parsed and published, but deleted-cell discovery is deliberately not
@@ -415,10 +495,60 @@ pub fn parse_hive_stream_with_metrics(
 #[cfg(test)]
 mod tests {
     use super::{
-        registry_recovery_plan, registry_recovery_worker_count, transaction_logs_to_apply,
-        TEMPORARILY_DISABLE_RECOVERY,
+        output_base_name, registry_recovery_plan, registry_recovery_worker_count,
+        transaction_logs_to_apply, TEMPORARILY_DISABLE_RECOVERY,
     };
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+
+    /// 사용자 하이브는 계정 접두로 발행되어야 한다 — 계정마다 같은 파일명이
+    /// 오므로 접두가 없으면 산출물이 서로를 덮어쓰고, 파생 계층도 계정을
+    /// 복원하지 못한다. 케이스 편차(ntuser.dat)도 정규 표기로 모인다.
+    #[test]
+    fn user_hives_are_published_with_their_account_prefix() {
+        assert_eq!(
+            output_base_name(Path::new("/e/REGISTRY/Administrator/NTUSER.DAT")),
+            "Administrator_NTUSER.DAT"
+        );
+        assert_eq!(
+            output_base_name(Path::new("/e/REGISTRY/svcuser/NTUSER.DAT")),
+            "svcuser_NTUSER.DAT"
+        );
+        assert_eq!(
+            output_base_name(Path::new("/e/REGISTRY/config/systemprofile/ntuser.dat")),
+            "systemprofile_NTUSER.DAT"
+        );
+        assert_eq!(
+            output_base_name(Path::new("/e/REGISTRY/Administrator/UsrClass.dat")),
+            "Administrator_UsrClass.dat"
+        );
+    }
+
+    /// 원본 디스크 배치(UsrClass.dat이 AppData 아래 깊이 놓임)에서도 계정은
+    /// AppData 바로 앞 컴포넌트로 복원된다.
+    #[test]
+    fn usrclass_account_comes_from_the_profile_above_appdata() {
+        assert_eq!(
+            output_base_name(Path::new(
+                "/img/Users/Administrator/AppData/Local/Microsoft/Windows/UsrClass.dat"
+            )),
+            "Administrator_UsrClass.dat"
+        );
+    }
+
+    /// 머신 하이브는 파생이 이름을 그대로 조회하므로 접두를 붙이지 않는다.
+    /// 수집기가 이미 접두를 붙여 둔 사용자 하이브 이름도 보존한다.
+    #[test]
+    fn machine_hives_and_prefixed_names_keep_their_own_name() {
+        assert_eq!(output_base_name(Path::new("/e/REGISTRY/config/SYSTEM")), "SYSTEM");
+        assert_eq!(
+            output_base_name(Path::new("/e/REGISTRY/config/RegBack/SOFTWARE")),
+            "SOFTWARE"
+        );
+        assert_eq!(
+            output_base_name(Path::new("/e/REGISTRY/flat/analyst_NTUSER.DAT")),
+            "analyst_NTUSER.DAT"
+        );
+    }
 
     #[test]
     fn recovery_workers_are_bounded_and_skip_empty_jobs() {

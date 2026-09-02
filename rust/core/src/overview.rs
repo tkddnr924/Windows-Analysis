@@ -1321,21 +1321,36 @@ pub fn build_bits_history_with_events(events: &EventLogOverviewCache) -> Vec<Row
             v if v == BITS_UNKNOWN_SIZE => String::new(),
             v => v,
         };
+        // 작업 생성(3)은 이름 없는 위치 기반 EventData로 기록된다 —
+        // string=작업 이름, string2=소유자, string3=프로세스 경로. 이 이벤트에는
+        // 작업 GUID 자체가 없다. 명명 필드를 먼저 찾고 비어 있을 때만 위치 필드로
+        // 폴백하므로 명명 필드를 쓰는 다른 이벤트 ID는 영향을 받지 않는다.
+        let job_created = eid == "3";
+        let named_or_positional = |names: &[&str], slot: &str| -> String {
+            let value = ed_field(&ed, names);
+            if !value.is_empty() || !job_created {
+                return value;
+            }
+            ed_field(&ed, &[slot])
+        };
         let mut row = Row::new();
         row.insert(
             "timestamp".into(),
             r.get("timestamp").cloned().unwrap_or_default(),
         );
-        row.insert("job_name".into(), ed_field(&ed, &["name", "jobTitle"]));
+        row.insert(
+            "job_name".into(),
+            named_or_positional(&["name", "jobTitle"], "string"),
+        );
         row.insert("job_id".into(), ed_field(&ed, &["Id", "jobId"]));
         row.insert("url".into(), ed_field(&ed, &["url"]));
         row.insert(
             "account".into(),
-            bare_account(&ed_field(&ed, &["jobOwner", "User"])),
+            bare_account(&named_or_positional(&["jobOwner", "User"], "string2")),
         );
         row.insert(
             "process".into(),
-            ed_field(&ed, &["processPath", "ProcessPath"]),
+            named_or_positional(&["processPath", "ProcessPath"], "string3"),
         );
         row.insert(
             "bytes_transferred".into(),
@@ -1345,6 +1360,133 @@ pub fn build_bits_history_with_events(events: &EventLogOverviewCache) -> Vec<Row
         row.insert("status".into(), status);
         row.insert("result".into(), result.to_string());
         row.insert("description".into(), description.to_string());
+        row.insert("event_id".into(), eid);
+        row.insert(
+            "record_key".into(),
+            r.get("_record_key").cloned().unwrap_or_default(),
+        );
+        rows.push(row);
+    }
+    rows
+}
+
+/// 서비스 이력 — System 채널의 Service Control Manager 이벤트를 서비스 단위로
+/// 한 축에 모은다. 설치(7045), 시작 유형 변경(7040), 상태 변경(7036), 시작
+/// 실패·비정상 종료(7000·7001·7023·7026·7031·7034·7042)가 대상이다.
+///
+/// 서비스 이름은 이벤트가 기록한 값을 그대로 쓴다. 7045는 짧은 이름
+/// (`ServiceName`), 상태 계열은 표시 이름(`param1`)이라 같은 서비스가 두 이름으로
+/// 남을 수 있는데, 둘을 잇는 매핑이 로그 안에 없으므로 지어내지 않는다 —
+/// 7040만 표시 이름(param1)과 짧은 이름(param4)을 함께 기록하므로 그때만
+/// `service_key`가 함께 채워진다.
+pub const SVC_KEYS: &[&str] = &[
+    "timestamp",
+    "service_name",
+    "service_key",
+    "image_path",
+    "account",
+    "description",
+    "state",
+    "start_type_before",
+    "start_type_after",
+    "service_type",
+    "detail",
+    "result",
+    "event_id",
+    "record_key",
+];
+
+const SCM_PROVIDER: &str = "Service Control Manager";
+
+pub fn build_service_history(out_dir: &Path) -> Vec<Row> {
+    build_service_history_with_events(&EventLogOverviewCache::load(out_dir))
+}
+
+pub fn build_service_history_with_events(events: &EventLogOverviewCache) -> Vec<Row> {
+    let mut rows = Vec::new();
+    for r in events.rows() {
+        if r.get("Provider").map(|s| s.as_str()) != Some(SCM_PROVIDER) {
+            continue;
+        }
+        let eid = r.get("EventID").cloned().unwrap_or_default();
+        let ed = parse_eventdata(r.get("EventData").map(|s| s.as_str()).unwrap_or(""));
+        let p = |n: &str| ed_field(&ed, &[n]);
+        // 결과는 Windows가 기록한 사실만 따른다 — 시작 실패·비정상 종료는 실패,
+        // 나머지는 정보. 도구가 위험도를 판단해 붙이지 않는다.
+        let (description, result) = match eid.as_str() {
+            "7045" => ("서비스 설치", "정보"),
+            "7040" => ("시작 유형 변경", "정보"),
+            "7036" => ("서비스 상태 변경", "정보"),
+            "7042" => ("서비스 중지 요청 처리", "정보"),
+            "7000" => ("서비스 시작 실패", "실패"),
+            "7001" => ("의존 서비스 시작 실패", "실패"),
+            "7023" => ("서비스 종료(오류)", "실패"),
+            "7026" => ("부팅/시스템 시작 드라이버 로드 실패", "실패"),
+            "7031" => ("서비스 비정상 종료(복구 동작)", "실패"),
+            "7034" => ("서비스 비정상 종료", "실패"),
+            _ => continue,
+        };
+        // 7026은 부팅 단위 기록이라 서비스 이름 자리에 드라이버 목록이 온다 —
+        // 서비스 이름으로 승격하지 않고 상세로만 남긴다.
+        let service_name = if eid == "7026" {
+            String::new()
+        } else if eid == "7045" {
+            p("ServiceName")
+        } else {
+            p("param1")
+        };
+        let detail = match eid.as_str() {
+            "7026" => p("param1").replace(['\r', '\n'], " ").trim().to_string(),
+            "7034" => match p("param2").as_str() {
+                "" => String::new(),
+                count => format!("종료 횟수 {count}"),
+            },
+            "7031" => p("param5"),
+            "7042" => p("param4"),
+            "7000" | "7023" => p("param2"),
+            "7001" => p("param2"),
+            _ => String::new(),
+        };
+        let mut row = Row::new();
+        row.insert(
+            "timestamp".into(),
+            r.get("timestamp").cloned().unwrap_or_default(),
+        );
+        row.insert("service_name".into(), service_name);
+        // 짧은 이름은 이벤트가 실제로 담고 있을 때만 채운다.
+        row.insert(
+            "service_key".into(),
+            match eid.as_str() {
+                "7045" => p("ServiceName"),
+                "7040" => p("param4"),
+                _ => String::new(),
+            },
+        );
+        row.insert("image_path".into(), p("ImagePath"));
+        row.insert("account".into(), p("AccountName"));
+        row.insert("description".into(), description.to_string());
+        row.insert(
+            "state".into(),
+            match eid.as_str() {
+                "7036" | "7042" => p("param2"),
+                _ => String::new(),
+            },
+        );
+        row.insert(
+            "start_type_before".into(),
+            if eid == "7040" { p("param2") } else { String::new() },
+        );
+        row.insert(
+            "start_type_after".into(),
+            match eid.as_str() {
+                "7040" => p("param3"),
+                "7045" => p("StartType"),
+                _ => String::new(),
+            },
+        );
+        row.insert("service_type".into(), p("ServiceType"));
+        row.insert("detail".into(), detail);
+        row.insert("result".into(), result.to_string());
         row.insert("event_id".into(), eid);
         row.insert(
             "record_key".into(),
@@ -1942,11 +2084,28 @@ fn is_regback_output(path: &Path) -> bool {
         .file_stem()
         .map(|s| s.to_string_lossy().to_lowercase())
         .unwrap_or_default();
-    let trimmed = match stem.rsplit_once('_') {
-        Some((head, tail)) if tail.chars().all(|c| c.is_ascii_digit()) => head,
-        _ => stem.as_str(),
-    };
-    trimmed.ends_with("_regback")
+    strip_uniq_suffix(&stem).ends_with("_regback")
+}
+
+/// 파이프라인이 이름 충돌을 피하려고 붙인 접미(`_2`, `_3`…)를 떼어 낸 stem.
+/// 산출물 이름으로 하이브 종류·계정을 판정하는 파생 코드가 이 접미 때문에
+/// 하이브를 통째로 건너뛰지 않게 한다.
+fn strip_uniq_suffix(stem: &str) -> &str {
+    match stem.rsplit_once('_') {
+        Some((head, tail)) if !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) => head,
+        _ => stem,
+    }
+}
+
+/// `<계정>_NTUSER.DAT` / `<계정>_UsrClass.dat` 산출물 이름에서 계정을 떼어 낸다.
+/// 접두가 없는 이름이면 None.
+fn account_prefix(stem: &str) -> Option<&str> {
+    let up = stem.to_uppercase();
+    ["_NTUSER.DAT", "_USRCLASS.DAT"]
+        .into_iter()
+        .filter(|suffix| up.ends_with(suffix))
+        .find_map(|suffix| stem.len().checked_sub(suffix.len()).and_then(|n| stem.get(..n)))
+        .filter(|account| !account.is_empty())
 }
 
 // PowerShell history
@@ -3987,18 +4146,17 @@ fn eh_from_userassist(out_dir: &Path) -> Vec<Row> {
     };
     files.sort();
     for p in files {
-        let stem = p
+        let raw_stem = p
             .file_stem()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default();
+        // 이름 충돌 접미(`_2`)가 붙은 하이브도 같은 NTUSER.DAT이다 — 여기서
+        // 떼지 않으면 그 계정의 UserAssist가 실행 이력에서 통째로 빠진다.
+        let stem = strip_uniq_suffix(&raw_stem);
         if !stem.to_uppercase().ends_with("NTUSER.DAT") {
             continue;
         }
-        let user = if stem.to_uppercase().ends_with("_NTUSER.DAT") {
-            stem[..stem.len() - "_NTUSER.DAT".len()].to_string()
-        } else {
-            stem.clone()
-        };
+        let user = account_prefix(stem).unwrap_or(stem).to_string();
         for r in read_table_with_rowid(&p, "Registry")
             .into_iter()
             .filter(is_live)
@@ -4208,6 +4366,11 @@ fn eh_from_wer(out_dir: &Path) -> Vec<Row> {
         .collect()
 }
 
+/// ExecutionHistory 파생 생성 로직 버전. 편입 대상이 바뀌면 올린다 —
+/// 뷰어의 호환 갱신이 이 값으로 구 저장본을 판별해 재생성한다.
+/// 2: WER 보고의 프로세스 시작 시각(AppSessionGuid) 편입.
+pub const EXECUTION_HISTORY_DERIVED_VERSION: i64 = 2;
+
 pub fn build_execution_history(out_dir: &Path) -> Vec<Row> {
     let registry = RegistryOverviewCache::load(out_dir);
     build_execution_history_with_registry(out_dir, &registry)
@@ -4305,6 +4468,7 @@ fn rf_row(pairs: &[(&str, String)]) -> Row {
 }
 
 fn hive_user(fname: &str) -> String {
+    let fname = strip_uniq_suffix(fname);
     let up = fname.to_uppercase();
     if up == "SOFTWARE" {
         return "(시스템)".into();
@@ -4312,14 +4476,7 @@ fn hive_user(fname: &str) -> String {
     if up == "DEFAULT" {
         return ".DEFAULT".into();
     }
-    if up.ends_with("NTUSER.DAT") {
-        return if up.ends_with("_NTUSER.DAT") {
-            fname[..fname.len() - "_NTUSER.DAT".len()].to_string()
-        } else {
-            fname.to_string()
-        };
-    }
-    fname.to_string()
+    account_prefix(fname).unwrap_or(fname).to_string()
 }
 
 fn find_sub_local(hay: &[u8], needle: &[u8]) -> Option<usize> {
@@ -6325,12 +6482,8 @@ pub fn build_path_references(out_dir: &Path, registry: &RegistryOverviewCache) -
     // 계정은 하이브 파일명의 사용자 접두(Administrator_UsrClass.dat 등).
     let mut bag_rows: Vec<crate::shellbag::BagRow> = Vec::new();
     for hive in registry.hives() {
-        let account = hive
-            .name
-            .split('_')
-            .next()
-            .unwrap_or(hive.name.as_str())
-            .to_string();
+        let stem = strip_uniq_suffix(&hive.name);
+        let account = account_prefix(stem).unwrap_or(stem).to_string();
         for r in &hive.rows {
             let key_path = r.get("key_path").cloned().unwrap_or_default();
             if !key_path.to_lowercase().contains("bagmru") {
@@ -6496,6 +6649,162 @@ mod tests {
         assert!(is_regback_output(Path::new("/x/REGISTRY/SOFTWARE_RegBack_2.sqlite")));
         assert!(!is_regback_output(Path::new("/x/REGISTRY/SYSTEM.sqlite")));
         assert!(!is_regback_output(Path::new("/x/REGISTRY/NTUSER.DAT.sqlite")));
+    }
+
+    /// 서비스 이력은 SCM 이벤트를 종류별로 알맞은 필드에 담아야 한다 —
+    /// 설치(7045)는 짧은 이름·ImagePath·계정, 상태 변경(7036)은 표시 이름과
+    /// 상태, 시작 유형 변경(7040)은 이전/이후 값. 실패 계열만 result=실패다.
+    #[test]
+    fn service_history_maps_each_scm_event_to_its_own_fields() {
+        let mk = |provider: &str, eid: &str, ed: serde_json::Value| {
+            let mut r = Row::new();
+            r.insert("Provider".into(), provider.into());
+            r.insert("EventID".into(), eid.into());
+            r.insert("timestamp".into(), "2026-04-16 00:32:51.502".into());
+            r.insert("EventData".into(), ed.to_string());
+            r
+        };
+        let rows = vec![
+            mk(
+                "Service Control Manager",
+                "7045",
+                serde_json::json!({
+                    "ServiceName": "SvcShort",
+                    "ImagePath": "C:\\Windows\\system32\\drivers\\svc.sys",
+                    "ServiceType": "커널 모드 드라이버",
+                    "StartType": "요청 시 시작",
+                    "AccountName": "LocalSystem",
+                }),
+            ),
+            mk(
+                "Service Control Manager",
+                "7036",
+                serde_json::json!({"param1": "Svc Display Name", "param2": "실행"}),
+            ),
+            mk(
+                "Service Control Manager",
+                "7040",
+                serde_json::json!({
+                    "param1": "Svc Display Name",
+                    "param2": "요청 시 시작",
+                    "param3": "자동 시작",
+                    "param4": "SvcShort",
+                }),
+            ),
+            mk(
+                "Service Control Manager",
+                "7034",
+                serde_json::json!({"param1": "Svc Display Name", "param2": "3"}),
+            ),
+            // 같은 채널이라도 SCM이 아닌 제공자는 제외.
+            mk(
+                "Microsoft-Windows-Directory-Services-SAM",
+                "16977",
+                serde_json::json!({"param1": "x"}),
+            ),
+        ];
+        let out = build_service_history_with_events(&EventLogOverviewCache::from_rows_for_tests(rows));
+        assert_eq!(out.len(), 4);
+
+        let install = &out[0];
+        assert_eq!(install["description"], "서비스 설치");
+        assert_eq!(install["service_name"], "SvcShort");
+        assert_eq!(install["service_key"], "SvcShort");
+        assert_eq!(install["image_path"], "C:\\Windows\\system32\\drivers\\svc.sys");
+        assert_eq!(install["account"], "LocalSystem");
+        assert_eq!(install["start_type_after"], "요청 시 시작");
+        assert_eq!(install["result"], "정보");
+
+        let state = &out[1];
+        assert_eq!(state["description"], "서비스 상태 변경");
+        assert_eq!(state["service_name"], "Svc Display Name");
+        assert_eq!(state["state"], "실행");
+        // 상태 변경 이벤트는 짧은 이름·경로를 담지 않는다 — 채워 넣지 않는다.
+        assert_eq!(state["service_key"], "");
+        assert_eq!(state["image_path"], "");
+
+        let start_type = &out[2];
+        assert_eq!(start_type["description"], "시작 유형 변경");
+        assert_eq!(start_type["start_type_before"], "요청 시 시작");
+        assert_eq!(start_type["start_type_after"], "자동 시작");
+        assert_eq!(start_type["service_key"], "SvcShort");
+
+        let crashed = &out[3];
+        assert_eq!(crashed["description"], "서비스 비정상 종료");
+        assert_eq!(crashed["result"], "실패");
+        assert_eq!(crashed["detail"], "종료 횟수 3");
+    }
+
+    /// BITS 작업 생성(3)은 이 제공자에서 유일하게 이름 없는 위치 기반
+    /// EventData로 기록된다 — 폴백이 없으면 작업 이름·소유자가 통째로 비어
+    /// 화면에서 "(작업 이름 없음)" 한 덩어리가 된다. 명명 필드를 쓰는 다른
+    /// 이벤트 ID는 폴백에 영향을 받지 않아야 한다.
+    #[test]
+    fn bits_job_creation_falls_back_to_positional_eventdata() {
+        let mk = |eid: &str, ed: serde_json::Value| {
+            let mut r = Row::new();
+            r.insert("Provider".into(), "Microsoft-Windows-Bits-Client".into());
+            r.insert("EventID".into(), eid.into());
+            r.insert("timestamp".into(), "2026-04-16 10:40:51.001".into());
+            r.insert("EventData".into(), ed.to_string());
+            r
+        };
+        let rows = vec![
+            mk(
+                "3",
+                serde_json::json!({
+                    "string": "Updater Job",
+                    "string2": "WIN-HOST\\Administrator",
+                    "string3": "",
+                }),
+            ),
+            mk(
+                "59",
+                serde_json::json!({
+                    "name": "Updater Job",
+                    "Id": "AD289467-93EA-436D-9088-22472CAF0F23",
+                    "url": "http://example.invalid/a.crx3",
+                }),
+            ),
+        ];
+        let out = build_bits_history_with_events(&EventLogOverviewCache::from_rows_for_tests(rows));
+        assert_eq!(out.len(), 2);
+        let created = &out[0];
+        assert_eq!(created["event_id"], "3");
+        assert_eq!(created["job_name"], "Updater Job");
+        assert_eq!(created["account"], "Administrator");
+        // 작업 생성 이벤트에는 GUID·URL 자체가 없다 — 지어내지 않는다.
+        assert_eq!(created["job_id"], "");
+        assert_eq!(created["url"], "");
+        assert_eq!(created["process"], "");
+        // 명명 필드를 쓰는 이벤트는 그대로다.
+        let transfer = &out[1];
+        assert_eq!(transfer["job_name"], "Updater Job");
+        assert_eq!(transfer["job_id"], "AD289467-93EA-436D-9088-22472CAF0F23");
+        assert_eq!(transfer["url"], "http://example.invalid/a.crx3");
+    }
+
+    /// 이름 충돌 접미(`_2`)가 붙은 산출물도 같은 하이브다 — 접미를 떼지 않으면
+    /// 그 계정의 UserAssist·Shellbag·특이사항이 파생에서 통째로 빠진다.
+    #[test]
+    fn uniq_suffix_does_not_hide_a_hive_from_derived_views() {
+        assert_eq!(strip_uniq_suffix("Administrator_NTUSER.DAT"), "Administrator_NTUSER.DAT");
+        assert_eq!(strip_uniq_suffix("NTUSER.DAT_2"), "NTUSER.DAT");
+        assert_eq!(strip_uniq_suffix("NTUSER.DAT_"), "NTUSER.DAT_");
+        assert!(strip_uniq_suffix("NTUSER.DAT_2").to_uppercase().ends_with("NTUSER.DAT"));
+    }
+
+    /// 산출물 이름의 계정 접두가 화면·파생의 계정 라벨로 복원된다.
+    #[test]
+    fn hive_account_labels_come_from_the_output_name_prefix() {
+        assert_eq!(hive_user("Administrator_NTUSER.DAT"), "Administrator");
+        assert_eq!(hive_user("Administrator_UsrClass.dat"), "Administrator");
+        assert_eq!(hive_user("svcuser_NTUSER.DAT_2"), "svcuser");
+        assert_eq!(hive_user("SOFTWARE"), "(시스템)");
+        assert_eq!(hive_user("DEFAULT"), ".DEFAULT");
+        assert_eq!(hive_user("SYSTEM"), "SYSTEM");
+        // 접두가 없는 예전 이름은 그대로 — 계정을 지어내지 않는다.
+        assert_eq!(hive_user("NTUSER.DAT"), "NTUSER.DAT");
     }
 
     /// EventLog의 오류 보고(1001)만 WER 통합에 편입되고, 필드가 P-필드에서

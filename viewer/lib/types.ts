@@ -6,6 +6,14 @@ export interface CsvData {
   rowCount: number;
 }
 
+/** 타임라인 빌드 전용 원본 페이지 — 행 수가 아니라 바이트 예산으로 끊긴다.
+ *  종료는 `nextOffset === null`로만 판단한다(짧은 페이지 ≠ 테이블 끝). */
+export interface TimelineSourcePage {
+  columns: string[];
+  rows: Record<string, string>[];
+  nextOffset: number | null;
+}
+
 /** A small, queryable page of related evidence records for the shared detail drawer. */
 export interface LinkedRowsPage {
   rows: Record<string, string>[];
@@ -463,9 +471,6 @@ export interface CacheMeta {
   cacheKey: string;
 }
 
-/** @deprecated use CacheMeta — kept for backward-compat in case something still references it */
-export type CacheEntry = CacheMeta;
-
 /** AI conversation extracted from the browser cache. */
 export interface AiConversation {
   provider: string;
@@ -477,8 +482,18 @@ export interface AiConversation {
   createdAt: string;
   updatedAt: string;
   url: string;
-  /** Pretty-printed raw JSON of the conversation object. */
+  /** 파생 테이블 rowid — 원문 단건 조회 키. */
+  rowId: number;
+  /** 원본 캐시 행 키(`<파일>::CacheEntries::<rowid>`) — 다른 화면과 북마크를 공유한다. */
+  sourceRecordKey: string;
+  /** 파생 시점에 센 메시지 수. 목록은 원문을 받지 않는다. */
+  messageCount: number;
+}
+
+/** 대화 원문 — 목록이 아니라 대화를 열 때만 조회한다. */
+export interface AiConversationDetail {
   rawJson: string;
+  sourceRecordKey: string;
 }
 
 export interface AiConversationPage {
@@ -488,6 +503,8 @@ export interface AiConversationPage {
   sourcesRead: number;
   /** Cache files that could not be read; other files may still have results. */
   sourceFailures: string[];
+  /** 파생 테이블 자체가 없는 이전 파싱본 — "기간 내 데이터 없음"과 구별한다. */
+  derivedMissing: boolean;
 }
 
 /** WMI-Activity 로그의 구독 이벤트(5859~5861)만 서버에서 걸러 온 결과 —
@@ -562,12 +579,6 @@ export interface ElectronApi {
   onPipelineLog(callback: (entry: PipelineLogEntry) => void): () => void;
   /** hostDir = a host's direct cases/<hostId>/ folder. */
   listCategories(hostDir: string): Promise<CategoryEntry[]>;
-  // Persisted master-timeline cache. The payload is opaque JSON authored by the
-  // frontend ({ builtForRunAt, entries }); the backend just stores/returns it.
-  // 읽기는 raw 바이트다 — 수백 MB 캐시를 문자열 IPC로 나르면 응답 JSON
-  // 직렬화만으로 메인 스레드가 수십 초 멈춘다. 캐시가 없으면 빈 버퍼.
-  saveMasterTimeline(hostDir: string, payload: string): Promise<void>;
-  loadMasterTimeline(hostDir: string): Promise<ArrayBuffer>;
   /** sqlite 타임라인 스트리밍 빌드 — begin → (insert · drain)* → finish/abort. */
   masterTimelineBuildBegin(hostDir: string, token: string, builtForRunAt: string): Promise<void>;
   masterTimelineBuildInsert(hostDir: string, token: string, ndjson: string): Promise<void>;
@@ -589,6 +600,7 @@ export interface ElectronApi {
   accountDirectory(hostDir: string): Promise<AccountDirectoryEntry[]>;
   readResultFile(fullPath: string, tableName?: string): Promise<CsvData>;
   readResultFilePage(fullPath: string, tableName: string | undefined, offset: number, limit: number): Promise<CsvData>;
+  timelineSourcePage(fullPath: string, tableName: string | undefined, offset: number, limit: number): Promise<TimelineSourcePage>;
   linkedResultRows(fullPath: string, tableName: string, matchColumn: string, matchValue: string, search: string, offset: number, limit: number): Promise<LinkedRowsPage>;
   resultRow(fullPath: string, tableName: string, rowid: number): Promise<ResultRow>;
   browserActivitySummary(fullPath: string, tableName: string, query: BrowserActivityQuery): Promise<BrowserActivitySummary>;
@@ -621,6 +633,7 @@ export interface ElectronApi {
   browserVisitGraph(hostDir: string, account: string, url: string, cacheKey?: string, sourceFile?: string): Promise<BrowserVisitGraph>;
   /** AI conversations extracted from browser cache, filtered and paged by cache timestamp. */
   aiConversations(hostDir: string, query: { start?: string; end?: string; offset: number; limit: number }): Promise<AiConversationPage>;
+  aiConversationDetail(hostDir: string, rowId: number): Promise<AiConversationDetail>;
   /** WMI-Activity 로그의 구독 이벤트(5859~5861)만 서버에서 걸러 받는다. */
   wmiSubscriptionEvents(hostDir: string): Promise<WmiSubscriptionEvents>;
   /** PowerShellHistory 원문(절단 없는 컬럼) 검색 — 일치 rowid 집합 반환. */

@@ -10,5 +10,4 @@ pub mod shellbag;
 pub mod parsers;
 pub mod pipeline;
 pub mod sqlite;
-pub mod timeline_cache;
 pub mod time;

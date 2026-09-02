@@ -17,6 +17,24 @@ pub fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
+/// 파생 테이블의 생성 로직 버전을 산출물 안에 남긴다. 뷰어는 스키마(컬럼)만
+/// 보고 최신 여부를 판단할 수 없다 — 컬럼이 같아도 편입 대상이 늘어난 경우가
+/// 있어(예: ExecutionHistory의 WER 실행 증거) 구 저장본을 최신으로 오판한다.
+/// `_wina_` 접두 테이블은 목록·검색에서 이미 숨겨지는 내부 메타다.
+pub fn stamp_derived_version(db_path: &Path, name: &str, version: i64) -> Result<()> {
+    let conn = Connection::open(db_path)?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS _wina_derived_version (name TEXT PRIMARY KEY, version INTEGER)",
+        [],
+    )?;
+    conn.execute(
+        "INSERT INTO _wina_derived_version (name, version) VALUES (?1, ?2)
+         ON CONFLICT(name) DO UPDATE SET version = excluded.version",
+        rusqlite::params![name, version],
+    )?;
+    Ok(())
+}
+
 pub fn write_table(
     db_path: &Path,
     table_name: &str,

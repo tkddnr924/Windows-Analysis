@@ -182,8 +182,9 @@ fn clear_previous_results(live_dir: &Path, only: Option<&HashSet<String>>) -> Re
         }
         std::fs::remove_dir_all(entry.path())?;
     }
-    // 통합 타임라인 캐시는 매 실행 재생성된다 — 지운 facts와 어긋난 이전
-    // 캐시가 남지 않게 함께 제거한다.
+    // v1.3.11 이하가 남긴 구 JSON 타임라인 캐시 — 더 이상 만들지도 읽지도
+    // 않는다(통합 타임라인은 sqlite 단일 경로). 지운 facts와 어긋난 대용량
+    // 산출물이 증거 폴더에 남지 않게 재파싱 때 함께 제거한다.
     let _ = std::fs::remove_file(live_dir.join("_master_timeline.cache.json"));
     // 스트리밍 빌드가 만드는 sqlite 타임라인도 함께 무효화한다(첫 열람 시 재빌드).
     let _ = std::fs::remove_file(live_dir.join("_master_timeline.sqlite"));
@@ -919,14 +920,17 @@ fn panic_details(payload: Box<dyn std::any::Any + Send>) -> String {
     combined.chars().take(4_000).collect()
 }
 
+/// 산출물 이름의 중복 회피. 대소문자를 구분하지 않는 파일시스템(macOS·Windows)
+/// 에서는 케이스만 다른 이름이 같은 파일이므로, 중복 판정 키를 소문자로 둔다 —
+/// 그러지 않으면 `NTUSER.DAT`가 `ntuser.dat`에 조용히 덮여 증거가 사라진다.
 fn uniq_name(base: &str, taken: &mut HashSet<String>) -> String {
-    if taken.insert(base.to_string()) {
+    if taken.insert(base.to_lowercase()) {
         return base.to_string();
     }
     let mut i = 2;
     loop {
         let n = format!("{}_{}", base, i);
-        if taken.insert(n.clone()) {
+        if taken.insert(n.to_lowercase()) {
             return n;
         }
         i += 1;
@@ -1317,10 +1321,10 @@ fn parse_registry_artifact(
     let mut taken = HashSet::new();
     let mut jobs: Vec<(PathBuf, Vec<PathBuf>, PathBuf, String)> = Vec::new();
     for p in paths {
-        let mut base = p
-            .file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| "hive".into());
+        // 사용자 하이브는 `<계정>_NTUSER.DAT` 꼴로 발행한다 — 계정마다 같은
+        // 파일명이 오므로, 접두가 없으면 하이브끼리 이름이 겹치고 파생 계층도
+        // 어느 계정의 값인지 복원하지 못한다.
+        let mut base = registry::output_base_name(p);
         let is_regback = p.components().any(|c| {
             c.as_os_str()
                 .to_string_lossy()
@@ -2519,6 +2523,11 @@ pub fn run_host_with_log_id(
                 overview::BITS_KEYS,
             )?;
             write_ov(
+                "ServiceHistory",
+                overview::build_service_history_with_events(&events),
+                overview::SVC_KEYS,
+            )?;
+            write_ov(
                 "FirewallHistory",
                 overview::build_firewall_history_with_events(&out_dir, &events),
                 overview::FW_KEYS,
@@ -2555,6 +2564,15 @@ pub fn run_host_with_log_id(
                 overview::build_execution_history_with_registry(&out_dir, &registry_overview),
                 overview::ROW_KEYS,
             )?;
+            // 파생 생성 로직 버전을 산출물에 남긴다 — 뷰어의 호환 갱신이 구
+            // 저장본(컬럼은 같지만 편입 대상이 적던 버전)을 판별해 재생성한다.
+            if let Err(error) = crate::sqlite::stamp_derived_version(
+                &ov.join("ExecutionHistory.sqlite"),
+                "ExecutionHistory",
+                overview::EXECUTION_HISTORY_DERIVED_VERSION,
+            ) {
+                emit(&format!("[!] ExecutionHistory 파생 버전 기록 실패: {error}"));
+            }
             write_ov(
                 "RegistryFindings",
                 overview::build_registry_findings_with_registry(&registry_overview),
@@ -2629,32 +2647,6 @@ pub fn run_host_with_log_id(
     let run_at = chrono::Local::now()
         .format("%Y-%m-%d %H:%M:%S%.3f")
         .to_string();
-
-    // 가공의 마지막 단계: 통합 타임라인 캐시. run_at(=호스트의 lastRunAt)을
-    // 키로 스테이징 루트에 기록하고, 발행 시 호스트 루트로 함께 이동한다.
-    // 캐시 생성 실패는 치명적이지 않다 — 뷰어가 탭 열람 시 직접 다시 만든다.
-    if !cancelled() {
-        match crate::timeline_cache::build_master_timeline_cache(&out_dir, &live_dir, &run_at) {
-            Ok(entry_count) => {
-                emit(&format!("[+] {} rows -> 통합 타임라인", entry_count));
-                append_current_log_lifecycle("timeline_cache_finished status=completed");
-                match seal_artifact_outputs(
-                    &out_dir,
-                    "_OVERVIEW",
-                    &["_master_timeline.cache.json".to_string()],
-                ) {
-                    Ok(sealed) => sealed_outputs.extend(sealed),
-                    Err(error) => emit(&format!("[!] 통합 타임라인 캐시 seal 실패: {error}")),
-                }
-            }
-            Err(error) => {
-                emit(&format!("[!] 통합 타임라인 캐시 생성 실패: {error}"));
-                append_current_log_lifecycle(&format!(
-                    "timeline_cache_finished status=failed error={error}"
-                ));
-            }
-        }
-    }
 
     let mut status = if cancelled() {
         "cancelled"
@@ -2806,6 +2798,17 @@ mod persistent_log_tests {
                 .unwrap_or_default()
                 .as_nanos(),
         ))
+    }
+
+    /// 대소문자를 구분하지 않는 파일시스템에서 케이스만 다른 산출물이 서로를
+    /// 덮어쓰지 않아야 한다 — `NTUSER.DAT`/`ntuser.dat`가 한 파일로 합쳐지면
+    /// 하이브 하나가 통째로 사라진다.
+    #[test]
+    fn output_names_do_not_collide_on_case_insensitive_filesystems() {
+        let mut taken = HashSet::new();
+        assert_eq!(uniq_name("NTUSER.DAT", &mut taken), "NTUSER.DAT");
+        assert_eq!(uniq_name("ntuser.dat", &mut taken), "ntuser.dat_2");
+        assert_eq!(uniq_name("NTUSER.DAT", &mut taken), "NTUSER.DAT_3");
     }
 
     #[test]
@@ -3362,6 +3365,9 @@ mod persistent_log_tests {
             );
             assert!(entry.get("outputs").is_none() || entry["outputs"].as_array().unwrap().is_empty());
         }
+        // 통합 타임라인은 sqlite 단일 경로다 — 파싱은 구 JSON 캐시를 만들지
+        // 않는다(대형 호스트에서 전량 적재·정렬·직렬화가 다시 일어나지 않음).
+        assert!(!host_dir.join("_master_timeline.cache.json").exists());
         // 건너뛴 SRUM 원본은 입력 항목에 실패 사유가 남아 0건 성공과 구분된다.
         let srum_entry = artifacts
             .iter()

@@ -1,5 +1,6 @@
 "use client";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useModalDialog } from "@/lib/useModalDialog";
 import AccountTreeOutlinedIcon from "@mui/icons-material/AccountTreeOutlined";
 import CloseIcon from "@mui/icons-material/Close";
 import CircularProgress from "@mui/material/CircularProgress";
@@ -420,24 +421,16 @@ function GraphCanvas({ graph }: { graph: BrowserVisitGraph }) {
 }
 
 export default function VisitFlowGraphModal({ state, graph, isCache, onRetry, onClose }: { state: "idle" | "loading" | "ready" | "error"; graph: BrowserVisitGraph | null; isCache: boolean; onRetry: () => void; onClose: () => void }) {
-  const closeRef = useRef<HTMLButtonElement>(null);
-  useEffect(() => {
-    closeRef.current?.focus();
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onClose();
-    };
-    document.addEventListener("keydown", onKey);
-    return () => document.removeEventListener("keydown", onKey);
-  }, [onClose]);
+  const dialogRef = useModalDialog(onClose);
   const hasGraph = state === "ready" && graph && graph.nodes.length > 0;
   return (
     <div onClick={onClose} style={{ position: "fixed", inset: 0, zIndex: 1100, display: "flex", alignItems: "center", justifyContent: "center", padding: 20, background: "rgba(1,4,9,0.6)" }}>
-      <div role="dialog" aria-modal="true" aria-label="브라우저 유입 흐름 그래프" onClick={(event) => event.stopPropagation()} style={{ display: "flex", flexDirection: "column", width: "min(1240px, 96vw)", height: hasGraph ? "86vh" : undefined, maxHeight: "86vh", minHeight: 0, overflow: "hidden", background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", boxShadow: "var(--shadow-panel)" }}>
+      <div ref={dialogRef} role="dialog" aria-modal="true" aria-label="브라우저 유입 흐름 그래프" onClick={(event) => event.stopPropagation()} style={{ display: "flex", flexDirection: "column", width: "min(1240px, 96vw)", height: hasGraph ? "86vh" : undefined, maxHeight: "86vh", minHeight: 0, overflow: "hidden", background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", boxShadow: "var(--shadow-panel)" }}>
         <header style={{ display: "flex", flexShrink: 0, alignItems: "center", gap: 10, padding: "12px 16px", borderBottom: "1px solid var(--border)" }}>
           <AccountTreeOutlinedIcon sx={{ fontSize: 18, color: "var(--accent)" }} />
           <span style={{ fontSize: 14, fontWeight: 700 }}>유입 흐름 · 페이지 이동 그래프</span>
           {graph?.sourceFile && <span style={{ fontSize: 11, color: "var(--text-faint)", fontFamily: "var(--mono)" }}>{graph.sourceFile}</span>}
-          <button ref={closeRef} type="button" onClick={onClose} aria-label="닫기" style={{ marginLeft: "auto", display: "inline-flex", padding: 4, border: "none", background: "transparent", color: "var(--text-faint)", cursor: "pointer" }}>
+          <button data-dialog-autofocus type="button" onClick={onClose} aria-label="닫기" style={{ marginLeft: "auto", display: "inline-flex", padding: 4, border: "none", background: "transparent", color: "var(--text-faint)", cursor: "pointer" }}>
             <CloseIcon sx={{ fontSize: 18 }} />
           </button>
         </header>

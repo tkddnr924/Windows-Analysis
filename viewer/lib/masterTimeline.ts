@@ -1,6 +1,6 @@
 import { resolveArtifactView } from "./artifactViews";
 import { executionSourceKey, browserActivityKindKey } from "./timelineKeys";
-import type { CategoryEntry } from "./types";
+import type { CategoryEntry, TimelineSourcePage } from "./types";
 
 // Hand control back to the event loop so pending clicks/renders are processed
 // mid-build. MessageChannel isn't subject to setTimeout's 4ms nested clamp, so
@@ -89,19 +89,19 @@ export async function streamBuildTimeline(
         let spec = resolveArtifactView(file.name);
         let firstPage = spec
           ? null
-          : await window.api.readResultFilePage(file.fullPath, file.tableName, 0, READ_CHUNK);
+          : await window.api.timelineSourcePage(file.fullPath, file.tableName, 0, READ_CHUNK);
         if (!spec) spec = resolveArtifactView(file.name, firstPage?.columns);
         if (!spec?.timelineField) continue;
         const timelineField = spec.timelineField;
         const group = artifactGroupOf(category.name, file.name);
-        let offset = 0;
+        let offset: number | null = 0;
         // eslint-disable-next-line no-constant-condition
         while (true) {
           throwIfAborted();
-          const page =
+          const page: TimelineSourcePage =
             offset === 0 && firstPage
               ? firstPage
-              : await window.api.readResultFilePage(file.fullPath, file.tableName, offset, READ_CHUNK);
+              : await window.api.timelineSourcePage(file.fullPath, file.tableName, offset ?? 0, READ_CHUNK);
           firstPage = null;
           if (!page.rows.length) break;
           for (const row of page.rows) {
@@ -140,8 +140,11 @@ export async function streamBuildTimeline(
               throwIfAborted();
             }
           }
-          if (page.rows.length < READ_CHUNK) break;
-          offset += READ_CHUNK;
+          // 페이지는 행 수 또는 바이트 예산 중 먼저 걸리는 쪽에서 끊긴다 —
+          // 짧은 페이지를 테이블 끝으로 오해하면 증거가 누락되므로, 종료는
+          // 백엔드가 알려주는 nextOffset으로만 판단한다.
+          if (page.nextOffset === null) break;
+          offset = page.nextOffset;
         }
       }
     }

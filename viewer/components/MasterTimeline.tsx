@@ -274,6 +274,10 @@ export default function MasterTimeline({ hostDir, onNavigate, onFetchLinkedRows,
   const [facets, setFacets] = useState<TimelineFacets | null>(null);
   const [pageData, setPageData] = useState<{ rows: TimelineEntry[]; total: number }>({ rows: [], total: 0 });
   const [loading, setLoading] = useState(true);
+  // 페이지·패싯 조회 실패를 "데이터 없음"으로 보여주면 증거 부재로 오인된다.
+  const [queryError, setQueryError] = useState<string | null>(null);
+  // 재시도용 — 조회 조건이 그대로여도 effect를 다시 돌린다.
+  const [reloadNonce, setReloadNonce] = useState(0);
 
   // 검색어 디바운스 — 타이핑마다 쿼리하지 않는다.
   useEffect(() => {
@@ -289,11 +293,13 @@ export default function MasterTimeline({ hostDir, onNavigate, onFetchLinkedRows,
       .then((f) => {
         if (!cancelled) setFacets(f);
       })
-      .catch(() => {});
+      .catch((error) => {
+        if (!cancelled) setQueryError(error instanceof Error ? error.message : String(error));
+      });
     return () => {
       cancelled = true;
     };
-  }, [hostDir]);
+  }, [hostDir, reloadNonce]);
 
   const globalActive = globalRangeActive(globalTimeRange);
   // Set은 렌더마다 새 참조라 deps로 못 쓴다 — 정렬된 문자열 키로 안정화한다.
@@ -322,18 +328,20 @@ export default function MasterTimeline({ hostDir, onNavigate, onFetchLinkedRows,
       .then((res) => {
         if (cancelled) return;
         setPageData({ rows: res.rows.map(pageRowToEntry), total: res.total });
+        setQueryError(null);
         setLoading(false);
       })
-      .catch(() => {
+      .catch((error) => {
         if (cancelled) return;
-        setPageData({ rows: [], total: 0 });
+        // 빈 결과로 대체하지 않는다 — 조회 실패와 "기록 없음"은 다른 사실이다.
+        setQueryError(error instanceof Error ? error.message : String(error));
         setLoading(false);
       });
     return () => {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hostDir, page, sortDir, hiddenTablesKey, hiddenExecKey, hiddenBrowserKey, onlySuspicious, debouncedSearch, globalActive, globalTimeRange.start, globalTimeRange.end]);
+  }, [hostDir, page, sortDir, hiddenTablesKey, hiddenExecKey, hiddenBrowserKey, onlySuspicious, debouncedSearch, globalActive, globalTimeRange.start, globalTimeRange.end, reloadNonce]);
 
   // EventLog is a single analyst-facing artifact even though it is stored as
   // several per-source tables (Security, System, Application, ...).
@@ -668,7 +676,14 @@ export default function MasterTimeline({ hostDir, onNavigate, onFetchLinkedRows,
         
       </ViewHeader>
 
-      {total === 0 ? (
+      {queryError ? (
+        <div role="alert" style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 10, flex: 1, minHeight: 0, padding: 24, textAlign: "center", fontSize: 13 }}>
+          <span style={{ fontWeight: 700, color: "var(--text)" }}>타임라인을 조회하지 못했습니다</span>
+          <span style={{ color: "var(--text-dim)", fontSize: 12.5, maxWidth: 560, wordBreak: "break-word" }}>{queryError}</span>
+          <span style={{ color: "var(--text-faint)", fontSize: 12 }}>기록이 없다는 뜻이 아닙니다 — 조회 자체가 실패했습니다.</span>
+          <button type="button" onClick={() => { setQueryError(null); setLoading(true); setReloadNonce((value) => value + 1); }} style={{ padding: "5px 12px", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", background: "var(--bg-elevated)", color: "var(--text)", cursor: "pointer", fontSize: 12.5 }}>다시 시도</button>
+        </div>
+      ) : total === 0 ? (
         <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", color: "var(--text-faint)", gap: 8 }}>
           <HourglassEmptyOutlinedIcon sx={{ fontSize: 28, color: "var(--text-faint)" }} />
           <span>{allArtifactsHidden ? "표시할 아티팩트를 선택하세요." : globalActive ? "사고 기간에 해당하는 기록이 없습니다." : "표시할 시간 기록이 없습니다."}</span>

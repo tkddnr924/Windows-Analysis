@@ -134,7 +134,7 @@ export interface ArtifactViewSpec {
    * Overview correlations (TargetInfo, ...) read as summaries/dashboards, not
    * spreadsheets, so each gets a purpose-built view.
    */
-  customView?: "targetInfo" | "executionHistory" | "powershellFlow" | "defender" | "registryFindings" | "rdpCache" | "browserHistory" | "smb" | "bits" | "firewall" | "scheduledTasks" | "wer" | "mft" | "wmiPersistence" | "usnJrnl";
+  customView?: "targetInfo" | "executionHistory" | "powershellFlow" | "defender" | "registryFindings" | "rdpCache" | "browserHistory" | "smb" | "bits" | "service" | "firewall" | "scheduledTasks" | "wer" | "mft" | "wmiPersistence" | "usnJrnl";
   /**
    * In the sidebar, present this table split by this column: instead of one
    * row for the whole table, the category lists one entry per distinct value
@@ -1043,6 +1043,36 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     ]}],
   },
 
+
+  // 서비스 이력 파생(_OVERVIEW/ServiceHistory) — System 채널 Service Control
+  // Manager 이벤트를 서비스 단위로 모은다. 원본(EventLog)이 이미 타임라인에
+  // 편입돼 있으므로 여기서는 편입하지 않는다(중복 방지).
+  ServiceHistory: {
+    customView: "service",
+    title: (r) => r.service_name || r.description || "(서비스 정보 없음)",
+    subtitle: (r) => r.image_path || "",
+    links: [{ key: "record_key", label: "이벤트 로그 원본 보기", targetFile: "EventLog_Events", targetColumn: "_record_key" }],
+    visibleColumns: ["timestamp", "service_name", "image_path", "description", "state", "result"],
+    priorityColumns: ["timestamp", "service_name", "image_path", "description", "state", "result"],
+    sections: [
+      { heading: "서비스", fields: [
+        { key: "service_name", label: "서비스 이름" },
+        { key: "service_key", label: "서비스 짧은 이름" },
+        { key: "image_path", label: "실행 파일 경로", kind: "path" },
+        { key: "account", label: "실행 계정", kind: "account" },
+        { key: "service_type", label: "서비스 유형" },
+      ]},
+      { heading: "기록", fields: [
+        { key: "description", label: "기록 종류" },
+        { key: "state", label: "상태" },
+        { key: "start_type_before", label: "이전 시작 유형" },
+        { key: "start_type_after", label: "시작 유형" },
+        { key: "detail", label: "상세" },
+        { key: "result", label: "결과" },
+        { key: "event_id", label: "이벤트 ID" },
+      ]},
+    ],
+  },
 
   BitsHistory: {
     customView: "bits",

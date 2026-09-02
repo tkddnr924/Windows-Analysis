@@ -1,7 +1,7 @@
 "use client";
 import SortIcon2 from "@mui/icons-material/SortOutlined";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import BookmarkBorderIcon from "@mui/icons-material/BookmarkBorder";
 import BookmarkIcon from "@mui/icons-material/Bookmark";
 import AutoAwesomeOutlinedIcon from "@mui/icons-material/AutoAwesomeOutlined";
@@ -24,12 +24,14 @@ import TextsmsOutlinedIcon from "@mui/icons-material/TextsmsOutlined";
 import type { AiConversation, BrowserActivityInsights, BrowserActivitySummary, BrowserDomainStatsPage, CsvData } from "@/lib/types";
 import { EMPTY_TIME_RANGE, toBound, type TimeRange } from "@/lib/timeRange";
 import RowDetailPanel from "./RowDetailPanel";
+import { useModalDialog } from "@/lib/useModalDialog";
 import PaginationControls from "@/components/PaginationControls";
 import { FilterDropdown, HeaderSearchInput, SelectDropdown, ViewHeader } from "@/components/FilterControls";
 
 type Row = Record<string, string>;
 type AiMessage = { role: string; text: string; time?: string };
-type DisplayAiConversation = AiConversation & { messages: AiMessage[]; raw: string };
+// 목록 행은 원문을 담지 않는다 — 원문·메시지는 대화를 열 때 단건 조회한다.
+type OpenAiConversation = AiConversation & { messages: AiMessage[]; raw: string };
 type BrowserLoadKey = "summary" | "insights" | "domains" | "accounts" | "page" | "conversations" | "referrals";
 type BrowserLoadErrors = Partial<Record<BrowserLoadKey, string>>;
 
@@ -40,6 +42,10 @@ interface Props {
   timeRange?: TimeRange;
   bookmarkedRowids?: Set<number>;
   onToggleBookmark?: (rowid: number) => void;
+  /** 파생 행이 가리키는 원본 증거 레코드의 북마크 상태·토글 — AI 대화는
+   *  원본 CacheEntries 행 키로만 다른 화면과 북마크를 공유한다. */
+  isSourceRecordBookmarked?: (recordKey: string) => boolean;
+  onToggleSourceRecordBookmark?: (recordKey: string) => void;
 }
 
 const PAGE_SIZE = 10;
@@ -224,7 +230,7 @@ function calendarGrid(y: number, m: number): (number | null)[] {
 const navigationButton: React.CSSProperties = { display: "inline-flex", alignItems: "center", justifyContent: "center", width: 26, height: 26, padding: 0, borderRadius: "var(--radius-sm)", background: "var(--bg-elevated)", border: "1px solid var(--border)", color: "var(--text-dim)", cursor: "pointer" };
 const pageButton = (disabled: boolean): React.CSSProperties => ({ display: "inline-flex", alignItems: "center", justifyContent: "center", gap: 2, minHeight: 30, padding: "4px 9px", borderRadius: "var(--radius-sm)", border: "1px solid var(--border)", background: "var(--bg-elevated)", color: "var(--text-dim)", cursor: disabled ? "default" : "pointer", opacity: disabled ? 0.42 : 1, fontSize: 12 });
 
-export default function BrowserHistoryView({ dbPath, tableName, hostDir = "", timeRange = EMPTY_TIME_RANGE, bookmarkedRowids, onToggleBookmark }: Props) {
+export default function BrowserHistoryView({ dbPath, tableName, hostDir = "", timeRange = EMPTY_TIME_RANGE, bookmarkedRowids, onToggleBookmark, isSourceRecordBookmarked, onToggleSourceRecordBookmark }: Props) {
   const [account, setAccount] = useState("(전체)");
   const [selectedDay, setSelectedDay] = useState("");
   const [showAllPeriod, setShowAllPeriod] = useState(false);
@@ -259,7 +265,9 @@ export default function BrowserHistoryView({ dbPath, tableName, hostDir = "", ti
   const [aiReferrals, setAiReferrals] = useState<Row[]>([]);
   const [aiReferralTotal, setAiReferralTotal] = useState(0);
   const [aiReferralPage, setAiReferralPage] = useState(0);
-  const [aiConvo, setAiConvo] = useState<DisplayAiConversation | null>(null);
+  const [aiConvo, setAiConvo] = useState<OpenAiConversation | null>(null);
+  const [aiConvoLoading, setAiConvoLoading] = useState(false);
+  const [aiDerivedMissing, setAiDerivedMissing] = useState(false);
   const [aiConvoOpener, setAiConvoOpener] = useState<HTMLElement | null>(null);
   const [aiPanel, setAiPanel] = useState<"conversations" | "referrals">("conversations");
   // Keep the last successful evidence page visible when a background query
@@ -327,10 +335,10 @@ export default function BrowserHistoryView({ dbPath, tableName, hostDir = "", ti
     return () => { active = false; };
   }, [dbPath, tableName, account, kinds, effectiveDay, showAllPeriod, search, timeRange, page, reloadNonce]);
   useEffect(() => {
-    if (!hostDir) { setAiConversations([]); setAiTotal(0); setAiSourceFailures([]); setAiSourceCount(0); setAiSourcesRead(0); return; }
+    if (!hostDir) { setAiConversations([]); setAiTotal(0); setAiSourceFailures([]); setAiSourceCount(0); setAiSourcesRead(0); setAiDerivedMissing(false); return; }
     let active = true;
     window.api.aiConversations(hostDir, { start: toBound(timeRange.start, "start") || undefined, end: toBound(timeRange.end, "end") || undefined, offset: aiPage * AI_PAGE_SIZE, limit: AI_PAGE_SIZE })
-      .then((result) => { if (active) { setAiConversations(result.conversations); setAiTotal(result.total); setAiSourceFailures(result.sourceFailures); setAiSourceCount(result.sourceCount); setAiSourcesRead(result.sourcesRead); setLoadErrors((errors) => ({ ...errors, conversations: undefined })); } }).catch(() => { if (active) setLoadErrors((errors) => ({ ...errors, conversations: "AI 대화 내역을 불러오지 못했습니다. 다시 시도하세요." })); });
+      .then((result) => { if (active) { setAiConversations(result.conversations); setAiTotal(result.total); setAiSourceFailures(result.sourceFailures); setAiSourceCount(result.sourceCount); setAiSourcesRead(result.sourcesRead); setAiDerivedMissing(result.derivedMissing); setLoadErrors((errors) => ({ ...errors, conversations: undefined })); } }).catch(() => { if (active) setLoadErrors((errors) => ({ ...errors, conversations: "AI 대화 내역을 불러오지 못했습니다. 다시 시도하세요." })); });
     return () => { active = false; };
   }, [hostDir, timeRange, aiPage, reloadNonce]);
   useEffect(() => setAiPage(0), [hostDir, timeRange]);
@@ -370,11 +378,9 @@ export default function BrowserHistoryView({ dbPath, tableName, hostDir = "", ti
     setAiConvoOpener(null);
     requestAnimationFrame(() => opener?.focus());
   };
-  const conversations = useMemo<DisplayAiConversation[]>(() => aiConversations.map((conversation) => {
-    let parsed = { title: "", createdAt: "", updatedAt: "", messages: [] as AiMessage[] };
-    try { parsed = parseAiJson(JSON.parse(conversation.rawJson)); } catch { /* Raw JSON remains readable in the modal. */ }
-    return { ...conversation, messages: parsed.messages, raw: conversation.rawJson, title: conversation.title || parsed.title, createdAt: conversation.createdAt || parsed.createdAt, updatedAt: conversation.updatedAt || parsed.updatedAt };
-  }), [aiConversations]);
+  // 목록은 백엔드가 준 표시용 메타데이터만 쓴다 — 원문을 받지도, 파싱하지도
+  // 않는다(대화 크기에 비례하는 전송·CPU 비용이 페이지 진입마다 들지 않게).
+  const conversations = aiConversations;
   const closeDownloads = () => {
     const opener = downloadsOpener;
     setDownloadsOpen(false);
@@ -404,11 +410,33 @@ export default function BrowserHistoryView({ dbPath, tableName, hostDir = "", ti
     setDomainStatsPage(0);
     setDomainStatsOpen(true);
   };
-  const openAiConversation = (conversation: DisplayAiConversation, opener: HTMLElement) => {
+  const openAiConversation = async (conversation: AiConversation, opener: HTMLElement) => {
     setDetail(null);
     opener.focus();
     setAiConvoOpener(opener);
-    setAiConvo(conversation);
+    // 원문은 이 시점에만 읽는다 — 목록 페이지를 넘길 때 대화 크기만큼의
+    // 바이트가 IPC를 통과하지 않는다.
+    setAiConvoLoading(true);
+    setAiConvo({ ...conversation, messages: [], raw: "" });
+    try {
+      const detail = await window.api.aiConversationDetail(hostDir, conversation.rowId);
+      let parsed = { title: "", createdAt: "", updatedAt: "", messages: [] as AiMessage[] };
+      try { parsed = parseAiJson(JSON.parse(detail.rawJson)); } catch { /* 원문은 모달에서 그대로 볼 수 있다. */ }
+      setAiConvo({
+        ...conversation,
+        messages: parsed.messages,
+        raw: detail.rawJson,
+        title: conversation.title || parsed.title,
+        createdAt: conversation.createdAt || parsed.createdAt,
+        updatedAt: conversation.updatedAt || parsed.updatedAt,
+        sourceRecordKey: detail.sourceRecordKey || conversation.sourceRecordKey,
+      });
+      setLoadErrors((errors) => ({ ...errors, conversations: undefined }));
+    } catch {
+      setLoadErrors((errors) => ({ ...errors, conversations: "AI 대화 원문을 불러오지 못했습니다. 다시 시도하세요." }));
+    } finally {
+      setAiConvoLoading(false);
+    }
   };
   const chooseDay = (day: string) => { setShowAllPeriod(false); setSelectedDay(day); setMonth(null); };
   const openDetail = (row: Row, opener: HTMLElement) => {
@@ -505,7 +533,7 @@ export default function BrowserHistoryView({ dbPath, tableName, hostDir = "", ti
               <PaginationControls ariaLabel="브라우저 활동 페이지" page={safePage} pageCount={pageCount} onChange={setPage} summary={`(${data.rowCount === 0 ? 0 : (safePage * PAGE_SIZE + 1).toLocaleString()}–${Math.min((safePage + 1) * PAGE_SIZE, data.rowCount).toLocaleString()} / ${data.rowCount.toLocaleString()})`} />
             </div>
           </> : <div style={{ flex: 1, minHeight: 0, overflow: "auto" }}>
-            {aiAllSourcesUnreadable ? <div role="alert" style={{ display: "flex", alignItems: "center", gap: 10, padding: 18, color: "var(--warning)", fontSize: 12.5 }}>AI 대화 캐시 원본을 읽지 못했습니다.<button className="nm-btn" type="button" onClick={() => setReloadNonce((value) => value + 1)} style={{ padding: "3px 7px", borderRadius: "var(--radius-sm)", border: "1px solid var(--border)", background: "var(--bg-elevated)", color: "var(--text-dim)", cursor: "pointer", fontSize: 11 }}>다시 시도</button></div> : aiTotal === 0 && aiReferralTotal === 0 ? <div style={{ padding: 18, color: "var(--text-faint)", fontSize: 12.5 }}>기간 필터 내 데이터 없음</div> : <>
+            {aiAllSourcesUnreadable ? <div role="alert" style={{ display: "flex", alignItems: "center", gap: 10, padding: 18, color: "var(--warning)", fontSize: 12.5 }}>AI 대화 캐시 원본을 읽지 못했습니다.<button className="nm-btn" type="button" onClick={() => setReloadNonce((value) => value + 1)} style={{ padding: "3px 7px", borderRadius: "var(--radius-sm)", border: "1px solid var(--border)", background: "var(--bg-elevated)", color: "var(--text-dim)", cursor: "pointer", fontSize: 11 }}>다시 시도</button></div> : aiDerivedMissing ? <div role="status" style={{ padding: 18, color: "var(--text-dim)", fontSize: 12.5, lineHeight: 1.7 }}>AI 대화 파생 데이터가 없습니다 — 이 호스트는 AI 대화 분석이 추가되기 전에 파싱됐습니다.<br /><span style={{ color: "var(--text-faint)" }}>재파싱하면 생성됩니다. 지금 화면은 &quot;AI 활동이 없었다&quot;는 뜻이 아닙니다.</span></div> : aiTotal === 0 && aiReferralTotal === 0 ? <div style={{ padding: 18, color: "var(--text-faint)", fontSize: 12.5 }}>기간 필터 내 데이터 없음</div> : <>
               <div role="tablist" aria-label="AI 대화 데이터 유형" style={{ display: "flex", gap: 4, padding: "8px 12px", borderBottom: "1px solid var(--border-subtle)" }}>
                 <button className="nm-btn" role="tab" aria-selected={aiPanel === "conversations"} onClick={() => setAiPanel("conversations")} style={controlButton(aiPanel === "conversations")}><SmartToyOutlinedIcon sx={{ fontSize: 15 }} />대화 {aiTotal.toLocaleString()}건</button>
                 <button className="nm-btn" role="tab" aria-selected={aiPanel === "referrals"} onClick={() => setAiPanel("referrals")} style={controlButton(aiPanel === "referrals")}><LinkIcon sx={{ fontSize: 15 }} />공유 링크 {aiReferralTotal.toLocaleString()}건</button>
@@ -514,7 +542,7 @@ export default function BrowserHistoryView({ dbPath, tableName, hostDir = "", ti
                 {aiTotal === 0 ? <div style={{ padding: 16, textAlign: "center", color: "var(--text-faint)", fontSize: 12.5 }}>기간 필터 내 대화 데이터 없음</div> : conversations.map((conversation, index) => {
                   const ProviderIcon = providerIcon(conversation.provider);
                   return (
-                    <button key={`${conversation.url}-${index}`} type="button" onClick={(event) => openAiConversation(conversation, event.currentTarget)} title="대화 내용 보기"
+                    <button key={`${conversation.url}-${index}`} type="button" onClick={(event) => { void openAiConversation(conversation, event.currentTarget); }} title="대화 내용 보기"
                       onMouseEnter={(event) => { event.currentTarget.style.background = "var(--bg-hover)"; }}
                       onMouseLeave={(event) => { event.currentTarget.style.background = "var(--bg-panel)"; }}
                       style={{ width: "100%", display: "flex", alignItems: "center", gap: 12, minHeight: 58, marginBottom: 8, padding: "8px 12px", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", background: "var(--bg-panel)", color: "inherit", cursor: "pointer", textAlign: "left", transition: "background .15s ease" }}>
@@ -525,7 +553,7 @@ export default function BrowserHistoryView({ dbPath, tableName, hostDir = "", ti
                         <span style={{ display: "flex", alignItems: "center", gap: 7, minWidth: 0 }}>
                           <span title={conversation.title || conversation.url} style={{ minWidth: 0, fontSize: 13, fontWeight: 700, color: "var(--text)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{conversation.title || "제목 없음"}</span>
                           <span style={{ flexShrink: 0, display: "inline-flex", alignItems: "center", gap: 4, fontSize: 11.5, fontWeight: 700, color: "var(--accent)", border: "1px solid var(--accent)", borderRadius: "var(--radius-sm)", padding: "1px 8px", whiteSpace: "nowrap" }}>{conversation.provider || "AI"}</span>
-                          {conversation.messages.length > 0 && <span style={{ flexShrink: 0, fontSize: 11, color: "var(--text-faint)", fontFamily: "var(--mono)" }}>메시지 {conversation.messages.length.toLocaleString()}개</span>}
+                          {conversation.messageCount > 0 && <span style={{ flexShrink: 0, fontSize: 11, color: "var(--text-faint)", fontFamily: "var(--mono)" }}>메시지 {conversation.messageCount.toLocaleString()}개</span>}
                         </span>
                         <span title={conversation.url} style={{ minWidth: 0, fontSize: 11.5, color: "var(--accent)", fontFamily: "var(--mono)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{conversation.url || "주소 정보 없음"}</span>
                       </span>
@@ -568,7 +596,9 @@ export default function BrowserHistoryView({ dbPath, tableName, hostDir = "", ti
     </div>
     </main>
     {detail && !aiConvo && !domainStatsOpen && <RowDetailPanel row={detail} columns={Object.keys(detail).filter((key) => key !== "__rowid")} focusedColumn={null} fileBaseName="BrowserActivity" onClose={closeDetail} onNavigate={() => {}} hostDir={hostDir} isBookmarked={bookmarkedRowids?.has(rowidOf(detail)) ?? false} onToggleBookmark={onToggleBookmark && Number.isFinite(rowidOf(detail)) ? () => onToggleBookmark(rowidOf(detail)) : undefined} />}
-    {aiConvo && <AiConversationModal conversation={aiConvo} onClose={closeAiConversation} />}
+    {aiConvo && <AiConversationModal conversation={aiConvo} loading={aiConvoLoading} onClose={closeAiConversation}
+      bookmarked={aiConvo.sourceRecordKey ? isSourceRecordBookmarked?.(aiConvo.sourceRecordKey) ?? false : false}
+      onToggleBookmark={aiConvo.sourceRecordKey && onToggleSourceRecordBookmark ? () => onToggleSourceRecordBookmark(aiConvo.sourceRecordKey) : undefined} />}
     {domainStatsOpen && <DomainStatsModal page={domainStatsPage} data={domainStats} visitTotal={insights.visitTotal} sortAsc={domainSortAsc} onSortAsc={(next) => { setDomainSortAsc(next); setDomainStatsPage(0); }} onPage={setDomainStatsPage} onClose={closeDomainStats} />}
     {downloadsOpen && <DownloadsModal page={downloadsPage} rows={downloadsData.rows} total={downloadsData.rowCount} onPage={setDownloadsPage} onOpenRow={(row, opener) => { openDetail(row, opener); }} onClose={closeDownloads} />}
   </div>;
@@ -610,25 +640,18 @@ function ActivityRow({ row, final: _final, bookmarked, onOpen, onToggleBookmark 
   </div>;
 }
 function DownloadsModal({ page, rows, total, onPage, onOpenRow, onClose }: { page: number; rows: Row[]; total: number; onPage: (page: number) => void; onOpenRow: (row: Row, opener: HTMLElement) => void; onClose: () => void }) {
-  const dialogRef = useRef<HTMLDivElement>(null);
-  const closeButtonRef = useRef<HTMLButtonElement>(null);
+  const dialogRef = useModalDialog(onClose);
   const pageCount = Math.max(1, Math.ceil(total / PAGE_SIZE));
   const safePage = Math.min(page, pageCount - 1);
   const first = total === 0 ? 0 : safePage * PAGE_SIZE + 1;
   const last = Math.min((safePage + 1) * PAGE_SIZE, total);
-  useEffect(() => {
-    closeButtonRef.current?.focus();
-    const closeOnEscape = (event: KeyboardEvent) => { if (event.key === "Escape") onClose(); };
-    document.addEventListener("keydown", closeOnEscape);
-    return () => document.removeEventListener("keydown", closeOnEscape);
-  }, [onClose]);
   return <div onClick={onClose} style={{ position: "fixed", inset: 0, zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center", padding: 20, background: "rgba(1,4,9,0.6)" }}>
     <div ref={dialogRef} role="dialog" aria-modal="true" aria-label="전체 다운로드 이력" onClick={(event) => event.stopPropagation()} style={{ display: "flex", flexDirection: "column", width: 860, maxWidth: "100%", maxHeight: "85vh", minHeight: 0, overflow: "hidden", background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", boxShadow: "var(--shadow-panel)" }}>
       <header style={{ display: "flex", flexShrink: 0, alignItems: "center", gap: 10, padding: "12px 16px", borderBottom: "1px solid var(--border)" }}>
         <DownloadOutlinedIcon sx={{ fontSize: 18, color: "var(--warning)" }} />
         <span style={{ fontSize: 14, fontWeight: 700 }}>전체 다운로드</span>
         <span style={{ fontSize: 11.5, color: "var(--text-faint)" }}>전체 {total.toLocaleString()}건 · 선택 계정 · 기간 필터 기준</span>
-        <button ref={closeButtonRef} type="button" onClick={onClose} aria-label="닫기" style={{ marginLeft: "auto", display: "inline-flex", padding: 4, border: "none", background: "transparent", color: "var(--text-faint)", cursor: "pointer" }}><CloseIcon sx={{ fontSize: 18 }} /></button>
+        <button data-dialog-autofocus type="button" onClick={onClose} aria-label="닫기" style={{ marginLeft: "auto", display: "inline-flex", padding: 4, border: "none", background: "transparent", color: "var(--text-faint)", cursor: "pointer" }}><CloseIcon sx={{ fontSize: 18 }} /></button>
       </header>
       <div style={{ flex: 1, minHeight: 0, overflow: "auto", padding: "10px 14px" }}>
         {total === 0 ? <div style={{ padding: 20, color: "var(--text-faint)", fontSize: 12.5 }}>기간 필터 내 다운로드 기록이 없습니다.</div> : rows.map((row) => (
@@ -658,29 +681,13 @@ function DownloadsModal({ page, rows, total, onPage, onOpenRow, onClose }: { pag
 }
 
 function DomainStatsModal({ page, data, visitTotal, sortAsc, onSortAsc, onPage, onClose }: { page: number; data: BrowserDomainStatsPage; visitTotal: number; sortAsc: boolean; onSortAsc: (asc: boolean) => void; onPage: (page: number) => void; onClose: () => void }) {
-  const dialogRef = useRef<HTMLDivElement>(null);
-  const closeButtonRef = useRef<HTMLButtonElement>(null);
+  const dialogRef = useModalDialog(onClose);
   const pageCount = Math.max(1, Math.ceil(data.total / DOMAIN_PAGE_SIZE));
   const safePage = Math.min(page, pageCount - 1);
   const first = data.total === 0 ? 0 : safePage * DOMAIN_PAGE_SIZE + 1;
   const last = Math.min((safePage + 1) * DOMAIN_PAGE_SIZE, data.total);
-  useEffect(() => {
-    closeButtonRef.current?.focus();
-    const closeOnEscape = (event: KeyboardEvent) => { if (event.key === "Escape") onClose(); };
-    document.addEventListener("keydown", closeOnEscape);
-    return () => document.removeEventListener("keydown", closeOnEscape);
-  }, [onClose]);
-  const trapFocus = (event: React.KeyboardEvent<HTMLDivElement>) => {
-    if (event.key !== "Tab") return;
-    const focusable = dialogRef.current?.querySelectorAll<HTMLElement>('button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])');
-    if (!focusable?.length) return;
-    const firstElement = focusable[0];
-    const lastElement = focusable[focusable.length - 1];
-    if (event.shiftKey && document.activeElement === firstElement) { event.preventDefault(); lastElement.focus(); }
-    if (!event.shiftKey && document.activeElement === lastElement) { event.preventDefault(); firstElement.focus(); }
-  };
   return <div onClick={onClose} style={{ position: "fixed", inset: 0, zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center", padding: 20, background: "rgba(1,4,9,0.6)" }}>
-    <div ref={dialogRef} role="dialog" aria-modal="true" aria-label="전체 방문 도메인 통계" onClick={(event) => event.stopPropagation()} onKeyDown={trapFocus} style={{ display: "flex", flexDirection: "column", width: 820, maxWidth: "100%", maxHeight: "85vh", minHeight: 0, overflow: "hidden", background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", boxShadow: "var(--shadow-panel)" }}>
+    <div ref={dialogRef} role="dialog" aria-modal="true" aria-label="전체 방문 도메인 통계" onClick={(event) => event.stopPropagation()} style={{ display: "flex", flexDirection: "column", width: 820, maxWidth: "100%", maxHeight: "85vh", minHeight: 0, overflow: "hidden", background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", boxShadow: "var(--shadow-panel)" }}>
       <header style={{ display: "flex", flexShrink: 0, alignItems: "center", gap: 10, padding: "12px 16px", borderBottom: "1px solid var(--border)" }}>
         <LanguageOutlinedIcon sx={{ fontSize: 18, color: "var(--accent)" }} />
         <span style={{ fontSize: 14, fontWeight: 700 }}>전체 방문 도메인</span>
@@ -688,7 +695,7 @@ function DomainStatsModal({ page, data, visitTotal, sortAsc, onSortAsc, onPage, 
         <button type="button" className="nm-btn" onClick={() => onSortAsc(!sortAsc)} title="방문 횟수 정렬 순서 변경" style={{ marginLeft: "auto", display: "inline-flex", alignItems: "center", gap: 5, minHeight: 29, padding: "3px 10px", background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", color: "var(--text-dim)", cursor: "pointer", fontSize: 11.5, fontWeight: 600, whiteSpace: "nowrap" }}>
           <SortIcon2 sx={{ fontSize: 15 }} />횟수 · {sortAsc ? "적은 순" : "많은 순"}
         </button>
-        <button ref={closeButtonRef} onClick={onClose} title="닫기" aria-label="닫기" style={{ display: "inline-flex", flexShrink: 0, padding: 2, background: "transparent", border: "none", color: "var(--text-faint)", cursor: "pointer" }}><CloseIcon sx={{ fontSize: 18 }} /></button>
+        <button data-dialog-autofocus onClick={onClose} title="닫기" aria-label="닫기" style={{ display: "inline-flex", flexShrink: 0, padding: 2, background: "transparent", border: "none", color: "var(--text-faint)", cursor: "pointer" }}><CloseIcon sx={{ fontSize: 18 }} /></button>
       </header>
       <main style={{ minHeight: 0, overflow: "auto", padding: "10px 14px" }}>{data.total === 0 ? <div style={{ padding: 18, color: "var(--text-faint)", fontSize: 12.5 }}>기간 필터 내 방문 도메인이 없습니다.</div> : data.domains.map((domain) => (
         <div key={domain.domain} title={domain.domain} style={{ display: "flex", alignItems: "center", gap: 12, minHeight: 52, marginBottom: 8, padding: "8px 12px", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", background: "var(--bg-elevated)" }}>
@@ -709,21 +716,14 @@ function DomainStatsModal({ page, data, visitTotal, sortAsc, onSortAsc, onPage, 
   </div>;
 }
 
-function AiConversationModal({ conversation, onClose }: { conversation: DisplayAiConversation; onClose: () => void }) {
+function AiConversationModal({ conversation, loading, bookmarked, onToggleBookmark, onClose }: { conversation: OpenAiConversation; loading: boolean; bookmarked: boolean; onToggleBookmark?: () => void; onClose: () => void }) {
   const [showRaw, setShowRaw] = useState(false);
   const [search, setSearch] = useState("");
   const searchQuery = search.trim().toLowerCase();
   const visibleMessages = searchQuery
     ? conversation.messages.filter((message) => message.text.toLowerCase().includes(searchQuery))
     : conversation.messages;
-  const dialogRef = useRef<HTMLDivElement>(null);
-  const closeButtonRef = useRef<HTMLButtonElement>(null);
-  useEffect(() => {
-    closeButtonRef.current?.focus();
-    const closeOnEscape = (event: KeyboardEvent) => { if (event.key === "Escape") onClose(); };
-    document.addEventListener("keydown", closeOnEscape);
-    return () => document.removeEventListener("keydown", closeOnEscape);
-  }, [onClose]);
+  const dialogRef = useModalDialog(onClose);
   const metadata = [
     ["캐시 관찰 시각", formatAiPayloadTime(conversation.date) || "시간 정보 없음"],
     ["대화 생성 시각", formatAiPayloadTime(conversation.createdAt) || "정보 없음"],
@@ -736,18 +736,9 @@ function AiConversationModal({ conversation, onClose }: { conversation: DisplayA
     if (/system|tool/.test(normalized)) return { kind: "system" as const, label: "시스템", color: "var(--text-faint)", Icon: AutoAwesomeOutlinedIcon };
     return { kind: "user" as const, label: "사용자", color: "var(--text-dim)", Icon: PersonOutlineIcon };
   };
-  const trapFocus = (event: React.KeyboardEvent<HTMLDivElement>) => {
-    if (event.key !== "Tab") return;
-    const focusable = dialogRef.current?.querySelectorAll<HTMLElement>('button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])');
-    if (!focusable?.length) return;
-    const first = focusable[0];
-    const last = focusable[focusable.length - 1];
-    if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
-    if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
-  };
 
   return <div onClick={onClose} style={{ position: "fixed", inset: 0, zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center", padding: 20, background: "rgba(1,4,9,0.6)" }}>
-    <div ref={dialogRef} role="dialog" aria-modal="true" aria-label="AI 대화 상세" onClick={(event) => event.stopPropagation()} onKeyDown={trapFocus} style={{ display: "flex", flexDirection: "column", width: 760, maxWidth: "100%", maxHeight: "85vh", minHeight: 0, overflow: "hidden", background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", boxShadow: "var(--shadow-panel)" }}>
+    <div ref={dialogRef} role="dialog" aria-modal="true" aria-label="AI 대화 상세" onClick={(event) => event.stopPropagation()} style={{ display: "flex", flexDirection: "column", width: 760, maxWidth: "100%", maxHeight: "85vh", minHeight: 0, overflow: "hidden", background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", boxShadow: "var(--shadow-panel)" }}>
       <header style={{ display: "flex", flexShrink: 0, alignItems: "center", gap: 10, padding: "12px 16px", borderBottom: "1px solid var(--border)", background: "var(--bg-panel)" }}>
         <ProviderMark provider={conversation.provider} />
         <span style={{ minWidth: 0, flex: 1, fontSize: 14, fontWeight: 700, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{conversation.title || "제목 없음"}</span>
@@ -756,7 +747,13 @@ function AiConversationModal({ conversation, onClose }: { conversation: DisplayA
           {searchQuery && <span role="status" style={{ color: visibleMessages.length > 0 ? "var(--text-faint)" : "var(--danger)", fontSize: 11.5, whiteSpace: "nowrap" }}>{visibleMessages.length.toLocaleString()}개 일치</span>}
         </div>}
         {conversation.messages.length > 0 && <button className="nm-btn" onClick={() => setShowRaw((value) => !value)} style={pageButton(false)}>{showRaw ? "대화 보기" : "원본 JSON"}</button>}
-        <button ref={closeButtonRef} onClick={onClose} title="닫기" aria-label="닫기" style={{ display: "inline-flex", flexShrink: 0, padding: 2, background: "transparent", border: "none", color: "var(--text-faint)", cursor: "pointer" }}><CloseIcon sx={{ fontSize: 18 }} /></button>
+        {onToggleBookmark && <button className="nm-btn" type="button" onClick={onToggleBookmark}
+          title={bookmarked ? "원본 캐시 기록 북마크 해제" : "원본 캐시 기록 북마크"}
+          aria-pressed={bookmarked}
+          style={{ display: "inline-flex", flexShrink: 0, padding: 2, background: "transparent", border: "none", color: bookmarked ? "var(--accent)" : "var(--text-faint)", cursor: "pointer" }}>
+          {bookmarked ? <BookmarkIcon sx={{ fontSize: 18 }} /> : <BookmarkBorderIcon sx={{ fontSize: 18 }} />}
+        </button>}
+        <button data-dialog-autofocus onClick={onClose} title="닫기" aria-label="닫기" style={{ display: "inline-flex", flexShrink: 0, padding: 2, background: "transparent", border: "none", color: "var(--text-faint)", cursor: "pointer" }}><CloseIcon sx={{ fontSize: 18 }} /></button>
       </header>
       <div style={{ flexShrink: 0, display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: "6px 18px", padding: "10px 16px", borderBottom: "1px solid var(--border-subtle)" }}>
         {metadata.map(([label, value]) => <div key={label} style={{ minWidth: 0 }}><div style={{ fontSize: 10, color: "var(--text-faint)", marginBottom: 2 }}>{label}</div><div title={value} style={{ fontSize: 11.5, color: "var(--text-dim)", fontFamily: "var(--mono)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{value}</div></div>)}

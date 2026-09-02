@@ -8,7 +8,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type {
   AccountDirectoryEntry, Bookmark, BookmarkInput, Case, CategoryEntry, CsvData, ElectronApi, Host,
-  ListCasesResult, CacheMeta, CacheBodyPreview, BrowserVisitGraph, PathReference, PipelineLogEntry, PipelineResult, ResultFileEntry, ResultProvenance, ArtifactInputFile, ParseReport, RunHostOptions, SearchCasePage, AiConversation, AiConversationPage, BrowserActivityQuery, BrowserActivitySummary, BrowserActivityInsights, BrowserDomainStatsPage, AccountEventPage, AccountEventQuery, AccountEventSource, ResultRow, MftRecordsPage, ParseLogPreview, WmiSubscriptionEvents, TimelineMeta, TimelineFacets, TimelinePage, TimelineQuery,
+  ListCasesResult, CacheMeta, CacheBodyPreview, BrowserVisitGraph, PathReference, PipelineLogEntry, PipelineResult, ResultFileEntry, ResultProvenance, ArtifactInputFile, ParseReport, RunHostOptions, SearchCasePage, AiConversation, AiConversationPage, AiConversationDetail, BrowserActivityQuery, BrowserActivitySummary, BrowserActivityInsights, BrowserDomainStatsPage, AccountEventPage, AccountEventQuery, AccountEventSource, ResultRow, MftRecordsPage, ParseLogPreview, WmiSubscriptionEvents, TimelineMeta, TimelineFacets, TimelinePage, TimelineSourcePage, TimelineQuery,
 } from "./types";
 
 function makeApi(): ElectronApi {
@@ -42,6 +42,7 @@ function makeApi(): ElectronApi {
     accountDirectory: (hostDir) => invoke<AccountDirectoryEntry[]>("account_directory", { hostDir }),
     readResultFile: (fullPath, tableName) => invoke<CsvData>("read_result_file", { fullPath, tableName: tableName ?? null }),
     readResultFilePage: (fullPath, tableName, offset, limit) => invoke<CsvData>("read_result_file_page", { fullPath, tableName: tableName ?? null, offset, limit }),
+    timelineSourcePage: (fullPath, tableName, offset, limit) => invoke<TimelineSourcePage>("timeline_source_page", { fullPath, tableName: tableName ?? null, offset, limit }),
     linkedResultRows: (fullPath, tableName, matchColumn, matchValue, search, offset, limit) => invoke("linked_result_rows", { fullPath, tableName, matchColumn, matchValue, search, offset, limit }),
     resultRow: (fullPath, tableName, rowid) => invoke<ResultRow>("result_row", { fullPath, tableName, rowid }),
     browserActivitySummary: (fullPath, tableName, query) => invoke<BrowserActivitySummary>("browser_activity_summary", { fullPath, tableName, query }),
@@ -61,30 +62,10 @@ function makeApi(): ElectronApi {
     listBookmarks: (caseDir) => invoke<Bookmark[]>("list_bookmarks", { caseDir }),
     toggleBookmark: (caseDir, entry: BookmarkInput) => invoke<Bookmark[]>("toggle_bookmark", { caseDir, entry }),
     updateBookmarkNote: (caseDir, id, note) => invoke<Bookmark[]>("update_bookmark_note", { caseDir, id, note }),
-    // 수백 MB 캐시를 JSON 인자로 보내면 요청 직렬화·파싱이 메인 스레드를
-    // 수 초 막고, 단발 raw 전송도 백엔드에서 전량 복사가 남는다 — 8MB raw
-    // 청크를 순차 전송한다(begin → [chunk → drain]* → finish, 원자 rename).
-    // 청크 커맨드는 소유 복사까지만 메인에서 수행하고 쓰기는 세션 워커가
-    // 맡으며, 매 청크 후 drain await로 in-flight를 1청크로 묶어 느린 저장
-    // 매체에서도 메인 스레드·메모리 피크가 상수로 유지된다.
-    saveMasterTimeline: async (hostDir, payload) => {
-      const CHUNK = 8 * 1024 * 1024;
-      const token = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
-      const encoder = new TextEncoder();
-      const head = encoder.encode(`${hostDir}\n${token}\n`);
-      const body = encoder.encode(payload);
-      await invoke<void>("save_master_timeline_begin", { hostDir, token });
-      for (let offset = 0; offset < body.length; offset += CHUNK) {
-        const piece = body.subarray(offset, Math.min(offset + CHUNK, body.length));
-        const bytes = new Uint8Array(head.length + piece.length);
-        bytes.set(head, 0);
-        bytes.set(piece, head.length);
-        await invoke<void>("save_master_timeline_chunk", bytes);
-        await invoke<void>("save_master_timeline_drain", { token });
-      }
-      await invoke<void>("save_master_timeline_finish", { hostDir, token });
-    },
-    loadMasterTimeline: (hostDir) => invoke<ArrayBuffer>("load_master_timeline", { hostDir }),
+    // 타임라인 전량을 한 번에 넘기면 요청 직렬화·파싱이 메인 스레드를 수 초
+    // 막는다 — 원본을 청크로 읽어 NDJSON 배치로 흘려 넣는다(begin →
+    // [insert → drain]* → finish, 마지막에 원자 rename). 매 배치 후 drain을
+    // await해 in-flight를 1배치로 묶으므로 메인 스레드·메모리 피크가 상수다.
     masterTimelineBuildBegin: (hostDir, token, builtForRunAt) => invoke<void>("master_timeline_build_begin", { hostDir, token, builtForRunAt }),
     masterTimelineBuildInsert: (hostDir, token, ndjson) => invoke<void>("master_timeline_build_insert", { hostDir, token, ndjson }),
     masterTimelineBuildDrain: (token) => invoke<void>("master_timeline_build_drain", { token }),
@@ -98,6 +79,7 @@ function makeApi(): ElectronApi {
     cacheEntryBody: (hostDir, account, url, cacheKey) => invoke<CacheBodyPreview>("cache_entry_body", { hostDir, account, url, cacheKey }),
     browserVisitGraph: (hostDir, account, url, cacheKey, sourceFile) => invoke<BrowserVisitGraph>("browser_visit_graph", { hostDir, account, url, cacheKey: cacheKey ?? null, sourceFile: sourceFile ?? null }),
     aiConversations: (hostDir, query) => invoke<AiConversationPage>("ai_conversations", { hostDir, query }),
+    aiConversationDetail: (hostDir, rowId) => invoke<AiConversationDetail>("ai_conversation_detail", { hostDir, rowId }),
     wmiSubscriptionEvents: (hostDir) => invoke<WmiSubscriptionEvents>("wmi_subscription_events", { hostDir }),
     powershellSearchRowids: (fullPath, query) => invoke<number[]>("powershell_search_rowids", { fullPath, query }),
   };

@@ -40,7 +40,8 @@ pub const RDP_FIELD_ORDER: &[&str] = &[
 /// The account an RDP cache file belongs to — the path segment right after the
 /// `RDP_CACHE` collection folder (…/RDP_CACHE/<account>/Cache/Cache0000.bin).
 /// Collected data isn't always laid out that way, so when no account can be
-/// derived from the path this returns "unknown" rather than an empty string.
+/// derived from the path this returns "unknown" rather than an empty string —
+/// 원본에 계정 정보가 없으면 지어내지 않는다.
 fn account_of(path: &std::path::Path) -> String {
     let parts: Vec<String> = path
         .components()
@@ -56,13 +57,22 @@ fn account_of(path: &std::path::Path) -> String {
     }
     // 원본 이미지 경로(…\Users\<계정>\…\Terminal Server Client\Cache\bcache24.bmc)
     // 폴백 — 수집기 배치(RDP_CACHE/<계정>)가 아닐 때 계정을 복원한다.
-    for (i, p) in parts.iter().enumerate() {
-        if (p.eq_ignore_ascii_case("Users") || p.eq_ignore_ascii_case("Documents and Settings"))
-            && i + 1 < parts.len()
-        {
-            let a = parts[i + 1].trim();
-            if !a.is_empty() {
-                return a.to_string();
+    // `Users`를 경로 전체에서 찾지는 않는다: 증거를 담아 둔 분석 호스트의 홈
+    // 디렉터리(/Users/<분석가>/…)가 걸려 분석가 계정이 증거의 계정으로 표시된다.
+    // RDP 클라이언트 캐시 폴더 안쪽에서만, 그 폴더에 가장 가까운 계정을 찾는다.
+    if let Some(client) = parts
+        .iter()
+        .rposition(|p| p.eq_ignore_ascii_case("Terminal Server Client"))
+    {
+        for i in (0..client).rev() {
+            let p = &parts[i];
+            if (p.eq_ignore_ascii_case("Users") || p.eq_ignore_ascii_case("Documents and Settings"))
+                && i + 1 < client
+            {
+                let a = parts[i + 1].trim();
+                if !a.is_empty() {
+                    return a.to_string();
+                }
             }
         }
     }
@@ -752,6 +762,30 @@ mod bmc_tests {
         assert!(tiles.is_empty());
         assert_eq!(corrupt.len(), 1);
         assert!(corrupt[0].get("_error").unwrap().contains("runs past end"));
+    }
+
+    /// 증거를 분석 호스트의 홈(/Users/<분석가>/…) 아래 두어도 그 계정이 증거의
+    /// 계정으로 새어 나오면 안 된다 — 원본에 계정 정보가 없으면 unknown이다.
+    #[test]
+    fn analyst_home_is_not_mistaken_for_the_evidence_account() {
+        assert_eq!(
+            account_of(Path::new(
+                "/Users/analyst/work/case/NonVolatile/RDP CACHE/Cache0000.bin"
+            )),
+            "unknown"
+        );
+        // 실제 RDP 클라이언트 캐시 경로에서는 종전대로 계정을 복원한다.
+        assert_eq!(
+            account_of(Path::new(
+                "/Users/analyst/work/case/C/Users/victim/AppData/Local/Microsoft/Terminal Server Client/Cache/bcache24.bmc"
+            )),
+            "victim"
+        );
+        // 수집기 배치(RDP_CACHE/<계정>)도 종전대로.
+        assert_eq!(
+            account_of(Path::new("/e/RDP_CACHE/victim/Cache/Cache0000.bin")),
+            "victim"
+        );
     }
 
     #[test]

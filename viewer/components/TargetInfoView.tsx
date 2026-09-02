@@ -23,6 +23,7 @@ import type { AccountEventPage, AccountEventQuery, CsvData, Bookmark } from "@/l
 import type { FetchLinkedRows } from "@/lib/types";
 import { toBound, type TimeRange } from "@/lib/timeRange";
 import RowDetailPanel from "./RowDetailPanel";
+import { useModalDialog } from "@/lib/useModalDialog";
 import type { AccountDirectory } from "@/lib/accountIdentity";
 import { basename } from "@/lib/viewShared";
 import PaginationControls from "@/components/PaginationControls";
@@ -839,13 +840,7 @@ function AccountDetailPage({ account, onBack, loadEvents, timeRange, onNavigate,
 }
 
 function EventDetailModal({ row, onClose }: { row: Row; onClose: () => void }) {
-  useEffect(() => {
-    function onKey(e: KeyboardEvent) {
-      if (e.key === "Escape") onClose();
-    }
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
+  const dialogRef = useModalDialog(onClose);
 
   const eid = row.EventID || "";
   const label = EVENT_LABELS[eid] || `Event ${eid}`;
@@ -860,7 +855,7 @@ function EventDetailModal({ row, onClose }: { row: Row; onClose: () => void }) {
 
   return (
     <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(1,4,9,0.7)", zIndex: 300, display: "flex", alignItems: "center", justifyContent: "center", padding: 24 }}>
-      <div onClick={(e) => e.stopPropagation()} style={{ width: "min(720px, 96vw)", maxHeight: "88vh", display: "flex", flexDirection: "column", background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", boxShadow: "var(--shadow-panel)", overflow: "hidden" }}>
+      <div ref={dialogRef} role="dialog" aria-modal="true" aria-label="이벤트 상세" onClick={(e) => e.stopPropagation()} style={{ width: "min(720px, 96vw)", maxHeight: "88vh", display: "flex", flexDirection: "column", background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", boxShadow: "var(--shadow-panel)", overflow: "hidden" }}>
         <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "12px 16px", borderBottom: "1px solid var(--border)", background: "var(--bg-elevated)", flexShrink: 0 }}>
           <span style={{ fontSize: 14.5, fontWeight: 700 }}>{label}</span>
           <span style={{ fontSize: 11, color: "var(--text-faint)" }}>EventID {eid} · {row._log || row.Channel || ""}</span>
