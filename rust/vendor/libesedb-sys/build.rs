@@ -49,6 +49,11 @@ fn apply_changes<P: AsRef<Path>, S: AsRef<str>>(root: P, patch_text: S) -> io::R
 
 fn main() {
     println!("cargo::rerun-if-changed=build.rs");
+    // Downstream patches are applied from here, so a change under patches/ must
+    // force this script to re-run and re-patch. Without this, adding a patch
+    // (e.g. fix-win11_page_tag_flags) leaves a cached, unpatched build product
+    // in place on CI runners that restore a prior target cache.
+    println!("cargo::rerun-if-changed=patches");
     println!("cargo::rerun-if-env-changed=LIBESEDB_MAXIMUM_NUMBER_OF_LEAF_PAGES");
 
     // docs.rs will attempt to compile, to allow for build scripts that generate

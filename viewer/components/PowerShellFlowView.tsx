@@ -159,7 +159,7 @@ export default function PowerShellFlowView({
   // 시간 정보가 없는 기록(ConsoleHost_history 등)은 세션 묶음과 분리해
   // 실행 이력 뷰와 같은 접이식 구역으로 보여준다.
   const [untimedOpen, setUntimedOpen] = useState(false);
-  const [untimedPage, setUntimedPage] = useState(0);
+  const [page, setPage] = useState(0);
 
   // 목록 IPC의 script_block/host_application은 앞 1,000자 미리보기 — 그 뒤의
   // IOC까지 놓치지 않도록, 검색어가 있으면 서버에서 원문 컬럼을 매칭한 rowid
@@ -195,7 +195,6 @@ export default function PowerShellFlowView({
       })
       .sort((a, b) => (a.account ?? "").localeCompare(b.account ?? "") || (Number(a.line_number) || 0) - (Number(b.line_number) || 0));
   }, [data.rows, kindFilter, hiddenAccounts, query, serverMatches]);
-  useEffect(() => setUntimedPage(0), [untimed.length]);
   const sessions = useMemo(() => {
     const needle = query.trim().toLowerCase();
     return allSessions.flatMap((session) => {
@@ -215,6 +214,14 @@ export default function PowerShellFlowView({
     () => [...new Set(allSessions.flatMap((session) => session.events.map((event) => event.account)))].sort((a, b) => a.localeCompare(b)),
     [allSessions],
   );
+  // 세션 목록도 다른 뷰처럼 10건씩 페이지네이션 — 필터·검색이 바뀌면 첫 페이지로.
+  const PS_PAGE_SIZE = 10;
+  useEffect(() => setPage(0), [hiddenAccounts, kindFilter, query, serverMatches]);
+  const pageCount = Math.max(1, Math.ceil(sessions.length / PS_PAGE_SIZE));
+  const safePage = Math.min(page, pageCount - 1);
+  const pageSessions = sessions.slice(safePage * PS_PAGE_SIZE, safePage * PS_PAGE_SIZE + PS_PAGE_SIZE);
+  const pageStart = sessions.length === 0 ? 0 : safePage * PS_PAGE_SIZE + 1;
+  const pageEnd = Math.min(sessions.length, safePage * PS_PAGE_SIZE + PS_PAGE_SIZE);
 
   function toggle(sessionKey: string) {
     setExpanded((previous) => {
@@ -250,43 +257,24 @@ export default function PowerShellFlowView({
               style={{ width: "100%", display: "flex", alignItems: "center", gap: 7, padding: "8px 12px", background: "transparent", border: "none", color: "var(--text-dim)", cursor: "pointer", fontSize: 12.5, textAlign: "left" }}
             >
               <KeyboardArrowDownOutlinedIcon sx={{ fontSize: 17, transform: untimedOpen ? "none" : "rotate(-90deg)", transition: "transform .15s ease" }} />
-              <strong style={{ color: "var(--text)" }}>시간 정보 없음</strong>
-              <span style={{ color: "var(--text-faint)" }}>{untimed.length.toLocaleString()}건 · 콘솔 입력 기록</span>
+              <strong style={{ color: "var(--text)" }}>콘솔 히스토리</strong>
+              <span style={{ color: "var(--text-faint)" }}>{untimed.length.toLocaleString()}줄 · PSReadLine (ConsoleHost_history)</span>
             </button>
             {untimedOpen && (
-              <div style={{ borderTop: "1px solid var(--border-subtle)" }}>
-                {untimed.slice(untimedPage * 10, untimedPage * 10 + 10).map((row, index) => {
-                  const rowid = Number((row as Record<string, unknown>).__rowid);
-                  const bookmarked = Number.isFinite(rowid) && (bookmarkedRowids?.has(rowid) ?? false);
-                  return (
-                    <div
-                      key={`${rowid}-${index}`}
-                      className={bookmarked ? "dfir-bookmarked-row" : undefined}
-                      // 행 전체(여백 포함)가 상세 열기 클릭 대상 — 북마크는 전파 차단.
-                      onClick={() => openDetail(row)}
-                      style={{ display: "flex", alignItems: "center", gap: 10, minHeight: 38, padding: "0 12px", borderBottom: "1px solid var(--border-subtle)", borderRadius: 0, cursor: "pointer" }}
-                      onMouseEnter={(event) => { if (!bookmarked) event.currentTarget.style.background = "var(--bg-hover)"; }}
-                      onMouseLeave={(event) => { if (!bookmarked) event.currentTarget.style.background = "transparent"; }}
-                    >
-                      <div role="button" tabIndex={0} onClick={(clickEvent) => { clickEvent.stopPropagation(); openDetail(row); }} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); openDetail(row); } }} style={{ flex: 1, display: "flex", alignItems: "center", gap: 10, minWidth: 0, cursor: "pointer", outlineOffset: 2 }}>
-                        <span style={{ width: 44, flexShrink: 0, textAlign: "right", color: "var(--text-faint)", fontFamily: "var(--mono)", fontSize: 11.5 }}>{row.line_number || "-"}</span>
-                        <span style={{ flexShrink: 0, fontSize: 11.5, fontWeight: 700, color: "var(--text-dim)", border: "1px solid var(--text-dim)", borderRadius: "var(--radius-sm)", padding: "1px 8px", whiteSpace: "nowrap" }}>{row.kind || "콘솔 히스토리"}</span>
-                        <span title={row.command} style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontFamily: "var(--mono)", fontSize: 12.5 }}>{row.command || "(명령 없음)"}</span>
-                        <span title={row.account} style={{ flexShrink: 0, maxWidth: 130, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: row.account ? "var(--text-dim)" : "var(--text-faint)", fontSize: 12 }}>{row.account || "계정 정보 없음"}</span>
-                      </div>
-                      {onToggleBookmark && Number.isFinite(rowid) && (
-                        <button type="button" className={bookmarked ? "dfir-bookmark-control" : undefined} onClick={(clickEvent) => { clickEvent.stopPropagation(); onToggleBookmark(rowid); }} aria-label={bookmarked ? "북마크 해제" : "북마크 추가"} title={bookmarked ? "북마크 해제" : "북마크 추가"} style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 28, height: 28, padding: 0, border: "none", background: "transparent", color: bookmarked ? "var(--bookmark-control)" : "var(--text-faint)", cursor: "pointer" }}>
-                          {bookmarked ? <BookmarkOutlinedIcon sx={{ fontSize: 16 }} /> : <BookmarkBorderOutlinedIcon sx={{ fontSize: 16 }} />}
-                        </button>
-                      )}
-                    </div>
-                  );
-                })}
-                {untimed.length > 10 && (
-                  <div style={{ display: "flex", justifyContent: "center", padding: "8px 0" }}>
-                    <PaginationControls ariaLabel="콘솔 입력 기록 페이지" page={untimedPage} pageCount={Math.max(1, Math.ceil(untimed.length / 10))} onChange={setUntimedPage} summary={`(${(untimedPage * 10 + 1).toLocaleString()}–${Math.min((untimedPage + 1) * 10, untimed.length).toLocaleString()} / ${untimed.length.toLocaleString()})`} />
+              // ConsoleHost_history(PSReadLine)는 시간 없는 명령 입력 히스토리 파일이라,
+              // 개별 이벤트가 아니라 실제 히스토리처럼 줄번호 + 명령을 연속 표시한다.
+              <div style={{ borderTop: "1px solid var(--border-subtle)", maxHeight: 560, overflow: "auto", background: "var(--bg-input)", padding: "6px 0" }}>
+                {/* 읽기 전용 히스토리 — 클릭 상세·북마크 없이 줄번호 + 명령만
+                    보여주고, 명령 텍스트는 드래그로 복사할 수 있게 한다. */}
+                {untimed.map((row, index) => (
+                  <div
+                    key={`${Number((row as Record<string, unknown>).__rowid)}-${index}`}
+                    style={{ display: "flex", alignItems: "flex-start", gap: 12, padding: "1px 12px", lineHeight: 1.6 }}
+                  >
+                    <span style={{ width: 46, flexShrink: 0, textAlign: "right", color: "var(--text-faint)", fontFamily: "var(--mono)", fontSize: 11.5, userSelect: "none", paddingTop: 1 }}>{row.line_number || index + 1}</span>
+                    <span style={{ flex: 1, minWidth: 0, fontFamily: "var(--mono)", fontSize: 12.5, color: "var(--text)", whiteSpace: "pre-wrap", wordBreak: "break-word", userSelect: "text" }}>{row.command || "(명령 없음)"}</span>
                   </div>
-                )}
+                ))}
               </div>
             )}
           </section>
@@ -295,7 +283,7 @@ export default function PowerShellFlowView({
           <div style={{ padding: 44, textAlign: "center", color: "var(--text-faint)", fontSize: 13 }}>
             {allSessions.length === 0 ? "기간 내 파워셸 실행 이력이 없습니다." : "검색 또는 필터 조건에 맞는 실행 이력이 없습니다."}
           </div>
-        ) : sessions.map((session) => {
+        ) : pageSessions.map((session) => {
           const open = expanded.has(session.key);
           const recordsId = `powershell-session-records-${session.key}`;
           const kindCounts = new Map<string, number>();
@@ -377,6 +365,11 @@ export default function PowerShellFlowView({
           );
         })}
       </main>
+      {sessions.length > 0 && (
+        <footer style={{ flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", minHeight: 44, padding: "6px 16px", borderTop: "1px solid var(--border)" }}>
+          <PaginationControls ariaLabel="파워셸 세션 페이지" page={safePage} pageCount={pageCount} onChange={setPage} summary={`(${pageStart.toLocaleString()}–${pageEnd.toLocaleString()} / ${sessions.length.toLocaleString()})`} />
+        </footer>
+      )}
       {selected && <RowDetailPanel row={selected} columns={data.columns} focusedColumn={null} fileBaseName={TABLE_NAME} onClose={() => setSelected(null)} onNavigate={(targetFile, targetColumn, value) => { setSelected(null); onNavigate(targetFile, targetColumn, value); }} onFetchLinkedRows={onFetchLinkedRows} accountDirectory={accountDirectory} isBookmarked={onToggleBookmark ? bookmarkedRowids?.has(Number((selected as Record<string, unknown>).__rowid)) ?? false : undefined} onToggleBookmark={onToggleBookmark ? () => onToggleBookmark(Number((selected as Record<string, unknown>).__rowid)) : undefined} />}
     </div>
   );

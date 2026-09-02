@@ -29,7 +29,7 @@ import BrowserHistoryView from "@/components/BrowserHistoryView";
 import GlobalProgress from "@/components/GlobalProgress";
 import { usePipelineRun } from "@/lib/usePipelineRun";
 import CircularProgress from "@mui/material/CircularProgress";
-import { buildMasterTimeline, enrichCachedTimeline, loadCachedTimelineInWorker, TimelineBuildAborted } from "@/lib/masterTimeline";
+import { streamBuildTimeline, TimelineBuildAborted, TIMELINE_LOGIC_VERSION } from "@/lib/masterTimeline";
 import { getArtifactView } from "@/lib/artifactViews";
 import { EMPTY_TIME_RANGE, type TimeRange } from "@/lib/timeRange";
 import { searchHitHostMatchesSourceBookmark } from "@/lib/searchBookmark";
@@ -52,6 +52,10 @@ const keyOf = (f: ResultFileEntry): string => `${f.fullPath}\u0000${f.tableName}
 // Bookmarks live there so they remain shared across registered hosts.
 // 원본(전용 뷰 없는) 테이블의 페이지 로딩 청크 크기.
 const RAW_TABLE_CHUNK = 20000;
+// 스크롤 이어받기로 한 테이블에 상주시킬 행 상한. 이 이상은 자동으로 싣지
+// 않는다 — 대형 EventLog(수십만 행)를 끝까지 스크롤해도 웹뷰 메모리가 무한히
+// 커지지 않게 막고, 그 지점부터는 검색·필터로 좁혀 보게 한다.
+const MAX_RESIDENT_RAW_ROWS = 100000;
 
 const parentDir = (dir: string): string => dir.slice(0, Math.max(dir.lastIndexOf("/"), dir.lastIndexOf("\\")));
 const accountDirectoryKey = (host: Pick<Host, "id" | "dir">): string => `${host.id}\u0000${host.dir.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase()}`;
@@ -104,7 +108,7 @@ export default function Home() {
   // optimistically change the local list: a failed disk write is not a saved
   // annotation.
   const [bookmarkError, setBookmarkError] = useState<string | null>(null);
-  const [masterTimeline, setMasterTimeline] = useState<{ hostId: string; entries: TimelineEntry[] } | null>(null);
+  const [masterTimeline, setMasterTimeline] = useState<{ hostId: string } | null>(null);
   const [masterTimelineLoading, setMasterTimelineLoading] = useState(false);
   // Cancels an in-flight master-timeline build. Building scans every result
   // table (EventLog alone can be hundreds of thousands of rows), so once the
@@ -114,7 +118,6 @@ export default function Home() {
   // Guards the post-parse prebuild so it runs once per (host, run) rather than
   // on every incidental case-list refresh (which would re-parse a large cache
   // JSON repeatedly). Keyed by host id + last run time.
-  const prebuiltTimelineKeyRef = useRef<string | null>(null);
   const [hostGraph, setHostGraph] = useState<{ caseId: string; graph: HostGraph } | null>(null);
   const [hostGraphLoading, setHostGraphLoading] = useState(false);
   // All IPs of every host in the case (a host can have several NICs). Shared by
@@ -205,14 +208,20 @@ export default function Home() {
   }, [bootstrapHostStore]);
 
   // Leaving the timeline tab cancels any build still scanning the result set,
-  // so it stops competing with the view the analyst just opened. Switching host
-  // is handled where the host changes (it also clears the built timeline).
+  // so it stops competing with the view the analyst just opened, AND releases
+  // the built timeline entries (tens of thousands of objects). Keeping them
+  // resident while viewing a raw table (which itself only chunk-queries) is
+  // what pushed the webview into OOM on large event logs. Re-entering the tab
+  // reloads from cache via handleSelectTimeline. Switching host is handled
+  // where the host changes (it also clears the built timeline).
   useEffect(() => {
-    if (activeVirtualTab !== "timeline" && timelineBuildRef.current) {
+    if (activeVirtualTab === "timeline") return;
+    if (timelineBuildRef.current) {
       timelineBuildRef.current.abort();
       timelineBuildRef.current = null;
       setMasterTimelineLoading(false);
     }
+    setMasterTimeline((current) => (current ? null : current));
   }, [activeVirtualTab]);
 
 
@@ -276,11 +285,12 @@ export default function Home() {
   async function handleSelectFile(file: ResultFileEntry) {
     setActiveVirtualTab(null);
     const key = keyOf(file);
+    // 활성 원본 테이블은 한 번에 하나만 메모리에 상주시킨다 — 다른 파일을 열면
+    // 이전 탭에 쌓인 행(대형 EventLog면 스크롤로 수십만 행)을 즉시 버려 웹뷰
+    // 메모리를 반환한다. 같은 파일을 다시 고르면 그대로 둔다(재로드 방지).
+    if (activePath === key && tabs.some((t) => keyOf(t.file) === key)) return;
     setActivePath(key);
-
-    const alreadyOpen = tabs.some((t) => keyOf(t.file) === key);
-    setTabs((prev) => (prev.some((t) => keyOf(t.file) === key) ? prev : [...prev, { file, data: null, loading: true, error: null }]));
-    if (alreadyOpen) return;
+    setTabs([{ file, data: null, loading: true, error: null }]);
     // 새로 여는 탭은 이어받기 실패 기록을 지워 재시도 기회를 준다.
     rawLoadFailed.current.delete(key);
 
@@ -335,6 +345,8 @@ export default function Home() {
     if (!activeTab?.data) return;
     const key = keyOf(activeTab.file);
     const loaded = activeTab.data.rows.length;
+    // 상주 행 상한에 도달하면 더 싣지 않는다 — 그 이상은 검색·필터로 좁혀 본다.
+    if (loaded >= MAX_RESIDENT_RAW_ROWS) return;
     if (loaded >= activeTab.data.rowCount || rawLoadInFlight.current.has(key) || rawLoadFailed.current.has(key)) return;
     rawLoadInFlight.current.add(key);
     try {
@@ -431,142 +443,38 @@ export default function Home() {
   // re-parse (new lastRunAt) misses it and forces a rebuild; `allowCache: false`
   // forces one too (used when an ExecutionHistory code-refresh invalidated it).
   // On a cache miss it builds (respecting the abort signal) and re-caches.
-  const buildOrLoadTimeline = useCallback(
-    async (
-      host: Host,
-      cats: CategoryEntry[],
-      signal: AbortSignal,
-      allowCache = true,
-      cacheOnly = false,
-    ): Promise<TimelineEntry[] | null> => {
-      const builtForRunAt = host.lastRunAt ?? "";
-      if (allowCache) {
-        // 캐시는 raw 바이트(IPC)로 받아 워커에서 파싱·보강한다 — JSON.parse와
-        // 태그 계산이 워커 스레드에서 돌아 메인 윈도우가 멈추지 않는다.
-        // (기존 문자열 IPC 경로는 응답 JSON 이스케이프가 메인 스레드에서 돌아
-        // 수백 MB 캐시에서 창이 수십 초 멈췄고, asset 프로토콜 fetch는 이
-        // 환경에서 실패해 매번 그 경로로 떨어졌다 — 결과 보기 진입 멈춤의
-        // 실제 원인.)
-        try {
-          const buffer = await window.api.loadMasterTimeline(host.dir);
-          if (buffer.byteLength > 0) {
-            if (signal.aborted) throw new TimelineBuildAborted();
-            try {
-              const entries = await loadCachedTimelineInWorker(buffer, builtForRunAt, signal);
-              if (entries) return entries;
-            } catch (workerError) {
-              if (workerError instanceof TimelineBuildAborted) throw workerError;
-              // 워커를 만들 수 없는 환경 — 마지막 수단: 메인 스레드에서 파싱.
-              // (버퍼가 워커로 이전된 뒤 실패한 경우 디코드가 빈 문자열이 되어
-              // 아래 catch로 빠지고, 클릭 시 빌드 경로가 다시 처리한다.)
-              const cached = JSON.parse(new TextDecoder().decode(buffer)) as { builtForRunAt?: string; entries?: TimelineEntry[] };
-              if (cached.builtForRunAt === builtForRunAt && Array.isArray(cached.entries)) {
-                return await enrichCachedTimeline(cached.entries, signal);
-              }
-            }
-          }
-        } catch (error) {
-          if (error instanceof TimelineBuildAborted) throw error;
-          // Missing/corrupt cache is not an error — fall through and rebuild.
-        }
-      }
-      // 백그라운드 프리로드는 캐시 적중만 노린다 — 캐시가 없다고 전체 결과
-      // 스캔(빌드)을 몰래 돌리지 않는다.
-      if (cacheOnly) return null;
-      const entries = await buildMasterTimeline(cats, signal);
-      // Persist for instant subsequent opens. Best-effort: a write failure must
-      // not fail the (already built) timeline the analyst is waiting for.
-      void window.api.saveMasterTimeline(host.dir, JSON.stringify({ builtForRunAt, entries })).catch(() => {});
-      return entries;
-    },
-    [],
-  );
-
-  // Prebuild + cache the master timeline as soon as a parse finishes, so the
-  // first "통합 타임라인" open is instant rather than kicking off the full
-  // result-set scan on the render thread. Runs in the background, is
-  // cancellable, and skips work when the host already has a fresh cache.
-  useEffect(() => {
-    if (!run.runComplete || !run.completedHostId) return;
-    const host = selectedCase?.hosts.find((h) => h.id === run.completedHostId);
-    if (!host) return;
-    const key = `${host.id}:${host.lastRunAt ?? ""}`;
-    if (prebuiltTimelineKeyRef.current === key) return;
-    const controller = new AbortController();
-    void (async () => {
-      try {
-        const cats = await window.api.listCategories(host.dir);
-        const entries = await buildOrLoadTimeline(host, cats, controller.signal);
-        if (controller.signal.aborted || !entries) return;
-        prebuiltTimelineKeyRef.current = key;
-        if (selectedHost?.id === host.id) {
-          setMasterTimeline({ hostId: host.id, entries });
-        }
-      } catch {
-        // Aborted (navigated away / superseded) or failed — the lazy open path
-        // rebuilds on demand, so a background failure is silent by design.
-      }
-    })();
-    return () => controller.abort();
-  }, [run.runComplete, run.completedHostId, selectedCase, buildOrLoadTimeline, selectedHost?.id]);
-
-  // 호스트를 선택하면 타임라인 캐시를 백그라운드에서 미리 읽고 보강해 둔다 —
-  // 첫 "통합 타임라인" 클릭이 로드/보강을 기다리지 않게. 캐시가 없으면 아무
-  // 것도 하지 않는다(전체 결과 스캔은 클릭 시에만).
-  const timelinePreloadKeyRef = useRef<string | null>(null);
-  useEffect(() => {
-    const host = selectedHost;
-    if (!host) return;
-    if (masterTimeline?.hostId === host.id) return;
-    if (run.runs.some((item) => item.hostId === host.id && (item.status === "running" || item.status === "queued"))) return;
-    const key = `${host.id}:${host.lastRunAt ?? ""}`;
-    if (timelinePreloadKeyRef.current === key) return;
-    timelinePreloadKeyRef.current = key;
-    const controller = new AbortController();
-    // 결과 보기 직후의 대시보드 로딩과 경쟁하지 않도록, 화면이 자리잡은 뒤
-    // 유휴 시점에 시작한다. 그 전에 탭을 클릭하면 클릭 경로가 대신 처리한다.
-    const timer = setTimeout(() => {
-      void (async () => {
-        try {
-          const entries = await buildOrLoadTimeline(host, [], controller.signal, true, true);
-          if (controller.signal.aborted || !entries) return;
-          prebuiltTimelineKeyRef.current = key;
-          setMasterTimeline((current) => current?.hostId === host.id ? current : { hostId: host.id, entries });
-        } catch {
-          // 취소되었거나 캐시가 깨진 경우 — 클릭 시 경로가 다시 처리한다.
-        }
-      })();
-    }, 1500);
-    return () => {
-      clearTimeout(timer);
-      controller.abort();
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedHost?.id, selectedHost?.lastRunAt, masterTimeline?.hostId, run.runs, buildOrLoadTimeline]);
-
   async function handleSelectTimeline() {
     setActiveVirtualTab("timeline");
     if (!selectedHost) return;
-    // Keep the timeline and ExecutionHistory detail on one source of truth.
-    // This is a derived-table-only compatibility upgrade; raw evidence is not
-    // parsed again. A refresh here also means any cached timeline is stale.
-    const refreshed = await window.api.refreshExecutionHistoryOverview(selectedHost.dir);
-    if (!refreshed && masterTimeline?.hostId === selectedHost.id) return;
-    // Supersede any build still running from an earlier click so two scans of
-    // the (large) result set never compete for the render thread at once.
+    const host = selectedHost;
+    // 타임라인은 ExecutionHistory 오버뷰와 같은 원천을 쓴다 — 파생 테이블만
+    // 재생성하며(원본 재파싱 아님), 갱신되면 기존 타임라인 캐시는 낡은 것이다.
+    const refreshed = await window.api.refreshExecutionHistoryOverview(host.dir);
+    if (!refreshed && masterTimeline?.hostId === host.id) return;
+    // 이전 클릭의 빌드가 남아 있으면 취소 — 대형 결과를 두 번 스캔하지 않는다.
     timelineBuildRef.current?.abort();
     const controller = new AbortController();
     timelineBuildRef.current = controller;
-    const host = selectedHost;
     setMasterTimelineLoading(true);
     try {
-      const entries = await buildOrLoadTimeline(host, categories, controller.signal, !refreshed);
-      if (!controller.signal.aborted && entries) setMasterTimeline({ hostId: host.id, entries });
+      const builtForRunAt = host.lastRunAt ?? "";
+      const meta = await window.api.masterTimelineMeta(host.dir);
+      const fresh =
+        meta.exists &&
+        meta.builtForRunAt === builtForRunAt &&
+        meta.logicVersion === TIMELINE_LOGIC_VERSION;
+      // 캐시가 없거나 낡았거나(재파싱/로직 변경) 오버뷰가 갱신됐으면 스트리밍
+      // 재빌드 — 각 테이블을 청크로 읽어 백엔드 sqlite로 흘려 넣는다(메모리
+      // 피크 = 청크 1개). 유효하면 즉시 페이지 쿼리 모드로 들어간다.
+      if (refreshed || !fresh) {
+        const cats = await window.api.listCategories(host.dir);
+        if (controller.signal.aborted) return;
+        await streamBuildTimeline(cats, host.dir, builtForRunAt, controller.signal);
+      }
+      if (!controller.signal.aborted) setMasterTimeline({ hostId: host.id });
     } catch (error) {
       if (!(error instanceof TimelineBuildAborted)) throw error;
     } finally {
-      // Only the current build owns the loading flag; a superseded one that
-      // lost the race must not flip it off under the newer build.
       if (timelineBuildRef.current === controller) {
         timelineBuildRef.current = null;
         setMasterTimelineLoading(false);
@@ -701,13 +609,14 @@ export default function Home() {
       perHost.push({ name: h.name, rdp: await readRows("RemoteDesktopHistory") });
     }
 
-    // A single "LOCAL" node collects console/AD-style sessions; loopback stays
-    // per-host (HOST/127.0.0.1) so every host's localhost tooling isn't merged.
+    // LOCAL(콘솔/AD형 세션)과 loopback(HOST/127.0.0.1)은 모두 호스트별로 분리한다
+    // — 여러 호스트의 로컬 세션이 하나의 공유 노드로 뭉치면 누구의 LOCAL인지 알 수
+    // 없고 그래프가 실제 관계를 왜곡한다(각 LOCAL은 그 호스트 자신의 로컬 로그온).
     const classify = (remote: string, owner: string) => {
       if (isLoopbackAddress(remote)) return { id: `${owner} loop`, label: `${owner}/${remote}`, kind: "loopback" as const, isHost: false };
       const peerHost = ipToHost.get(remote);
       if (peerHost) return { id: peerHost, label: peerHost, kind: "host" as const, isHost: true };
-      if (remote.toUpperCase() === "LOCAL") return { id: "LOCAL", label: "LOCAL", kind: "local" as const, isHost: false };
+      if (remote.toUpperCase() === "LOCAL") return { id: `${owner} local`, label: `${owner}/LOCAL`, kind: "local" as const, isHost: false };
       return { id: remote, label: remote, kind: "external" as const, isHost: false };
     };
 
@@ -944,7 +853,6 @@ export default function Home() {
   }
 
   const activeTab = tabs.find((t) => keyOf(t.file) === activePath) ?? null;
-  const activeTimeline = selectedHost && masterTimeline?.hostId === selectedHost.id ? masterTimeline.entries : null;
   const currentAccountDirectory = selectedHost ? accountDirectories[accountDirectoryKey(selectedHost)] : undefined;
   const accountDirectoryForHostId = useCallback(
     (hostId: string): AccountDirectory | undefined => {
@@ -1093,17 +1001,22 @@ export default function Home() {
                 <button type="button" onClick={() => setBookmarkError(null)} aria-label="북마크 저장 오류 닫기" style={{ marginLeft: "auto", padding: "2px 7px", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", background: "transparent", color: "var(--text-dim)", cursor: "pointer", fontSize: 11 }}>닫기</button>
               </div>
             )}
-            {activeVirtualTab === "timeline" && (
-              <MasterTimeline
-                entries={activeTimeline}
-                loading={masterTimelineLoading}
-                onNavigate={handleNavigate}
-                onFetchLinkedRows={fetchLinkedRows}
-                isBookmarked={isTimelineEntryBookmarked}
-                onToggleBookmark={handleToggleTimelineBookmark}
-                globalTimeRange={timeRange}
-                accountDirectory={currentAccountDirectory}
-              />
+            {activeVirtualTab === "timeline" && selectedHost && (
+              masterTimelineLoading ? (
+                <div role="status" aria-live="polite" style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100%", color: "var(--text-dim)", gap: 10, fontSize: 14 }}>
+                  <span>모든 아티팩트를 시간순으로 모으는 중...</span>
+                </div>
+              ) : masterTimeline?.hostId === selectedHost.id ? (
+                <MasterTimeline
+                  hostDir={selectedHost.dir}
+                  onNavigate={handleNavigate}
+                  onFetchLinkedRows={fetchLinkedRows}
+                  isBookmarked={isTimelineEntryBookmarked}
+                  onToggleBookmark={handleToggleTimelineBookmark}
+                  globalTimeRange={timeRange}
+                  accountDirectory={currentAccountDirectory}
+                />
+              ) : null
             )}
 
             {activeVirtualTab === "bookmarks" && (

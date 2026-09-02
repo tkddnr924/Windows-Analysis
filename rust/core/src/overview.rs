@@ -880,6 +880,14 @@ pub const WER_OV_KEYS: &[&str] = &[
     "AppPath",
     "TargetAppId",
     "ReportIdentifier",
+    // AppSessionGuid에서 디코딩 — 결함 프로세스의 PID와 생성(시작) 시각.
+    "app_pid",
+    "app_start_time",
+    // 크래시 시각 − 시작 시각 = 프로세스가 유지된 시간("1일 5시간 19분").
+    "app_uptime",
+    // 크래시 핵심 — 결함 모듈(P4)과 예외 코드(P7).
+    "fault_module",
+    "exception_code",
     "report",
     "source",
     "record_key",
@@ -892,6 +900,109 @@ fn wer_ov_row() -> Row {
         r.insert((*k).to_string(), String::new());
     }
     r
+}
+
+/// WER AppSessionGuid를 (PID, 프로세스 생성 시각)으로 디코딩한다.
+/// 형식 "PPPPPPPP-BBBB-CCCC-DDDD-EEEEEEEEEEEE": 앞 8자리 hex가 PID이고,
+/// 마지막 두 그룹(Data4, 8바이트)이 프로세스 생성 FILETIME을 little-endian으로
+/// 담는다. (예: 000011e8-…-6189-bef9f6f7dc01 → PID 4584, 2026-06-09 19:01:43 KST)
+fn decode_app_session_guid(guid: &str) -> Option<(u32, String)> {
+    let parts: Vec<&str> = guid.trim().split('-').collect();
+    if parts.len() != 5 {
+        return None;
+    }
+    let pid = u32::from_str_radix(parts[0], 16).ok()?;
+    let data4 = format!("{}{}", parts[3], parts[4]);
+    if data4.len() != 16 {
+        return None;
+    }
+    let start = filetime_hex(&data4);
+    if start.is_empty() {
+        return None;
+    }
+    Some((pid, start))
+}
+
+/// report JSON의 AppSessionGuid를 디코딩해 app_pid·app_start_time을 채운다
+/// (Report.wer·EventLog 1001 두 출처 모두 report에 이 키를 담는다).
+fn wer_enrich_app_session(rec: &mut Row) {
+    let guid = rec
+        .get("report")
+        .and_then(|r| serde_json::from_str::<serde_json::Value>(r).ok())
+        .and_then(|v| {
+            v.get("AppSessionGuid")
+                .and_then(|g| g.as_str())
+                .map(str::to_string)
+        });
+    if let Some((pid, start)) = guid.as_deref().and_then(decode_app_session_guid) {
+        rec.insert("app_pid".into(), pid.to_string());
+        // 크래시 시각(rec.timestamp)은 enrich 호출 전에 이미 채워져 있다.
+        if let Some(crash) = rec.get("timestamp").filter(|s| !s.is_empty()) {
+            let up = duration_kr(&start, crash);
+            if !up.is_empty() {
+                rec.insert("app_uptime".into(), up);
+            }
+        }
+        rec.insert("app_start_time".into(), start);
+    }
+}
+
+/// 두 "YYYY-MM-DD hh:mm:ss.fff" 시각(start→end)의 경과를 "1일 5시간 19분"으로
+/// 포맷한다. 두 값은 같은 시간대(KST)라 오프셋이 상쇄된다. 파싱 실패·음수면 빈 문자열.
+fn duration_kr(start: &str, end: &str) -> String {
+    let fmt = "%Y-%m-%d %H:%M:%S%.3f";
+    let s = chrono::NaiveDateTime::parse_from_str(start.trim(), fmt).ok();
+    let e = chrono::NaiveDateTime::parse_from_str(end.trim(), fmt).ok();
+    let (s, e) = match (s, e) {
+        (Some(s), Some(e)) => (s, e),
+        _ => return String::new(),
+    };
+    let secs = (e - s).num_seconds();
+    if secs < 0 {
+        return String::new();
+    }
+    let (d, h, m, sec) = (
+        secs / 86400,
+        (secs % 86400) / 3600,
+        (secs % 3600) / 60,
+        secs % 60,
+    );
+    let mut parts = Vec::new();
+    if d > 0 {
+        parts.push(format!("{d}일"));
+    }
+    if h > 0 {
+        parts.push(format!("{h}시간"));
+    }
+    if m > 0 {
+        parts.push(format!("{m}분"));
+    }
+    if parts.is_empty() {
+        parts.push(format!("{sec}초"));
+    }
+    parts.join(" ")
+}
+
+/// report에서 결함 모듈(P4)과 예외 코드(P7)를 뽑는다. Sig 배열이 있으면 표준
+/// APPCRASH/BEX 순서(3=모듈, 6=예외코드)로, 없으면 명명된 P4/P7로 읽는다.
+/// (라벨은 로캘 의존이라 이름 대신 위치로 매칭한다.)
+fn wer_module_exception_from_report(report: &str) -> (String, String) {
+    let v: serde_json::Value = match serde_json::from_str(report) {
+        Ok(v) => v,
+        Err(_) => return (String::new(), String::new()),
+    };
+    if let Some(sig) = v.get("Sig").and_then(|s| s.as_array()) {
+        let val = |i: usize| {
+            sig.get(i)
+                .and_then(|e| e.get("Value"))
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+        return (val(3), val(6));
+    }
+    let p = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+    (p("P4"), p("P7"))
 }
 
 /// 1001 P-필드에서 결함 모듈의 전체 경로를 찾는다 — WER 임시 보관 폴더
@@ -908,6 +1019,43 @@ fn wer_p_field_path(d: &serde_json::Map<String, serde_json::Value>) -> String {
         }
     }
     String::new()
+}
+
+/// 일부 시스템의 1001 이벤트는 EventData를 명명된 `<Data Name="P1">` 대신
+/// 이름 없는 `<Data>값</Data>` 시퀀스({"Data":{"#text":[...]}})로 남긴다. 이때
+/// AppName·EventType이 P1/EventName 키에서 빠져 "(이름 없음)"으로 보이므로,
+/// WER 1001의 표준 순서로 EventName·P1..P10을 채워 명명된 형태와 통일한다.
+/// 이름 없는 스키마: [2]=EventName, [5]=P1, [6]=P2 … (앞쪽 0·1·3·4는
+/// Bucket/Response/Cab 부기 필드). 명명된 데이터는 그대로 둔다.
+fn normalize_wer_eventdata(
+    mut d: serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Map<String, serde_json::Value> {
+    if d.contains_key("P1") || d.contains_key("EventName") {
+        return d;
+    }
+    let arr = d
+        .get("Data")
+        .and_then(|v| v.get("#text"))
+        .and_then(|v| v.as_array())
+        .cloned();
+    if let Some(arr) = arr {
+        let at = |i: usize| {
+            arr.get(i)
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+        if arr.len() > 2 {
+            d.insert("EventName".into(), serde_json::Value::String(at(2)));
+        }
+        for i in 1..=10usize {
+            let idx = 4 + i; // P1 → 인덱스 5
+            if idx < arr.len() {
+                d.insert(format!("P{i}"), serde_json::Value::String(at(idx)));
+            }
+        }
+    }
+    d
 }
 
 pub fn build_wer_reports(out_dir: &Path) -> Vec<Row> {
@@ -936,6 +1084,13 @@ pub fn build_wer_reports_with_events(out_dir: &Path, events: &EventLogOverviewCa
         }
         rec.insert("source".into(), "Report.wer".into());
         rec.insert("record_key".into(), source_record_key(&db, "WER_Reports", &r));
+        wer_enrich_app_session(&mut rec);
+        let (fm, ex) = rec
+            .get("report")
+            .map(|report| wer_module_exception_from_report(report))
+            .unwrap_or_default();
+        rec.insert("fault_module".into(), fm);
+        rec.insert("exception_code".into(), ex);
         rows.push(rec);
     }
     // 2) EventLog의 Windows Error Reporting 보고(1001) — 앱 정보가 있는 오류
@@ -948,7 +1103,7 @@ pub fn build_wer_reports_with_events(out_dir: &Path, events: &EventLogOverviewCa
             continue;
         }
         let raw = r.get("EventData").map(String::as_str).unwrap_or("");
-        let d = parse_eventdata(raw);
+        let d = normalize_wer_eventdata(parse_eventdata(raw));
         let mut rec = wer_ov_row();
         rec.insert(
             "timestamp".into(),
@@ -968,6 +1123,17 @@ pub fn build_wer_reports_with_events(out_dir: &Path, events: &EventLogOverviewCa
             "_source_file".into(),
             r.get("_source_file").cloned().unwrap_or_default(),
         );
+        wer_enrich_app_session(&mut rec);
+        // report(raw)가 Data 배열이면 Sig/P가 없으니 정규화한 d의 P4/P7로 보강.
+        let (mut fm, mut ex) = wer_module_exception_from_report(raw);
+        if fm.is_empty() {
+            fm = jget(&d, "P4");
+        }
+        if ex.is_empty() {
+            ex = jget(&d, "P7");
+        }
+        rec.insert("fault_module".into(), fm);
+        rec.insert("exception_code".into(), ex);
         rows.push(rec);
     }
     // 시각 문자열 오름차순(빈 시각은 뒤) — 뷰 기본 정렬과 같은 안정 순서.
@@ -4008,6 +4174,40 @@ fn eh_from_prefetch(out_dir: &Path) -> Vec<Row> {
         .collect()
 }
 
+/// WER의 AppSessionGuid에서 디코딩한 프로세스 생성 시각을 실행 증거로 편입한다.
+/// (크래시한 프로그램이 그 시각에 실행됐다는 뜻 — 크래시 시각과의 차이로 실행
+/// 유지 시간도 가늠할 수 있다.) 시작 시각이 디코딩된 보고만 대상으로 한다.
+fn eh_from_wer(out_dir: &Path) -> Vec<Row> {
+    let events = EventLogOverviewCache::load(out_dir);
+    build_wer_reports_with_events(out_dir, &events)
+        .into_iter()
+        .filter_map(|r| {
+            let start = r.get("app_start_time").cloned().unwrap_or_default();
+            if start.is_empty() {
+                return None;
+            }
+            let app_name = r.get("AppName").cloned().unwrap_or_default();
+            let app_path = r.get("AppPath").cloned().unwrap_or_default();
+            let pname = if app_name.is_empty() {
+                basename_win(&app_path)
+            } else {
+                app_name
+            };
+            if pname.is_empty() {
+                return None;
+            }
+            Some(eh_row(&[
+                ("timestamp", start),
+                ("program_name", pname),
+                ("program_path", app_path),
+                ("user", String::new()),
+                ("source_artifact", "WER".into()),
+                ("record_key", r.get("record_key").cloned().unwrap_or_default()),
+            ]))
+        })
+        .collect()
+}
+
 pub fn build_execution_history(out_dir: &Path) -> Vec<Row> {
     let registry = RegistryOverviewCache::load(out_dir);
     build_execution_history_with_registry(out_dir, &registry)
@@ -4028,6 +4228,7 @@ pub fn build_execution_history_with_registry(
     // 에서 그 단서와 함께 표시한다.
     rows.extend(eh_from_prefetch(out_dir));
     rows.extend(eh_from_timeline(out_dir));
+    rows.extend(eh_from_wer(out_dir));
     rows
 }
 
@@ -6354,6 +6555,53 @@ mod tests {
         assert_eq!(r["source"], "EventLog");
         assert_eq!(r["record_key"], "Application::10");
         assert!(r["report"].contains("APPCRASH"));
+    }
+
+    /// 이름 없는 `<Data>값</Data>` 시퀀스로 기록된 1001도 표준 순서로
+    /// AppName·EventType이 채워져 "(이름 없음)"으로 남지 않는다.
+    #[test]
+    fn wer_reports_map_unnamed_eventdata_array() {
+        let mk = |provider: &str, eid: &str, ed: serde_json::Value, key: &str| {
+            let mut r = Row::new();
+            r.insert("Provider".into(), provider.into());
+            r.insert("EventID".into(), eid.into());
+            r.insert("timestamp".into(), "2026-06-22 10:31:12.334".into());
+            r.insert("_record_key".into(), key.into());
+            r.insert("_source_file".into(), "Application.evtx".into());
+            r.insert("EventData".into(), ed.to_string());
+            r
+        };
+        // [2]=EventName, [5]=P1(앱), [8]=P4(모듈) — 앞쪽은 Bucket/Response/Cab.
+        let rows = vec![mk(
+            "Windows Error Reporting",
+            "1001",
+            serde_json::json!({"Data": {"#text": [
+                "", "0", "APPCRASH", "N/A", "0",
+                "app.exe", "1.0.0.0", "abcd1234", "mod.dll",
+                "10.0.0.0", "efef5678", "c0000005", "0000000000001234"
+            ]}}),
+            "Application::1",
+        )];
+        let out = build_wer_reports_with_events(
+            Path::new("/nonexistent-wer-unnamed-fixture"),
+            &EventLogOverviewCache::from_rows_for_tests(rows),
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["EventType"], "APPCRASH");
+        assert_eq!(out[0]["AppName"], "app.exe");
+    }
+
+    /// AppSessionGuid → (PID, 프로세스 생성 FILETIME) 디코딩 검증.
+    /// 앞 8자리 hex = PID, 마지막 두 그룹(8바이트) = FILETIME little-endian.
+    #[test]
+    fn app_session_guid_decodes_pid_and_start_time() {
+        let (pid, start) =
+            decode_app_session_guid("000011e8-0000-0309-6189-bef9f6f7dc01").unwrap();
+        assert_eq!(pid, 4584);
+        // 마지막 두 그룹 6189-bef9f6f7dc01 → FILETIME 0x01dcf7f6f9be8961 → 2026-06-09.
+        assert!(start.starts_with("2026-06-09"), "start={start}");
+        // 잘못된 형식은 None.
+        assert!(decode_app_session_guid("not-a-guid").is_none());
     }
 
     /// SessionID 재사용 회귀: 세션 종료(23) 뒤 같은 SessionID로 다른 사용자가

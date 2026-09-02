@@ -331,6 +331,60 @@ export interface TimelineEntry {
   columns: string[];
 }
 
+/** 백엔드 sqlite로 materialize된 마스터 타임라인 — 검색·필터·정렬·페이지를
+ * SQL로 처리해 프런트가 전체 엔트리를 메모리에 상주시키지 않는다. */
+export interface TimelineMeta {
+  exists: boolean;
+  builtForRunAt: string;
+  logicVersion: number;
+  total: number;
+}
+export interface TimelineFacetCount {
+  key: string;
+  count: number;
+}
+export interface TimelineTableFacet {
+  artifactGroup: string;
+  sourceTable: string;
+  category: string;
+  count: number;
+}
+export interface TimelineFacets {
+  tables: TimelineTableFacet[];
+  execSources: TimelineFacetCount[];
+  browserKinds: TimelineFacetCount[];
+}
+export interface TimelineQuery {
+  search?: string;
+  hiddenSourceTables?: string[];
+  hiddenExecSources?: string[];
+  hiddenBrowserKinds?: string[];
+  onlySuspicious?: boolean;
+  start?: string;
+  end?: string;
+  /** true = 최신 먼저(내림차순). */
+  sortDesc?: boolean;
+  offset: number;
+  limit: number;
+}
+/** 페이지가 실어오는 경량 타임라인 행 — 원본 값 전체는 rowJson에 담겨 상세/
+ * 태그 재계산에 쓰이고, 페이지당 100행만 메모리에 있다. */
+export interface TimelinePageRow {
+  ts: string;
+  category: string;
+  sourceTable: string;
+  artifactGroup: string;
+  fullPath: string;
+  rowidSrc: number;
+  recordKey: string;
+  eventTime: string;
+  rowJson: string;
+}
+export interface TimelinePage {
+  rows: TimelinePageRow[];
+  total: number;
+}
+
 /** Resolves a detail-view link (e.g. "이 exe가 로드한 파일") to the actual
  * matching rows in the target table, so they can be shown inline instead of
  * navigating away. Returns null if the target table isn't found. */
@@ -514,6 +568,15 @@ export interface ElectronApi {
   // 직렬화만으로 메인 스레드가 수십 초 멈춘다. 캐시가 없으면 빈 버퍼.
   saveMasterTimeline(hostDir: string, payload: string): Promise<void>;
   loadMasterTimeline(hostDir: string): Promise<ArrayBuffer>;
+  /** sqlite 타임라인 스트리밍 빌드 — begin → (insert · drain)* → finish/abort. */
+  masterTimelineBuildBegin(hostDir: string, token: string, builtForRunAt: string): Promise<void>;
+  masterTimelineBuildInsert(hostDir: string, token: string, ndjson: string): Promise<void>;
+  masterTimelineBuildDrain(token: string): Promise<void>;
+  masterTimelineBuildFinish(hostDir: string, token: string): Promise<void>;
+  masterTimelineBuildAbort(hostDir: string, token: string): Promise<void>;
+  masterTimelineMeta(hostDir: string): Promise<TimelineMeta>;
+  masterTimelineFacets(hostDir: string): Promise<TimelineFacets>;
+  masterTimelinePage(hostDir: string, query: TimelineQuery): Promise<TimelinePage>;
   listResultFiles(categoryDir: string): Promise<ResultFileEntry[]>;
   /** Rebuilds only a legacy ExecutionHistory overview to add raw record links. */
   refreshExecutionHistoryOverview(hostDir: string): Promise<boolean>;

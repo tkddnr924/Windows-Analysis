@@ -185,6 +185,8 @@ fn clear_previous_results(live_dir: &Path, only: Option<&HashSet<String>>) -> Re
     // 통합 타임라인 캐시는 매 실행 재생성된다 — 지운 facts와 어긋난 이전
     // 캐시가 남지 않게 함께 제거한다.
     let _ = std::fs::remove_file(live_dir.join("_master_timeline.cache.json"));
+    // 스트리밍 빌드가 만드는 sqlite 타임라인도 함께 무효화한다(첫 열람 시 재빌드).
+    let _ = std::fs::remove_file(live_dir.join("_master_timeline.sqlite"));
     Ok(())
 }
 

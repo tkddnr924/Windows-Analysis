@@ -1374,6 +1374,594 @@ async fn load_master_timeline(host_dir: String) -> tauri::ipc::Response {
     .unwrap_or_else(|_| tauri::ipc::Response::new(Vec::new()))
 }
 
+// --- 마스터 타임라인 sqlite materialize: 스트리밍 빌드 + 페이지 쿼리 ---
+// 타임라인을 프런트 메모리에 전량 상주시키지 않도록, 각 결과 테이블을 청크로
+// 변환해 이 sqlite로 흘려 넣고(빌드) 이후 검색·필터·정렬·페이지를 SQL로
+// 조회한다. 빌드 세션은 save_master_timeline_* 청크 프로토콜과 같은 구조
+// (raw 청크 + 워커 쓰기 + drain)를 따르되, 파일 append 대신 트랜잭션 insert다.
+
+/// 구조 로직(필터키·검색 blob·include 규칙) 버전. 규칙이 바뀌면 올려 재빌드 유도.
+const TIMELINE_LOGIC_VERSION: i64 = 1;
+
+fn timeline_db_path(host_dir: &str) -> PathBuf {
+    Path::new(host_dir).join("_master_timeline.sqlite")
+}
+fn timeline_db_building_path(host_dir: &str, token: &str) -> PathBuf {
+    Path::new(host_dir).join(format!("_master_timeline.sqlite.building-{token}"))
+}
+
+const TIMELINE_SCHEMA: &str = "CREATE TABLE master_timeline (\
+ ts TEXT NOT NULL, category TEXT NOT NULL, source_table TEXT NOT NULL,\
+ artifact_group TEXT NOT NULL, filter_key TEXT NOT NULL DEFAULT '',\
+ has_tags INTEGER NOT NULL, full_path TEXT NOT NULL, rowid_src INTEGER NOT NULL,\
+ record_key TEXT NOT NULL DEFAULT '', event_time TEXT NOT NULL DEFAULT '',\
+ search_blob TEXT NOT NULL, row_json TEXT NOT NULL);\
+ CREATE TABLE _meta (key TEXT PRIMARY KEY, value TEXT);";
+
+#[derive(serde::Deserialize)]
+struct TimelineInsertRow {
+    ts: String,
+    category: String,
+    source_table: String,
+    artifact_group: String,
+    #[serde(default)]
+    filter_key: String,
+    has_tags: i64,
+    full_path: String,
+    rowid_src: i64,
+    #[serde(default)]
+    record_key: String,
+    #[serde(default)]
+    event_time: String,
+    search_blob: String,
+    row_json: String,
+}
+
+struct TimelineBuildSession {
+    conn: rusqlite::Connection,
+    host_dir: String,
+    building_path: PathBuf,
+    pending: usize,
+    error: Option<String>,
+}
+type TimelineBuildHandle = std::sync::Arc<(Mutex<TimelineBuildSession>, std::sync::Condvar)>;
+fn timeline_build_sessions(
+) -> &'static Mutex<std::collections::HashMap<String, TimelineBuildHandle>> {
+    static SESSIONS: OnceLock<Mutex<std::collections::HashMap<String, TimelineBuildHandle>>> =
+        OnceLock::new();
+    SESSIONS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+fn timeline_build_begin_impl(
+    host_dir: &str,
+    token: &str,
+    built_for_run_at: &str,
+) -> Result<(), String> {
+    // 중단된 이전 빌드의 임시 DB·세션 정리 (호스트당 단일 빌더 전제).
+    if let Ok(rd) = std::fs::read_dir(host_dir) {
+        for e in rd.flatten() {
+            if e.file_name()
+                .to_string_lossy()
+                .starts_with("_master_timeline.sqlite.building-")
+            {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+    if let Ok(mut sessions) = timeline_build_sessions().lock() {
+        sessions.retain(|_, handle| {
+            handle.0.lock().map(|s| s.host_dir != host_dir).unwrap_or(true)
+        });
+    }
+    let building = timeline_db_building_path(host_dir, token);
+    let conn = rusqlite::Connection::open(&building)
+        .map_err(|e| format!("타임라인 임시 DB 생성 실패: {e}"))?;
+    conn.execute_batch("PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF;")
+        .map_err(|e| format!("타임라인 DB 설정 실패: {e}"))?;
+    conn.execute_batch(TIMELINE_SCHEMA)
+        .map_err(|e| format!("타임라인 스키마 생성 실패: {e}"))?;
+    conn.execute(
+        "INSERT INTO _meta (key, value) VALUES ('built_for_run_at', ?1), ('logic_version', ?2)",
+        rusqlite::params![built_for_run_at, TIMELINE_LOGIC_VERSION.to_string()],
+    )
+    .map_err(|e| format!("타임라인 메타 기록 실패: {e}"))?;
+    if let Ok(mut sessions) = timeline_build_sessions().lock() {
+        sessions.insert(
+            token.to_string(),
+            std::sync::Arc::new((
+                Mutex::new(TimelineBuildSession {
+                    conn,
+                    host_dir: host_dir.to_string(),
+                    building_path: building,
+                    pending: 0,
+                    error: None,
+                }),
+                std::sync::Condvar::new(),
+            )),
+        );
+    }
+    Ok(())
+}
+
+/// 메인 커맨드에서 호출: 세션 확인·pending 증가까지만 하고 실제 insert는
+/// 워커 스레드로 넘긴다(느린 저장 매체가 이벤트 루프를 막지 않게). 순서는
+/// 프런트의 배치당 drain await가 보장한다.
+fn timeline_build_insert_impl(
+    host_dir: &str,
+    token: &str,
+    rows: Vec<TimelineInsertRow>,
+) -> Result<(), String> {
+    let handle = timeline_build_sessions()
+        .lock()
+        .ok()
+        .and_then(|s| s.get(token).cloned())
+        .ok_or_else(|| "타임라인 빌드 세션이 없습니다".to_string())?;
+    {
+        let mut session = handle.0.lock().map_err(|_| "빌드 세션 잠금 실패".to_string())?;
+        if session.host_dir != host_dir {
+            return Err("타임라인 빌드 세션의 호스트 경로가 일치하지 않습니다".to_string());
+        }
+        if let Some(error) = &session.error {
+            return Err(error.clone());
+        }
+        if session.pending > 0 {
+            return Err("이전 배치 쓰기가 끝나지 않았습니다 — drain 후 전송해야 합니다".to_string());
+        }
+        session.pending += 1;
+    }
+    let worker = handle.clone();
+    std::thread::spawn(move || {
+        let result = (|| -> Result<(), String> {
+            let mut session = worker.0.lock().map_err(|_| "빌드 세션 잠금 실패".to_string())?;
+            let tx = session
+                .conn
+                .transaction()
+                .map_err(|e| format!("타임라인 트랜잭션 실패: {e}"))?;
+            {
+                let mut stmt = tx
+                    .prepare_cached(
+                        "INSERT INTO master_timeline (ts,category,source_table,artifact_group,filter_key,has_tags,full_path,rowid_src,record_key,event_time,search_blob,row_json) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                    )
+                    .map_err(|e| format!("타임라인 insert 준비 실패: {e}"))?;
+                for r in &rows {
+                    stmt.execute(rusqlite::params![
+                        r.ts, r.category, r.source_table, r.artifact_group, r.filter_key,
+                        r.has_tags, r.full_path, r.rowid_src, r.record_key, r.event_time,
+                        r.search_blob, r.row_json
+                    ])
+                    .map_err(|e| format!("타임라인 insert 실패: {e}"))?;
+                }
+            }
+            tx.commit().map_err(|e| format!("타임라인 커밋 실패: {e}"))?;
+            Ok(())
+        })();
+        if let Ok(mut session) = worker.0.lock() {
+            session.pending = session.pending.saturating_sub(1);
+            if let Err(error) = result {
+                session.error.get_or_insert(error);
+            }
+        }
+        worker.1.notify_all();
+    });
+    Ok(())
+}
+
+fn timeline_build_wait_impl(token: &str) -> Result<(), String> {
+    let handle = timeline_build_sessions()
+        .lock()
+        .ok()
+        .and_then(|s| s.get(token).cloned())
+        .ok_or_else(|| "타임라인 빌드 세션이 없습니다".to_string())?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    let mut session = handle.0.lock().map_err(|_| "빌드 세션 잠금 실패".to_string())?;
+    while session.pending > 0 && session.error.is_none() {
+        if std::time::Instant::now() >= deadline {
+            return Err("타임라인 빌드 시간 초과".to_string());
+        }
+        let (next, _) = handle
+            .1
+            .wait_timeout(session, std::time::Duration::from_millis(500))
+            .map_err(|_| "빌드 세션 잠금 실패".to_string())?;
+        session = next;
+    }
+    match &session.error {
+        Some(error) => Err(error.clone()),
+        None => Ok(()),
+    }
+}
+
+fn timeline_build_finish_impl(host_dir: &str, token: &str) -> Result<(), String> {
+    {
+        let handle = timeline_build_sessions()
+            .lock()
+            .ok()
+            .and_then(|s| s.get(token).cloned())
+            .ok_or_else(|| "타임라인 빌드 세션이 없습니다".to_string())?;
+        let session = handle.0.lock().map_err(|_| "빌드 세션 잠금 실패".to_string())?;
+        if session.host_dir != host_dir {
+            return Err("타임라인 빌드 세션의 호스트 경로가 일치하지 않습니다".to_string());
+        }
+    }
+    timeline_build_wait_impl(token)?;
+    // bulk insert가 끝난 뒤 인덱스를 만든다(insert 속도).
+    let building = {
+        let handle = timeline_build_sessions()
+            .lock()
+            .ok()
+            .and_then(|s| s.get(token).cloned())
+            .ok_or_else(|| "타임라인 빌드 세션이 없습니다".to_string())?;
+        let session = handle.0.lock().map_err(|_| "빌드 세션 잠금 실패".to_string())?;
+        session
+            .conn
+            .execute_batch(
+                "CREATE INDEX ix_ts ON master_timeline(ts); CREATE INDEX ix_group ON master_timeline(artifact_group);",
+            )
+            .map_err(|e| format!("타임라인 인덱스 생성 실패: {e}"))?;
+        session.building_path.clone()
+    };
+    // 세션 제거 → conn drop(파일 닫힘) → 원자 rename.
+    if let Ok(mut sessions) = timeline_build_sessions().lock() {
+        sessions.remove(token);
+    }
+    std::fs::rename(&building, timeline_db_path(host_dir))
+        .map_err(|e| format!("타임라인 DB 확정 실패: {e}"))
+}
+
+fn timeline_build_abort_impl(host_dir: &str, token: &str) {
+    if let Ok(mut sessions) = timeline_build_sessions().lock() {
+        sessions.remove(token);
+    }
+    let _ = std::fs::remove_file(timeline_db_building_path(host_dir, token));
+}
+
+#[tauri::command]
+async fn master_timeline_build_begin(
+    host_dir: String,
+    token: String,
+    built_for_run_at: String,
+) -> Result<(), String> {
+    if !valid_saving_token(&token) {
+        return Err("타임라인 빌드 토큰이 잘못되었습니다".to_string());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        timeline_build_begin_impl(&host_dir, &token, &built_for_run_at)
+    })
+    .await
+    .map_err(|e| format!("타임라인 빌드 시작 작업이 중단되었습니다: {e}"))?
+}
+
+/// 줄바꿈 구분 JSON(NDJSON) 행 배치를 문자열 인자로 받는다. (raw 바이트 IPC는
+/// 이 환경에서 custom protocol 로드 실패로 동작하지 않아 문자열 IPC를 쓴다.
+/// 배치는 프런트에서 ~4MB로 제한돼 인자 역직렬화 부담이 작다.)
+#[tauri::command]
+async fn master_timeline_build_insert(
+    host_dir: String,
+    token: String,
+    ndjson: String,
+) -> Result<(), String> {
+    if !valid_saving_token(&token) {
+        return Err("타임라인 빌드 토큰이 잘못되었습니다".to_string());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let rows: Vec<TimelineInsertRow> = ndjson
+            .split('\n')
+            .filter(|line| !line.trim().is_empty())
+            .map(serde_json::from_str)
+            .collect::<Result<_, _>>()
+            .map_err(|e| format!("타임라인 빌드 행 파싱 실패: {e}"))?;
+        timeline_build_insert_impl(&host_dir, &token, rows)
+    })
+    .await
+    .map_err(|e| format!("타임라인 빌드 작업이 중단되었습니다: {e}"))?
+}
+
+#[tauri::command]
+async fn master_timeline_build_drain(token: String) -> Result<(), String> {
+    if !valid_saving_token(&token) {
+        return Err("타임라인 빌드 토큰이 잘못되었습니다".to_string());
+    }
+    tauri::async_runtime::spawn_blocking(move || timeline_build_wait_impl(&token))
+        .await
+        .map_err(|e| format!("타임라인 빌드 작업이 중단되었습니다: {e}"))?
+}
+
+#[tauri::command]
+async fn master_timeline_build_finish(host_dir: String, token: String) -> Result<(), String> {
+    if !valid_saving_token(&token) {
+        return Err("타임라인 빌드 토큰이 잘못되었습니다".to_string());
+    }
+    tauri::async_runtime::spawn_blocking(move || timeline_build_finish_impl(&host_dir, &token))
+        .await
+        .map_err(|e| format!("타임라인 빌드 작업이 중단되었습니다: {e}"))?
+}
+
+#[tauri::command]
+async fn master_timeline_build_abort(host_dir: String, token: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        timeline_build_abort_impl(&host_dir, &token);
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("타임라인 빌드 작업이 중단되었습니다: {e}"))?
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TimelineMeta {
+    exists: bool,
+    built_for_run_at: String,
+    logic_version: i64,
+    total: i64,
+}
+
+fn timeline_meta_impl(host_dir: &str) -> TimelineMeta {
+    let empty = || TimelineMeta {
+        exists: false,
+        built_for_run_at: String::new(),
+        logic_version: 0,
+        total: 0,
+    };
+    let path = timeline_db_path(host_dir);
+    if !path.exists() {
+        return empty();
+    }
+    let conn = match open_ro(&path.to_string_lossy()) {
+        Ok(c) => c,
+        Err(_) => return empty(),
+    };
+    let meta = |key: &str| -> String {
+        conn.query_row("SELECT value FROM _meta WHERE key=?1", [key], |r| r.get(0))
+            .unwrap_or_default()
+    };
+    let total: i64 = conn
+        .query_row("SELECT COUNT(*) FROM master_timeline", [], |r| r.get(0))
+        .unwrap_or(0);
+    TimelineMeta {
+        exists: true,
+        built_for_run_at: meta("built_for_run_at"),
+        logic_version: meta("logic_version").parse().unwrap_or(0),
+        total,
+    }
+}
+
+#[tauri::command]
+async fn master_timeline_meta(host_dir: String) -> TimelineMeta {
+    tauri::async_runtime::spawn_blocking(move || timeline_meta_impl(&host_dir))
+        .await
+        .unwrap_or(TimelineMeta {
+            exists: false,
+            built_for_run_at: String::new(),
+            logic_version: 0,
+            total: 0,
+        })
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TimelineFacetCount {
+    key: String,
+    count: i64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TimelineTableFacet {
+    artifact_group: String,
+    source_table: String,
+    category: String,
+    count: i64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TimelineFacets {
+    tables: Vec<TimelineTableFacet>,
+    exec_sources: Vec<TimelineFacetCount>,
+    browser_kinds: Vec<TimelineFacetCount>,
+}
+
+fn timeline_facets_impl(host_dir: &str) -> Result<TimelineFacets, String> {
+    let conn = open_ro(&timeline_db_path(host_dir).to_string_lossy())
+        .map_err(|_| "타임라인 DB를 열 수 없습니다".to_string())?;
+    let tables = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT artifact_group, source_table, category, COUNT(*) FROM master_timeline \
+                 GROUP BY artifact_group, source_table, category ORDER BY artifact_group, source_table",
+            )
+            .map_err(|e| format!("타임라인 패싯 조회 실패: {e}"))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(TimelineTableFacet {
+                    artifact_group: r.get(0)?,
+                    source_table: r.get(1)?,
+                    category: r.get(2)?,
+                    count: r.get(3)?,
+                })
+            })
+            .map_err(|e| format!("타임라인 패싯 조회 실패: {e}"))?;
+        rows.filter_map(|r| r.ok()).collect::<Vec<_>>()
+    };
+    let facet_by_key = |conn: &rusqlite::Connection, source: &str| -> Vec<TimelineFacetCount> {
+        conn.prepare(
+            "SELECT filter_key, COUNT(*) FROM master_timeline \
+             WHERE source_table=?1 AND filter_key<>'' GROUP BY filter_key ORDER BY COUNT(*) DESC",
+        )
+        .and_then(|mut stmt| {
+            let rows = stmt.query_map([source], |r| {
+                Ok(TimelineFacetCount {
+                    key: r.get(0)?,
+                    count: r.get(1)?,
+                })
+            })?;
+            Ok(rows.filter_map(|r| r.ok()).collect::<Vec<_>>())
+        })
+        .unwrap_or_default()
+    };
+    Ok(TimelineFacets {
+        tables,
+        exec_sources: facet_by_key(&conn, "ExecutionHistory"),
+        browser_kinds: facet_by_key(&conn, "BrowserActivity"),
+    })
+}
+
+#[tauri::command]
+async fn master_timeline_facets(host_dir: String) -> Result<TimelineFacets, String> {
+    tauri::async_runtime::spawn_blocking(move || timeline_facets_impl(&host_dir))
+        .await
+        .map_err(|e| format!("타임라인 패싯 작업이 중단되었습니다: {e}"))?
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TimelineQuery {
+    #[serde(default)]
+    search: String,
+    #[serde(default)]
+    hidden_source_tables: Vec<String>,
+    #[serde(default)]
+    hidden_exec_sources: Vec<String>,
+    #[serde(default)]
+    hidden_browser_kinds: Vec<String>,
+    #[serde(default)]
+    only_suspicious: bool,
+    #[serde(default)]
+    start: String,
+    #[serde(default)]
+    end: String,
+    #[serde(default)]
+    sort_desc: bool,
+    offset: i64,
+    limit: i64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TimelinePageRow {
+    ts: String,
+    category: String,
+    source_table: String,
+    artifact_group: String,
+    full_path: String,
+    rowid_src: i64,
+    record_key: String,
+    event_time: String,
+    row_json: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TimelinePage {
+    rows: Vec<TimelinePageRow>,
+    total: i64,
+}
+
+fn timeline_page_impl(host_dir: &str, query: TimelineQuery) -> Result<TimelinePage, String> {
+    let conn = open_ro(&timeline_db_path(host_dir).to_string_lossy())
+        .map_err(|_| "타임라인 DB를 열 수 없습니다".to_string())?;
+    let limit = query.limit.clamp(1, 1000);
+    let offset = query.offset.max(0);
+    let mut clauses: Vec<String> = Vec::new();
+    let mut params: Vec<String> = Vec::new();
+    let in_clause = |clauses: &mut Vec<String>,
+                         params: &mut Vec<String>,
+                         values: &[String],
+                         wrap: &dyn Fn(&str) -> String| {
+        if values.is_empty() {
+            return;
+        }
+        let placeholders: Vec<String> = values
+            .iter()
+            .map(|value| {
+                params.push(value.clone());
+                format!("?{}", params.len())
+            })
+            .collect();
+        clauses.push(wrap(&placeholders.join(",")));
+    };
+    in_clause(&mut clauses, &mut params, &query.hidden_source_tables, &|ph| {
+        format!("source_table NOT IN ({ph})")
+    });
+    in_clause(&mut clauses, &mut params, &query.hidden_exec_sources, &|ph| {
+        format!("NOT (source_table='ExecutionHistory' AND filter_key IN ({ph}))")
+    });
+    in_clause(&mut clauses, &mut params, &query.hidden_browser_kinds, &|ph| {
+        format!("NOT (source_table='BrowserActivity' AND filter_key IN ({ph}))")
+    });
+    if query.only_suspicious {
+        clauses.push("has_tags=1".to_string());
+    }
+    if !query.start.trim().is_empty() {
+        params.push(query.start.trim().to_string());
+        clauses.push(format!("ts >= ?{}", params.len()));
+    }
+    if !query.end.trim().is_empty() {
+        params.push(query.end.trim().to_string());
+        clauses.push(format!("ts <= ?{}", params.len()));
+    }
+    if !query.search.trim().is_empty() {
+        // 검색 blob은 소문자로 저장돼 있으므로 검색어도 소문자화하고, LIKE
+        // 와일드카드(%,_)와 이스케이프 문자는 리터럴로 처리해 현재 프런트의
+        // 부분 문자열 검색과 의미를 맞춘다.
+        let escaped = query
+            .search
+            .trim()
+            .to_lowercase()
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        params.push(format!("%{escaped}%"));
+        clauses.push(format!("search_blob LIKE ?{} ESCAPE '\\'", params.len()));
+    }
+    let where_clause = if clauses.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", clauses.join(" AND "))
+    };
+    let refs: Vec<&dyn rusqlite::ToSql> =
+        params.iter().map(|value| value as &dyn rusqlite::ToSql).collect();
+    let total: i64 = conn
+        .query_row(
+            &format!("SELECT COUNT(*) FROM master_timeline{where_clause}"),
+            refs.as_slice(),
+            |r| r.get(0),
+        )
+        .map_err(|e| format!("타임라인 건수 조회 실패: {e}"))?;
+    let dir = if query.sort_desc { "DESC" } else { "ASC" };
+    let sql = format!(
+        "SELECT ts,category,source_table,artifact_group,full_path,rowid_src,record_key,event_time,row_json \
+         FROM master_timeline{where_clause} ORDER BY ts {dir}, source_table, rowid_src LIMIT {limit} OFFSET {offset}"
+    );
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| format!("타임라인 페이지 조회 실패: {e}"))?;
+    let rows = stmt
+        .query_map(refs.as_slice(), |r| {
+            Ok(TimelinePageRow {
+                ts: r.get(0)?,
+                category: r.get(1)?,
+                source_table: r.get(2)?,
+                artifact_group: r.get(3)?,
+                full_path: r.get(4)?,
+                rowid_src: r.get(5)?,
+                record_key: r.get(6)?,
+                event_time: r.get(7)?,
+                row_json: r.get(8)?,
+            })
+        })
+        .map_err(|e| format!("타임라인 페이지 조회 실패: {e}"))?
+        .filter_map(|r| r.ok())
+        .collect::<Vec<_>>();
+    Ok(TimelinePage { rows, total })
+}
+
+#[tauri::command]
+async fn master_timeline_page(host_dir: String, query: TimelineQuery) -> Result<TimelinePage, String> {
+    tauri::async_runtime::spawn_blocking(move || timeline_page_impl(&host_dir, query))
+        .await
+        .map_err(|e| format!("타임라인 페이지 작업이 중단되었습니다: {e}"))?
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ResultFileEntry {
@@ -3375,10 +3963,15 @@ fn list_column_values_blocking(
     if !table_columns(&conn, &table).contains(&column) {
         return vec![];
     }
+    // 필터 드롭다운은 최빈값 상위 N개만 필요하다. 고카디널리티 컬럼(MFT path,
+    // timestamp 등)은 고유값이 수십만이라 전량을 IPC로 실으면 웹뷰 메모리가
+    // 커지므로 상위 빈도만 잘라 보낸다 — 그 밖의 값은 검색으로 찾는다.
+    const LIST_COLUMN_VALUES_MAX: usize = 2000;
     let sql = format!(
-        "SELECT {c} AS value, COUNT(*) AS count FROM {t} GROUP BY {c} ORDER BY count DESC",
+        "SELECT {c} AS value, COUNT(*) AS count FROM {t} GROUP BY {c} ORDER BY count DESC LIMIT {lim}",
         c = q(&column),
-        t = q(&table)
+        t = q(&table),
+        lim = LIST_COLUMN_VALUES_MAX,
     );
     let mut stmt = match conn.prepare(&sql) {
         Ok(s) => s,
@@ -8249,6 +8842,14 @@ fn main() {
             save_master_timeline_drain,
             save_master_timeline_finish,
             load_master_timeline,
+            master_timeline_build_begin,
+            master_timeline_build_insert,
+            master_timeline_build_drain,
+            master_timeline_build_finish,
+            master_timeline_build_abort,
+            master_timeline_meta,
+            master_timeline_facets,
+            master_timeline_page,
             list_result_files,
             refresh_execution_history_overview,
             account_directory,

@@ -8,8 +8,9 @@ import BookmarkBorderIcon from "@mui/icons-material/BookmarkBorder";
 import BookmarkIcon from "@mui/icons-material/Bookmark";
 import BugReportOutlinedIcon from "@mui/icons-material/BugReportOutlined";
 import HourglassEmptyOutlinedIcon from "@mui/icons-material/HourglassEmptyOutlined";
-import type { FetchLinkedRows, TimelineEntry } from "@/lib/types";
-import { inRange, rangeActive as globalRangeActive, type TimeRange } from "@/lib/timeRange";
+import type { FetchLinkedRows, TimelineEntry, TimelineFacets, TimelinePageRow, TimelineQuery } from "@/lib/types";
+import { rangeActive as globalRangeActive, type TimeRange } from "@/lib/timeRange";
+import { EXECUTION_SOURCE_LABELS, BROWSER_KIND_LABEL } from "@/lib/timelineKeys";
 import ReportProblemOutlinedIcon from "@mui/icons-material/ReportProblemOutlined";
 import TaskOutlinedIcon from "@mui/icons-material/TaskOutlined";
 import BoltOutlinedIcon from "@mui/icons-material/BoltOutlined";
@@ -160,38 +161,6 @@ function timelineTileIcon(category: string, table: string) {
   return TimelineOutlinedIcon2;
 }
 
-const EXECUTION_SOURCE_LABELS: Record<string, string> = {
-  amcache: "Amcache",
-  userassist: "UserAssist",
-  prefetch: "Prefetch",
-  srum: "SRUM",
-  bam: "BAM",
-  other: "기타",
-};
-
-function executionSourceKey(row: Record<string, string>): string {
-  const source = (row.source_artifact || "").trim().toLowerCase();
-  if (source.startsWith("amcache")) return "amcache";
-  if (source === "userassist") return "userassist";
-  if (source === "prefetch") return "prefetch";
-  if (source === "srum") return "srum";
-  if (source === "bam") return "bam";
-  return "other";
-}
-
-function browserActivityKindKey(row: Record<string, string>): string {
-  const kind = (row.kind || "").trim().toLowerCase();
-  if (kind === "visit" || kind === "download" || kind === "cache") return kind;
-  return "other";
-}
-
-const BROWSER_KIND_LABEL: Record<string, string> = {
-  visit: "BrowserActivity:Visit",
-  download: "BrowserActivity:Download",
-  cache: "BrowserActivity:Cache",
-  other: "BrowserActivity:기타",
-};
-
 function ArtifactFilterCheckbox({
   label,
   checked,
@@ -254,8 +223,8 @@ function ArtifactFilterCheckbox({
 }
 
 interface MasterTimelineProps {
-  entries: TimelineEntry[] | null;
-  loading: boolean;
+  /** 이 호스트의 sqlite 타임라인을 페이지 쿼리로 조회한다. */
+  hostDir: string;
   onNavigate: (targetFile: string, targetColumn: string, value: string) => void;
   onFetchLinkedRows: FetchLinkedRows;
   /** Resolves direct and source-linked bookmarks for an entry. */
@@ -266,7 +235,32 @@ interface MasterTimelineProps {
   accountDirectory?: AccountDirectory;
 }
 
-export default function MasterTimeline({ entries, loading, onNavigate, onFetchLinkedRows, isBookmarked, onToggleBookmark, globalTimeRange, accountDirectory }: MasterTimelineProps) {
+// 페이지 행(경량 + 원본 row_json)을 렌더용 엔트리로 — row_json을 파싱해 기존
+// row 기반 표현·태그·상세 로직을 100행에만 그대로 재사용한다.
+function pageRowToEntry(r: TimelinePageRow): TimelineEntry {
+  let row: Record<string, string> = {};
+  try {
+    row = JSON.parse(r.rowJson) as Record<string, string>;
+  } catch {
+    /* 손상된 행은 빈 값으로 — 시각·카테고리는 그래도 표시된다. */
+  }
+  const columns = Object.keys(row);
+  const spec = resolveArtifactView(r.sourceTable, columns);
+  return {
+    timestamp: r.ts,
+    category: r.category,
+    table: r.sourceTable,
+    summary: "",
+    subtitle: "",
+    tags: spec?.tags?.(row) ?? [],
+    rowid: r.rowidSrc,
+    fullPath: r.fullPath,
+    row,
+    columns,
+  };
+}
+
+export default function MasterTimeline({ hostDir, onNavigate, onFetchLinkedRows, isBookmarked, onToggleBookmark, globalTimeRange, accountDirectory }: MasterTimelineProps) {
   const [page, setPage] = useState(0);
   const [sortDir, setSortDir] = useState<"asc" | "desc">("asc");
   const [hiddenTables, setHiddenTables] = useState<Set<string>>(new Set());
@@ -276,65 +270,120 @@ export default function MasterTimeline({ entries, loading, onNavigate, onFetchLi
   const [selectedEntry, setSelectedEntry] = useState<TimelineEntry | null>(null);
   const [onlySuspicious, setOnlySuspicious] = useState(false);
   const [search, setSearch] = useState("");
-  const allRows = entries ?? [];
+  const [debouncedSearch, setDebouncedSearch] = useState("");
+  const [facets, setFacets] = useState<TimelineFacets | null>(null);
+  const [pageData, setPageData] = useState<{ rows: TimelineEntry[]; total: number }>({ rows: [], total: 0 });
+  const [loading, setLoading] = useState(true);
+
+  // 검색어 디바운스 — 타이핑마다 쿼리하지 않는다.
+  useEffect(() => {
+    const timer = setTimeout(() => setDebouncedSearch(search), 250);
+    return () => clearTimeout(timer);
+  }, [search]);
+
+  // 아티팩트 필터 메뉴용 패싯(그룹·소스·건수) — 호스트당 1회.
+  useEffect(() => {
+    let cancelled = false;
+    void window.api
+      .masterTimelineFacets(hostDir)
+      .then((f) => {
+        if (!cancelled) setFacets(f);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [hostDir]);
+
+  const globalActive = globalRangeActive(globalTimeRange);
+  // Set은 렌더마다 새 참조라 deps로 못 쓴다 — 정렬된 문자열 키로 안정화한다.
+  const hiddenTablesKey = [...hiddenTables].sort().join(",");
+  const hiddenExecKey = [...hiddenExecutionSources].sort().join(",");
+  const hiddenBrowserKey = [...hiddenBrowserKinds].sort().join(",");
+
+  // 필터·정렬·검색·페이지·기간이 바뀔 때마다 백엔드에서 그 페이지만 조회한다.
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    const query: TimelineQuery = {
+      search: debouncedSearch.trim(),
+      hiddenSourceTables: [...hiddenTables],
+      hiddenExecSources: [...hiddenExecutionSources],
+      hiddenBrowserKinds: [...hiddenBrowserKinds],
+      onlySuspicious,
+      start: globalActive ? globalTimeRange.start : "",
+      end: globalActive ? globalTimeRange.end : "",
+      sortDesc: sortDir === "desc",
+      offset: page * PAGE_SIZE,
+      limit: PAGE_SIZE,
+    };
+    void window.api
+      .masterTimelinePage(hostDir, query)
+      .then((res) => {
+        if (cancelled) return;
+        setPageData({ rows: res.rows.map(pageRowToEntry), total: res.total });
+        setLoading(false);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setPageData({ rows: [], total: 0 });
+        setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hostDir, page, sortDir, hiddenTablesKey, hiddenExecKey, hiddenBrowserKey, onlySuspicious, debouncedSearch, globalActive, globalTimeRange.start, globalTimeRange.end]);
 
   // EventLog is a single analyst-facing artifact even though it is stored as
   // several per-source tables (Security, System, Application, ...).
+  // 필터 메뉴는 백엔드 패싯(그룹·소스·건수)으로 구동한다 — 전체 행을
+  // 순회하지 않는다. EventLog 계열은 'EVENTLOG' 한 그룹으로 묶는다.
   const artifactControls = useMemo(() => {
     const m = new Map<string, { label: string; category: string; tables: string[] }>();
-    for (const entry of allRows) {
-      const isEventLog = normalizedArtifactKey(entry.category) === "EVENTLOG";
-      const key = isEventLog ? "EVENTLOG" : entry.table;
+    for (const t of facets?.tables ?? []) {
+      const isEventLog = normalizedArtifactKey(t.category) === "EVENTLOG";
+      const key = isEventLog ? "EVENTLOG" : t.sourceTable;
       const previous = m.get(key);
-      if (previous) previous.tables.push(entry.table);
-      else m.set(key, { label: artifactDisplayName(entry.category, entry.table), category: entry.category, tables: [entry.table] });
+      if (previous) previous.tables.push(t.sourceTable);
+      else m.set(key, { label: artifactDisplayName(t.category, t.sourceTable), category: t.category, tables: [t.sourceTable] });
     }
     return [...m.values()]
       .map((item) => ({ ...item, tables: [...new Set(item.tables)] }))
       .sort((a, b) => a.label.localeCompare(b.label));
-  }, [allRows]);
+  }, [facets]);
 
   const allArtifactTables = useMemo(
     () => [...new Set(artifactControls.flatMap(({ tables }) => tables))],
     [artifactControls],
   );
   const executionSources = useMemo(
-    () => [...new Set(allRows
-      .filter((entry) => entry.table === "ExecutionHistory")
-      .map((entry) => executionSourceKey(entry.row)))].sort((a, b) => (EXECUTION_SOURCE_LABELS[a] ?? a).localeCompare(EXECUTION_SOURCE_LABELS[b] ?? b)),
-    [allRows],
+    () =>
+      (facets?.execSources ?? [])
+        .map((f) => f.key)
+        .sort((a, b) => (EXECUTION_SOURCE_LABELS[a] ?? a).localeCompare(EXECUTION_SOURCE_LABELS[b] ?? b)),
+    [facets],
   );
-  const browserKinds = useMemo(() => {
-    const map = new Map<string, number>();
-    for (const entry of allRows) {
-      if (entry.table !== "BrowserActivity") continue;
-      const kind = browserActivityKindKey(entry.row);
-      map.set(kind, (map.get(kind) ?? 0) + 1);
-    }
+  const browserKinds = useMemo<Array<[string, number]>>(() => {
     const order: Array<string> = ["visit", "download", "cache", "other"];
-    return [...map.entries()].sort((a, b) => {
-      const ai = order.indexOf(a[0]);
-      const bi = order.indexOf(b[0]);
-      if (ai === -1 || bi === -1) return a[0].localeCompare(b[0]);
-      return ai - bi;
-    });
-  }, [allRows]);
+    return (facets?.browserKinds ?? [])
+      .map((f) => [f.key, f.count] as [string, number])
+      .sort((a, b) => {
+        const ai = order.indexOf(a[0]);
+        const bi = order.indexOf(b[0]);
+        if (ai === -1 || bi === -1) return a[0].localeCompare(b[0]);
+        return ai - bi;
+      });
+  }, [facets]);
   const artifactTableCounts = useMemo(() => {
     const map = new Map<string, number>();
-    for (const entry of allRows) {
-      map.set(entry.table, (map.get(entry.table) ?? 0) + 1);
-    }
+    for (const t of facets?.tables ?? []) map.set(t.sourceTable, (map.get(t.sourceTable) ?? 0) + t.count);
     return map;
-  }, [allRows]);
+  }, [facets]);
 
-  function isEntryHidden(entry: TimelineEntry) {
-    if (hiddenTables.has(entry.table)) return true;
-    if (entry.table === "ExecutionHistory" && hiddenExecutionSources.has(executionSourceKey(entry.row))) return true;
-    if (entry.table === "BrowserActivity" && hiddenBrowserKinds.has(browserActivityKindKey(entry.row))) return true;
-    return false;
-  }
-
-  const allArtifactsHidden = allRows.length > 0 && allRows.every(isEntryHidden);
+  // 필터가 모든 소스 테이블을 숨긴 상태 — 결과 0을 그 안내로 구분한다.
+  const allArtifactsHidden =
+    allArtifactTables.length > 0 && allArtifactTables.every((table) => hiddenTables.has(table));
 
   function toggleTables(tables: string[]) {
     const allVisible = tables.every((table) => !hiddenTables.has(table));
@@ -421,44 +470,22 @@ export default function MasterTimeline({ entries, loading, onNavigate, onFetchLi
     });
   }
 
-  const globalActive = globalRangeActive(globalTimeRange);
-  useEffect(() => setPage(0), [search, onlySuspicious, hiddenTables]);
-  const rows = useMemo(() => {
-    const needle = search.trim().toLowerCase();
-    const filtered = allRows.filter((e) => {
-      if (isEntryHidden(e)) return false;
-      if (onlySuspicious && e.tags.length === 0) return false;
-      if (globalActive && !inRange(e.timestamp, globalTimeRange)) return false;
-      if (needle) {
-        const haystack = [e.table, e.category, ...Object.values(e.row)].join("\u0000").toLowerCase();
-        if (!haystack.includes(needle)) return false;
-      }
-      return true;
-    });
-    // Timestamps are pre-formatted YYYY-MM-DD hh:mm:ss.fff, so string compare
-    // is chronological. Rows with no timestamp always sink to the bottom
-    // regardless of direction (they can't be placed on the timeline).
-    return [...filtered].sort((a, b) => {
-      if (!a.timestamp && !b.timestamp) return 0;
-      if (!a.timestamp) return 1;
-      if (!b.timestamp) return -1;
-      const cmp = a.timestamp < b.timestamp ? -1 : a.timestamp > b.timestamp ? 1 : 0;
-      return sortDir === "asc" ? cmp : -cmp;
-    });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [allRows, sortDir, hiddenTables, hiddenExecutionSources, hiddenBrowserKinds, globalActive, globalTimeRange, onlySuspicious, search]);
-
-  // 페이지 단위 표시(10건). 필터·정렬이 바뀌면 첫 페이지로 돌아간다.
-  const pageCount = Math.max(1, Math.ceil(rows.length / PAGE_SIZE));
+  // 결과는 백엔드에서 이미 검색·필터·정렬·페이지된 경량 행이다(전량 상주 없음).
+  const rows = pageData.rows;
+  const total = pageData.total;
+  const pageCount = Math.max(1, Math.ceil(total / PAGE_SIZE));
   const safePage = Math.min(page, pageCount - 1);
-  const pageRows = rows.slice(safePage * PAGE_SIZE, safePage * PAGE_SIZE + PAGE_SIZE);
-  const pageStart = rows.length === 0 ? 0 : safePage * PAGE_SIZE + 1;
-  const pageEnd = Math.min(rows.length, safePage * PAGE_SIZE + PAGE_SIZE);
+  const pageRows = rows;
+  const pageStart = total === 0 ? 0 : safePage * PAGE_SIZE + 1;
+  const pageEnd = Math.min(total, safePage * PAGE_SIZE + PAGE_SIZE);
+  // 필터·정렬·검색·기간이 바뀌면 첫 페이지로 — 쿼리 effect도 같은 값에 반응한다.
   useEffect(() => {
     setPage(0);
-  }, [sortDir, hiddenTables, hiddenExecutionSources, hiddenBrowserKinds, globalTimeRange, onlySuspicious]);
+  }, [sortDir, hiddenTablesKey, hiddenExecKey, hiddenBrowserKey, globalActive, globalTimeRange.start, globalTimeRange.end, onlySuspicious, debouncedSearch]);
 
-  if (loading) {
+  // 첫 조회(표시할 데이터가 아직 없음)에만 전체 화면 로딩을 띄운다. 페이지
+  // 이동·필터 변경 등 재조회는 기존 목록을 유지한 채 살짝 어둡게만 한다.
+  if (loading && rows.length === 0) {
     return (
       <div
         role="status"
@@ -479,7 +506,7 @@ export default function MasterTimeline({ entries, loading, onNavigate, onFetchLi
           aria-label="통합 타임라인을 불러오는 중"
           sx={{ color: "var(--accent)" }}
         />
-        <span>모든 아티팩트를 시간순으로 모으는 중...</span>
+        <span>타임라인을 불러오는 중...</span>
       </div>
     );
   }
@@ -488,7 +515,7 @@ export default function MasterTimeline({ entries, loading, onNavigate, onFetchLi
 
   return (
     <div className="dfir-view" style={{ display: "flex", flexDirection: "column", flex: 1, minHeight: 0, minWidth: 0 }}>
-      <ViewHeader icon={TimelineOutlinedIcon} title="통합 타임라인" meta={`${rows.length.toLocaleString()}건`}>
+      <ViewHeader icon={TimelineOutlinedIcon} title="통합 타임라인" meta={`${total.toLocaleString()}건`}>
           <HeaderSearchInput value={search} onChange={setSearch} placeholder="이름 · 경로 · 내용 검색" ariaLabel="통합 타임라인 검색" width={300} />
           <SortDropdown value={sortDir} onChange={(next) => setSortDir(next as "asc" | "desc")} />
           <button className="nm-btn" onClick={() => setOnlySuspicious((value) => !value)} title="의심 태그가 붙은 항목만 표시" aria-pressed={onlySuspicious} style={{ ...toolbarButtonStyle, background: onlySuspicious ? "var(--danger-subtle)" : "var(--bg-elevated)", color: onlySuspicious ? "var(--danger)" : "var(--text-dim)", borderColor: onlySuspicious ? "var(--danger)" : "var(--border)" }}>
@@ -641,14 +668,14 @@ export default function MasterTimeline({ entries, loading, onNavigate, onFetchLi
         
       </ViewHeader>
 
-      {rows.length === 0 ? (
+      {total === 0 ? (
         <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", color: "var(--text-faint)", gap: 8 }}>
           <HourglassEmptyOutlinedIcon sx={{ fontSize: 28, color: "var(--text-faint)" }} />
           <span>{allArtifactsHidden ? "표시할 아티팩트를 선택하세요." : globalActive ? "사고 기간에 해당하는 기록이 없습니다." : "표시할 시간 기록이 없습니다."}</span>
         </div>
       ) : (
       <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
-      <div style={{ flex: 1, minHeight: 0, overflow: "auto", padding: "12px 14px 4px" }}>
+      <div style={{ flex: 1, minHeight: 0, overflow: "auto", padding: "12px 14px 4px", opacity: loading ? 0.55 : 1, transition: "opacity .15s ease" }}>
         {pageRows.map((entry, indexInPage) => {
           const absoluteIndex = safePage * PAGE_SIZE + indexInPage;
           const presentation = currentTimelinePresentation(entry);
@@ -765,7 +792,7 @@ export default function MasterTimeline({ entries, loading, onNavigate, onFetchLi
         })}
       </div>
       <footer style={{ flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", minHeight: 44, padding: "6px 16px", borderTop: "1px solid var(--border)" }}>
-        <PaginationControls ariaLabel="통합 타임라인 페이지" page={safePage} pageCount={pageCount} onChange={setPage} summary={`(${pageStart.toLocaleString()}–${pageEnd.toLocaleString()} / ${rows.length.toLocaleString()})`} />
+        <PaginationControls ariaLabel="통합 타임라인 페이지" page={safePage} pageCount={pageCount} onChange={setPage} summary={`(${pageStart.toLocaleString()}–${pageEnd.toLocaleString()} / ${total.toLocaleString()})`} />
       </footer>
       </div>
       )}
@@ -787,27 +814,6 @@ export default function MasterTimeline({ entries, loading, onNavigate, onFetchLi
           onToggleBookmark={() => onToggleBookmark(selectedEntry)}
         />
       )}
-
-      <footer
-        aria-label="통합 타임라인 상태"
-        style={{
-          display: "flex",
-          alignItems: "center",
-          minHeight: 30,
-          padding: "0 14px",
-          borderTop: "1px solid var(--border)",
-          background: "var(--bg-panel)",
-          color: "var(--text-faint)",
-          fontSize: 11.5,
-          fontWeight: 600,
-          flexShrink: 0,
-        }}
-      >
-        <span>통합 타임라인 {rows.length.toLocaleString()}건</span>
-        {rows.length !== allRows.length && (
-          <span style={{ marginLeft: 8, color: "var(--text-dim)" }}>전체 {allRows.length.toLocaleString()}건</span>
-        )}
-      </footer>
     </div>
   );
 }
