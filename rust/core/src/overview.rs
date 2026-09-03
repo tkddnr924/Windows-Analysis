@@ -873,6 +873,12 @@ fn ntstatus_note(status: u64) -> Option<&'static str> {
 
 // Report.wer 파싱 산출물(WER_FIELD_ORDER)과 같은 컬럼 이름을 유지해 WER 뷰가
 // 두 출처를 구분 없이 렌더링한다. source가 출처를, record_key가 원본 행을 남긴다.
+/// WerReports 파생 생성 로직 버전. 편입 대상·컬럼이 바뀌면 올린다 — 뷰어의
+/// 호환 갱신이 이 값으로 구 저장본을 판별해 재생성한다.
+/// 2: WER 보고의 실행 정보(app_pid·app_start_time·app_uptime·fault_module·
+///    exception_code) 편입.
+pub const WER_REPORTS_DERIVED_VERSION: i64 = 2;
+
 pub const WER_OV_KEYS: &[&str] = &[
     "timestamp",
     "EventType",

@@ -315,6 +315,13 @@ export default function Home() {
         // the exact same record fields as the ExecutionHistory view.
         if (refreshed) setMasterTimeline(null);
       }
+      // 같은 이유로 오류 보고 파생도 버전이 낮으면 재생성한다 — 실행 이력에는
+      // WER 실행 정보가 반영되는데 오류 보고 화면만 구 스키마를 보는 불일치를
+      // 막는다(원본 facts는 그대로, 파생만 다시 만든다).
+      if (file.tableName === "WerReports" && selectedHost) {
+        const refreshed = await window.api.refreshWerReportsOverview(selectedHost.dir);
+        if (refreshed) setMasterTimeline(null);
+      }
       const fileCustomView = getArtifactView(file.name)?.customView;
       // 서버 페이지네이션 전용 뷰 — 행을 IPC로 싣지 않고 뷰가 직접 조회한다.
       // MFT도 여기 속한다: MftView는 dbPath만 받아 mft_children/mft_search로

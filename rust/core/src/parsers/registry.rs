@@ -61,35 +61,41 @@ fn canonical_user_hive_name(fname: &str) -> Option<&'static str> {
     None
 }
 
-/// 계정 디렉터리로 볼 수 없는 이름 — 수집기의 아티팩트 폴더와 Windows 경로
-/// 컴포넌트다. 이 자리에 바로 놓인 사용자 하이브(평면 수집본
-/// `REGISTRY/NTUSER.DAT` 등)는 계정 근거가 전혀 없으므로 접두를 만들지 않는다.
-/// 원본에 없는 값을 계정으로 제시하면 자동 실행·실행 이력·레지스트리 특이사항이
-/// 존재하지 않는 사용자 활동처럼 보인다.
-const NON_ACCOUNT_DIRS: &[&str] = &[
+/// 계정별 프로필 디렉터리를 담는 것으로 확인된 컨테이너 이름. 사용자 하이브의
+/// 계정은 **이 컨테이너 바로 아래 디렉터리일 때만** 인정한다.
+///
+/// 이전에는 반대로 "계정일 수 없는 이름" 차단 목록을 썼는데, 두 방향 모두에서
+/// 틀렸다 — 목록에 없는 임의 수집 폴더(`Collected/`, `EvidenceExport/`)는 여전히
+/// 가짜 계정을 만들었고, 반대로 목록 단어와 이름이 같은 **실제 계정**
+/// (`REGISTRY/Windows/NTUSER.DAT`)은 계정을 잃었다. 계정은 추측이 아니라 경로
+/// 구조가 뒷받침할 때만 부여한다.
+const ACCOUNT_CONTAINER_DIRS: &[&str] = &[
+    // 수집기가 계정별로 하이브를 모아 두는 폴더
     "REGISTRY",
     "REGISTRY_WOW64",
     "REGISTRIES",
     "HIVES",
     "HIVE",
-    "CONFIG",
-    "REGBACK",
-    "SYSTEM32",
-    "SYSWOW64",
-    "WINDOWS",
-    "WINNT",
+    // Windows의 프로필 루트
     "USERS",
     "DOCUMENTS AND SETTINGS",
     "PROFILES",
+    // Windows\System32\config\systemprofile
+    "CONFIG",
 ];
 
-/// 하이브 경로에서 계정명을 복원한다. `AppData` 아래 깊이 놓이는 UsrClass.dat은
-/// 그 바로 앞 컴포넌트가 계정이고, 그 밖에는 하이브가 놓인 디렉터리명이 계정이다
-/// (`Users\<계정>\NTUSER.DAT`, 수집기가 계정별로 모아 둔 `REGISTRY/<계정>/` 모두
-/// 이 규칙으로 풀린다). 증거 경로 자체가 `Users` 아래 있을 수 있으므로 경로에서
-/// `Users` 컴포넌트를 찾아 올라가지는 않는다 — 분석 호스트의 계정을 증거의 계정으로
-/// 오인하게 된다. 디렉터리 이름이 계정일 수 없는 경우(NON_ACCOUNT_DIRS)에는
-/// 계정을 추정하지 않고 None을 돌려준다.
+/// 하이브 경로에서 계정명을 복원한다. 근거는 둘 중 하나여야 한다.
+///
+/// 1. `…\<계정>\AppData\…\UsrClass.dat` — AppData 바로 앞이 프로필 디렉터리.
+/// 2. `<계정 컨테이너>\<계정>\NTUSER.DAT` — 계정별 프로필을 담는 것으로 확인된
+///    컨테이너(`Users`, 수집기의 `REGISTRY/` 등) 바로 아래 디렉터리.
+///
+/// 그 외(평면 수집본 `REGISTRY/NTUSER.DAT`, 임의 폴더 `Collected/NTUSER.DAT`)는
+/// 계정을 알 수 없으므로 접두 없이 발행한다 — 원본에 없는 값을 계정으로 제시하면
+/// UserAssist·Shellbag·레지스트리 특이사항이 존재하지 않는 사용자 활동처럼 보인다.
+///
+/// 증거 경로 자체가 분석 호스트의 `Users` 아래 있을 수 있으므로 경로 전체에서
+/// `Users`를 찾아 올라가지 않는다 — 하이브 바로 위 두 단계만 본다.
 fn hive_account(primary: &Path) -> Option<String> {
     let parts: Vec<String> = primary
         .components()
@@ -99,8 +105,6 @@ fn hive_account(primary: &Path) -> Option<String> {
     let dirs = &parts[..parts.len().saturating_sub(1)];
     // 하이브에 가장 가까운 AppData를 기준으로 삼는다 — 증거를 담아 둔 분석
     // 호스트 경로에 AppData가 들어 있어도 그쪽을 계정으로 잡지 않게.
-    // AppData 바로 앞 컴포넌트는 프로필 디렉터리라는 강한 근거다. 그 근거가
-    // 없으면 하이브가 놓인 디렉터리를 쓰되, 계정일 수 없는 이름은 배제한다.
     let account = match dirs
         .iter()
         .rposition(|part| part.eq_ignore_ascii_case("AppData"))
@@ -109,10 +113,12 @@ fn hive_account(primary: &Path) -> Option<String> {
     {
         Some(profile) => profile,
         None => {
+            // 부모가 계정 디렉터리라는 근거는 그 위(조부모)가 계정 컨테이너인지다.
             let parent = dirs.last()?;
-            if NON_ACCOUNT_DIRS
+            let container = dirs.get(dirs.len().checked_sub(2)?)?;
+            if !ACCOUNT_CONTAINER_DIRS
                 .iter()
-                .any(|deny| parent.eq_ignore_ascii_case(deny))
+                .any(|known| container.eq_ignore_ascii_case(known))
             {
                 return None;
             }
@@ -572,45 +578,47 @@ mod tests {
         );
     }
 
-    /// 계정 디렉터리 없이 평면 수집된 사용자 하이브는 계정을 추정하지 않는다 —
-    /// 수집 폴더명(`REGISTRY` 등)을 계정으로 쓰면 원본에 없는 사용자가 자동
-    /// 실행·실행 이력·레지스트리 특이사항의 소유자로 표시된다.
+    /// 계정은 경로 구조가 뒷받침할 때만 부여한다 — 임의 수집 폴더를 계정으로
+    /// 쓰면 원본에 없는 사용자가 UserAssist·Shellbag·자동 실행의 소유자로
+    /// 표시되고, 반대로 실제 계정 이름이 흔한 단어라고 버리면 계정 귀속을 잃는다.
     #[test]
-    fn flat_collected_user_hives_do_not_invent_an_account() {
+    fn hive_account_requires_structural_evidence() {
+        // 계정 근거 없음 — 평면 수집본과 지원하지 않는 임의 수집 폴더.
         for path in [
             "/e/REGISTRY/NTUSER.DAT",
             "/e/REGISTRY/UsrClass.dat",
             "/e/registry/ntuser.dat",
-            "/e/REGISTRY_WOW64/NTUSER.DAT",
-            "/e/Windows/System32/config/NTUSER.DAT",
+            "/e/Collected/NTUSER.DAT",
+            "/e/EvidenceExport/NTUSER.DAT",
+            "/e/Collection_2026/NTUSER.DAT",
             "/img/Users/NTUSER.DAT",
         ] {
             let name = output_base_name(Path::new(path));
             assert!(
-                !name.contains('_') || name.starts_with("NTUSER") || name.starts_with("UsrClass"),
+                name == "NTUSER.DAT" || name == "UsrClass.dat",
                 "{path} → {name}: 계정 근거가 없는데 접두가 붙었다"
             );
         }
-        assert_eq!(output_base_name(Path::new("/e/REGISTRY/NTUSER.DAT")), "NTUSER.DAT");
-        assert_eq!(
-            output_base_name(Path::new("/e/REGISTRY/UsrClass.dat")),
-            "UsrClass.dat"
-        );
-        assert_eq!(output_base_name(Path::new("/e/registry/ntuser.dat")), "NTUSER.DAT");
-        // 계정 디렉터리와 AppData 경로는 기존대로 계정을 복원한다.
-        assert_eq!(
-            output_base_name(Path::new("/e/REGISTRY/Administrator/NTUSER.DAT")),
-            "Administrator_NTUSER.DAT"
-        );
-        assert_eq!(
-            output_base_name(Path::new(
-                "/img/Users/Administrator/AppData/Local/Microsoft/Windows/UsrClass.dat"
-            )),
-            "Administrator_UsrClass.dat"
-        );
+
+        // 계정 컨테이너 바로 아래 디렉터리는 계정이다 — 이름이 흔한 단어여도
+        // 구조가 계정임을 보증하므로 버리지 않는다.
+        for (path, expected) in [
+            ("/e/REGISTRY/Administrator/NTUSER.DAT", "Administrator_NTUSER.DAT"),
+            ("/e/REGISTRY/svcuser/NTUSER.DAT", "svcuser_NTUSER.DAT"),
+            ("/e/REGISTRY/Windows/NTUSER.DAT", "Windows_NTUSER.DAT"),
+            ("/e/REGISTRY/config/systemprofile/ntuser.dat", "systemprofile_NTUSER.DAT"),
+            ("/e/REGISTRY/Administrator/UsrClass.dat", "Administrator_UsrClass.dat"),
+            ("/img/Users/Administrator/NTUSER.DAT", "Administrator_NTUSER.DAT"),
+            (
+                "/img/Users/Administrator/AppData/Local/Microsoft/Windows/UsrClass.dat",
+                "Administrator_UsrClass.dat",
+            ),
+        ] {
+            assert_eq!(output_base_name(Path::new(path)), expected, "path={path}");
+        }
     }
 
-    /// 머신 하이브는 파생이 이름을 그대로 조회하므로 접두를 붙이지 않는다.
+    /// 머신 하이브는 파생이 이름을 그대로 조회하므로 접두를 붙이지 않는다.    /// 머신 하이브는 파생이 이름을 그대로 조회하므로 접두를 붙이지 않는다.
     /// 수집기가 이미 접두를 붙여 둔 사용자 하이브 이름도 보존한다.
     #[test]
     fn machine_hives_and_prefixed_names_keep_their_own_name() {

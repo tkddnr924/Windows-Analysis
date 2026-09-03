@@ -591,6 +591,7 @@ export interface ElectronApi {
   listResultFiles(categoryDir: string): Promise<ResultFileEntry[]>;
   /** Rebuilds only a legacy ExecutionHistory overview to add raw record links. */
   refreshExecutionHistoryOverview(hostDir: string): Promise<boolean>;
+  refreshWerReportsOverview(hostDir: string): Promise<boolean>;
   resultProvenance(fullPath: string, tableName: string): Promise<ResultProvenance[]>;
   artifactInputFiles(sourceFile: string): Promise<ArtifactInputFile[]>;
   parseReport(hostDir: string): Promise<ParseReport | null>;

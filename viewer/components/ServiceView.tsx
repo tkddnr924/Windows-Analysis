@@ -161,7 +161,7 @@ export default function ServiceView({
                 type="button"
                 onClick={() => toggle(service.key)}
                 aria-expanded={open}
-                aria-label={`${service.key} 서비스 이벤트 ${service.events.length}건 ${open ? "접기" : "펼치기"}`}
+                aria-label={`${service.name || service.key} 서비스 이벤트 ${service.events.length}건 ${open ? "접기" : "펼치기"}`}
                 style={{ width: "100%", display: "flex", alignItems: "center", gap: 12, minHeight: 60, padding: "11px 14px", border: "none", background: open ? `color-mix(in srgb, ${tone} 6%, transparent)` : "transparent", color: "var(--text)", cursor: "pointer", textAlign: "left", transition: "background .18s ease", outlineOffset: -2 }}
                 onMouseEnter={(event) => { if (!open) event.currentTarget.style.background = "var(--bg-hover)"; }}
                 onMouseLeave={(event) => { event.currentTarget.style.background = open ? `color-mix(in srgb, ${tone} 6%, transparent)` : "transparent"; }}
@@ -171,7 +171,10 @@ export default function ServiceView({
                 </span>
                 <span style={{ flex: 1, minWidth: 0, display: "grid", gap: 3 }}>
                   <span style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0 }}>
-                    <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 13.5, fontWeight: 700, color: "var(--text)" }}>{service.key}</span>
+                    {/* 제목은 사람이 읽을 표시 이름, 보조로 SCM 짧은 서비스 이름.
+                        두 값이 같으면(표시 이름 근거가 없는 서비스) 한 번만 쓴다. */}
+                    <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 13.5, fontWeight: 700, color: "var(--text)" }}>{service.name || service.key}</span>
+                    {service.name && service.name !== service.key && <span title={service.key} style={{ flexShrink: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 220, color: "var(--text-faint)", fontFamily: "var(--mono)", fontSize: 11.5 }}>{service.key}</span>}
                   </span>
                   <span style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0, color: "var(--text-dim)", fontSize: 12 }}>
                     <span title={service.imagePath || undefined} style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontFamily: "var(--mono)", color: service.imagePath ? "var(--text-dim)" : "var(--text-faint)" }}>{service.imagePath || "설치 기록 없음 (실행 파일 경로 미기록)"}</span>

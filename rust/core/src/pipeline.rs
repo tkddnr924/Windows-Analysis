@@ -2542,6 +2542,13 @@ pub fn run_host_with_log_id(
                 overview::build_wer_reports_with_events(&out_dir, &events),
                 overview::WER_OV_KEYS,
             )?;
+            if let Err(error) = crate::sqlite::stamp_derived_version(
+                &ov.join("WerReports.sqlite"),
+                "WerReports",
+                overview::WER_REPORTS_DERIVED_VERSION,
+            ) {
+                emit(&format!("[!] WerReports 파생 버전 기록 실패: {error}"));
+            }
             drop(events);
             write_ov(
                 "BrowserActivity",

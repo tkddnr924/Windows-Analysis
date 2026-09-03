@@ -28,14 +28,30 @@ export interface ServiceGroup {
   events: ServiceRow[];
 }
 
-/** 7040처럼 두 이름을 함께 가진 레코드에서만 대응표를 만든다. */
+/** 7040처럼 두 이름을 함께 가진 레코드에서만 대응표를 만든다.
+ *
+ * 표시 이름은 사람이 읽는 라벨이라 전역 유일성이 보장되지 않는다 — 같은 표시
+ * 이름이 서로 다른 서비스에 쓰이거나 수집 기간 중 바뀌었을 수 있다. 그래서
+ * 후보 짧은 이름을 **집합으로 모아 정확히 하나일 때만** 별칭으로 인정한다.
+ * 후보가 둘 이상이면 어느 서비스인지 판별할 근거가 없으므로 별칭을 만들지
+ * 않는다(입력 순서에 따라 임의의 서비스로 합쳐지는 것을 막는다).
+ *
+ * Windows 서비스 이름은 대소문자를 구분하지 않으므로 표시 이름 키도 그렇게 다룬다. */
 export function displayToShortName(rows: ServiceRow[]): Map<string, string> {
-  const alias = new Map<string, string>();
+  const candidates = new Map<string, Set<string>>();
   for (const row of rows) {
-    const display = row.service_name || "";
-    const short = row.service_key || "";
-    if (!display || !short || display === short) continue;
-    if (!alias.has(display)) alias.set(display, short);
+    const display = (row.service_name || "").trim();
+    const short = (row.service_key || "").trim();
+    if (!display || !short || display.toLowerCase() === short.toLowerCase()) continue;
+    const key = display.toLowerCase();
+    const set = candidates.get(key) ?? new Set<string>();
+    set.add(short);
+    candidates.set(key, set);
+  }
+  const alias = new Map<string, string>();
+  for (const [display, shorts] of candidates) {
+    // 후보가 정확히 하나일 때만 — 모호하면 결합하지 않는다.
+    if (shorts.size === 1) alias.set(display, [...shorts][0]);
   }
   return alias;
 }
@@ -51,7 +67,7 @@ export function groupServiceEvents(
     if (!inRange(timestamp)) continue;
     const name = raw.service_name || "";
     // 레코드 자신의 짧은 이름이 있으면 그것이 가장 강한 근거다.
-    const canonical = raw.service_key || alias.get(name) || name;
+    const canonical = raw.service_key || alias.get(name.trim().toLowerCase()) || name;
     // 7026(부팅 드라이버 로드 실패)은 서비스 이름 자리에 드라이버 목록이 와
     // 파생이 이름을 비워 둔다. 서비스로 묶을 근거가 없으므로 원본 레코드마다
     // 독립 항목으로 남긴다 — 서로 다른 부팅·드라이버가 한 덩어리로 합쳐지면

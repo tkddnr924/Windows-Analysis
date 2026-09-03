@@ -35,6 +35,7 @@ function makeApi(): ElectronApi {
     listCategories: (hostDir) => invoke<CategoryEntry[]>("list_categories", { hostDir }),
     listResultFiles: (categoryDir) => invoke<ResultFileEntry[]>("list_result_files", { categoryDir }),
     refreshExecutionHistoryOverview: (hostDir) => invoke<boolean>("refresh_execution_history_overview", { hostDir }),
+    refreshWerReportsOverview: (hostDir) => invoke<boolean>("refresh_wer_reports_overview", { hostDir }),
     resultProvenance: (fullPath, tableName) => invoke<ResultProvenance[]>("result_provenance", { fullPath, tableName }),
     artifactInputFiles: (sourceFile) => invoke<ArtifactInputFile[]>("artifact_input_files", { sourceFile }),
     parseReport: (hostDir) => invoke<ParseReport | null>("parse_report", { hostDir }),

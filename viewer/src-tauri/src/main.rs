@@ -1955,6 +1955,54 @@ async fn refresh_execution_history_overview(host_dir: String) -> Result<bool, St
         .map_err(|error| format!("실행 이력 개요 갱신 작업이 중단되었습니다: {error}"))?
 }
 
+/// 파생 테이블의 생성 로직 버전을 읽는다. 마커가 없는 구 저장본은 0으로 본다.
+fn derived_version_of(db: &Path, name: &str) -> i64 {
+    open_ro(&db.to_string_lossy())
+        .ok()
+        .and_then(|conn| {
+            conn.query_row(
+                "SELECT version FROM _wina_derived_version WHERE name = ?1",
+                rusqlite::params![name],
+                |row| row.get::<_, i64>(0),
+            )
+            .ok()
+        })
+        .unwrap_or(0)
+}
+
+/// 기존 호스트의 `WerReports` 파생을 현재 버전으로 재생성한다. 오류 보고 화면과
+/// 실행 이력이 서로 다른 파생 버전을 보지 않게 한다 — 실행 정보(app_start_time
+/// 등)가 편입된 뒤 파싱한 호스트만 새 컬럼을 갖는데, 구 저장본은 컬럼 자체가
+/// 없어 화면이 이전 행을 그대로 쓴다.
+fn refresh_wer_reports_overview_blocking(host_dir: String) -> Result<bool, String> {
+    let out_dir = PathBuf::from(host_dir);
+    let overview_path = out_dir.join("_OVERVIEW").join("WerReports.sqlite");
+    if !overview_path.exists() {
+        return Ok(false);
+    }
+    if derived_version_of(&overview_path, "WerReports") >= overview::WER_REPORTS_DERIVED_VERSION {
+        return Ok(false);
+    }
+    // 0건이어도 고정 스키마로 발행해 구 컬럼·구 행이 남지 않게 한다.
+    let rows = overview::build_wer_reports(&out_dir);
+    write_table(&overview_path, "WerReports", &rows, overview::WER_OV_KEYS)
+        .map_err(|error| error.to_string())?;
+    wina_core::sqlite::stamp_derived_version(
+        &overview_path,
+        "WerReports",
+        overview::WER_REPORTS_DERIVED_VERSION,
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(true)
+}
+
+#[tauri::command]
+async fn refresh_wer_reports_overview(host_dir: String) -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(move || refresh_wer_reports_overview_blocking(host_dir))
+        .await
+        .map_err(|error| format!("오류 보고 개요 갱신 작업이 중단되었습니다: {error}"))?
+}
+
 fn refresh_execution_history_overview_blocking(host_dir: String) -> Result<bool, String> {
     let out_dir = PathBuf::from(host_dir);
     let overview_path = out_dir.join("_OVERVIEW").join("ExecutionHistory.sqlite");
@@ -7342,6 +7390,30 @@ mod execution_history_upgrade_tests {
             "마커 없는 저장본은 현재 파생 버전보다 낮아 재생성 대상이어야 한다"
         );
 
+        // WerReports도 같은 계약이다 — 마커가 없는 구 저장본은 재생성 대상.
+        let wer_db = ov.join("WerReports.sqlite");
+        {
+            let conn = Connection::open(&wer_db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE WerReports (timestamp TEXT, EventType TEXT, AppName TEXT, report TEXT);
+                 INSERT INTO WerReports VALUES ('2026-01-01 00:00:00.000','APPCRASH','old.exe','{}')",
+            )
+            .unwrap();
+        }
+        assert_eq!(derived_version_of(&wer_db, "WerReports"), 0);
+        assert!(derived_version_of(&wer_db, "WerReports") < overview::WER_REPORTS_DERIVED_VERSION);
+        wina_core::sqlite::stamp_derived_version(
+            &wer_db,
+            "WerReports",
+            overview::WER_REPORTS_DERIVED_VERSION,
+        )
+        .unwrap();
+        assert_eq!(
+            refresh_wer_reports_overview_blocking(root.to_string_lossy().to_string()),
+            Ok(false),
+            "현재 버전 마커가 있으면 재생성하지 않는다"
+        );
+
         // 마커를 현재 버전으로 찍으면 최신으로 판정돼 재생성하지 않는다.
         wina_core::sqlite::stamp_derived_version(
             &db,
@@ -8916,6 +8988,7 @@ fn main() {
             master_timeline_page,
             list_result_files,
             refresh_execution_history_overview,
+            refresh_wer_reports_overview,
             account_directory,
             result_provenance,
             artifact_input_files,

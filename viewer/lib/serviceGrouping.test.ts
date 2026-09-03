@@ -49,6 +49,33 @@ test("별칭 근거가 없는 이름은 짧은 이름과 합쳐지지 않는다"
   assert.deepEqual(groups.map((g) => g.key).sort(), ["Svc Display Name", "SvcShort"]);
 });
 
+// 같은 표시 이름이 서로 다른 짧은 이름에 대응하면 어느 서비스인지 판별할 근거가
+// 없다 — 입력 순서에 따라 임의로 합쳐지면 안 된다.
+test("표시 이름이 여러 짧은 이름에 대응하면 별칭을 만들지 않는다", () => {
+  const rows = [
+    row({ timestamp: "2026-01-01 10:00:00.000", service_name: "공용 표시명", service_key: "SvcA", event_id: "7040" }),
+    row({ timestamp: "2026-01-01 10:05:00.000", service_name: "공용 표시명", service_key: "SvcB", event_id: "7040" }),
+    row({ timestamp: "2026-01-01 10:10:00.000", service_name: "공용 표시명", event_id: "7036" }),
+  ];
+  const groups = groupServiceEvents(rows);
+  const keys = groups.map((g) => g.key).sort();
+  // 7040 두 건은 자기 service_key로 각각 묶이고, 표시명만 가진 7036은 독립 유지.
+  assert.deepEqual(keys, ["SvcA", "SvcB", "공용 표시명"]);
+  // 입력 순서를 뒤집어도 결과가 같아야 한다(임의 귀속 금지).
+  const reversed = groupServiceEvents([...rows].reverse()).map((g) => g.key).sort();
+  assert.deepEqual(reversed, keys);
+});
+
+// 대소문자만 다른 표시 이름도 같은 이름으로 본다(Windows 서비스 이름 규칙).
+test("표시 이름 대응은 대소문자를 구분하지 않는다", () => {
+  const groups = groupServiceEvents([
+    row({ timestamp: "2026-01-01 10:00:00.000", service_name: "Svc Display Name", service_key: "SvcShort", event_id: "7040" }),
+    row({ timestamp: "2026-01-01 10:10:00.000", service_name: "svc display name", event_id: "7036" }),
+  ]);
+  assert.equal(groups.length, 1);
+  assert.equal(groups[0].key, "SvcShort");
+});
+
 // 7026은 서비스 이름 자리에 드라이버 목록이 오는 부팅 단위 기록이라 파생이
 // 이름을 비운다. 전부 한 카드로 뭉치면 기간·실패 수가 과도하게 합산된다.
 test("이름 없는 7026 기록은 원본 레코드마다 독립 항목으로 남는다", () => {

@@ -406,12 +406,19 @@ function sequenceParticipants(entries: SequenceEntry[], currentHostId: string | 
 }
 
 function HostFlowLedger({ entries, undatedEntries, unresolvedEntries, currentHostId, onOpen, onRemove, accountDirectoryForHost }: { entries: SequenceEntry[]; undatedEntries: BookmarkEntry[]; unresolvedEntries: BookmarkEntry[]; currentHostId: string | null; onOpen: (entry: BookmarkEntry) => void; onRemove: (bookmark: Bookmark) => void; accountDirectoryForHost?: (hostId: string) => AccountDirectory | undefined }) {
-  const participants = sequenceParticipants(entries, currentHostId);
+  // 이 보기도 10건 고정 페이지네이션이다 — 시간축·캔버스·하단 목록 모두 현재
+  // 페이지 항목만 렌더한다. 참여 레인·캔버스 높이도 페이지 기준으로 계산해야
+  // 현재 페이지에 없는 상대 때문에 빈 레인이 남지 않는다.
+  const pagedFlow = usePagedEntries(entries);
+  const pagedUndated = usePagedEntries(undatedEntries);
+  const pagedUnresolved = usePagedEntries(unresolvedEntries);
+  const pageEntries = pagedFlow.rows;
+  const participants = sequenceParticipants(pageEntries, currentHostId);
   if (entries.length === 0 && undatedEntries.length === 0 && unresolvedEntries.length === 0) return <div role="status" style={{ display: "grid", placeItems: "center", flex: 1, minHeight: 0, color: "var(--text-faint)", fontSize: 12.5 }}>기간 필터 내 시간 정보가 있는 북마크가 없습니다.</div>;
   const timeGutter = 196;
   const laneWidth = 220;
   const canvasWidth = Math.max(680, participants.length * laneWidth);
-  const canvasHeight = Math.max(150, 48 + entries.length * 64);
+  const canvasHeight = Math.max(150, 48 + pageEntries.length * 64);
   return <section aria-label="호스트 흐름 시퀀스 다이어그램" style={{ flex: 1, minHeight: 0, overflow: "auto" }}><div style={{ minWidth: timeGutter + canvasWidth, paddingBottom: 10 }}>
     <div style={{ position: "sticky", top: 0, zIndex: 3, display: "grid", gridTemplateColumns: `${timeGutter}px ${canvasWidth}px`, borderBottom: "1px solid var(--border)", background: "var(--bg-panel)" }}>
       <div aria-hidden="true" style={{ display: "flex", alignItems: "flex-end", padding: "0 10px 10px 14px", color: "var(--text-faint)", fontSize: 10.5, fontWeight: 700 }}>시간 축</div>
@@ -423,10 +430,21 @@ function HostFlowLedger({ entries, undatedEntries, unresolvedEntries, currentHos
       })}</div>
     </div>
     <div style={{ display: "grid", gridTemplateColumns: `${timeGutter}px ${canvasWidth}px`, minHeight: canvasHeight }}>
-      <div aria-label="시간순 이벤트" style={{ position: "relative", borderRight: "1px solid var(--border)" }}>{entries.map((entry, index) => <div key={entry.bookmark.id} style={{ position: "absolute", top: 48 + index * 64 - 12, right: 8, left: 14, minHeight: 24 }}><time style={{ position: "absolute", left: 0, right: 30, color: "var(--text-time)", fontFamily: "var(--mono)", fontSize: 12.5, whiteSpace: "nowrap" }}>{formatEvidenceTimestamp(entry.eventTime)}</time>{entry.eventTimeLabel === "레지스트리 키 마지막 기록 시각" && <span style={{ position: "absolute", top: 17, left: 0, right: 30, color: "var(--text-faint)", fontSize: 10.5, whiteSpace: "nowrap" }}>레지스트리 키 마지막 기록 시각</span>}<button type="button" onClick={() => onRemove(entry.bookmark)} aria-label={`${eventTitle(entry)} 북마크 제거`} style={{ position: "absolute", right: 0, top: -5, display: "grid", placeItems: "center", width: 24, height: 24, padding: 0, border: "1px solid transparent", borderRadius: "var(--radius-sm)", background: "transparent", color: "var(--text-faint)", cursor: "pointer" }}><DeleteOutlineOutlinedIcon sx={{ fontSize: 15 }} /></button></div>)}</div>
-      <div role="list" aria-label="시간순 호스트 메시지" style={{ position: "relative", minHeight: canvasHeight }}>{participants.map((participant, index) => <span aria-hidden="true" key={participant.key} style={{ position: "absolute", top: 0, bottom: 0, left: `${((index + .5) / Math.max(participants.length, 1)) * 100}%`, borderLeft: "1px dashed var(--border)", background: participant.key === `host:${currentHostId}` ? "color-mix(in srgb, var(--accent) 5%, transparent)" : "transparent" }} />)}{entries.map((entry, index) => <SequenceCanvasEvent key={entry.bookmark.id} entry={entry} index={index} participants={participants} onOpen={onOpen} accountDirectory={accountDirectoryForHost?.(entry.host.id)} />)}</div>
+      <div aria-label="시간순 이벤트" style={{ position: "relative", borderRight: "1px solid var(--border)" }}>{pageEntries.map((entry, index) => <div key={entry.bookmark.id} style={{ position: "absolute", top: 48 + index * 64 - 12, right: 8, left: 14, minHeight: 24 }}><time style={{ position: "absolute", left: 0, right: 30, color: "var(--text-time)", fontFamily: "var(--mono)", fontSize: 12.5, whiteSpace: "nowrap" }}>{formatEvidenceTimestamp(entry.eventTime)}</time>{entry.eventTimeLabel === "레지스트리 키 마지막 기록 시각" && <span style={{ position: "absolute", top: 17, left: 0, right: 30, color: "var(--text-faint)", fontSize: 10.5, whiteSpace: "nowrap" }}>레지스트리 키 마지막 기록 시각</span>}<button type="button" onClick={() => onRemove(entry.bookmark)} aria-label={`${eventTitle(entry)} 북마크 제거`} style={{ position: "absolute", right: 0, top: -5, display: "grid", placeItems: "center", width: 24, height: 24, padding: 0, border: "1px solid transparent", borderRadius: "var(--radius-sm)", background: "transparent", color: "var(--text-faint)", cursor: "pointer" }}><DeleteOutlineOutlinedIcon sx={{ fontSize: 15 }} /></button></div>)}</div>
+      <div role="list" aria-label="시간순 호스트 메시지" style={{ position: "relative", minHeight: canvasHeight }}>{participants.map((participant, index) => <span aria-hidden="true" key={participant.key} style={{ position: "absolute", top: 0, bottom: 0, left: `${((index + .5) / Math.max(participants.length, 1)) * 100}%`, borderLeft: "1px dashed var(--border)", background: participant.key === `host:${currentHostId}` ? "color-mix(in srgb, var(--accent) 5%, transparent)" : "transparent" }} />)}{pageEntries.map((entry, index) => <SequenceCanvasEvent key={entry.bookmark.id} entry={entry} index={index} participants={participants} onOpen={onOpen} accountDirectory={accountDirectoryForHost?.(entry.host.id)} />)}</div>
     </div>
-    {(undatedEntries.length > 0 || unresolvedEntries.length > 0) && <div style={{ marginTop: 10, borderTop: "1px solid var(--border)" }}><div style={{ padding: "9px 14px 6px", color: "var(--text-faint)", fontSize: 11.5, fontWeight: 700 }}>시간 축에 배치할 수 없는 항목</div>{[...undatedEntries, ...unresolvedEntries].map((entry) => <TimelineRow key={entry.bookmark.id} entry={entry} currentHostId={currentHostId} onOpen={onOpen} onRemove={onRemove} />)}</div>}
+    {entries.length > 0 && <div style={{ padding: "8px 14px 2px" }}><PaginationControls ariaLabel="호스트 흐름 페이지" page={pagedFlow.page} pageCount={pagedFlow.pageCount} onChange={pagedFlow.setPage} summary={pagedFlow.summary} /></div>}
+    {(undatedEntries.length > 0 || unresolvedEntries.length > 0) && <div style={{ marginTop: 10, borderTop: "1px solid var(--border)" }}>
+      <div style={{ padding: "9px 14px 6px", color: "var(--text-faint)", fontSize: 11.5, fontWeight: 700 }}>시간 축에 배치할 수 없는 항목</div>
+      {undatedEntries.length > 0 && <>
+        {pagedUndated.rows.map((entry) => <TimelineRow key={entry.bookmark.id} entry={entry} currentHostId={currentHostId} onOpen={onOpen} onRemove={onRemove} />)}
+        <div style={{ padding: "6px 14px 2px" }}><PaginationControls ariaLabel="시간 정보 없음 페이지" page={pagedUndated.page} pageCount={pagedUndated.pageCount} onChange={pagedUndated.setPage} summary={pagedUndated.summary} /></div>
+      </>}
+      {unresolvedEntries.length > 0 && <>
+        {pagedUnresolved.rows.map((entry) => <TimelineRow key={entry.bookmark.id} entry={entry} currentHostId={currentHostId} onOpen={onOpen} onRemove={onRemove} />)}
+        <div style={{ padding: "6px 14px 2px" }}><PaginationControls ariaLabel="원본 행 확인 필요 페이지" page={pagedUnresolved.page} pageCount={pagedUnresolved.pageCount} onChange={pagedUnresolved.setPage} summary={pagedUnresolved.summary} /></div>
+      </>}
+    </div>}
   </div></section>;
 }
 
