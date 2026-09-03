@@ -36,6 +36,7 @@ import { getArtifactView, resolveArtifactView } from "@/lib/artifactViews";
 import { formatEvidenceTimestamp, type TimeRange } from "@/lib/timeRange";
 import TagList from "./TagList";
 import RowDetailPanel from "./RowDetailPanel";
+import PaginationControls from "@/components/PaginationControls";
 import { resolveUserDisplay, type AccountDirectory } from "@/lib/accountIdentity";
 import { pathBelongsToHost, visuallyHidden } from "@/lib/viewShared";
 
@@ -76,6 +77,20 @@ type SequenceEntry = BookmarkEntry & {
 type SequenceParticipant = { key: string; label: string };
 
 const MAX_CONCURRENT_ROW_LOOKUPS = 4;
+/// 모든 목록·카드 내부 원본 레코드는 10건 고정 페이지네이션이다(AGENTS.md).
+/// 북마크가 많아도 한 화면의 DOM 행 수가 북마크 수에 비례하지 않게 한다.
+const BOOKMARK_PAGE_SIZE = 10;
+
+function usePagedEntries<T>(entries: T[]): { rows: T[]; page: number; pageCount: number; setPage: (next: number) => void; summary: string } {
+  const [page, setPage] = useState(0);
+  const pageCount = Math.max(1, Math.ceil(entries.length / BOOKMARK_PAGE_SIZE));
+  const safePage = Math.min(page, pageCount - 1);
+  const rows = entries.slice(safePage * BOOKMARK_PAGE_SIZE, (safePage + 1) * BOOKMARK_PAGE_SIZE);
+  const first = entries.length === 0 ? 0 : safePage * BOOKMARK_PAGE_SIZE + 1;
+  const last = Math.min(entries.length, (safePage + 1) * BOOKMARK_PAGE_SIZE);
+  return { rows, page: safePage, pageCount, setPage, summary: `(${first.toLocaleString()}–${last.toLocaleString()} / ${entries.length.toLocaleString()})` };
+}
+
 
 function hostDirFromResultPath(fullPath: string): string | undefined {
   const normalized = fullPath.replace(/\\/g, "/");
@@ -304,11 +319,13 @@ export default function BookmarksView({ bookmarks, hosts, hostIpMap, currentHost
 }
 
 function TimelineLedger({ entries, undatedEntries, unresolvedEntries, currentHostId, onOpen, onRemove }: { entries: BookmarkEntry[]; undatedEntries: BookmarkEntry[]; unresolvedEntries: BookmarkEntry[]; currentHostId: string | null; onOpen: (entry: BookmarkEntry) => void; onRemove: (bookmark: Bookmark) => void }) {
-  return <section aria-label="북마크 시간 원장" style={{ flex: 1, minHeight: 0, overflow: "auto", padding: "12px 14px 4px" }}><div style={{ minWidth: 760 }}>{entries.map((entry) => <TimelineRow key={entry.bookmark.id} entry={entry} currentHostId={currentHostId} onOpen={onOpen} onRemove={onRemove} />)}{undatedEntries.length > 0 && <LedgerGroup label="시간 정보 없음" entries={undatedEntries} currentHostId={currentHostId} onOpen={onOpen} onRemove={onRemove} bordered={entries.length > 0} />}{unresolvedEntries.length > 0 && <LedgerGroup label="원본 행 확인 필요" entries={unresolvedEntries} currentHostId={currentHostId} onOpen={onOpen} onRemove={onRemove} bordered={entries.length > 0 || undatedEntries.length > 0} />}</div></section>;
+  const paged = usePagedEntries(entries);
+  return <section aria-label="북마크 시간 원장" style={{ flex: 1, minHeight: 0, overflow: "auto", padding: "12px 14px 4px" }}><div style={{ minWidth: 760 }}>{paged.rows.map((entry) => <TimelineRow key={entry.bookmark.id} entry={entry} currentHostId={currentHostId} onOpen={onOpen} onRemove={onRemove} />)}{entries.length > 0 && <div style={{ padding: "6px 0 2px" }}><PaginationControls ariaLabel="북마크 시간 원장 페이지" page={paged.page} pageCount={paged.pageCount} onChange={paged.setPage} summary={paged.summary} /></div>}{undatedEntries.length > 0 && <LedgerGroup label="시간 정보 없음" entries={undatedEntries} currentHostId={currentHostId} onOpen={onOpen} onRemove={onRemove} bordered={entries.length > 0} />}{unresolvedEntries.length > 0 && <LedgerGroup label="원본 행 확인 필요" entries={unresolvedEntries} currentHostId={currentHostId} onOpen={onOpen} onRemove={onRemove} bordered={entries.length > 0 || undatedEntries.length > 0} />}</div></section>;
 }
 
 function LedgerGroup({ label, entries, currentHostId, onOpen, onRemove, bordered }: { label: string; entries: BookmarkEntry[]; currentHostId: string | null; onOpen: (entry: BookmarkEntry) => void; onRemove: (bookmark: Bookmark) => void; bordered: boolean }) {
-  return <div style={{ marginTop: bordered ? 6 : 0 }}><div style={{ padding: "4px 2px 8px", color: "var(--text-faint)", fontSize: 11.5, fontWeight: 700 }}>{label} · {entries.length}건</div>{entries.map((entry) => <TimelineRow key={entry.bookmark.id} entry={entry} currentHostId={currentHostId} onOpen={onOpen} onRemove={onRemove} />)}</div>;
+  const paged = usePagedEntries(entries);
+  return <div style={{ marginTop: bordered ? 6 : 0 }}><div style={{ padding: "4px 2px 8px", color: "var(--text-faint)", fontSize: 11.5, fontWeight: 700 }}>{label} · {entries.length}건</div>{paged.rows.map((entry) => <TimelineRow key={entry.bookmark.id} entry={entry} currentHostId={currentHostId} onOpen={onOpen} onRemove={onRemove} />)}{entries.length > 0 && <div style={{ padding: "6px 0 2px" }}><PaginationControls ariaLabel={`${label} 페이지`} page={paged.page} pageCount={paged.pageCount} onChange={paged.setPage} summary={paged.summary} /></div>}</div>;
 }
 
 function TimelineRow({ entry, currentHostId, onOpen, onRemove }: { entry: BookmarkEntry; currentHostId: string | null; onOpen: (entry: BookmarkEntry) => void; onRemove: (bookmark: Bookmark) => void }) {

@@ -817,4 +817,3 @@ function SearchResults({ rows, searching, error, bmRowids, selectedRowid, onSele
     </div>
   );
 }
-

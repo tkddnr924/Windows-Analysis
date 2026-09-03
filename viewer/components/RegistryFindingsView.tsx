@@ -249,6 +249,10 @@ function RegistryLedger({ rows, untimedExcluded, category, onSelect, bookmarkedR
             </span>
             <span style={{ width: 122, flexShrink: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: userLabel === "계정 정보 없음" ? "var(--text-faint)" : "var(--text-dim)", fontSize: 12 }}>{userLabel}</span>
             <span title={keyPath || undefined} style={{ width: 230, flexShrink: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text-faint)", fontFamily: "var(--mono)", fontSize: 11.5, direction: "rtl", textAlign: "left" }}>{keyPath || "키 경로 없음"}</span>
+            {/* 이 뷰는 전역 기간 필터 대신 자체 날짜 필터·시간 정렬을 쓴다 —
+                그 근거가 되는 마지막 기록 시각을 목록에서 바로 비교할 수 있어야
+                한다(상세를 열어야만 보이면 정렬·필터를 검증할 수 없다). */}
+            <span title={row.timestamp || undefined} style={{ width: 148, flexShrink: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: row.timestamp ? "var(--text-time)" : "var(--text-faint)", fontFamily: "var(--mono)", fontSize: 11.5, textAlign: "right" }}>{row.timestamp || "시간 정보 없음"}</span>
           </div>
           <Tooltip title={bookmarked ? "북마크 해제" : "북마크"}><span><IconButton className={bookmarked ? "dfir-bookmark-control" : undefined} aria-label={bookmarked ? "북마크 해제" : "북마크"} disabled={!onToggleBookmark} size="small" onClick={(clickEvent) => { clickEvent.stopPropagation(); onToggleBookmark?.(rowId(row)); }} sx={{ color: bookmarked ? "var(--bookmark-control)" : "var(--text-faint)", borderRadius: "var(--radius-sm)" }}>{bookmarked ? <BookmarkIcon sx={{ fontSize: 17 }} /> : <BookmarkBorderOutlinedIcon sx={{ fontSize: 17 }} />}</IconButton></span></Tooltip>
         </div>;

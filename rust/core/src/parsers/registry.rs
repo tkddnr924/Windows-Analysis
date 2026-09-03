@@ -61,12 +61,35 @@ fn canonical_user_hive_name(fname: &str) -> Option<&'static str> {
     None
 }
 
+/// 계정 디렉터리로 볼 수 없는 이름 — 수집기의 아티팩트 폴더와 Windows 경로
+/// 컴포넌트다. 이 자리에 바로 놓인 사용자 하이브(평면 수집본
+/// `REGISTRY/NTUSER.DAT` 등)는 계정 근거가 전혀 없으므로 접두를 만들지 않는다.
+/// 원본에 없는 값을 계정으로 제시하면 자동 실행·실행 이력·레지스트리 특이사항이
+/// 존재하지 않는 사용자 활동처럼 보인다.
+const NON_ACCOUNT_DIRS: &[&str] = &[
+    "REGISTRY",
+    "REGISTRY_WOW64",
+    "REGISTRIES",
+    "HIVES",
+    "HIVE",
+    "CONFIG",
+    "REGBACK",
+    "SYSTEM32",
+    "SYSWOW64",
+    "WINDOWS",
+    "WINNT",
+    "USERS",
+    "DOCUMENTS AND SETTINGS",
+    "PROFILES",
+];
+
 /// 하이브 경로에서 계정명을 복원한다. `AppData` 아래 깊이 놓이는 UsrClass.dat은
 /// 그 바로 앞 컴포넌트가 계정이고, 그 밖에는 하이브가 놓인 디렉터리명이 계정이다
 /// (`Users\<계정>\NTUSER.DAT`, 수집기가 계정별로 모아 둔 `REGISTRY/<계정>/` 모두
 /// 이 규칙으로 풀린다). 증거 경로 자체가 `Users` 아래 있을 수 있으므로 경로에서
 /// `Users` 컴포넌트를 찾아 올라가지는 않는다 — 분석 호스트의 계정을 증거의 계정으로
-/// 오인하게 된다.
+/// 오인하게 된다. 디렉터리 이름이 계정일 수 없는 경우(NON_ACCOUNT_DIRS)에는
+/// 계정을 추정하지 않고 None을 돌려준다.
 fn hive_account(primary: &Path) -> Option<String> {
     let parts: Vec<String> = primary
         .components()
@@ -76,12 +99,26 @@ fn hive_account(primary: &Path) -> Option<String> {
     let dirs = &parts[..parts.len().saturating_sub(1)];
     // 하이브에 가장 가까운 AppData를 기준으로 삼는다 — 증거를 담아 둔 분석
     // 호스트 경로에 AppData가 들어 있어도 그쪽을 계정으로 잡지 않게.
-    let account = dirs
+    // AppData 바로 앞 컴포넌트는 프로필 디렉터리라는 강한 근거다. 그 근거가
+    // 없으면 하이브가 놓인 디렉터리를 쓰되, 계정일 수 없는 이름은 배제한다.
+    let account = match dirs
         .iter()
         .rposition(|part| part.eq_ignore_ascii_case("AppData"))
         .and_then(|i| i.checked_sub(1))
         .and_then(|i| dirs.get(i))
-        .or_else(|| dirs.last())?;
+    {
+        Some(profile) => profile,
+        None => {
+            let parent = dirs.last()?;
+            if NON_ACCOUNT_DIRS
+                .iter()
+                .any(|deny| parent.eq_ignore_ascii_case(deny))
+            {
+                return None;
+            }
+            parent
+        }
+    };
     let account = sanitize_name_component(account);
     // 루트(`/`, `C:\\`)처럼 계정으로 볼 수 없는 컴포넌트는 접두를 만들지 않는다.
     if account.is_empty() || account.chars().all(|c| c == '_' || c == '.') {
@@ -527,6 +564,44 @@ mod tests {
     /// AppData 바로 앞 컴포넌트로 복원된다.
     #[test]
     fn usrclass_account_comes_from_the_profile_above_appdata() {
+        assert_eq!(
+            output_base_name(Path::new(
+                "/img/Users/Administrator/AppData/Local/Microsoft/Windows/UsrClass.dat"
+            )),
+            "Administrator_UsrClass.dat"
+        );
+    }
+
+    /// 계정 디렉터리 없이 평면 수집된 사용자 하이브는 계정을 추정하지 않는다 —
+    /// 수집 폴더명(`REGISTRY` 등)을 계정으로 쓰면 원본에 없는 사용자가 자동
+    /// 실행·실행 이력·레지스트리 특이사항의 소유자로 표시된다.
+    #[test]
+    fn flat_collected_user_hives_do_not_invent_an_account() {
+        for path in [
+            "/e/REGISTRY/NTUSER.DAT",
+            "/e/REGISTRY/UsrClass.dat",
+            "/e/registry/ntuser.dat",
+            "/e/REGISTRY_WOW64/NTUSER.DAT",
+            "/e/Windows/System32/config/NTUSER.DAT",
+            "/img/Users/NTUSER.DAT",
+        ] {
+            let name = output_base_name(Path::new(path));
+            assert!(
+                !name.contains('_') || name.starts_with("NTUSER") || name.starts_with("UsrClass"),
+                "{path} → {name}: 계정 근거가 없는데 접두가 붙었다"
+            );
+        }
+        assert_eq!(output_base_name(Path::new("/e/REGISTRY/NTUSER.DAT")), "NTUSER.DAT");
+        assert_eq!(
+            output_base_name(Path::new("/e/REGISTRY/UsrClass.dat")),
+            "UsrClass.dat"
+        );
+        assert_eq!(output_base_name(Path::new("/e/registry/ntuser.dat")), "NTUSER.DAT");
+        // 계정 디렉터리와 AppData 경로는 기존대로 계정을 복원한다.
+        assert_eq!(
+            output_base_name(Path::new("/e/REGISTRY/Administrator/NTUSER.DAT")),
+            "Administrator_NTUSER.DAT"
+        );
         assert_eq!(
             output_base_name(Path::new(
                 "/img/Users/Administrator/AppData/Local/Microsoft/Windows/UsrClass.dat"

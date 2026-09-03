@@ -12,6 +12,7 @@ import { getArtifactView } from "@/lib/artifactViews";
 import { inRange, EMPTY_TIME_RANGE, rangeActive, type TimeRange } from "@/lib/timeRange";
 import PaginationControls from "@/components/PaginationControls";
 import RowDetailPanel from "./RowDetailPanel";
+import { groupServiceEvents, type ServiceGroup, type ServiceRow } from "@/lib/serviceGrouping";
 
 // Service Control Manager 이벤트를 서비스 단위로 묶어 읽는 뷰. 한 서비스가
 // 카드 하나이고, 설치·시작 유형 변경·상태 변경·실패가 그 카드의 이력이 된다.
@@ -44,19 +45,6 @@ interface Row {
   record_key?: string;
 }
 
-interface Service {
-  key: string;
-  name: string;
-  imagePath: string;
-  installs: number;
-  startTypeChanges: number;
-  stateChanges: number;
-  failures: number;
-  first: string;
-  last: string;
-  events: Row[];
-}
-
 interface Props {
   data: CsvData;
   onNavigate: (targetFile: string, targetColumn: string, value: string) => void;
@@ -85,45 +73,12 @@ export default function ServiceView({
   const spec = getArtifactView(TABLE);
   const rangeOn = rangeActive(timeRange);
 
-  const services = useMemo(() => {
-    const byKey = new Map<string, Service>();
-    for (const raw of data.rows as Row[]) {
-      const timestamp = raw.timestamp ?? "";
-      if (!inRange(timestamp, timeRange)) continue;
-      // 서비스 이름이 없는 기록(부팅 드라이버 로드 실패)은 이름 대신 그
-      // 기록 종류로 묶는다 — 이름 없는 카드 한 덩어리로 뭉치지 않게.
-      const name = raw.service_name || "";
-      const key = name || raw.description || "(서비스 정보 없음)";
-      const service = byKey.get(key) ?? {
-        key,
-        name,
-        imagePath: "",
-        installs: 0,
-        startTypeChanges: 0,
-        stateChanges: 0,
-        failures: 0,
-        first: timestamp,
-        last: timestamp,
-        events: [],
-      };
-      if (!byKey.has(key)) byKey.set(key, service);
-
-      if (!service.imagePath && raw.image_path) service.imagePath = raw.image_path;
-      if (raw.event_id === "7045") service.installs += 1;
-      else if (raw.event_id === "7040") service.startTypeChanges += 1;
-      else if (raw.event_id === "7036") service.stateChanges += 1;
-      if (raw.result === "실패") service.failures += 1;
-      if (timestamp) {
-        if (!service.first || timestamp < service.first) service.first = timestamp;
-        if (!service.last || timestamp > service.last) service.last = timestamp;
-      }
-      service.events.push(raw);
-    }
-    for (const service of byKey.values()) {
-      service.events.sort((a, b) => (a.timestamp ?? "").localeCompare(b.timestamp ?? ""));
-    }
-    return [...byKey.values()];
-  }, [data.rows, timeRange]);
+  // 서비스 묶음 규칙은 순수 함수로 분리했다(lib/serviceGrouping) — 7040이
+  // 제공한 표시 이름↔짧은 이름 대응만 근거로 삼아 정규화한다.
+  const services = useMemo(
+    () => groupServiceEvents(data.rows as ServiceRow[], (timestamp) => inRange(timestamp, timeRange)),
+    [data.rows, timeRange],
+  );
 
   const kinds = useMemo(() => {
     const seen: string[] = [];

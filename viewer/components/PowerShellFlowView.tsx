@@ -159,11 +159,12 @@ export default function PowerShellFlowView({
   // 시간 정보가 없는 기록(ConsoleHost_history 등)은 세션 묶음과 분리해
   // 실행 이력 뷰와 같은 접이식 구역으로 보여준다.
   const [untimedOpen, setUntimedOpen] = useState(false);
-  // PSReadLine 히스토리는 수만 줄이 될 수 있다 — 접었다 펴는 것만으로 모든
-  // 줄을 DOM에 만들면 통합 타임라인에서 없앤 UI 멈춤이 여기서 재현된다.
-  // 처음에는 일정 줄만 렌더하고 필요할 때 이어서 붙인다.
-  const UNTIMED_RENDER_STEP = 500;
-  const [untimedShown, setUntimedShown] = useState(UNTIMED_RENDER_STEP);
+  // PSReadLine 히스토리는 수만 줄이 될 수 있다. 모든 목록과 카드 안 원본
+  // 레코드는 10건 고정 페이지네이션(AGENTS.md)이므로 여기도 같은 단위를 쓴다 —
+  // 전량 렌더로 인한 UI 멈춤도 함께 사라진다.
+  const [untimedPage, setUntimedPage] = useState(0);
+  // 세션 카드를 펼쳤을 때 보이는 원본 이벤트도 같은 10건 단위다.
+  const [eventPages, setEventPages] = useState<Record<string, number>>({});
   const [page, setPage] = useState(0);
 
   // 목록 IPC의 script_block/host_application은 앞 1,000자 미리보기 — 그 뒤의
@@ -227,6 +228,10 @@ export default function PowerShellFlowView({
   const pageSessions = sessions.slice(safePage * PS_PAGE_SIZE, safePage * PS_PAGE_SIZE + PS_PAGE_SIZE);
   const pageStart = sessions.length === 0 ? 0 : safePage * PS_PAGE_SIZE + 1;
   const pageEnd = Math.min(sessions.length, safePage * PS_PAGE_SIZE + PS_PAGE_SIZE);
+  // 콘솔 히스토리도 같은 10건 단위. 필터가 바뀌어 줄 수가 줄면 페이지를 보정한다.
+  const untimedPageCount = Math.max(1, Math.ceil(untimed.length / PS_PAGE_SIZE));
+  const untimedSafePage = Math.min(untimedPage, untimedPageCount - 1);
+  const untimedPageRows = untimed.slice(untimedSafePage * PS_PAGE_SIZE, (untimedSafePage + 1) * PS_PAGE_SIZE);
 
   function toggle(sessionKey: string) {
     setExpanded((previous) => {
@@ -271,7 +276,7 @@ export default function PowerShellFlowView({
               <div style={{ borderTop: "1px solid var(--border-subtle)", maxHeight: 560, overflow: "auto", background: "var(--bg-input)", padding: "6px 0" }}>
                 {/* 읽기 전용 히스토리 — 클릭 상세·북마크 없이 줄번호 + 명령만
                     보여주고, 명령 텍스트는 드래그로 복사할 수 있게 한다. */}
-                {untimed.slice(0, untimedShown).map((row, index) => (
+                {untimedPageRows.map((row, index) => (
                   <div
                     key={`${Number((row as Record<string, unknown>).__rowid)}-${index}`}
                     style={{ display: "flex", alignItems: "flex-start", gap: 12, padding: "1px 12px", lineHeight: 1.6 }}
@@ -280,21 +285,15 @@ export default function PowerShellFlowView({
                     <span style={{ flex: 1, minWidth: 0, fontFamily: "var(--mono)", fontSize: 12.5, color: "var(--text)", whiteSpace: "pre-wrap", wordBreak: "break-word", userSelect: "text" }}>{row.command || "(명령 없음)"}</span>
                   </div>
                 ))}
-                {untimed.length > untimedShown && (
-                  <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 10, padding: "10px 12px" }}>
-                    <span style={{ color: "var(--text-faint)", fontSize: 11.5, fontFamily: "var(--mono)" }}>
-                      {untimedShown.toLocaleString()} / {untimed.length.toLocaleString()}줄
-                    </span>
-                    <button className="nm-btn" type="button" onClick={() => setUntimedShown((value) => value + UNTIMED_RENDER_STEP)}
-                      style={{ padding: "3px 10px", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", background: "var(--bg-elevated)", color: "var(--text-dim)", cursor: "pointer", fontSize: 11.5 }}>
-                      {Math.min(UNTIMED_RENDER_STEP, untimed.length - untimedShown).toLocaleString()}줄 더 보기
-                    </button>
-                    <button className="nm-btn" type="button" onClick={() => setUntimedShown(untimed.length)}
-                      style={{ padding: "3px 10px", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", background: "var(--bg-elevated)", color: "var(--text-dim)", cursor: "pointer", fontSize: 11.5 }}>
-                      전체 보기
-                    </button>
-                  </div>
-                )}
+                <div style={{ padding: "6px 12px 2px" }}>
+                  <PaginationControls
+                    ariaLabel="콘솔 히스토리 페이지"
+                    page={untimedSafePage}
+                    pageCount={untimedPageCount}
+                    onChange={setUntimedPage}
+                    summary={`(${untimed.length === 0 ? 0 : (untimedSafePage * PS_PAGE_SIZE + 1).toLocaleString()}–${Math.min(untimed.length, (untimedSafePage + 1) * PS_PAGE_SIZE).toLocaleString()} / ${untimed.length.toLocaleString()}줄)`}
+                  />
+                </div>
               </div>
             )}
           </section>
@@ -305,6 +304,10 @@ export default function PowerShellFlowView({
           </div>
         ) : pageSessions.map((session) => {
           const open = expanded.has(session.key);
+          // 세션마다 독립 페이지 상태. 필터로 이벤트 수가 줄면 보정한다.
+          const eventPageCount = Math.max(1, Math.ceil(session.events.length / PS_PAGE_SIZE));
+          const eventSafePage = Math.min(eventPages[session.key] ?? 0, eventPageCount - 1);
+          const eventPageRows = session.events.slice(eventSafePage * PS_PAGE_SIZE, (eventSafePage + 1) * PS_PAGE_SIZE);
           const recordsId = `powershell-session-records-${session.key}`;
           const kindCounts = new Map<string, number>();
           for (const event of session.events) {
@@ -353,7 +356,7 @@ export default function PowerShellFlowView({
               </button>
               {open && (
                 <div id={recordsId} role="region" aria-label={`원본 기록 ${session.events.length}건`} className="ps-session-records" style={{ borderTop: "1px solid var(--border-subtle)", background: "var(--bg)" }}>
-                  {session.events.map((event, eventIndex) => {
+                  {eventPageRows.map((event, eventIndex) => {
                     const evidence = eventEvidence(event);
                     const bookmarked = Number.isFinite(event.rowid) && (bookmarkedRowids?.has(event.rowid) ?? false);
                     const hostApplicationSecondary = evidence.label !== "HostApplication" ? firstLine(event.hostApplication, 180) : "";
@@ -379,6 +382,17 @@ export default function PowerShellFlowView({
                       </div>
                     );
                   })}
+                  {/* 카드 안 원본 레코드도 10건 고정 — 한 세션에 4104가 수천 건
+                      쌓여도 카드를 여는 것만으로 화면이 멈추지 않는다. */}
+                  <div style={{ padding: "6px 14px 8px 60px" }}>
+                    <PaginationControls
+                      ariaLabel={`${session.key} 원본 기록 페이지`}
+                      page={eventSafePage}
+                      pageCount={eventPageCount}
+                      onChange={(next) => setEventPages((previous) => ({ ...previous, [session.key]: next }))}
+                      summary={`(${session.events.length === 0 ? 0 : (eventSafePage * PS_PAGE_SIZE + 1).toLocaleString()}–${Math.min(session.events.length, (eventSafePage + 1) * PS_PAGE_SIZE).toLocaleString()} / ${session.events.length.toLocaleString()})`}
+                    />
+                  </div>
                 </div>
               )}
             </section>

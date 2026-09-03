@@ -170,7 +170,7 @@ export default function RdpCacheView({ data, mode = "fragments" }: RdpCacheViewP
             /* reconstructed fragments only — 세션(파일)별 갤러리 + 페이지네이션 */
             <FileGallery
               items={g.fragments}
-              pageSize={12}
+              pageSize={10}
               renderItem={(f) => (
                 <button
                   key={f.fragment_index}
