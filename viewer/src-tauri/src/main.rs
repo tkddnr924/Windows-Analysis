@@ -1269,7 +1269,7 @@ async fn timeline_source_page(
 // 대신 트랜잭션 insert를 수행한다.
 
 /// 구조 로직(필터키·검색 blob·include 규칙) 버전. 규칙이 바뀌면 올려 재빌드 유도.
-const TIMELINE_LOGIC_VERSION: i64 = 1;
+const TIMELINE_LOGIC_VERSION: i64 = 2;
 
 fn timeline_db_path(host_dir: &str) -> PathBuf {
     Path::new(host_dir).join("_master_timeline.sqlite")
@@ -1278,12 +1278,95 @@ fn timeline_db_building_path(host_dir: &str, token: &str) -> PathBuf {
     Path::new(host_dir).join(format!("_master_timeline.sqlite.building-{token}"))
 }
 
+/// 타임라인의 원본 행 참조 묶음을 원본 SQLite에서 한 번에 읽는다.
+///
+/// 타임라인 DB는 원본 행 전체를 복사해 두지 않는다 — 그러면 증거(185MB)보다
+/// 큰 사본(782MB)이 만들어지고, 빌드 때 그 전량이 렌더러를 왕복한다. 대신
+/// `full_path`+`rowid_src`만 저장하고, 필요한 시점(빌드 중 검색 문자열 생성,
+/// 페이지 조회의 표시·상세)에 해당 행만 파일별로 묶어 읽는다.
+///
+/// 반환은 `(full_path, rowid) -> (컬럼 순서대로의 값)`. 컬럼 순서를 유지하는
+/// 이유는 검색 문자열을 만들 때 프런트가 쓰던 값 순서와 같아야 하기 때문이다.
+fn read_source_rows_by_rowid(
+    refs: &[(String, String, i64)],
+) -> std::collections::HashMap<(String, i64), Vec<(String, Value)>> {
+    let mut by_file: std::collections::HashMap<(String, String), Vec<i64>> =
+        std::collections::HashMap::new();
+    for (path, table, rowid) in refs {
+        by_file
+            .entry((path.clone(), table.clone()))
+            .or_default()
+            .push(*rowid);
+    }
+    let mut out = std::collections::HashMap::new();
+    for ((path, table), rowids) in by_file {
+        let Ok(conn) = open_ro(&path) else { continue };
+        let mut columns = table_columns(&conn, &table);
+        if table == "CacheEntries" {
+            columns.retain(|c| c != "body_b64");
+        }
+        let select = if table == "CacheEntries" {
+            columns.iter().map(|c| q(c)).collect::<Vec<_>>().join(", ")
+        } else {
+            "*".to_string()
+        };
+        // rowid 묶음은 100개씩 나눠 조회한다(플레이스홀더·SQL 길이 상한).
+        for chunk in rowids.chunks(100) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT rowid AS __rowid, {} FROM {} WHERE rowid IN ({})",
+                select,
+                q(&table),
+                placeholders
+            );
+            let Ok(mut stmt) = conn.prepare(&sql) else { continue };
+            let names: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
+            let params: Vec<&dyn rusqlite::ToSql> =
+                chunk.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+            let Ok(mut cursor) = stmt.query(params.as_slice()) else { continue };
+            while let Ok(Some(row)) = cursor.next() {
+                let mut values = Vec::with_capacity(names.len());
+                let mut rowid = 0i64;
+                for (i, name) in names.iter().enumerate() {
+                    let Ok(raw) = row.get_ref(i) else { continue };
+                    let value = cell(raw);
+                    if name == "__rowid" {
+                        rowid = value.as_i64().unwrap_or(0);
+                    }
+                    values.push((name.clone(), value));
+                }
+                out.insert((path.clone(), rowid), values);
+            }
+        }
+    }
+    out
+}
+
+/// 검색 문자열 — `[테이블, 카테고리, ...행 값]`을 공백으로 이은 소문자.
+/// 빌드 시 프런트가 만들어 보내던 것을 백엔드에서 만든다(같은 내용을 IPC로
+/// 한 번 더 나르지 않는다).
+fn timeline_search_blob(table: &str, category: &str, values: &[(String, Value)]) -> String {
+    let mut parts: Vec<String> = Vec::with_capacity(values.len() + 2);
+    parts.push(table.to_string());
+    parts.push(category.to_string());
+    for (_, value) in values {
+        parts.push(match value {
+            Value::String(text) => text.clone(),
+            Value::Null => String::new(),
+            other => other.to_string(),
+        });
+    }
+    parts.join(" ").to_lowercase()
+}
+
 const TIMELINE_SCHEMA: &str = "CREATE TABLE master_timeline (\
  ts TEXT NOT NULL, category TEXT NOT NULL, source_table TEXT NOT NULL,\
  artifact_group TEXT NOT NULL, filter_key TEXT NOT NULL DEFAULT '',\
  has_tags INTEGER NOT NULL, full_path TEXT NOT NULL, rowid_src INTEGER NOT NULL,\
  record_key TEXT NOT NULL DEFAULT '', event_time TEXT NOT NULL DEFAULT '',\
- search_blob TEXT NOT NULL, row_json TEXT NOT NULL);\
+ search_blob TEXT NOT NULL);\
  CREATE TABLE _meta (key TEXT PRIMARY KEY, value TEXT);";
 
 #[derive(serde::Deserialize)]
@@ -1301,8 +1384,6 @@ struct TimelineInsertRow {
     record_key: String,
     #[serde(default)]
     event_time: String,
-    search_blob: String,
-    row_json: String,
 }
 
 struct TimelineBuildSession {
@@ -1400,6 +1481,13 @@ fn timeline_build_insert_impl(
     let worker = handle.clone();
     std::thread::spawn(move || {
         let result = (|| -> Result<(), String> {
+            // 검색 문자열은 원본에서 만든다 — 프런트가 행 사본을 IPC로 다시
+            // 보내지 않게 한다(이 배치의 행만 파일별로 묶어 읽는다).
+            let refs: Vec<(String, String, i64)> = rows
+                .iter()
+                .map(|r| (r.full_path.clone(), r.source_table.clone(), r.rowid_src))
+                .collect();
+            let sources = read_source_rows_by_rowid(&refs);
             let mut session = worker.0.lock().map_err(|_| "빌드 세션 잠금 실패".to_string())?;
             let tx = session
                 .conn
@@ -1408,14 +1496,18 @@ fn timeline_build_insert_impl(
             {
                 let mut stmt = tx
                     .prepare_cached(
-                        "INSERT INTO master_timeline (ts,category,source_table,artifact_group,filter_key,has_tags,full_path,rowid_src,record_key,event_time,search_blob,row_json) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                        "INSERT INTO master_timeline (ts,category,source_table,artifact_group,filter_key,has_tags,full_path,rowid_src,record_key,event_time,search_blob) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
                     )
                     .map_err(|e| format!("타임라인 insert 준비 실패: {e}"))?;
                 for r in &rows {
+                    let blob = sources
+                        .get(&(r.full_path.clone(), r.rowid_src))
+                        .map(|values| timeline_search_blob(&r.source_table, &r.category, values))
+                        .unwrap_or_default();
                     stmt.execute(rusqlite::params![
                         r.ts, r.category, r.source_table, r.artifact_group, r.filter_key,
                         r.has_tags, r.full_path, r.rowid_src, r.record_key, r.event_time,
-                        r.search_blob, r.row_json
+                        blob
                     ])
                     .map_err(|e| format!("타임라인 insert 실패: {e}"))?;
                 }
@@ -1734,7 +1826,8 @@ struct TimelinePageRow {
     rowid_src: i64,
     record_key: String,
     event_time: String,
-    row_json: String,
+    /// 원본 행 — 타임라인 DB에 사본을 두지 않고 페이지마다 원본에서 읽어 붙인다.
+    row: Map<String, Value>,
 }
 
 #[derive(Serialize)]
@@ -1817,7 +1910,7 @@ fn timeline_page_impl(host_dir: &str, query: TimelineQuery) -> Result<TimelinePa
         .map_err(|e| format!("타임라인 건수 조회 실패: {e}"))?;
     let dir = if query.sort_desc { "DESC" } else { "ASC" };
     let sql = format!(
-        "SELECT ts,category,source_table,artifact_group,full_path,rowid_src,record_key,event_time,row_json \
+        "SELECT ts,category,source_table,artifact_group,full_path,rowid_src,record_key,event_time \
          FROM master_timeline{where_clause} ORDER BY ts {dir}, source_table, rowid_src LIMIT {limit} OFFSET {offset}"
     );
     let mut stmt = conn
@@ -1834,12 +1927,25 @@ fn timeline_page_impl(host_dir: &str, query: TimelineQuery) -> Result<TimelinePa
                 rowid_src: r.get(5)?,
                 record_key: r.get(6)?,
                 event_time: r.get(7)?,
-                row_json: r.get(8)?,
+                row: Map::new(),
             })
         })
         .map_err(|e| format!("타임라인 페이지 조회 실패: {e}"))?
         .filter_map(|r| r.ok())
         .collect::<Vec<_>>();
+    // 이 페이지(최대 1,000행)의 원본 행만 파일별로 묶어 읽어 붙인다 — 목록의
+    // 제목·태그와 상세 드로어가 쓰던 값이 그대로 유지된다.
+    let refs: Vec<(String, String, i64)> = rows
+        .iter()
+        .map(|r| (r.full_path.clone(), r.source_table.clone(), r.rowid_src))
+        .collect();
+    let sources = read_source_rows_by_rowid(&refs);
+    let mut rows = rows;
+    for row in &mut rows {
+        if let Some(values) = sources.get(&(row.full_path.clone(), row.rowid_src)) {
+            row.row = values.iter().cloned().collect();
+        }
+    }
     Ok(TimelinePage { rows, total })
 }
 
@@ -7430,6 +7536,100 @@ mod execution_history_upgrade_tests {
     }
 }
 
+#[cfg(test)]
+mod timeline_build_tests {
+    use super::*;
+
+    /// 타임라인 DB는 원본 행 사본을 담지 않는다 — 검색 문자열은 백엔드가 원본에서
+    /// 만들고, 페이지 조회는 그 페이지 분의 원본 행만 읽어 붙인다. 증거 사본을
+    /// IPC로 나르지 않으면서 검색·표시 결과는 같아야 한다.
+    #[test]
+    fn timeline_derives_search_and_attaches_rows_without_storing_copies() {
+        let root = std::env::temp_dir().join(format!("wina-tl-build-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let src_dir = root.join("EVENTLOG");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let src = src_dir.join("Security.sqlite");
+        {
+            let conn = Connection::open(&src).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE Security (timestamp TEXT, EventID TEXT, EventData TEXT);
+                 INSERT INTO Security VALUES ('2026-01-01 10:00:00.000','4624','{\"User\":\"CORP\\\\analyst\"}');
+                 INSERT INTO Security VALUES ('2026-01-02 10:00:00.000','4625','{\"User\":\"CORP\\\\intruder\"}')",
+            )
+            .unwrap();
+        }
+        let host = root.to_string_lossy().to_string();
+        let token = "tl-build-token";
+        timeline_build_begin_impl(&host, token, "2026-01-01 00:00:00.000").unwrap();
+        let full = src.to_string_lossy().to_string();
+        // 프런트가 보내는 것은 경량 필드뿐이다(원본 사본·검색 문자열 없음).
+        let ndjson = format!(
+            "{}\n{}",
+            serde_json::json!({
+                "ts": "2026-01-01 10:00:00.000", "category": "EVENTLOG", "source_table": "Security",
+                "artifact_group": "g", "filter_key": "", "has_tags": 0, "full_path": full,
+                "rowid_src": 1, "record_key": "Security::1", "event_time": "2026-01-01 10:00:00.000"
+            }),
+            serde_json::json!({
+                "ts": "2026-01-02 10:00:00.000", "category": "EVENTLOG", "source_table": "Security",
+                "artifact_group": "g", "filter_key": "", "has_tags": 0, "full_path": full,
+                "rowid_src": 2, "record_key": "Security::2", "event_time": "2026-01-02 10:00:00.000"
+            })
+        );
+        let rows: Vec<TimelineInsertRow> = ndjson
+            .split('\n')
+            .map(serde_json::from_str)
+            .collect::<Result<_, _>>()
+            .unwrap();
+        timeline_build_insert_impl(&host, token, rows).unwrap();
+        timeline_build_finish_impl(&host, token).unwrap();
+
+        // 타임라인 DB에 원본 행 사본 컬럼이 없다.
+        let db = Connection::open(timeline_db_path(&host)).unwrap();
+        let columns = table_columns(&db, "master_timeline");
+        assert!(!columns.iter().any(|c| c == "row_json"), "columns={columns:?}");
+        drop(db);
+
+        let page = |search: &str| {
+            timeline_page_impl(
+                &host,
+                TimelineQuery {
+                    search: search.to_string(),
+                    hidden_source_tables: vec![],
+                    hidden_exec_sources: vec![],
+                    hidden_browser_kinds: vec![],
+                    only_suspicious: false,
+                    start: String::new(),
+                    end: String::new(),
+                    sort_desc: false,
+                    offset: 0,
+                    limit: 50,
+                },
+            )
+            .unwrap()
+        };
+
+        // 원본 행 값(EventData 안의 계정)으로 검색된다 — 백엔드가 만든 검색
+        // 문자열이 프런트가 만들던 것과 같은 범위를 덮는다.
+        let hit = page("intruder");
+        assert_eq!(hit.total, 1);
+        assert_eq!(hit.rows[0].rowid_src, 2);
+        assert_eq!(page("analyst").total, 1);
+        assert_eq!(page("4624").total, 1);
+        assert_eq!(page("없는값").total, 0);
+
+        // 페이지 조회는 원본 행을 붙여 준다(목록 제목·태그·상세가 쓰던 값).
+        let all = page("");
+        assert_eq!(all.rows.len(), 2);
+        assert_eq!(all.rows[0].row["EventID"], serde_json::json!("4624"));
+        assert!(all.rows[0].row.contains_key("EventData"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
 #[cfg(test)]
 mod timeline_source_page_tests {
     use super::*;

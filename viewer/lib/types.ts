@@ -386,7 +386,8 @@ export interface TimelinePageRow {
   rowidSrc: number;
   recordKey: string;
   eventTime: string;
-  rowJson: string;
+  /** 원본 행 — 백엔드가 페이지마다 원본 파일에서 읽어 붙인다. */
+  row: Record<string, string>;
 }
 export interface TimelinePage {
   rows: TimelinePageRow[];

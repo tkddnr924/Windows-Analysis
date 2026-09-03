@@ -26,7 +26,7 @@ const YIELD_EVERY = 8000;
 
 // 백엔드 TIMELINE_LOGIC_VERSION(main.rs)과 동기화한다 — 구조 로직(필터키·검색
 // blob·include 규칙)이 바뀌면 양쪽을 올려 기존 캐시를 무효화(재빌드)한다.
-export const TIMELINE_LOGIC_VERSION = 1;
+export const TIMELINE_LOGIC_VERSION = 2;
 
 // 소스 테이블을 페이지로 읽는 청크 크기. 이 청크 하나가 빌드 중 프런트 메모리
 // 피크의 상한이다(전체 테이블을 한 번에 올리지 않는다).
@@ -125,9 +125,9 @@ export async function streamBuildTimeline(
               rowid_src: Number((row as unknown as Record<string, unknown>).__rowid) || 0,
               record_key: row.record_key || row._record_key || "",
               event_time: row.timestamp || "",
-              // 검색 대상: [table, category, ...행 값들]를 공백으로 이은 소문자.
-              search_blob: [file.name, category.name, ...Object.values(row)].join(" ").toLowerCase(),
-              row_json: JSON.stringify(row),
+              // 행 사본(row_json)과 검색 문자열(search_blob)은 보내지 않는다 —
+              // 같은 증거를 두 벌 더 만들어 IPC로 나르면 원본보다 큰 payload가
+              // 된다. 백엔드가 full_path+rowid로 원본에서 직접 만든다.
             });
             batch.push(line);
             batchBytes += line.length + 1;

@@ -235,15 +235,12 @@ interface MasterTimelineProps {
   accountDirectory?: AccountDirectory;
 }
 
-// 페이지 행(경량 + 원본 row_json)을 렌더용 엔트리로 — row_json을 파싱해 기존
-// row 기반 표현·태그·상세 로직을 100행에만 그대로 재사용한다.
+// 페이지 행을 렌더용 엔트리로 — 기존 row 기반 표현·태그·상세 로직을
+// 현재 페이지 행에만 그대로 재사용한다.
 function pageRowToEntry(r: TimelinePageRow): TimelineEntry {
-  let row: Record<string, string> = {};
-  try {
-    row = JSON.parse(r.rowJson) as Record<string, string>;
-  } catch {
-    /* 손상된 행은 빈 값으로 — 시각·카테고리는 그래도 표시된다. */
-  }
+  // 원본 행은 백엔드가 이 페이지 분만 원본 파일에서 읽어 붙여 준다(타임라인
+  // DB에 사본을 두지 않는다). 원본을 못 읽은 행은 빈 값 — 시각·카테고리는 표시된다.
+  const row = (r.row ?? {}) as Record<string, string>;
   const columns = Object.keys(row);
   const spec = resolveArtifactView(r.sourceTable, columns);
   return {
