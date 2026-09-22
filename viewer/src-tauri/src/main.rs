@@ -17,7 +17,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use rusqlite::types::ValueRef;
@@ -68,6 +68,20 @@ fn cases_dir() -> PathBuf {
         .ok()
         .and_then(|p| p.parent().map(|d| d.join("cases")))
         .unwrap_or_else(|| dev_repo_path("cases"))
+}
+
+/// WebView2 user data folder.
+///
+/// Without an explicit path Tauri forces `%LOCALAPPDATA%\<identifier>` on
+/// Windows/Linux and WebView2 creates `EBWebView\` inside it. Everything this
+/// tool writes must stay under `cases/`, so pin it to `cases/.webview`.
+/// Host listing needs `host.json` and legacy migration needs `case.json`, so
+/// this folder is never mistaken for a host.
+fn webview_data_dir() -> PathBuf {
+    if let Ok(d) = std::env::var("WINA_WEBVIEW_DIR") {
+        return PathBuf::from(d);
+    }
+    cases_dir().join(".webview")
 }
 
 // --- shared types (camelCase to match the frontend) ------------------------
@@ -966,6 +980,10 @@ async fn run_host(
                         format!("[LIFECYCLE] 재파싱으로 이 호스트의 이전 북마크 {removed}건 삭제"),
                     );
                 }
+                // 발행으로 원본 파일 지문이 바뀌었으므로 뷰 캐시(계정 이벤트
+                // 인덱스·브라우저 도메인 집계)의 기존 엔트리는 다시 히트될 수
+                // 없다. TTL은 다음 접근에만 돌기 때문에 여기서 비운다.
+                clear_result_view_caches();
             }
             emit_pipeline_event(
                 &app,
@@ -1392,13 +1410,18 @@ struct TimelineBuildSession {
     building_path: PathBuf,
     pending: usize,
     error: Option<String>,
+    /// 마지막으로 이 세션에 작업이 오간 시각 — 웹뷰 리로드·크래시로 abort가
+    /// 오지 않은 세션을 회수하는 기준이다.
+    touched_at: Instant,
 }
 type TimelineBuildHandle = std::sync::Arc<(Mutex<TimelineBuildSession>, std::sync::Condvar)>;
+/// 진행 중이 아니면서 이 시간 이상 방치된 빌드 세션은 다음 begin에서 회수한다.
+const TIMELINE_BUILD_SESSION_IDLE: Duration = Duration::from_secs(600);
 fn timeline_build_sessions(
 ) -> &'static Mutex<std::collections::HashMap<String, TimelineBuildHandle>> {
-    static SESSIONS: OnceLock<Mutex<std::collections::HashMap<String, TimelineBuildHandle>>> =
-        OnceLock::new();
-    SESSIONS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+    static SESSIONS: LazyLock<Mutex<std::collections::HashMap<String, TimelineBuildHandle>>> =
+        LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+    &SESSIONS
 }
 
 fn timeline_build_begin_impl(
@@ -1417,10 +1440,26 @@ fn timeline_build_begin_impl(
             }
         }
     }
+    let mut abandoned: Vec<PathBuf> = Vec::new();
     if let Ok(mut sessions) = timeline_build_sessions().lock() {
+        let now = Instant::now();
         sessions.retain(|_, handle| {
-            handle.0.lock().map(|s| s.host_dir != host_dir).unwrap_or(true)
+            let Ok(session) = handle.0.lock() else { return true };
+            // 같은 호스트의 이전 빌드는 대체한다(호스트당 단일 빌더 전제).
+            // 다른 호스트라도 진행 중이 아니면서 오래 방치된 세션은 회수한다 —
+            // 프런트가 abort를 보내지 못한 경우(웹뷰 리로드·크래시) 열린 SQLite
+            // 연결과 .building- 파일이 그 호스트로 다음 begin이 올 때까지 남는다.
+            let stale = session.host_dir == host_dir
+                || (session.pending == 0
+                    && now.duration_since(session.touched_at) > TIMELINE_BUILD_SESSION_IDLE);
+            if stale {
+                abandoned.push(session.building_path.clone());
+            }
+            !stale
         });
+    }
+    for path in abandoned {
+        let _ = std::fs::remove_file(path);
     }
     let building = timeline_db_building_path(host_dir, token);
     let conn = rusqlite::Connection::open(&building)
@@ -1444,6 +1483,7 @@ fn timeline_build_begin_impl(
                     building_path: building,
                     pending: 0,
                     error: None,
+                    touched_at: Instant::now(),
                 }),
                 std::sync::Condvar::new(),
             )),
@@ -1477,6 +1517,7 @@ fn timeline_build_insert_impl(
             return Err("이전 배치 쓰기가 끝나지 않았습니다 — drain 후 전송해야 합니다".to_string());
         }
         session.pending += 1;
+        session.touched_at = Instant::now();
     }
     let worker = handle.clone();
     std::thread::spawn(move || {
@@ -1517,6 +1558,7 @@ fn timeline_build_insert_impl(
         })();
         if let Ok(mut session) = worker.0.lock() {
             session.pending = session.pending.saturating_sub(1);
+            session.touched_at = Instant::now();
             if let Err(error) = result {
                 session.error.get_or_insert(error);
             }
@@ -2375,6 +2417,8 @@ struct BrowserDomainCacheKey {
 struct BrowserDomainCacheEntry {
     key: BrowserDomainCacheKey,
     domains: Vec<BrowserVisitedDomainStat>,
+    /// 이 엔트리가 붙잡고 있는 대략적인 상주 바이트(문자열 소유분 포함).
+    bytes: usize,
     inserted_at: Instant,
 }
 
@@ -2385,8 +2429,20 @@ struct BrowserDomainCache {
 
 const BROWSER_DOMAIN_CACHE_MAX_ENTRIES: usize = 4;
 const BROWSER_DOMAIN_CACHE_MAX_DOMAINS_PER_ENTRY: usize = 50_000;
+/// 항목 수만으로는 실제 상주량이 정해지지 않는다(도메인 문자열 길이가 제각각).
+/// TTL은 get/put이 다시 호출될 때만 돌기 때문에, 뷰를 떠난 뒤의 상주량 상한은
+/// 이 바이트 예산이 정한다.
+const BROWSER_DOMAIN_CACHE_MAX_BYTES: usize = 8 * 1024 * 1024;
 const BROWSER_DOMAIN_CACHE_TTL: Duration = Duration::from_secs(30);
-static BROWSER_DOMAIN_CACHE: OnceLock<Mutex<BrowserDomainCache>> = OnceLock::new();
+static BROWSER_DOMAIN_CACHE: LazyLock<Mutex<BrowserDomainCache>> =
+    LazyLock::new(|| Mutex::new(BrowserDomainCache::default()));
+
+fn browser_domain_bytes(domains: &[BrowserVisitedDomainStat]) -> usize {
+    domains
+        .iter()
+        .map(|stat| std::mem::size_of::<BrowserVisitedDomainStat>() + stat.domain.capacity())
+        .sum()
+}
 
 /// One EventLog SQLite table selected by the renderer.  EventLog collection
 /// can produce one result database per original EVTX, so account activity
@@ -2480,6 +2536,8 @@ struct AccountEventIndex {
 struct AccountEventCacheEntry {
     key: AccountEventCacheKey,
     index: AccountEventIndex,
+    /// 이 엔트리가 붙잡고 있는 대략적인 상주 바이트(hit 문자열 소유분 포함).
+    bytes: usize,
     inserted_at: Instant,
 }
 
@@ -2490,8 +2548,41 @@ struct AccountEventIndexCache {
 
 const ACCOUNT_EVENT_CACHE_MAX_ENTRIES: usize = 4;
 const ACCOUNT_EVENT_CACHE_MAX_HITS_PER_ENTRY: usize = 250_000;
+/// hit 수 상한만으로는 상주량이 정해지지 않는다 — hit마다 timestamp/evidence
+/// 문자열을 소유한다. TTL은 get/put 호출 시에만 돌아 계정 뷰를 떠난 뒤에는
+/// 회수되지 않으므로, 유휴 상태의 상한은 이 바이트 예산이 정한다.
+const ACCOUNT_EVENT_CACHE_MAX_BYTES: usize = 48 * 1024 * 1024;
 const ACCOUNT_EVENT_CACHE_TTL: Duration = Duration::from_secs(30);
-static ACCOUNT_EVENT_INDEX_CACHE: OnceLock<Mutex<AccountEventIndexCache>> = OnceLock::new();
+static ACCOUNT_EVENT_INDEX_CACHE: LazyLock<Mutex<AccountEventIndexCache>> =
+    LazyLock::new(|| Mutex::new(AccountEventIndexCache::default()));
+
+fn account_event_index_bytes(index: &AccountEventIndex) -> usize {
+    index
+        .hits
+        .iter()
+        .map(|hit| {
+            std::mem::size_of::<AccountEventHit>()
+                + hit.timestamp.capacity()
+                + hit.evidence.capacity()
+        })
+        .sum()
+}
+
+/// 파싱이 결과를 다시 발행하면 두 뷰 캐시의 기존 엔트리는 파일 지문이 달라져
+/// 다시 히트될 수 없다 — 즉 순수한 쓰레기다. TTL은 다음 접근에만 돌기 때문에
+/// 발행 시점에 명시적으로 비운다.
+fn clear_result_view_caches() {
+    ACCOUNT_EVENT_INDEX_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entries
+        .clear();
+    BROWSER_DOMAIN_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entries
+        .clear();
+}
 
 fn value_text(value: &Value) -> Option<String> {
     match value {
@@ -2768,9 +2859,7 @@ fn account_event_cache_key(
 }
 
 fn account_event_cache_get(key: &AccountEventCacheKey) -> Option<AccountEventIndex> {
-    let cache =
-        ACCOUNT_EVENT_INDEX_CACHE.get_or_init(|| Mutex::new(AccountEventIndexCache::default()));
-    let mut cache = cache
+    let mut cache = ACCOUNT_EVENT_INDEX_CACHE
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let now = Instant::now();
@@ -2785,16 +2874,17 @@ fn account_event_cache_get(key: &AccountEventCacheKey) -> Option<AccountEventInd
 }
 
 fn account_event_cache_put(key: AccountEventCacheKey, index: AccountEventIndex) {
-    // The cache is intentionally bounded by both entry count and hit-reference
-    // count.  Each hit is metadata only (source/rowid/timestamp/evidence), not
+    // The cache is bounded by entry count, hit-reference count, and a byte
+    // budget.  Each hit is metadata only (source/rowid/timestamp/evidence), not
     // an EventLog row body; unusually broad accounts simply re-scan rather
     // than retaining an unbounded in-process index.
-    if index.hits.len() > ACCOUNT_EVENT_CACHE_MAX_HITS_PER_ENTRY {
+    let bytes = account_event_index_bytes(&index);
+    if index.hits.len() > ACCOUNT_EVENT_CACHE_MAX_HITS_PER_ENTRY
+        || bytes > ACCOUNT_EVENT_CACHE_MAX_BYTES
+    {
         return;
     }
-    let cache =
-        ACCOUNT_EVENT_INDEX_CACHE.get_or_init(|| Mutex::new(AccountEventIndexCache::default()));
-    let mut cache = cache
+    let mut cache = ACCOUNT_EVENT_INDEX_CACHE
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let now = Instant::now();
@@ -2804,10 +2894,19 @@ fn account_event_cache_put(key: AccountEventCacheKey, index: AccountEventIndex) 
     cache.entries.push_back(AccountEventCacheEntry {
         key,
         index,
+        bytes,
         inserted_at: now,
     });
-    while cache.entries.len() > ACCOUNT_EVENT_CACHE_MAX_ENTRIES {
-        cache.entries.pop_front();
+    // 방금 넣은 엔트리는 단독으로 예산 안이므로, 예산 초과는 항상 오래된
+    // 엔트리를 버려서 해소된다(최신 1건은 남긴다).
+    let mut total: usize = cache.entries.iter().map(|entry| entry.bytes).sum();
+    while cache.entries.len() > ACCOUNT_EVENT_CACHE_MAX_ENTRIES
+        || (total > ACCOUNT_EVENT_CACHE_MAX_BYTES && cache.entries.len() > 1)
+    {
+        match cache.entries.pop_front() {
+            Some(dropped) => total = total.saturating_sub(dropped.bytes),
+            None => break,
+        }
     }
 }
 
@@ -2817,9 +2916,7 @@ static ACCOUNT_EVENT_SOURCE_SCAN_COUNT: std::sync::atomic::AtomicUsize =
 
 #[cfg(test)]
 fn clear_account_event_cache_for_test() {
-    let cache =
-        ACCOUNT_EVENT_INDEX_CACHE.get_or_init(|| Mutex::new(AccountEventIndexCache::default()));
-    cache
+    ACCOUNT_EVENT_INDEX_CACHE
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .entries
@@ -3228,8 +3325,7 @@ fn browser_domain_cache_key(
 }
 
 fn browser_domain_cache_get(key: &BrowserDomainCacheKey) -> Option<Vec<BrowserVisitedDomainStat>> {
-    let cache = BROWSER_DOMAIN_CACHE.get_or_init(|| Mutex::new(BrowserDomainCache::default()));
-    let mut cache = cache
+    let mut cache = BROWSER_DOMAIN_CACHE
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let now = Instant::now();
@@ -3244,13 +3340,16 @@ fn browser_domain_cache_get(key: &BrowserDomainCacheKey) -> Option<Vec<BrowserVi
 }
 
 fn browser_domain_cache_put(key: BrowserDomainCacheKey, domains: Vec<BrowserVisitedDomainStat>) {
-    // The cache is capped by entry count and domain count. Very broad scopes
-    // still return a server page, but are deliberately not retained in memory.
-    if domains.len() > BROWSER_DOMAIN_CACHE_MAX_DOMAINS_PER_ENTRY {
+    // The cache is capped by entry count, domain count, and a byte budget. Very
+    // broad scopes still return a server page, but are deliberately not
+    // retained in memory.
+    let bytes = browser_domain_bytes(&domains);
+    if domains.len() > BROWSER_DOMAIN_CACHE_MAX_DOMAINS_PER_ENTRY
+        || bytes > BROWSER_DOMAIN_CACHE_MAX_BYTES
+    {
         return;
     }
-    let cache = BROWSER_DOMAIN_CACHE.get_or_init(|| Mutex::new(BrowserDomainCache::default()));
-    let mut cache = cache
+    let mut cache = BROWSER_DOMAIN_CACHE
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let now = Instant::now();
@@ -3260,10 +3359,17 @@ fn browser_domain_cache_put(key: BrowserDomainCacheKey, domains: Vec<BrowserVisi
     cache.entries.push_back(BrowserDomainCacheEntry {
         key,
         domains,
+        bytes,
         inserted_at: now,
     });
-    while cache.entries.len() > BROWSER_DOMAIN_CACHE_MAX_ENTRIES {
-        cache.entries.pop_front();
+    let mut total: usize = cache.entries.iter().map(|entry| entry.bytes).sum();
+    while cache.entries.len() > BROWSER_DOMAIN_CACHE_MAX_ENTRIES
+        || (total > BROWSER_DOMAIN_CACHE_MAX_BYTES && cache.entries.len() > 1)
+    {
+        match cache.entries.pop_front() {
+            Some(dropped) => total = total.saturating_sub(dropped.bytes),
+            None => break,
+        }
     }
 }
 
@@ -3273,8 +3379,7 @@ static BROWSER_DOMAIN_AGGREGATION_BUILD_COUNT: std::sync::atomic::AtomicUsize =
 
 #[cfg(test)]
 fn clear_browser_domain_cache_for_test() {
-    let cache = BROWSER_DOMAIN_CACHE.get_or_init(|| Mutex::new(BrowserDomainCache::default()));
-    cache
+    BROWSER_DOMAIN_CACHE
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .entries
@@ -6988,10 +7093,60 @@ mod account_event_tests {
     use super::*;
 
     fn cache_test_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+        static LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+        LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// 항목 수 상한(4)에 걸리지 않는 두 건이라도, 합계가 바이트 예산을 넘으면
+    /// 오래된 쪽이 회수되고 최신 항목은 남아야 한다 — TTL이 유휴 상태에서 돌지
+    /// 않으므로 상주량 상한은 이 예산이 정한다.
+    #[test]
+    fn account_event_cache_evicts_older_entries_to_stay_inside_its_byte_budget() {
+        let _lock = cache_test_lock();
+        clear_account_event_cache_for_test();
+        let evidence = "x".repeat(1024);
+        // 엔트리 하나가 예산의 절반을 넘도록 만든다(약 28MB).
+        let index_of = |tag: &str| AccountEventIndex {
+            hits: (0..26_000)
+                .map(|rowid| AccountEventHit {
+                    source_index: 0,
+                    rowid,
+                    timestamp: tag.to_string(),
+                    evidence: evidence.clone(),
+                })
+                .collect(),
+            source_count: 1,
+            sources_read: 1,
+            source_failures: Vec::new(),
+        };
+        let key_of = |sid: &str| AccountEventCacheKey {
+            sources: Vec::new(),
+            sid: sid.to_string(),
+            username: String::new(),
+            search: String::new(),
+            start: String::new(),
+            end: String::new(),
+        };
+        assert!(
+            account_event_index_bytes(&index_of("a")) > ACCOUNT_EVENT_CACHE_MAX_BYTES / 2,
+            "테스트 픽스처가 예산의 절반을 넘지 않으면 축출을 검증하지 못한다"
+        );
+
+        account_event_cache_put(key_of("first"), index_of("first"));
+        assert!(account_event_cache_get(&key_of("first")).is_some());
+
+        account_event_cache_put(key_of("second"), index_of("second"));
+        assert!(
+            account_event_cache_get(&key_of("first")).is_none(),
+            "예산 초과 시 오래된 엔트리가 회수되어야 한다"
+        );
+        assert!(
+            account_event_cache_get(&key_of("second")).is_some(),
+            "방금 넣은 엔트리는 남아야 한다"
+        );
+        clear_account_event_cache_for_test();
     }
 
     fn event(event_data: Value) -> Map<String, Value> {
@@ -7625,6 +7780,61 @@ mod timeline_build_tests {
         assert_eq!(all.rows[0].row["EventID"], serde_json::json!("4624"));
         assert!(all.rows[0].row.contains_key("EventData"));
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 웹뷰 리로드·크래시로 abort가 오지 않은 빌드 세션은 열린 SQLite 연결과
+    /// `.building-` 임시 파일을 붙잡는다. 회수 조건이 "같은 host_dir"뿐이면 그
+    /// 호스트로 다음 빌드가 오기 전까지 무기한 남는다 — 유휴 세션은 다른
+    /// 호스트의 다음 빌드가 회수해야 한다.
+    #[test]
+    fn idle_abandoned_timeline_session_is_reclaimed_by_the_next_build() {
+        let root = std::env::temp_dir().join(format!("wina-tl-idle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let abandoned_host = root.join("hostA");
+        let next_host = root.join("hostB");
+        std::fs::create_dir_all(&abandoned_host).unwrap();
+        std::fs::create_dir_all(&next_host).unwrap();
+        let abandoned = abandoned_host.to_string_lossy().to_string();
+        let next = next_host.to_string_lossy().to_string();
+
+        timeline_build_begin_impl(&abandoned, "tok-idle", "2026-01-01 00:00:00.000").unwrap();
+        let building = {
+            let handle = timeline_build_sessions()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get("tok-idle")
+                .cloned()
+                .expect("빌드 세션이 등록되어야 한다");
+            let mut session = handle
+                .0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // abort를 받지 못한 채 방치된 상태를 만든다(진행 중인 배치 없음).
+            session.touched_at = Instant::now()
+                .checked_sub(TIMELINE_BUILD_SESSION_IDLE + Duration::from_secs(1))
+                .unwrap();
+            session.building_path.clone()
+        };
+        assert!(building.exists());
+
+        timeline_build_begin_impl(&next, "tok-live", "2026-01-01 00:00:00.000").unwrap();
+        {
+            let sessions = timeline_build_sessions()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert!(
+                sessions.get("tok-idle").is_none(),
+                "유휴 세션이 회수되지 않았다"
+            );
+            assert!(
+                sessions.get("tok-live").is_some(),
+                "방금 시작한 세션은 남아야 한다"
+            );
+        }
+        assert!(!building.exists(), "회수된 세션의 임시 DB 파일이 남았다");
+
+        timeline_build_abort_impl(&next, "tok-live");
         let _ = std::fs::remove_dir_all(&root);
     }
 }
@@ -8302,8 +8512,8 @@ mod browser_activity_tests {
     }
 
     fn browser_domain_cache_test_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+        static LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+        LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -9225,7 +9435,29 @@ fn main() {
             wmi_subscription_events,
             powershell_search_rowids
         ])
-        .setup(|_app| Ok(()))
+        .setup(|app| {
+            // Window keeps the tauri.conf.json `main` config (`create: false`);
+            // only the WebView2 data folder moves to `cases/.webview`.
+            let config = app
+                .config()
+                .app
+                .windows
+                .iter()
+                .find(|window| window.label == "main")
+                .cloned()
+                .ok_or("tauri.conf.json has no `main` window config")?;
+            let mut builder = tauri::WebviewWindowBuilder::from_config(app.handle(), &config)?;
+            let dir = webview_data_dir();
+            match std::fs::create_dir_all(&dir) {
+                Ok(()) => builder = builder.data_directory(dir),
+                Err(error) => eprintln!(
+                    "[WEBVIEW] cannot create {} ({error}) — falling back to LocalAppData",
+                    dir.display()
+                ),
+            }
+            builder.build()?;
+            Ok(())
+        })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

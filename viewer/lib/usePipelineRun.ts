@@ -124,8 +124,14 @@ export function usePipelineRun(onDone?: () => void): PipelineRun {
   useEffect(() => {
     const unsubscribe = window.api.onPipelineLog((entry) => {
       const signal = interpretLine(entry.line);
-      setRuns((previous) => previous.map((run) => {
-        if (run.runId !== entry.runId) return run;
+      setRuns((previous) => {
+        // 로그는 줄 단위로 도착한다. 매 줄 새 배열을 만들면 `runs` 참조가
+        // 초당 수십 번 바뀌어, 이를 의존성으로 둔 화면 effect(호스트별 보고서
+        // 동기화 등)가 통째로 재실행된다. 대상 실행이 없거나 바뀐 필드가
+        // 없으면 이전 배열을 그대로 돌려준다.
+        const index = previous.findIndex((run) => run.runId === entry.runId);
+        if (index < 0) return previous;
+        const run = previous[index];
         let running = run.runningArtifacts;
         let completed = run.completedSteps;
         let current = entry.status === "running" ? run.currentArtifact : null;
@@ -148,7 +154,15 @@ export function usePipelineRun(onDone?: () => void): PipelineRun {
           current = runningLabel(running);
           if (signal.kind === "failure" && !failed.includes(signal.name)) failed = [...failed, signal.name];
         }
-        return {
+        if (
+          entry.status === run.status
+          && current === run.currentArtifact
+          && running === run.runningArtifacts
+          && completed === run.completedSteps
+          && failed === run.failedArtifacts
+        ) return previous;
+        const next = previous.slice();
+        next[index] = {
           ...run,
           status: entry.status,
           currentArtifact: current,
@@ -156,7 +170,8 @@ export function usePipelineRun(onDone?: () => void): PipelineRun {
           completedSteps: completed,
           failedArtifacts: failed,
         };
-      }));
+        return next;
+      });
       // The legacy compact progress banner follows the latest user-selected
       // run. Other hosts remain independently visible via `runs`.
       if (entry.runId !== currentRunRef.current) return;
@@ -216,17 +231,26 @@ export function usePipelineRun(onDone?: () => void): PipelineRun {
     setFailedArtifacts([]);
     setDismissed(false);
     setTotalSteps((opts.only ? opts.only.length : opts.totalArtifacts) + 1);
-    setRuns((previous) => [...previous, {
-      runId,
-      hostId: opts.hostId,
-      hostName: opts.hostName,
-      status: "queued",
-      currentArtifact: null,
-      runningArtifacts: [],
-      totalSteps: (opts.only ? opts.only.length : opts.totalArtifacts) + 1,
-      completedSteps: 0,
-      failedArtifacts: [],
-    }]);
+    // 같은 호스트의 종료된 이전 실행 항목은 버린다. 화면이 읽는 것은 호스트당
+    // 진행 중 1건(activeRunForHost)과 최신 종료 1건(terminalRunForHost)뿐이라
+    // 정보 손실이 없고, 재파싱을 반복하는 세션에서 항목이 무한히 쌓이는 것을
+    // 막는다. 진행/대기 항목은 동시 슬롯 추적에 필요하므로 건드리지 않는다.
+    setRuns((previous) => [
+      ...previous.filter((run) => run.hostId !== opts.hostId
+        || run.status === "queued"
+        || run.status === "running"),
+      {
+        runId,
+        hostId: opts.hostId,
+        hostName: opts.hostName,
+        status: "queued",
+        currentArtifact: null,
+        runningArtifacts: [],
+        totalSteps: (opts.only ? opts.only.length : opts.totalArtifacts) + 1,
+        completedSteps: 0,
+        failedArtifacts: [],
+      },
+    ]);
 
     try {
       const result = await window.api.runHost({ caseId: opts.caseId, hostId: opts.hostId, runId, only: opts.only });
@@ -234,6 +258,9 @@ export function usePipelineRun(onDone?: () => void): PipelineRun {
         ? { ...run, status: result.status, currentArtifact: null }
         : run));
       if (result.status === "cancelled") {
+        // 취소 표시를 여기서 소비한다 — 이 조기 return이 아래 공통 정리를
+        // 건너뛰어 runId가 세션 내내 남던 자리다.
+        cancelledRunsRef.current.delete(runId);
         if (currentRunRef.current === runId) {
           setRunningHostId(null);
           setCurrentArtifact(null);

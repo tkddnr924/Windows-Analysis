@@ -1829,11 +1829,17 @@ fn parse_browser_history_artifact(
     entry: &mut ParseArtifactReport,
 ) -> Result<Vec<String>> {
     entry_record_inputs(entry, paths);
+    let planned: Vec<_> = paths.iter().map(|p| (p, timeline::wal_siblings(p))).collect();
+    for (_, sides) in &planned {
+        for side in sides {
+            entry_record_input(entry, side, true);
+        }
+    }
     let mut outputs = Vec::new();
     let mut taken = HashSet::new();
     // 계정 하나의 History가 손상돼도 그 계정만 건너뛴다(파싱 실패 == 손상
     // 아티팩트). 이미 저장 완료된 다른 계정 결과는 그대로 발행된다.
-    for p in paths {
+    for (p, sides) in planned {
         let acct = browser_account(p);
         // 브라우저 판별: 경로 세그먼트 → 내용(내부 스킴) → 미상. 미상이면
         // 브라우저를 주장하지 않고 종전처럼 계정명만 쓴다 — 같은 계정에
@@ -1848,7 +1854,7 @@ fn parse_browser_history_artifact(
         let out = out_dir.join(&relative);
         let unit = run_unit_or_skip(&p.display().to_string(), &[&out], || -> Result<(usize, bool)> {
             // 테이블 단위 스트리밍 기록 — 전체 행을 메모리에 쌓지 않는다.
-            let (record_count, wrote) = browser_history::parse_history_stream(p, &out)?;
+            let (record_count, wrote) = browser_history::parse_history_stream(p, &sides, &out)?;
             if wrote {
                 emit(&format!("[+] {} rows -> {}", record_count, out.display()));
             }

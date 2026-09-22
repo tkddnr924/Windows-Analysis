@@ -315,8 +315,15 @@ function GraphCanvas({ graph }: { graph: BrowserVisitGraph }) {
         ref={viewportRef}
         onPointerDown={(event) => {
           if (event.button !== 0) return;
+          // 포인터 캡처 + 요소 리스너 — window 리스너로 붙이면 창 밖에서 버튼을
+          // 놓거나 드래그 중 언마운트될 때 pointerup이 오지 않아 핸들러가
+          // window에 남고 컴포넌트 클로저를 계속 잡는다. 캡처하면 pointerup이
+          // 항상 이 요소로 배달되고, 언마운트 시 리스너도 함께 사라진다.
+          const el = event.currentTarget;
+          const pointerId = event.pointerId;
           const drag = { lastX: event.clientX, lastY: event.clientY, moved: false };
           const onMove = (move: PointerEvent) => {
+            if (move.pointerId !== pointerId) return;
             const dx = move.clientX - drag.lastX;
             const dy = move.clientY - drag.lastY;
             if (!drag.moved && Math.abs(dx) + Math.abs(dy) <= 3) return;
@@ -325,15 +332,24 @@ function GraphCanvas({ graph }: { graph: BrowserVisitGraph }) {
             drag.lastY = move.clientY;
             setView((v) => ({ ...v, x: v.x + dx, y: v.y + dy }));
           };
-          const onUp = () => {
-            window.removeEventListener("pointermove", onMove);
-            window.removeEventListener("pointerup", onUp);
+          const onUp = (up: PointerEvent) => {
+            if (up.pointerId !== pointerId) return;
+            el.removeEventListener("pointermove", onMove);
+            el.removeEventListener("pointerup", onUp);
+            el.removeEventListener("pointercancel", onUp);
+            if (el.hasPointerCapture(pointerId)) el.releasePointerCapture(pointerId);
             // pointerup 직후 같은 태스크에서 click이 디스패치된다 — 그 한 번만 무시.
             suppressClickRef.current = drag.moved;
             setTimeout(() => { suppressClickRef.current = false; }, 0);
           };
-          window.addEventListener("pointermove", onMove);
-          window.addEventListener("pointerup", onUp);
+          try {
+            el.setPointerCapture(pointerId);
+          } catch {
+            // 캡처 불가(이미 해제된 포인터 등)면 리스너만 붙여 진행한다.
+          }
+          el.addEventListener("pointermove", onMove);
+          el.addEventListener("pointerup", onUp);
+          el.addEventListener("pointercancel", onUp);
         }}
         onClickCapture={(event) => {
           // 드래그로 끝난 클릭이 노드 선택으로 새지 않게 막는다.

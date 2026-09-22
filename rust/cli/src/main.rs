@@ -166,7 +166,8 @@ fn debug_parse(args: &[String]) -> Result<()> {
             eprintln!("WER: {} reports", r.len());
         }
         "parse-history" => {
-            let (rows, _) = parse_history_stream(&inp, &out)?;
+            let sides = wina_core::parsers::timeline::wal_siblings(&inp);
+            let (rows, _) = parse_history_stream(&inp, &sides, &out)?;
             eprintln!("BrowserHistory: {} rows", rows);
         }
         "parse-rdpcache" => {

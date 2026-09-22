@@ -33,6 +33,11 @@ const MFT_CHILDREN_PAGE = 100;
 
 const ROOT_ENTRY = 5;
 const LIST_FETCH_SIZE = 200; // lazy 로딩 배치 크기
+// 스크롤 이어받기로 재귀 목록에 상주시킬 행 상한. 원본 테이블 경로의
+// MAX_RESIDENT_RAW_ROWS(app/page.tsx)와 같은 값·같은 계약이다 — 수백만 행
+// $MFT를 끝까지 스크롤해도 웹뷰 메모리가 무한히 커지지 않게 막고, 그
+// 지점부터는 패턴·시간 필터로 좁혀 보게 한다(상한 도달은 화면에 표시한다).
+const MAX_RESIDENT_LIST_ROWS = 100000;
 const LIST_ROW_HEIGHT = 56;
 // 시각 기준 정렬·기간 필터 키 → 라벨/컬럼. si_* 4종에 더해 fn_*($FILE_NAME
 // 0x30)도 제공한다 — timestomping은 주로 $SI만 조작되므로 $FN 기준 정렬이
@@ -131,7 +136,9 @@ export default function MftView({ dbPath, tableBookmarks, onToggleBookmark, allB
   const [referenceDetail, setReferenceDetail] = useState<PathReference | null>(null);
   // Cross-artifact sightings of a path (JumpList today), indexed by lowercased
   // path so the tree can tag rows without a query per row.
-  const [pathRefs, setPathRefs] = useState<RefMap>(new Map());
+  // Map은 in-place로 병합하고 래퍼 객체만 새로 만들어 리렌더한다 — 배치마다
+  // new Map(prev)로 전량 복사하면 목록 이어받기가 O(N²)가 된다.
+  const [pathRefs, setPathRefs] = useState<{ map: RefMap }>({ map: new Map() });
   const [pathRefsError, setPathRefsError] = useState<string | null>(null);
   // Accounts seen across all references, and which are currently shown. An
   // investigator can uncheck accounts unrelated to the attack so their
@@ -144,9 +151,13 @@ export default function MftView({ dbPath, tableBookmarks, onToggleBookmark, allB
   // JumpList·Shellbag을 재구성해 통째로 들고 있던 방식을 대체 (협약: 즉석
   // 가공 금지). 계정 필터 목록은 파생 테이블 집계로 따로 받는다.
   const requestedRefPaths = useRef<Set<string>>(new Set());
+  // 재귀 목록에서 교차참조 요청을 이미 검사한 지점 — 목록은 뒤로만 append
+  // 되므로 이 커서 이후만 훑으면 된다.
+  const listRefCursor = useRef(0);
   useEffect(() => {
     requestedRefPaths.current = new Set();
-    setPathRefs(new Map());
+    listRefCursor.current = 0;
+    setPathRefs({ map: new Map() });
     setPathRefsError(null);
     let alive = true;
     window.api.pathReferenceAccounts(hostDirOf(dbPath)).then((accounts) => {
@@ -185,7 +196,12 @@ export default function MftView({ dbPath, tableBookmarks, onToggleBookmark, allB
     };
     root?.rows.forEach(collect);
     Object.values(childrenCache).forEach((page) => page.rows.forEach(collect));
-    listRows.forEach(collect);
+    // 목록은 커서 이후 구간만 — 배치마다 전 행을 다시 훑으면 로드된 행 수에
+    // 제곱으로 비용이 붙는다. 필터 변경으로 목록이 처음부터 다시 차면
+    // (길이가 줄면) 커서를 되돌린다.
+    const listCursorBefore = Math.min(listRefCursor.current, listRows.length);
+    for (let i = listCursorBefore; i < listRows.length; i += 1) collect(listRows[i]);
+    listRefCursor.current = listRows.length;
     (results ?? []).forEach(collect);
     if (pending.length === 0) return;
     let alive = true;
@@ -194,12 +210,11 @@ export default function MftView({ dbPath, tableBookmarks, onToggleBookmark, allB
       setPathRefsError(null);
       if (list.length === 0) return;
       setPathRefs((prev) => {
-        const merged: RefMap = new Map(prev);
         for (const r of list) {
-          const arr = merged.get(r.path);
-          if (arr) merged.set(r.path, [...arr, r]); else merged.set(r.path, [r]);
+          const arr = prev.map.get(r.path);
+          if (arr) arr.push(r); else prev.map.set(r.path, [r]);
         }
-        return merged;
+        return { map: prev.map };
       });
     }).catch(() => {
       // $MFT evidence remains usable without optional cross-artifact tags;
@@ -207,7 +222,9 @@ export default function MftView({ dbPath, tableBookmarks, onToggleBookmark, allB
       // 실패한 배치의 경로는 요청 이력에서 되돌린다 — 다음 트리 확장·검색으로
       // effect가 다시 돌 때 자연 재시도되고, 일시 오류가 해당 경로들의 태그를
       // 세션 내내 누락시키지 않는다 (재등록 선점으로 중복 요청은 없음).
+      // 목록 커서도 이번 배치 이전으로 되돌려야 목록 행이 재시도에서 빠지지 않는다.
       for (const path of pending) requestedRefPaths.current.delete(path);
+      listRefCursor.current = Math.min(listRefCursor.current, listCursorBefore);
       if (alive) setPathRefsError("교차 참조 정보를 불러오지 못했습니다.");
     });
     return () => { alive = false; };
@@ -380,6 +397,8 @@ export default function MftView({ dbPath, tableBookmarks, onToggleBookmark, allB
   }, [dbPath, listQuery, viewMode, listOptions]);
   const loadMoreList = useCallback(() => {
     if (listLoading || listTotal === null || listRows.length >= listTotal) return;
+    // 상주 상한 도달 — 더 싣지 않는다. 화면에는 상한 안내를 띄운다.
+    if (listRows.length >= MAX_RESIDENT_LIST_ROWS) return;
     const seq = listSeq.current;
     setListLoading(true);
     window.api.mftRecordsPage(dbPath, listQuery, listRows.length, LIST_FETCH_SIZE, listOptions).then((page) => {
@@ -411,7 +430,7 @@ export default function MftView({ dbPath, tableBookmarks, onToggleBookmark, allB
       onToggleBookmark={() => onToggleBookmark(Number(selected.__rowid), "")}
       onToggleFieldBookmark={(field) => onToggleBookmark(Number(selected.__rowid), field)}
       isFieldBookmarked={(field) => bmFieldKeys.has(`${selected.__rowid}@${field}`)}
-      relatedEvidence={refsFor(pathRefs, selected, selAccounts).map((reference, index) => ({
+      relatedEvidence={refsFor(pathRefs.map, selected, selAccounts).map((reference, index) => ({
         id: `${reference.fullPath}:${reference.tableName}:${reference.rowid}:${index}`,
         label: `${reference.kind} · ${reference.account || "미상"}`,
         subtitle: reference.label,
@@ -449,11 +468,11 @@ export default function MftView({ dbPath, tableBookmarks, onToggleBookmark, allB
       <div className={`mft-content mft-content--${viewMode}`} style={{ flex: 1, minHeight: 0, display: "grid", gap: 10, padding: 14, background: "var(--bg)", gridTemplateColumns: stackedInspector ? "minmax(0, 1fr)" : "minmax(0, 7fr) minmax(300px, 3fr)", gridTemplateRows: stackedInspector ? "minmax(300px, 1fr) minmax(260px, .75fr)" : undefined }}>
         <aside aria-label={viewMode === "tree" ? "파일 탐색기" : "재귀 파일 시스템 목록"} style={{ minWidth: 0, minHeight: 0, overflow: "hidden", padding: viewMode === "tree" ? "8px 10px 14px" : "0", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", background: "var(--bg-panel)", display: "flex", flexDirection: "column" }}>
           {viewMode === "list" ? (
-            <MftRecordList rows={listRows} total={listTotal} loading={listLoading} error={listError} query={listQuery} bmRowids={bmRowids} selectedRowid={selectedRowid} refs={pathRefs} accountFilter={selAccounts} onSelect={setSelected} onLoadMore={loadMoreList} sortKey={listSortKey} onSortKey={setListSortKey} sortDesc={listSortDesc} onSortDesc={setListSortDesc} filesOnly={listFilesOnly} onFilesOnly={setListFilesOnly} pattern={listPattern} onPattern={setListPattern} timeStart={listTimeStart} timeEnd={listTimeEnd} onTimeRange={(next) => { setListTimeStart(next.start); setListTimeEnd(next.end); }} timeLabel={MFT_TIME_SORTS[listTimeKey]?.label ?? "생성 시각"} />
+            <MftRecordList rows={listRows} total={listTotal} loading={listLoading} error={listError} query={listQuery} bmRowids={bmRowids} selectedRowid={selectedRowid} refs={pathRefs.map} accountFilter={selAccounts} onSelect={setSelected} onLoadMore={loadMoreList} sortKey={listSortKey} onSortKey={setListSortKey} sortDesc={listSortDesc} onSortDesc={setListSortDesc} filesOnly={listFilesOnly} onFilesOnly={setListFilesOnly} pattern={listPattern} onPattern={setListPattern} timeStart={listTimeStart} timeEnd={listTimeEnd} onTimeRange={(next) => { setListTimeStart(next.start); setListTimeEnd(next.end); }} timeLabel={MFT_TIME_SORTS[listTimeKey]?.label ?? "생성 시각"} />
           ) : <>
             <div style={{ flex: 1, minHeight: 0, overflow: "auto" }}>
               {results !== null ? (
-                <SearchResults rows={results} searching={searching} error={searchError} bmRowids={bmRowids} selectedRowid={selectedRowid} onSelect={setSelected} refs={pathRefs} accountFilter={selAccounts} />
+                <SearchResults rows={results} searching={searching} error={searchError} bmRowids={bmRowids} selectedRowid={selectedRowid} onSelect={setSelected} refs={pathRefs.map} accountFilter={selAccounts} />
               ) : root === null ? (
                 <div style={{ minHeight: 100, display: "flex", alignItems: "center", justifyContent: "center", gap: 8, color: "var(--text-dim)", fontSize: 12.5 }}>
                   <CircularProgress size={17} thickness={4} />
@@ -478,7 +497,7 @@ export default function MftView({ dbPath, tableBookmarks, onToggleBookmark, allB
                       onToggle={toggle}
                       onSelect={setSelected}
                       onLoadMore={loadMoreChildren}
-                      refs={pathRefs}
+                      refs={pathRefs.map}
                       accountFilter={selAccounts}
                     />
                   ))}
@@ -554,11 +573,14 @@ function MftRecordList({ rows, total, loading, error, query, bmRowids, selectedR
   const grid = sortValue ? "minmax(0, 3fr) 176px minmax(108px, 1fr)" : "minmax(0, 3fr) minmax(108px, 1fr)";
   const virtualItems = virtualizer.getVirtualItems();
   const lastVisibleIndex = virtualItems.length ? virtualItems[virtualItems.length - 1].index : 0;
+  // 상주 상한에 도달했는지 — 도달하면 이어받기를 멈추고 헤더에 안내를 띄운다.
+  // 조용히 멈추면 분석가가 "레코드가 여기까지"로 오판한다.
+  const capped = rows.length >= MAX_RESIDENT_LIST_ROWS;
   // lazy 로딩: 스크롤이 끝 30행 안쪽에 닿으면 다음 배치를 이어서 불러온다.
   useEffect(() => {
-    if (loading || total === null || rows.length >= total) return;
+    if (loading || total === null || rows.length >= total || capped) return;
     if (lastVisibleIndex >= rows.length - 30) onLoadMore();
-  }, [lastVisibleIndex, loading, rows.length, total, onLoadMore]);
+  }, [lastVisibleIndex, loading, rows.length, total, capped, onLoadMore]);
   useEffect(() => { scrollRef.current?.scrollTo({ top: 0 }); }, [query, sortKey, sortDesc, filesOnly, pattern, timeStart, timeEnd]);
 
   return <section aria-label="MFT 재귀 목록" style={{ display: "flex", flexDirection: "column", flex: 1, minHeight: 0 }}>
@@ -608,6 +630,11 @@ function MftRecordList({ rows, total, loading, error, query, bmRowids, selectedR
       >
         <FolderOutlinedIcon sx={{ fontSize: 15 }} />폴더 포함
       </button>
+      {capped && (
+        <span role="status" style={{ color: "var(--warning)", fontSize: 11.5, fontWeight: 650, whiteSpace: "nowrap" }}>
+          상주 상한 {MAX_RESIDENT_LIST_ROWS.toLocaleString()}건 도달 · 패턴·시간 필터로 좁혀 보세요
+        </span>
+      )}
       <span style={{ marginLeft: "auto", color: "var(--text-faint)", fontSize: 11.5, fontVariantNumeric: "tabular-nums" }}>
         {total !== null ? `${rows.length.toLocaleString()} / ${total.toLocaleString()}건` : "\u00a0"}
         {loading && rows.length > 0 && " · 불러오는 중…"}

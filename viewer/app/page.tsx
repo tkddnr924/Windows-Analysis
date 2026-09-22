@@ -59,7 +59,11 @@ const RAW_TABLE_CHUNK = 20000;
 const MAX_RESIDENT_RAW_ROWS = 100000;
 
 const parentDir = (dir: string): string => dir.slice(0, Math.max(dir.lastIndexOf("/"), dir.lastIndexOf("\\")));
-const accountDirectoryKey = (host: Pick<Host, "id" | "dir">): string => `${host.id}\u0000${host.dir.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase()}`;
+// 키에 호스트의 마지막 실행 시각을 포함한다 — 재파싱하면 계정 목록이 바뀌므로
+// 이전 발행본의 SID→계정 매핑을 계속 쓰면 안 된다(재파싱 정책: 이전 결과는
+// 삭제된다). 같은 호스트의 옛 키는 loadAccountDirectory에서 함께 버린다.
+const accountDirectoryKey = (host: Pick<Host, "id" | "dir" | "lastRunAt">): string =>
+  `${host.id}\u0000${host.dir.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase()}\u0000${host.lastRunAt ?? ""}`;
 
 type SourceRecordRef = { fileName?: string; tableName: string; rowid: number };
 
@@ -143,7 +147,7 @@ export default function Home() {
   // read returning late must not restore a just-finished host to `미실행`.
   const caseRefreshSequence = useRef(0);
 
-  const loadAccountDirectory = useCallback((host: Pick<Host, "id" | "dir">): Promise<AccountDirectory> => {
+  const loadAccountDirectory = useCallback((host: Pick<Host, "id" | "dir" | "lastRunAt">): Promise<AccountDirectory> => {
     const key = accountDirectoryKey(host);
     const cached = accountDirectoryCache.current[key];
     if (cached) return Promise.resolve(cached);
@@ -152,8 +156,23 @@ export default function Home() {
     const request = window.api.accountDirectory(host.dir)
       .then((entries) => {
         const directory = accountDirectoryFromEntries(entries);
+        // 같은 호스트의 이전 실행 키는 버린다 — 키에 실행 시각만 넣으면
+        // 재파싱마다 항목이 쌓인다. 옛 매핑은 더 이상 유효하지 않으므로
+        // 보관할 이유가 없다.
+        const hostPrefix = `${host.id}\u0000`;
+        for (const existing of Object.keys(accountDirectoryCache.current)) {
+          if (existing !== key && existing.startsWith(hostPrefix)) delete accountDirectoryCache.current[existing];
+        }
         accountDirectoryCache.current[key] = directory;
-        setAccountDirectories((current) => current[key] === directory ? current : { ...current, [key]: directory });
+        setAccountDirectories((current) => {
+          if (current[key] === directory) return current;
+          const next: Record<string, AccountDirectory> = {};
+          for (const [existing, value] of Object.entries(current)) {
+            if (existing !== key && !existing.startsWith(hostPrefix)) next[existing] = value;
+          }
+          next[key] = directory;
+          return next;
+        });
         return directory;
       })
       .finally(() => accountDirectoryRequests.current.delete(key));

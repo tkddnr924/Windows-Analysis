@@ -714,6 +714,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// `cases/` also holds app-internal folders (WebView2 data in
+    /// `cases/.webview`). Counting them as hosts would show ghost hosts.
+    #[test]
+    fn app_internal_directories_at_cases_root_are_not_hosts() {
+        let root = temporary_directory("internal-dirs");
+        let host = create_host(
+            "ignored",
+            "FIRST",
+            "/evidence/first",
+            "2026-08-23 12:00:01",
+            &root,
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join(".webview").join("EBWebView")).unwrap();
+        std::fs::write(root.join(".webview").join("EBWebView").join("state"), b"x").unwrap();
+
+        let cases = list_cases(&root).unwrap();
+
+        assert_eq!(cases[0].hosts.len(), 1);
+        assert_eq!(cases[0].hosts[0].id, host.id);
+        assert!(
+            root.join(".webview").join("EBWebView").join("state").is_file(),
+            "migration must not move app-internal folders"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn legacy_case_migration_moves_results_logs_and_rewrites_bookmarks() {
         let root = temporary_directory("legacy");
