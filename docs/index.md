@@ -13,7 +13,7 @@
 - [앱 구조와 데이터 관리](patterns/application.md)
 - [디자인 규칙](patterns/design.md)
 - [파싱 아키텍처와 데이터 보존](patterns/parsing.md) — Chromium History WAL 처리·검증 포함
-- [DFIR 분석 뷰](patterns/dfir-analysis.md)
+- [DFIR 분석 뷰](patterns/dfir-analysis.md) — 북마크 사건 시각과 원본 키 시각 구분
 - [호스트 연결 3D 뷰](patterns/host-connections.md)
 
 ## 관리

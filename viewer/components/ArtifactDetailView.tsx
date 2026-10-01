@@ -752,6 +752,7 @@ function DetailSection({ section, row, onFetchLinkedRows, hostDir, accountDirect
 interface ArtifactDetailViewProps {
   spec: ArtifactViewSpec;
   row: Record<string, string>;
+  evidenceTime?: { value: string; label?: string };
   onNavigate: (targetFile: string, targetColumn: string, value: string) => void;
   onFetchLinkedRows?: FetchLinkedRows;
   /** Host evidence directory, required only for on-demand Browser Cache bodies. */
@@ -798,7 +799,7 @@ function VisitFlowLauncher({ row, hostDir }: { row: Record<string, string>; host
   );
 }
 
-export default function ArtifactDetailView({ spec, row, onNavigate, onFetchLinkedRows, hostDir, accountDirectory, onToggleFieldBookmark, isFieldBookmarked }: ArtifactDetailViewProps) {
+export default function ArtifactDetailView({ spec, row, evidenceTime, onNavigate, onFetchLinkedRows, hostDir, accountDirectory, onToggleFieldBookmark, isFieldBookmarked }: ArtifactDetailViewProps) {
   const title = spec.title(row);
   const subtitle = spec.subtitle?.(row);
   const tags = spec.tags?.(row) ?? [];
@@ -810,9 +811,9 @@ export default function ArtifactDetailView({ spec, row, onNavigate, onFetchLinke
   const activeLinks = (spec.links ?? []).filter((link) => row[link.key]);
   const activeEmbeddedLinks = (spec.embeddedLinks ?? []).filter((link) => row[link.key]);
 
-  // The record's time. Always surfaced when present — the primary timeline
-  // field if the spec declares one, else a plain "timestamp"/"last_write".
-  const timeValue = (spec.timelineField ? row[spec.timelineField] : "") || row.timestamp || row.last_write || "";
+  // Selection context does not replace any original evidence field.
+  const timeValue = evidenceTime?.value ?? ((spec.timelineField ? row[spec.timelineField] : "") || row.timestamp || row.last_write || "");
+  const showTime = Boolean(timeValue && (evidenceTime || spec.overviewTime !== "hide"));
 
   return (
     <div style={{ minWidth: 0, maxWidth: "100%" }}>
@@ -820,13 +821,14 @@ export default function ArtifactDetailView({ spec, row, onNavigate, onFetchLinke
         <div className="dfir-section-label" style={{ marginBottom: 8 }}>증거 개요</div>
         <div style={{ padding: "12px 14px", background: "var(--bg-elevated)", border: "1px solid color-mix(in srgb, var(--text-faint) 38%, transparent)", borderRadius: "var(--radius-md)" }}>
           <div style={{ minWidth: 0, maxWidth: "100%", fontSize: 16, fontWeight: 700, overflowWrap: "anywhere", wordBreak: "break-word" }}>{title}</div>
-          {timeValue && spec.overviewTime !== "hide" && (
+          {showTime && (
             <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12.5, color: "var(--text-time)", fontFamily: "var(--mono)", fontWeight: 550, marginTop: 7 }}>
+              {evidenceTime?.label && <span>{evidenceTime.label}</span>}
               {timeValue}
               <CopyButton value={timeValue} />
             </div>
           )}
-          {subtitle && !(timeValue && spec.overviewTime !== "hide") && (
+          {subtitle && !showTime && (
             <div style={{ display: "inline-flex", alignItems: "center", gap: 6, minWidth: 0, maxWidth: "100%", fontSize: 12.5, color: "var(--text-time)", fontFamily: "var(--mono)", fontWeight: 550, marginTop: 7, overflowWrap: "anywhere", wordBreak: "break-word" }}>
               <span style={{ minWidth: 0 }}>{subtitle}</span>
               <CopyButton value={subtitle} />

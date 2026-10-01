@@ -17,6 +17,8 @@ interface RowDetailPanelProps {
   row: Record<string, string>;
   columns: string[];
   focusedColumn: string | null;
+  /** Selected evidence time; never merged into the source row. */
+  evidenceTime?: { value: string; label?: string };
   fileBaseName: string;
   onClose: () => void;
   onNavigate: (targetFile: string, targetColumn: string, value: string) => void;
@@ -184,7 +186,7 @@ function RawFieldValue({ column, value, focused }: { column: string; value: stri
   );
 }
 
-export default function RowDetailPanel({ row, columns, focusedColumn, fileBaseName, onClose, onNavigate, onFetchLinkedRows, hostDir, accountDirectory, isBookmarked, onToggleBookmark, variant = "drawer", onToggleFieldBookmark, isFieldBookmarked, relatedEvidence = [] }: RowDetailPanelProps) {
+export default function RowDetailPanel({ row, columns, focusedColumn, evidenceTime, fileBaseName, onClose, onNavigate, onFetchLinkedRows, hostDir, accountDirectory, isBookmarked, onToggleBookmark, variant = "drawer", onToggleFieldBookmark, isFieldBookmarked, relatedEvidence = [] }: RowDetailPanelProps) {
   // EventLog-derived overview rows (PowerShell/RDP/SMB correlations) carry a
   // two-part `<table>::<rowid>` key (legacy hosts: `<log>.evtx::<EventRecordID>`).
   // Load that raw event so it always uses the shared EventLog detail. Other
@@ -372,7 +374,7 @@ export default function RowDetailPanel({ row, columns, focusedColumn, fileBaseNa
             <div style={{ padding: 20, color: "var(--text-dim)", fontSize: 12.5 }}>원본 이벤트 로그를 불러오는 중...</div>
           ) : spec && !showRaw ? (
             <>
-              <ArtifactDetailView spec={spec} row={effRow} onNavigate={onNavigate} onFetchLinkedRows={onFetchLinkedRows} hostDir={hostDir} accountDirectory={accountDirectory} onToggleFieldBookmark={onToggleFieldBookmark} isFieldBookmarked={isFieldBookmarked} />
+              <ArtifactDetailView spec={spec} row={effRow} evidenceTime={evidenceTime} onNavigate={onNavigate} onFetchLinkedRows={onFetchLinkedRows} hostDir={hostDir} accountDirectory={accountDirectory} onToggleFieldBookmark={onToggleFieldBookmark} isFieldBookmarked={isFieldBookmarked} />
               {relatedEvidence.length > 0 && (
                 <section style={{ padding: "14px 16px 18px", borderBottom: "1px solid var(--border-subtle)" }}>
                   <div className="dfir-section-label" style={{ marginBottom: 7 }}>교차 참조 증거</div>

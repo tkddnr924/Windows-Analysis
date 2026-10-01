@@ -1297,7 +1297,7 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     sections: [
       { heading: "레지스트리 원본 레코드", fields: [
         { key: "_ua_program", label: "실행 프로그램 (UserAssist 해독)", kind: "path", compute: (r) => userAssistProgram(r) || undefined },
-        { key: "last_write", label: "마지막 기록 시각" },
+        { key: "last_write", label: "레지스트리 키 마지막 기록 시각" },
         { key: "key_path", label: "키 경로", kind: "path", compute: (r) => displayRegistryKeyPath(r.key_path, r._source_file) },
         { key: "value_name", label: "값 이름" },
         { key: "value_type", label: "값 유형", kind: "badge" },

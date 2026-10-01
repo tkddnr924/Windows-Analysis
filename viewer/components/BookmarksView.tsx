@@ -240,7 +240,7 @@ function EntryOpenButton({ entry, onOpen }: { entry: BookmarkEntry; onOpen: (ent
 }
 
 export default function BookmarksView({ bookmarks, hosts, hostIpMap, currentHostId, timeRange, onRemove, onNavigate, onFetchLinkedRows, accountDirectoryForHost }: BookmarksViewProps) {
-  const [detail, setDetail] = useState<{ bookmark: Bookmark; row: Record<string, string>; columns: string[] } | null>(null);
+  const [detail, setDetail] = useState<{ bookmark: Bookmark; row: Record<string, string>; columns: string[]; evidenceTime: { value: string; label?: string } } | null>(null);
   const [rowCache, setRowCache] = useState<Record<string, RowLoad>>({});
   const [lookupAttempt, setLookupAttempt] = useState(0);
   const [sortDir, setSortDir] = useState<"asc" | "desc">("asc");
@@ -299,7 +299,14 @@ export default function BookmarksView({ bookmarks, hosts, hostIpMap, currentHost
 
   const failedCount = entries.filter((entry) => entry.load?.status === "error").length;
   const emptyForRange = timedEntries.length === 0 && undatedEntries.length === 0 && unresolvedEntries.length === 0;
-  const openDetail = (entry: BookmarkEntry) => { if (entry.row) setDetail({ bookmark: entry.bookmark, row: entry.row, columns: entry.columns }); };
+  const openDetail = (entry: BookmarkEntry) => {
+    if (entry.row) setDetail({
+      bookmark: entry.bookmark,
+      row: entry.row,
+      columns: entry.columns,
+      evidenceTime: { value: entry.eventTime, label: entry.eventTimeLabel ?? "북마크 사건 시각" },
+    });
+  };
   const retryFailedRows = () => {
     setRowCache((previous) => Object.fromEntries(Object.entries(previous).filter(([, value]) => value.status !== "error")));
     setLookupAttempt((attempt) => attempt + 1);
@@ -313,7 +320,7 @@ export default function BookmarksView({ bookmarks, hosts, hostIpMap, currentHost
 
       {failedCount > 0 && <div role="alert" style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0, padding: "7px 14px", borderBottom: "1px solid color-mix(in srgb, var(--danger) 42%, var(--border))", background: "color-mix(in srgb, var(--danger) 7%, var(--bg-panel))", color: "var(--text)", fontSize: 12 }}>원본 행 {failedCount}건을 불러오지 못했습니다.<button type="button" onClick={retryFailedRows} style={{ display: "inline-flex", alignItems: "center", gap: 4, marginLeft: "auto", minHeight: 26, padding: "2px 8px", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", background: "transparent", color: "var(--text-dim)", cursor: "pointer", fontSize: 11.5 }}><RefreshOutlinedIcon sx={{ fontSize: 14 }} />다시 시도</button></div>}
       {emptyForRange ? <div role="status" style={{ display: "grid", placeItems: "center", flex: 1, minHeight: 0, color: "var(--text-faint)", fontSize: 12.5 }}>기간 필터 내 시간 정보가 있는 북마크가 없습니다.</div> : viewMode === "timeline" ? <TimelineLedger entries={timedEntries} undatedEntries={undatedEntries} unresolvedEntries={unresolvedEntries} currentHostId={currentHostId} onOpen={openDetail} onRemove={onRemove} /> : <HostFlowLedger entries={sequenceEntries} undatedEntries={undatedEntries} unresolvedEntries={unresolvedEntries} currentHostId={currentHostId} onOpen={openDetail} onRemove={onRemove} accountDirectoryForHost={accountDirectoryForHost} />}
-      {detail && <RowDetailPanel row={detail.row} columns={detail.columns} focusedColumn={null} fileBaseName={detail.bookmark.tableName} onClose={() => setDetail(null)} onNavigate={(file, column, value) => { setDetail(null); onNavigate(file, column, value); }} onFetchLinkedRows={onFetchLinkedRows} hostDir={hostDirFromResultPath(detail.bookmark.fullPath)} accountDirectory={accountDirectoryForHost?.(hostForBookmark(detail.bookmark, hosts).id)} isBookmarked onToggleBookmark={() => { onRemove(detail.bookmark); setDetail(null); }} />}
+      {detail && <RowDetailPanel row={detail.row} columns={detail.columns} evidenceTime={detail.evidenceTime} focusedColumn={detail.bookmark.field ?? null} fileBaseName={detail.bookmark.tableName} onClose={() => setDetail(null)} onNavigate={(file, column, value) => { setDetail(null); onNavigate(file, column, value); }} onFetchLinkedRows={onFetchLinkedRows} hostDir={hostDirFromResultPath(detail.bookmark.fullPath)} accountDirectory={accountDirectoryForHost?.(hostForBookmark(detail.bookmark, hosts).id)} isBookmarked onToggleBookmark={() => { onRemove(detail.bookmark); setDetail(null); }} />}
     </main>
   );
 }

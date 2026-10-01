@@ -8,7 +8,7 @@
 
 ![platform](https://img.shields.io/badge/Windows-지원-1f6feb)
 ![platform](https://img.shields.io/badge/macOS-지원-1f6feb)
-![version](https://img.shields.io/badge/version-1.3.14-555555)
+![version](https://img.shields.io/badge/version-1.3.15-555555)
 ![offline](https://img.shields.io/badge/네트워크_전송-없음-2ea043)
 ![storage](https://img.shields.io/badge/결과_저장-cases_폴더-2ea043)
 
