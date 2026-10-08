@@ -14,8 +14,8 @@ use serde_json::Value;
 use crate::sqlite::{Row, StreamWriter};
 use crate::time::fmt_kst;
 
-/// The IR-relevant .evtx to parse (exact filenames, case-insensitive), matching
-/// the Python parser's allowlist. "%4" is the on-disk escaping for "/".
+/// IR-relevant collected logs (exact filenames, case-insensitive).
+/// "%4" is the on-disk escaping for "/".
 pub const ALLOWLIST: &[&str] = &[
     "Security.evtx",
     "System.evtx",
@@ -26,13 +26,15 @@ pub const ALLOWLIST: &[&str] = &[
     "Microsoft-Windows-TerminalServices-RemoteConnectionManager%4Operational.evtx",
     "Microsoft-Windows-TerminalServices-RDPClient%4Operational.evtx",
     "Microsoft-Windows-Windows Defender%4Operational.evtx",
+    "Microsoft-Windows-Windows Defender%4WHC.evtx",
     "Microsoft-Windows-TaskScheduler%4Operational.evtx",
+    "Microsoft-Windows-TaskScheduler%4Maintenance.evtx",
     "Microsoft-Windows-SMBServer%4Security.evtx",
     "Microsoft-Windows-SMBServer%4Audit.evtx",
     "Microsoft-Windows-SmbClient%4Security.evtx",
     "Microsoft-Windows-Bits-Client%4Operational.evtx",
     "Microsoft-Windows-Windows Firewall With Advanced Security%4Firewall.evtx",
-    // 원격 WMI 실행·구독(5857~5861) — WMI 이벤트 구독 뷰와 짝.
+    // Preserve WMI execution and subscription evidence.
     "Microsoft-Windows-WMI-Activity%4Operational.evtx",
     // WinRM/원격 PowerShell 접속.
     "Microsoft-Windows-WinRM%4Operational.evtx",

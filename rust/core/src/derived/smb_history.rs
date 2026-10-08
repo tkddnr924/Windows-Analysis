@@ -389,6 +389,7 @@ CREATE TABLE SmbLogObservations (
   source_file TEXT,
   facts_db TEXT,
   facts_table TEXT,
+  facts_generation TEXT,
   collection_state TEXT,
   input_row_count INTEGER,
   event_count INTEGER,
@@ -458,7 +459,7 @@ CREATE TABLE source_records (
 );
 CREATE INDEX idx_source_lookup ON source_records(source_db,source_table,source_rowid,source_field);
 CREATE TABLE _wina_derived_version(name TEXT NOT NULL PRIMARY KEY,version INTEGER NOT NULL);
-INSERT INTO _wina_derived_version VALUES('overview_contract',1),('smb_history',2);
+INSERT INTO _wina_derived_version VALUES('overview_contract',1),('smb_history',3);
 "#;
 
 const MAIN: &[&str] = &[
@@ -677,6 +678,7 @@ const SMBLOGOBSERVATIONS: &[&str] = &[
     "source_file",
     "facts_db",
     "facts_table",
+    "facts_generation",
     "collection_state",
     "input_row_count",
     "event_count",

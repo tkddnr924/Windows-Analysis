@@ -152,7 +152,7 @@ export interface ArtifactViewSpec {
    * Overview correlations (TargetInfo, ...) read as summaries/dashboards, not
    * spreadsheets, so each gets a purpose-built view.
    */
-  customView?: "targetInfo" | "executionHistory" | "powershellFlow" | "defender" | "registryFindings" | "rdpCache" | "browserHistory" | "smb" | "bits" | "service" | "firewall" | "scheduledTasks" | "wer" | "mft" | "wmiPersistence" | "usnJrnl";
+  customView?: "targetInfo" | "executionHistory" | "powershellFlow" | "defender" | "registryFindings" | "rdpCache" | "browserHistory" | "smb" | "bits" | "service" | "firewall" | "scheduledTasks" | "wer" | "mft" | "usnJrnl";
   /**
    * In the sidebar, present this table split by this column: instead of one
    * row for the whole table, the category lists one entry per distinct value
@@ -563,8 +563,8 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
       ]},
     ],
   },
-  // WMI Repository (OBJECTS.DATA) 원본 facts — 시그니처 스캔 결과. 화면은
-  // 파생 WmiSubscriptions를 쓴다.
+  // WMI Repository (OBJECTS.DATA) 원본 facts — 시그니처 스캔 결과. 전용 뷰는
+  // 삭제했고 원본 데이터 목록·검색·북마크 상세에서 이 규칙으로 표시한다.
   WMI_Persistence: {
     title: (r) => r.name || "(WMI)",
     subtitle: (r) => r.kind || "",
@@ -588,8 +588,9 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
   },
   // WMI 이벤트 구독 파생(_OVERVIEW/WmiSubscriptions) — 필터·컨슈머·바인딩.
   // 리포지터리에는 시각이 없어 timestamp는 NULL이고 타임라인에 넣지 않는다.
+  // 전용 뷰는 2026-10-07 사용자 확정으로 삭제했고, 이 표시 규칙은 검색 결과·
+  // 북마크 등 공통 상세에서 계속 쓴다.
   WmiSubscriptions: {
-    customView: "wmiPersistence",
     title: (r) => r.filter_name || r.consumer_name || r.object_path || "(WMI)",
     subtitle: (r) => r.object_type || "",
     priorityColumns: ["object_type", "filter_name", "consumer_name", "consumer_type", "query", "namespace", "command"],

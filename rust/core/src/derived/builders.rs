@@ -5,7 +5,7 @@ use anyhow::Result;
 use super::ancillary;
 use super::schema::{self, DbSpec};
 use super::{
-    flag, int, json_text, nz, text, text_raw, Cell, Ctx, DerivedDb, Record, SourceRef,
+    int, json_text, nz, text, text_raw, Cell, Ctx, DerivedDb, SourceRef,
 };
 use crate::overview::{self, EventLogOverviewCache, RegistryOverviewCache};
 use crate::sqlite::Row;
@@ -71,27 +71,6 @@ fn source_from_parts(
         .source_from_record_key(&format!("{stem}::{table}::{rowid}"), None, file, nz(label))
 }
 
-// Compute milliseconds only from valid, chronologically ordered timestamps.
-fn elapsed_ms(start: &str, end: &str) -> Cell {
-    let parse = |value: &str| {
-        let value = value.trim();
-        chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f")
-            .or_else(|_| chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S"))
-            .ok()
-    };
-    match (parse(start), parse(end)) {
-        (Some(start), Some(end)) => {
-            let delta = end.signed_duration_since(start).num_milliseconds();
-            if delta >= 0 {
-                Cell::Int(delta)
-            } else {
-                Cell::Null
-            }
-        }
-        _ => Cell::Null,
-    }
-}
-
 // User-scoped expansion requires a SID, not an inferred account identity.
 fn sid_of(raw: &str) -> Option<&str> {
     if super::is_sid(raw) {
@@ -110,285 +89,20 @@ pub(super) fn build_event_backed(
     events: &EventLogOverviewCache,
 ) -> Result<Vec<(String, usize)>> {
     Ok(vec![
-        ("ScheduledTasks".into(), scheduled_tasks(ctx, events)?),
-        ("ServiceHistory".into(), service_history(ctx, events)?),
+        ("ScheduledTasks".into(), super::scheduled_tasks::build(ctx, events)?),
+        ("ServiceHistory".into(), super::service_history::build(ctx, events)?),
         ("SmbHistory".into(), super::smb_history::build(ctx, events)?),
         (
             "RemoteDesktopHistory".into(),
             super::remote_access::build(ctx, events)?,
         ),
-        ("BitsHistory".into(), bits_history(ctx, events)?),
-        ("FirewallHistory".into(), firewall_history(ctx, events)?),
+        ("BitsHistory".into(), super::bits_history::build(ctx, events)?),
+        ("FirewallHistory".into(), super::firewall_history::build(ctx, events)?),
         ("PowerShellHistory".into(), powershell_history(ctx, events)?),
-        ("WerReports".into(), wer_reports(ctx, events)?),
-        ("Defender".into(), defender(ctx, events)?),
+        ("WerReports".into(), super::wer_reports::build(ctx, events)?),
+        ("Defender".into(), super::defender::build(ctx, events)?),
         ("RdpCache".into(), rdp_cache(ctx)?),
     ])
-}
-
-// --- ScheduledTasks ---------------------------------------------------------
-
-// Definitions own action/trigger children; execution events stay separate.
-fn scheduled_tasks(ctx: &Ctx, events: &EventLogOverviewCache) -> Result<usize> {
-    let spec = spec_of("ScheduledTasks");
-    let mut db = DerivedDb::create(&ctx.overview_dir(), "ScheduledTasks")?;
-
-    let facts = ctx
-        .out_dir
-        .join("TASKSCHEDULER")
-        .join("TaskScheduler_Tasks.sqlite");
-    for row in overview::read_table_with_rowid(&facts, "TaskScheduler_Tasks") {
-        let uri = g(&row, "uri");
-        let author = g(&row, "author");
-        let task_name = g(&row, "task_name");
-        let mut rec = ctx.record(spec);
-        rec.timestamp(g(&row, "timestamp"), "작업 등록 시각");
-        rec.set("event_type", text("작업 정의"));
-        rec.account(g(&row, "run_as"), &ctx.meta);
-        rec.set("task_name", text(task_name));
-        rec.set("task_path", text(uri));
-        rec.set(
-            "is_microsoft",
-            Cell::Int(i64::from(
-                uri.to_lowercase().starts_with("\\microsoft\\")
-                    || author.to_lowercase().contains("microsoft"),
-            )),
-        );
-        rec.set("run_as", text(g(&row, "run_as")));
-        if super::is_sid(g(&row, "run_as")) {
-            rec.set("run_as_sid", text(g(&row, "run_as")));
-        }
-        rec.set("run_level", text(g(&row, "run_level")));
-        rec.set("logon_type", text(g(&row, "logon_type")));
-        rec.set("enabled", flag(g(&row, "enabled")));
-        rec.set("hidden", flag(g(&row, "hidden")));
-        rec.set("author", text(author));
-        rec.set("task_description", text(g(&row, "description")));
-        rec.set("uri", text(uri));
-        // Failed parsing must not look like a valid task with no actions.
-        if let Some(error) = nz(g(&row, "_error")) {
-            rec.set("description", text(error));
-        }
-        task_children(&mut rec, g(&row, "actions_json"), g(&row, "triggers_json"), ctx);
-        rec.source(source_from_parts(
-            ctx,
-            "TASKSCHEDULER/TaskScheduler_Tasks.sqlite",
-            "TaskScheduler_Tasks",
-            g(&row, "__source_rowid"),
-            nz(g(&row, "_source_file")),
-            "작업 정의",
-        )?);
-        db.write(rec)?;
-    }
-
-    for row in events.rows() {
-        if g(row, "Provider") != "Microsoft-Windows-TaskScheduler" {
-            continue;
-        }
-        let event_id = g(row, "EventID");
-        let (event_type, result) = match event_id {
-            "100" => ("작업 시작", ""),
-            "102" => ("작업 완료", "성공"),
-            "101" | "103" | "111" | "202" | "203" => ("작업 실패", "실패"),
-            "129" => ("프로세스 생성", ""),
-            "200" => ("동작 시작", ""),
-            _ => continue,
-        };
-        let data = overview::parse_eventdata(g(row, "EventData"));
-        let task = ed_field(&data, "TaskName");
-        if task.is_empty() {
-            continue;
-        }
-        let mut rec = ctx.record(spec);
-        rec.timestamp(g(row, "timestamp"), "작업 이벤트 시각");
-        rec.set("event_type", text(event_type));
-        rec.set("result", text(result));
-        rec.set(
-            "task_name",
-            text(task.rsplit('\\').next().unwrap_or(task.as_str())),
-        );
-        rec.set("task_path", text(&task));
-        rec.set("event_id", int(event_id));
-        rec.set("provider", text("Microsoft-Windows-TaskScheduler"));
-        // 129 records a process path; 200 records the action name.
-        let detail = match event_id {
-            "129" => ed_field(&data, "Path"),
-            "200" => ed_field(&data, "ActionName"),
-            _ => String::new(),
-        };
-        rec.set("description", text(&detail));
-        rec.source(source_of(ctx, row, "_record_key", "_source_file", event_type)?);
-        db.write(rec)?;
-    }
-    db.finish()
-}
-
-// Preserve structured action/trigger arrays from facts.
-fn task_children(rec: &mut Record, actions_json: &str, triggers_json: &str, ctx: &Ctx) {
-    let array = |raw: &str| -> Vec<serde_json::Value> {
-        match serde_json::from_str::<serde_json::Value>(raw) {
-            Ok(serde_json::Value::Array(items)) => items,
-            _ => Vec::new(),
-        }
-    };
-    let field = |value: &serde_json::Value, key: &str| -> Option<String> {
-        value.get(key).and_then(|v| v.as_str()).map(str::to_string)
-    };
-    for action in array(actions_json) {
-        let command = field(&action, "command");
-        rec.child(
-            "TaskActions",
-            vec![
-                super::text_opt(field(&action, "action_type").as_deref()),
-                super::text_opt(command.as_deref()),
-                ctx.meta.resolve_path(command.as_deref().unwrap_or(""), None),
-                super::text_opt(field(&action, "arguments").as_deref()),
-                super::text_opt(field(&action, "working_directory").as_deref()),
-                super::text_opt(field(&action, "raw").as_deref()),
-            ],
-        );
-    }
-    for trigger in array(triggers_json) {
-        let enabled = match trigger.get("enabled").and_then(|v| v.as_bool()) {
-            Some(value) => super::flag_bool(value),
-            None => Cell::Null,
-        };
-        rec.child(
-            "TaskTriggers",
-            vec![
-                super::text_opt(field(&trigger, "trigger_type").as_deref()),
-                super::text_opt(field(&trigger, "start_time").as_deref()),
-                super::text_opt(field(&trigger, "end_time").as_deref()),
-                enabled,
-                super::text_opt(field(&trigger, "raw").as_deref()),
-            ],
-        );
-    }
-}
-
-// --- ServiceHistory ---------------------------------------------------------
-
-fn service_history(ctx: &Ctx, events: &EventLogOverviewCache) -> Result<usize> {
-    let spec = spec_of("ServiceHistory");
-    let mut db = DerivedDb::create(&ctx.overview_dir(), "ServiceHistory")?;
-    for row in overview::build_service_history_with_events(events) {
-        let mut rec = ctx.record(spec);
-        let description = g(&row, "description");
-        rec.timestamp(g(&row, "timestamp"), "이벤트 기록 시각");
-        rec.set("event_type", text(description));
-        rec.set("description", text(description));
-        rec.set("service_name", text(g(&row, "service_name")));
-        rec.set("service_key", text(g(&row, "service_key")));
-        let image_path = g(&row, "image_path");
-        rec.set("image_path", text(image_path));
-        rec.set("image_path_resolved", ctx.meta.resolve_path(image_path, None));
-        // Service execution identity is distinct from the event's actor.
-        let service_account = g(&row, "account");
-        rec.set("service_account", text(service_account));
-        if super::is_sid(service_account) {
-            rec.set("service_account_sid", text(service_account));
-        }
-        rec.set("state", text(g(&row, "state")));
-        rec.set("start_type_before", text(g(&row, "start_type_before")));
-        rec.set("start_type_after", text(g(&row, "start_type_after")));
-        rec.set("service_type", text(g(&row, "service_type")));
-        rec.set("detail", text(g(&row, "detail")));
-        rec.set("result", text(g(&row, "result")));
-        rec.set("event_id", int(g(&row, "event_id")));
-        rec.set("provider", text("Service Control Manager"));
-        rec.source(source_of(ctx, &row, "record_key", "_source_file", description)?);
-        db.write(rec)?;
-    }
-    db.finish()
-}
-
-
-
-// --- BitsHistory ------------------------------------------------------------
-
-fn bits_history(ctx: &Ctx, events: &EventLogOverviewCache) -> Result<usize> {
-    let spec = spec_of("BitsHistory");
-    let mut db = DerivedDb::create(&ctx.overview_dir(), "BitsHistory")?;
-    for row in overview::build_bits_history_with_events(events) {
-        let description = g(&row, "description");
-        let mut rec = ctx.record(spec);
-        rec.timestamp(g(&row, "timestamp"), "이벤트 기록 시각");
-        rec.set("event_type", text(description));
-        rec.set("description", text(description));
-        rec.account(g(&row, "account"), &ctx.meta);
-        rec.set("job_name", text(g(&row, "job_name")));
-        rec.set("job_id", text(g(&row, "job_id")));
-        let url = g(&row, "url");
-        let local_path = g(&row, "local_path");
-        rec.set("url", text(url));
-        rec.set("local_path", text(local_path));
-        rec.set(
-            "local_path_resolved",
-            ctx.meta.resolve_path(local_path, None),
-        );
-        rec.set("process", text(g(&row, "process")));
-        let transferred = int(g(&row, "bytes_transferred"));
-        let total = int(g(&row, "bytes_total"));
-        rec.set("bytes_transferred", transferred.clone());
-        rec.set("bytes_total", total.clone());
-        rec.set("status", text(g(&row, "status")));
-        rec.set("result", text(g(&row, "result")));
-        rec.set("event_id", int(g(&row, "event_id")));
-        // Only file-level events contain an evidenced transfer child.
-        if matches!(g(&row, "event_id"), "59" | "60" | "61") && (nz(url).is_some() || nz(local_path).is_some())
-        {
-            rec.child(
-                "BitsFiles",
-                vec![
-                    text(url),
-                    text(local_path),
-                    ctx.meta.resolve_path(local_path, None),
-                    transferred,
-                    total,
-                ],
-            );
-        }
-        rec.source(source_of(ctx, &row, "record_key", "_source_file", description)?);
-        db.write(rec)?;
-    }
-    db.finish()
-}
-
-// --- FirewallHistory --------------------------------------------------------
-
-fn firewall_history(ctx: &Ctx, events: &EventLogOverviewCache) -> Result<usize> {
-    let spec = spec_of("FirewallHistory");
-    let mut db = DerivedDb::create(&ctx.overview_dir(), "FirewallHistory")?;
-    for row in overview::build_firewall_history_with_events(ctx.out_dir, events) {
-        let kind = g(&row, "kind");
-        let mut rec = ctx.record(spec);
-        rec.timestamp(g(&row, "timestamp"), "이벤트 기록 시각");
-        rec.set("event_type", text(kind));
-        rec.set("description", text(g(&row, "detail")));
-        rec.account(g(&row, "account"), &ctx.meta);
-        rec.set("rule_name", text(g(&row, "rule_name")));
-        rec.set("rule_id", text(g(&row, "rule_id")));
-        let app_path = g(&row, "app_path");
-        rec.set("app_path", text(app_path));
-        rec.set("app_path_resolved", ctx.meta.resolve_path(app_path, None));
-        rec.set("service", text(g(&row, "service")));
-        rec.set("direction", text(g(&row, "direction")));
-        rec.set("action", text(g(&row, "action")));
-        rec.set("protocol", text(g(&row, "protocol")));
-        rec.set("local_ports", text(g(&row, "local_ports")));
-        rec.set("remote_ports", text(g(&row, "remote_ports")));
-        // Keep port ranges/lists in text; numeric columns accept single ports.
-        rec.set("local_port", int(g(&row, "local_ports")));
-        rec.set("remote_port", int(g(&row, "remote_ports")));
-        rec.set("profiles", text(g(&row, "profiles")));
-        rec.set("modifying_app", text(g(&row, "modifying_app")));
-        rec.set("detail", text(g(&row, "detail")));
-        rec.set("event_id", int(g(&row, "event_id")));
-        rec.set("provider", text(g(&row, "provider")));
-        rec.source(source_of(ctx, &row, "record_key", "_source_file", kind)?);
-        db.write(rec)?;
-    }
-    db.finish()
 }
 
 // --- PowerShellHistory ------------------------------------------------------
@@ -488,104 +202,6 @@ fn powershell_history(ctx: &Ctx, events: &EventLogOverviewCache) -> Result<usize
     db.finish()
 }
 
-// --- WerReports -------------------------------------------------------------
-
-fn wer_reports(ctx: &Ctx, events: &EventLogOverviewCache) -> Result<usize> {
-    let spec = spec_of("WerReports");
-    let mut db = DerivedDb::create(&ctx.overview_dir(), "WerReports")?;
-    for row in overview::build_wer_reports_with_events(ctx.out_dir, events) {
-        let source = g(&row, "source");
-        let timestamp = g(&row, "timestamp");
-        let start = g(&row, "app_start_time");
-        let mut rec = ctx.record(spec);
-        rec.timestamp(timestamp, "보고 시각");
-        rec.set("event_type", text(source));
-        rec.set("error_type", text(g(&row, "EventType")));
-        rec.set("app_name", text(g(&row, "AppName")));
-        let app_path = g(&row, "AppPath");
-        rec.set("app_path", text(app_path));
-        rec.set("app_path_resolved", ctx.meta.resolve_path(app_path, None));
-        rec.set("target_app_id", text(g(&row, "TargetAppId")));
-        rec.set("report_identifier", text(g(&row, "ReportIdentifier")));
-        rec.set("app_pid", int(g(&row, "app_pid")));
-        rec.set("app_start_time", text(start));
-        // Derive milliseconds from timestamps, not localized uptime text.
-        rec.set("app_uptime", text(g(&row, "app_uptime")));
-        rec.set("app_uptime_ms", elapsed_ms(start, timestamp));
-        rec.set("fault_module", text(g(&row, "fault_module")));
-        rec.set("exception_code", text(g(&row, "exception_code")));
-        rec.set("report", text_raw(g(&row, "report")));
-        rec.set("source", text(source));
-        rec.source(source_of(ctx, &row, "record_key", "_source_file", source)?);
-        db.write(rec)?;
-    }
-    db.finish()
-}
-
-// --- Defender ---------------------------------------------------------------
-
-fn defender(ctx: &Ctx, events: &EventLogOverviewCache) -> Result<usize> {
-    let spec = spec_of("Defender");
-    let mut db = DerivedDb::create(&ctx.overview_dir(), "Defender")?;
-    let rows = overview::build_defender_with_events(events);
-    for row in rows {
-        let section = g(&row, "section");
-        let title = g(&row, "title");
-        let mut rec = ctx.record(spec);
-        rec.timestamp(g(&row, "timestamp"), "이벤트 기록 시각");
-        rec.set("event_type", text(section));
-        rec.set("section", text(section));
-        rec.account(g(&row, "user"), &ctx.meta);
-        rec.set("event_id", int(g(&row, "event_id")));
-        rec.set("title", text(title));
-        if section == "threat" {
-            rec.set("threat_name", text(title));
-        }
-        rec.set("detail", text(g(&row, "detail")));
-        rec.set("severity", text(g(&row, "severity")));
-        rec.set("category", text(g(&row, "category")));
-        rec.set("action", text(g(&row, "action")));
-        rec.set("action_time", text(g(&row, "action_time")));
-        rec.set("process", text(g(&row, "process")));
-        rec.set("source", text(g(&row, "source")));
-        rec.set("remediation", text(g(&row, "remediation")));
-        rec.set("additional_actions", text(g(&row, "additional_actions")));
-        rec.set("origin", text(g(&row, "origin")));
-        rec.set("detection_user", text(g(&row, "detection_user")));
-        rec.set("raw_line", text_raw(g(&row, "raw_line")));
-        rec.source(source_of(ctx, &row, "record_key", "_source_file", section)?);
-        db.write(rec)?;
-    }
-    // Read materialized MPDetection facts, not the collected file again.
-    let ancillary_db = ancillary::ancillary_path(ctx.out_dir);
-    for row in overview::read_table_with_rowid(&ancillary_db, ancillary::DEFENDER_TABLE) {
-        let section = g(&row, "section");
-        let threat = g(&row, "threat_name");
-        let mut rec = ctx.record(spec);
-        rec.timestamp(g(&row, "timestamp"), "탐지 기록 시각");
-        rec.set("event_type", text(section));
-        rec.set("section", text(section));
-        rec.set("title", text(threat));
-        rec.set("threat_name", text(threat));
-        rec.set("detail", text(g(&row, "detail")));
-        rec.set("source", text(g(&row, "source")));
-        rec.set("raw_line", text_raw(g(&row, "raw_line")));
-        rec.source(with_artifact(
-            source_from_parts(
-                ctx,
-                ancillary::ANCILLARY_DB,
-                ancillary::DEFENDER_TABLE,
-                g(&row, "__source_rowid"),
-                nz(g(&row, "_source_file")),
-                "MPDetection 로그 행",
-            )?,
-            ancillary::DEFENDER_ARTIFACT,
-        ));
-        db.write(rec)?;
-    }
-    db.finish()
-}
-
 // --- RdpCache ---------------------------------------------------------------
 
 fn rdp_cache(ctx: &Ctx) -> Result<usize> {
@@ -644,7 +260,7 @@ pub(super) fn build_registry_backed(
 fn execution_history(ctx: &Ctx, registry: &RegistryOverviewCache, events: &EventLogOverviewCache) -> Result<usize> {
     let spec = spec_of("ExecutionHistory");
     let mut db = DerivedDb::create(&ctx.overview_dir(), "ExecutionHistory")?;
-    for row in overview::build_execution_history_with_registry(ctx.out_dir, registry, events) {
+    for row in overview::build_execution_history_with_registry(ctx.out_dir, registry, events)? {
         let evidence = g(&row, "source_artifact");
         let account = g(&row, "user");
         let program_path = g(&row, "program_path");
@@ -1072,6 +688,7 @@ fn path_references(ctx: &Ctx, registry: &RegistryOverviewCache) -> Result<usize>
         rec.source(source);
         db.write(rec)?;
     }
+    super::artifact_paths::write(ctx, &mut db)?;
     db.finish()
 }
 

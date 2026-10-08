@@ -17,7 +17,7 @@ use crate::parsers::{
     powershell_history, prefetch, rdpcache, recyclebin, registry, srum, taskscheduler, timeline, usnjrnl,
     wer, wmi_repository,
 };
-use crate::sqlite::{write_table, Row};
+use crate::sqlite::{write_fixed_table, write_table, Row};
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -1773,17 +1773,15 @@ fn parse_taskscheduler_artifact(
     if !rows.is_empty() {
         let relative = "TASKSCHEDULER/TaskScheduler_Tasks.sqlite".to_string();
         let out = out_dir.join(&relative);
-        if run_unit_or_skip("TaskScheduler", &[&out], || {
-            write_table(
+        if let Some(count) = run_unit_or_skip("TaskScheduler", &[&out], || {
+            write_fixed_table(
                 &out,
                 taskscheduler::TASK_TABLE,
-                &rows,
+                rows,
                 taskscheduler::TASK_FIELD_ORDER,
             )
-        })?
-        .is_some()
-        {
-            emit(&format!("[+] {} rows -> {}", rows.len(), out.display()));
+        })? {
+            emit(&format!("[+] {} rows -> {}", count, out.display()));
             outputs.push(relative);
         }
     }
@@ -1962,12 +1960,10 @@ fn parse_wer_artifact(
     if !rows.is_empty() {
         let relative = "WER/WER_Reports.sqlite".to_string();
         let out = out_dir.join(&relative);
-        if run_unit_or_skip("WER", &[&out], || {
-            write_table(&out, wer::WER_TABLE, &rows, wer::WER_FIELD_ORDER)
-        })?
-        .is_some()
-        {
-            emit(&format!("[+] {} rows -> {}", rows.len(), out.display()));
+        if let Some(count) = run_unit_or_skip("WER", &[&out], || {
+            write_fixed_table(&out, wer::WER_TABLE, rows, wer::WER_FIELD_ORDER)
+        })? {
+            emit(&format!("[+] {} rows -> {}", count, out.display()));
             outputs.push(relative);
         }
     }

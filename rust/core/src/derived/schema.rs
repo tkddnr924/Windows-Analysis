@@ -362,7 +362,7 @@ CREATE TABLE "ExecutionVolumes" (
 );
 CREATE TABLE _wina_derived_version (name TEXT NOT NULL PRIMARY KEY, version INTEGER NOT NULL);
 INSERT INTO _wina_derived_version(name,version) VALUES ('overview_contract',1);
-INSERT INTO _wina_derived_version(name,version) VALUES ('execution_history',3);
+INSERT INTO _wina_derived_version(name,version) VALUES ('execution_history',4);
 "#;
 
 const EXECUTION_HISTORY_COLUMNS: &[&str] = &[
@@ -1003,697 +1003,6 @@ const REGISTRY_EXPLORER_CHILDREN: &[ChildSpec] = &[
     ChildSpec { table: "source_records", columns: REGISTRY_EXPLORER_SOURCE_RECORDS_COLUMNS },
     ChildSpec { table: REGISTRY_QUICK_TARGETS_TABLE, columns: REGISTRY_EXPLORER_QUICK_TARGETS_COLUMNS },
 ];
-
-
-
-
-
-const SCHEDULED_TASKS_DDL: &str = r#"PRAGMA foreign_keys=ON;
-CREATE TABLE "ScheduledTasks" (
-  "record_id" TEXT NOT NULL,
-  "host_id" TEXT NOT NULL,
-  "dataset_id" TEXT NOT NULL,
-  "timestamp" TEXT,
-  "overview_name" TEXT NOT NULL,
-  "account" TEXT,
-  "account_sid" TEXT,
-  "timestamp_kind" TEXT,
-  "event_type" TEXT,
-  "description" TEXT,
-  "task_name" TEXT,
-  "task_path" TEXT,
-  "is_microsoft" INTEGER CHECK ("is_microsoft" IN (0,1)),
-  "run_as" TEXT,
-  "run_as_sid" TEXT,
-  "run_level" TEXT,
-  "logon_type" TEXT,
-  "enabled" INTEGER CHECK ("enabled" IN (0,1)),
-  "hidden" INTEGER CHECK ("hidden" IN (0,1)),
-  "author" TEXT,
-  "task_description" TEXT,
-  "uri" TEXT,
-  "result" TEXT,
-  "event_id" INTEGER,
-  "provider" TEXT,
-  PRIMARY KEY(record_id),
-  CHECK(overview_name = 'ScheduledTasks'),
-  CHECK(timestamp IS NULL OR timestamp_kind IS NOT NULL)
-);
-CREATE INDEX "idx_ScheduledTasks_time" ON "ScheduledTasks"(timestamp, record_id);
-CREATE INDEX "idx_ScheduledTasks_account" ON "ScheduledTasks"(account_sid, timestamp);
-CREATE TABLE "source_records" (
-  "record_id" TEXT NOT NULL,
-  "ordinal" INTEGER NOT NULL,
-  "source_dataset_id" TEXT NOT NULL,
-  "source_artifact" TEXT NOT NULL,
-  "source_db" TEXT NOT NULL,
-  "source_table" TEXT NOT NULL,
-  "source_rowid" INTEGER NOT NULL,
-  "source_field" TEXT,
-  "source_record_key" TEXT,
-  "source_file" TEXT,
-  "source_label" TEXT,
-  PRIMARY KEY(record_id, ordinal),
-  CHECK(ordinal >= 0),
-  FOREIGN KEY(record_id) REFERENCES "ScheduledTasks"("record_id") ON DELETE CASCADE
-);
-CREATE INDEX idx_source_lookup ON source_records(source_db, source_table, source_rowid, source_field);
-CREATE TABLE "TaskActions" (
-  "record_id" TEXT NOT NULL,
-  "ordinal" INTEGER NOT NULL,
-  "action_type" TEXT,
-  "command" TEXT,
-  "command_resolved" TEXT,
-  "arguments" TEXT,
-  "working_directory" TEXT,
-  "raw_action" TEXT,
-  PRIMARY KEY ("record_id", ordinal),
-  CHECK (ordinal >= 0),
-  FOREIGN KEY ("record_id") REFERENCES "ScheduledTasks"("record_id") ON DELETE CASCADE
-);
-CREATE TABLE "TaskTriggers" (
-  "record_id" TEXT NOT NULL,
-  "ordinal" INTEGER NOT NULL,
-  "trigger_type" TEXT,
-  "start_time" TEXT,
-  "end_time" TEXT,
-  "enabled" INTEGER CHECK ("enabled" IN (0,1)),
-  "raw_trigger" TEXT,
-  PRIMARY KEY ("record_id", ordinal),
-  CHECK (ordinal >= 0),
-  FOREIGN KEY ("record_id") REFERENCES "ScheduledTasks"("record_id") ON DELETE CASCADE
-);
-CREATE TABLE _wina_derived_version (name TEXT NOT NULL PRIMARY KEY, version INTEGER NOT NULL);
-INSERT INTO _wina_derived_version(name,version) VALUES ('overview_contract',1);
-"#;
-
-const SCHEDULED_TASKS_COLUMNS: &[&str] = &[
-    "record_id",
-    "host_id",
-    "dataset_id",
-    "timestamp",
-    "overview_name",
-    "account",
-    "account_sid",
-    "timestamp_kind",
-    "event_type",
-    "description",
-    "task_name",
-    "task_path",
-    "is_microsoft",
-    "run_as",
-    "run_as_sid",
-    "run_level",
-    "logon_type",
-    "enabled",
-    "hidden",
-    "author",
-    "task_description",
-    "uri",
-    "result",
-    "event_id",
-    "provider",
-];
-
-const SCHEDULED_TASKS_SOURCE_RECORDS_COLUMNS: &[&str] = &[
-    "record_id",
-    "ordinal",
-    "source_dataset_id",
-    "source_artifact",
-    "source_db",
-    "source_table",
-    "source_rowid",
-    "source_field",
-    "source_record_key",
-    "source_file",
-    "source_label",
-];
-
-const SCHEDULED_TASKS_TASK_ACTIONS_COLUMNS: &[&str] = &[
-    "record_id",
-    "ordinal",
-    "action_type",
-    "command",
-    "command_resolved",
-    "arguments",
-    "working_directory",
-    "raw_action",
-];
-
-const SCHEDULED_TASKS_TASK_TRIGGERS_COLUMNS: &[&str] = &[
-    "record_id",
-    "ordinal",
-    "trigger_type",
-    "start_time",
-    "end_time",
-    "enabled",
-    "raw_trigger",
-];
-
-const SCHEDULED_TASKS_CHILDREN: &[ChildSpec] = &[
-    ChildSpec { table: "source_records", columns: SCHEDULED_TASKS_SOURCE_RECORDS_COLUMNS },
-    ChildSpec { table: "TaskActions", columns: SCHEDULED_TASKS_TASK_ACTIONS_COLUMNS },
-    ChildSpec { table: "TaskTriggers", columns: SCHEDULED_TASKS_TASK_TRIGGERS_COLUMNS },
-];
-
-
-const SERVICE_HISTORY_DDL: &str = r#"PRAGMA foreign_keys=ON;
-CREATE TABLE "ServiceHistory" (
-  "record_id" TEXT NOT NULL,
-  "host_id" TEXT NOT NULL,
-  "dataset_id" TEXT NOT NULL,
-  "timestamp" TEXT,
-  "overview_name" TEXT NOT NULL,
-  "account" TEXT,
-  "account_sid" TEXT,
-  "timestamp_kind" TEXT,
-  "event_type" TEXT,
-  "description" TEXT,
-  "service_name" TEXT,
-  "service_key" TEXT,
-  "image_path" TEXT,
-  "image_path_resolved" TEXT,
-  "service_account" TEXT,
-  "service_account_sid" TEXT,
-  "state" TEXT,
-  "start_type_before" TEXT,
-  "start_type_after" TEXT,
-  "service_type" TEXT,
-  "detail" TEXT,
-  "result" TEXT,
-  "event_id" INTEGER,
-  "provider" TEXT,
-  PRIMARY KEY(record_id),
-  CHECK(overview_name = 'ServiceHistory'),
-  CHECK(timestamp IS NULL OR timestamp_kind IS NOT NULL)
-);
-CREATE INDEX "idx_ServiceHistory_time" ON "ServiceHistory"(timestamp, record_id);
-CREATE INDEX "idx_ServiceHistory_account" ON "ServiceHistory"(account_sid, timestamp);
-CREATE TABLE "source_records" (
-  "record_id" TEXT NOT NULL,
-  "ordinal" INTEGER NOT NULL,
-  "source_dataset_id" TEXT NOT NULL,
-  "source_artifact" TEXT NOT NULL,
-  "source_db" TEXT NOT NULL,
-  "source_table" TEXT NOT NULL,
-  "source_rowid" INTEGER NOT NULL,
-  "source_field" TEXT,
-  "source_record_key" TEXT,
-  "source_file" TEXT,
-  "source_label" TEXT,
-  PRIMARY KEY(record_id, ordinal),
-  CHECK(ordinal >= 0),
-  FOREIGN KEY(record_id) REFERENCES "ServiceHistory"("record_id") ON DELETE CASCADE
-);
-CREATE INDEX idx_source_lookup ON source_records(source_db, source_table, source_rowid, source_field);
-
-CREATE TABLE _wina_derived_version (name TEXT NOT NULL PRIMARY KEY, version INTEGER NOT NULL);
-INSERT INTO _wina_derived_version(name,version) VALUES ('overview_contract',1);
-"#;
-
-const SERVICE_HISTORY_COLUMNS: &[&str] = &[
-    "record_id",
-    "host_id",
-    "dataset_id",
-    "timestamp",
-    "overview_name",
-    "account",
-    "account_sid",
-    "timestamp_kind",
-    "event_type",
-    "description",
-    "service_name",
-    "service_key",
-    "image_path",
-    "image_path_resolved",
-    "service_account",
-    "service_account_sid",
-    "state",
-    "start_type_before",
-    "start_type_after",
-    "service_type",
-    "detail",
-    "result",
-    "event_id",
-    "provider",
-];
-
-const SERVICE_HISTORY_SOURCE_RECORDS_COLUMNS: &[&str] = &[
-    "record_id",
-    "ordinal",
-    "source_dataset_id",
-    "source_artifact",
-    "source_db",
-    "source_table",
-    "source_rowid",
-    "source_field",
-    "source_record_key",
-    "source_file",
-    "source_label",
-];
-
-const SERVICE_HISTORY_CHILDREN: &[ChildSpec] = &[
-    ChildSpec { table: "source_records", columns: SERVICE_HISTORY_SOURCE_RECORDS_COLUMNS },
-];
-
-
-const DEFENDER_DDL: &str = r#"PRAGMA foreign_keys=ON;
-CREATE TABLE "Defender" (
-  "record_id" TEXT NOT NULL,
-  "host_id" TEXT NOT NULL,
-  "dataset_id" TEXT NOT NULL,
-  "timestamp" TEXT,
-  "overview_name" TEXT NOT NULL,
-  "account" TEXT,
-  "account_sid" TEXT,
-  "timestamp_kind" TEXT,
-  "event_type" TEXT,
-  "description" TEXT,
-  "section" TEXT,
-  "event_id" INTEGER,
-  "title" TEXT,
-  "detail" TEXT,
-  "severity" TEXT,
-  "category" TEXT,
-  "threat_name" TEXT,
-  "target_path" TEXT,
-  "detection_type" TEXT,
-  "action" TEXT,
-  "action_time" TEXT,
-  "process" TEXT,
-  "source" TEXT,
-  "remediation" TEXT,
-  "additional_actions" TEXT,
-  "origin" TEXT,
-  "detection_user" TEXT,
-  "raw_line" TEXT,
-  "result" TEXT,
-  PRIMARY KEY(record_id),
-  CHECK(overview_name = 'Defender'),
-  CHECK(timestamp IS NULL OR timestamp_kind IS NOT NULL)
-);
-CREATE INDEX "idx_Defender_time" ON "Defender"(timestamp, record_id);
-CREATE INDEX "idx_Defender_account" ON "Defender"(account_sid, timestamp);
-CREATE TABLE "source_records" (
-  "record_id" TEXT NOT NULL,
-  "ordinal" INTEGER NOT NULL,
-  "source_dataset_id" TEXT NOT NULL,
-  "source_artifact" TEXT NOT NULL,
-  "source_db" TEXT NOT NULL,
-  "source_table" TEXT NOT NULL,
-  "source_rowid" INTEGER NOT NULL,
-  "source_field" TEXT,
-  "source_record_key" TEXT,
-  "source_file" TEXT,
-  "source_label" TEXT,
-  PRIMARY KEY(record_id, ordinal),
-  CHECK(ordinal >= 0),
-  FOREIGN KEY(record_id) REFERENCES "Defender"("record_id") ON DELETE CASCADE
-);
-CREATE INDEX idx_source_lookup ON source_records(source_db, source_table, source_rowid, source_field);
-
-CREATE TABLE _wina_derived_version (name TEXT NOT NULL PRIMARY KEY, version INTEGER NOT NULL);
-INSERT INTO _wina_derived_version(name,version) VALUES ('overview_contract',1);
-"#;
-
-const DEFENDER_COLUMNS: &[&str] = &[
-    "record_id",
-    "host_id",
-    "dataset_id",
-    "timestamp",
-    "overview_name",
-    "account",
-    "account_sid",
-    "timestamp_kind",
-    "event_type",
-    "description",
-    "section",
-    "event_id",
-    "title",
-    "detail",
-    "severity",
-    "category",
-    "threat_name",
-    "target_path",
-    "detection_type",
-    "action",
-    "action_time",
-    "process",
-    "source",
-    "remediation",
-    "additional_actions",
-    "origin",
-    "detection_user",
-    "raw_line",
-    "result",
-];
-
-const DEFENDER_SOURCE_RECORDS_COLUMNS: &[&str] = &[
-    "record_id",
-    "ordinal",
-    "source_dataset_id",
-    "source_artifact",
-    "source_db",
-    "source_table",
-    "source_rowid",
-    "source_field",
-    "source_record_key",
-    "source_file",
-    "source_label",
-];
-
-const DEFENDER_CHILDREN: &[ChildSpec] = &[
-    ChildSpec { table: "source_records", columns: DEFENDER_SOURCE_RECORDS_COLUMNS },
-];
-
-
-const FIREWALL_HISTORY_DDL: &str = r#"PRAGMA foreign_keys=ON;
-CREATE TABLE "FirewallHistory" (
-  "record_id" TEXT NOT NULL,
-  "host_id" TEXT NOT NULL,
-  "dataset_id" TEXT NOT NULL,
-  "timestamp" TEXT,
-  "overview_name" TEXT NOT NULL,
-  "account" TEXT,
-  "account_sid" TEXT,
-  "timestamp_kind" TEXT,
-  "event_type" TEXT,
-  "description" TEXT,
-  "rule_name" TEXT,
-  "rule_id" TEXT,
-  "app_path" TEXT,
-  "app_path_resolved" TEXT,
-  "service" TEXT,
-  "direction" TEXT,
-  "action" TEXT,
-  "protocol" TEXT,
-  "protocol_number" INTEGER,
-  "local_address" TEXT,
-  "remote_address" TEXT,
-  "local_ports" TEXT,
-  "remote_ports" TEXT,
-  "local_port" INTEGER,
-  "remote_port" INTEGER,
-  "profiles" TEXT,
-  "modifying_app" TEXT,
-  "detail" TEXT,
-  "event_id" INTEGER,
-  "provider" TEXT,
-  PRIMARY KEY(record_id),
-  CHECK(overview_name = 'FirewallHistory'),
-  CHECK(timestamp IS NULL OR timestamp_kind IS NOT NULL)
-);
-CREATE INDEX "idx_FirewallHistory_time" ON "FirewallHistory"(timestamp, record_id);
-CREATE INDEX "idx_FirewallHistory_account" ON "FirewallHistory"(account_sid, timestamp);
-CREATE TABLE "source_records" (
-  "record_id" TEXT NOT NULL,
-  "ordinal" INTEGER NOT NULL,
-  "source_dataset_id" TEXT NOT NULL,
-  "source_artifact" TEXT NOT NULL,
-  "source_db" TEXT NOT NULL,
-  "source_table" TEXT NOT NULL,
-  "source_rowid" INTEGER NOT NULL,
-  "source_field" TEXT,
-  "source_record_key" TEXT,
-  "source_file" TEXT,
-  "source_label" TEXT,
-  PRIMARY KEY(record_id, ordinal),
-  CHECK(ordinal >= 0),
-  FOREIGN KEY(record_id) REFERENCES "FirewallHistory"("record_id") ON DELETE CASCADE
-);
-CREATE INDEX idx_source_lookup ON source_records(source_db, source_table, source_rowid, source_field);
-
-CREATE TABLE _wina_derived_version (name TEXT NOT NULL PRIMARY KEY, version INTEGER NOT NULL);
-INSERT INTO _wina_derived_version(name,version) VALUES ('overview_contract',1);
-"#;
-
-const FIREWALL_HISTORY_COLUMNS: &[&str] = &[
-    "record_id",
-    "host_id",
-    "dataset_id",
-    "timestamp",
-    "overview_name",
-    "account",
-    "account_sid",
-    "timestamp_kind",
-    "event_type",
-    "description",
-    "rule_name",
-    "rule_id",
-    "app_path",
-    "app_path_resolved",
-    "service",
-    "direction",
-    "action",
-    "protocol",
-    "protocol_number",
-    "local_address",
-    "remote_address",
-    "local_ports",
-    "remote_ports",
-    "local_port",
-    "remote_port",
-    "profiles",
-    "modifying_app",
-    "detail",
-    "event_id",
-    "provider",
-];
-
-const FIREWALL_HISTORY_SOURCE_RECORDS_COLUMNS: &[&str] = &[
-    "record_id",
-    "ordinal",
-    "source_dataset_id",
-    "source_artifact",
-    "source_db",
-    "source_table",
-    "source_rowid",
-    "source_field",
-    "source_record_key",
-    "source_file",
-    "source_label",
-];
-
-const FIREWALL_HISTORY_CHILDREN: &[ChildSpec] = &[
-    ChildSpec { table: "source_records", columns: FIREWALL_HISTORY_SOURCE_RECORDS_COLUMNS },
-];
-
-
-const BITS_HISTORY_DDL: &str = r#"PRAGMA foreign_keys=ON;
-CREATE TABLE "BitsHistory" (
-  "record_id" TEXT NOT NULL,
-  "host_id" TEXT NOT NULL,
-  "dataset_id" TEXT NOT NULL,
-  "timestamp" TEXT,
-  "overview_name" TEXT NOT NULL,
-  "account" TEXT,
-  "account_sid" TEXT,
-  "timestamp_kind" TEXT,
-  "event_type" TEXT,
-  "description" TEXT,
-  "job_name" TEXT,
-  "job_id" TEXT,
-  "url" TEXT,
-  "local_path" TEXT,
-  "local_path_resolved" TEXT,
-  "process" TEXT,
-  "bytes_transferred" INTEGER,
-  "bytes_total" INTEGER,
-  "status" TEXT,
-  "result" TEXT,
-  "event_id" INTEGER,
-  PRIMARY KEY(record_id),
-  CHECK(overview_name = 'BitsHistory'),
-  CHECK(timestamp IS NULL OR timestamp_kind IS NOT NULL)
-);
-CREATE INDEX "idx_BitsHistory_time" ON "BitsHistory"(timestamp, record_id);
-CREATE INDEX "idx_BitsHistory_account" ON "BitsHistory"(account_sid, timestamp);
-CREATE TABLE "source_records" (
-  "record_id" TEXT NOT NULL,
-  "ordinal" INTEGER NOT NULL,
-  "source_dataset_id" TEXT NOT NULL,
-  "source_artifact" TEXT NOT NULL,
-  "source_db" TEXT NOT NULL,
-  "source_table" TEXT NOT NULL,
-  "source_rowid" INTEGER NOT NULL,
-  "source_field" TEXT,
-  "source_record_key" TEXT,
-  "source_file" TEXT,
-  "source_label" TEXT,
-  PRIMARY KEY(record_id, ordinal),
-  CHECK(ordinal >= 0),
-  FOREIGN KEY(record_id) REFERENCES "BitsHistory"("record_id") ON DELETE CASCADE
-);
-CREATE INDEX idx_source_lookup ON source_records(source_db, source_table, source_rowid, source_field);
-CREATE TABLE "BitsFiles" (
-  "record_id" TEXT NOT NULL,
-  "ordinal" INTEGER NOT NULL,
-  "url" TEXT,
-  "local_path" TEXT,
-  "local_path_resolved" TEXT,
-  "bytes_transferred" INTEGER,
-  "bytes_total" INTEGER,
-  PRIMARY KEY ("record_id", ordinal),
-  CHECK (ordinal >= 0),
-  FOREIGN KEY ("record_id") REFERENCES "BitsHistory"("record_id") ON DELETE CASCADE
-);
-CREATE TABLE _wina_derived_version (name TEXT NOT NULL PRIMARY KEY, version INTEGER NOT NULL);
-INSERT INTO _wina_derived_version(name,version) VALUES ('overview_contract',1);
-"#;
-
-const BITS_HISTORY_COLUMNS: &[&str] = &[
-    "record_id",
-    "host_id",
-    "dataset_id",
-    "timestamp",
-    "overview_name",
-    "account",
-    "account_sid",
-    "timestamp_kind",
-    "event_type",
-    "description",
-    "job_name",
-    "job_id",
-    "url",
-    "local_path",
-    "local_path_resolved",
-    "process",
-    "bytes_transferred",
-    "bytes_total",
-    "status",
-    "result",
-    "event_id",
-];
-
-const BITS_HISTORY_SOURCE_RECORDS_COLUMNS: &[&str] = &[
-    "record_id",
-    "ordinal",
-    "source_dataset_id",
-    "source_artifact",
-    "source_db",
-    "source_table",
-    "source_rowid",
-    "source_field",
-    "source_record_key",
-    "source_file",
-    "source_label",
-];
-
-const BITS_HISTORY_BITS_FILES_COLUMNS: &[&str] = &[
-    "record_id",
-    "ordinal",
-    "url",
-    "local_path",
-    "local_path_resolved",
-    "bytes_transferred",
-    "bytes_total",
-];
-
-const BITS_HISTORY_CHILDREN: &[ChildSpec] = &[
-    ChildSpec { table: "source_records", columns: BITS_HISTORY_SOURCE_RECORDS_COLUMNS },
-    ChildSpec { table: "BitsFiles", columns: BITS_HISTORY_BITS_FILES_COLUMNS },
-];
-
-
-const WER_REPORTS_DDL: &str = r#"PRAGMA foreign_keys=ON;
-CREATE TABLE "WerReports" (
-  "record_id" TEXT NOT NULL,
-  "host_id" TEXT NOT NULL,
-  "dataset_id" TEXT NOT NULL,
-  "timestamp" TEXT,
-  "overview_name" TEXT NOT NULL,
-  "account" TEXT,
-  "account_sid" TEXT,
-  "timestamp_kind" TEXT,
-  "event_type" TEXT,
-  "description" TEXT,
-  "error_type" TEXT,
-  "app_name" TEXT,
-  "app_path" TEXT,
-  "app_path_resolved" TEXT,
-  "target_app_id" TEXT,
-  "report_identifier" TEXT,
-  "app_pid" INTEGER,
-  "app_start_time" TEXT,
-  "app_uptime" TEXT,
-  "app_uptime_ms" INTEGER,
-  "fault_module" TEXT,
-  "exception_code" TEXT,
-  "report" TEXT,
-  "source" TEXT,
-  PRIMARY KEY(record_id),
-  CHECK(overview_name = 'WerReports'),
-  CHECK(timestamp IS NULL OR timestamp_kind IS NOT NULL)
-);
-CREATE INDEX "idx_WerReports_time" ON "WerReports"(timestamp, record_id);
-CREATE INDEX "idx_WerReports_account" ON "WerReports"(account_sid, timestamp);
-CREATE TABLE "source_records" (
-  "record_id" TEXT NOT NULL,
-  "ordinal" INTEGER NOT NULL,
-  "source_dataset_id" TEXT NOT NULL,
-  "source_artifact" TEXT NOT NULL,
-  "source_db" TEXT NOT NULL,
-  "source_table" TEXT NOT NULL,
-  "source_rowid" INTEGER NOT NULL,
-  "source_field" TEXT,
-  "source_record_key" TEXT,
-  "source_file" TEXT,
-  "source_label" TEXT,
-  PRIMARY KEY(record_id, ordinal),
-  CHECK(ordinal >= 0),
-  FOREIGN KEY(record_id) REFERENCES "WerReports"("record_id") ON DELETE CASCADE
-);
-CREATE INDEX idx_source_lookup ON source_records(source_db, source_table, source_rowid, source_field);
-
-CREATE TABLE _wina_derived_version (name TEXT NOT NULL PRIMARY KEY, version INTEGER NOT NULL);
-INSERT INTO _wina_derived_version(name,version) VALUES ('overview_contract',1);
-"#;
-
-const WER_REPORTS_COLUMNS: &[&str] = &[
-    "record_id",
-    "host_id",
-    "dataset_id",
-    "timestamp",
-    "overview_name",
-    "account",
-    "account_sid",
-    "timestamp_kind",
-    "event_type",
-    "description",
-    "error_type",
-    "app_name",
-    "app_path",
-    "app_path_resolved",
-    "target_app_id",
-    "report_identifier",
-    "app_pid",
-    "app_start_time",
-    "app_uptime",
-    "app_uptime_ms",
-    "fault_module",
-    "exception_code",
-    "report",
-    "source",
-];
-
-const WER_REPORTS_SOURCE_RECORDS_COLUMNS: &[&str] = &[
-    "record_id",
-    "ordinal",
-    "source_dataset_id",
-    "source_artifact",
-    "source_db",
-    "source_table",
-    "source_rowid",
-    "source_field",
-    "source_record_key",
-    "source_file",
-    "source_label",
-];
-
-const WER_REPORTS_CHILDREN: &[ChildSpec] = &[
-    ChildSpec { table: "source_records", columns: WER_REPORTS_SOURCE_RECORDS_COLUMNS },
-];
-
 
 const RDP_CACHE_DDL: &str = r#"PRAGMA foreign_keys=ON;
 CREATE TABLE "RdpCache" (
@@ -2639,10 +1948,40 @@ CREATE TABLE "PathReferenceCandidates" (
   FOREIGN KEY(record_id) REFERENCES PathReferences(record_id) ON DELETE CASCADE
 );
 CREATE INDEX "idx_PathReferenceCandidates_file" ON "PathReferenceCandidates"(volume_id, file_record_id);
+CREATE TABLE "PathReferenceOrigins" (
+  "record_id" TEXT NOT NULL,
+  "ordinal" INTEGER NOT NULL CHECK(ordinal >= 0),
+  "origin_db" TEXT NOT NULL,
+  "origin_table" TEXT NOT NULL,
+  "origin_record_id" TEXT NOT NULL,
+  "origin_child_table" TEXT,
+  "origin_ordinal" INTEGER,
+  "origin_field" TEXT,
+  "role" TEXT NOT NULL,
+  "raw_input" TEXT,
+  "resolution_basis" TEXT,
+  PRIMARY KEY(record_id, ordinal),
+  CHECK((origin_child_table IS NULL AND origin_ordinal IS NULL)
+     OR (origin_child_table IS NOT NULL AND origin_ordinal IS NOT NULL AND origin_ordinal >= 0)),
+  FOREIGN KEY(record_id) REFERENCES PathReferences(record_id) ON DELETE CASCADE
+);
+CREATE INDEX idx_PathReferenceOrigins_origin
+  ON PathReferenceOrigins(origin_db, origin_table, origin_record_id);
+CREATE TABLE "PathReferenceExecutionCandidates" (
+  "record_id" TEXT NOT NULL,
+  "ordinal" INTEGER NOT NULL CHECK(ordinal >= 0),
+  "execution_record_id" TEXT NOT NULL,
+  "match_basis" TEXT NOT NULL CHECK(match_basis = 'same_host_dataset_drive_path'),
+  PRIMARY KEY(record_id, ordinal),
+  UNIQUE(record_id, execution_record_id),
+  FOREIGN KEY(record_id) REFERENCES PathReferences(record_id) ON DELETE CASCADE
+);
+CREATE INDEX idx_PathReferenceExecutionCandidates_execution
+  ON PathReferenceExecutionCandidates(execution_record_id);
 
 CREATE TABLE _wina_derived_version (name TEXT NOT NULL PRIMARY KEY, version INTEGER NOT NULL);
 INSERT INTO _wina_derived_version(name,version) VALUES ('overview_contract',1);
-INSERT INTO _wina_derived_version(name,version) VALUES ('path_references',2);
+INSERT INTO _wina_derived_version(name,version) VALUES ('path_references',3);
 "#;
 
 const PATH_REFERENCES_COLUMNS: &[&str] = &[
@@ -2694,6 +2033,14 @@ const PATH_REFERENCES_CHILDREN: &[ChildSpec] = &[
     ChildSpec { table: "source_records", columns: PATH_REFERENCES_SOURCE_RECORDS_COLUMNS },
     ChildSpec { table: "PathReferenceCandidates", columns: &[
         "record_id", "ordinal", "file_record_id", "volume_id", "match_basis",
+    ] },
+    ChildSpec { table: "PathReferenceOrigins", columns: &[
+        "record_id", "ordinal", "origin_db", "origin_table", "origin_record_id",
+        "origin_child_table", "origin_ordinal", "origin_field", "role",
+        "raw_input", "resolution_basis",
+    ] },
+    ChildSpec { table: "PathReferenceExecutionCandidates", columns: &[
+        "record_id", "ordinal", "execution_record_id", "match_basis",
     ] },
 ];
 
@@ -2833,48 +2180,12 @@ pub const SPECS: &[DbSpec] = &[
     },
     super::remote_access::SPEC,
     super::smb_history::SPEC,
-    DbSpec {
-        name: "ScheduledTasks",
-        table: "ScheduledTasks",
-        columns: SCHEDULED_TASKS_COLUMNS,
-        children: SCHEDULED_TASKS_CHILDREN,
-        ddl: SCHEDULED_TASKS_DDL,
-    },
-    DbSpec {
-        name: "ServiceHistory",
-        table: "ServiceHistory",
-        columns: SERVICE_HISTORY_COLUMNS,
-        children: SERVICE_HISTORY_CHILDREN,
-        ddl: SERVICE_HISTORY_DDL,
-    },
-    DbSpec {
-        name: "Defender",
-        table: "Defender",
-        columns: DEFENDER_COLUMNS,
-        children: DEFENDER_CHILDREN,
-        ddl: DEFENDER_DDL,
-    },
-    DbSpec {
-        name: "FirewallHistory",
-        table: "FirewallHistory",
-        columns: FIREWALL_HISTORY_COLUMNS,
-        children: FIREWALL_HISTORY_CHILDREN,
-        ddl: FIREWALL_HISTORY_DDL,
-    },
-    DbSpec {
-        name: "BitsHistory",
-        table: "BitsHistory",
-        columns: BITS_HISTORY_COLUMNS,
-        children: BITS_HISTORY_CHILDREN,
-        ddl: BITS_HISTORY_DDL,
-    },
-    DbSpec {
-        name: "WerReports",
-        table: "WerReports",
-        columns: WER_REPORTS_COLUMNS,
-        children: WER_REPORTS_CHILDREN,
-        ddl: WER_REPORTS_DDL,
-    },
+    super::scheduled_tasks::SPEC,
+    super::service_history::SPEC,
+    super::defender::SPEC,
+    super::firewall_history::SPEC,
+    super::bits_history::SPEC,
+    super::wer_reports::SPEC,
     DbSpec {
         name: "RdpCache",
         table: "RdpCache",

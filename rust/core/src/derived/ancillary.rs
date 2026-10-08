@@ -1,4 +1,4 @@
-//! Persist hosts and MPDetection evidence before deriving overview rows.
+//! Persist supplemental source evidence before deriving overview rows.
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -11,25 +11,13 @@ use crate::sqlite::Row;
 pub const ANCILLARY_DB: &str = "SUPPLEMENTAL/Ancillary_Records.sqlite";
 pub const ANCILLARY_CATEGORY: &str = "SUPPLEMENTAL";
 pub const HOSTS_TABLE: &str = "Hosts_Records";
-pub const DEFENDER_TABLE: &str = "Defender_Records";
 
 pub const HOSTS_ARTIFACT: &str = "Hosts";
-pub const DEFENDER_ARTIFACT: &str = "MPDetection";
 
 const CREATE_SQL: &str = r#"
 CREATE TABLE "Hosts_Records" (
   "ip" TEXT,
   "host_name" TEXT,
-  "line_number" INTEGER,
-  "raw_line" TEXT,
-  "_source_file" TEXT NOT NULL
-);
-CREATE TABLE "Defender_Records" (
-  "timestamp" TEXT,
-  "section" TEXT,
-  "threat_name" TEXT,
-  "detail" TEXT,
-  "source" TEXT,
   "line_number" INTEGER,
   "raw_line" TEXT,
   "_source_file" TEXT NOT NULL
@@ -82,28 +70,14 @@ pub fn prepare_ancillary_facts(
                 get(&row, "_source_file"),
             ])?;
         }
-        let mut defender = conn.prepare(
-            "INSERT INTO \"Defender_Records\" \
-             (timestamp, section, threat_name, detail, source, line_number, raw_line, _source_file) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-        )?;
-        for row in overview::defender_from_mpdetection(target) {
-            count += defender.execute(rusqlite::params![
-                opt(get(&row, "timestamp")),
-                opt(get(&row, "section")),
-                opt(get(&row, "title")),
-                opt(get(&row, "detail")),
-                opt(get(&row, "source")),
-                opt(get(&row, "line_number")).and_then(|v| v.parse::<i64>().ok()),
-                get(&row, "raw_line"),
-                get(&row, "_source_file"),
-            ])?;
-        }
     }
     conn.execute_batch("COMMIT")?;
     drop(conn);
     super::stamp_facts_generation(&path, dataset_id)?;
-    Ok(if count == 0 { Vec::new() } else { vec![ANCILLARY_DB.to_string()] })
+    let mut published = if count == 0 { Vec::new() } else { vec![ANCILLARY_DB.to_string()] };
+    published.extend(super::defender::prepare_inputs(out_dir, target, dataset_id)?);
+    published.extend(super::scheduled_tasks::prepare_inputs(out_dir, target, dataset_id)?);
+    Ok(published)
 }
 
 pub fn ancillary_path(out_dir: &Path) -> std::path::PathBuf {

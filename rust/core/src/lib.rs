@@ -14,6 +14,7 @@ pub mod parsers;
 mod powershell_decode;
 mod remote_access;
 mod smb;
+mod wer_evidence;
 pub mod pipeline;
 pub mod sqlite;
 pub mod time;

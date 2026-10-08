@@ -4095,54 +4095,6 @@ async fn ai_referrals(
     .map_err(|error| format!("AI 공유 링크 작업이 중단되었습니다: {error}"))?
 }
 
-/// WMI-Activity 이벤트 로그에서 구독 이벤트(5859~5861)만 서버에서 걸러
-/// 돌려준다 — 원본 EventLog 테이블 전체를 IPC로 옮기지 않는다(payload가 로그
-/// 크기가 아니라 구독 이벤트 수에 비례). rows에는 `__rowid`가 있어 원본
-/// EventLog 행 기준 북마크가 연결된다. 로그가 없는 호스트는 빈 결과.
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct WmiSubscriptionEvents {
-    columns: Vec<String>,
-    rows: Vec<Map<String, Value>>,
-    full_path: String,
-    table_name: String,
-}
-
-#[tauri::command]
-async fn wmi_subscription_events(host_dir: String) -> Result<WmiSubscriptionEvents, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let path = PathBuf::from(&host_dir)
-            .join("EVENTLOG")
-            .join("Microsoft-Windows-WMI-Activity%4Operational.sqlite");
-        let empty = WmiSubscriptionEvents {
-            columns: Vec::new(),
-            rows: Vec::new(),
-            full_path: String::new(),
-            table_name: String::new(),
-        };
-        if !path.is_file() {
-            return Ok(empty);
-        }
-        let conn = open_ro(&path.to_string_lossy())?;
-        let Some(table) = first_table(&conn, &path) else {
-            return Ok(empty);
-        };
-        let columns = table_columns(&conn, &table);
-        let sql = format!(
-            "SELECT rowid AS __rowid, * FROM {} WHERE \"EventID\" IN ('5859','5860','5861') ORDER BY timestamp ASC",
-            q(&table)
-        );
-        let rows = query_rows(&conn, &sql, &[])?;
-        Ok(WmiSubscriptionEvents {
-            columns,
-            rows,
-            full_path: path.to_string_lossy().to_string(),
-            table_name: table,
-        })
-    })
-    .await
-    .map_err(|error| format!("WMI 구독 이벤트 조회가 중단되었습니다: {error}"))?
-}
 
 /// PowerShellHistory 원문 검색 — 목록 IPC는 script_block/host_application을
 /// 미리보기(1,000자)로만 싣기 때문에, 그 뒤의 IOC·명령 문자열은 서버에서
@@ -10978,7 +10930,6 @@ fn main() {
             browser_visit_graph,
             ai_conversations,
             ai_conversation_detail,
-            wmi_subscription_events,
             powershell_search_rowids
         ])
         .setup(|app| {

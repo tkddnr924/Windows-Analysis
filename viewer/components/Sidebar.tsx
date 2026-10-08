@@ -23,7 +23,6 @@ import TaskOutlinedIcon from "@mui/icons-material/TaskOutlined";
 import MiscellaneousServicesOutlinedIcon from "@mui/icons-material/MiscellaneousServicesOutlined";
 import LanguageOutlinedIcon from "@mui/icons-material/LanguageOutlined";
 import PhotoLibraryOutlinedIcon from "@mui/icons-material/PhotoLibraryOutlined";
-import DeviceHubOutlinedIcon from "@mui/icons-material/DeviceHubOutlined";
 import HistoryOutlinedIcon from "@mui/icons-material/HistoryOutlined";
 import ReportProblemOutlinedIcon from "@mui/icons-material/ReportProblemOutlined";
 import ShieldOutlinedIcon from "@mui/icons-material/ShieldOutlined";
@@ -77,7 +76,7 @@ const CATEGORY_LABELS: Record<string, string> = {
   RECYCLEBIN: "휴지통",
 };
 
-/// 승격 분석 항목(WER·WMI·USN)의 결과 없음 표시 — 개요 테이블의 "0건에도
+/// 승격 분석 항목(WER·USN)의 결과 없음 표시 — 개요 테이블의 "0건에도
 /// 스키마 발행" 통일 정책(2026-08-31)과 같은 취지로, 결과가 없어도 항목이
 /// 사라지지 않고 "해당 활동 없음"이 확인 가능한 정보로 남는다 (2026-09-01
 /// 사용자 확정).
@@ -170,12 +169,12 @@ const OVERVIEW_TABLE_NAMES: Record<string, string> = {
 };
 
 // 호스트 분석 소그룹 — 분석 관점별 묶음 (2026-08-31 사용자 확정, RDP Cache는
-// 네트워크 그룹 맨 아래). "@USN"/"@WER"/"@WMI"는 승격된 개별 항목이고
+// 네트워크 그룹 맨 아래). "@USN"/"@WER"는 승격된 개별 항목이고
 // 나머지는 _OVERVIEW 테이블 이름. 목록에 없는 테이블은 그룹 뒤에 그대로
 // 나열되는 안전망을 둔다 (새 테이블이 추가돼도 사라지지 않게).
 const ANALYSIS_GROUPS: { title: string; items: string[] }[] = [
   { title: "파일 시스템", items: ["FileSystemEntries", "@USN", "RecycleBin"] },
-  { title: "실행 흔적", items: ["ExecutionHistory", "PowerShellHistory", "ServiceHistory", "ScheduledTasks", "@WMI"] },
+  { title: "실행 흔적", items: ["ExecutionHistory", "PowerShellHistory", "ServiceHistory", "ScheduledTasks"] },
   { title: "네트워크 · 원격", items: ["RemoteDesktopHistory", "SmbHistory", "BitsHistory", "FirewallHistory", "BrowserActivity", "RdpCache"] },
   { title: "시스템 · 보안", items: ["RegistryFindings", "Defender", "@WER"] },
 ];
@@ -564,8 +563,9 @@ export default function Sidebar({
   const overviewByFile = useMemo(() => {
     const map = new Map<string, ResultFileEntry[]>();
     for (const file of browsableResultFiles(effectiveOverviewFiles ?? [])) {
-      // 승격 항목(@WER·@USN·@WMI)이 여는 파생 테이블과 화면이 없는 백데이터
-      // (경로 참조·AI 대화·공통 참조 정보 Metadata)는 일반 목록에서 제외한다.
+      // 승격 항목(@WER·@USN)이 여는 파생 테이블, 전용 뷰를 삭제한
+      // WmiSubscriptions, 화면이 없는 백데이터(경로 참조·AI 대화·공통 참조
+      // 정보 Metadata)는 일반 목록에서 제외한다.
       if (file.name === "TargetInfo"
         || file.fileName === "PathReferences"
         || file.fileName === "AiConversations"
@@ -612,11 +612,12 @@ export default function Sidebar({
   // USN 저널은 화면용 파생(_OVERVIEW/UsnJournal)을 연다 — 원본 facts
   // (FILESYSTEM/UsnJrnl_Records)는 원본 데이터 목록에 그대로 남는다.
   const usnEntry = effectiveOverviewFiles?.find((file) => file.fileName === "UsnJournal") ?? null;
-  // WMI 이벤트 구독도 화면용 파생(_OVERVIEW/WmiSubscriptions)을 연다.
-  const wmiEntry = effectiveOverviewFiles?.find((file) => file.fileName === "WmiSubscriptions") ?? null;
-  // FILESYSTEM(원본 USN facts)은 원본 데이터 목록에 남긴다 — 승격 항목이
-  // 파생 테이블을 열므로 원본은 여기서만 접근한다.
-  const rawCategories = categories.filter((c) => c.name !== "_OVERVIEW" && c.name !== "WER" && c.name !== "WMI");
+  // WMI 전용 뷰 삭제(2026-10-07 사용자 확정) 이후 _OVERVIEW/WmiSubscriptions를
+  // 여는 승격 항목은 없다. 수집·파싱·저장과 검색·북마크 경로는 그대로다.
+  // 원본 WMI facts(WMI/WMI_Persistence)는 다른 아티팩트와 같이 "원본 데이터"
+  // 목록에 남는다. FILESYSTEM(원본 USN facts)도 승격 항목이 파생 테이블을
+  // 열므로 원본은 그 목록에서만 접근한다.
+  const rawCategories = categories.filter((c) => c.name !== "_OVERVIEW" && c.name !== "WER");
 
   // Every artifact that ran, mapped to its category, in run order — so the
   // "원본 데이터" list is 1:1 with the run list. Categories with real output
@@ -628,7 +629,7 @@ export default function Sidebar({
   const seenNames = new Set<string>();
   for (const artifact of activeHost.artifactsRun ?? []) {
     const cat = categoryForArtifact(artifact);
-    if (cat === "_OVERVIEW" || cat === "WER" || cat === "WMI" || seenNames.has(cat)) continue;
+    if (cat === "_OVERVIEW" || cat === "WER" || seenNames.has(cat)) continue;
     seenNames.add(cat);
     orderedNames.push(cat);
   }
@@ -759,11 +760,6 @@ export default function Sidebar({
                   const entry = effectiveWerEntry;
                   if (entry) rows.push(<PinnedNavRow key="wer" icon={<ReportProblemOutlinedIcon sx={{ fontSize: 19 }} />} label="오류 보고" selected={sameEntry(selectedFile, entry)} onClick={() => onSelectFile(entry)} />);
                   else rows.push(<EmptyPinnedRow key="wer" icon={<ReportProblemOutlinedIcon sx={{ fontSize: 19 }} />} label="오류 보고" />);
-                  continue;
-                }
-                if (item === "@WMI") {
-                  if (wmiEntry) rows.push(<PinnedNavRow key="wmi" icon={<DeviceHubOutlinedIcon sx={{ fontSize: 19 }} />} label="WMI 이벤트 구독" selected={sameEntry(selectedFile, wmiEntry)} onClick={() => onSelectFile(wmiEntry)} />);
-                  else rows.push(<EmptyPinnedRow key="wmi" icon={<DeviceHubOutlinedIcon sx={{ fontSize: 19 }} />} label="WMI 이벤트 구독" />);
                   continue;
                 }
                 const tables = overviewByFile.get(item);

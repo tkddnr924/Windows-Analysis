@@ -20,7 +20,7 @@ use wina_core::parsers::srum::parse_srum_stream;
 use wina_core::parsers::taskscheduler::{parse_tasks, TASK_FIELD_ORDER, TASK_TABLE};
 use wina_core::parsers::usnjrnl::parse_usn_stream;
 use wina_core::parsers::wer::{parse_wer, WER_FIELD_ORDER, WER_TABLE};
-use wina_core::sqlite::write_table;
+use wina_core::sqlite::{write_fixed_table, write_table};
 
 fn now() -> String {
     chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
@@ -157,8 +157,8 @@ fn debug_parse(args: &[String]) -> Result<()> {
         }
         "parse-tasks" => {
             let r = parse_tasks(&inp)?;
-            write_table(&out, TASK_TABLE, &r, TASK_FIELD_ORDER)?;
-            eprintln!("TaskScheduler: {} tasks", r.len());
+            let count = write_fixed_table(&out, TASK_TABLE, r, TASK_FIELD_ORDER)?;
+            eprintln!("TaskScheduler: {} tasks", count);
         }
         "parse-jumplists" => {
             let r = parse_jumplists(&inp)?;
@@ -174,8 +174,8 @@ fn debug_parse(args: &[String]) -> Result<()> {
         }
         "parse-wer" => {
             let r = parse_wer(&inp)?;
-            write_table(&out, WER_TABLE, &r, WER_FIELD_ORDER)?;
-            eprintln!("WER: {} reports", r.len());
+            let count = write_fixed_table(&out, WER_TABLE, r, WER_FIELD_ORDER)?;
+            eprintln!("WER: {} reports", count);
         }
         "parse-history" => {
             let sides = wina_core::parsers::timeline::wal_siblings(&inp);

@@ -23,7 +23,6 @@ import ScheduledTasksView from "@/components/ScheduledTasksView";
 import DefenderView from "@/components/DefenderView";
 import RegistryFindingsView from "@/components/RegistryFindingsView";
 import WerView from "@/components/WerView";
-import WmiPersistenceView from "@/components/WmiPersistenceView";
 import UsnJrnlView from "@/components/UsnJrnlView";
 import MftView from "@/components/MftView";
 import BrowserHistoryView from "@/components/BrowserHistoryView";
@@ -890,9 +889,6 @@ export default function Home() {
   const bookmarkRawRecord = useCallback((fullPath: string, tableName: string, rowid: number) => {
     bookmarkRawRecordRef.current(fullPath, tableName, rowid);
   }, []);
-  // Timeline rows span many files, so a per-file rowid set isn't enough —
-  // key on fullPath+rowid to tell which timeline entries are bookmarked.
-  const bookmarkedKeys = new Set(bookmarksForCurrentHost.map((b) => `${b.fullPath}#${b.rowid}`));
   const isTimelineEntryBookmarked = (entry: TimelineEntry) =>
     isRecordBookmarked(hostBookmarkRefKeys, { fullPath: entry.fullPath, tableName: entry.table, rowid: entry.rowid }, parseSourceRefs(entry.row.__source_refs));
   // Opens a source record in place from the detail panel's source list. Paths
@@ -1178,16 +1174,6 @@ export default function Home() {
                   bookmarkedRowids={activeBookmarkedRowids}
                   onToggleBookmark={(rowid) => handleToggleActiveRowBookmark(rowid)}
                   timeRange={timeRange}
-                />
-              ) : getArtifactView(activeTab.file.name)?.customView === "wmiPersistence" ? (
-                <WmiPersistenceView
-                  data={activeTab.data}
-                  dbPath={activeTab.file.fullPath}
-                  bookmarkedRowids={activeBookmarkedRowids}
-                  onToggleBookmark={(rowid) => handleToggleActiveRowBookmark(rowid)}
-                  timeRange={timeRange}
-                  bookmarkedKeys={bookmarkedKeys}
-                  onToggleEventBookmark={(fullPath, tableName, rowid, eventTime) => handleToggleBookmark(fullPath, tableName, rowid, undefined, eventTime)}
                 />
               ) : getArtifactView(activeTab.file.name)?.customView === "registryFindings" ? (
                 <RegistryFindingsView

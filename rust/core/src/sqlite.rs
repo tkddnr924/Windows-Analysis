@@ -329,6 +329,20 @@ impl StreamWriter {
     }
 }
 
+/// Keep declared facts columns even when every row omits a value.
+pub fn write_fixed_table(
+    db_path: &Path,
+    table_name: &str,
+    rows: Vec<Row>,
+    columns: &[&str],
+) -> Result<usize> {
+    let mut writer = StreamWriter::create(db_path, table_name, columns, columns)?;
+    for row in rows {
+        writer.push(row)?;
+    }
+    writer.finish()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

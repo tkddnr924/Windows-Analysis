@@ -72,16 +72,17 @@ pub(super) fn populate(ctx: &Ctx, db: &DerivedDb, events: &EventLogOverviewCache
                 .ok_or_else(||anyhow::anyhow!("missing EventLogInputs provenance"))?;
             let stats = bounds.remove(table.as_str()).unwrap_or_default();
             let parsed = status == "parsed";
+            let facts_generation = ctx.facts.by_stem(&table).map(|facts|ctx.facts.generation(facts)).transpose()?;
             db.conn().execute(
                 "INSERT INTO SmbLogObservations(observation_id,host_id,dataset_id,log_name,source_file,facts_db,facts_table,
                  collection_state,input_row_count,event_count,corrupted_count,untimed_count,first_observed_time,last_observed_time,
-                 audit_setting_state,error,source_dataset_id,source_db,source_table,source_rowid)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,'unknown',?15,?16,?17,?18,?19)",
+                 audit_setting_state,error,source_dataset_id,source_db,source_table,source_rowid,facts_generation)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,'unknown',?15,?16,?17,?18,?19,?20)",
                 params![uuid::Uuid::new_v4().to_string(),ctx.host_id,ctx.dataset_id,table,file,
                     row.get::<_,Option<String>>(2)?.filter(|s|!s.is_empty()),
                     row.get::<_,Option<String>>(3)?.filter(|s|!s.is_empty()),state,count,
                     parsed.then_some(stats.count),parsed.then_some(stats.corrupt),parsed.then_some(stats.untimed),
-                    stats.first,stats.last,row.get::<_,Option<String>>(6)?,source.dataset,source.db,source.table,source.rowid],
+                    stats.first,stats.last,row.get::<_,Option<String>>(6)?,source.dataset,source.db,source.table,source.rowid,facts_generation],
             )?;
         }
     }
@@ -92,7 +93,7 @@ pub(super) fn populate(ctx: &Ctx, db: &DerivedDb, events: &EventLogOverviewCache
         db.conn().execute(
             "INSERT INTO SmbLogObservations(observation_id,host_id,dataset_id,log_name,source_file,facts_db,facts_table,
              collection_state,event_count,corrupted_count,untimed_count,first_observed_time,last_observed_time,
-             audit_setting_state,source_dataset_id)
+             audit_setting_state,facts_generation)
              VALUES(?1,?2,?3,?4,?5,?6,?7,'unknown',?8,?9,?10,?11,?12,'unknown',?13)",
             params![uuid::Uuid::new_v4().to_string(),ctx.host_id,ctx.dataset_id,table,stats.source_file,
                 facts.map(|f|f.relative.as_str()),table,stats.count,stats.corrupt,stats.untimed,stats.first,stats.last,generation],

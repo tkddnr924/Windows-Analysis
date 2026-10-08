@@ -18,6 +18,15 @@ mod remote_access;
 mod smb_history;
 mod smb_environment;
 mod smb_observations;
+mod scheduled_tasks;
+mod service_history;
+mod defender;
+mod defender_protection;
+mod defender_support;
+mod firewall_history;
+mod bits_history;
+mod wer_reports;
+mod artifact_paths;
 mod stream;
 mod usn;
 mod path_candidates;
@@ -718,62 +727,125 @@ impl Ctx<'_> {
 // Complete generation
 // ---------------------------------------------------------------------------
 
+fn validate_source_table(
+    conn: &Connection,
+    out_dir: &Path,
+    overview: &str,
+    source_table: &str,
+) -> Result<()> {
+    let quoted = crate::sqlite::quote_ident(source_table);
+    let incomplete: bool = conn.query_row(
+        &format!(
+            "SELECT EXISTS(SELECT 1 FROM {quoted}
+             WHERE (source_db IS NOT NULL OR source_table IS NOT NULL
+                 OR source_rowid IS NOT NULL OR source_dataset_id IS NOT NULL)
+               AND (source_db IS NULL OR source_table IS NULL
+                 OR source_rowid IS NULL OR source_dataset_id IS NULL
+                 OR source_db='' OR source_table='' OR source_dataset_id=''
+                 OR source_rowid<=0))"
+        ),
+        [],
+        |row| row.get(0),
+    )?;
+    if incomplete {
+        return Err(anyhow!("{overview}/{source_table}: incomplete source coordinates"));
+    }
+    let sources = {
+        let mut query = conn.prepare(&format!(
+            "SELECT DISTINCT source_db, source_table, source_dataset_id FROM {quoted}
+             WHERE source_db IS NOT NULL ORDER BY source_db, source_table"
+        ))?;
+        let rows = query.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let mut attached: Option<&str> = None;
+    let mut attached_generation = String::new();
+    for (relative, table, generation) in &sources {
+        if attached != Some(relative.as_str()) {
+            if Path::new(relative).components().any(|part| !matches!(part, std::path::Component::Normal(_))) {
+                return Err(anyhow!("{overview}/{source_table}: source DB must be host-relative: {relative}"));
+            }
+            let source_path = out_dir.join(relative);
+            if !source_path.is_file() {
+                return Err(anyhow!("{overview}/{source_table}: missing source DB {relative}"));
+            }
+            if attached.is_some() {
+                conn.execute_batch("DETACH DATABASE facts")?;
+            }
+            conn.execute("ATTACH DATABASE ?1 AS facts", [source_path.to_string_lossy().as_ref()])?;
+            attached_generation = conn.query_row(
+                "SELECT dataset_id FROM facts._wina_facts_generation", [], |row| row.get(0),
+            )?;
+            attached = Some(relative.as_str());
+        }
+        if generation != &attached_generation {
+            return Err(anyhow!("{overview}/{source_table}: source generation mismatch for {relative}"));
+        }
+        let missing: Option<i64> = conn.query_row(
+            &format!(
+                "SELECT s.source_rowid FROM {quoted} s
+                 LEFT JOIN facts.{} f ON f.rowid=s.source_rowid
+                 WHERE s.source_db=?1 AND s.source_table=?2 AND f.rowid IS NULL LIMIT 1",
+                crate::sqlite::quote_ident(table),
+            ),
+            rusqlite::params![relative, table], |row| row.get(0),
+        ).optional()?;
+        if let Some(rowid) = missing {
+            return Err(anyhow!("{overview}/{source_table}: missing source {relative}/{table}/{rowid}"));
+        }
+    }
+    if attached.is_some() {
+        conn.execute_batch("DETACH DATABASE facts")?;
+    }
+    Ok(())
+}
+
 fn validate_lineage(out_dir: &Path) -> Result<()> {
     for spec in schema::SPECS {
         let path = out_dir.join("_OVERVIEW").join(format!("{}.sqlite", spec.name));
         let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        let sources = {
+        let source_tables = {
             let mut query = conn.prepare(
-                "SELECT DISTINCT source_db, source_table, source_dataset_id FROM source_records ORDER BY source_db, source_table",
+                "SELECT m.name FROM sqlite_master m WHERE m.type='table'
+                 AND (SELECT COUNT(*) FROM pragma_table_info(m.name)
+                      WHERE name IN ('source_db','source_table','source_rowid','source_dataset_id'))=4",
             )?;
-            let rows = query.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
-            })?;
+            let rows = query.query_map([], |row| row.get::<_, String>(0))?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
         };
-        let mut attached: Option<&str> = None;
-        let mut attached_generation = String::new();
-        for (relative, table, generation) in &sources {
-            if attached != Some(relative.as_str()) {
-                if Path::new(relative).components().any(|part| !matches!(part, std::path::Component::Normal(_))) {
-                    return Err(anyhow!("{}: source DB must be host-relative: {relative}", spec.name));
-                }
-                let source_path = out_dir.join(relative);
-                if !source_path.is_file() {
-                    return Err(anyhow!("{}: missing source DB {relative}", spec.name));
-                }
-                if attached.is_some() {
-                    conn.execute_batch("DETACH DATABASE facts")?;
-                }
-                conn.execute("ATTACH DATABASE ?1 AS facts", [source_path.to_string_lossy().as_ref()])?;
-                attached_generation = conn.query_row(
-                    "SELECT dataset_id FROM facts._wina_facts_generation", [], |row| row.get(0),
-                )?;
-                attached = Some(relative.as_str());
-            }
-            if generation != &attached_generation {
-                return Err(anyhow!("{}: source generation mismatch for {relative}", spec.name));
-            }
-            let missing: Option<(String, i64)> = conn.query_row(
-                &format!(
-                    "SELECT s.record_id, s.source_rowid FROM source_records s LEFT JOIN facts.{} f ON f.rowid=s.source_rowid WHERE s.source_db=?1 AND s.source_table=?2 AND f.rowid IS NULL LIMIT 1",
-                    crate::sqlite::quote_ident(table),
-                ),
-                rusqlite::params![relative, table], |row| Ok((row.get(0)?, row.get(1)?)),
-            ).optional()?;
-            if let Some((record_id, rowid)) = missing {
-                return Err(anyhow!("{} record {record_id}: missing source {relative}/{table}/{rowid}", spec.name));
-            }
+        for table in source_tables {
+            validate_source_table(&conn, out_dir, spec.name, &table)?;
         }
-        if spec.name == "TargetInfo" {
-            let metadata = out_dir.join("_OVERVIEW/Metadata.sqlite");
-            conn.execute("ATTACH DATABASE ?1 AS metadata_target", [metadata.to_string_lossy().as_ref()])?;
-            let invalid: bool = conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM TargetInfo t LEFT JOIN metadata_target.metadata m ON m.metadata_id=t.metadata_id WHERE t.metadata_id IS NOT NULL AND m.metadata_id IS NULL)",
-                [], |row| row.get(0),
-            )?;
-            if invalid {
-                return Err(anyhow!("TargetInfo contains a missing metadata reference"));
+        if spec.name != "Metadata" {
+            let metadata_tables = {
+                let mut query = conn.prepare(
+                    "SELECT m.name FROM sqlite_master m WHERE m.type='table'
+                     AND (SELECT COUNT(*) FROM pragma_table_info(m.name)
+                          WHERE name IN ('metadata_id','host_id','dataset_id'))=3",
+                )?;
+                let rows = query.query_map([], |row| row.get::<_, String>(0))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            if !metadata_tables.is_empty() {
+                let metadata = out_dir.join("_OVERVIEW/Metadata.sqlite");
+                conn.execute("ATTACH DATABASE ?1 AS metadata_target", [metadata.to_string_lossy().as_ref()])?;
+                for table in metadata_tables {
+                    let invalid: bool = conn.query_row(
+                        &format!(
+                            "SELECT EXISTS(SELECT 1 FROM {} t
+                             LEFT JOIN metadata_target.metadata m ON m.metadata_id=t.metadata_id
+                               AND m.host_id=t.host_id AND m.dataset_id=t.dataset_id
+                             WHERE t.metadata_id IS NOT NULL AND m.metadata_id IS NULL)",
+                            crate::sqlite::quote_ident(&table),
+                        ),
+                        [], |row| row.get(0),
+                    )?;
+                    if invalid {
+                        return Err(anyhow!("{}/{table}: missing or foreign metadata reference", spec.name));
+                    }
+                }
             }
         }
         if spec.name == "PathReferences" {
@@ -790,6 +862,7 @@ fn validate_lineage(out_dir: &Path) -> Result<()> {
             if invalid {
                 return Err(anyhow!("Path reference candidate has a missing or foreign file record"));
             }
+            artifact_paths::validate(&conn, out_dir)?;
         }
     }
     Ok(())
@@ -921,6 +994,90 @@ mod tests {
         db.execute("UPDATE source_records SET source_dataset_id='wrong-generation'", []).unwrap();
         assert!(validate_lineage(&out_dir).is_err());
         drop(db);
+        std::fs::remove_dir_all(out_dir.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn publication_validates_standalone_evidence_coordinates() {
+        let (out_dir, target) = fixture("side-source-validation");
+        facts_db(&out_dir, "EVENTLOG/Security.sqlite",
+            "CREATE TABLE Security(value TEXT); INSERT INTO Security VALUES ('evidence');");
+        build_all(&out_dir, &target, "host", "derived-generation").unwrap();
+        let db = Connection::open_with_flags(out_dir.join("_OVERVIEW/SmbHistory.sqlite"),
+            OpenFlags::SQLITE_OPEN_READ_WRITE).unwrap();
+        db.execute_batch(
+            "INSERT INTO SmbLogObservations(observation_id,host_id,dataset_id,
+                 source_db,source_table,source_rowid,source_dataset_id)
+             VALUES ('standalone','host','derived-generation',
+                 'EVENTLOG/Security.sqlite','Security',99,'facts-gen-1');"
+        ).unwrap();
+        assert!(validate_lineage(&out_dir).is_err());
+        db.execute("UPDATE SmbLogObservations SET source_rowid=1 WHERE observation_id='standalone'", []).unwrap();
+        validate_lineage(&out_dir).unwrap();
+        db.execute("UPDATE SmbLogObservations SET source_dataset_id='wrong' WHERE observation_id='standalone'", []).unwrap();
+        assert!(validate_lineage(&out_dir).is_err());
+        db.execute("UPDATE SmbLogObservations SET source_dataset_id=NULL WHERE observation_id='standalone'", []).unwrap();
+        assert!(validate_lineage(&out_dir).is_err());
+        db.execute("UPDATE SmbLogObservations SET source_db=NULL,source_table=NULL,source_rowid=NULL WHERE observation_id='standalone'", []).unwrap();
+        validate_lineage(&out_dir).unwrap();
+        drop(db);
+        std::fs::remove_dir_all(out_dir.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn publication_rejects_missing_or_foreign_path_origins() {
+        let (out_dir, target) = fixture("path-origin-validation");
+        build_all(&out_dir, &target, "host", "generation").unwrap();
+        let paths = Connection::open_with_flags(out_dir.join("_OVERVIEW/PathReferences.sqlite"),
+            OpenFlags::SQLITE_OPEN_READ_WRITE).unwrap();
+        paths.execute_batch(
+            "INSERT INTO PathReferences(record_id,host_id,dataset_id,overview_name)
+                 VALUES ('path','host','generation','PathReferences');
+             INSERT INTO PathReferenceOrigins(record_id,ordinal,origin_db,origin_table,
+                 origin_record_id,role)
+                 VALUES ('path',0,'ExecutionHistory.sqlite','ExecutionHistory','origin','executable');"
+        ).unwrap();
+        assert!(validate_lineage(&out_dir).is_err());
+        let origin = Connection::open_with_flags(out_dir.join("_OVERVIEW/ExecutionHistory.sqlite"),
+            OpenFlags::SQLITE_OPEN_READ_WRITE).unwrap();
+        origin.execute_batch(
+            "INSERT INTO ExecutionHistory(record_id,host_id,dataset_id,overview_name)
+                 VALUES ('origin','host','generation','ExecutionHistory');"
+        ).unwrap();
+        validate_lineage(&out_dir).unwrap();
+        origin.execute("UPDATE ExecutionHistory SET host_id='other' WHERE record_id='origin'", []).unwrap();
+        assert!(validate_lineage(&out_dir).is_err());
+        origin.execute("UPDATE ExecutionHistory SET host_id='host',dataset_id='old' WHERE record_id='origin'", []).unwrap();
+        assert!(validate_lineage(&out_dir).is_err());
+        drop(origin);
+        drop(paths);
+        std::fs::remove_dir_all(out_dir.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn publication_validates_standalone_metadata_host_and_generation() {
+        let (out_dir, target) = fixture("side-metadata-validation");
+        build_all(&out_dir, &target, "host", "generation").unwrap();
+        let evidence = Connection::open_with_flags(out_dir.join("_OVERVIEW/BitsHistory.sqlite"),
+            OpenFlags::SQLITE_OPEN_READ_WRITE).unwrap();
+        evidence.execute_batch(
+            "INSERT INTO BitsMetadataReferences(reference_id,host_id,dataset_id,metadata_id)
+                 VALUES ('reference','host','generation','metadata');"
+        ).unwrap();
+        assert!(validate_lineage(&out_dir).is_err());
+        let metadata = Connection::open_with_flags(out_dir.join("_OVERVIEW/Metadata.sqlite"),
+            OpenFlags::SQLITE_OPEN_READ_WRITE).unwrap();
+        metadata.execute_batch(
+            "INSERT INTO metadata(metadata_id,host_id,dataset_id,kind,scope,key,resolution_status)
+                 VALUES ('metadata','host','generation','host','machine','architecture','resolved');"
+        ).unwrap();
+        validate_lineage(&out_dir).unwrap();
+        evidence.execute("UPDATE BitsMetadataReferences SET host_id='other' WHERE reference_id='reference'", []).unwrap();
+        assert!(validate_lineage(&out_dir).is_err());
+        evidence.execute("UPDATE BitsMetadataReferences SET host_id='host',dataset_id='old' WHERE reference_id='reference'", []).unwrap();
+        assert!(validate_lineage(&out_dir).is_err());
+        drop(metadata);
+        drop(evidence);
         std::fs::remove_dir_all(out_dir.parent().unwrap()).unwrap();
     }
 
@@ -2151,23 +2308,21 @@ mod tests {
     #[test]
     fn scheduled_tasks_keep_definitions_and_events_as_separate_rows() {
         let (out_dir, target) = fixture("tasks");
-        facts_db(
-            &out_dir,
-            "TASKSCHEDULER/TaskScheduler_Tasks.sqlite",
-            "CREATE TABLE TaskScheduler_Tasks (timestamp TEXT, task_name TEXT, enabled TEXT, \
-             hidden TEXT, run_as TEXT, run_level TEXT, actions TEXT, trigger_types TEXT, \
-             trigger_start TEXT, actions_json TEXT, triggers_json TEXT, author TEXT, \
-             description TEXT, logon_type TEXT, uri TEXT, _source_file TEXT);\
-             INSERT INTO TaskScheduler_Tasks VALUES ('2026-05-06 07:08:09.000','Updater','true',\
-             'false','SYSTEM','HighestAvailable','cmd.exe /c evil.bat','LogonTrigger',\
-             '2026-05-01 00:00:00.000',\
-             '[{\"action_type\":\"Exec\",\"command\":\"cmd.exe\",\"arguments\":\"/c evil.bat\",\
-             \"working_directory\":null,\"raw\":\"cmd.exe /c evil.bat\"}]',\
-             '[{\"trigger_type\":\"LogonTrigger\",\"start_time\":\"2026-05-01 00:00:00.000\",\
-             \"end_time\":null,\"enabled\":true,\"raw\":\"<LogonTrigger/>\"}]',\
-             'attacker','backdoor','InteractiveToken','\\Updater',\
-             'C:\\Windows\\System32\\Tasks\\Updater');",
-        );
+        let task_file = target.join("Updater");
+        std::fs::write(&task_file, r#"<Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+<RegistrationInfo><Date>2026-05-06T07:08:09+09:00</Date><URI>\Updater</URI></RegistrationInfo>
+<Principals><Principal><UserId>SYSTEM</UserId></Principal></Principals>
+<Triggers><LogonTrigger><Enabled>true</Enabled></LogonTrigger></Triggers>
+<Actions><Exec><Command>cmd.exe</Command><Arguments>/c evil.bat</Arguments></Exec></Actions>
+</Task>"#).unwrap();
+        let parsed = crate::parsers::taskscheduler::parse_tasks_from(&[task_file]);
+        let task_facts = out_dir.join("TASKSCHEDULER/TaskScheduler_Tasks.sqlite");
+        std::fs::create_dir_all(task_facts.parent().unwrap()).unwrap();
+        crate::sqlite::write_fixed_table(
+            &task_facts, "TaskScheduler_Tasks", parsed,
+            crate::parsers::taskscheduler::TASK_FIELD_ORDER,
+        ).unwrap();
+        stamp_facts_generation(&task_facts, "facts-gen-1").unwrap();
         facts_db(
             &out_dir,
             "EVENTLOG/TaskScheduler.sqlite",
@@ -2179,22 +2334,25 @@ mod tests {
         );
         build_all(&out_dir, &target, "host-1", "ds-1").unwrap();
         let conn = open(&out_dir, "ScheduledTasks");
-        let rows: Vec<(String, Option<i64>, String)> = conn
-            .prepare("SELECT event_type, event_id, record_id FROM ScheduledTasks ORDER BY event_type")
+        let rows: Vec<(Option<i64>, String)> = conn
+            .prepare("SELECT event_id, record_id FROM ScheduledTasks")
             .unwrap()
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
         assert_eq!(rows.len(), 2);
-        let definition = rows.iter().find(|(kind, _, _)| kind == "작업 정의").unwrap();
-        let event = rows.iter().find(|(kind, _, _)| kind == "작업 완료").unwrap();
-        assert_eq!(definition.1, None);
-        assert_eq!(event.1, Some(102));
+        let definition = rows.iter().find(|(event_id, _)| event_id.is_none()).unwrap();
+        let event = rows.iter().find(|(event_id, _)| *event_id == Some(102)).unwrap();
+        let definition_time: String = conn.query_row(
+            "SELECT timestamp FROM ScheduledTasks WHERE record_id=?1",
+            [&definition.1], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(definition_time, "2026-05-06 07:08:09.000");
         let (action_type, command, arguments): (String, String, Option<String>) = conn
             .query_row(
                 "SELECT action_type, command, arguments FROM TaskActions WHERE record_id=?1",
-                [&definition.2],
+                [&definition.1],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
@@ -2204,7 +2362,7 @@ mod tests {
         let (trigger_type, enabled): (String, i64) = conn
             .query_row(
                 "SELECT trigger_type, enabled FROM TaskTriggers WHERE record_id=?1",
-                [&definition.2],
+                [&definition.1],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
@@ -2213,18 +2371,37 @@ mod tests {
         let (db, table, rowid): (String, String, i64) = conn
             .query_row(
                 "SELECT source_db, source_table, source_rowid FROM source_records WHERE record_id=?1",
-                [&event.2],
+                [&event.1],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
         assert_eq!(db, "EVENTLOG/TaskScheduler.sqlite");
         assert_eq!(table, "TaskScheduler");
         assert_eq!(rowid, 1);
+        let observation: (String, String, i64, bool) = conn.query_row(
+            "SELECT collection_state, facts_generation, task_event_count,
+                    source_dataset_id IS NULL AND source_db IS NULL
+                    AND source_table IS NULL AND source_rowid IS NULL
+             FROM TaskLogObservations WHERE log_name='TaskScheduler'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).unwrap();
+        assert_eq!(observation, ("unknown".into(), "facts-gen-1".into(), 1, true));
+        let paths = open(&out_dir, "PathReferences");
+        let definition_path: (String, Option<String>) = paths.query_row(
+            "SELECT p.target_path,p.target_path_resolved
+             FROM PathReferences p JOIN PathReferenceOrigins o USING(record_id)
+             WHERE o.role='scheduled_task_definition_file'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(definition_path,
+            (r"%SystemRoot%\System32\Tasks\Updater".into(), None));
         let _ = std::fs::remove_dir_all(out_dir.parent().unwrap());
     }
 
     #[test]
-    fn hosts_and_mpdetection_rows_point_at_real_raw_rows() {
+    fn hosts_rows_point_at_real_raw_rows() {
         let (out_dir, target) = fixture("ancillary");
         let etc = target.join("Windows").join("System32").join("drivers").join("etc");
         std::fs::create_dir_all(&etc).unwrap();
@@ -2233,20 +2410,8 @@ mod tests {
             "# 주석 줄\n10.0.0.5 payload.example # 설명\n",
         )
         .unwrap();
-        let support = target
-            .join("ProgramData")
-            .join("Microsoft")
-            .join("Windows Defender")
-            .join("Support");
-        std::fs::create_dir_all(&support).unwrap();
-        std::fs::write(
-            support.join("MPDetection-20260322.log"),
-            "2026-03-22T17:20:21.623 DETECTION Trojan:Win32/Evil file:_C:\\temp\\evil.exe\n",
-        )
-        .unwrap();
 
-        let published = prepare_ancillary_facts(&out_dir, &target, "facts-gen-1").unwrap();
-        assert_eq!(published, vec![ancillary::ANCILLARY_DB.to_string()]);
+        prepare_ancillary_facts(&out_dir, &target, "facts-gen-1").unwrap();
         build_all(&out_dir, &target, "host-1", "ds-1").unwrap();
 
         let conn = open(&out_dir, "TargetInfo");
@@ -2289,38 +2454,6 @@ mod tests {
         assert_eq!(dataset, "facts-gen-1");
         assert!(file.ends_with("hosts"), "{file}");
 
-        let conn = open(&out_dir, "Defender");
-        let (section, threat, source, table, artifact, rowid): (
-            String,
-            String,
-            String,
-            String,
-            String,
-            i64,
-        ) = conn
-            .query_row(
-                "SELECT d.section, d.threat_name, d.source, s.source_table, s.source_artifact, \
-                 s.source_rowid FROM Defender d JOIN source_records s ON s.record_id = d.record_id \
-                 WHERE d.source = 'MPDetection'",
-                [],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                    ))
-                },
-            )
-            .unwrap();
-        assert_eq!(section, "threat");
-        assert_eq!(threat, "Trojan:Win32/Evil");
-        assert_eq!(source, "MPDetection");
-        assert_eq!(table, ancillary::DEFENDER_TABLE);
-        assert_eq!(artifact, ancillary::DEFENDER_ARTIFACT);
-        assert_eq!(rowid, 1);
         let _ = std::fs::remove_dir_all(out_dir.parent().unwrap());
     }
 

@@ -8,7 +8,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type {
   AccountDirectoryEntry, Bookmark, BookmarkInput, Case, CategoryEntry, CsvData, DBRow, ElectronApi, Host, HostMetadata, LinkedRowsPage, MftChildrenPage,
-  ListCasesResult, CacheMeta, CacheBodyPreview, BrowserVisitGraph, PathReference, PipelineLogEntry, PipelineResult, ResultFileEntry, ResultProvenance, ArtifactInputFile, ParseReport, ParseEligibility, RunHostOptions, SearchCasePage, AiConversation, AiConversationPage, AiConversationDetail, BrowserActivityQuery, BrowserActivitySummary, BrowserActivityInsights, BrowserDomainStatsPage, AccountEventPage, AccountEventQuery, AccountEventSource, MftRecordBody, MftVolume, OverviewContractStatus, RecordSource, ResultRow, MftRecordsPage, ParseLogPreview, WmiSubscriptionEvents, TimelineMeta, TimelineFacets, TimelinePage, TimelineSourcePage, TimelineQuery,
+  ListCasesResult, CacheMeta, CacheBodyPreview, BrowserVisitGraph, PathReference, PipelineLogEntry, PipelineResult, ResultFileEntry, ResultProvenance, ArtifactInputFile, ParseReport, ParseEligibility, RunHostOptions, SearchCasePage, AiConversation, AiConversationPage, AiConversationDetail, BrowserActivityQuery, BrowserActivitySummary, BrowserActivityInsights, BrowserDomainStatsPage, AccountEventPage, AccountEventQuery, AccountEventSource, MftRecordBody, MftVolume, OverviewContractStatus, RecordSource, ResultRow, MftRecordsPage, ParseLogPreview, TimelineMeta, TimelineFacets, TimelinePage, TimelineSourcePage, TimelineQuery,
 } from "./types";
 
 // 저장 계약(docs-01)의 결과 DB는 INTEGER·REAL 컬럼을 쓴다. 화면 코드는 셀을
@@ -115,7 +115,6 @@ function makeApi(): ElectronApi {
     browserVisitGraph: (hostDir, account, url, cacheKey, sourceFile) => invoke<BrowserVisitGraph>("browser_visit_graph", { hostDir, account, url, cacheKey: cacheKey ?? null, sourceFile: sourceFile ?? null }),
     aiConversations: (hostDir, query) => invoke<AiConversationPage>("ai_conversations", { hostDir, query }),
     aiConversationDetail: (hostDir, rowId) => invoke<AiConversationDetail>("ai_conversation_detail", { hostDir, rowId }),
-    wmiSubscriptionEvents: (hostDir) => invoke<WmiSubscriptionEvents>("wmi_subscription_events", { hostDir }).then(table),
     powershellSearchRowids: (fullPath, query) => invoke<number[]>("powershell_search_rowids", { fullPath, query }),
   };
 }

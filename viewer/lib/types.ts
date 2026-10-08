@@ -521,16 +521,6 @@ export interface AiConversationPage {
   derivedMissing: boolean;
 }
 
-/** WMI-Activity 로그의 구독 이벤트(5859~5861)만 서버에서 걸러 온 결과 —
- *  원본 EventLog 전체를 IPC로 옮기지 않는다. rows에는 __rowid가 있어 원본
- *  EventLog 행 기준 북마크가 연결된다. 로그가 없으면 fullPath가 빈 문자열. */
-export interface WmiSubscriptionEvents {
-  columns: string[];
-  rows: Record<string, string>[];
-  fullPath: string;
-  tableName: string;
-}
-
 /** One EventLog result table used by the account-detail activity query. */
 export interface AccountEventSource {
   fullPath: string;
@@ -726,8 +716,6 @@ export interface ElectronApi {
   /** AI conversations extracted from browser cache, filtered and paged by cache timestamp. */
   aiConversations(hostDir: string, query: { start?: string; end?: string; offset: number; limit: number }): Promise<AiConversationPage>;
   aiConversationDetail(hostDir: string, rowId: number): Promise<AiConversationDetail>;
-  /** WMI-Activity 로그의 구독 이벤트(5859~5861)만 서버에서 걸러 받는다. */
-  wmiSubscriptionEvents(hostDir: string): Promise<WmiSubscriptionEvents>;
   /** PowerShellHistory 원문(절단 없는 컬럼) 검색 — 일치 rowid 집합 반환. */
   powershellSearchRowids(fullPath: string, query: string): Promise<number[]>;
 }
