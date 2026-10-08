@@ -9,16 +9,16 @@ use rusqlite::{Connection, OpenFlags};
 use super::schema::{self, DbSpec};
 use super::{flag, int, json_text, nz, text, text_opt, text_raw, Cell, Ctx, DerivedDb};
 
-fn spec_of(name: &str) -> &'static DbSpec {
+pub(super) fn spec_of(name: &str) -> &'static DbSpec {
     schema::spec(name).expect("문서에 없는 파생 DB")
 }
 
-fn open_ro(path: &Path) -> Result<Connection> {
+pub(super) fn open_ro(path: &Path) -> Result<Connection> {
     Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .with_context(|| format!("원본 열기: {}", path.display()))
 }
 
-fn fact_files(out_dir: &Path, category: &str, table: &str) -> Vec<PathBuf> {
+pub(super) fn fact_files(out_dir: &Path, category: &str, table: &str) -> Vec<PathBuf> {
     let dir = out_dir.join(category);
     let mut files: Vec<PathBuf> = match std::fs::read_dir(&dir) {
         Ok(entries) => entries
@@ -44,7 +44,7 @@ fn has_table(path: &Path, table: &str) -> bool {
     .is_ok()
 }
 
-fn cell_of(value: ValueRef<'_>) -> Cell {
+pub(super) fn cell_of(value: ValueRef<'_>) -> Cell {
     match value {
         ValueRef::Null => Cell::Null,
         ValueRef::Integer(v) => Cell::Int(v),
@@ -55,14 +55,14 @@ fn cell_of(value: ValueRef<'_>) -> Cell {
 }
 
 // Evidence text preserves whitespace.
-fn raw_cell_of(value: ValueRef<'_>) -> Cell {
+pub(super) fn raw_cell_of(value: ValueRef<'_>) -> Cell {
     match value {
         ValueRef::Text(v) => text_raw(&String::from_utf8_lossy(v)),
         other => cell_of(other),
     }
 }
 
-fn int_of(value: ValueRef<'_>) -> Cell {
+pub(super) fn int_of(value: ValueRef<'_>) -> Cell {
     match value {
         ValueRef::Integer(v) => Cell::Int(v),
         ValueRef::Text(v) => int(&String::from_utf8_lossy(v)),
@@ -70,7 +70,7 @@ fn int_of(value: ValueRef<'_>) -> Cell {
     }
 }
 
-fn str_of(value: ValueRef<'_>) -> String {
+pub(super) fn str_of(value: ValueRef<'_>) -> String {
     match value {
         ValueRef::Text(v) => String::from_utf8_lossy(v).into_owned(),
         ValueRef::Integer(v) => v.to_string(),
@@ -83,7 +83,7 @@ pub(super) fn build_streaming(ctx: &Ctx) -> Result<Vec<(String, usize)>> {
         ("AiConversations".into(), ai_conversations(ctx)?),
         ("WmiSubscriptions".into(), wmi_subscriptions(ctx)?),
         ("FileSystemEntries".into(), file_system_entries(ctx)?),
-        ("UsnJournal".into(), usn_journal(ctx)?),
+        ("UsnJournal".into(), super::usn::build(ctx)?),
         ("RecycleBin".into(), recycle_bin(ctx)?),
     ])
 }
@@ -337,78 +337,8 @@ fn file_system_entries(ctx: &Ctx) -> Result<usize> {
 }
 
 // ---------------------------------------------------------------------------
-// UsnJournal
+// UsnJournal — see derived/usn.rs
 // ---------------------------------------------------------------------------
-
-// Select a recognized reason by priority without discarding the raw reason.
-fn usn_event_type(reason: &str) -> Option<&'static str> {
-    const PRIORITY: &[(&str, &str)] = &[
-        ("FILE_DELETE", "삭제"),
-        ("RENAME_OLD_NAME", "이름 변경(이전 이름)"),
-        ("RENAME_NEW_NAME", "이름 변경(새 이름)"),
-        ("FILE_CREATE", "생성"),
-        ("DATA_OVERWRITE", "내용 변경"),
-        ("DATA_EXTEND", "내용 변경"),
-        ("DATA_TRUNCATION", "내용 변경"),
-        ("NAMED_DATA_OVERWRITE", "내용 변경"),
-        ("NAMED_DATA_EXTEND", "내용 변경"),
-        ("NAMED_DATA_TRUNCATION", "내용 변경"),
-        ("SECURITY_CHANGE", "보안 변경"),
-        ("BASIC_INFO_CHANGE", "속성 변경"),
-        ("STREAM_CHANGE", "스트림 변경"),
-        ("CLOSE", "닫기"),
-    ];
-    let flags: Vec<&str> = reason.split('|').map(str::trim).collect();
-    PRIORITY
-        .iter()
-        .find(|(flag, _)| flags.contains(flag))
-        .map(|(_, label)| *label)
-}
-
-fn usn_journal(ctx: &Ctx) -> Result<usize> {
-    let spec = spec_of("UsnJournal");
-    let mut db = DerivedDb::create(&ctx.overview_dir(), "UsnJournal")?;
-    let table = crate::parsers::usnjrnl::USN_TABLE;
-    for path in fact_files(ctx.out_dir, "FILESYSTEM", table) {
-        let conn = open_ro(&path)?;
-        let mut stmt = conn.prepare(&format!(
-            "SELECT rowid, timestamp, filename, reason, file_attributes_mask, usn, source_info, \
-             security_id, file_reference, parent_file_reference, _source_file, reason_mask, \
-             record_version FROM {}",
-            crate::sqlite::quote_ident(table)
-        ))?;
-        let mut query = stmt.query([])?;
-        while let Some(row) = query.next()? {
-            let rowid: i64 = row.get(0)?;
-            let reason = str_of(row.get_ref(3)?);
-            let mut rec = ctx.record(spec);
-            rec.timestamp(&str_of(row.get_ref(1)?), "변경 기록 시각");
-            rec.set("event_type", text_opt(usn_event_type(&reason)));
-            rec.set("file_name", raw_cell_of(row.get_ref(2)?));
-            // $J alone cannot establish path, volume, journal ID or account.
-            rec.set("usn", cell_of(row.get_ref(5)?));
-            rec.set("file_reference", cell_of(row.get_ref(8)?));
-            rec.set("parent_reference", cell_of(row.get_ref(9)?));
-            rec.set("reason_mask", cell_of(row.get_ref(11)?));
-            rec.set("reason", text(&reason));
-            rec.set("record_version", int_of(row.get_ref(12)?));
-            rec.set("source_info", cell_of(row.get_ref(6)?));
-            rec.set("security_id", int_of(row.get_ref(7)?));
-            // Preserve raw attribute bits; decoded labels remain in facts.
-            rec.set("file_attributes", cell_of(row.get_ref(4)?));
-            let source_file = str_of(row.get_ref(10)?);
-            rec.source(ctx.facts.source_from_row(
-                &path,
-                table,
-                rowid,
-                nz(&source_file),
-                Some("USN 변경 레코드"),
-            )?);
-            db.write(rec)?;
-        }
-    }
-    db.finish()
-}
 
 // ---------------------------------------------------------------------------
 // RecycleBin

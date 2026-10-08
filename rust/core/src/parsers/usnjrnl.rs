@@ -1,6 +1,7 @@
 //! USN Change Journal ($UsnJrnl:$J) parser — one row per USN record. Manual
 //! struct parsing (USN_RECORD_V2 64-bit refs / V3 128-bit refs), mirroring the
-//! Python parser byte-for-byte, including exact FILETIME rounding.
+//! Python parser byte-for-byte, including exact FILETIME rounding. Each row
+//! also carries the record's absolute byte offset in its input file.
 use std::path::Path;
 
 use anyhow::Result;
@@ -25,6 +26,8 @@ pub const USN_FIELD_ORDER: &[&str] = &[
     "record_version",
     "file_attributes_mask",
     "_source_file",
+    // Absolute byte offset of this record header in the input file (decimal).
+    "record_offset",
 ];
 
 const REASON_FLAGS: &[(u32, &str)] = &[
@@ -104,7 +107,11 @@ pub fn parse_usn_stream(path: &Path, out: &Path) -> Result<usize> {
     // 리필용 읽기 버퍼는 한 번만 할당해 재사용한다 — 수 GB $J에서 리필마다
     // 4 MiB를 새로 할당·제로화하면 allocator 부하만 커진다.
     let mut chunk = vec![0u8; WINDOW];
+    // Name decoding buffer, reused so each record costs no extra allocation.
+    let mut name_units: Vec<u16> = Vec::new();
     let mut pos = 0usize;
+    // Absolute file offset of buf[0]; grows by the bytes dropped on each drain.
+    let mut base = 0u64;
     let mut eof = false;
     loop {
         if crate::pipeline::cancelled() {
@@ -114,6 +121,7 @@ pub fn parse_usn_stream(path: &Path, out: &Path) -> Result<usize> {
             pos = buf.len();
         }
         if !eof && buf.len() - pos < MAX_RECLEN {
+            base += pos as u64;
             buf.drain(..pos);
             pos = 0;
             while buf.len() < WINDOW {
@@ -202,11 +210,13 @@ pub fn parse_usn_stream(path: &Path, out: &Path) -> Result<usize> {
         let name = {
             let start = pos + name_off;
             let end = pos + name_end;
-            let u16s: Vec<u16> = data[start..end]
-                .chunks_exact(2)
-                .map(|c| u16::from_le_bytes([c[0], c[1]]))
-                .collect();
-            String::from_utf16_lossy(&u16s)
+            name_units.clear();
+            name_units.extend(
+                data[start..end]
+                    .chunks_exact(2)
+                    .map(|c| u16::from_le_bytes([c[0], c[1]])),
+            );
+            String::from_utf16_lossy(&name_units)
         };
 
         let mut row = Row::new();
@@ -231,6 +241,7 @@ pub fn parse_usn_stream(path: &Path, out: &Path) -> Result<usize> {
         row.insert("file_reference".into(), file_ref.to_string());
         row.insert("parent_file_reference".into(), parent_ref.to_string());
         row.insert("_source_file".into(), source.clone());
+        row.insert("record_offset".into(), (base + pos as u64).to_string());
         writer.push(row)?;
         pos += advance;
     }
@@ -358,6 +369,195 @@ mod tests {
             .unwrap();
         assert_eq!(usn, "222");
         assert_eq!(name, "evil.exe");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// V3 record: 76-byte fixed header (128-bit references) + UTF-16LE name.
+    fn usn_v3(usn: u64, file_ref: u128, parent_ref: u128, name: &str) -> Vec<u8> {
+        let name_bytes: Vec<u8> = name.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let mut b = vec![0u8; 76];
+        b[4..6].copy_from_slice(&3u16.to_le_bytes());
+        b[8..24].copy_from_slice(&file_ref.to_le_bytes());
+        b[24..40].copy_from_slice(&parent_ref.to_le_bytes());
+        b[40..48].copy_from_slice(&usn.to_le_bytes());
+        b[72..74].copy_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+        b[74..76].copy_from_slice(&76u16.to_le_bytes());
+        b.extend(name_bytes);
+        let reclen = b.len() as u32;
+        b[0..4].copy_from_slice(&reclen.to_le_bytes());
+        while !b.len().is_multiple_of(8) {
+            b.push(0);
+        }
+        b
+    }
+
+    fn tmp_dir(tag: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("wina-usn-{tag}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    /// Parse `data` into a fresh DB and return (usn, record_offset) per row.
+    fn offsets_of(root: &std::path::Path, name: &str, data: &[u8]) -> Vec<(String, String)> {
+        let source = root.join(name);
+        let output = root.join(format!("{name}.sqlite"));
+        std::fs::write(&source, data).unwrap();
+        parse_usn_stream(&source, &output).unwrap();
+        let db = rusqlite::Connection::open(&output).unwrap();
+        let mut query = db
+            .prepare(&format!(
+                "SELECT usn, record_offset FROM \"{}\" ORDER BY rowid",
+                USN_TABLE
+            ))
+            .unwrap();
+        let rows = query
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<(String, String)>>>()
+            .unwrap();
+        drop(query);
+        drop(db);
+        rows
+    }
+
+    #[test]
+    fn record_offset_is_absolute_across_window_refills() {
+        let root = tmp_dir("offset-window");
+        // First record at 0, then more than one 4 MiB window of zero padding so
+        // the reader drains the buffer before reaching the second record.
+        let mut data = usn_v2(64, 111, "x", 60, 2);
+        data.resize(data.len() + 4 * 1024 * 1024 + 4096, 0);
+        let second = data.len();
+        data.extend(usn_v2(64, 222, "y", 60, 2));
+        let rows = offsets_of(&root, "J", &data);
+        assert_eq!(
+            rows,
+            vec![
+                ("111".to_string(), "0".to_string()),
+                ("222".to_string(), second.to_string()),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn record_offset_survives_padding_and_skipped_records() {
+        let root = tmp_dir("offset-skip");
+        let mut data = vec![0u8; 16];
+        let first = data.len();
+        data.extend(usn_v2(64, 111, "x", 60, 2));
+        data.extend([0u8; 8]);
+        // Unknown record version — skipped whole, must not shift later offsets.
+        let mut unknown = usn_v2(64, 999, "x", 60, 2);
+        unknown[4..6].copy_from_slice(&9u16.to_le_bytes());
+        data.extend(unknown);
+        let second = data.len();
+        data.extend(usn_v2(64, 222, "y", 60, 2));
+        // Corrupt length — resynchronised in 8-byte steps.
+        data.extend([0xFFu8; 8]);
+        let third = data.len();
+        data.extend(usn_v2(64, 333, "z", 60, 2));
+        let rows = offsets_of(&root, "J", &data);
+        assert_eq!(
+            rows,
+            vec![
+                ("111".to_string(), first.to_string()),
+                ("222".to_string(), second.to_string()),
+                ("333".to_string(), third.to_string()),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn large_usn_and_references_keep_full_precision_with_offsets() {
+        let root = tmp_dir("offset-large");
+        let mut v2 = usn_v2(64, u64::MAX, "x", 60, 2);
+        v2[8..16].copy_from_slice(&u64::MAX.to_le_bytes());
+        v2[16..24].copy_from_slice(&u64::MAX.to_le_bytes());
+        let v3_at = v2.len();
+        let v3 = usn_v3(u64::MAX - 1, u128::MAX, 1u128 << 64, "y");
+        let mut data = v2;
+        data.extend(v3);
+        let source = root.join("J");
+        let output = root.join("usn.sqlite");
+        std::fs::write(&source, &data).unwrap();
+        assert_eq!(parse_usn_stream(&source, &output).unwrap(), 2);
+        let db = rusqlite::Connection::open(&output).unwrap();
+        let mut query = db
+            .prepare(&format!(
+                "SELECT usn, file_reference, parent_file_reference, mft_entry, \
+                 parent_mft_entry, record_version, record_offset FROM \"{}\" ORDER BY rowid",
+                USN_TABLE
+            ))
+            .unwrap();
+        let rows: Vec<(String, String, String, String, String, String, String)> = query
+            .query_map([], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "18446744073709551615".to_string(),
+                    "18446744073709551615".to_string(),
+                    "18446744073709551615".to_string(),
+                    "281474976710655".to_string(),
+                    "281474976710655".to_string(),
+                    "2".to_string(),
+                    "0".to_string(),
+                ),
+                (
+                    "18446744073709551614".to_string(),
+                    "340282366920938463463374607431768211455".to_string(),
+                    "18446744073709551616".to_string(),
+                    "281474976710655".to_string(),
+                    "0".to_string(),
+                    "3".to_string(),
+                    v3_at.to_string(),
+                ),
+            ]
+        );
+        drop(query);
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn offsets_are_independent_per_input() {
+        let root = tmp_dir("offset-inputs");
+        let mut first = vec![0u8; 16];
+        first.extend(usn_v2(64, 111, "x", 60, 2));
+        let second = usn_v2(64, 222, "y", 60, 2);
+        assert_eq!(
+            offsets_of(&root, "J1", &first),
+            vec![("111".to_string(), "16".to_string())]
+        );
+        assert_eq!(
+            offsets_of(&root, "J2", &second),
+            vec![("222".to_string(), "0".to_string())]
+        );
+        let db = rusqlite::Connection::open(root.join("J2.sqlite")).unwrap();
+        let source_file: String = db
+            .query_row(
+                &format!("SELECT _source_file FROM \"{}\"", USN_TABLE),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(source_file, root.join("J2").to_string_lossy());
+        drop(db);
         let _ = std::fs::remove_dir_all(root);
     }
 }

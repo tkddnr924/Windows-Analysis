@@ -2346,6 +2346,47 @@ const FILE_SYSTEM_ENTRIES_CHILDREN: &[ChildSpec] = &[
 
 
 const USN_JOURNAL_DDL: &str = r#"PRAGMA foreign_keys=ON;
+CREATE TABLE "UsnChangeGroups" (
+  "group_id" TEXT NOT NULL,
+  "host_id" TEXT NOT NULL,
+  "dataset_id" TEXT NOT NULL,
+  "input_id" TEXT NOT NULL,
+  "input_name" TEXT,
+  "source_file" TEXT,
+  "source_relative" TEXT,
+  "record_version" INTEGER,
+  "file_reference" TEXT,
+  "file_reference_sort" TEXT,
+  "first_parent_reference" TEXT,
+  "last_parent_reference" TEXT,
+  "first_file_name" TEXT,
+  "last_file_name" TEXT,
+  "distinct_file_name_count" INTEGER,
+  "first_timestamp" TEXT,
+  "last_timestamp" TEXT,
+  "first_usn" TEXT,
+  "first_usn_sort" TEXT,
+  "last_usn" TEXT,
+  "last_usn_sort" TEXT,
+  "first_input_sequence" INTEGER,
+  "last_input_sequence" INTEGER,
+  "member_count" INTEGER,
+  "event_type" TEXT,
+  "reason_union_mask" TEXT,
+  "reason_union" TEXT,
+  "unknown_reason_mask" TEXT,
+  "has_unknown_reason" INTEGER CHECK ("has_unknown_reason" IN (0,1)),
+  "group_scope" TEXT NOT NULL,
+  "grouping_basis" TEXT NOT NULL,
+  "boundary_reason" TEXT,
+  "close_observed" INTEGER CHECK ("close_observed" IN (0,1)),
+  "is_display_summary" INTEGER NOT NULL CHECK ("is_display_summary" = 1),
+  "operation_confirmed" INTEGER NOT NULL CHECK ("operation_confirmed" = 0),
+  PRIMARY KEY(group_id)
+);
+CREATE INDEX "idx_UsnChangeGroups_input" ON "UsnChangeGroups"(input_id, first_input_sequence);
+CREATE INDEX "idx_UsnChangeGroups_reference" ON "UsnChangeGroups"(input_id, record_version, file_reference_sort);
+CREATE INDEX "idx_UsnChangeGroups_time" ON "UsnChangeGroups"(first_timestamp, group_id);
 CREATE TABLE "UsnJournal" (
   "record_id" TEXT NOT NULL,
   "host_id" TEXT NOT NULL,
@@ -2370,12 +2411,127 @@ CREATE TABLE "UsnJournal" (
   "source_info" TEXT,
   "security_id" INTEGER,
   "file_attributes" TEXT,
+  "input_id" TEXT NOT NULL,
+  "input_name" TEXT,
+  "source_file" TEXT,
+  "source_relative" TEXT,
+  "record_offset" TEXT,
+  "input_sequence" INTEGER,
+  "usn_sort" TEXT,
+  "file_reference_sort" TEXT,
+  "parent_reference_sort" TEXT,
+  "group_id" TEXT,
+  "group_ordinal" INTEGER,
+  "rename_role" TEXT,
   PRIMARY KEY(record_id),
   CHECK(overview_name = 'UsnJournal'),
-  CHECK(timestamp IS NULL OR timestamp_kind IS NOT NULL)
+  CHECK(timestamp IS NULL OR timestamp_kind IS NOT NULL),
+  CHECK(group_ordinal IS NULL OR group_ordinal >= 0),
+  CHECK(rename_role IS NULL OR rename_role IN ('old','new','both')),
+  FOREIGN KEY(group_id) REFERENCES "UsnChangeGroups"("group_id") ON DELETE CASCADE
 );
 CREATE INDEX "idx_UsnJournal_time" ON "UsnJournal"(timestamp, record_id);
 CREATE INDEX "idx_UsnJournal_account" ON "UsnJournal"(account_sid, timestamp);
+CREATE INDEX "idx_UsnJournal_input" ON "UsnJournal"(input_id, input_sequence);
+CREATE INDEX "idx_UsnJournal_usn" ON "UsnJournal"(input_id, usn_sort, record_id);
+CREATE INDEX "idx_UsnJournal_reference" ON "UsnJournal"(input_id, record_version, file_reference_sort, usn_sort);
+CREATE INDEX "idx_UsnJournal_group" ON "UsnJournal"(group_id, group_ordinal);
+CREATE INDEX "idx_UsnJournal_name" ON "UsnJournal"(file_name COLLATE NOCASE, timestamp);
+CREATE INDEX "idx_UsnJournal_rename" ON "UsnJournal"(input_id, record_version, file_reference, usn_sort) WHERE rename_role IS NOT NULL;
+CREATE TABLE "UsnGroupMembers" (
+  "group_id" TEXT NOT NULL,
+  "ordinal" INTEGER NOT NULL,
+  "record_id" TEXT NOT NULL,
+  "input_id" TEXT NOT NULL,
+  "input_sequence" INTEGER,
+  "record_offset" TEXT,
+  "timestamp" TEXT,
+  "file_name" TEXT,
+  "event_type" TEXT,
+  "reason" TEXT,
+  "reason_mask" TEXT,
+  "usn" TEXT,
+  "usn_sort" TEXT,
+  PRIMARY KEY(group_id, ordinal),
+  CHECK(ordinal >= 0),
+  FOREIGN KEY(group_id) REFERENCES "UsnChangeGroups"("group_id") ON DELETE CASCADE,
+  FOREIGN KEY(record_id) REFERENCES "UsnJournal"("record_id") ON DELETE CASCADE
+);
+CREATE UNIQUE INDEX "idx_UsnGroupMembers_record" ON "UsnGroupMembers"(record_id);
+CREATE INDEX "idx_UsnGroupMembers_name" ON "UsnGroupMembers"(file_name COLLATE NOCASE, group_id);
+CREATE TABLE "UsnReasonFlags" (
+  "record_id" TEXT NOT NULL,
+  "ordinal" INTEGER NOT NULL,
+  "group_id" TEXT NOT NULL,
+  "reason_flag" TEXT NOT NULL,
+  "flag_bit" TEXT NOT NULL,
+  "is_unknown" INTEGER NOT NULL CHECK ("is_unknown" IN (0,1)),
+  PRIMARY KEY(record_id, ordinal),
+  CHECK(ordinal >= 0),
+  FOREIGN KEY(record_id) REFERENCES "UsnJournal"("record_id") ON DELETE CASCADE,
+  FOREIGN KEY(group_id) REFERENCES "UsnChangeGroups"("group_id") ON DELETE CASCADE
+);
+CREATE INDEX "idx_UsnReasonFlags_flag" ON "UsnReasonFlags"(reason_flag, group_id);
+CREATE INDEX "idx_UsnReasonFlags_group" ON "UsnReasonFlags"(group_id, reason_flag);
+CREATE TABLE "UsnRenameEvents" (
+  "rename_id" TEXT NOT NULL,
+  "host_id" TEXT NOT NULL,
+  "dataset_id" TEXT NOT NULL,
+  "input_id" TEXT NOT NULL,
+  "input_name" TEXT,
+  "record_version" INTEGER,
+  "file_reference" TEXT,
+  "file_reference_sort" TEXT,
+  "status" TEXT NOT NULL,
+  "ambiguity_reason" TEXT,
+  "matching_basis" TEXT NOT NULL,
+  "old_record_id" TEXT,
+  "new_record_id" TEXT,
+  "old_group_id" TEXT,
+  "new_group_id" TEXT,
+  "old_file_name" TEXT,
+  "new_file_name" TEXT,
+  "old_usn" TEXT,
+  "old_usn_sort" TEXT,
+  "new_usn" TEXT,
+  "new_usn_sort" TEXT,
+  "old_timestamp" TEXT,
+  "new_timestamp" TEXT,
+  "old_candidate_count" INTEGER NOT NULL,
+  "new_candidate_count" INTEGER NOT NULL,
+  PRIMARY KEY(rename_id),
+  CHECK(status IN ('paired','missing_old','missing_new','ambiguous')),
+  CHECK(status <> 'paired' OR (old_record_id IS NOT NULL AND new_record_id IS NOT NULL)),
+  FOREIGN KEY(old_record_id) REFERENCES "UsnJournal"("record_id") ON DELETE CASCADE,
+  FOREIGN KEY(new_record_id) REFERENCES "UsnJournal"("record_id") ON DELETE CASCADE,
+  FOREIGN KEY(old_group_id) REFERENCES "UsnChangeGroups"("group_id") ON DELETE CASCADE,
+  FOREIGN KEY(new_group_id) REFERENCES "UsnChangeGroups"("group_id") ON DELETE CASCADE
+);
+CREATE INDEX "idx_UsnRenameEvents_reference" ON "UsnRenameEvents"(input_id, record_version, file_reference);
+CREATE INDEX "idx_UsnRenameEvents_status" ON "UsnRenameEvents"(status, input_id);
+CREATE INDEX "idx_UsnRenameEvents_new_name" ON "UsnRenameEvents"(new_file_name COLLATE NOCASE);
+CREATE INDEX "idx_UsnRenameEvents_old_name" ON "UsnRenameEvents"(old_file_name COLLATE NOCASE);
+CREATE TABLE "UsnRenameCandidates" (
+  "rename_id" TEXT NOT NULL,
+  "ordinal" INTEGER NOT NULL,
+  "record_id" TEXT NOT NULL,
+  "group_id" TEXT NOT NULL,
+  "role" TEXT NOT NULL,
+  "file_name" TEXT,
+  "usn" TEXT,
+  "usn_sort" TEXT,
+  "timestamp" TEXT,
+  "record_offset" TEXT,
+  "input_sequence" INTEGER,
+  "reason_mask" TEXT,
+  PRIMARY KEY(rename_id, ordinal),
+  CHECK(ordinal >= 0),
+  CHECK(role IN ('old','new','both')),
+  FOREIGN KEY(rename_id) REFERENCES "UsnRenameEvents"("rename_id") ON DELETE CASCADE,
+  FOREIGN KEY(record_id) REFERENCES "UsnJournal"("record_id") ON DELETE CASCADE,
+  FOREIGN KEY(group_id) REFERENCES "UsnChangeGroups"("group_id") ON DELETE CASCADE
+);
+CREATE INDEX "idx_UsnRenameCandidates_record" ON "UsnRenameCandidates"(record_id);
 CREATE TABLE "source_records" (
   "record_id" TEXT NOT NULL,
   "ordinal" INTEGER NOT NULL,
@@ -2396,6 +2552,7 @@ CREATE INDEX idx_source_lookup ON source_records(source_db, source_table, source
 
 CREATE TABLE _wina_derived_version (name TEXT NOT NULL PRIMARY KEY, version INTEGER NOT NULL);
 INSERT INTO _wina_derived_version(name,version) VALUES ('overview_contract',1);
+INSERT INTO _wina_derived_version(name,version) VALUES ('usn_journal',2);
 "#;
 
 const USN_JOURNAL_COLUMNS: &[&str] = &[
@@ -2422,6 +2579,18 @@ const USN_JOURNAL_COLUMNS: &[&str] = &[
     "source_info",
     "security_id",
     "file_attributes",
+    "input_id",
+    "input_name",
+    "source_file",
+    "source_relative",
+    "record_offset",
+    "input_sequence",
+    "usn_sort",
+    "file_reference_sort",
+    "parent_reference_sort",
+    "group_id",
+    "group_ordinal",
+    "rename_role",
 ];
 
 const USN_JOURNAL_SOURCE_RECORDS_COLUMNS: &[&str] = &[
@@ -2438,8 +2607,119 @@ const USN_JOURNAL_SOURCE_RECORDS_COLUMNS: &[&str] = &[
     "source_label",
 ];
 
+pub const USN_CHANGE_GROUPS_COLUMNS: &[&str] = &[
+    "group_id",
+    "host_id",
+    "dataset_id",
+    "input_id",
+    "input_name",
+    "source_file",
+    "source_relative",
+    "record_version",
+    "file_reference",
+    "file_reference_sort",
+    "first_parent_reference",
+    "last_parent_reference",
+    "first_file_name",
+    "last_file_name",
+    "distinct_file_name_count",
+    "first_timestamp",
+    "last_timestamp",
+    "first_usn",
+    "first_usn_sort",
+    "last_usn",
+    "last_usn_sort",
+    "first_input_sequence",
+    "last_input_sequence",
+    "member_count",
+    "event_type",
+    "reason_union_mask",
+    "reason_union",
+    "unknown_reason_mask",
+    "has_unknown_reason",
+    "group_scope",
+    "grouping_basis",
+    "boundary_reason",
+    "close_observed",
+    "is_display_summary",
+    "operation_confirmed",
+];
+
+pub const USN_GROUP_MEMBERS_COLUMNS: &[&str] = &[
+    "group_id",
+    "ordinal",
+    "record_id",
+    "input_id",
+    "input_sequence",
+    "record_offset",
+    "timestamp",
+    "file_name",
+    "event_type",
+    "reason",
+    "reason_mask",
+    "usn",
+    "usn_sort",
+];
+
+pub const USN_REASON_FLAGS_COLUMNS: &[&str] = &[
+    "record_id",
+    "ordinal",
+    "group_id",
+    "reason_flag",
+    "flag_bit",
+    "is_unknown",
+];
+
+pub const USN_RENAME_EVENTS_COLUMNS: &[&str] = &[
+    "rename_id",
+    "host_id",
+    "dataset_id",
+    "input_id",
+    "input_name",
+    "record_version",
+    "file_reference",
+    "file_reference_sort",
+    "status",
+    "ambiguity_reason",
+    "matching_basis",
+    "old_record_id",
+    "new_record_id",
+    "old_group_id",
+    "new_group_id",
+    "old_file_name",
+    "new_file_name",
+    "old_usn",
+    "old_usn_sort",
+    "new_usn",
+    "new_usn_sort",
+    "old_timestamp",
+    "new_timestamp",
+    "old_candidate_count",
+    "new_candidate_count",
+];
+
+pub const USN_RENAME_CANDIDATES_COLUMNS: &[&str] = &[
+    "rename_id",
+    "ordinal",
+    "record_id",
+    "group_id",
+    "role",
+    "file_name",
+    "usn",
+    "usn_sort",
+    "timestamp",
+    "record_offset",
+    "input_sequence",
+    "reason_mask",
+];
+
 const USN_JOURNAL_CHILDREN: &[ChildSpec] = &[
     ChildSpec { table: "source_records", columns: USN_JOURNAL_SOURCE_RECORDS_COLUMNS },
+    ChildSpec { table: "UsnChangeGroups", columns: USN_CHANGE_GROUPS_COLUMNS },
+    ChildSpec { table: "UsnGroupMembers", columns: USN_GROUP_MEMBERS_COLUMNS },
+    ChildSpec { table: "UsnReasonFlags", columns: USN_REASON_FLAGS_COLUMNS },
+    ChildSpec { table: "UsnRenameEvents", columns: USN_RENAME_EVENTS_COLUMNS },
+    ChildSpec { table: "UsnRenameCandidates", columns: USN_RENAME_CANDIDATES_COLUMNS },
 ];
 
 

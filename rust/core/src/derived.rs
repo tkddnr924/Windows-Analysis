@@ -12,6 +12,7 @@ pub mod schema;
 
 mod builders;
 mod stream;
+mod usn;
 mod path_candidates;
 
 /// Materialize direct evidence before deriving rows that reference it.
@@ -1241,78 +1242,455 @@ mod tests {
         let _ = std::fs::remove_dir_all(out_dir.parent().unwrap());
     }
 
+    const USN_DDL: &str = "CREATE TABLE UsnJrnl_Records (timestamp TEXT, filename TEXT, \
+         reason TEXT, file_attributes TEXT, mft_entry TEXT, parent_mft_entry TEXT, usn TEXT, \
+         source_info TEXT, security_id TEXT, file_reference TEXT, parent_file_reference TEXT, \
+         reason_mask TEXT, record_version TEXT, file_attributes_mask TEXT, _source_file TEXT, \
+         record_offset TEXT);";
+
+    struct UsnRow<'a> {
+        timestamp: &'a str,
+        name: &'a str,
+        reason: &'a str,
+        usn: &'a str,
+        reference: &'a str,
+        mask: &'a str,
+        version: &'a str,
+        security: &'a str,
+        offset: &'a str,
+    }
+
+    impl UsnRow<'_> {
+        fn new<'a>(timestamp: &'a str, name: &'a str, reason: &'a str, usn: &'a str, reference: &'a str, mask: &'a str) -> UsnRow<'a> {
+            UsnRow { timestamp, name, reason, usn, reference, mask, version: "2", security: "264", offset: "0" }
+        }
+
+        fn sql(&self, source: &str) -> String {
+            format!(
+                "INSERT INTO UsnJrnl_Records VALUES ('{}','{}','{}','ARCHIVE','5','7','{}','0','{}',\
+                 '{}','281474976710661','{}','{}','32','{}','{}');",
+                self.timestamp, self.name, self.reason, self.usn, self.security, self.reference,
+                self.mask, self.version, source, self.offset
+            )
+        }
+    }
+
+    fn usn_facts(out_dir: &Path, relative: &str, source: &str, rows: &[UsnRow<'_>]) {
+        let mut sql = String::from(USN_DDL);
+        for row in rows {
+            sql.push_str(&row.sql(source));
+        }
+        facts_db(out_dir, relative, &sql);
+    }
+
+    fn scalar<T: rusqlite::types::FromSql>(conn: &Connection, sql: &str) -> T {
+        conn.query_row(sql, [], |row| row.get(0)).unwrap()
+    }
+
+    fn strings(conn: &Connection, sql: &str) -> Vec<String> {
+        let mut stmt = conn.prepare(sql).unwrap();
+        let rows = stmt
+            .query_map([], |row| row.get::<_, Option<String>>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        rows.into_iter().map(|value| value.unwrap_or_default()).collect()
+    }
+
+    fn assert_usn_integrity(conn: &Connection) {
+        let violations: i64 = scalar(conn, "SELECT count(*) FROM pragma_foreign_key_check");
+        assert_eq!(violations, 0, "외래 키 위반");
+        let records: i64 = scalar(conn, "SELECT count(*) FROM UsnJournal");
+        let members: i64 = scalar(conn, "SELECT count(*) FROM UsnGroupMembers");
+        assert_eq!(records, members, "모든 원문 기록은 정확히 하나의 묶음 구성원이다");
+        let unlinked: i64 = scalar(conn, "SELECT count(*) FROM UsnJournal WHERE group_id IS NULL");
+        assert_eq!(unlinked, 0);
+        let summary: i64 = scalar(
+            conn,
+            "SELECT count(*) FROM UsnChangeGroups WHERE is_display_summary=1 AND operation_confirmed=0",
+        );
+        let groups: i64 = scalar(conn, "SELECT count(*) FROM UsnChangeGroups");
+        assert_eq!(summary, groups, "묶음은 표시 요약이며 확정된 작업이 아니다");
+    }
+
     #[test]
-    fn usn_journal_streams_every_input_and_keeps_external_fields_null() {
-        let (out_dir, target) = fixture("usn");
-        let usn_ddl = "CREATE TABLE UsnJrnl_Records (timestamp TEXT, filename TEXT, reason TEXT, \
-             file_attributes TEXT, mft_entry TEXT, parent_mft_entry TEXT, usn TEXT, \
-             source_info TEXT, security_id TEXT, file_reference TEXT, \
-             parent_file_reference TEXT, reason_mask TEXT, record_version TEXT, file_attributes_mask TEXT, _source_file TEXT);";
-        facts_db(
+    fn usn_separates_inputs_with_identical_reference_and_time() {
+        let (out_dir, target) = fixture("usn-inputs");
+        let reference = "281474976710700";
+        usn_facts(
             &out_dir,
             "FILESYSTEM/UsnJrnl_Records.sqlite",
-            &format!(
-                "{usn_ddl} INSERT INTO UsnJrnl_Records VALUES ('2026-02-03 10:11:12.000','a.txt',\
-                 'FILE_DELETE|CLOSE','ARCHIVE','42','5','18446744073709551615','0','264',\
-                 '281474976710700','281474976710661','2147484160','2','32','C:\\$Extend\\$UsnJrnl');"
-            ),
+            "C:\\$Extend\\$UsnJrnl",
+            &[UsnRow {
+                offset: "4096",
+                ..UsnRow::new("2026-02-03 10:11:12.000", "a.txt", "FILE_DELETE|CLOSE", "18446744073709551615", reference, "2147484160")
+            }],
         );
-        facts_db(
+        usn_facts(
             &out_dir,
             "FILESYSTEM/UsnJrnl_Records_2.sqlite",
-            &format!(
-                "{usn_ddl} INSERT INTO UsnJrnl_Records VALUES ('2026-02-04 10:11:12.000','b.txt',\
-                 'FILE_CREATE','ARCHIVE','43','5','9','0','264','1','2','256','3','32','D:\\$Extend\\$UsnJrnl');"
-            ),
+            "D:\\$Extend\\$UsnJrnl",
+            &[UsnRow {
+                offset: "8192",
+                ..UsnRow::new("2026-02-03 10:11:12.000", "b.txt", "FILE_DELETE|CLOSE", "18446744073709551615", reference, "2147484160")
+            }],
         );
         let report = build_all(&out_dir, &target, "host-1", "ds-1").unwrap();
-        assert_eq!(
-            report.iter().find(|(name, _)| name == "UsnJournal").unwrap().1,
-            2,
-            "모든 $J 입력을 흘려 넣는다"
-        );
+        assert_eq!(report.iter().find(|(name, _)| name == "UsnJournal").unwrap().1, 2);
         let conn = open(&out_dir, "UsnJournal");
-        let (event_type, usn, reference, security, path, volume, journal, mask, version): (
-            String,
-            String,
-            String,
-            i64,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<i64>,
+        assert_usn_integrity(&conn);
+        assert_eq!(scalar::<i64>(&conn, "SELECT count(DISTINCT input_id) FROM UsnJournal"), 2);
+        assert_eq!(
+            scalar::<i64>(&conn, "SELECT count(DISTINCT group_id) FROM UsnJournal"),
+            2,
+            "같은 참조·시각이어도 다른 입력을 합치지 않는다"
+        );
+        let (event_type, usn, security, path, volume, journal, mask, version, offset, sort): (
+            String, String, i64, Option<String>, Option<String>, Option<String>, String, i64, String, String,
         ) = conn
             .query_row(
-                "SELECT event_type, usn, file_reference, security_id, path, volume_id, \
-                 journal_id, reason_mask, record_version FROM UsnJournal WHERE file_name='a.txt'",
+                "SELECT event_type, usn, security_id, path, volume_id, journal_id, reason_mask, \
+                 record_version, record_offset, usn_sort FROM UsnJournal WHERE file_name='a.txt'",
                 [],
                 |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                        row.get(6)?,
-                        row.get(7)?,
-                        row.get(8)?,
-                    ))
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?,
+                        row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?))
                 },
             )
             .unwrap();
         assert_eq!(event_type, "삭제");
         assert_eq!(usn, "18446744073709551615");
-        assert_eq!(reference, "281474976710700");
         assert_eq!(security, 264);
-        assert_eq!((path, volume, journal), (None, None, None));
-        assert_eq!(mask.as_deref(), Some("2147484160"));
-        assert_eq!(version, Some(2));
-        let sources: i64 = conn
-            .query_row("SELECT count(*) FROM source_records", [], |row| row.get(0))
+        assert_eq!((path, volume, journal), (None, None, None), "$J만으로 경로·볼륨·저널을 확정하지 않는다");
+        assert_eq!(mask, "2147484160");
+        assert_eq!(version, 2);
+        assert_eq!(offset, "4096", "원본 오프셋을 보존한다");
+        assert_eq!(sort, "2018446744073709551615");
+        let names = strings(&conn, "SELECT input_name FROM UsnJournal ORDER BY file_name");
+        assert_eq!(names, vec!["$UsnJrnl".to_string(), "$UsnJrnl".to_string()]);
+        let sources: Vec<String> = strings(
+            &conn,
+            "SELECT source_db || '#' || source_table || '#' || source_rowid || '#' || source_dataset_id \
+             FROM source_records ORDER BY source_db",
+        );
+        assert_eq!(
+            sources,
+            vec![
+                "FILESYSTEM/UsnJrnl_Records.sqlite#UsnJrnl_Records#1#facts-gen-1".to_string(),
+                "FILESYSTEM/UsnJrnl_Records_2.sqlite#UsnJrnl_Records#1#facts-gen-1".to_string(),
+            ]
+        );
+        let version: i64 = scalar(
+            &conn,
+            "SELECT version FROM _wina_derived_version WHERE name='usn_journal'",
+        );
+        assert_eq!(version, 2);
+        let _ = std::fs::remove_dir_all(out_dir.parent().unwrap());
+    }
+
+    #[test]
+    fn usn_group_keeps_each_raw_mask_and_stores_the_union_separately() {
+        let (out_dir, target) = fixture("usn-group");
+        let reference = "281474976710700";
+        usn_facts(
+            &out_dir,
+            "FILESYSTEM/UsnJrnl_Records.sqlite",
+            "C:\\$Extend\\$UsnJrnl",
+            &[
+                UsnRow::new("2026-02-03 10:11:12.000", "a.txt", "DATA_EXTEND", "10", reference, "2"),
+                // 0x08000000 is not a documented reason bit in this build.
+                UsnRow::new("2026-02-03 10:11:12.100", "a.txt", "DATA_OVERWRITE|DATA_EXTEND", "20", reference, "134217731"),
+                UsnRow::new("2026-02-03 10:11:12.200", "a.txt", "DATA_OVERWRITE|DATA_EXTEND|CLOSE", "30", reference, "2147483651"),
+            ],
+        );
+        build_all(&out_dir, &target, "host-1", "ds-1").unwrap();
+        let conn = open(&out_dir, "UsnJournal");
+        assert_usn_integrity(&conn);
+        assert_eq!(scalar::<i64>(&conn, "SELECT count(*) FROM UsnChangeGroups"), 1);
+        let (members, union_mask, union_names, unknown, has_unknown, boundary, closed): (
+            i64, String, String, String, i64, String, i64,
+        ) = conn
+            .query_row(
+                "SELECT member_count, reason_union_mask, reason_union, unknown_reason_mask, \
+                 has_unknown_reason, boundary_reason, close_observed FROM UsnChangeGroups",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
+            )
             .unwrap();
-        assert_eq!(sources, 2);
+        assert_eq!(members, 3);
+        assert_eq!(union_mask, (0x8000_0003u64 | 0x0800_0000).to_string());
+        assert_eq!(union_names, "DATA_OVERWRITE|DATA_EXTEND|UNKNOWN_0x08000000|CLOSE");
+        assert_eq!(unknown, "134217728", "알 수 없는 비트를 버리지 않는다");
+        assert_eq!(has_unknown, 1);
+        assert_eq!((boundary.as_str(), closed), ("close_flag", 1));
+        let masks = strings(&conn, "SELECT reason_mask FROM UsnJournal ORDER BY usn_sort");
+        assert_eq!(masks, vec!["2", "134217731", "2147483651"], "원문 마스크는 합친 마스크로 대체되지 않는다");
+        let member_usns = strings(&conn, "SELECT usn FROM UsnGroupMembers ORDER BY ordinal");
+        assert_eq!(member_usns, vec!["10", "20", "30"]);
+        // Full-reason search selects the group; representative event_type stays separate.
+        let matched: i64 = scalar(
+            &conn,
+            "SELECT count(*) FROM UsnChangeGroups g WHERE EXISTS(SELECT 1 FROM UsnReasonFlags f \
+             WHERE f.group_id=g.group_id AND f.reason_flag='DATA_OVERWRITE')",
+        );
+        assert_eq!(matched, 1);
+        let unknown_flag: i64 = scalar(
+            &conn,
+            "SELECT count(*) FROM UsnReasonFlags WHERE reason_flag='UNKNOWN_0x08000000' AND is_unknown=1",
+        );
+        assert_eq!(unknown_flag, 1);
+        let first_row_flags = strings(
+            &conn,
+            "SELECT f.reason_flag FROM UsnReasonFlags f JOIN UsnJournal j ON j.record_id=f.record_id \
+             WHERE j.usn='10' ORDER BY f.ordinal",
+        );
+        assert_eq!(first_row_flags, vec!["DATA_EXTEND"]);
+        let _ = std::fs::remove_dir_all(out_dir.parent().unwrap());
+    }
+
+    #[test]
+    fn usn_pairs_two_rename_cycles_and_keeps_the_old_name_in_the_group() {
+        let (out_dir, target) = fixture("usn-rename");
+        let reference = "19703248369790624";
+        usn_facts(
+            &out_dir,
+            "FILESYSTEM/UsnJrnl_Records.sqlite",
+            "C:\\$Extend\\$UsnJrnl",
+            &[
+                UsnRow::new("2026-02-03 10:11:12.000", "tmp.dat", "FILE_CREATE", "100", reference, "256"),
+                UsnRow::new("2026-02-03 10:11:12.100", "tmp.dat", "FILE_CREATE|CLOSE", "110", reference, "2147483904"),
+                UsnRow::new("2026-02-03 10:11:13.000", "tmp.dat", "RENAME_OLD_NAME", "120", reference, "4096"),
+                UsnRow::new("2026-02-03 10:11:13.100", "final.dat", "RENAME_NEW_NAME", "130", reference, "8192"),
+                // The trailing CLOSE repeats the accumulated NEW flag.
+                UsnRow::new("2026-02-03 10:11:13.200", "final.dat", "RENAME_NEW_NAME|CLOSE", "140", reference, "2147491840"),
+                UsnRow::new("2026-02-03 10:11:14.000", "final.dat", "RENAME_OLD_NAME", "150", reference, "4096"),
+                UsnRow::new("2026-02-03 10:11:14.100", "final.dat~RF.TMP", "RENAME_NEW_NAME", "160", reference, "8192"),
+                UsnRow::new("2026-02-03 10:11:14.200", "final.dat~RF.TMP", "RENAME_NEW_NAME|CLOSE", "170", reference, "2147491840"),
+            ],
+        );
+        build_all(&out_dir, &target, "host-1", "ds-1").unwrap();
+        let conn = open(&out_dir, "UsnJournal");
+        assert_usn_integrity(&conn);
+        assert_eq!(scalar::<i64>(&conn, "SELECT count(*) FROM UsnChangeGroups"), 3);
+        let pairs = strings(
+            &conn,
+            "SELECT status || '#' || old_file_name || '>' || new_file_name || '#' || old_usn || '>' || new_usn \
+             || '#' || old_candidate_count || '/' || new_candidate_count FROM UsnRenameEvents ORDER BY old_usn_sort",
+        );
+        assert_eq!(
+            pairs,
+            vec![
+                "paired#tmp.dat>final.dat#120>130#1/2".to_string(),
+                "paired#final.dat>final.dat~RF.TMP#150>160#1/2".to_string(),
+            ],
+            "연속된 두 이름 변경은 두 건으로 남는다"
+        );
+        assert_eq!(
+            scalar::<i64>(&conn, "SELECT count(*) FROM UsnRenameCandidates"),
+            6,
+            "반복된 NEW 기록도 근거로 보존한다"
+        );
+        // Searching the second cycle's new name must still expose the old name.
+        let group: String = scalar(
+            &conn,
+            "SELECT g.group_id FROM UsnChangeGroups g WHERE EXISTS(SELECT 1 FROM UsnGroupMembers m \
+             WHERE m.group_id=g.group_id AND m.file_name='final.dat~RF.TMP')",
+        );
+        let names = strings(
+            &conn,
+            &format!("SELECT file_name FROM UsnGroupMembers WHERE group_id='{group}' ORDER BY ordinal"),
+        );
+        assert_eq!(names, vec!["final.dat", "final.dat~RF.TMP", "final.dat~RF.TMP"]);
+        let distinct: i64 = scalar(
+            &conn,
+            &format!("SELECT distinct_file_name_count FROM UsnChangeGroups WHERE group_id='{group}'"),
+        );
+        assert_eq!(distinct, 2);
+        let _ = std::fs::remove_dir_all(out_dir.parent().unwrap());
+    }
+
+    #[test]
+    fn usn_rename_preserves_name_whitespace_in_every_projection() {
+        let (out_dir, target) = fixture("usn-name-whitespace");
+        usn_facts(&out_dir, "FILESYSTEM/UsnJrnl_Records.sqlite", "C:\\$J", &[
+            UsnRow::new("", " old ", "RENAME_OLD_NAME", "10", "111", "4096"),
+            UsnRow::new("", " new ", "RENAME_NEW_NAME|CLOSE", "20", "111", "2147491840"),
+        ]);
+        build_all(&out_dir, &target, "host-1", "ds-1").unwrap();
+        let conn = open(&out_dir, "UsnJournal");
+        for sql in [
+            "SELECT file_name FROM UsnGroupMembers ORDER BY ordinal",
+            "SELECT file_name FROM UsnRenameCandidates ORDER BY ordinal",
+            "SELECT old_file_name FROM UsnRenameEvents UNION ALL SELECT new_file_name FROM UsnRenameEvents",
+            "SELECT first_file_name FROM UsnChangeGroups UNION ALL SELECT last_file_name FROM UsnChangeGroups",
+        ] {
+            assert_eq!(strings(&conn, sql), vec![" old ", " new "], "{sql}");
+        }
+        let _ = std::fs::remove_dir_all(out_dir.parent().unwrap());
+    }
+
+    #[test]
+    fn usn_rename_conflicting_parent_references_stay_ambiguous() {
+        let (out_dir, target) = fixture("usn-rename-parent");
+        usn_facts(&out_dir, "FILESYSTEM/UsnJrnl_Records.sqlite", "C:\\$J", &[
+            UsnRow::new("", "old", "RENAME_OLD_NAME", "10", "111", "4096"),
+            UsnRow::new("", "new", "RENAME_NEW_NAME", "20", "111", "8192"),
+            UsnRow::new("", "new", "RENAME_NEW_NAME|CLOSE", "30", "111", "2147491840"),
+        ]);
+        let facts = Connection::open(out_dir.join("FILESYSTEM/UsnJrnl_Records.sqlite")).unwrap();
+        facts.execute("UPDATE UsnJrnl_Records SET parent_file_reference='281474976710662' WHERE usn='30'", []).unwrap();
+        drop(facts);
+        build_all(&out_dir, &target, "host-1", "ds-1").unwrap();
+        let conn = open(&out_dir, "UsnJournal");
+        assert_eq!(strings(&conn, "SELECT status || '#' || ambiguity_reason FROM UsnRenameEvents"),
+            vec!["ambiguous#multiple_new_parents"]);
+        assert_eq!(scalar::<i64>(&conn, "SELECT count(*) FROM UsnRenameCandidates"), 3);
+        assert_usn_integrity(&conn);
+        let _ = std::fs::remove_dir_all(out_dir.parent().unwrap());
+    }
+
+    #[test]
+    fn usn_rename_without_a_confirmed_pair_stays_unmatched_or_ambiguous() {
+        let (out_dir, target) = fixture("usn-rename-gap");
+        usn_facts(
+            &out_dir,
+            "FILESYSTEM/UsnJrnl_Records.sqlite",
+            "C:\\$Extend\\$UsnJrnl",
+            &[
+                UsnRow::new("2026-02-03 10:11:12.000", "only-old.dat", "RENAME_OLD_NAME|CLOSE", "10", "111", "2147487744"),
+                UsnRow::new("2026-02-03 10:11:13.000", "only-new.dat", "RENAME_NEW_NAME|CLOSE", "20", "222", "2147491840"),
+                UsnRow::new("2026-02-03 10:11:14.000", "x.dat", "RENAME_OLD_NAME", "30", "333", "4096"),
+                UsnRow::new("2026-02-03 10:11:14.100", "y.dat", "RENAME_OLD_NAME", "40", "333", "4096"),
+                UsnRow::new("2026-02-03 10:11:14.200", "z.dat", "RENAME_NEW_NAME|CLOSE", "50", "333", "2147491840"),
+            ],
+        );
+        build_all(&out_dir, &target, "host-1", "ds-1").unwrap();
+        let conn = open(&out_dir, "UsnJournal");
+        assert_usn_integrity(&conn);
+        let events = strings(
+            &conn,
+            "SELECT file_reference || '#' || status || '#' || ifnull(ambiguity_reason,'-') || '#' \
+             || ifnull(old_record_id,'-') FROM UsnRenameEvents ORDER BY file_reference",
+        );
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0], "111#missing_new#-#".to_string() + &scalar::<String>(&conn, "SELECT record_id FROM UsnJournal WHERE file_name='only-old.dat'"));
+        assert_eq!(events[1], "222#missing_old#-#-");
+        assert!(events[2].starts_with("333#ambiguous#multiple_old_names#-"), "실제: {}", events[2]);
+        let candidates: i64 = scalar(
+            &conn,
+            "SELECT count(*) FROM UsnRenameCandidates c JOIN UsnRenameEvents e ON e.rename_id=c.rename_id \
+             WHERE e.file_reference='333'",
+        );
+        assert_eq!(candidates, 3, "모호해도 모든 후보를 남긴다");
+        assert_eq!(scalar::<i64>(&conn, "SELECT count(*) FROM UsnRenameEvents WHERE status='paired'"), 0);
+        let _ = std::fs::remove_dir_all(out_dir.parent().unwrap());
+    }
+
+    #[test]
+    fn usn_never_merges_interleaved_or_unordered_records() {
+        let (out_dir, target) = fixture("usn-interleaved");
+        usn_facts(
+            &out_dir,
+            "FILESYSTEM/UsnJrnl_Records.sqlite",
+            "C:\\$Extend\\$UsnJrnl",
+            &[
+                UsnRow::new("2026-02-03 10:11:12.000", "a.txt", "DATA_EXTEND", "10", "111", "2"),
+                UsnRow::new("2026-02-03 10:11:12.000", "b.txt", "DATA_EXTEND", "11", "222", "2"),
+                // Same USN as the first record: order is not established.
+                UsnRow::new("2026-02-03 10:11:12.000", "a.txt", "DATA_EXTEND", "10", "111", "2"),
+                UsnRow::new("2026-02-03 10:11:12.000", "b.txt", "DATA_EXTEND|CLOSE", "12", "222", "2147483650"),
+            ],
+        );
+        build_all(&out_dir, &target, "host-1", "ds-1").unwrap();
+        let conn = open(&out_dir, "UsnJournal");
+        assert_usn_integrity(&conn);
+        let groups = strings(
+            &conn,
+            "SELECT file_reference || '#' || member_count || '#' || boundary_reason FROM UsnChangeGroups \
+             ORDER BY file_reference, first_usn_sort, first_input_sequence",
+        );
+        assert_eq!(
+            groups,
+            vec!["111#1#usn_order", "111#1#reference_end", "222#2#close_flag"],
+            "같은 시각이어도 다른 참조나 순서 미확정을 합치지 않는다"
+        );
+        let crossing: i64 = scalar(
+            &conn,
+            "SELECT count(*) FROM (SELECT group_id FROM UsnJournal GROUP BY group_id \
+             HAVING count(DISTINCT file_reference) > 1)",
+        );
+        assert_eq!(crossing, 0);
+        let _ = std::fs::remove_dir_all(out_dir.parent().unwrap());
+    }
+
+    #[test]
+    fn usn_keeps_zero_unknown_and_values_beyond_the_signed_range() {
+        let (out_dir, target) = fixture("usn-range");
+        usn_facts(
+            &out_dir,
+            "FILESYSTEM/UsnJrnl_Records.sqlite",
+            "C:\\$Extend\\$UsnJrnl",
+            &[
+                UsnRow { security: "0", ..UsnRow::new("2026-02-03 10:11:12.000", "zero.txt", "", "0", "281474976710700", "0") },
+                UsnRow { security: "", version: "3", ..UsnRow::new("2026-02-03 10:11:13.000", "unknown.txt", "", "", "", "") },
+                UsnRow { version: "3", ..UsnRow::new("2026-02-03 10:11:14.000", "huge.txt", "FILE_CREATE|CLOSE", "18446744073709551615", "340282366920938463463374607431768211455", "2147483904") },
+            ],
+        );
+        build_all(&out_dir, &target, "host-1", "ds-1").unwrap();
+        let conn = open(&out_dir, "UsnJournal");
+        assert_usn_integrity(&conn);
+        let (zero_usn, zero_sort, zero_security): (String, String, i64) = conn
+            .query_row("SELECT usn, usn_sort, security_id FROM UsnJournal WHERE file_name='zero.txt'", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap();
+        assert_eq!((zero_usn.as_str(), zero_sort.as_str(), zero_security), ("0", "010", 0));
+        let (usn, sort, reference, security): (Option<String>, Option<String>, Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT usn, usn_sort, file_reference, security_id FROM UsnJournal WHERE file_name='unknown.txt'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!((usn, sort, reference, security), (None, None, None, None), "미확인 값을 0으로 바꾸지 않는다");
+        let ordered = strings(
+            &conn,
+            "SELECT file_name FROM UsnJournal WHERE usn_sort IS NOT NULL ORDER BY usn_sort",
+        );
+        assert_eq!(ordered, vec!["zero.txt", "huge.txt"], "64비트를 넘는 USN도 정렬이 유지된다");
+        let reference_sort: String = scalar(
+            &conn,
+            "SELECT file_reference_sort FROM UsnJournal WHERE file_name='huge.txt'",
+        );
+        assert_eq!(reference_sort, "39340282366920938463463374607431768211455");
+        let boundary: String = scalar(
+            &conn,
+            "SELECT g.boundary_reason FROM UsnChangeGroups g JOIN UsnJournal j ON j.group_id=g.group_id \
+             WHERE j.file_name='unknown.txt'",
+        );
+        assert_eq!(boundary, "file_reference_missing");
+        let _ = std::fs::remove_dir_all(out_dir.parent().unwrap());
+    }
+
+    #[test]
+    fn usn_facts_without_record_offset_require_reparsing() {
+        let (out_dir, target) = fixture("usn-legacy");
+        facts_db(
+            &out_dir,
+            "FILESYSTEM/UsnJrnl_Records.sqlite",
+            "CREATE TABLE UsnJrnl_Records (timestamp TEXT, filename TEXT, reason TEXT, \
+             file_attributes TEXT, mft_entry TEXT, parent_mft_entry TEXT, usn TEXT, source_info TEXT, \
+             security_id TEXT, file_reference TEXT, parent_file_reference TEXT, reason_mask TEXT, \
+             record_version TEXT, file_attributes_mask TEXT, _source_file TEXT); \
+             INSERT INTO UsnJrnl_Records VALUES ('2026-02-03 10:11:12.000','a.txt','FILE_CREATE',\
+             'ARCHIVE','5','7','10','0','264','111','222','256','2','32','C:\\$Extend\\$UsnJrnl');",
+        );
+        let error = build_all(&out_dir, &target, "host-1", "ds-1").unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("record_offset") && message.contains("다시 파싱"),
+            "실제: {message}"
+        );
         let _ = std::fs::remove_dir_all(out_dir.parent().unwrap());
     }
 
