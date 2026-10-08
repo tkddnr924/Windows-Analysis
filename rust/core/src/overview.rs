@@ -316,7 +316,7 @@ pub fn read_eventlog(out_dir: &Path, needle: &str) -> Vec<Row> {
             .file_stem()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default();
-        if !stem.to_lowercase().contains(needle) {
+        if stem == "EventLogInputs" || !stem.to_lowercase().contains(needle) {
             continue;
         }
         out.extend(read_table(&p, &stem));
@@ -847,33 +847,6 @@ fn bare_account(name: &str) -> String {
     tail.split('@').next().unwrap_or("").trim().to_string()
 }
 
-fn smb_client_ip(client_name: &str) -> String {
-    client_name.trim_start_matches('\\').trim().to_string()
-}
-
-/// SmbClient 이벤트의 대상 "\\server\share" 또는 "\\server"에서 서버 부분만
-/// 뽑는다 — SmbHistory의 remote_address(연결 상대)로 쓴다.
-fn smb_target_server(name: &str) -> String {
-    name.trim_start_matches('\\')
-        .split('\\')
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_string()
-}
-
-/// SmbClient 이벤트 NTSTATUS 중 분석에서 판별 가치가 있는 값만 이름을 붙인다
-/// — 나머지는 원문 숫자 없이 이벤트 설명만 남긴다(미주석 코드 나열 방지).
-fn ntstatus_note(status: u64) -> Option<&'static str> {
-    match status {
-        0xC000_0022 => Some("접근 거부"),
-        0xC000_006D => Some("로그온 실패"),
-        0xC000_006A => Some("잘못된 비밀번호"),
-        0xC000_0064 => Some("존재하지 않는 계정"),
-        0xC000_0234 => Some("계정 잠김"),
-        _ => None,
-    }
-}
 
 // --- 오류 보고(WER) 통합 — Report.wer 산출물 + EventLog 오류 보고(1001) ---
 
@@ -1157,123 +1130,6 @@ pub fn build_wer_reports_with_events(out_dir: &Path, events: &EventLogOverviewCa
     rows
 }
 
-pub fn build_smb_history(out_dir: &Path) -> Vec<Row> {
-    build_smb_history_with_events(&EventLogOverviewCache::load(out_dir))
-}
-
-pub const SMB_KEYS: &[&str] = &[
-    "timestamp",
-    "direction",
-    "remote_address",
-    "account",
-    "result",
-    "description",
-    "event_id",
-    "provider",
-    "record_key",
-];
-
-pub fn build_smb_history_with_events(events: &EventLogOverviewCache) -> Vec<Row> {
-    let mut rows = Vec::new();
-    for r in events.rows() {
-        let provider = r.get("Provider").cloned().unwrap_or_default();
-        let eid = r.get("EventID").cloned().unwrap_or_default();
-        let ed = parse_eventdata(r.get("EventData").map(|s| s.as_str()).unwrap_or(""));
-        let (mut remote, mut account, result, description, direction);
-        if provider == "Microsoft-Windows-Security-Auditing" && (eid == "4624" || eid == "4625") {
-            direction = "inbound";
-            if ed_field(&ed, &["LogonType"]) != "3" {
-                continue;
-            }
-            remote = ed_field(&ed, &["IpAddress", "SourceNetworkAddress"]);
-            account = ed_field(&ed, &["TargetUserName"]);
-            result = if eid == "4624" { "성공" } else { "실패" }.to_string();
-            description = if eid == "4624" {
-                "네트워크 로그온 성공 (SMB 등)"
-            } else {
-                "네트워크 로그온 실패 (SMB 등)"
-            }
-            .to_string();
-        } else if provider == "Microsoft-Windows-SMBServer" && (eid == "551" || eid == "1009") {
-            direction = "inbound";
-            let inner = match ed.get("EventData") {
-                Some(serde_json::Value::Object(m)) => m.clone(),
-                _ => ed.clone(),
-            };
-            remote = smb_client_ip(&inner.get("ClientName").map(vstr).unwrap_or_default());
-            account = inner.get("UserName").map(vstr).unwrap_or_default();
-            if eid == "551" {
-                result = "실패".into();
-                description = "SMB 인증 실패".into();
-            } else {
-                result = "실패".into();
-                description = "SMB 세션 인증 실패".into();
-            }
-        } else if provider.eq_ignore_ascii_case("Microsoft-Windows-SMBClient") {
-            // SmbClient%4Security — 이 호스트가 클라이언트로서 원격 서버·공유에
-            // 접근한 기록(아웃바운드). 이 채널에는 실패 계열만 남지만 "이
-            // 호스트가 어디로 SMB 접속을 시도했는가"라는 횡적 이동의 방향
-            // 정보를 준다. 대상(ShareName/ServerName)이 없는 행은 연결 상대를
-            // 특정할 수 없어 아래 remote 공백 검사에서 걸러진다.
-            direction = "outbound";
-            let inner = match ed.get("EventData") {
-                Some(serde_json::Value::Object(m)) => m.clone(),
-                _ => ed.clone(),
-            };
-            let target = {
-                let share = inner.get("ShareName").map(vstr).unwrap_or_default();
-                if share.is_empty() {
-                    inner.get("ServerName").map(vstr).unwrap_or_default()
-                } else {
-                    share
-                }
-            };
-            remote = smb_target_server(&target);
-            account = inner.get("UserName").map(vstr).unwrap_or_default();
-            result = "실패".into();
-            let what = match eid.as_str() {
-                "31010" => "SMB 공유 접근 실패",
-                "31001" => "SMB 서버 인증 실패",
-                _ => "SMB 클라이언트 연결 실패",
-            };
-            let status_note = inner
-                .get("Status")
-                .map(vstr)
-                .and_then(|value| value.trim().parse::<u64>().ok())
-                .and_then(ntstatus_note);
-            description = match status_note {
-                Some(note) => format!("{what} ({target} — {note})"),
-                None => format!("{what} ({target})"),
-            };
-        } else {
-            continue;
-        }
-        if remote.is_empty() || remote == "-" {
-            continue;
-        }
-        let mut row = Row::new();
-        row.insert(
-            "timestamp".into(),
-            r.get("timestamp").cloned().unwrap_or_default(),
-        );
-        row.insert("direction".into(), direction.into());
-        row.insert("remote_address".into(), std::mem::take(&mut remote));
-        row.insert(
-            "account".into(),
-            bare_account(std::mem::take(&mut account).as_str()),
-        );
-        row.insert("description".into(), description);
-        row.insert("result".into(), result);
-        row.insert("event_id".into(), eid);
-        row.insert("provider".into(), provider);
-        row.insert(
-            "record_key".into(),
-            r.get("_record_key").cloned().unwrap_or_default(),
-        );
-        rows.push(row);
-    }
-    rows
-}
 
 /// BITS(Background Intelligent Transfer Service) 전송 이벤트를 개요 테이블로.
 /// 공격자가 파일 다운로드 수단으로 자주 악용하므로 작업 생성~전송 결과까지
@@ -7159,109 +7015,6 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    #[test]
-    fn smb_server_event_1009_is_retained_as_failure() {
-        let root = std::env::temp_dir().join(format!("wina-smb-overview-{}", std::process::id()));
-        let event_dir = root.join("EVENTLOG");
-        std::fs::create_dir_all(&event_dir).unwrap();
-        let db_path = event_dir.join("SMBServer.sqlite");
-        let conn = Connection::open(&db_path).unwrap();
-        conn.execute(
-            "CREATE TABLE SMBServer (Provider TEXT, EventID TEXT, EventData TEXT, timestamp TEXT, _record_key TEXT)",
-            [],
-        ).unwrap();
-        conn.execute(
-            "INSERT INTO SMBServer VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![
-                "Microsoft-Windows-SMBServer",
-                "1009",
-                r#"{"EventData":{"ClientName":"\\\\192.0.2.15","UserName":"CONTOSO\\analyst"}}"#,
-                "2026-08-21 10:00:00.000",
-                "SMBServer.evtx::1009",
-            ],
-        )
-        .unwrap();
-        drop(conn);
-
-        let rows = build_smb_history(&root);
-        assert_eq!(rows.len(), 1);
-        let row = &rows[0];
-        assert_eq!(
-            row.get("remote_address").map(String::as_str),
-            Some("192.0.2.15")
-        );
-        assert_eq!(row.get("account").map(String::as_str), Some("analyst"));
-        assert_eq!(row.get("result").map(String::as_str), Some("실패"));
-        assert_eq!(
-            row.get("description").map(String::as_str),
-            Some("SMB 세션 인증 실패")
-        );
-        assert_eq!(row.get("direction").map(String::as_str), Some("inbound"));
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    /// SmbClient%4Security(31010 등)는 이 호스트가 클라이언트로서 원격 공유에
-    /// 접근한 기록 — outbound로 채택돼야 한다. EventData는 실측 그대로 평탄
-    /// JSON이고 Status 0xC0000022(접근 거부)는 설명에 이름으로 풀린다.
-    #[test]
-    fn smb_client_share_failure_is_retained_as_outbound() {
-        let root = std::env::temp_dir().join(format!("wina-smbclient-overview-{}", std::process::id()));
-        let event_dir = root.join("EVENTLOG");
-        std::fs::create_dir_all(&event_dir).unwrap();
-        let db_path = event_dir.join("SmbClientSecurity.sqlite");
-        let conn = Connection::open(&db_path).unwrap();
-        conn.execute(
-            "CREATE TABLE SmbClientSecurity (Provider TEXT, EventID TEXT, EventData TEXT, timestamp TEXT, _record_key TEXT)",
-            [],
-        ).unwrap();
-        for (eid, data, key) in [
-            (
-                "31010",
-                r#"{"Reason": 12, "Status": 3221225506, "ShareNameLength": 24, "ShareName": "\\192.168.10.199\\dbbackup", "ObjectNameLength": 0, "ObjectName": ""}"#,
-                "SmbClient.evtx::1",
-            ),
-            // ShareName 없이 ServerName만 있는 이벤트(31013 등)도 서버 주소로 채택.
-            (
-                "31013",
-                r#"{"Smb2Command": 11, "ServerName": "\\192.168.10.63", "Status": 3221266432}"#,
-                "SmbClient.evtx::2",
-            ),
-            // 대상 정보가 없는 행은 연결 상대를 특정할 수 없어 제외.
-            ("31017", r#"{"Status": 0}"#, "SmbClient.evtx::3"),
-        ] {
-            conn.execute(
-                "INSERT INTO SmbClientSecurity VALUES (?1, ?2, ?3, '2026-08-21 12:00:00.000', ?4)",
-                rusqlite::params!["Microsoft-Windows-SMBClient", eid, data, key],
-            )
-            .unwrap();
-        }
-        drop(conn);
-
-        let rows = build_smb_history(&root);
-        assert_eq!(rows.len(), 2);
-        let share = &rows[0];
-        assert_eq!(share.get("direction").map(String::as_str), Some("outbound"));
-        assert_eq!(
-            share.get("remote_address").map(String::as_str),
-            Some("192.168.10.199")
-        );
-        assert_eq!(share.get("result").map(String::as_str), Some("실패"));
-        assert_eq!(
-            share.get("description").map(String::as_str),
-            Some("SMB 공유 접근 실패 (\\192.168.10.199\\dbbackup — 접근 거부)")
-        );
-        let server = &rows[1];
-        assert_eq!(server.get("direction").map(String::as_str), Some("outbound"));
-        assert_eq!(
-            server.get("remote_address").map(String::as_str),
-            Some("192.168.10.63")
-        );
-        assert_eq!(
-            server.get("description").map(String::as_str),
-            Some("SMB 클라이언트 연결 실패 (\\192.168.10.63)")
-        );
-        std::fs::remove_dir_all(root).unwrap();
-    }
 
     /// T5: XML 정의에 Operational 이벤트 실행 요약이 병합된다 — 키는 선행
     /// 역슬래시 유무(uri vs TaskName)를 무시하고, 129의 실제 프로세스 경로가

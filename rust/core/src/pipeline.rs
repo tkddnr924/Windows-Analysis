@@ -1309,8 +1309,20 @@ fn parse_eventlog_artifact(
     entry: &mut ParseArtifactReport,
 ) -> Result<Vec<String>> {
     entry_record_inputs(entry, paths);
+    // Scoped staging copies prior facts; this artifact owns the whole category.
+    // 범위 재파싱에서 이번에 수집되지 않은 지난 실행의 로그가 그대로 발행되면
+    // 분석가는 그것을 이번 수집본으로 읽는다.
+    let eventlog_dir = out_dir.join("EVENTLOG");
+    if eventlog_dir.exists() {
+        std::fs::remove_dir_all(&eventlog_dir).with_context(|| {
+            format!("이벤트 로그 이전 스테이지 정리: {}", eventlog_dir.display())
+        })?;
+    }
     let mut outputs = Vec::new();
-    let mut taken = HashSet::new();
+    // 매니페스트 이름을 선점한다 — 같은 이름의 수집 로그는 EventLogInputs_2로
+    // 발행되어 입력 기록이 facts에 덮이지 않는다.
+    let mut taken = HashSet::from([eventlog::INPUTS_TABLE.to_lowercase()]);
+    let mut input_rows: Vec<Row> = Vec::with_capacity(paths.len() + 1);
     // 손상된 레코드는 파서가 corrupted_chunk 행으로 격리한다. 파일 자체가
     // 열리지 않는 로그는 그 파일만 건너뛰어, 나머지 로그의 저장 완료분이
     // 함께 폐기되지 않게 한다(파싱 실패 == 손상 아티팩트).
@@ -1326,20 +1338,64 @@ fn parse_eventlog_artifact(
             .extension()
             .map(|e| e.to_string_lossy().eq_ignore_ascii_case("evt"))
             .unwrap_or(false);
-        if let Some(n) = run_unit_or_skip(&p.display().to_string(), &[&out], || {
+        let mut row = Row::new();
+        row.insert("source_file".into(), p.to_string_lossy().into_owned());
+        match run_unit_or_skip_reason(&p.display().to_string(), &[&out], || {
             if is_evt {
                 eventlog::parse_evt_stream(p, &out, &name)
             } else {
                 eventlog::parse_evtx_stream(p, &out, &name)
             }
         })? {
-            entry_record_input_count(entry, p, n);
-            if n > 0 {
-                emit(&format!("[+] {} rows -> {} [{}]", n, out.display(), name));
+            Ok(n) => {
+                entry_record_input_count(entry, p, n);
+                if n > 0 {
+                    emit(&format!("[+] {} rows -> {} [{}]", n, out.display(), name));
+                }
+                outputs.push(relative.clone());
+                row.insert("facts_db".into(), relative.clone());
+                row.insert("facts_table".into(), name.clone());
+                row.insert("status".into(), eventlog::INPUT_STATUS_PARSED.into());
+                // corrupted_chunk 격리 행까지 포함한 저장 행 수 — 0건 수집과
+                // 읽기 실패를 구분하는 근거다.
+                row.insert("row_count".into(), n.to_string());
+                row.insert("error".into(), String::new());
             }
-            outputs.push(relative);
+            // 건너뛴 원본은 사유 원문과 함께 남긴다 — 실패를 추정하지 않고,
+            // 출력이 지워졌으므로 facts 좌표는 비운다.
+            Err(reason) => {
+                entry_record_input_error(entry, p, &reason);
+                row.insert("facts_db".into(), String::new());
+                row.insert("facts_table".into(), String::new());
+                row.insert("status".into(), eventlog::INPUT_STATUS_READ_FAILED.into());
+                row.insert("row_count".into(), "0".into());
+                row.insert("error".into(), reason);
+            }
         }
+        input_rows.push(row);
     }
+    // 탐색이 끝났다는 사실 자체를 남긴다. 이 행이 있으면 목록에 없는 채널은
+    // "미수집"이고, 매니페스트가 아예 없으면 "이번 결과에 이벤트 로그 실행
+    // 기록 없음(알 수 없음)"이다 — 수집 0건에도 기록된다.
+    let mut summary = Row::new();
+    summary.insert("source_file".into(), String::new());
+    summary.insert("facts_db".into(), String::new());
+    summary.insert("facts_table".into(), String::new());
+    summary.insert(
+        "status".into(),
+        eventlog::INPUT_STATUS_DISCOVERY_COMPLETE.into(),
+    );
+    summary.insert("row_count".into(), paths.len().to_string());
+    summary.insert("error".into(), String::new());
+    input_rows.push(summary);
+    write_table(
+        &out_dir.join(eventlog::INPUTS_RELATIVE),
+        eventlog::INPUTS_TABLE,
+        &input_rows,
+        eventlog::INPUT_FIELDS,
+    )?;
+    outputs.push(eventlog::INPUTS_RELATIVE.to_string());
+    outputs.sort();
     Ok(outputs)
 }
 
@@ -2837,6 +2893,188 @@ mod persistent_log_tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// 유효하지만 레코드가 하나도 없는 XP .evt — 0x30 헤더 + EOF(커서) 레코드.
+    /// "수집은 됐지만 이벤트 0건"인 실제 입력을 만든다.
+    fn empty_evt_bytes() -> Vec<u8> {
+        fn put(buffer: &mut [u8], offset: usize, value: u32) {
+            buffer[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        let mut data = vec![0u8; 0x30];
+        put(&mut data, 0x00, 0x30);
+        put(&mut data, 0x04, 0x654c_664c); // "LfLe"
+        put(&mut data, 0x08, 1);
+        put(&mut data, 0x0C, 1);
+        put(&mut data, 0x10, 0x30); // StartOffset
+        put(&mut data, 0x20, 0x58); // 파일 길이
+        put(&mut data, 0x2C, 0x30);
+        let mut eof = vec![0u8; 0x28];
+        put(&mut eof, 0x00, 0x28);
+        for (index, magic) in [0x1111_1111u32, 0x2222_2222, 0x3333_3333, 0x4444_4444]
+            .iter()
+            .enumerate()
+        {
+            put(&mut eof, 4 + index * 4, *magic);
+        }
+        put(&mut eof, 0x14, 0x30); // BeginRecord
+        put(&mut eof, 0x24, 0x28);
+        data.extend(eof);
+        data
+    }
+
+    fn manifest_row(
+        connection: &rusqlite::Connection,
+        status: &str,
+    ) -> (String, String, String, String, String) {
+        connection
+            .query_row(
+                "SELECT source_file,facts_db,facts_table,row_count,error FROM EventLogInputs \
+                 WHERE status=?1",
+                [status],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap_or_else(|error| panic!("{status} manifest row: {error}"))
+    }
+
+    /// A04: 수집된 빈 로그·읽기 실패·미수집을 저장에서 구분할 수 있어야 한다.
+    /// 0건으로 파싱된 입력은 facts 좌표와 함께 parsed, 열지 못한 입력은 사유
+    /// 원문과 함께 read_failed, 목록에 없는 채널은 미수집으로 읽힌다.
+    #[test]
+    fn eventlog_manifest_separates_empty_logs_from_read_failures() {
+        let _guard = PIPELINE_LOG_TEST_LOCK.lock();
+        let root = temporary_directory("eventlog-manifest");
+        let target = root.join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        let empty = target.join("SysEvent.Evt");
+        let unreadable = target.join("AppEvent.Evt");
+        std::fs::write(&empty, empty_evt_bytes()).unwrap();
+        std::fs::write(&unreadable, b"not an event log").unwrap();
+        let out = root.join("output");
+        let mut outcome = ArtifactOutcome::new("EventLog");
+
+        let outputs = parse_eventlog_artifact(
+            &[empty.clone(), unreadable.clone()],
+            &out,
+            &mut outcome.entry,
+        )
+        .unwrap();
+
+        assert_eq!(
+            outputs,
+            vec![
+                "EVENTLOG/EventLogInputs.sqlite".to_string(),
+                "EVENTLOG/SysEvent.sqlite".to_string(),
+            ],
+            "읽지 못한 로그는 발행되지 않고, 매니페스트는 항상 발행된다"
+        );
+        assert!(!out.join("EVENTLOG/AppEvent.sqlite").exists());
+        let manifest =
+            rusqlite::Connection::open(out.join("EVENTLOG/EventLogInputs.sqlite")).unwrap();
+        let parsed = manifest_row(&manifest, "parsed");
+        assert_eq!(parsed.0, empty.to_string_lossy());
+        assert_eq!(parsed.1, "EVENTLOG/SysEvent.sqlite");
+        assert_eq!(parsed.2, "SysEvent");
+        assert_eq!(parsed.3, "0", "수집된 빈 로그는 0건 파싱으로 남는다");
+        assert_eq!(parsed.4, "");
+        let failed = manifest_row(&manifest, "read_failed");
+        assert_eq!(failed.0, unreadable.to_string_lossy());
+        assert_eq!(failed.1, "");
+        assert_eq!(failed.2, "");
+        assert_eq!(failed.3, "0");
+        assert!(
+            !failed.4.is_empty(),
+            "읽기 실패는 사유 원문을 잃지 않는다"
+        );
+        let discovery = manifest_row(&manifest, "discovery_complete");
+        assert_eq!(
+            (
+                discovery.0.as_str(),
+                discovery.1.as_str(),
+                discovery.2.as_str()
+            ),
+            ("", "", "")
+        );
+        assert_eq!(discovery.3, "2", "요약 행은 발견한 입력 수를 남긴다");
+        let listed: i64 = manifest
+            .query_row(
+                "SELECT COUNT(*) FROM EventLogInputs WHERE source_file LIKE '%Security.evtx'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(listed, 0, "수집되지 않은 채널은 매니페스트에 없다");
+        drop(manifest);
+        // 실패한 입력은 보고서에서도 "0건 성공"과 구분된다.
+        let failed_input = outcome
+            .entry
+            .inputs
+            .iter()
+            .find(|input| input.source_path == unreadable.to_string_lossy())
+            .expect("실패 입력 보고");
+        assert!(failed_input.error.as_deref().is_some_and(|e| !e.is_empty()));
+        // Keywords는 저장 스키마에 남는다(이벤트 0건이어도 컬럼은 존재).
+        let facts = rusqlite::Connection::open(out.join("EVENTLOG/SysEvent.sqlite")).unwrap();
+        assert!(
+            facts.prepare("SELECT Keywords FROM SysEvent").is_ok(),
+            "Keywords 컬럼이 저장 스키마에 있어야 한다"
+        );
+        drop(facts);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// 입력이 하나도 없어도 "이번 실행에서 탐색은 끝났다"는 근거를 남겨야
+    /// 미수집과 미실행(매니페스트 없음)을 구분할 수 있다.
+    #[test]
+    fn eventlog_without_inputs_still_writes_a_discovery_manifest() {
+        let _guard = PIPELINE_LOG_TEST_LOCK.lock();
+        let root = temporary_directory("eventlog-no-input");
+        let out = root.join("output");
+        let mut outcome = ArtifactOutcome::new("EventLog");
+
+        let outputs = parse_eventlog_artifact(&[], &out, &mut outcome.entry).unwrap();
+
+        assert_eq!(outputs, vec!["EVENTLOG/EventLogInputs.sqlite".to_string()]);
+        let manifest =
+            rusqlite::Connection::open(out.join("EVENTLOG/EventLogInputs.sqlite")).unwrap();
+        let rows: i64 = manifest
+            .query_row("SELECT COUNT(*) FROM EventLogInputs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 1);
+        assert_eq!(manifest_row(&manifest, "discovery_complete").3, "0");
+        drop(manifest);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// 매니페스트와 같은 이름의 로그가 수집돼도 입력 기록이 덮이지 않는다.
+    #[test]
+    fn eventlog_manifest_name_is_reserved_against_a_collected_log() {
+        let _guard = PIPELINE_LOG_TEST_LOCK.lock();
+        let root = temporary_directory("eventlog-reserved");
+        let target = root.join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        let collision = target.join("EventLogInputs.Evt");
+        std::fs::write(&collision, empty_evt_bytes()).unwrap();
+        let out = root.join("output");
+        let mut outcome = ArtifactOutcome::new("EventLog");
+
+        parse_eventlog_artifact(&[collision], &out, &mut outcome.entry).unwrap();
+
+        let manifest =
+            rusqlite::Connection::open(out.join("EVENTLOG/EventLogInputs.sqlite")).unwrap();
+        let parsed = manifest_row(&manifest, "parsed");
+        assert_eq!(parsed.1, "EVENTLOG/EventLogInputs_2.sqlite");
+        assert_eq!(parsed.2, "EventLogInputs_2");
+        drop(manifest);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn registry_discovery_keeps_all_primary_hives_and_known_corrupt_inputs() {
         let root = temporary_directory("registry-discovery");
@@ -3613,6 +3851,105 @@ mod persistent_log_tests {
         assert!(log.contains("artifact_finished name=Registry status=completed"));
         assert!(log.contains("artifact_finished name=SRUM status=completed"));
         assert!(log.contains("run_finished status=ok"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// 범위 재파싱(EventLog만)은 이번 수집본만 발행해야 한다 — 지난 실행의
+    /// 이벤트 로그 facts가 남아 현재 데이터처럼 보이면 안 되고, 범위 밖
+    /// 카테고리는 그대로 유지돼야 한다.
+    #[test]
+    fn scoped_eventlog_rerun_drops_stale_facts_and_keeps_other_categories() {
+        let _serial = PIPELINE_LOG_TEST_LOCK.lock();
+        CANCEL.store(false, Ordering::Relaxed);
+        let root = temporary_directory("eventlog-scoped");
+        let cases_dir = root.join("cases");
+        let target_dir = root.join("target");
+        std::fs::create_dir_all(&target_dir).unwrap();
+        std::fs::write(target_dir.join("SysEvent.Evt"), empty_evt_bytes()).unwrap();
+        let case = case_store::create_case("case", "2026-10-09 00:00:00", &cases_dir).unwrap();
+        let host = case_store::create_host(
+            &case.id,
+            "host",
+            &target_dir.to_string_lossy(),
+            "2026-10-09 00:00:00",
+            &cases_dir,
+        )
+        .unwrap();
+        let host_dir = case_store::host_dir(&cases_dir, &case.id, &host.id);
+        // 지난 실행이 남긴, 이번에는 수집되지 않은 로그.
+        let stale = host_dir.join("EVENTLOG/Security.sqlite");
+        let mut stale_row: Row = eventlog::EVENT_COLUMNS
+            .iter()
+            .map(|field| ((*field).to_string(), String::new()))
+            .collect();
+        for (field, value) in [
+            ("timestamp", "2026-10-01 00:00:00.000"),
+            ("Channel", "Security"),
+            ("EventID", "4624"),
+            ("Keywords", "0x8020000000000000"),
+            ("Provider", "Microsoft-Windows-Security-Auditing"),
+            ("_record_key", "Security::1"),
+            ("_status", "ok"),
+            ("_source_file", "C:\\removed\\Security.evtx"),
+        ] {
+            stale_row.insert(field.into(), value.into());
+        }
+        write_table(&stale, "Security", &[stale_row], eventlog::EVENT_COLUMNS).unwrap();
+        crate::derived::stamp_facts_generation(&stale, "previous-eventlog-generation").unwrap();
+        // 범위 밖 카테고리의 지난 결과.
+        let untouched = host_dir.join("PREFETCH/Prefetch.sqlite");
+        std::fs::create_dir_all(untouched.parent().unwrap()).unwrap();
+        std::fs::write(&untouched, b"keep").unwrap();
+        let only = HashSet::from(["EventLog".to_string()]);
+
+        run_host_with_log_id(
+            &case.id,
+            &host.id,
+            &cases_dir,
+            Some(only),
+            Some("eventlog-scoped"),
+        )
+        .expect("EventLog 범위 재파싱");
+
+        assert!(
+            !stale.exists(),
+            "이번에 수집되지 않은 지난 로그가 현재 수집본으로 남으면 안 된다"
+        );
+        assert!(host_dir.join("EVENTLOG/SysEvent.sqlite").is_file());
+        assert_eq!(std::fs::read(&untouched).unwrap(), b"keep");
+        let manifest =
+            rusqlite::Connection::open(host_dir.join("EVENTLOG/EventLogInputs.sqlite")).unwrap();
+        let discovered: (String, String) = manifest
+            .query_row(
+                "SELECT row_count,facts_db FROM EventLogInputs WHERE status='discovery_complete'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(discovered, ("1".to_string(), String::new()));
+        let removed: i64 = manifest
+            .query_row(
+                "SELECT COUNT(*) FROM EventLogInputs WHERE facts_db='EVENTLOG/Security.sqlite'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(removed, 0);
+        // 매니페스트도 이번 실행 facts 세대로 스탬프되어 발행된다.
+        assert!(crate::derived::facts_generation(
+            &host_dir.join("EVENTLOG/EventLogInputs.sqlite")
+        )
+        .unwrap()
+        .is_some_and(|generation| generation != "previous-eventlog-generation"));
+        drop(manifest);
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(host_dir.join("parse_report.json")).unwrap())
+                .unwrap();
+        let entry = report["artifacts"]
+            .as_array()
+            .and_then(|entries| entries.iter().find(|entry| entry["name"] == "EventLog"))
+            .expect("EventLog artifact report");
+        assert_eq!(entry["status"], "completed");
         let _ = std::fs::remove_dir_all(root);
     }
 }

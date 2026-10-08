@@ -1006,98 +1006,6 @@ const REGISTRY_EXPLORER_CHILDREN: &[ChildSpec] = &[
 
 
 
-const SMB_HISTORY_DDL: &str = r#"PRAGMA foreign_keys=ON;
-CREATE TABLE "SmbHistory" (
-  "record_id" TEXT NOT NULL,
-  "host_id" TEXT NOT NULL,
-  "dataset_id" TEXT NOT NULL,
-  "timestamp" TEXT,
-  "overview_name" TEXT NOT NULL,
-  "account" TEXT,
-  "account_sid" TEXT,
-  "timestamp_kind" TEXT,
-  "event_type" TEXT,
-  "description" TEXT,
-  "direction" TEXT,
-  "remote_address" TEXT,
-  "remote_port" INTEGER,
-  "share_name" TEXT,
-  "share_path" TEXT,
-  "target_file" TEXT,
-  "access_mask" TEXT,
-  "access_rights" TEXT,
-  "result" TEXT,
-  "event_id" INTEGER,
-  "provider" TEXT,
-  PRIMARY KEY(record_id),
-  CHECK(overview_name = 'SmbHistory'),
-  CHECK(timestamp IS NULL OR timestamp_kind IS NOT NULL)
-);
-CREATE INDEX "idx_SmbHistory_time" ON "SmbHistory"(timestamp, record_id);
-CREATE INDEX "idx_SmbHistory_account" ON "SmbHistory"(account_sid, timestamp);
-CREATE TABLE "source_records" (
-  "record_id" TEXT NOT NULL,
-  "ordinal" INTEGER NOT NULL,
-  "source_dataset_id" TEXT NOT NULL,
-  "source_artifact" TEXT NOT NULL,
-  "source_db" TEXT NOT NULL,
-  "source_table" TEXT NOT NULL,
-  "source_rowid" INTEGER NOT NULL,
-  "source_field" TEXT,
-  "source_record_key" TEXT,
-  "source_file" TEXT,
-  "source_label" TEXT,
-  PRIMARY KEY(record_id, ordinal),
-  CHECK(ordinal >= 0),
-  FOREIGN KEY(record_id) REFERENCES "SmbHistory"("record_id") ON DELETE CASCADE
-);
-CREATE INDEX idx_source_lookup ON source_records(source_db, source_table, source_rowid, source_field);
-
-CREATE TABLE _wina_derived_version (name TEXT NOT NULL PRIMARY KEY, version INTEGER NOT NULL);
-INSERT INTO _wina_derived_version(name,version) VALUES ('overview_contract',1);
-"#;
-
-const SMB_HISTORY_COLUMNS: &[&str] = &[
-    "record_id",
-    "host_id",
-    "dataset_id",
-    "timestamp",
-    "overview_name",
-    "account",
-    "account_sid",
-    "timestamp_kind",
-    "event_type",
-    "description",
-    "direction",
-    "remote_address",
-    "remote_port",
-    "share_name",
-    "share_path",
-    "target_file",
-    "access_mask",
-    "access_rights",
-    "result",
-    "event_id",
-    "provider",
-];
-
-const SMB_HISTORY_SOURCE_RECORDS_COLUMNS: &[&str] = &[
-    "record_id",
-    "ordinal",
-    "source_dataset_id",
-    "source_artifact",
-    "source_db",
-    "source_table",
-    "source_rowid",
-    "source_field",
-    "source_record_key",
-    "source_file",
-    "source_label",
-];
-
-const SMB_HISTORY_CHILDREN: &[ChildSpec] = &[
-    ChildSpec { table: "source_records", columns: SMB_HISTORY_SOURCE_RECORDS_COLUMNS },
-];
 
 
 const SCHEDULED_TASKS_DDL: &str = r#"PRAGMA foreign_keys=ON;
@@ -2924,13 +2832,7 @@ pub const SPECS: &[DbSpec] = &[
         ddl: REGISTRY_EXPLORER_DDL,
     },
     super::remote_access::SPEC,
-    DbSpec {
-        name: "SmbHistory",
-        table: "SmbHistory",
-        columns: SMB_HISTORY_COLUMNS,
-        children: SMB_HISTORY_CHILDREN,
-        ddl: SMB_HISTORY_DDL,
-    },
+    super::smb_history::SPEC,
     DbSpec {
         name: "ScheduledTasks",
         table: "ScheduledTasks",

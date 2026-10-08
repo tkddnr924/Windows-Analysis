@@ -112,7 +112,7 @@ pub(super) fn build_event_backed(
     Ok(vec![
         ("ScheduledTasks".into(), scheduled_tasks(ctx, events)?),
         ("ServiceHistory".into(), service_history(ctx, events)?),
-        ("SmbHistory".into(), smb_history(ctx, events)?),
+        ("SmbHistory".into(), super::smb_history::build(ctx, events)?),
         (
             "RemoteDesktopHistory".into(),
             super::remote_access::build(ctx, events)?,
@@ -302,34 +302,6 @@ fn service_history(ctx: &Ctx, events: &EventLogOverviewCache) -> Result<usize> {
     db.finish()
 }
 
-// --- SmbHistory -------------------------------------------------------------
-
-fn smb_history(ctx: &Ctx, events: &EventLogOverviewCache) -> Result<usize> {
-    let spec = spec_of("SmbHistory");
-    let mut db = DerivedDb::create(&ctx.overview_dir(), "SmbHistory")?;
-    for row in overview::build_smb_history_with_events(events) {
-        let description = g(&row, "description");
-        // SMBClient descriptions append target/status annotations in parentheses.
-        let event_type = description
-            .split(" (")
-            .next()
-            .unwrap_or(description)
-            .to_string();
-        let mut rec = ctx.record(spec);
-        rec.timestamp(g(&row, "timestamp"), "이벤트 기록 시각");
-        rec.set("event_type", text(&event_type));
-        rec.set("description", text(description));
-        rec.account(g(&row, "account"), &ctx.meta);
-        rec.set("direction", text(g(&row, "direction")));
-        rec.set("remote_address", text(g(&row, "remote_address")));
-        rec.set("result", text(g(&row, "result")));
-        rec.set("event_id", int(g(&row, "event_id")));
-        rec.set("provider", text(g(&row, "provider")));
-        rec.source(source_of(ctx, &row, "record_key", "_source_file", &event_type)?);
-        db.write(rec)?;
-    }
-    db.finish()
-}
 
 
 // --- BitsHistory ------------------------------------------------------------

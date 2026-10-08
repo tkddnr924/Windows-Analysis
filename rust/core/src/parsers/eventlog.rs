@@ -55,6 +55,9 @@ pub const EVENT_COLUMNS: &[&str] = &[
     "EventID",
     "LevelName",
     "Level",
+    // System/Keywords — audit success/failure bits (0x8020…/0x8010…) and the
+    // provider's keyword flags. Stored as the raw rendered value, not decoded.
+    "Keywords",
     "Provider",
     "Computer",
     "EventRecordID",
@@ -69,6 +72,33 @@ pub const EVENT_COLUMNS: &[&str] = &[
     "_error",
     "_source_file",
 ];
+
+// ---------------------------------------------------------------------------
+// Collected-input manifest. One row per discovered allowlisted log plus a
+// single discovery_complete summary row, written on every EventLog run so a
+// consumer can tell "collected but empty", "read failed" and "never collected"
+// apart instead of inferring it from a missing facts table.
+// ---------------------------------------------------------------------------
+
+pub const INPUTS_TABLE: &str = "EventLogInputs";
+pub const INPUTS_DB: &str = "EventLogInputs.sqlite";
+pub const INPUTS_RELATIVE: &str = "EVENTLOG/EventLogInputs.sqlite";
+pub const INPUT_FIELDS: &[&str] = &[
+    "source_file",
+    "facts_db",
+    "facts_table",
+    "status",
+    "row_count",
+    "error",
+];
+/// 입력을 끝까지 읽어 facts 테이블을 만든 상태. row_count는 저장된 전체 행
+/// (corrupted_chunk 격리 행 포함)이다.
+pub const INPUT_STATUS_PARSED: &str = "parsed";
+/// 파일을 열거나 해석하지 못해 건너뛴 상태 — 사유 원문을 error에 남긴다.
+pub const INPUT_STATUS_READ_FAILED: &str = "read_failed";
+/// 이 실행에서 이벤트 로그 탐색이 끝났다는 요약 행. row_count는 발견한 입력
+/// 수이며, 입력이 0개여도 기록된다(수집 0건과 미실행을 구분하는 근거).
+pub const INPUT_STATUS_DISCOVERY_COMPLETE: &str = "discovery_complete";
 
 fn level_name(level: Option<&str>) -> String {
     match level {
@@ -156,6 +186,75 @@ fn fmt_ts(system_time: Option<&Value>, record_ts: DateTime<Utc>) -> String {
     fmt_kst(record_ts)
 }
 
+/// Build one facts row from the evtx crate's JSON record. Every System scalar
+/// is stored exactly as rendered — Keywords in particular carries the audit
+/// success/failure bits, and decoding them belongs to the analysis layer.
+fn evtx_row(data: &Value, record_ts: DateTime<Utc>) -> Row {
+    let sys = get(data, &["Event", "System"]).unwrap_or(&Value::Null);
+    let payload =
+        get(data, &["Event", "EventData"]).or_else(|| get(data, &["Event", "UserData"]));
+
+    let level = cell(scalar(sys.get("Level")));
+    let mut row = Row::new();
+    row.insert(
+        "timestamp".into(),
+        fmt_ts(
+            get(sys, &["TimeCreated", "#attributes", "SystemTime"]),
+            record_ts,
+        ),
+    );
+    if let Some(v) = cell(sys.get("Channel")) {
+        row.insert("Channel".into(), v);
+    }
+    if let Some(v) = cell(scalar(sys.get("EventID"))) {
+        row.insert("EventID".into(), v);
+    }
+    row.insert("LevelName".into(), level_name(level.as_deref()));
+    if let Some(v) = level {
+        row.insert("Level".into(), v);
+    }
+    // Keywords decides audit success vs failure for Security/SMB auditing;
+    // absent in a record (or in legacy .evt) it stays NULL rather than 0.
+    if let Some(v) = cell(scalar(sys.get("Keywords"))) {
+        row.insert("Keywords".into(), v);
+    }
+    if let Some(v) = cell(get(sys, &["Provider", "#attributes", "Name"])) {
+        row.insert("Provider".into(), v);
+    }
+    if let Some(v) = cell(sys.get("Computer")) {
+        row.insert("Computer".into(), v);
+    }
+    if let Some(v) = cell(sys.get("EventRecordID")) {
+        row.insert("EventRecordID".into(), v);
+    }
+    if let Some(v) = cell(get(sys, &["Execution", "#attributes", "ProcessID"])) {
+        row.insert("ProcessID".into(), v);
+    }
+    if let Some(v) = cell(get(sys, &["Execution", "#attributes", "ThreadID"])) {
+        row.insert("ThreadID".into(), v);
+    }
+    // System/Correlation — the provider's own activity id. RDP and Security
+    // records use it to tie one connection's events together, so it must
+    // survive into facts.
+    if let Some(v) = cell(get(sys, &["Correlation", "#attributes", "ActivityID"])) {
+        row.insert("ActivityID".into(), v);
+    }
+    if let Some(v) = cell(get(sys, &["Correlation", "#attributes", "RelatedActivityID"])) {
+        row.insert("RelatedActivityID".into(), v);
+    }
+    if let Some(v) = cell(get(sys, &["Security", "#attributes", "UserID"])) {
+        row.insert("UserID".into(), v);
+    }
+    row.insert(
+        "EventData".into(),
+        match payload {
+            Some(p) => py_json(p),
+            None => String::new(),
+        },
+    );
+    row
+}
+
 pub fn parse_evtx_stream(path: &Path, out: &Path, table: &str) -> Result<usize> {
     let src = path.to_string_lossy().to_string();
     let mut parser = EvtxParser::from_path(path)?;
@@ -189,67 +288,7 @@ pub fn parse_evtx_stream(path: &Path, out: &Path, table: &str) -> Result<usize> 
             }
             Ok(r) => {
                 next_rowid += 1;
-                let data = &r.data;
-                let system = get(data, &["Event", "System"]);
-                let sys = system.unwrap_or(&Value::Null);
-                let payload = get(data, &["Event", "EventData"])
-                    .or_else(|| get(data, &["Event", "UserData"]));
-
-                let level = cell(scalar(sys.get("Level")));
-                let mut row = Row::new();
-                row.insert(
-                    "timestamp".into(),
-                    fmt_ts(
-                        get(sys, &["TimeCreated", "#attributes", "SystemTime"]),
-                        r.timestamp,
-                    ),
-                );
-                if let Some(v) = cell(sys.get("Channel")) {
-                    row.insert("Channel".into(), v);
-                }
-                if let Some(v) = cell(scalar(sys.get("EventID"))) {
-                    row.insert("EventID".into(), v);
-                }
-                row.insert("LevelName".into(), level_name(level.as_deref()));
-                if let Some(v) = level {
-                    row.insert("Level".into(), v);
-                }
-                if let Some(v) = cell(get(sys, &["Provider", "#attributes", "Name"])) {
-                    row.insert("Provider".into(), v);
-                }
-                if let Some(v) = cell(sys.get("Computer")) {
-                    row.insert("Computer".into(), v);
-                }
-                let erid = cell(sys.get("EventRecordID"));
-                if let Some(v) = &erid {
-                    row.insert("EventRecordID".into(), v.clone());
-                }
-                if let Some(v) = cell(get(sys, &["Execution", "#attributes", "ProcessID"])) {
-                    row.insert("ProcessID".into(), v);
-                }
-                if let Some(v) = cell(get(sys, &["Execution", "#attributes", "ThreadID"])) {
-                    row.insert("ThreadID".into(), v);
-                }
-                // System/Correlation — the provider's own activity id. RDP and
-                // Security records use it to tie one connection's events
-                // together, so it must survive into facts.
-                if let Some(v) = cell(get(sys, &["Correlation", "#attributes", "ActivityID"])) {
-                    row.insert("ActivityID".into(), v);
-                }
-                if let Some(v) = cell(get(sys, &["Correlation", "#attributes", "RelatedActivityID"]))
-                {
-                    row.insert("RelatedActivityID".into(), v);
-                }
-                if let Some(v) = cell(get(sys, &["Security", "#attributes", "UserID"])) {
-                    row.insert("UserID".into(), v);
-                }
-                row.insert(
-                    "EventData".into(),
-                    match payload {
-                        Some(p) => py_json(p),
-                        None => String::new(),
-                    },
-                );
+                let mut row = evtx_row(&r.data, r.timestamp);
                 row.insert("_status".into(), "ok".into());
                 row.insert("_error".into(), String::new());
                 row.insert(
@@ -594,6 +633,128 @@ pub fn parse_evt_stream(path: &Path, out: &Path, table: &str) -> Result<usize> {
 }
 
 #[cfg(test)]
+mod evtx_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn record_ts() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-10-07T01:02:03Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    /// 5140(공유 접근 감사)의 성공/실패 근거는 Keywords 비트다 — evtx 크레이트가
+    /// 렌더한 원문 그대로 저장되고 임의 해석을 덧붙이지 않아야 한다.
+    #[test]
+    fn evtx_system_keywords_and_scalars_are_preserved_raw() {
+        let data = json!({
+            "Event": {
+                "System": {
+                    "Provider": {"#attributes": {"Name": "Microsoft-Windows-Security-Auditing"}},
+                    "EventID": 5140,
+                    "Level": "0",
+                    "Keywords": "0x8020000000000000",
+                    "Channel": "Security",
+                    "Computer": "HOST-01",
+                    "EventRecordID": 4242,
+                    "Correlation": {"#attributes": {"ActivityID": "{1111-2222}"}},
+                    "Execution": {"#attributes": {"ProcessID": 4, "ThreadID": 88}},
+                    "Security": {"#attributes": {"UserID": "S-1-5-18"}},
+                    "TimeCreated": {"#attributes": {"SystemTime": "2026-10-07T04:05:06.789Z"}}
+                },
+                "EventData": {"ShareName": "C$", "IpAddress": "10.0.0.9"}
+            }
+        });
+        let row = evtx_row(&data, record_ts());
+        assert_eq!(
+            row.get("Keywords").map(String::as_str),
+            Some("0x8020000000000000")
+        );
+        assert_eq!(row.get("EventID").map(String::as_str), Some("5140"));
+        assert_eq!(row.get("Level").map(String::as_str), Some("0"));
+        assert_eq!(row.get("LevelName").map(String::as_str), Some("Information"));
+        assert_eq!(row.get("Channel").map(String::as_str), Some("Security"));
+        assert_eq!(
+            row.get("Provider").map(String::as_str),
+            Some("Microsoft-Windows-Security-Auditing")
+        );
+        assert_eq!(row.get("EventRecordID").map(String::as_str), Some("4242"));
+        assert_eq!(row.get("ProcessID").map(String::as_str), Some("4"));
+        assert_eq!(row.get("ThreadID").map(String::as_str), Some("88"));
+        assert_eq!(row.get("UserID").map(String::as_str), Some("S-1-5-18"));
+        assert_eq!(
+            row.get("ActivityID").map(String::as_str),
+            Some("{1111-2222}")
+        );
+        // 기록 시각은 System/TimeCreated 우선(레코드 헤더 시각이 아니다).
+        assert_eq!(
+            row.get("timestamp").map(String::as_str),
+            Some("2026-10-07 13:05:06.789")
+        );
+        assert_eq!(
+            row.get("EventData").map(String::as_str),
+            Some(r#"{"ShareName": "C$", "IpAddress": "10.0.0.9"}"#)
+        );
+        assert!(!row.contains_key("RelatedActivityID"));
+    }
+
+    /// 감사 실패 Keywords도 같은 원문으로 남고, 구형 래핑(#text)도 풀어 읽는다.
+    #[test]
+    fn evtx_wrapped_keywords_scalar_is_unwrapped_without_translation() {
+        let data = json!({
+            "Event": {
+                "System": {
+                    "EventID": {"#attributes": {"Qualifiers": 0}, "#text": 4625},
+                    "Keywords": {"#attributes": {"Hex": true}, "#text": "0x8010000000000000"},
+                    "Level": "0"
+                }
+            }
+        });
+        let row = evtx_row(&data, record_ts());
+        assert_eq!(row.get("EventID").map(String::as_str), Some("4625"));
+        assert_eq!(
+            row.get("Keywords").map(String::as_str),
+            Some("0x8010000000000000")
+        );
+    }
+
+    /// Keywords 없는 레코드는 0이 아니라 NULL(키 없음)로 남겨야 "감사 실패"로
+    /// 오독되지 않는다. payload 없는 레코드의 EventData는 기존대로 빈 문자열.
+    #[test]
+    fn evtx_record_without_keywords_leaves_the_column_null() {
+        let data = json!({
+            "Event": {
+                "System": {"EventID": 7036, "Channel": "System", "Level": "4"}
+            }
+        });
+        let row = evtx_row(&data, record_ts());
+        assert!(!row.contains_key("Keywords"));
+        assert_eq!(row.get("EventData").map(String::as_str), Some(""));
+        // System/TimeCreated가 없으면 레코드 헤더 시각으로 되돌아간다.
+        assert_eq!(
+            row.get("timestamp").map(String::as_str),
+            Some("2026-10-07 10:02:03.000")
+        );
+    }
+
+    /// UserData만 있는 공급자(예: 방화벽 일부)도 payload를 잃지 않는다.
+    #[test]
+    fn evtx_userdata_payload_is_kept_when_eventdata_is_absent() {
+        let data = json!({
+            "Event": {
+                "System": {"EventID": 2004},
+                "UserData": {"RuleName": "allow-smb"}
+            }
+        });
+        let row = evtx_row(&data, record_ts());
+        assert_eq!(
+            row.get("EventData").map(String::as_str),
+            Some(r#"{"RuleName": "allow-smb"}"#)
+        );
+    }
+}
+
+#[cfg(test)]
 mod evt_tests {
     use super::*;
     use std::path::PathBuf;
@@ -713,6 +874,28 @@ mod evt_tests {
         assert_eq!(
             rows[1].get("LevelName").map(String::as_str),
             Some("AuditFailure")
+        );
+    }
+
+    /// EVENTLOGRECORD에는 Keywords 상당 필드가 없다 — 감사 성공/실패는
+    /// EventType(LevelName)으로만 남고 Keywords는 0이 아니라 NULL이어야 한다.
+    #[test]
+    fn legacy_evt_rows_leave_keywords_null() {
+        let r1 = record(1, 0x0210, 0x08, "Administrator");
+        let mut stream = Vec::new();
+        stream.extend(&r1);
+        stream.extend(eof_record(EVT_HEADER as u32));
+        let file_len = (EVT_HEADER + stream.len()) as u32;
+        let mut data = header(EVT_HEADER as u32, false, file_len);
+        data.extend(stream);
+
+        let rows = parse_to_rows(&data);
+        assert_eq!(rows.len(), 1);
+        // read_table은 NULL을 키 없음으로 돌려준다(빈 문자열과 구분).
+        assert!(!rows[0].contains_key("Keywords"));
+        assert_eq!(
+            rows[0].get("LevelName").map(String::as_str),
+            Some("AuditSuccess")
         );
     }
 
