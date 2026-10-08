@@ -605,8 +605,7 @@ export default function BrowserHistoryView({ dbPath, tableName, hostDir = "", ti
     </main>
     {detail && !aiConvo && !domainStatsOpen && <RowDetailPanel row={detail} columns={Object.keys(detail).filter((key) => key !== "__rowid")} focusedColumn={null} fileBaseName="BrowserActivity" onClose={closeDetail} onNavigate={() => {}} hostDir={hostDir} isBookmarked={isRowBookmarked?.(detail) ?? false} onToggleBookmark={onToggleBookmark && Number.isFinite(rowidOf(detail)) ? () => onToggleBookmark(rowidOf(detail)) : undefined} />}
     {aiConvo && (() => {
-      // 원본 근거가 정확히 한 건일 때만 모달에서 바로 북마크한다 — 여러 건이면
-      // 어느 레코드를 남길지는 증거 상세의 "원본 근거"에서 고른다.
+      // Direct bookmarking requires exactly one source record.
       const target = aiSources.length === 1 && aiSources[0].source_full_path ? aiSources[0] : null;
       const targetRowid = target ? Number(target.source_rowid) : Number.NaN;
       const canBookmark = Boolean(target && onToggleRawRecordBookmark && Number.isSafeInteger(targetRowid));

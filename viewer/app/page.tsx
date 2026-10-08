@@ -713,7 +713,7 @@ export default function Home() {
     const targets = new Map<string, RecordSource>();
     for (const source of sources) targets.set(`${source.source_db}\u0000${source.source_table}\u0000${source.source_rowid}`, source);
     if (targets.size > 1) {
-      setBookmarkError("원본 근거가 여러 건입니다. 증거 상세의 '원본 근거'에서 북마크할 레코드를 고르세요.");
+      setBookmarkError("여러 원본에 연결된 기록은 현재 북마크를 지원하지 않습니다.");
       return;
     }
     const [target] = [...targets.values()];
@@ -817,7 +817,7 @@ export default function Home() {
       // source list; the result list never guesses a representative origin.
       const refs = searchHitRefs(h);
       if (refs.length > 1) {
-        setBookmarkError("원본 근거가 여러 건입니다. 결과를 열어 '원본 근거'에서 북마크할 레코드를 고르세요.");
+        setBookmarkError("여러 원본에 연결된 기록은 현재 북마크를 지원하지 않습니다.");
         return;
       }
       const [ref] = refs;

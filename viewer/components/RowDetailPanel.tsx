@@ -6,11 +6,10 @@ import ChevronRightOutlinedIcon from "@mui/icons-material/ChevronRightOutlined";
 import DescriptionOutlinedIcon from "@mui/icons-material/DescriptionOutlined";
 import FolderOpenOutlinedIcon from "@mui/icons-material/FolderOpenOutlined";
 import LinkOutlinedIcon from "@mui/icons-material/LinkOutlined";
-import SourceOutlinedIcon from "@mui/icons-material/SourceOutlined";
 import ContentCopyOutlinedIcon from "@mui/icons-material/ContentCopyOutlined";
 import { resolveArtifactView, type FieldSpec } from "@/lib/artifactViews";
 import { RecordScopeContext } from "@/lib/recordScope";
-import type { DBRow, FetchLinkedRows, RecordSource } from "@/lib/types";
+import type { DBRow, FetchLinkedRows } from "@/lib/types";
 import type { AccountDirectory } from "@/lib/accountIdentity";
 import { useModalDialog } from "@/lib/useModalDialog";
 import ArtifactDetailView from "./ArtifactDetailView";
@@ -189,31 +188,13 @@ function RawFieldValue({ column, value, focused }: { column: string; value: stri
 }
 
 export default function RowDetailPanel({ row, columns, focusedColumn, evidenceTime, fileBaseName, onClose, onNavigate, onFetchLinkedRows, hostDir, accountDirectory, isBookmarked, onToggleBookmark, variant = "drawer", onToggleFieldBookmark, isFieldBookmarked, relatedEvidence = [] }: RowDetailPanelProps) {
-  // This row's evidence comes from source_records in the same DB; no
-  // `<table>::<rowid>` pointer is inferred from row values (docs-01: record_id
-  // identifies the derived row and one row may have several origins).
-  // Raw facts tables have no source_records and return an empty list.
   const scope = useContext(RecordScopeContext);
   const rowid = Number((row as Record<string, unknown>).__rowid);
   // 좌표는 원시 값으로만 의존한다 — 범위 객체는 렌더마다 새로 만들어질 수 있어
   // 객체 동일성에 의존하면 조회가 끝없이 되풀이된다.
   const scopePath = scope?.fullPath ?? "";
   const scopeTable = scope?.tableName ?? "";
-  const canReadSources = Boolean(scopePath && scopeTable && Number.isSafeInteger(rowid));
-  const [sources, setSources] = useState<RecordSource[] | null>(null);
-  const [sourcesError, setSourcesError] = useState<string | null>(null);
-
-  useEffect(() => {
-    setSources(null);
-    setSourcesError(null);
-    if (!canReadSources) return;
-    let alive = true;
-    window.api.readRecordSources(scopePath, scopeTable, rowid)
-      .then((list) => { if (alive) setSources(list); })
-      // Showing a failed lookup as "no evidence" would change the analysis.
-      .catch(() => { if (alive) setSourcesError("원본 근거를 불러오지 못했습니다."); });
-    return () => { alive = false; };
-  }, [canReadSources, scopePath, scopeTable, rowid]);
+  const canReadChildren = Boolean(scopePath && scopeTable && Number.isSafeInteger(rowid));
 
   const spec = resolveArtifactView(fileBaseName, columns);
   const [showRaw, setShowRaw] = useState(!spec);
@@ -226,7 +207,7 @@ export default function RowDetailPanel({ row, columns, focusedColumn, evidenceTi
   const [children, setChildren] = useState<Record<string, DBRow[]>>({});
   useEffect(() => {
     setChildren({});
-    if (!canReadSources || !childTables?.length) return;
+    if (!canReadChildren || !childTables?.length) return;
     let alive = true;
     Promise.all(childTables.map(async (child) => {
       const childRows = await window.api.readRecordChildren(scopePath, scopeTable, rowid, child.table).catch(() => [] as DBRow[]);
@@ -235,7 +216,7 @@ export default function RowDetailPanel({ row, columns, focusedColumn, evidenceTi
       if (alive) setChildren(Object.fromEntries(entries));
     });
     return () => { alive = false; };
-  }, [canReadSources, scopePath, scopeTable, rowid, childTables]);
+  }, [canReadChildren, scopePath, scopeTable, rowid, childTables]);
 
   // 값이 있는 자식 표만 그린다 — 근거가 없으면 섹션을 만들지 않는다.
   const childSections = (childTables ?? [])
@@ -263,70 +244,6 @@ export default function RowDetailPanel({ row, columns, focusedColumn, evidenceTi
       </section>
     ));
 
-  // Source evidence — a row may have several origins, so list them all. Paths
-  // are backend-verified inside the host root; unverified ones are shown as a
-  // record without an open action rather than with an invented path.
-  const sourceSection = sourcesError || sources?.length ? (
-    <section style={{ padding: "14px 16px 18px", borderBottom: "1px solid var(--border-subtle)" }}>
-      <div className="dfir-section-label" style={{ marginBottom: 7 }}>원본 근거{sources?.length ? ` (${sources.length})` : ""}</div>
-      {sourcesError && <div role="alert" style={{ color: "var(--danger)", fontSize: 11.5 }}>{sourcesError}</div>}
-      {sources?.map((source) => {
-        const sourceRowid = Number(source.source_rowid);
-        const openRecord = scope?.openRecord;
-        const canOpen = Boolean(openRecord && source.source_full_path && Number.isSafeInteger(sourceRowid));
-        const detail = `${source.source_db} · ${source.source_table} #${source.source_rowid}${source.source_field ? ` · ${source.source_field}` : ""}`;
-        const body = (
-          <>
-            <span aria-hidden="true" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 30, height: 30, flexShrink: 0, borderRadius: "var(--radius)", background: "var(--accent-subtle)" }}>
-              <SourceOutlinedIcon sx={{ fontSize: 16, color: "var(--accent)" }} />
-            </span>
-            <span style={{ flex: 1, minWidth: 0, display: "grid", gap: 3 }}>
-              <span style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0 }}>
-                <span style={{ flexShrink: 0, fontSize: 11, fontWeight: 700, color: "var(--accent)", border: "1px solid var(--accent)", borderRadius: "var(--radius)", padding: "0 7px", whiteSpace: "nowrap" }}>{source.source_artifact}</span>
-                {source.source_label && <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 12.5, fontWeight: 650 }}>{source.source_label}</span>}
-              </span>
-              <span style={{ minWidth: 0, fontSize: 11.5, color: "var(--text-faint)", fontFamily: "var(--mono)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{detail}</span>
-              {source.source_file && <span style={{ minWidth: 0, fontSize: 11, color: "var(--text-faint)", fontFamily: "var(--mono)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{source.source_file}</span>}
-            </span>
-          </>
-        );
-        const style: React.CSSProperties = { flex: 1, display: "flex", alignItems: "center", gap: 10, minHeight: 50, padding: "8px 10px", textAlign: "left", background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: "var(--radius)", color: "var(--text)" };
-        const bookmarkSource = scope?.bookmarkSource;
-        const canBookmark = Boolean(bookmarkSource && source.source_full_path && Number.isSafeInteger(sourceRowid));
-        const sourceBookmarked = Boolean(source.source_full_path && scope?.isSourceBookmarked?.(source.source_full_path, source.source_table, sourceRowid));
-        return (
-          <div key={`${source.ordinal}-${source.source_db}-${source.source_rowid}`} style={{ display: "flex", alignItems: "stretch", gap: 6, marginBottom: 6 }}>
-            {canOpen ? (
-              <button type="button" onClick={() => openRecord!(source.source_full_path, source.source_table, sourceRowid)} style={{ ...style, cursor: "pointer", transition: "background .15s ease" }}
-                onMouseEnter={(event) => { event.currentTarget.style.background = "var(--bg-hover)"; }}
-                onMouseLeave={(event) => { event.currentTarget.style.background = "var(--bg-elevated)"; }}>
-                {body}
-                <ChevronRightOutlinedIcon aria-hidden="true" sx={{ color: "var(--text-faint)", fontSize: 17, flexShrink: 0 }} />
-              </button>
-            ) : (
-              <div style={style} title={source.source_full_path ? undefined : "원본 결과 파일을 찾지 못해 열 수 없습니다"}>
-                {body}
-              </div>
-            )}
-            {/* Bookmarks only ever annotate a raw evidence record, so with
-                several origins the analyst picks one here. */}
-            {canBookmark && (
-              <button
-                type="button"
-                className={sourceBookmarked ? "dfir-bookmark-control nm-btn" : "nm-btn"}
-                onClick={() => bookmarkSource!(source.source_full_path, source.source_table, sourceRowid)}
-                title={sourceBookmarked ? "이 원본 레코드 북마크 해제" : "이 원본 레코드 북마크"}
-                aria-label={sourceBookmarked ? "이 원본 레코드 북마크 해제" : "이 원본 레코드 북마크"}
-                style={{ flexShrink: 0, width: 38, display: "grid", placeItems: "center", background: sourceBookmarked ? "var(--bookmark-subtle)" : "var(--bg-elevated)", color: sourceBookmarked ? "var(--bookmark)" : "var(--text-faint)", border: `1px solid ${sourceBookmarked ? "var(--bookmark-border)" : "var(--border)"}`, borderRadius: "var(--radius)", cursor: "pointer", fontSize: 11.5, fontWeight: 700 }}
-              >
-                {sourceBookmarked ? "★" : "☆"}
-              </button>
-            )}
-          </div>
-        );
-      })}
-    </section>
-  ) : null;
 
   return (
     <div
@@ -510,25 +427,13 @@ export default function RowDetailPanel({ row, columns, focusedColumn, evidenceTi
                 </section>
               )}
               {childSections}
-              {sourceSection}
             </>
           ) : (
             <>
-              {/* 출처 고정 표시 — 이 행이 어떤 원본 파일에서 나왔는지.
-                  _source_file(원시 facts의 수집 원본 경로) → source_records가
-                  보관한 수집 원본 파일 → 결과 파일명 순으로, 있는 값만 그대로
-                  보여준다. 없는 값을 지어내지 않는다. */}
-              <div style={{ padding: "10px 16px", borderBottom: "1px solid var(--border-subtle)", display: "grid", gap: 3 }}>
-                <div className="dfir-section-label">원본 파일</div>
-                <div style={{ fontFamily: "var(--mono)", fontSize: 11.5, color: "var(--text-dim)", wordBreak: "break-all" }}>
-                  {row._source_file || sources?.find((source) => source.source_file)?.source_file || fileBaseName}
-                </div>
-              </div>
               {columns.map((col) => (
                 <RawFieldValue key={col} column={col} value={row[col] ?? ""} focused={col === focusedColumn} />
               ))}
               {childSections}
-              {sourceSection}
             </>
           )}
         </div>
