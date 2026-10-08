@@ -4,10 +4,10 @@
 //! write_table. Overview builders are a separate (later) stage.
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::Serialize;
 
 use crate::case_store::{self};
@@ -1008,8 +1008,36 @@ pub fn discover_host_inputs(target: &Path) -> finder::Found {
     found
 }
 
-/// Locate one artifact's evidence files under the target (path/content rules
-/// unchanged from the sequential pipeline). 탐색 중 만난 접근·순회 실패도
+fn discover_registry_hives(target: &Path) -> finder::Found {
+    let (files, errors) = finder::walk_files(target);
+    let mut found = finder::Found { paths: Vec::new(), errors };
+    for path in files {
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        let known = registry::REG_FILENAMES.iter().any(|n| name.eq_ignore_ascii_case(n))
+            || registry::REG_SUFFIXES.iter().any(|suffix| {
+                name.get(name.len().saturating_sub(suffix.len())..)
+                    .is_some_and(|end| end.eq_ignore_ascii_case(suffix))
+            });
+        if known {
+            found.paths.push(path);
+            continue;
+        }
+        // REGF file_type at offset 28: primary=0; transaction logs=1/6.
+        let mut header = [0u8; 32];
+        match File::open(&path).and_then(|mut file| file.read_exact(&mut header)) {
+            Ok(()) if &header[..4] == b"regf" && header[28..32] == [0; 4] => {
+                found.paths.push(path);
+            }
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {}
+            Err(error) => found.errors.push(format!("{}: {}", path.display(), error)),
+        }
+    }
+    found
+}
+
+/// Locate one artifact's evidence files under the target. Registry includes
+/// primary REGF headers regardless of name. 탐색 중 만난 접근·순회 실패도
 /// 함께 반환된다 — 파이프라인이 아티팩트 보고서에 기록해 "발견 0건"과
 /// 구분한다. RegBack 하이브도 별도 증거로 계획에 포함한다(출력명·파생 입력
 /// 구분은 파싱/파생 단계 몫 — 2026-08-31 사용자 확정).
@@ -1024,13 +1052,7 @@ fn discover_artifact_files(name: &str, target: &Path) -> finder::Found {
             all.errors.extend(evt.errors);
             all
         }
-        "Registry" => {
-            let mut all = finder::by_name(target, registry::REG_FILENAMES);
-            let suffixed = finder::by_suffix(target, registry::REG_SUFFIXES);
-            all.paths.extend(suffixed.paths);
-            all.errors.extend(suffixed.errors);
-            all
-        }
+        "Registry" => discover_registry_hives(target),
         "UsnJrnl" => finder::by_name(target, &["$J"]),
         "MFT" => finder::by_name(target, &["$MFT"]),
         "SRUM" => finder::by_name(target, &["SRUDB.dat"]),
@@ -1327,6 +1349,15 @@ fn parse_registry_artifact(
     outcome: &mut ArtifactOutcome,
 ) -> Result<Vec<String>> {
     entry_record_inputs(&mut outcome.entry, paths);
+    // Scoped staging copies prior facts; this artifact owns the whole category.
+    let registry_dir = out_dir.join("REGISTRY");
+    if registry_dir.exists() {
+        std::fs::remove_dir_all(&registry_dir)
+            .with_context(|| format!("레지스트리 이전 스테이지 정리: {}", registry_dir.display()))?;
+    }
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
     // 트랜잭션 로그는 항상 조합해 최신 정합 상태를 파싱한다. 삭제 셀 복구는
     // 비용이 커서 임시로 끈 상태 — 보고서에 그대로 드러낸다.
     if registry::registry_recovery_disabled() {
@@ -1347,14 +1378,12 @@ fn parse_registry_artifact(
     // Every worker writes its own SQLite output, so normal allocated-record
     // parsing remains isolated in live-only mode.
     //
-    // RegBack 하이브도 별도 증거로 파싱하되 출력명에 `_RegBack`을 붙인다 —
-    // facts에는 보존되고, 파생(_OVERVIEW) 단계는 이 접미로 라이브 하이브만
-    // 입력으로 삼아 오래된 값의 이중 표시를 막는다 (2026-08-31 사용자 확정).
+    // RegBack remains separate. Findings exclude it; full exploration keeps it.
     //
     // 하이브별 트랜잭션 로그 목록은 여기서 한 번만 확정한다(파싱 계획 고정) —
     // 입력 기록·logsDiscovered·실제 파서 입력이 같은 스냅샷을 쓴다 (Amcache와
     // 동일). 각 로그는 복구 로그 입력으로 보고서에 남는다.
-    let mut taken = HashSet::new();
+    let mut taken = HashSet::from(["registryinputs".to_string()]);
     let mut jobs: Vec<(PathBuf, Vec<PathBuf>, PathBuf, String)> = Vec::new();
     for p in paths {
         // 사용자 하이브는 `<계정>_NTUSER.DAT` 꼴로 발행한다 — 계정마다 같은
@@ -1385,7 +1414,7 @@ fn parse_registry_artifact(
     let parsed_counts = Mutex::new(Vec::<(PathBuf, String, registry::HiveParseMetrics)>::with_capacity(jobs.len()));
     // (설명, 저장 환경 오류 여부) — 손상 하이브는 건너뛰고, 디스크 부족 같은
     // 저장 오류만 아티팩트 실패로 올린다.
-    let source_failures = Mutex::new(Vec::<(String, bool)>::new());
+    let source_failures = Mutex::new(Vec::<(PathBuf, String, bool)>::new());
     std::thread::scope(|s| {
         for _ in 0..workers {
             s.spawn(|| loop {
@@ -1418,7 +1447,7 @@ fn parse_registry_artifact(
                             emit(&format!("[*] 손상된 하이브 건너뜀: {} ({})", src.display(), e));
                         }
                         if let Ok(mut failures) = source_failures.lock() {
-                            failures.push((format!("{}: {}", src.display(), e), storage));
+                            failures.push((src.clone(), format!("{}: {}", src.display(), e), storage));
                         }
                     }
                 }
@@ -1462,19 +1491,13 @@ fn parse_registry_artifact(
     if let Some(recovery) = outcome.registry_recovery.as_mut() {
         recovery.transaction_logs_applied = any_logs_applied && !any_log_apply_failed;
     }
-    // 손상된 하이브는 건너뛴 것으로 취급한다(파싱 실패 == 손상 아티팩트).
-    // 성공한 하이브 출력은 그대로 발행되고, 건너뛴 사실은 보고서의
-    // registry_hives에만 남는다. 디스크 부족 같은 저장 환경 오류만
-    // 아티팩트 실패(partial)로 올린다.
+    // Corrupted inputs remain visible in both the report and exploration manifest.
+    // Storage failures still fail the artifact.
     let failures = source_failures.into_inner().unwrap_or_default();
     outcome
         .registry_hives
-        .extend(failures.iter().map(|(failure, storage)| RegistryHiveReport {
-            source_path: failure
-                .split_once(": ")
-                .map(|(path, _)| path)
-                .unwrap_or(failure)
-                .to_string(),
+        .extend(failures.iter().map(|(source, failure, storage)| RegistryHiveReport {
+            source_path: source.to_string_lossy().to_string(),
             status: if *storage { "failed" } else { "skipped_corrupted" }.to_string(),
             row_count: 0,
             recovery_logs_discovered: 0,
@@ -1489,8 +1512,8 @@ fn parse_registry_artifact(
         }));
     let storage_failures: Vec<&String> = failures
         .iter()
-        .filter(|(_, storage)| *storage)
-        .map(|(failure, _)| failure)
+        .filter(|(_, _, storage)| *storage)
+        .map(|(_, failure, _)| failure)
         .collect();
     if !storage_failures.is_empty() {
         anyhow::bail!(
@@ -1503,6 +1526,30 @@ fn parse_registry_artifact(
                 .join("; ")
         );
     }
+    let mut input_rows = Vec::with_capacity(outcome.registry_hives.len());
+    for (source, logs, _, relative) in &jobs {
+        let source_text = source.to_string_lossy();
+        let Some(report) = outcome.registry_hives.iter()
+            .find(|report| report.source_path == source_text) else { continue };
+        let mut row = Row::new();
+        row.insert("source_file".into(), source_text.into_owned());
+        row.insert("facts_db".into(), relative.clone());
+        row.insert("hive_name".into(), source.file_name().unwrap_or_default().to_string_lossy().into_owned());
+        row.insert("status".into(), report.status.clone());
+        row.insert("row_count".into(), report.row_count.to_string());
+        row.insert("error".into(), report.error.clone().unwrap_or_default());
+        row.insert("logs_discovered".into(), logs.len().to_string());
+        row.insert("logs_applied".into(), report.recovery_log_count.to_string());
+        row.insert("log_error".into(), report.recovery_log_apply_error.clone().unwrap_or_default());
+        input_rows.push(row);
+    }
+    const INPUT_FIELDS: &[&str] = &[
+        "source_file", "facts_db", "hive_name", "status", "row_count",
+        "error", "logs_discovered", "logs_applied", "log_error",
+    ];
+    let manifest = "REGISTRY/RegistryInputs.sqlite";
+    write_table(&out_dir.join(manifest), "RegistryInputs", &input_rows, INPUT_FIELDS)?;
+    outputs.push(manifest.to_string());
     outputs.sort();
     Ok(outputs)
 }
@@ -1921,7 +1968,8 @@ fn parse_browser_history_artifact(
         // 브라우저를 주장하지 않고 종전처럼 계정명만 쓴다 — 같은 계정에
         // 여러 History가 있을 때 어느 브라우저인지 산출물 이름에 남기기
         // 위한 것(T8). 원본 경로는 parse_report 입력 목록에 보존된다.
-        let base = match browser_cache::browser_of(p).or_else(|| history_content_browser(p)) {
+        let browser = browser_cache::browser_of(p).or_else(|| history_content_browser(p));
+        let base = match browser {
             Some(browser) => format!("{}_{}", acct, browser),
             None => acct,
         };
@@ -1932,6 +1980,8 @@ fn parse_browser_history_artifact(
             // 테이블 단위 스트리밍 기록 — 전체 행을 메모리에 쌓지 않는다.
             let (record_count, wrote) = browser_history::parse_history_stream(p, &sides, &out)?;
             if wrote {
+                crate::browser_input::write_input(&out,
+                    &crate::browser_input::BrowserInput::from_source(p, "history", browser))?;
                 emit(&format!("[+] {} rows -> {}", record_count, out.display()));
             }
             Ok((record_count, wrote))
@@ -2001,7 +2051,12 @@ fn parse_browser_cache_artifact(
                 browser_cache::CACHE_FIELD_ORDER,
             )?;
             browser_cache::parse_cache_index(&index_path, &mut |row| writer.push(row))?;
-            writer.finish()
+            let count = writer.finish()?;
+            if count > 0 {
+                crate::browser_input::write_input(&out,
+                    &crate::browser_input::BrowserInput::from_source(&index_path, "cache", None))?;
+            }
+            Ok(count)
         })?;
         match unit {
             Some(0) => {
@@ -2071,6 +2126,10 @@ fn parse_ie_webcache_artifact(
             if let Some(writer) = downloads.take() {
                 total += writer.finish()?;
             }
+            if total > 0 {
+                crate::browser_input::write_input(&out,
+                    &crate::browser_input::BrowserInput::from_source(p, "ie_webcache", Some("IE")))?;
+            }
             Ok(total)
         })?;
         match unit {
@@ -2095,53 +2154,33 @@ fn parse_ie_indexdat_artifact(
 ) -> Result<Vec<String>> {
     entry_record_inputs(entry, paths);
     let mut outputs = Vec::new();
-    // 계정 하나에 index.dat가 여러 개(History.IE5/Content.IE5/Cookies/일별
-    // 컨테이너) — 계정별 출력 SQLite 하나로 모은다. 미지원 버전·손상 파일은
-    // 그 파일만 건너뛰고 경고를 남긴다.
-    let mut by_account: std::collections::BTreeMap<String, Vec<&PathBuf>> =
-        std::collections::BTreeMap::new();
+    let mut taken = HashSet::new();
     for p in paths {
-        by_account
-            .entry(ie_webcache::ie_account(p))
-            .or_default()
-            .push(p);
-    }
-    for (acct, files) in by_account {
-        let relative = format!("BROWSER/{acct}_IE_IndexDat.sqlite");
+        let acct = ie_webcache::ie_account(p);
+        let name = uniq_name(&format!("{acct}_IE_IndexDat"), &mut taken);
+        let relative = format!("BROWSER/{name}.sqlite");
         let out = out_dir.join(&relative);
-        type Unit = (usize, Vec<(PathBuf, usize)>, Vec<(PathBuf, String)>);
-        let unit = run_unit_or_skip(&format!("index.dat[{acct}]"), &[&out], || -> Result<Unit> {
+        let unit = run_unit_or_skip(&p.display().to_string(), &[&out], || -> Result<usize> {
             let mut writer = crate::sqlite::StreamWriter::create(
                 &out,
                 ie_indexdat::TABLE,
                 ie_indexdat::FIELD_ORDER,
                 ie_indexdat::FIELD_ORDER,
             )?;
-            let mut per_source: Vec<(PathBuf, usize)> = Vec::new();
-            let mut failures: Vec<(PathBuf, String)> = Vec::new();
-            for p in &files {
-                match ie_indexdat::parse_index_dat(p, &acct, &mut |row| writer.push(row)) {
-                    Ok(nrows) => per_source.push(((*p).clone(), nrows)),
-                    Err(error) => {
-                        emit(&format!("[!] index.dat 건너뜀 {}: {}", p.display(), error));
-                        failures.push(((*p).clone(), error.to_string()));
-                    }
-                }
+            ie_indexdat::parse_index_dat(p, &acct, &mut |row| writer.push(row))?;
+            let count = writer.finish()?;
+            if count > 0 {
+                crate::browser_input::write_input(&out,
+                    &crate::browser_input::BrowserInput::from_source(p, "ie_indexdat", Some("IE")))?;
             }
-            Ok((writer.finish()?, per_source, failures))
+            Ok(count)
         })?;
-        if let Some((total, per_source, failures)) = unit {
-            for (source, count) in per_source {
-                entry_record_input_count(entry, &source, count);
-            }
-            // 실패한 파일은 사유와 함께 입력에 남는다 — 0건 성공과 구분.
-            for (source, reason) in failures {
-                entry_record_input_error(entry, &source, &reason);
-            }
-            if total == 0 {
+        if let Some(count) = unit {
+            entry_record_input_count(entry, p, count);
+            if count == 0 {
                 let _ = std::fs::remove_file(&out);
             } else {
-                emit(&format!("[+] {} rows -> {}", total, out.display()));
+                emit(&format!("[+] {} rows -> {}", count, out.display()));
                 outputs.push(relative);
             }
         }
@@ -2763,6 +2802,63 @@ mod persistent_log_tests {
                 .unwrap_or_default()
                 .as_nanos(),
         ))
+    }
+
+    #[test]
+    fn indexdat_sources_with_the_same_account_remain_separate_inputs() {
+        let _guard = PIPELINE_LOG_TEST_LOCK.lock();
+        let root = temporary_directory("indexdat-inputs");
+        let mut bytes = vec![0u8; 0x180];
+        let magic = b"Client UrlCache MMF Ver 5.2\0";
+        bytes[..magic.len()].copy_from_slice(magic);
+        bytes[0x80..0x84].copy_from_slice(b"REDR");
+        bytes[0x84..0x88].copy_from_slice(&1u32.to_le_bytes());
+        let url = b"https://example.test/";
+        bytes[0x90..0x90 + url.len()].copy_from_slice(url);
+        let paths: Vec<_> = ["History.IE5", "Content.IE5"].iter()
+            .map(|folder| root.join("BROWSER/analyst/IE").join(folder).join("index.dat"))
+            .collect();
+        for path in &paths {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, &bytes).unwrap();
+        }
+        let out = root.join("output");
+        let mut outcome = ArtifactOutcome::new("IEIndexDat");
+        let outputs = parse_ie_indexdat_artifact(&paths, &out, &mut outcome.entry).unwrap();
+        assert_eq!(outputs.len(), 2);
+        for (relative, source) in outputs.iter().zip(&paths) {
+            let conn = rusqlite::Connection::open(out.join(relative)).unwrap();
+            let input = crate::browser_input::read_input(&conn).unwrap();
+            assert_eq!(input.source_file.as_deref(), source.to_str());
+            assert_eq!(input.account_label.as_deref(), Some("analyst"));
+            assert_eq!(conn.query_row("SELECT count(*) FROM IEIndexDat_Records", [],
+                |row| row.get::<_, i64>(0)).unwrap(), 1);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn registry_discovery_keeps_all_primary_hives_and_known_corrupt_inputs() {
+        let root = temporary_directory("registry-discovery");
+        std::fs::create_dir_all(root.join("RegBack")).unwrap();
+        let mut header = [0u8; 32];
+        header[..4].copy_from_slice(b"regf");
+        for name in ["COMPONENTS", "renamed-evidence.bin", "RegBack/SYSTEM"] {
+            std::fs::write(root.join(name), header).unwrap();
+        }
+        header[28..32].copy_from_slice(&1u32.to_le_bytes());
+        std::fs::write(root.join("other.LOG1"), header).unwrap();
+        std::fs::write(root.join("SOFTWARE"), b"corrupt").unwrap();
+        std::fs::write(root.join("unrelated.txt"), b"not a hive").unwrap();
+        let found = discover_artifact_files("Registry", &root);
+        let mut relative: Vec<_> = found.paths.iter().map(|p| p.strip_prefix(&root).unwrap().to_path_buf()).collect();
+        relative.sort();
+        let mut expected: Vec<_> = ["COMPONENTS", "renamed-evidence.bin", "RegBack/SYSTEM", "SOFTWARE"]
+            .iter().map(PathBuf::from).collect();
+        expected.sort();
+        assert_eq!(relative, expected);
+        assert!(found.errors.is_empty());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -3392,6 +3488,9 @@ mod persistent_log_tests {
         std::fs::write(target_dir.join("SOFTWARE"), b"not a registry hive").unwrap();
         std::fs::write(target_dir.join("SRUDB.dat"), b"not an ESE database").unwrap();
         std::fs::write(target_dir.join("Amcache.hve"), b"not an amcache hive").unwrap();
+        let mut reserved_name = [0u8; 32];
+        reserved_name[..4].copy_from_slice(b"regf");
+        std::fs::write(target_dir.join("RegistryInputs"), reserved_name).unwrap();
         let case = case_store::create_case("case", "2026-08-23 01:02:03", &cases_dir).unwrap();
         let host = case_store::create_host(
             &case.id,
@@ -3401,6 +3500,20 @@ mod persistent_log_tests {
             &cases_dir,
         )
         .unwrap();
+        let host_dir = case_store::host_dir(&cases_dir, &case.id, &host.id);
+        let stale = host_dir.join("REGISTRY/RemovedInput.sqlite");
+        let mut old_key: Row = registry::REG_FIELD_ORDER.iter()
+            .map(|field| ((*field).to_string(), String::new())).collect();
+        for (field, value) in [
+            ("entry_kind", "key"), ("key_offset", "4128"), ("key_name", "ROOT"),
+            ("key_path", "\\ROOT"), ("key_read_status", "ok"),
+            ("key_subkey_count", "0"), ("key_value_count", "0"), ("_recovery", "live"),
+            ("_source_file", "C:\\removed\\SOFTWARE"),
+        ] {
+            old_key.insert(field.into(), value.into());
+        }
+        write_table(&stale, "Registry", &[old_key], registry::REG_FIELD_ORDER).unwrap();
+        crate::derived::stamp_facts_generation(&stale, "previous-registry-generation").unwrap();
         let mut only = HashSet::new();
         only.insert("Registry".to_string());
         only.insert("SRUM".to_string());
@@ -3410,7 +3523,7 @@ mod persistent_log_tests {
         run_host_with_log_id(&case.id, &host.id, &cases_dir, Some(only), Some(run_id))
             .expect("skipped corrupted sources must not fail the run");
 
-        let host_dir = case_store::host_dir(&cases_dir, &case.id, &host.id);
+        assert!(!stale.exists(), "A removed input must not survive Registry reparsing");
         let report: serde_json::Value =
             serde_json::from_slice(&std::fs::read(host_dir.join("parse_report.json")).unwrap())
                 .unwrap();
@@ -3422,9 +3535,11 @@ mod persistent_log_tests {
                 .expect("artifact entry");
             assert_eq!(
                 entry["status"], "completed",
-                "{artifact}: a skipped corrupted source completes with no output"
+                "{artifact}: a skipped corrupted source must not fail the run"
             );
-            assert!(entry.get("outputs").is_none() || entry["outputs"].as_array().unwrap().is_empty());
+            if artifact != "Registry" {
+                assert!(entry.get("outputs").is_none() || entry["outputs"].as_array().unwrap().is_empty());
+            }
         }
         // 통합 타임라인은 sqlite 단일 경로다 — 파싱은 구 JSON 캐시를 만들지
         // 않는다(대형 호스트에서 전량 적재·정렬·직렬화가 다시 일어나지 않음).
@@ -3447,6 +3562,31 @@ mod persistent_log_tests {
         assert!(report["registryHives"]
             .as_array()
             .is_some_and(|hives| hives.iter().any(|hive| hive["status"] == "skipped_corrupted")));
+        let inputs = rusqlite::Connection::open(
+            host_dir.join("REGISTRY/RegistryInputs.sqlite"),
+        ).unwrap();
+        let failed_hive: (String, String, String, String) = inputs.query_row(
+            "SELECT source_file,status,row_count,error FROM RegistryInputs WHERE hive_name='SOFTWARE'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).unwrap();
+        assert_eq!(failed_hive.0, target_dir.join("SOFTWARE").to_string_lossy());
+        assert_eq!(failed_hive.1, "skipped_corrupted");
+        assert_eq!(failed_hive.2, "0");
+        assert!(!failed_hive.3.is_empty(), "Unreadable input must retain its error");
+        let reserved_facts: String = inputs.query_row(
+            "SELECT facts_db FROM RegistryInputs WHERE hive_name='RegistryInputs'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(reserved_facts, "REGISTRY/RegistryInputs_2.sqlite");
+        drop(inputs);
+        let explorer = rusqlite::Connection::open(host_dir.join("_OVERVIEW/RegistryExplorer.sqlite")).unwrap();
+        let inventory: (i64, i64) = explorer.query_row(
+            "SELECT COUNT(*),SUM(key_count) FROM RegistryHives", [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(inventory, (2, 0));
+        drop(explorer);
         // 손상 Amcache 건너뜀도 경로·오류와 함께 영구 보고서에 남아야
         // 0건 결과와 구분된다.
         let amcache_hive = report["amcacheHives"]

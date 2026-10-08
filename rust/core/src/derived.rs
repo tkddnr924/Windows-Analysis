@@ -11,6 +11,9 @@ pub mod ancillary;
 pub mod schema;
 
 mod builders;
+mod browser_activity;
+mod ai_conversations;
+mod registry_explorer;
 mod stream;
 mod usn;
 mod path_candidates;
@@ -458,6 +461,11 @@ impl DerivedDb {
         self.spec
     }
 
+    /// 같은 생성 트랜잭션 안에서 이미 쓴 행을 되읽어 내부 참조를 확정한다.
+    pub fn conn(&self) -> &Connection {
+        &self.conn
+    }
+
     fn insert(&mut self, table: &str, columns: &[&str], values: &[Cell]) -> Result<()> {
         debug_assert_eq!(columns.len(), values.len(), "{table} 컬럼 수 불일치");
         let sql = format!(
@@ -783,7 +791,7 @@ fn validate_lineage(out_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Build all 21 schemas, including empty results; propagate generation failures.
+/// Build all 22 schemas, including empty results; propagate generation failures.
 pub fn build_all(
     out_dir: &Path,
     target: &Path,
@@ -817,6 +825,12 @@ pub fn build_all(
     for (name, rows) in builders::build_registry_backed(&ctx, &registry, &events)? {
         report.push((name, rows));
     }
+    // 전수 레지스트리 저장은 선별 판정 뒤에 만든다 — 퀵 접근 관계가
+    // RegistryFindings의 원본 좌표를 그대로 읽어 연결하기 때문이다.
+    report.push((
+        registry_explorer::DB_NAME.to_string(),
+        registry_explorer::build(&ctx)?,
+    ));
     drop(events);
     drop(registry);
     for (name, rows) in stream::build_streaming(&ctx)? {
@@ -841,10 +855,12 @@ mod tests {
 
     #[test]
     fn every_documented_database_has_a_spec() {
-        assert_eq!(schema::SPECS.len(), 21);
+        assert_eq!(schema::SPECS.len(), 22);
         for spec in schema::SPECS {
             assert!(!spec.columns.is_empty(), "{} 컬럼 없음", spec.name);
-            if spec.name != "Metadata" {
+            // metadata는 호스트 사실, RegistryExplorer는 하이브 트리라서
+            // 사건 공통 컬럼 계약을 쓰지 않는다 — 나머지 20개는 모두 쓴다.
+            if !matches!(spec.name, "Metadata" | "RegistryExplorer") {
                 assert!(
                     spec.columns.starts_with(COMMON_COLUMNS),
                     "{} 공통 컬럼 누락",
@@ -975,15 +991,32 @@ mod tests {
     #[test]
     fn target_accounts_store_role_matched_events_and_complete_evidence() {
         let (out_dir, target) = fixture("target-account-events");
-        let registry = facts_db(&out_dir, "REGISTRY/SOFTWARE.sqlite",
-            "CREATE TABLE Registry(last_write TEXT,key_path TEXT,value_name TEXT,value_type TEXT,
-             value_data TEXT,_recovery TEXT,_source_file TEXT);");
+        let registry = registry_explorer::fixture::write_hive(
+            &out_dir,
+            "SOFTWARE.sqlite",
+            "C:\\Windows\\System32\\config\\SOFTWARE",
+            &[],
+        );
         let registry = Connection::open(registry).unwrap();
-        for (sid, path) in [("S-1-5-18", r"C:\Windows\System32\config\systemprofile"),
-            ("S-1-5-21-11-22-33-1001", r"C:\Users\Ghost")] {
-            registry.execute("INSERT INTO Registry VALUES ('2026-01-01 00:00:00.000',?1,
-                'ProfileImagePath','REG_SZ',?2,'live','SOFTWARE')",
-                rusqlite::params![format!(r"\ROOT\Microsoft\Windows NT\CurrentVersion\ProfileList\{sid}"),path]).unwrap();
+        for (index, (sid, path)) in [("S-1-5-18", r"C:\Windows\System32\config\systemprofile"),
+            ("S-1-5-21-11-22-33-1001", r"C:\Users\Ghost")].into_iter().enumerate() {
+            let key_path = format!(r"\ROOT\Microsoft\Windows NT\CurrentVersion\ProfileList\{sid}");
+            registry.execute(
+                "INSERT INTO Registry(last_write,key_path,value_name,value_type,value_data,
+                 _recovery,_source_file,entry_kind,key_offset,parent_key_offset,key_name,
+                 key_subkey_count,key_value_count,key_read_status,key_read_error,value_offset,
+                 value_name_raw,value_type_code,value_data_hex,value_data_text,value_read_status,
+                 value_read_error)
+                 VALUES ('2026-01-01 00:00:00.000',?1,'ProfileImagePath','REG_SZ',?2,'live',
+                 'C:\\Windows\\System32\\config\\SOFTWARE','value',?3,'4096','ProfileList',
+                 '0','1','ok','',?4,'ProfileImagePath','1',?5,?2,'ok','')",
+                rusqlite::params![
+                    key_path,
+                    path,
+                    format!("{}", 8192 + index * 4096),
+                    format!("{}", 9000 + index),
+                    crate::hex::hex_lower(path.as_bytes()),
+                ]).unwrap();
         }
         drop(registry);
         let event_path = facts_db(&out_dir, "EVENTLOG/Security.sqlite",
@@ -1134,7 +1167,7 @@ mod tests {
     fn build_all_publishes_every_database_even_with_no_evidence() {
         let (out_dir, target) = fixture("empty");
         let report = build_all(&out_dir, &target, "host-1", "ds-1").unwrap();
-        assert_eq!(report.len(), 21);
+        assert_eq!(report.len(), 22);
         for (index, spec) in schema::SPECS.iter().enumerate() {
             assert_eq!(report[index].0, spec.name, "보고 순서는 문서 순서다");
             let conn = open(&out_dir, spec.name);

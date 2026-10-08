@@ -685,7 +685,7 @@ pub(super) fn build_registry_backed(
         ("RegistryFindings".into(), registry_findings(ctx, registry)?),
         ("TargetInfo".into(), target_info(ctx, registry, events)?),
         ("PathReferences".into(), path_references(ctx, registry)?),
-        ("BrowserActivity".into(), browser_activity(ctx)?),
+        ("BrowserActivity".into(), super::browser_activity::build(ctx)?),
     ])
 }
 
@@ -1125,57 +1125,3 @@ fn path_references(ctx: &Ctx, registry: &RegistryOverviewCache) -> Result<usize>
     db.finish()
 }
 
-// --- BrowserActivity --------------------------------------------------------
-
-fn browser_activity(ctx: &Ctx) -> Result<usize> {
-    let spec = spec_of("BrowserActivity");
-    let mut db = DerivedDb::create(&ctx.overview_dir(), "BrowserActivity")?;
-    for row in overview::build_browser_history(ctx.out_dir) {
-        let kind = g(&row, "kind");
-        let account = g(&row, "account");
-        let status = g(&row, "status");
-        let mut rec = ctx.record(spec);
-        let timestamp_kind = match kind {
-            "visit" => "방문 시각",
-            "download" => "다운로드 시작 시각",
-            _ => "캐시 관찰 시각",
-        };
-        rec.timestamp(g(&row, "timestamp"), timestamp_kind);
-        rec.set("event_type", text(kind));
-        rec.account(account, &ctx.meta);
-        rec.set("browser", text(g(&row, "browser")));
-        rec.set("title", text(g(&row, "title")));
-        rec.set("url", text(g(&row, "url")));
-        rec.set("url_raw", text(g(&row, "url_raw")));
-        rec.set("visit_count", int(g(&row, "visit_count")));
-        rec.set("typed_count", int(g(&row, "typed_count")));
-        rec.set("detail", text(g(&row, "detail")));
-        rec.set("size", text(g(&row, "size")));
-        rec.set("size_bytes", int(g(&row, "size_bytes")));
-        rec.set("mime", text(g(&row, "mime")));
-        rec.set("danger", text(g(&row, "danger")));
-        rec.set("source_url", text(g(&row, "source_url")));
-        rec.set("status", text(status));
-        rec.set("http_status", int(status));
-        rec.set("cache_key", text(g(&row, "cache_key")));
-        rec.set("cache_body_recovered", flag(g(&row, "cache_body_recovered")));
-        if kind == "download" {
-            let path = g(&row, "detail");
-            rec.set("download_path", text(path));
-            rec.set(
-                "download_path_resolved",
-                ctx.meta.resolve_path(path, sid_of(account)),
-            );
-        }
-        rec.source(source_from_parts(
-            ctx,
-            g(&row, "__source_db"),
-            g(&row, "__source_table"),
-            g(&row, "__source_rowid"),
-            nz(g(&row, "_source_file")),
-            kind,
-        )?);
-        db.write(rec)?;
-    }
-    db.finish()
-}

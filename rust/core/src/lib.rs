@@ -1,6 +1,7 @@
 //! Evidence parsers and typed, provenance-linked overview generation.
 mod account_events;
 pub mod ai_activity;
+pub mod browser_input;
 pub mod case_store;
 pub mod finder;
 pub mod hex;

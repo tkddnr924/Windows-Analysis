@@ -13,17 +13,17 @@ use crate::sqlite::Row;
 /// Read an entire table as Vec<Row> (TEXT cells; NULL -> absent key). Returns
 /// empty if the DB/table is missing.
 pub fn read_table(db: &Path, table: &str) -> Vec<Row> {
-    read_table_inner(db, table, false)
+    read_table_inner(db, table, false, None)
 }
 
 /// Read a table together with each SQLite rowid. 파생은 이 rowid로 원본 행을
 /// 가리키는 근거(source_records)를 만든다 — 추가 컬럼(`__source_rowid`)은
 /// 내부 식별용이며 분석가에게 보여 주는 데이터가 아니다.
 pub fn read_table_with_rowid(db: &Path, table: &str) -> Vec<Row> {
-    read_table_inner(db, table, true)
+    read_table_inner(db, table, true, None)
 }
 
-fn read_table_inner(db: &Path, table: &str, include_rowid: bool) -> Vec<Row> {
+fn read_table_inner(db: &Path, table: &str, include_rowid: bool, fields: Option<&[&str]>) -> Vec<Row> {
     if !db.exists() {
         return Vec::new();
     }
@@ -40,7 +40,10 @@ fn read_table_inner(db: &Path, table: &str, include_rowid: bool) -> Vec<Row> {
         Ok(s) => s,
         Err(_) => return Vec::new(),
     };
-    let cols: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
+    let cols: Vec<(usize, String)> = stmt.column_names().iter().enumerate()
+        .filter(|(_, name)| fields.is_none_or(|fields| fields.contains(name)))
+        .map(|(index, name)| (index, (*name).to_string()))
+        .collect();
     let mut out = Vec::new();
     let mut q = match stmt.query([]) {
         Ok(q) => q,
@@ -48,8 +51,8 @@ fn read_table_inner(db: &Path, table: &str, include_rowid: bool) -> Vec<Row> {
     };
     while let Ok(Some(r)) = q.next() {
         let mut row = Row::new();
-        for (i, c) in cols.iter().enumerate() {
-            let v = match r.get_ref(i) {
+        for (i, c) in &cols {
+            let v = match r.get_ref(*i) {
                 Ok(ValueRef::Null) => continue,
                 Ok(ValueRef::Text(t)) => String::from_utf8_lossy(t).into_owned(),
                 Ok(ValueRef::Integer(n)) => n.to_string(),
@@ -3131,556 +3134,6 @@ pub fn build_powershell_history_with_events(
     rows
 }
 
-// --- BrowserActivity ("BrowserActivity") — visits + downloads + cache ---
-pub const BH_KEYS: &[&str] = &[
-    "account",
-    "kind",
-    "timestamp",
-    "title",
-    "url",
-    "url_raw",
-    "visit_count",
-    "typed_count",
-    "detail",
-    "size",
-    "size_bytes",
-    "mime",
-    "danger",
-    "source_url",
-    "status",
-    "cache_key",
-    "cache_body_recovered",
-    "_source_file",
-];
-/// BrowserActivity 행의 출처 표기·유입 흐름 출처 고정에 쓰는 호스트 상대
-/// 경로("BROWSER/<파일>.sqlite"). 파생은 스테이징 트리에서 만들어지므로 절대
-/// 경로를 남기면 발행 후 사라지는 임시 경로가 증거 표기에 남는다.
-fn browser_rel(db: &Path) -> String {
-    format!(
-        "BROWSER/{}",
-        db.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()
-    )
-}
-
-fn bh_row(pairs: &[(&str, String)]) -> Row {
-    let mut r = Row::new();
-    for k in BH_KEYS {
-        r.insert((*k).to_string(), String::new());
-    }
-    for (k, v) in pairs {
-        r.insert((*k).to_string(), v.clone());
-    }
-    r
-}
-
-/// Chrome/WebKit time = microseconds since 1601-01-01 UTC -> KST display.
-fn chrome_time(value: &str) -> String {
-    let v: i64 = match value.trim().parse() {
-        Ok(v) => v,
-        Err(_) => return String::new(),
-    };
-    if v <= 0 {
-        return String::new();
-    }
-    match v.checked_mul(10) {
-        Some(ticks) => crate::time::fmt_filetime(ticks),
-        None => String::new(),
-    }
-}
-
-/// urllib.parse.unquote — percent-decode %XX as UTF-8 (errors=replace); '+' is
-/// left as-is (unquote, not unquote_plus). Non-%XX text passes through.
-fn url_decode(url: &str) -> String {
-    if url.is_empty() {
-        return String::new();
-    }
-    let b = url.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(b.len());
-    let mut i = 0;
-    let hexval = |c: u8| -> Option<u8> {
-        match c {
-            b'0'..=b'9' => Some(c - b'0'),
-            b'a'..=b'f' => Some(c - b'a' + 10),
-            b'A'..=b'F' => Some(c - b'A' + 10),
-            _ => None,
-        }
-    };
-    while i < b.len() {
-        if b[i] == b'%' && i + 2 < b.len() {
-            if let (Some(h), Some(l)) = (hexval(b[i + 1]), hexval(b[i + 2])) {
-                out.push(h << 4 | l);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(b[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-fn human_bytes(value: &str) -> String {
-    let n: i64 = match value.trim().parse() {
-        Ok(v) => v,
-        Err(_) => return String::new(),
-    };
-    if n < 0 {
-        return String::new();
-    }
-    let units = ["B", "KB", "MB", "GB", "TB"];
-    let mut f = n as f64;
-    for (idx, u) in units.iter().enumerate() {
-        if f < 1024.0 || idx == units.len() - 1 {
-            return if *u == "B" {
-                format!("{} {}", f as i64, u)
-            } else {
-                format!("{:.1} {}", f, u)
-            };
-        }
-        f /= 1024.0;
-    }
-    format!("{} B", n)
-}
-
-/// 파일 stem에서 첫 번째로 맞는 접미를 떼어 계정명을 복원한다 — 산출물
-/// 이름이 `<계정>[_<브라우저>][_Cache]` 꼴이므로(T8 브라우저 표기), 접미
-/// 목록에는 브라우저 변형 전부가 들어온다.
-fn browser_sources(
-    out_dir: &Path,
-    category: &str,
-    suffixes: &[&str],
-) -> Vec<(String, std::path::PathBuf)> {
-    let dir = out_dir.join(category);
-    let mut files: Vec<_> = match std::fs::read_dir(&dir) {
-        Ok(rd) => rd
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().map(|x| x == "sqlite").unwrap_or(false))
-            .collect(),
-        Err(_) => return Vec::new(),
-    };
-    files.sort();
-    files
-        .into_iter()
-        .map(|p| {
-            let stem = p
-                .file_stem()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_default();
-            let account = suffixes
-                .iter()
-                .find_map(|suffix| stem.strip_suffix(suffix))
-                .unwrap_or(&stem)
-                .to_string();
-            (account, p)
-        })
-        .collect()
-}
-
-/// CacheEntries에서 브라우저 활동 개요가 쓰는 메타데이터 컬럼만 읽는다.
-/// body_b64는 본문 존재 여부만 필요하므로 플래그("1"/"")로 축약해, 다중 MB
-/// base64 본문이 개요 생성 중 메모리에 올라오지 않게 한다. 없는 컬럼은 빈 값.
-fn read_cache_entry_meta(db: &Path) -> Vec<Row> {
-    const META_COLUMNS: &[&str] = &[
-        "account",
-        "url",
-        "response_time",
-        "creation_time",
-        "content_length",
-        "body_size",
-        "content_type",
-        "status",
-        "cache_key",
-        "_source_file",
-    ];
-    if !db.exists() {
-        return Vec::new();
-    }
-    let con = match Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY) {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
-    };
-    let mut present: Vec<String> = Vec::new();
-    if let Ok(mut stmt) = con.prepare("SELECT name FROM pragma_table_info('CacheEntries')") {
-        if let Ok(mut q) = stmt.query([]) {
-            while let Ok(Some(r)) = q.next() {
-                if let Ok(name) = r.get::<_, String>(0) {
-                    present.push(name);
-                }
-            }
-        }
-    }
-    // 원본 연결에는 실제 rowid가 필요하다 — 메타 조회에서 함께 읽는다.
-    let mut select: Vec<String> = vec!["CAST(rowid AS TEXT)".to_string()];
-    let mut keys: Vec<&str> = vec!["__source_rowid"];
-    for column in META_COLUMNS {
-        if present.iter().any(|name| name == column) {
-            select.push(format!("\"{}\"", column));
-            keys.push(column);
-        }
-    }
-    if present.iter().any(|name| name == "body_b64") {
-        select.push("CASE WHEN \"body_b64\" IS NULL OR \"body_b64\" = '' THEN '' ELSE '1' END".to_string());
-        keys.push("body_b64");
-    }
-    if select.is_empty() {
-        return Vec::new();
-    }
-    let mut stmt = match con.prepare(&format!(
-        "SELECT {} FROM \"CacheEntries\"",
-        select.join(", ")
-    )) {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
-    };
-    let mut out = Vec::new();
-    let mut q = match stmt.query([]) {
-        Ok(q) => q,
-        Err(_) => return Vec::new(),
-    };
-    while let Ok(Some(r)) = q.next() {
-        let mut row = Row::new();
-        for (i, key) in keys.iter().enumerate() {
-            let value: String = r.get::<_, Option<String>>(i).ok().flatten().unwrap_or_default();
-            row.insert((*key).to_string(), value);
-        }
-        out.push(row);
-    }
-    out
-}
-
-/// IE 방문 URL은 "Visited: <계정>@<URL>" 또는 "<계정>@<URL>" 형태로
-/// 저장된다 — 표시·도메인 집계용 url은 실제 URL만 남긴다 (원문은 url_raw).
-/// ftp://user@host 처럼 '@' 앞에 스킴·경로가 있는 정상 URL은 건드리지 않는다.
-fn ie_visit_url(raw: &str) -> String {
-    let s = raw.trim();
-    let s = s.strip_prefix("Visited:").map(str::trim).unwrap_or(s);
-    match s.split_once('@') {
-        Some((head, rest)) if !head.contains('/') && !head.contains(':') => rest.to_string(),
-        _ => s.to_string(),
-    }
-}
-
-/// iedownload 메타데이터(" | " 구분 세그먼트)에서 원본 URL을 찾는다.
-/// http(s) 세그먼트가 없으면 원래 값(iedownload:{GUID})을 그대로 쓴다.
-fn ie_download_url(metadata: &str, fallback: &str) -> String {
-    match metadata.rfind("http") {
-        Some(at) => metadata[at..]
-            .split(" | ")
-            .next()
-            .unwrap_or("")
-            .trim()
-            .to_string(),
-        None => fallback.to_string(),
-    }
-}
-
-/// 산출물 파일 stem(`<계정>_<브라우저>[_Cache]`)에서 브라우저 이름을 읽는다.
-/// 이름에 브라우저 표기가 없으면 빈 값 — 추정하지 않는다.
-fn browser_of(db: &Path) -> String {
-    let stem = db
-        .file_stem()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_default()
-        .to_lowercase();
-    for (needle, name) in [
-        ("_chrome", "Chrome"),
-        ("_edge", "Edge"),
-        ("_whale", "Whale"),
-        ("_ie_webcache", "IE"),
-        ("_ie_indexdat", "IE"),
-        ("_unknown", "Unknown"),
-    ] {
-        if stem.contains(needle) {
-            return name.to_string();
-        }
-    }
-    String::new()
-}
-
-pub fn build_browser_history(out_dir: &Path) -> Vec<Row> {
-    let mut rows: Vec<Row> = Vec::new();
-    // Cached HTTP responses (BrowserCache) — empty when no cache artifact present.
-    for (account, db) in browser_sources(
-        out_dir,
-        "BROWSER",
-        &["_Chrome_Cache", "_Edge_Cache", "_Whale_Cache", "_Unknown_Cache"],
-    ) {
-        for c in read_cache_entry_meta(&db) {
-            let g = |k: &str| c.get(k).cloned().unwrap_or_default();
-            let ts = {
-                let r = g("response_time");
-                if !r.is_empty() {
-                    r
-                } else {
-                    g("creation_time")
-                }
-            };
-            let url = g("url");
-            if ts.is_empty() || url.is_empty() {
-                continue;
-            }
-            let acct = {
-                let a = g("account");
-                if !a.is_empty() {
-                    a
-                } else {
-                    account.clone()
-                }
-            };
-            let size = {
-                let s = g("content_length");
-                if !s.is_empty() {
-                    s
-                } else {
-                    g("body_size")
-                }
-            };
-            let title = {
-                let b = basename_win(&url);
-                if b.is_empty() {
-                    url.clone()
-                } else {
-                    b
-                }
-            };
-            // A cache response is marked as recovered only when the cache
-            // parser retained an actual decoded response body. Metadata or a
-            // body address alone is not sufficient: those cannot be opened
-            // as recovered evidence in the common detail panel.
-            let cache_body_recovered = if g("body_b64").is_empty() {
-                String::new()
-            } else {
-                "1".into()
-            };
-            rows.push(bh_row(&[
-                ("account", acct),
-                ("kind", "cache".into()),
-                ("timestamp", ts),
-                ("title", title),
-                ("url", url),
-                ("mime", g("content_type")),
-                ("size", size.clone()),
-                ("size_bytes", size),
-                ("status", g("status")),
-                ("cache_key", g("cache_key")),
-                ("cache_body_recovered", cache_body_recovered),
-                // 출처 — 수집 원본 경로가 있으면 그것, 없으면 결과 파일(상대).
-                ("_source_file", {
-                    let src = g("_source_file");
-                    if src.is_empty() { browser_rel(&db) } else { src }
-                }),
-                ("browser", browser_of(&db)),
-                ("__source_db", browser_rel(&db)),
-                ("__source_table", "CacheEntries".into()),
-                ("__source_rowid", g("__source_rowid")),
-            ]));
-        }
-    }
-    // "_Chrome_History"는 Python 시절 산출물 접미(하위 호환).
-    for (account, db) in browser_sources(
-        out_dir,
-        "BROWSER",
-        &["_Chrome_History", "_Chrome", "_Edge", "_Whale"],
-    ) {
-        for u in read_table_with_rowid(&db, "urls") {
-            let g = |k: &str| u.get(k).cloned().unwrap_or_default();
-            let raw = g("url");
-            // Python: str(x or "") — a 0 count is falsy, rendered blank.
-            let count = |v: String| {
-                if v.is_empty() || v == "0" {
-                    String::new()
-                } else {
-                    v
-                }
-            };
-            rows.push(bh_row(&[
-                ("account", account.clone()),
-                ("kind", "visit".into()),
-                ("timestamp", chrome_time(&g("last_visit_time"))),
-                ("title", g("title")),
-                ("url", url_decode(&raw)),
-                ("url_raw", raw.clone()),
-                ("visit_count", count(g("visit_count"))),
-                ("typed_count", count(g("typed_count"))),
-                // History 원본 테이블에는 경로 컬럼이 없다 — 1:1 결과 파일로 표기.
-                ("_source_file", browser_rel(&db)),
-                ("browser", browser_of(&db)),
-                ("__source_db", browser_rel(&db)),
-                ("__source_table", "urls".into()),
-                ("__source_rowid", g("__source_rowid")),
-            ]));
-        }
-        for d in read_table_with_rowid(&db, "downloads") {
-            let g = |k: &str| d.get(k).cloned().unwrap_or_default();
-            let tgt = {
-                let t = g("target_path");
-                if !t.is_empty() {
-                    t
-                } else {
-                    g("current_path")
-                }
-            };
-            let src = {
-                let a = g("tab_url");
-                if !a.is_empty() {
-                    a
-                } else {
-                    let b = g("referrer");
-                    if !b.is_empty() {
-                        b
-                    } else {
-                        g("site_url")
-                    }
-                }
-            };
-            // Python's guard tests the string "0", but danger_type is an integer
-            // column, so an in-memory int 0 never matches and is kept as "0";
-            // only a genuinely empty/NULL value blanks. Match that observable
-            // behavior (pass the raw value; blank only when empty).
-            let danger = g("danger_type");
-            let size_raw = {
-                let t = g("total_bytes");
-                if !t.is_empty() {
-                    t
-                } else {
-                    g("received_bytes")
-                }
-            };
-            rows.push(bh_row(&[
-                ("account", account.clone()),
-                ("kind", "download".into()),
-                ("timestamp", chrome_time(&g("start_time"))),
-                ("title", basename_win(&url_decode(&tgt))),
-                ("detail", url_decode(&tgt)),
-                ("url", url_decode(&src)),
-                ("url_raw", src.clone()),
-                ("source_url", url_decode(&src)),
-                ("size", human_bytes(&size_raw)),
-                ("size_bytes", size_raw),
-                ("mime", g("mime_type")),
-                ("danger", danger),
-                ("_source_file", browser_rel(&db)),
-                ("browser", browser_of(&db)),
-                ("__source_db", browser_rel(&db)),
-                ("__source_table", "downloads".into()),
-                ("__source_rowid", g("__source_rowid")),
-            ]));
-        }
-    }
-    // IE10+/구형 Edge WebCache — History 컨테이너의 방문과 iedownload 항목.
-    for (account, db) in browser_sources(out_dir, "BROWSER", &["_IE_WebCache"]) {
-        for h in read_table_with_rowid(&db, "IEWebCache_History") {
-            let g = |k: &str| h.get(k).cloned().unwrap_or_default();
-            let raw = g("url");
-            let url = ie_visit_url(&raw);
-            let ts = g("accessed_time");
-            if url.is_empty() || ts.is_empty() {
-                continue;
-            }
-            let acct = {
-                let a = g("account");
-                if !a.is_empty() { a } else { account.clone() }
-            };
-            let count = g("access_count");
-            rows.push(bh_row(&[
-                ("account", acct),
-                ("kind", "visit".into()),
-                ("timestamp", ts),
-                ("url", url_decode(&url)),
-                ("url_raw", raw),
-                (
-                    "visit_count",
-                    if count.is_empty() || count == "0" { String::new() } else { count },
-                ),
-                ("_source_file", {
-                    let src = g("_source_file");
-                    if src.is_empty() { browser_rel(&db) } else { src }
-                }),
-                ("browser", browser_of(&db)),
-                ("__source_db", browser_rel(&db)),
-                ("__source_table", "IEWebCache_History".into()),
-                ("__source_rowid", g("__source_rowid")),
-            ]));
-        }
-        for d in read_table_with_rowid(&db, "IEWebCache_Downloads") {
-            let g = |k: &str| d.get(k).cloned().unwrap_or_default();
-            let ts = {
-                let a = g("accessed_time");
-                if !a.is_empty() { a } else { g("modified_time") }
-            };
-            if ts.is_empty() {
-                continue;
-            }
-            let acct = {
-                let a = g("account");
-                if !a.is_empty() { a } else { account.clone() }
-            };
-            let url = ie_download_url(&g("metadata"), &g("url"));
-            rows.push(bh_row(&[
-                ("account", acct),
-                ("kind", "download".into()),
-                ("timestamp", ts),
-                ("title", basename_win(&url_decode(&url))),
-                ("url", url_decode(&url)),
-                ("url_raw", g("url")),
-                ("source_url", url_decode(&url)),
-                ("_source_file", {
-                    let src = g("_source_file");
-                    if src.is_empty() { browser_rel(&db) } else { src }
-                }),
-                ("browser", browser_of(&db)),
-                ("__source_db", browser_rel(&db)),
-                ("__source_table", "IEWebCache_Downloads".into()),
-                ("__source_rowid", g("__source_rowid")),
-            ]));
-        }
-    }
-    // IE5~9 index.dat — History 컨테이너(MSHist·History.IE5)의 방문 기록.
-    // Content(캐시)·Cookies 컨테이너는 원본 테이블에서 본다.
-    for (account, db) in browser_sources(out_dir, "BROWSER", &["_IE_IndexDat"]) {
-        for r in read_table_with_rowid(&db, "IEIndexDat_Records") {
-            let g = |k: &str| r.get(k).cloned().unwrap_or_default();
-            if !g("container").to_lowercase().contains("hist") {
-                continue;
-            }
-            let raw = g("url");
-            let url = ie_visit_url(&raw);
-            let ts = {
-                let a = g("accessed_time");
-                if !a.is_empty() { a } else { g("modified_time") }
-            };
-            if url.is_empty() || ts.is_empty() {
-                continue;
-            }
-            let acct = {
-                let a = g("account");
-                if !a.is_empty() { a } else { account.clone() }
-            };
-            let hits = g("hits");
-            rows.push(bh_row(&[
-                ("account", acct),
-                ("kind", "visit".into()),
-                ("timestamp", ts),
-                ("url", url_decode(&url)),
-                ("url_raw", raw),
-                (
-                    "visit_count",
-                    if hits.is_empty() || hits == "0" { String::new() } else { hits },
-                ),
-                ("_source_file", {
-                    let src = g("_source_file");
-                    if src.is_empty() { browser_rel(&db) } else { src }
-                }),
-                ("browser", browser_of(&db)),
-                ("__source_db", browser_rel(&db)),
-                ("__source_table", "IEIndexDat_Records".into()),
-                ("__source_rowid", g("__source_rowid")),
-            ]));
-        }
-    }
-    rows
-}
-
 // --- TargetInfo ("TargetInfo") — system / accounts / networks / interfaces ---
 pub const TI_KEYS: &[&str] = &[
     "timestamp",
@@ -3896,7 +3349,11 @@ impl RegistryOverviewHive {
     /// 키를 파생 행으로 옮겨 담아, 개요 북마크가 원본 Registry 레코드로
     /// 승격될 수 있게 한다.
     fn load(database: std::path::PathBuf) -> Self {
-        let mut rows: Vec<Row> = read_table_with_rowid(&database, "Registry")
+        // Correlations do not need the Explorer's raw payloads or cell metadata.
+        let mut rows: Vec<Row> = read_table_inner(&database, "Registry", true, Some(&[
+            "__source_rowid", "last_write", "key_path", "value_name", "value_type",
+            "value_data", "_recovery", "_source_file",
+        ]))
             .into_iter()
             .filter(is_live)
             .collect();
@@ -3945,6 +3402,18 @@ impl RegistryOverviewCache {
                         .is_some_and(|extension| extension == "sqlite")
                 })
                 .filter(|path| !is_regback_output(path))
+                // Full Explorer discovery must not broaden legacy analysis rules.
+                .filter(|path| {
+                    let Some(stem) = path.file_stem() else { return false };
+                    let stem = stem.to_string_lossy();
+                    let stem = strip_uniq_suffix(&stem);
+                    crate::parsers::registry::REG_FILENAMES.iter()
+                        .any(|name| stem.eq_ignore_ascii_case(name))
+                        || crate::parsers::registry::REG_SUFFIXES.iter().any(|suffix| {
+                            stem.get(stem.len().saturating_sub(suffix.len())..)
+                                .is_some_and(|end| end.eq_ignore_ascii_case(suffix))
+                        })
+                })
                 .collect(),
             Err(_) => return Self { hives: Vec::new() },
         };
@@ -5214,6 +4683,28 @@ fn parse_shimcache(data: &[u8]) -> ShimcacheParse {
     out
 }
 
+// A rule target is not evidence that the key or value exists.
+fn registry_rule_path(rows: &[Row], suffix: &str, control_set: bool) -> String {
+    let fallback = || format!("…\\{suffix}");
+    let Some(root) = rows.iter().filter_map(|row| row.get("key_path"))
+        .find(|path| path.starts_with('\\') && !path[1..].contains('\\')) else {
+        return fallback();
+    };
+    if !control_set {
+        return format!("{root}\\{suffix}");
+    }
+    let select_path = format!("{root}\\Select");
+    let current = rows.iter().find(|row| {
+        row.get("key_path").is_some_and(|path| path.eq_ignore_ascii_case(&select_path))
+            && row.get("value_name").is_some_and(|name| name.eq_ignore_ascii_case("Current"))
+    }).and_then(|row| row.get("value_data"))
+        .and_then(|value| value.parse::<u32>().ok()).filter(|value| *value > 0);
+    match current {
+        Some(current) => format!("{root}\\ControlSet{current:03}\\{suffix}"),
+        None => fallback(),
+    }
+}
+
 fn rf_credential_protection(system: &[Row]) -> Vec<Row> {
     let mut rows = Vec::new();
     let wd_row = reg_pick_row(system, "\\securityproviders\\wdigest", "UseLogonCredential");
@@ -5239,7 +4730,9 @@ fn rf_credential_protection(system: &[Row]) -> Vec<Row> {
     } else {
         rows.push(rf_row(&[("category", "자격 증명 보호".into()), ("name", "WDigest UseLogonCredential".into()), ("value", "미설정 (기본값)".into()), ("status", "정보".into()),
             ("detail", "미설정 — 최신 Windows(8.1/2012 R2+)는 기본 비활성이나, 구버전이거나 값이 추가되면 평문 캐시가 켜질 수 있음".into()),
-            ("key_path", "…\\Control\\SecurityProviders\\WDigest".into()), ("source", "SYSTEM".into())]));
+            ("key_path", wd_row.and_then(|row| row.get("key_path")).cloned()
+                .unwrap_or_else(|| registry_rule_path(system, r"Control\SecurityProviders\WDigest", true))),
+            ("source", "SYSTEM".into())]));
     }
     let ppl_row = reg_pick_row(system, "\\control\\lsa", "RunAsPPL");
     let ppl = ppl_row
@@ -5271,7 +4764,8 @@ fn rf_credential_protection(system: &[Row]) -> Vec<Row> {
                 "RunAsPPL 미설정 — LSASS가 보호 프로세스로 실행되지 않아 자격증명 덤프에 노출"
                     .into(),
             ),
-            ("key_path", "…\\Control\\Lsa".into()),
+            ("key_path", ppl_row.and_then(|row| row.get("key_path")).cloned()
+                .unwrap_or_else(|| registry_rule_path(system, r"Control\Lsa", true))),
             ("source", "SYSTEM".into()),
         ]));
     }
@@ -6122,7 +5616,11 @@ fn rf_security_config(software: &[Row]) -> Vec<Row> {
         ("value", value.into()),
         ("status", status.into()),
         ("detail", detail.into()),
-        ("key_path", "…\\Policies\\Microsoft\\Windows\\PowerShell\\ScriptBlockLogging".into()),
+        ("key_path", if sbl_row.is_none() {
+            registry_rule_path(software, r"Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging", false)
+        } else {
+            "…\\Policies\\Microsoft\\Windows\\PowerShell\\ScriptBlockLogging".into()
+        }),
         ("source", "SOFTWARE".into()),
         ("record_key", picked_record_key(sbl_row)),
     ]));
@@ -7258,6 +6756,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn missing_registry_settings_keep_confirmed_target_paths_without_inventing_values() {
+        let root = Row::from([("key_path".into(), r"\ROOT".into())]);
+        let select = Row::from([
+            ("key_path".into(), r"\ROOT\Select".into()),
+            ("value_name".into(), "Current".into()),
+            ("value_data".into(), "2".into()),
+        ]);
+        let findings = rf_credential_protection(&[root.clone(), select]);
+        for (name, path) in [
+            ("WDigest UseLogonCredential", r"\ROOT\ControlSet002\Control\SecurityProviders\WDigest"),
+            ("LSASS 보호(RunAsPPL)", r"\ROOT\ControlSet002\Control\Lsa"),
+        ] {
+            let row = findings.iter().find(|row| row["name"] == name).unwrap();
+            assert_eq!(row["key_path"], path);
+            assert!(row.get("record_key").is_none_or(String::is_empty));
+        }
+        let no_select = rf_credential_protection(&[root.clone()]);
+        assert!(no_select.iter().all(|r| !r["key_path"].contains("ControlSet001")));
+        let software = rf_security_config(&[root]);
+        let row = software.iter().find(|row| row["name"] == "ScriptBlockLogging").unwrap();
+        assert_eq!(row["key_path"], r"\ROOT\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging");
+        assert!(row.get("record_key").is_none_or(String::is_empty));
+    }
+
+    #[test]
     fn classifies_local_absolute_paths_and_keeps_drive() {
         let c = classify_path("C:\\Users\\Alice\\a.txt");
         assert_eq!(c.kind, "drive_absolute");
@@ -7748,48 +7271,6 @@ mod tests {
     }
 
     #[test]
-    fn ie_webcache_rows_join_browser_activity() {
-        assert_eq!(ie_visit_url("Visited: Administrator@file:///E:/a.txt"), "file:///E:/a.txt");
-        assert_eq!(ie_visit_url("user@http://x.example/"), "http://x.example/");
-        assert_eq!(ie_visit_url("http://plain.example/"), "http://plain.example/");
-        assert_eq!(ie_download_url("garbage | NAVER Corp. | https://dl.example/f.exe", "iedownload:{X}"), "https://dl.example/f.exe");
-        assert_eq!(ie_download_url("no url here", "iedownload:{X}"), "iedownload:{X}");
-
-        let root = std::env::temp_dir().join(format!("wina-ie-bh-{}", std::process::id()));
-        let browser = root.join("BROWSER");
-        std::fs::create_dir_all(&browser).unwrap();
-        let conn = Connection::open(browser.join("Admin_IE_WebCache.sqlite")).unwrap();
-        conn.execute(
-            "CREATE TABLE IEWebCache_History (accessed_time TEXT, url TEXT, container TEXT, access_count TEXT, account TEXT)",
-            [],
-        ).unwrap();
-        conn.execute(
-            "INSERT INTO IEWebCache_History VALUES ('2026-03-26 13:32:29.295', 'Visited: Admin@file:///C:/x.pbl', 'History', '1', 'Admin')",
-            [],
-        ).unwrap();
-        conn.execute(
-            "CREATE TABLE IEWebCache_Downloads (accessed_time TEXT, modified_time TEXT, url TEXT, metadata TEXT, account TEXT)",
-            [],
-        ).unwrap();
-        conn.execute(
-            "INSERT INTO IEWebCache_Downloads VALUES ('2025-05-21 10:38:56.389', '', 'iedownload:{G}', 'a | https://dl.example/setup.exe', 'Admin')",
-            [],
-        ).unwrap();
-        drop(conn);
-
-        let rows = build_browser_history(&root);
-        std::fs::remove_dir_all(&root).unwrap();
-        assert_eq!(rows.len(), 2);
-        let visit = rows.iter().find(|r| r["kind"] == "visit").unwrap();
-        assert_eq!(visit["url"], "file:///C:/x.pbl");
-        assert_eq!(visit["account"], "Admin");
-        assert_eq!(visit["visit_count"], "1");
-        let dl = rows.iter().find(|r| r["kind"] == "download").unwrap();
-        assert_eq!(dl["url"], "https://dl.example/setup.exe");
-        assert_eq!(dl["title"], "setup.exe");
-    }
-
-    #[test]
     fn rdpcorets_131_joins_remote_desktop_history_with_bare_ip() {
         assert_eq!(strip_client_port("10.0.0.1:59151"), "10.0.0.1");
         assert_eq!(strip_client_port("[10.0.0.1]:52550"), "10.0.0.1");
@@ -8271,46 +7752,6 @@ mod tests {
             .expect("idle task");
         assert!(idle.get("last_run_time").is_none());
         assert!(idle.get("run_count").is_none());
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn browser_activity_marks_only_cache_rows_with_stored_recovered_bodies() {
-        let root = std::env::temp_dir().join(format!(
-            "wina-browser-cache-overview-{}",
-            std::process::id()
-        ));
-        let browser_dir = root.join("BROWSER");
-        std::fs::create_dir_all(&browser_dir).unwrap();
-        let db_path = browser_dir.join("analyst_Chrome_Cache.sqlite");
-        let conn = Connection::open(&db_path).unwrap();
-        conn.execute(
-            "CREATE TABLE CacheEntries (account TEXT, url TEXT, response_time TEXT, creation_time TEXT, content_length TEXT, body_size TEXT, content_type TEXT, status TEXT, cache_key TEXT, body_b64 TEXT)",
-            [],
-        ).unwrap();
-        conn.execute(
-            "INSERT INTO CacheEntries VALUES (?1, ?2, ?3, '', '12', '12', 'text/plain', '200 OK', 'cache-1', ?4)",
-            rusqlite::params!["analyst", "https://example.test/recovered.txt", "2026-08-22 10:00:00.000", "aGVsbG8="],
-        ).unwrap();
-        conn.execute(
-            "INSERT INTO CacheEntries VALUES (?1, ?2, ?3, '', '12', '12', 'text/plain', '200 OK', 'cache-2', '')",
-            rusqlite::params!["analyst", "https://example.test/metadata-only.txt", "2026-08-22 10:00:01.000"],
-        ).unwrap();
-        drop(conn);
-
-        let rows = build_browser_history(&root);
-        assert_eq!(rows.len(), 2);
-        assert_eq!(
-            rows[0].get("cache_body_recovered").map(String::as_str),
-            Some("1")
-        );
-        assert_eq!(
-            rows[1].get("cache_body_recovered").map(String::as_str),
-            Some("")
-        );
-        assert!(rows
-            .iter()
-            .all(|row| row.get("kind").map(String::as_str) == Some("cache")));
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -9884,6 +9325,14 @@ mod tests {
         legacy.extend(rf_uninstall_installs(&legacy_hives));
         legacy.extend(rf_execution_traces(&legacy_hives));
         legacy.extend(rf_shimcache(&legacy_hives));
+        // Broader Explorer discovery must not expand legacy analysis inputs.
+        let extra = Connection::open(registry_dir.join("Amcache.hve.sqlite")).unwrap();
+        extra.execute_batch(
+            "CREATE TABLE Registry(key_path TEXT,value_name TEXT,value_data TEXT,last_write TEXT,_recovery TEXT,_source_file TEXT);
+             INSERT INTO Registry VALUES ('\\ROOT\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\RunMRU',
+               'a','unrelated.exe','2026-01-03 00:00:00.000','live','evidence/Amcache.hve');",
+        ).unwrap();
+        drop(extra);
         let registry = RegistryOverviewCache::load(&root);
         let findings = build_registry_findings_with_registry(&registry);
         assert_eq!(findings, legacy);

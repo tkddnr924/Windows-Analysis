@@ -626,250 +626,6 @@ const POWER_SHELL_HISTORY_CHILDREN: &[ChildSpec] = &[
 ];
 
 
-const BROWSER_ACTIVITY_DDL: &str = r#"PRAGMA foreign_keys=ON;
-CREATE TABLE "BrowserActivity" (
-  "record_id" TEXT NOT NULL,
-  "host_id" TEXT NOT NULL,
-  "dataset_id" TEXT NOT NULL,
-  "timestamp" TEXT,
-  "overview_name" TEXT NOT NULL,
-  "account" TEXT,
-  "account_sid" TEXT,
-  "timestamp_kind" TEXT,
-  "event_type" TEXT,
-  "description" TEXT,
-  "browser" TEXT,
-  "profile" TEXT,
-  "title" TEXT,
-  "url" TEXT,
-  "url_raw" TEXT,
-  "visit_count" INTEGER,
-  "typed_count" INTEGER,
-  "detail" TEXT,
-  "size" TEXT,
-  "size_bytes" INTEGER,
-  "mime" TEXT,
-  "danger" TEXT,
-  "source_url" TEXT,
-  "status" TEXT,
-  "http_status" INTEGER,
-  "cache_key" TEXT,
-  "cache_body_recovered" INTEGER CHECK ("cache_body_recovered" IN (0,1)),
-  "download_path" TEXT,
-  "download_path_resolved" TEXT,
-  "response_headers" TEXT,
-  PRIMARY KEY(record_id),
-  CHECK(overview_name = 'BrowserActivity'),
-  CHECK(timestamp IS NULL OR timestamp_kind IS NOT NULL)
-);
-CREATE INDEX "idx_BrowserActivity_time" ON "BrowserActivity"(timestamp, record_id);
-CREATE INDEX "idx_BrowserActivity_account" ON "BrowserActivity"(account_sid, timestamp);
-CREATE TABLE "source_records" (
-  "record_id" TEXT NOT NULL,
-  "ordinal" INTEGER NOT NULL,
-  "source_dataset_id" TEXT NOT NULL,
-  "source_artifact" TEXT NOT NULL,
-  "source_db" TEXT NOT NULL,
-  "source_table" TEXT NOT NULL,
-  "source_rowid" INTEGER NOT NULL,
-  "source_field" TEXT,
-  "source_record_key" TEXT,
-  "source_file" TEXT,
-  "source_label" TEXT,
-  PRIMARY KEY(record_id, ordinal),
-  CHECK(ordinal >= 0),
-  FOREIGN KEY(record_id) REFERENCES "BrowserActivity"("record_id") ON DELETE CASCADE
-);
-CREATE INDEX idx_source_lookup ON source_records(source_db, source_table, source_rowid, source_field);
-
-CREATE TABLE _wina_derived_version (name TEXT NOT NULL PRIMARY KEY, version INTEGER NOT NULL);
-INSERT INTO _wina_derived_version(name,version) VALUES ('overview_contract',1);
-"#;
-
-const BROWSER_ACTIVITY_COLUMNS: &[&str] = &[
-    "record_id",
-    "host_id",
-    "dataset_id",
-    "timestamp",
-    "overview_name",
-    "account",
-    "account_sid",
-    "timestamp_kind",
-    "event_type",
-    "description",
-    "browser",
-    "profile",
-    "title",
-    "url",
-    "url_raw",
-    "visit_count",
-    "typed_count",
-    "detail",
-    "size",
-    "size_bytes",
-    "mime",
-    "danger",
-    "source_url",
-    "status",
-    "http_status",
-    "cache_key",
-    "cache_body_recovered",
-    "download_path",
-    "download_path_resolved",
-    "response_headers",
-];
-
-const BROWSER_ACTIVITY_SOURCE_RECORDS_COLUMNS: &[&str] = &[
-    "record_id",
-    "ordinal",
-    "source_dataset_id",
-    "source_artifact",
-    "source_db",
-    "source_table",
-    "source_rowid",
-    "source_field",
-    "source_record_key",
-    "source_file",
-    "source_label",
-];
-
-const BROWSER_ACTIVITY_CHILDREN: &[ChildSpec] = &[
-    ChildSpec { table: "source_records", columns: BROWSER_ACTIVITY_SOURCE_RECORDS_COLUMNS },
-];
-
-
-const AI_CONVERSATIONS_DDL: &str = r#"PRAGMA foreign_keys=ON;
-CREATE TABLE "AiConversations" (
-  "record_id" TEXT NOT NULL,
-  "host_id" TEXT NOT NULL,
-  "dataset_id" TEXT NOT NULL,
-  "timestamp" TEXT,
-  "overview_name" TEXT NOT NULL,
-  "account" TEXT,
-  "account_sid" TEXT,
-  "timestamp_kind" TEXT,
-  "event_type" TEXT,
-  "description" TEXT,
-  "provider" TEXT,
-  "conversation_id" TEXT,
-  "service_account" TEXT,
-  "title" TEXT,
-  "created_at" TEXT,
-  "updated_at" TEXT,
-  "url" TEXT,
-  "raw_json" TEXT CHECK ("raw_json" IS NULL OR json_valid("raw_json")),
-  "message_count" INTEGER,
-  PRIMARY KEY(record_id),
-  CHECK(overview_name = 'AiConversations'),
-  CHECK(timestamp IS NULL OR timestamp_kind IS NOT NULL)
-);
-CREATE INDEX "idx_AiConversations_time" ON "AiConversations"(timestamp, record_id);
-CREATE INDEX "idx_AiConversations_account" ON "AiConversations"(account_sid, timestamp);
-CREATE TABLE "source_records" (
-  "record_id" TEXT NOT NULL,
-  "ordinal" INTEGER NOT NULL,
-  "source_dataset_id" TEXT NOT NULL,
-  "source_artifact" TEXT NOT NULL,
-  "source_db" TEXT NOT NULL,
-  "source_table" TEXT NOT NULL,
-  "source_rowid" INTEGER NOT NULL,
-  "source_field" TEXT,
-  "source_record_key" TEXT,
-  "source_file" TEXT,
-  "source_label" TEXT,
-  PRIMARY KEY(record_id, ordinal),
-  CHECK(ordinal >= 0),
-  FOREIGN KEY(record_id) REFERENCES "AiConversations"("record_id") ON DELETE CASCADE
-);
-CREATE INDEX idx_source_lookup ON source_records(source_db, source_table, source_rowid, source_field);
-CREATE TABLE "AiMessages" (
-  "record_id" TEXT NOT NULL,
-  "ordinal" INTEGER NOT NULL,
-  "message_id" TEXT,
-  "role" TEXT,
-  "content" TEXT,
-  "created_at" TEXT,
-  PRIMARY KEY ("record_id", ordinal),
-  CHECK (ordinal >= 0),
-  FOREIGN KEY ("record_id") REFERENCES "AiConversations"("record_id") ON DELETE CASCADE
-);
-CREATE TABLE "AiAttachments" (
-  "record_id" TEXT NOT NULL,
-  "ordinal" INTEGER NOT NULL,
-  "message_ordinal" INTEGER,
-  "url" TEXT,
-  "file_name" TEXT,
-  "mime" TEXT,
-  PRIMARY KEY ("record_id", ordinal),
-  CHECK (ordinal >= 0),
-  FOREIGN KEY ("record_id") REFERENCES "AiConversations"("record_id") ON DELETE CASCADE,
-  FOREIGN KEY (record_id, message_ordinal) REFERENCES AiMessages(record_id, ordinal)
-);
-CREATE TABLE _wina_derived_version (name TEXT NOT NULL PRIMARY KEY, version INTEGER NOT NULL);
-INSERT INTO _wina_derived_version(name,version) VALUES ('overview_contract',1);
-"#;
-
-const AI_CONVERSATIONS_COLUMNS: &[&str] = &[
-    "record_id",
-    "host_id",
-    "dataset_id",
-    "timestamp",
-    "overview_name",
-    "account",
-    "account_sid",
-    "timestamp_kind",
-    "event_type",
-    "description",
-    "provider",
-    "conversation_id",
-    "service_account",
-    "title",
-    "created_at",
-    "updated_at",
-    "url",
-    "raw_json",
-    "message_count",
-];
-
-const AI_CONVERSATIONS_SOURCE_RECORDS_COLUMNS: &[&str] = &[
-    "record_id",
-    "ordinal",
-    "source_dataset_id",
-    "source_artifact",
-    "source_db",
-    "source_table",
-    "source_rowid",
-    "source_field",
-    "source_record_key",
-    "source_file",
-    "source_label",
-];
-
-const AI_CONVERSATIONS_AI_MESSAGES_COLUMNS: &[&str] = &[
-    "record_id",
-    "ordinal",
-    "message_id",
-    "role",
-    "content",
-    "created_at",
-];
-
-const AI_CONVERSATIONS_AI_ATTACHMENTS_COLUMNS: &[&str] = &[
-    "record_id",
-    "ordinal",
-    "message_ordinal",
-    "url",
-    "file_name",
-    "mime",
-];
-
-const AI_CONVERSATIONS_CHILDREN: &[ChildSpec] = &[
-    ChildSpec { table: "source_records", columns: AI_CONVERSATIONS_SOURCE_RECORDS_COLUMNS },
-    ChildSpec { table: "AiMessages", columns: AI_CONVERSATIONS_AI_MESSAGES_COLUMNS },
-    ChildSpec { table: "AiAttachments", columns: AI_CONVERSATIONS_AI_ATTACHMENTS_COLUMNS },
-];
-
-
 const REGISTRY_FINDINGS_DDL: &str = r#"PRAGMA foreign_keys=ON;
 CREATE TABLE "RegistryFindings" (
   "record_id" TEXT NOT NULL,
@@ -965,6 +721,288 @@ const REGISTRY_FINDINGS_CHILDREN: &[ChildSpec] = &[
     ChildSpec { table: "source_records", columns: REGISTRY_FINDINGS_SOURCE_RECORDS_COLUMNS },
 ];
 
+
+// Full hive inventory and typed key/value evidence, separate from selected findings.
+const REGISTRY_EXPLORER_DDL: &str = r#"PRAGMA foreign_keys=ON;
+CREATE TABLE "RegistryHives" (
+  "hive_id" TEXT NOT NULL,
+  "ordinal" INTEGER NOT NULL,
+  "host_id" TEXT NOT NULL,
+  "dataset_id" TEXT NOT NULL,
+  "hive_name" TEXT NOT NULL,
+  "source_file" TEXT,
+  "facts_db" TEXT,
+  "facts_dataset_id" TEXT,
+  "inventory_source" TEXT NOT NULL,
+  "input_status" TEXT,
+  "load_status" TEXT NOT NULL,
+  "load_error" TEXT,
+  "input_error" TEXT,
+  "facts_row_count" INTEGER,
+  "logs_discovered" INTEGER,
+  "logs_applied" INTEGER,
+  "log_error" TEXT,
+  "is_regback" INTEGER NOT NULL CHECK ("is_regback" IN (0,1)),
+  "key_count" INTEGER NOT NULL,
+  "value_count" INTEGER NOT NULL,
+  "root_count" INTEGER NOT NULL,
+  PRIMARY KEY("hive_id"),
+  UNIQUE("ordinal"),
+  CHECK("inventory_source" IN ('manifest','facts_scan')),
+  CHECK("load_status" IN ('loaded','not_parsed','facts_missing','facts_unreadable')),
+  CHECK("load_status" <> 'loaded' OR "facts_dataset_id" IS NOT NULL),
+  CHECK("load_status" = 'loaded' OR ("key_count" = 0 AND "value_count" = 0)),
+  CHECK("key_count" >= 0 AND "value_count" >= 0 AND "root_count" >= 0)
+);
+CREATE INDEX "idx_RegistryHives_name" ON "RegistryHives"("hive_name","ordinal");
+CREATE INDEX "idx_RegistryHives_facts" ON "RegistryHives"("facts_db");
+CREATE TABLE "RegistryExplorer" (
+  "record_id" TEXT NOT NULL,
+  "host_id" TEXT NOT NULL,
+  "dataset_id" TEXT NOT NULL,
+  "hive_id" TEXT NOT NULL,
+  "entry_kind" TEXT NOT NULL,
+  "key_record_id" TEXT,
+  "parent_record_id" TEXT,
+  "parent_status" TEXT,
+  "key_offset" TEXT,
+  "parent_key_offset" TEXT,
+  "key_name" TEXT,
+  "key_path" TEXT,
+  "key_path_lower" TEXT,
+  "key_depth" INTEGER,
+  "key_last_write" TEXT,
+  "key_subkey_count" INTEGER,
+  "key_value_count" INTEGER,
+  "stored_subkey_count" INTEGER,
+  "stored_value_count" INTEGER,
+  "key_read_status" TEXT,
+  "key_read_error" TEXT,
+  "value_offset" TEXT,
+  "value_name" TEXT,
+  "value_name_lower" TEXT,
+  "value_is_default" INTEGER,
+  "value_display_name" TEXT,
+  "value_type_code" INTEGER,
+  "value_type_code_raw" TEXT,
+  "value_type_name" TEXT,
+  "value_data" BLOB,
+  "value_data_hex" TEXT,
+  "value_data_length" INTEGER,
+  "value_data_text" TEXT,
+  "value_read_status" TEXT,
+  "value_read_error" TEXT,
+  "recovery" TEXT NOT NULL,
+  "source_rowid" INTEGER NOT NULL,
+  PRIMARY KEY("record_id"),
+  FOREIGN KEY("hive_id") REFERENCES "RegistryHives"("hive_id") ON DELETE CASCADE,
+  FOREIGN KEY("key_record_id") REFERENCES "RegistryExplorer"("record_id") ON DELETE CASCADE,
+  FOREIGN KEY("parent_record_id") REFERENCES "RegistryExplorer"("record_id") ON DELETE CASCADE,
+  CHECK("entry_kind" IN ('key','value')),
+  CHECK(("entry_kind" = 'key') = ("key_path" IS NOT NULL)),
+  CHECK(("entry_kind" = 'key') = ("key_offset" IS NOT NULL)),
+  CHECK(("entry_kind" = 'key') = ("key_path_lower" IS NOT NULL)),
+  CHECK(("entry_kind" = 'key') = ("key_depth" IS NOT NULL)),
+  CHECK(("entry_kind" = 'key') = ("key_read_status" IS NOT NULL)),
+  CHECK(("entry_kind" = 'key') = ("parent_status" IS NOT NULL)),
+  CHECK(("entry_kind" = 'key') = ("stored_subkey_count" IS NOT NULL)),
+  CHECK(("entry_kind" = 'key') = ("stored_value_count" IS NOT NULL)),
+  CHECK("parent_record_id" IS NULL OR "entry_kind" = 'key'),
+  CHECK("key_read_status" IS NULL OR "key_read_status" IN ('ok','partial')),
+  CHECK("parent_status" IS NULL OR "parent_status" IN ('root','linked','unresolved')),
+  CHECK("parent_status" <> 'root' OR ("parent_key_offset" IS NULL AND "key_depth" = 0)),
+  CHECK("parent_status" <> 'linked' OR "parent_record_id" IS NOT NULL),
+  CHECK("key_depth" IS NULL OR "key_depth" >= 0),
+  CHECK(("entry_kind" = 'value') = ("key_record_id" IS NOT NULL)),
+  CHECK(("entry_kind" = 'value') = ("value_name" IS NOT NULL)),
+  CHECK(("entry_kind" = 'value') = ("value_name_lower" IS NOT NULL)),
+  CHECK(("entry_kind" = 'value') = ("value_is_default" IS NOT NULL)),
+  CHECK(("entry_kind" = 'value') = ("value_read_status" IS NOT NULL)),
+  CHECK(("entry_kind" = 'value') = ("value_data_hex" IS NOT NULL)),
+  CHECK(("entry_kind" = 'value') = ("value_data_length" IS NOT NULL)),
+  CHECK("value_read_status" IS NULL OR "value_read_status" IN ('ok','empty','error','partial')),
+  CHECK("value_is_default" IS NULL OR "value_is_default" IN (0,1)),
+  CHECK("value_is_default" IS NULL OR ("value_is_default" = 1) = ("value_name" = '')),
+  CHECK("value_data_length" IS NULL OR "value_data_length" >= 0),
+  CHECK("value_data" IS NULL OR length("value_data") = "value_data_length"),
+  CHECK("value_data" IS NULL OR "value_data_hex" IS NULL
+        OR length("value_data_hex") = 2 * length("value_data")),
+  CHECK("source_rowid" > 0)
+);
+CREATE INDEX "idx_RegistryExplorer_hive_path" ON "RegistryExplorer"("hive_id","key_path_lower")
+  WHERE "entry_kind" = 'key';
+CREATE INDEX "idx_RegistryExplorer_path" ON "RegistryExplorer"("key_path_lower","hive_id")
+  WHERE "entry_kind" = 'key';
+CREATE INDEX "idx_RegistryExplorer_children" ON "RegistryExplorer"("parent_record_id","key_path_lower")
+  WHERE "entry_kind" = 'key';
+CREATE INDEX "idx_RegistryExplorer_key_offset" ON "RegistryExplorer"("hive_id","key_offset")
+  WHERE "entry_kind" = 'key';
+CREATE INDEX "idx_RegistryExplorer_key_source" ON "RegistryExplorer"("hive_id","source_rowid")
+  WHERE "entry_kind" = 'key';
+CREATE UNIQUE INDEX "idx_RegistryExplorer_value_source" ON "RegistryExplorer"("hive_id","source_rowid")
+  WHERE "entry_kind" = 'value';
+CREATE INDEX "idx_RegistryExplorer_values" ON "RegistryExplorer"("key_record_id","source_rowid")
+  WHERE "entry_kind" = 'value';
+CREATE INDEX "idx_RegistryExplorer_value_name" ON "RegistryExplorer"("value_name_lower","record_id")
+  WHERE "entry_kind" = 'value';
+CREATE INDEX "idx_RegistryExplorer_value_type" ON "RegistryExplorer"("value_type_code","record_id")
+  WHERE "entry_kind" = 'value';
+CREATE TABLE "source_records" (
+  "record_id" TEXT NOT NULL,
+  "ordinal" INTEGER NOT NULL,
+  "source_dataset_id" TEXT NOT NULL,
+  "source_artifact" TEXT NOT NULL,
+  "source_db" TEXT NOT NULL,
+  "source_table" TEXT NOT NULL,
+  "source_rowid" INTEGER NOT NULL,
+  "source_field" TEXT,
+  "source_record_key" TEXT,
+  "source_file" TEXT,
+  "source_label" TEXT,
+  PRIMARY KEY(record_id, ordinal),
+  CHECK(ordinal >= 0),
+  FOREIGN KEY(record_id) REFERENCES "RegistryExplorer"("record_id") ON DELETE CASCADE
+);
+CREATE INDEX idx_source_lookup ON source_records(source_db, source_table, source_rowid, source_field);
+CREATE TABLE "RegistryQuickTargets" (
+  "finding_record_id" TEXT NOT NULL,
+  "ordinal" INTEGER NOT NULL,
+  "resolution" TEXT NOT NULL,
+  "basis" TEXT NOT NULL,
+  "target_record_id" TEXT,
+  "target_kind" TEXT,
+  "target_key_path" TEXT,
+  "hive_id" TEXT,
+  "finding_source_db" TEXT,
+  "finding_source_rowid" INTEGER,
+  "finding_hive_name" TEXT,
+  "finding_key_path" TEXT,
+  "candidate_count" INTEGER NOT NULL,
+  PRIMARY KEY("finding_record_id","ordinal"),
+  CHECK("ordinal" >= 0),
+  CHECK("candidate_count" >= 0),
+  CHECK("basis" IN ('source_records','key_path')),
+  CHECK("resolution" IN ('exact_value','exact_key','parent_key','ancestor_key','ambiguous',
+                         'unresolved','unavailable','missing_hive')),
+  CHECK(("resolution" IN ('exact_value','exact_key','parent_key','ancestor_key'))
+        = ("target_record_id" IS NOT NULL)),
+  CHECK(("target_record_id" IS NULL) = ("target_kind" IS NULL)),
+  CHECK("target_kind" IS NULL OR "target_kind" IN ('key','value')),
+  -- Keep requested paths separate from verified target paths.
+  CHECK("target_key_path" IS NULL OR "resolution" IN ('parent_key','ancestor_key')),
+  CHECK("resolution" <> 'ancestor_key' OR "target_key_path" IS NOT NULL),
+  FOREIGN KEY("target_record_id") REFERENCES "RegistryExplorer"("record_id") ON DELETE CASCADE,
+  FOREIGN KEY("hive_id") REFERENCES "RegistryHives"("hive_id") ON DELETE CASCADE
+);
+CREATE INDEX "idx_RegistryQuickTargets_target" ON "RegistryQuickTargets"("target_record_id");
+
+CREATE TABLE _wina_derived_version (name TEXT NOT NULL PRIMARY KEY, version INTEGER NOT NULL);
+INSERT INTO _wina_derived_version(name,version) VALUES ('overview_contract',1);
+INSERT INTO _wina_derived_version(name,version) VALUES ('registry_explorer',1);
+"#;
+
+pub const REGISTRY_HIVES_TABLE: &str = "RegistryHives";
+pub const REGISTRY_QUICK_TARGETS_TABLE: &str = "RegistryQuickTargets";
+
+const REGISTRY_EXPLORER_COLUMNS: &[&str] = &[
+    "record_id",
+    "host_id",
+    "dataset_id",
+    "hive_id",
+    "entry_kind",
+    "key_record_id",
+    "parent_record_id",
+    "parent_status",
+    "key_offset",
+    "parent_key_offset",
+    "key_name",
+    "key_path",
+    "key_path_lower",
+    "key_depth",
+    "key_last_write",
+    "key_subkey_count",
+    "key_value_count",
+    "stored_subkey_count",
+    "stored_value_count",
+    "key_read_status",
+    "key_read_error",
+    "value_offset",
+    "value_name",
+    "value_name_lower",
+    "value_is_default",
+    "value_display_name",
+    "value_type_code",
+    "value_type_code_raw",
+    "value_type_name",
+    "value_data",
+    "value_data_hex",
+    "value_data_length",
+    "value_data_text",
+    "value_read_status",
+    "value_read_error",
+    "recovery",
+    "source_rowid",
+];
+
+const REGISTRY_EXPLORER_HIVES_COLUMNS: &[&str] = &[
+    "hive_id",
+    "ordinal",
+    "host_id",
+    "dataset_id",
+    "hive_name",
+    "source_file",
+    "facts_db",
+    "facts_dataset_id",
+    "inventory_source",
+    "input_status",
+    "load_status",
+    "load_error",
+    "input_error",
+    "facts_row_count",
+    "logs_discovered",
+    "logs_applied",
+    "log_error",
+    "is_regback",
+    "key_count",
+    "value_count",
+    "root_count",
+];
+
+const REGISTRY_EXPLORER_QUICK_TARGETS_COLUMNS: &[&str] = &[
+    "finding_record_id",
+    "ordinal",
+    "resolution",
+    "basis",
+    "target_record_id",
+    "target_kind",
+    "target_key_path",
+    "hive_id",
+    "finding_source_db",
+    "finding_source_rowid",
+    "finding_hive_name",
+    "finding_key_path",
+    "candidate_count",
+];
+
+const REGISTRY_EXPLORER_SOURCE_RECORDS_COLUMNS: &[&str] = &[
+    "record_id",
+    "ordinal",
+    "source_dataset_id",
+    "source_artifact",
+    "source_db",
+    "source_table",
+    "source_rowid",
+    "source_field",
+    "source_record_key",
+    "source_file",
+    "source_label",
+];
+
+const REGISTRY_EXPLORER_CHILDREN: &[ChildSpec] = &[
+    ChildSpec { table: REGISTRY_HIVES_TABLE, columns: REGISTRY_EXPLORER_HIVES_COLUMNS },
+    ChildSpec { table: "source_records", columns: REGISTRY_EXPLORER_SOURCE_RECORDS_COLUMNS },
+    ChildSpec { table: REGISTRY_QUICK_TARGETS_TABLE, columns: REGISTRY_EXPLORER_QUICK_TARGETS_COLUMNS },
+];
 
 const REMOTE_DESKTOP_HISTORY_DDL: &str = r#"PRAGMA foreign_keys=ON;
 CREATE TABLE "RemoteDesktopHistory" (
@@ -2964,26 +3002,22 @@ pub const SPECS: &[DbSpec] = &[
         children: POWER_SHELL_HISTORY_CHILDREN,
         ddl: POWER_SHELL_HISTORY_DDL,
     },
-    DbSpec {
-        name: "BrowserActivity",
-        table: "BrowserActivity",
-        columns: BROWSER_ACTIVITY_COLUMNS,
-        children: BROWSER_ACTIVITY_CHILDREN,
-        ddl: BROWSER_ACTIVITY_DDL,
-    },
-    DbSpec {
-        name: "AiConversations",
-        table: "AiConversations",
-        columns: AI_CONVERSATIONS_COLUMNS,
-        children: AI_CONVERSATIONS_CHILDREN,
-        ddl: AI_CONVERSATIONS_DDL,
-    },
+    super::browser_activity::SPEC,
+    super::ai_conversations::SPEC,
     DbSpec {
         name: "RegistryFindings",
         table: "RegistryFindings",
         columns: REGISTRY_FINDINGS_COLUMNS,
         children: REGISTRY_FINDINGS_CHILDREN,
         ddl: REGISTRY_FINDINGS_DDL,
+    },
+    // 선별 판정 뒤에 생성한다 — 퀵 접근 관계가 RegistryFindings 좌표를 읽는다.
+    DbSpec {
+        name: "RegistryExplorer",
+        table: "RegistryExplorer",
+        columns: REGISTRY_EXPLORER_COLUMNS,
+        children: REGISTRY_EXPLORER_CHILDREN,
+        ddl: REGISTRY_EXPLORER_DDL,
     },
     DbSpec {
         name: "RemoteDesktopHistory",

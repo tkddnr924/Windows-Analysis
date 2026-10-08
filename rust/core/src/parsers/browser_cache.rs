@@ -31,6 +31,9 @@ pub const CACHE_FIELD_ORDER: &[&str] = &[
     "cache_key",
     "all_headers",
     "body_b64",
+    // 1 = body fully read and decoded (an empty body_b64 then means the response
+    // really was empty), 0 = not recovered. No per-reason columns.
+    "body_recovered",
     "account",
     "_source_file",
     "_status",
@@ -56,49 +59,71 @@ fn is_displayable(ct: &str) -> bool {
 }
 
 /// Decode a cached body per its Content-Encoding (Chrome stores it as received).
-/// Falls back to the raw bytes if the encoding is unknown or decoding fails.
-/// 해제 스트림은 DECODED_CAP+1 바이트에서 끊어 읽는다 — 사후 길이 검사만으로는
-/// 압축 폭탄이 검사 전에 무제한 메모리를 삼키므로, 상한 초과분은 호출부의
-/// 기존 길이 검사가 거부하도록 cap+1까지만 만든다.
-fn decode_body(raw: &[u8], encoding: &str) -> Vec<u8> {
-    fn bounded<R: std::io::Read>(reader: R) -> Option<Vec<u8>> {
-        use std::io::Read;
-        let mut out = Vec::new();
-        if reader
-            .take(DECODED_CAP as u64 + 1)
-            .read_to_end(&mut out)
-            .is_ok()
-            && !out.is_empty()
-        {
-            Some(out)
-        } else {
-            None
+/// `None` means "not recovered": compressed, corrupt, truncated or unsupported
+/// bytes are never promoted to a plaintext body (R03). Decoding stops at
+/// DECODED_CAP+1 bytes so a compression bomb cannot eat memory before the
+/// caller's length check rejects it.
+fn decode_body(raw: Vec<u8>, encoding: &str) -> Option<Vec<u8>> {
+    let mut data = raw;
+    // Servers apply Content-Encoding left to right, so undo it right to left.
+    for token in encoding.split(',').rev() {
+        let token = token.trim().to_ascii_lowercase();
+        let input = std::mem::take(&mut data);
+        data = match token.as_str() {
+            "" | "identity" | "none" => input,
+            // MultiGzDecoder: a concatenated multi-member body must decode whole,
+            // not just its first member.
+            "gzip" | "x-gzip" => bounded(flate2::read::MultiGzDecoder::new(&input[..]))?,
+            // flate2 >= 1.1.10 required: older zio::read accepted a truncated
+            // stream at EOF instead of reporting "incomplete deflate stream".
+            "deflate" => {
+                if has_zlib_header(&input) {
+                    bounded(flate2::read::ZlibDecoder::new(&input[..]))?
+                } else {
+                    bounded(flate2::read::DeflateDecoder::new(&input[..]))?
+                }
+            }
+            "br" => bounded(brotli::Decompressor::new(&input[..], 4096))?,
+            "zstd" => bounded(zstd::stream::read::Decoder::new(&input[..]).ok()?)?,
+            // sdch / zsdch / dcz …: never claim success for what we cannot decode.
+            _ => return None,
+        };
+        if data.len() > DECODED_CAP {
+            // Already cut at the cap: the caller rejects it and we do not feed
+            // knowingly truncated bytes into the next stage.
+            return Some(data);
         }
     }
-    let enc = encoding.to_lowercase();
-    if enc.contains("br") {
-        if let Some(out) = bounded(brotli::Decompressor::new(raw, 4096)) {
-            return out;
-        }
-    } else if enc.contains("gzip") {
-        if let Some(out) = bounded(flate2::read::GzDecoder::new(raw)) {
-            return out;
-        }
-    } else if enc.contains("deflate") {
-        if let Some(out) = bounded(flate2::read::ZlibDecoder::new(raw)) {
-            return out;
-        }
-        if let Some(out) = bounded(flate2::read::DeflateDecoder::new(raw)) {
-            return out;
-        }
-    }
-    raw.to_vec()
+    Some(data)
+}
+
+fn bounded<R: std::io::Read>(reader: R) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut out = Vec::new();
+    reader
+        .take(DECODED_CAP as u64 + 1)
+        .read_to_end(&mut out)
+        .ok()?;
+    Some(out)
+}
+
+/// True for a zlib (RFC 1950) wrapper: CM == 8 and the CMF/FLG check value is a
+/// multiple of 31. Some servers send raw deflate, so the two paths must be told
+/// apart up front — retrying a truncated zlib stream as raw deflate could turn
+/// garbage into a "successful" body.
+fn has_zlib_header(raw: &[u8]) -> bool {
+    raw.len() >= 2
+        && raw[0] & 0x0F == 8
+        && (u16::from(raw[0]) * 256 + u16::from(raw[1])) % 31 == 0
 }
 
 const INDEX_MAGIC: u32 = 0xC103_CAC3;
 const INDEX_HEADER_SIZE: usize = 368;
 const BLOCK_HEADER_SIZE: usize = 8192;
 const ENTRY_SIZE: usize = 256;
+// Chromium kMaxInternalKeyLength — keys up to this length sit inside the
+// EntryStore (up to 4 blocks); longer ones live at the long_key address.
+const MAX_INTERNAL_KEY_LEN: usize = 4 * ENTRY_SIZE - 96 - 1;
 const MAX_ENTRIES: usize = 2_000_000;
 const TIME_LO: i64 = 12_000_000_000_000_000; // ~1981
 const TIME_HI: i64 = 16_000_000_000_000_000; // ~2108
@@ -175,9 +200,16 @@ impl Cache {
             .entry(name.to_string())
             .or_insert_with(|| std::fs::read(dir.join(name)).unwrap_or_default())
     }
-    fn read(&mut self, addr: u32, size: usize) -> Vec<u8> {
+    /// Stored bytes plus whether the declared length was fully present. Silently
+    /// truncating a short read or a block-capacity overflow would make partial
+    /// bytes look like a good body, so completeness is decided here (R03).
+    fn read_stream(&mut self, addr: u32, size: usize) -> Stream {
+        // size == 0 means "length unspecified": nothing declared, nothing short.
         if addr & 0x8000_0000 == 0 {
-            return Vec::new();
+            return Stream {
+                bytes: Vec::new(),
+                complete: size == 0,
+            };
         }
         let file_type = (addr >> 28) & 0x7;
         if file_type == 0 {
@@ -186,32 +218,50 @@ impl Cache {
             // 길이와 무관하게 실제 파일은 수백 MiB일 수 있으므로 요청 길이만,
             // 길이 미지정·과대 주장 경로(헤더 등)는 RAW_CAP까지만 읽는다.
             let limit = if size > 0 { size.min(RAW_CAP) } else { RAW_CAP };
-            let mut out = Vec::new();
+            let mut bytes = Vec::new();
             if let Ok(file) = std::fs::File::open(f) {
                 use std::io::Read;
-                let _ = file.take(limit as u64).read_to_end(&mut out);
+                let _ = file.take(limit as u64).read_to_end(&mut bytes);
             }
-            return out;
+            let complete = size == 0 || (size <= RAW_CAP && bytes.len() == size);
+            return Stream { bytes, complete };
         }
         let bs = match block_size(file_type) {
             Some(b) => b,
-            None => return Vec::new(),
+            None => {
+                return Stream {
+                    bytes: Vec::new(),
+                    complete: false,
+                }
+            }
         };
         let file_selector = (addr >> 16) & 0xFF;
-        let num_blocks = ((addr >> 24) & 0x3) + 1;
+        let num_blocks = ((addr >> 24) & 0x3) as usize + 1;
         let block_num = (addr & 0xFFFF) as usize;
-        let length = if size > 0 {
-            size
-        } else {
-            num_blocks as usize * bs
-        };
+        // The address's block count is this stream's capacity; reading past it
+        // would append somebody else's blocks to the body.
+        let capacity = num_blocks * bs;
+        let length = if size > 0 { size } else { capacity };
         let off = BLOCK_HEADER_SIZE + block_num * bs;
         let data = self.block_bytes(&format!("data_{}", file_selector));
-        if off >= data.len() {
-            return Vec::new();
+        let available = data.len().saturating_sub(off).min(capacity);
+        let take = length.min(available);
+        let bytes = data[off.min(data.len())..(off + take).min(data.len())].to_vec();
+        Stream {
+            bytes,
+            complete: take == length,
         }
-        data[off..(off + length).min(data.len())].to_vec()
     }
+    /// For paths that need no length check (entry / key / headers).
+    fn read(&mut self, addr: u32, size: usize) -> Vec<u8> {
+        self.read_stream(addr, size).bytes
+    }
+}
+
+/// Bytes of one cache stream and whether the declared length was met.
+struct Stream {
+    bytes: Vec<u8>,
+    complete: bool,
 }
 
 fn scan_times(blob: &[u8]) -> Vec<i64> {
@@ -309,17 +359,59 @@ fn walk_addresses(cache: &mut Cache, index_bytes: &[u8]) -> Vec<u32> {
     addrs
 }
 
+/// Request URL carved out of a cache key (R02). Real keys look like
+/// `[Range_]<credential>/<upload_id>/[_dk_[s_|cn_]<top site> <frame site> ]<URL>`,
+/// and a URL cannot contain a space, so in a double-keyed (_dk_) key the request
+/// URL follows the last space. Scanning for the last `http` instead rewrote
+/// requests such as `?r=https://…` into the URL nested in their query.
 fn url_from_key(key: &str) -> String {
-    if key.is_empty() {
-        return String::new();
+    let mut rest = key.trim();
+    // Range child entries carry a "Range_" prefix and a ":<sig>:<child>" suffix.
+    let ranged = rest.strip_prefix("Range_");
+    if let Some(stripped) = ranged {
+        rest = stripped;
     }
-    let a = key.rfind("http://").map(|x| x as isize).unwrap_or(-1);
-    let b = key.rfind("https://").map(|x| x as isize).unwrap_or(-1);
-    let pos = a.max(b);
-    if pos >= 0 {
-        key[pos as usize..].trim().to_string()
-    } else {
-        key.to_string()
+    // `<credential>/<upload_id>/` prefix, stripped only when both are decimal.
+    let numeric_prefix = rest
+        .split_once('/')
+        .filter(|(first, _)| !first.is_empty() && first.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|(_, after_first)| {
+            after_first
+                .split_once('/')
+                .filter(|(second, _)| !second.is_empty() && second.bytes().all(|b| b.is_ascii_digit()))
+        });
+    if let Some((_, after)) = numeric_prefix {
+        rest = after;
+    }
+    // In a double-keyed section (_dk_ / _dk_s_ / _dk_cn_) sites precede the URL.
+    if rest.starts_with("_dk_") {
+        if let Some(space) = rest.rfind(' ') {
+            rest = &rest[space + 1..];
+        }
+    }
+    if ranged.is_some() {
+        rest = strip_range_child_suffix(rest);
+    }
+    rest.to_string()
+}
+
+/// Drop only a range child's `:<hex signature>:<child index>` suffix; anything
+/// that does not match that shape (a port, for instance) is left alone.
+fn strip_range_child_suffix(url: &str) -> &str {
+    let (head, child) = match url.rsplit_once(':') {
+        Some(parts) => parts,
+        None => return url,
+    };
+    if child.is_empty() || !child.bytes().all(|b| b.is_ascii_digit()) {
+        return url;
+    }
+    match head.rsplit_once(':') {
+        Some((base, signature))
+            if !signature.is_empty() && signature.bytes().all(|b| b.is_ascii_hexdigit()) =>
+        {
+            base
+        }
+        _ => url,
     }
 }
 
@@ -347,8 +439,18 @@ fn entry_row(cache: &mut Cache, addr: u32, account: &str, source: &str) -> Optio
         return None;
     }
     let key_len = key_len as usize;
+    // Chromium keeps keys up to kMaxInternalKeyLength inline, spilling into the
+    // extra blocks of a multi-block EntryStore (long_key == 0); only longer keys
+    // live at `long_key`. Reading just the first 256 bytes emptied every key over
+    // 160 bytes — 580 Chrome and 2,591 Edge rows had no url/cache_key.
     let key_bytes: Vec<u8> = if key_len <= ENTRY_SIZE - 96 {
         buf[96..(96 + key_len).min(buf.len())].to_vec()
+    } else if key_len <= MAX_INTERNAL_KEY_LEN {
+        let full = cache.read(addr, 96 + key_len);
+        match full.len() {
+            n if n > 96 => full[96..].to_vec(),
+            _ => Vec::new(),
+        }
     } else {
         cache.read(long_key, key_len)
     };
@@ -392,41 +494,44 @@ fn entry_row(cache: &mut Cache, addr: u32, account: &str, source: &str) -> Optio
     r.insert("etag".into(), hd("etag"));
     r.insert("cache_control".into(), hd("cache-control"));
     r.insert("location".into(), hd("location"));
-    // Extract the response body (stream 1) for previewable types, decoded per
-    // Content-Encoding, base64 so the viewer can show images / read text.
+    // Body (stream 1) is kept only for previewable types, decoded per
+    // Content-Encoding and base64 encoded. Only fully recovered bytes land in
+    // body_b64; short reads, decode failures, unsupported encodings and cap
+    // overflows are all "not recovered" and never store compressed bytes (R03).
     let ct = hd("content-type").to_lowercase();
-    let body_b64 = if body_addr != 0
-        && data_size[1] > 0
-        && (data_size[1] as usize) <= RAW_CAP
-        && is_displayable(&ct)
-    {
-        let raw = cache.read(body_addr, data_size[1] as usize);
-        if raw.is_empty() {
-            String::new()
+    let declared_body = data_size[1] as usize;
+    let (body_b64, body_recovered) = if declared_body == 0 {
+        // A response with no body (204 / 304 …) is validly empty, not a failure.
+        (String::new(), true)
+    } else if body_addr == 0 || declared_body > RAW_CAP || !is_displayable(&ct) {
+        (String::new(), false)
+    } else {
+        let stream = cache.read_stream(body_addr, declared_body);
+        if !stream.complete {
+            (String::new(), false)
         } else {
-            let dec = decode_body(&raw, &hd("content-encoding"));
-            if !dec.is_empty() && dec.len() <= DECODED_CAP {
-                use base64::Engine;
-                base64::engine::general_purpose::STANDARD.encode(&dec)
-            } else {
-                String::new()
+            match decode_body(stream.bytes, &hd("content-encoding")) {
+                Some(decoded) if decoded.len() <= DECODED_CAP => {
+                    use base64::Engine;
+                    (
+                        base64::engine::general_purpose::STANDARD.encode(&decoded),
+                        true,
+                    )
+                }
+                _ => (String::new(), false),
             }
         }
-    } else {
-        String::new()
     };
 
-    r.insert(
-        "body_size".into(),
-        if data_size[1] != 0 {
-            data_size[1].to_string()
-        } else {
-            String::new()
-        },
-    );
+    // Keep 0 distinct from unknown: store the declared length as is (R11).
+    r.insert("body_size".into(), data_size[1].to_string());
     r.insert("body_file".into(), body_file);
     r.insert("all_headers".into(), h.all_headers);
     r.insert("body_b64".into(), body_b64);
+    r.insert(
+        "body_recovered".into(),
+        if body_recovered { "1".into() } else { "0".into() },
+    );
     r.insert("_source_file".into(), source.into());
     Some(r)
 }
@@ -569,33 +674,36 @@ mod tests {
     #[test]
     fn decode_body_bounds_decompression_memory() {
         use std::io::Write;
-        // 8 MiB 제로 본문 — DECODED_CAP(4 MiB)을 넘게 팽창하는 고압축 입력.
-        // 해제 결과는 cap+1 바이트에서 끊겨야 하고(메모리 상한), 호출부의
-        // 길이 검사가 그 값을 거부한다.
+        // 8 MiB of zeros — a highly compressible input that expands past
+        // DECODED_CAP (4 MiB). Decoding must stop at cap+1 bytes (memory bound)
+        // and the caller's length check rejects that value.
         let plain = vec![0u8; 8 * 1024 * 1024];
         let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         gz.write_all(&plain).unwrap();
         let gz = gz.finish().unwrap();
-        assert_eq!(decode_body(&gz, "gzip").len(), DECODED_CAP + 1);
+        assert_eq!(decode_body(gz, "gzip").unwrap().len(), DECODED_CAP + 1);
 
         let mut zl = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
         zl.write_all(&plain).unwrap();
         let zl = zl.finish().unwrap();
-        assert_eq!(decode_body(&zl, "deflate").len(), DECODED_CAP + 1);
+        assert_eq!(decode_body(zl, "deflate").unwrap().len(), DECODED_CAP + 1);
 
         let mut br = Vec::new();
         {
             let mut w = brotli::CompressorWriter::new(&mut br, 4096, 5, 22);
             w.write_all(&plain).unwrap();
         }
-        assert_eq!(decode_body(&br, "br").len(), DECODED_CAP + 1);
+        assert_eq!(decode_body(br, "br").unwrap().len(), DECODED_CAP + 1);
 
-        // 상한 이내의 정상 본문은 온전히 해제된다.
+        let zs = zstd::encode_all(&plain[..], 3).unwrap();
+        assert_eq!(decode_body(zs, "zstd").unwrap().len(), DECODED_CAP + 1);
+
+        // A normal body within the cap decodes whole.
         let small = b"hello cache body".repeat(64);
         let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         gz.write_all(&small).unwrap();
         let gz = gz.finish().unwrap();
-        assert_eq!(decode_body(&gz, "gzip"), small);
+        assert_eq!(decode_body(gz, "gzip").as_deref(), Some(&small[..]));
     }
 
     #[test]
@@ -617,6 +725,9 @@ mod tests {
         assert_eq!(cache.read(addr, 100).len(), 100);
         assert_eq!(cache.read(addr, 0).len(), RAW_CAP);
         assert_eq!(cache.read(addr, usize::MAX).len(), RAW_CAP);
+        // A stream cut at the cap reports that the declared length was not met.
+        assert!(cache.read_stream(addr, 100).complete);
+        assert!(!cache.read_stream(addr, usize::MAX).complete);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -688,6 +799,532 @@ mod tests {
         .unwrap();
         assert_eq!(counted, 0);
         assert_eq!(rows, 0);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // ---- R02: cache key prefix / request URL boundary ----
+
+    /// Only key shapes seen in the real collection (Chrome 3,489 / Edge 8,070
+    /// entries). The request URL is the last token after the
+    /// `<credential>/<upload_id>/[_dk_…]` prefix; a URL nested in a query must
+    /// never replace it.
+    #[test]
+    fn url_from_key_parses_prefix_and_keeps_nested_urls() {
+        // Double key (_dk_), cross-site variants (_dk_s_, _dk_cn_), non-zero id.
+        assert_eq!(
+            url_from_key(
+                "1/0/_dk_https://chatgpt.com https://chatgpt.com https://chatgpt.com/backend-api/wham/usage/credit-usage-events"
+            ),
+            "https://chatgpt.com/backend-api/wham/usage/credit-usage-events"
+        );
+        assert_eq!(
+            url_from_key(
+                "1/0/_dk_s_https://claude.ai https://hcaptcha.com https://newassets.hcaptcha.com/captcha/v1/static/hcaptcha.html"
+            ),
+            "https://newassets.hcaptcha.com/captcha/v1/static/hcaptcha.html"
+        );
+        assert_eq!(
+            url_from_key("1/0/_dk_cn_https://github.com https://github.com https://github.com/"),
+            "https://github.com/"
+        );
+        assert_eq!(
+            url_from_key(
+                "1/1790620045052570/_dk_s_https://helpu.kr https://helpu.kr https://helpu.kr/HelpuCustomer_CustomerPage_old/jsign/download.php"
+            ),
+            "https://helpu.kr/HelpuCustomer_CustomerPage_old/jsign/download.php"
+        );
+        // Request with a plain URL inside its query: do not cut at the last http.
+        assert_eq!(
+            url_from_key(
+                "1/0/_dk_https://glasswire.com https://glasswire.com https://b.sf-syn.com/badge_img/2987402/light-default?&variant_id=sf&r=https://www.glasswire.com/"
+            ),
+            "https://b.sf-syn.com/badge_img/2987402/light-default?&variant_id=sf&r=https://www.glasswire.com/"
+        );
+        assert_eq!(
+            url_from_key(
+                "1/0/_dk_https://naver.com https://naver.com https://search.pstatic.net/sunny?src=https%3A%2F%2Fwww.gogoip.co.kr%2Fgogoip_icon.ico&type=f30_30_png_expire24"
+            ),
+            "https://search.pstatic.net/sunny?src=https%3A%2F%2Fwww.gogoip.co.kr%2Fgogoip_icon.ico&type=f30_30_png_expire24"
+        );
+        // Even with a chrome:// isolation key the last token is the request URL.
+        assert_eq!(
+            url_from_key(
+                "1/0/_dk_chrome://new-tab-page chrome-untrusted://new-tab-page https://www.gstatic.com/feedback/js/help/prod/service/lazy.min.js"
+            ),
+            "https://www.gstatic.com/feedback/js/help/prod/service/lazy.min.js"
+        );
+        assert_eq!(
+            url_from_key("1/0/_dk_chrome://whats-new chrome://whats-new chrome://whats-new/"),
+            "chrome://whats-new/"
+        );
+        // Keys without a double-key section and without any prefix.
+        assert_eq!(
+            url_from_key("1/0/https://connect.facebook.net/en_US/fbevents.js"),
+            "https://connect.facebook.net/en_US/fbevents.js"
+        );
+        assert_eq!(
+            url_from_key("https://example.test/a?next=https://b.test/c"),
+            "https://example.test/a?next=https://b.test/c"
+        );
+        // Range child entry (Range_…:<signature>:<child index>).
+        assert_eq!(
+            url_from_key(
+                "Range_1/0/_dk_https://claude.ai https://claude.ai https://assets.claude.ai/videos/cowork-login-hero.mp4:2fae9d4cd130f4:2"
+            ),
+            "https://assets.claude.ai/videos/cowork-login-hero.mp4"
+        );
+        // A suffix that is not the range shape (a port) stays untouched.
+        assert_eq!(
+            url_from_key("1/0/_dk_https://a.test https://a.test https://a.test:8443/x"),
+            "https://a.test:8443/x"
+        );
+        assert_eq!(url_from_key(""), "");
+    }
+
+    // ---- R03: decoding must prove a complete stream ----
+
+    /// Compressed, corrupt and unsupported bytes never become a successful body;
+    /// a validly empty body and the cap boundaries stay distinguishable.
+    #[test]
+    fn decode_body_requires_successful_full_decode() {
+        use std::io::Write;
+        let plain = b"cache body plaintext".repeat(32);
+
+        let gz = {
+            let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            e.write_all(&plain).unwrap();
+            e.finish().unwrap()
+        };
+        assert_eq!(decode_body(gz.clone(), "gzip").as_deref(), Some(&plain[..]));
+        // Truncated body: without the gzip trailer this must not pass.
+        assert_eq!(decode_body(gz[..gz.len() - 8].to_vec(), "gzip"), None);
+        assert_eq!(decode_body(gz[..12].to_vec(), "gzip"), None);
+        // Corrupt body.
+        assert_eq!(decode_body(b"\x1f\x8b not really gzip".to_vec(), "gzip"), None);
+        // Concatenated gzip members must all be decoded, not just the first.
+        let two_members = {
+            let mut both = gz.clone();
+            both.extend_from_slice(&gz);
+            both
+        };
+        let doubled = plain.repeat(2);
+        assert_eq!(decode_body(two_members.clone(), "gzip").as_deref(), Some(&doubled[..]));
+        // A truncated second member fails the whole body.
+        assert_eq!(
+            decode_body(two_members[..two_members.len() - 8].to_vec(), "gzip"),
+            None
+        );
+
+        let zs = zstd::encode_all(&plain[..], 3).unwrap();
+        assert_eq!(decode_body(zs.clone(), "zstd").as_deref(), Some(&plain[..]));
+        assert_eq!(decode_body(zs[..zs.len() - 4].to_vec(), "zstd"), None);
+        assert_eq!(
+            decode_body(b"\x28\xb5\x2f\xfd broken zstd frame".to_vec(), "zstd"),
+            None
+        );
+        assert_eq!(decode_body(plain.clone(), "zstd"), None);
+
+        let zl = {
+            let mut e = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+            e.write_all(&plain).unwrap();
+            e.finish().unwrap()
+        };
+        assert_eq!(decode_body(zl.clone(), "deflate").as_deref(), Some(&plain[..]));
+        let raw_deflate = {
+            let mut e =
+                flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+            e.write_all(&plain).unwrap();
+            e.finish().unwrap()
+        };
+        assert_eq!(
+            decode_body(raw_deflate.clone(), "deflate").as_deref(),
+            Some(&plain[..])
+        );
+        // Only the header picks the path; a failure is never retried elsewhere.
+        assert!(has_zlib_header(&zl));
+        assert!(!has_zlib_header(&raw_deflate));
+        // Truncated zlib / raw deflate: flate2 (>= 1.1.10) reports "incomplete
+        // deflate stream" at EOF without StreamEnd and we keep no partial output.
+        assert_eq!(decode_body(zl[..zl.len() - 6].to_vec(), "deflate"), None);
+        assert_eq!(decode_body(zl[..4].to_vec(), "deflate"), None);
+        assert_eq!(
+            decode_body(raw_deflate[..raw_deflate.len() - 3].to_vec(), "deflate"),
+            None
+        );
+        assert_eq!(decode_body(b"not deflate at all".to_vec(), "deflate"), None);
+
+        let br = {
+            let mut out = Vec::new();
+            {
+                let mut w = brotli::CompressorWriter::new(&mut out, 4096, 5, 22);
+                w.write_all(&plain).unwrap();
+            }
+            out
+        };
+        assert_eq!(decode_body(br.clone(), "br").as_deref(), Some(&plain[..]));
+        // A cut brotli stream fails where its input runs out.
+        assert_eq!(decode_body(br[..br.len() / 2].to_vec(), "br"), None);
+
+        // Encodings stacked by the server are undone in reverse order.
+        let chained = {
+            let mut out = Vec::new();
+            {
+                let mut w = brotli::CompressorWriter::new(&mut out, 4096, 5, 22);
+                w.write_all(&gz).unwrap();
+            }
+            out
+        };
+        assert_eq!(decode_body(chained, "gzip, br").as_deref(), Some(&plain[..]));
+
+        // No encoding / identity: the stored bytes are the body.
+        assert_eq!(decode_body(plain.clone(), "").as_deref(), Some(&plain[..]));
+        assert_eq!(
+            decode_body(plain.clone(), "identity").as_deref(),
+            Some(&plain[..])
+        );
+        // Unsupported encodings seen in the real Edge cache (zsdch) stay failures.
+        assert_eq!(decode_body(plain.clone(), "zsdch"), None);
+        assert_eq!(decode_body(plain.clone(), "sdch"), None);
+        assert_eq!(decode_body(plain.clone(), "dcz"), None);
+        assert_eq!(decode_body(plain.clone(), "gzip, zsdch"), None);
+
+        // Validly empty: a complete gzip stream whose output is 0 bytes.
+        let empty_gz = {
+            let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            e.write_all(b"").unwrap();
+            e.finish().unwrap()
+        };
+        assert_eq!(decode_body(empty_gz, "gzip"), Some(Vec::new()));
+        assert_eq!(decode_body(Vec::new(), ""), Some(Vec::new()));
+
+        // Cap boundary: exactly DECODED_CAP passes, more is cut to cap+1 so the
+        // caller rejects it.
+        let at_cap = vec![b'x'; DECODED_CAP];
+        let gz_cap = {
+            let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            e.write_all(&at_cap).unwrap();
+            e.finish().unwrap()
+        };
+        assert_eq!(decode_body(gz_cap, "gzip").unwrap().len(), DECODED_CAP);
+        let over_cap = vec![b'x'; DECODED_CAP + 1024];
+        let gz_over = {
+            let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            e.write_all(&over_cap).unwrap();
+            e.finish().unwrap()
+        };
+        assert_eq!(decode_body(gz_over, "gzip").unwrap().len(), DECODED_CAP + 1);
+        let zs_over = zstd::encode_all(&over_cap[..], 3).unwrap();
+        assert_eq!(decode_body(zs_over, "zstd").unwrap().len(), DECODED_CAP + 1);
+    }
+
+    /// A declared length that the actual read cannot meet (short file, block
+    /// capacity overflow, block outside the file) is never reported complete.
+    #[test]
+    fn read_stream_reports_short_and_overflowing_reads() {
+        let root = synth_dir("wina-cache-stream");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("f_000001"), vec![7u8; 100]).unwrap();
+        let mut data3 = vec![0u8; BLOCK_HEADER_SIZE + 1024];
+        data3[BLOCK_HEADER_SIZE..].fill(9);
+        std::fs::write(root.join("data_3"), &data3).unwrap();
+        let mut cache = Cache::new(root.clone());
+
+        // External file: declared 100 == actual, declared 500 > actual, > RAW_CAP.
+        let ext = 0x8000_0001u32;
+        let exact = cache.read_stream(ext, 100);
+        assert_eq!((exact.bytes.len(), exact.complete), (100, true));
+        let short = cache.read_stream(ext, 500);
+        assert_eq!((short.bytes.len(), short.complete), (100, false));
+        let over = cache.read_stream(ext, RAW_CAP + 1);
+        assert_eq!((over.bytes.len(), over.complete), (100, false));
+
+        // Block file: 2,000 bytes declared on a one-block (1 KiB) address must
+        // stay incomplete instead of borrowing the neighbouring block.
+        let block = 0x8000_0000u32 | (3 << 28) | (3 << 16);
+        let full = cache.read_stream(block, 1024);
+        assert_eq!((full.bytes.len(), full.complete), (1024, true));
+        assert!(full.bytes.iter().all(|&b| b == 9));
+        let spill = cache.read_stream(block, 2000);
+        assert_eq!((spill.bytes.len(), spill.complete), (1024, false));
+        // Block number past the end of the file.
+        let outside = cache.read_stream(block | 50, 256);
+        assert!(outside.bytes.is_empty() && !outside.complete);
+        // No stream without the initialized bit; only declared 0 is "validly empty".
+        assert!(cache.read_stream(0, 0).complete);
+        assert!(!cache.read_stream(0, 10).complete);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn synth_dir(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    const SYNTH_T1: i64 = 13_400_000_000_000_000;
+    const SYNTH_T2: i64 = 13_400_000_000_100_000;
+
+    /// Shaped like the real stream 0 (serialized HttpResponseInfo): two Chrome
+    /// microsecond times, then NUL separated status/header lines, double NUL end.
+    fn synth_headers(status: &str, headers: &[&str]) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&SYNTH_T1.to_le_bytes());
+        v.extend_from_slice(&SYNTH_T2.to_le_bytes());
+        v.extend_from_slice(status.as_bytes());
+        v.push(0);
+        for h in headers {
+            v.extend_from_slice(h.as_bytes());
+            v.push(0);
+        }
+        v.push(0);
+        v
+    }
+
+    enum SynthBody {
+        None,
+        External { bytes: Vec<u8>, declared: u32 },
+        Block { bytes: Vec<u8>, declared: u32 },
+    }
+
+    struct SynthEntry {
+        key: String,
+        headers: Vec<u8>,
+        body: SynthBody,
+    }
+
+    /// Minimal blockfile cache: index hash table + data_1 EntryStore blocks (4
+    /// per entry so long inline keys span blocks as they do in practice) +
+    /// data_3 1 KiB blocks and f_###### external files for the streams.
+    fn build_synth_cache(dir: &Path, entries: &[SynthEntry]) {
+        std::fs::create_dir_all(dir).unwrap();
+        let mut data1 = vec![0u8; BLOCK_HEADER_SIZE + entries.len() * 4 * ENTRY_SIZE];
+        let mut data3 = vec![0u8; BLOCK_HEADER_SIZE + entries.len().max(1) * 1024];
+        let mut index = vec![0u8; INDEX_HEADER_SIZE + entries.len() * 4];
+        index[..4].copy_from_slice(&INDEX_MAGIC.to_le_bytes());
+        index[28..32].copy_from_slice(&(entries.len() as u32).to_le_bytes());
+        for (i, e) in entries.iter().enumerate() {
+            let block = (i * 4) as u32;
+            // file_type 2 (data_1, 256-byte blocks), 4 blocks, selector 1.
+            let entry_addr = 0x8000_0000 | (2u32 << 28) | (3u32 << 24) | (1u32 << 16) | block;
+            let slot = INDEX_HEADER_SIZE + i * 4;
+            index[slot..slot + 4].copy_from_slice(&entry_addr.to_le_bytes());
+            std::fs::write(dir.join(format!("f_{:06x}", 0x10 + i)), &e.headers).unwrap();
+            let header_addr = 0x8000_0000u32 | (0x10 + i as u32);
+            let (body_addr, declared) = match &e.body {
+                SynthBody::None => (0u32, 0u32),
+                SynthBody::External { bytes, declared } => {
+                    std::fs::write(dir.join(format!("f_{:06x}", 0x100 + i)), bytes).unwrap();
+                    (0x8000_0000u32 | (0x100 + i as u32), *declared)
+                }
+                SynthBody::Block { bytes, declared } => {
+                    let off = BLOCK_HEADER_SIZE + i * 1024;
+                    data3[off..off + bytes.len()].copy_from_slice(bytes);
+                    // file_type 3 (data_3, 1 KiB blocks), 1 block, selector 3.
+                    (0x8000_0000u32 | (3u32 << 28) | (3u32 << 16) | i as u32, *declared)
+                }
+            };
+            let base = BLOCK_HEADER_SIZE + block as usize * ENTRY_SIZE;
+            let mut put32 = |off: usize, v: u32| {
+                data1[base + off..base + off + 4].copy_from_slice(&v.to_le_bytes());
+            };
+            put32(4, 0); // next: end of chain
+            put32(24, (SYNTH_T1 as u64 & 0xFFFF_FFFF) as u32);
+            put32(28, (SYNTH_T1 as u64 >> 32) as u32);
+            put32(32, e.key.len() as u32);
+            put32(36, 0); // no long_key: the key continues inside the entry blocks
+            put32(40, e.headers.len() as u32);
+            put32(44, declared);
+            put32(56, header_addr);
+            put32(60, body_addr);
+            data1[base + 96..base + 96 + e.key.len()].copy_from_slice(e.key.as_bytes());
+        }
+        std::fs::write(dir.join("index"), &index).unwrap();
+        std::fs::write(dir.join("data_1"), &data1).unwrap();
+        std::fs::write(dir.join("data_3"), &data3).unwrap();
+    }
+
+    /// R02 / R03 / R11 end to end on a synthetic blockfile cache: recovered vs
+    /// failed bodies, validly empty bodies, caps, a long inline key, raw headers
+    /// with the status reason, a 0 size and the source path.
+    #[test]
+    fn parse_cache_index_separates_recovered_bodies_from_failures() {
+        use std::io::Write;
+        let root = synth_dir("wina-cache-synth");
+        let dir = root.join("BROWSER/userZ/CHROME/Cache/Cache_Data");
+        let gz = {
+            let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            e.write_all(b"<html>recovered</html>").unwrap();
+            e.finish().unwrap()
+        };
+        let zs = zstd::encode_all(&b"{\"ok\":true}"[..], 3).unwrap();
+        let long_url = format!("https://long.test/{}.js", "a".repeat(200));
+        let entries = vec![
+            SynthEntry {
+                key: "1/0/_dk_https://a.test https://a.test https://a.test/page?next=https://b.test/x"
+                    .into(),
+                headers: synth_headers(
+                    "HTTP/1.1 200 OK",
+                    &["Content-Type: text/html", "Content-Encoding: gzip", "Server: nginx"],
+                ),
+                body: SynthBody::External { declared: gz.len() as u32, bytes: gz.clone() },
+            },
+            SynthEntry {
+                key: "1/0/_dk_s_https://a.test https://a.test https://a.test/api.json".into(),
+                headers: synth_headers(
+                    "HTTP/1.1 200 OK",
+                    &["Content-Type: application/json", "Content-Encoding: zstd"],
+                ),
+                body: SynthBody::External { declared: zs.len() as u32, bytes: zs.clone() },
+            },
+            SynthEntry {
+                key: "1/0/_dk_https://a.test https://a.test https://a.test/corrupt.html".into(),
+                headers: synth_headers(
+                    "HTTP/1.1 200 OK",
+                    &["Content-Type: text/html", "Content-Encoding: gzip"],
+                ),
+                body: SynthBody::External {
+                    // Declared length matches the bytes: decoding is what fails.
+                    declared: 18,
+                    bytes: b"\x1f\x8bbroken gzip body".to_vec(),
+                },
+            },
+            SynthEntry {
+                key: "1/0/_dk_https://a.test https://a.test https://a.test/short.txt".into(),
+                headers: synth_headers("HTTP/1.1 200 OK", &["Content-Type: text/plain"]),
+                body: SynthBody::External { declared: 500, bytes: vec![b'z'; 100] },
+            },
+            SynthEntry {
+                key: "1/0/_dk_https://a.test https://a.test https://a.test/empty".into(),
+                headers: synth_headers(
+                    "HTTP/1.1 204 No Content",
+                    &["Content-Type: text/plain", "Content-Length: 0"],
+                ),
+                body: SynthBody::None,
+            },
+            SynthEntry {
+                key: "1/0/_dk_https://a.test https://a.test https://a.test/app.bin".into(),
+                headers: synth_headers(
+                    "HTTP/1.1 200 OK",
+                    &["Content-Type: application/octet-stream"],
+                ),
+                body: SynthBody::External { declared: 10, bytes: vec![1u8; 10] },
+            },
+            SynthEntry {
+                key: "1/0/_dk_https://a.test https://a.test https://a.test/spill.txt".into(),
+                headers: synth_headers("HTTP/1.1 200 OK", &["Content-Type: text/plain"]),
+                body: SynthBody::Block { declared: 2000, bytes: vec![b'q'; 1024] },
+            },
+            SynthEntry {
+                key: "1/0/_dk_https://a.test https://a.test https://a.test/huge.txt".into(),
+                headers: synth_headers("HTTP/1.1 200 OK", &["Content-Type: text/plain"]),
+                body: SynthBody::External { declared: RAW_CAP as u32 + 1, bytes: vec![b'y'; 10] },
+            },
+            SynthEntry {
+                key: format!("1/0/_dk_https://long.test https://long.test {long_url}"),
+                headers: synth_headers(
+                    "HTTP/1.1 404 Not Found",
+                    &["Content-Type: text/plain", "ETag: \"abc\""],
+                ),
+                body: SynthBody::External { declared: 4, bytes: b"gone".to_vec() },
+            },
+            SynthEntry {
+                key: "1/0/_dk_https://a.test https://a.test https://a.test/unsupported.txt".into(),
+                headers: synth_headers(
+                    "HTTP/1.1 200 OK",
+                    &["Content-Type: text/plain", "Content-Encoding: zsdch"],
+                ),
+                body: SynthBody::External { declared: 8, bytes: b"whatever".to_vec() },
+            },
+        ];
+        build_synth_cache(&dir, &entries);
+        let index_path = dir.join("index");
+        let mut rows: Vec<Row> = Vec::new();
+        let count = parse_cache_index(&index_path, &mut |row| {
+            rows.push(row);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(count, entries.len());
+        assert_eq!(rows.len(), entries.len());
+        let f = |i: usize, k: &str| rows[i].get(k).cloned().unwrap_or_default();
+        let body = |i: usize| {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD
+                .decode(f(i, "body_b64").as_bytes())
+                .unwrap()
+        };
+
+        // 0: gzip recovered; the request URL keeps the URL inside its query.
+        assert_eq!(f(0, "url"), "https://a.test/page?next=https://b.test/x");
+        assert_eq!(f(0, "cache_key"), entries[0].key);
+        assert_eq!(f(0, "status"), "200 OK");
+        assert_eq!(
+            f(0, "all_headers"),
+            "HTTP/1.1 200 OK\nContent-Type: text/html\nContent-Encoding: gzip\nServer: nginx"
+        );
+        assert_eq!(f(0, "server"), "nginx");
+        assert_eq!(f(0, "body_recovered"), "1");
+        assert_eq!(body(0), b"<html>recovered</html>");
+        assert_eq!(f(0, "body_size"), gz.len().to_string());
+        assert_eq!(f(0, "request_time"), chrome_time(SYNTH_T1));
+        assert_eq!(f(0, "response_time"), chrome_time(SYNTH_T2));
+        assert_eq!(f(0, "creation_time"), chrome_time(SYNTH_T1));
+        assert_eq!(f(0, "_source_file"), index_path.to_string_lossy());
+        assert_eq!(f(0, "account"), "userZ");
+
+        // 1: zstd recovered (672 real bodies take this path).
+        assert_eq!(f(1, "url"), "https://a.test/api.json");
+        assert_eq!(f(1, "body_recovered"), "1");
+        assert_eq!(body(1), b"{\"ok\":true}");
+
+        // 2 / 3: corrupt compression and a short read fail with an empty body.
+        for i in [2usize, 3] {
+            assert_eq!(f(i, "body_recovered"), "0", "row {i}");
+            assert_eq!(f(i, "body_b64"), "", "row {i}");
+        }
+        assert_eq!(f(3, "body_size"), "500");
+
+        // 4: validly empty body: recovered, and the size is 0 rather than NULL.
+        assert_eq!(f(4, "status"), "204 No Content");
+        assert_eq!(f(4, "body_recovered"), "1");
+        assert_eq!(f(4, "body_b64"), "");
+        assert_eq!(f(4, "body_size"), "0");
+        assert_eq!(f(4, "content_length"), "0");
+
+        // 5 / 6 / 7: non-previewable MIME, block overflow, declared > RAW_CAP.
+        for i in [5usize, 6, 7] {
+            assert_eq!(f(i, "body_recovered"), "0", "row {i}");
+            assert_eq!(f(i, "body_b64"), "", "row {i}");
+        }
+        assert_eq!(f(5, "body_size"), "10");
+        assert_eq!(f(6, "body_size"), "2000");
+        assert_eq!(f(7, "body_size"), (RAW_CAP + 1).to_string());
+
+        // 8: a key over 160 bytes continued in the entry blocks is read whole.
+        assert_eq!(f(8, "cache_key"), entries[8].key);
+        assert_eq!(f(8, "url"), long_url);
+        assert_eq!(f(8, "status"), "404 Not Found");
+        assert_eq!(f(8, "etag"), "\"abc\"");
+        assert_eq!(f(8, "body_recovered"), "1");
+        assert_eq!(body(8), b"gone");
+
+        // 9: an unsupported encoding never promotes compressed bytes to a body.
+        assert_eq!(f(9, "content_encoding"), "zsdch");
+        assert_eq!(f(9, "body_recovered"), "0");
+        assert_eq!(f(9, "body_b64"), "");
+
+        // Stored columns must stay within the declared order (pipeline DDL).
+        for row in &rows {
+            for key in row.keys() {
+                assert!(CACHE_FIELD_ORDER.contains(&key.as_str()), "{key}");
+            }
+        }
+        assert!(CACHE_FIELD_ORDER.contains(&"body_recovered"));
         let _ = std::fs::remove_dir_all(root);
     }
 }

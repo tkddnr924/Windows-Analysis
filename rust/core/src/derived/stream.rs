@@ -7,7 +7,7 @@ use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OpenFlags};
 
 use super::schema::{self, DbSpec};
-use super::{flag, int, json_text, nz, text, text_opt, text_raw, Cell, Ctx, DerivedDb};
+use super::{flag, int, nz, text, text_raw, Cell, Ctx, DerivedDb};
 
 pub(super) fn spec_of(name: &str) -> &'static DbSpec {
     schema::spec(name).expect("문서에 없는 파생 DB")
@@ -80,82 +80,12 @@ pub(super) fn str_of(value: ValueRef<'_>) -> String {
 
 pub(super) fn build_streaming(ctx: &Ctx) -> Result<Vec<(String, usize)>> {
     Ok(vec![
-        ("AiConversations".into(), ai_conversations(ctx)?),
+        ("AiConversations".into(), super::ai_conversations::build(ctx)?),
         ("WmiSubscriptions".into(), wmi_subscriptions(ctx)?),
         ("FileSystemEntries".into(), file_system_entries(ctx)?),
         ("UsnJournal".into(), super::usn::build(ctx)?),
         ("RecycleBin".into(), recycle_bin(ctx)?),
     ])
-}
-
-// ---------------------------------------------------------------------------
-// AiConversations
-// ---------------------------------------------------------------------------
-
-fn ai_conversations(ctx: &Ctx) -> Result<usize> {
-    let spec = spec_of("AiConversations");
-    let mut db = DerivedDb::create(&ctx.overview_dir(), "AiConversations")?;
-    crate::ai_activity::build_ai_conversations_stream(ctx.out_dir, &mut |record| {
-        let row = &record.row;
-        let get = |key: &str| row.get(key).map(String::as_str).unwrap_or("");
-        let mut rec = ctx.record(spec);
-        rec.timestamp(get("date"), "캐시 관찰 시각");
-        rec.set("event_type", text("AI 대화"));
-        // Cache account identifies the collected Windows profile.
-        rec.account(get("account"), &ctx.meta);
-        rec.set("provider", text(get("provider")));
-        rec.set("conversation_id", text(get("conversation_id")));
-        // Service login identity is distinct from the Windows account.
-        rec.set("service_account", text(get("service_account")));
-        rec.set("title", text(get("title")));
-        rec.set("created_at", text(get("created_at")));
-        rec.set("updated_at", text(get("updated_at")));
-        rec.set("url", text(get("url")));
-        rec.set("raw_json", json_text(get("raw_json")));
-        rec.set("message_count", int(get("message_count")));
-        for message in &record.messages {
-            rec.child(
-                "AiMessages",
-                vec![
-                    text_opt(message.message_id.as_deref()),
-                    text_opt(message.role.as_deref()),
-                    message
-                        .content
-                        .as_deref()
-                        .map(text_raw)
-                        .unwrap_or(Cell::Null),
-                    text_opt(message.created_at.as_deref()),
-                ],
-            );
-        }
-        let messages = record.messages.len();
-        for attachment in &record.attachments {
-            // Do not link attachments to nonexistent messages.
-            let ordinal = attachment
-                .message_ordinal
-                .filter(|ordinal| *ordinal < messages)
-                .map(|ordinal| Cell::Int(ordinal as i64))
-                .unwrap_or(Cell::Null);
-            rec.child(
-                "AiAttachments",
-                vec![
-                    ordinal,
-                    text_opt(attachment.url.as_deref()),
-                    text_opt(attachment.file_name.as_deref()),
-                    text_opt(attachment.mime.as_deref()),
-                ],
-            );
-        }
-        rec.source(ctx.facts.source_from_record_key(
-            get("source_record_key"),
-            None,
-            nz(get("_source_file")),
-            Some("AI 대화 캐시 응답"),
-        )?);
-        db.write(rec)?;
-        Ok(())
-    })?;
-    db.finish()
 }
 
 // ---------------------------------------------------------------------------
