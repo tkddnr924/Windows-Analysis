@@ -41,7 +41,7 @@ export default function AccountFilterChips({
         aria-label={ariaLabel}
         title="계정별 표시 선택"
         onClick={() => setOpen((value) => !value)}
-        style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", gap: 5, minHeight: 30, padding: "4px 10px", background: filtering ? "var(--accent-subtle)" : "var(--bg-elevated)", color: filtering ? "var(--accent)" : "var(--text-dim)", border: `1px solid ${filtering ? "color-mix(in srgb, var(--accent) 58%, var(--border))" : "var(--border)"}`, borderRadius: "var(--radius-md)", cursor: "pointer", fontSize: 12, fontWeight: filtering ? 650 : 500, whiteSpace: "nowrap" }}
+        style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", gap: 5, minHeight: 30, padding: "4px 10px", background: filtering ? "var(--accent-subtle)" : "var(--bg-elevated)", color: filtering ? "var(--accent)" : "var(--text-dim)", border: `1px solid ${filtering ? "color-mix(in srgb, var(--accent) 58%, var(--border))" : "var(--border)"}`, borderRadius: "var(--radius)", cursor: "pointer", fontSize: 12, fontWeight: filtering ? 650 : 500, whiteSpace: "nowrap" }}
       >
         <PersonOutlineOutlinedIcon sx={{ fontSize: 16 }} />
         계정 {visibleCount}/{accounts.length}
@@ -49,7 +49,7 @@ export default function AccountFilterChips({
       {open && (
         <>
           <div onClick={() => setOpen(false)} style={{ position: "fixed", inset: 0, zIndex: 40 }} />
-          <div role="group" aria-label={ariaLabel} style={{ position: "absolute", top: "calc(100% + 6px)", [align]: 0, zIndex: 41, minWidth: 235, maxHeight: 320, overflowY: "auto", background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", boxShadow: "var(--shadow-panel)", padding: 6 }}>
+          <div role="group" aria-label={ariaLabel} style={{ position: "absolute", top: "calc(100% + 6px)", [align]: 0, zIndex: 41, minWidth: 235, maxHeight: 320, overflowY: "auto", background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: "var(--radius)", boxShadow: "var(--shadow-panel)", padding: 6 }}>
             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, padding: "4px 8px 7px", borderBottom: "1px solid var(--border-subtle)" }}>
               <span style={{ fontSize: 12, fontWeight: 700, color: "var(--text)" }}>계정 표시</span>
               <span style={{ display: "inline-flex", gap: 9 }}>
@@ -70,7 +70,7 @@ export default function AccountFilterChips({
                   type="button"
                   aria-pressed={checked}
                   onClick={() => onToggle(account)}
-                  style={{ width: "100%", display: "flex", alignItems: "center", gap: 7, minHeight: 32, padding: "4px 8px", background: "transparent", border: "none", borderRadius: "var(--radius-sm)", color: checked ? "var(--text)" : "var(--text-faint)", cursor: "pointer", fontSize: 12.5, fontWeight: checked ? 600 : 500, textAlign: "left" }}
+                  style={{ width: "100%", display: "flex", alignItems: "center", gap: 7, minHeight: 32, padding: "4px 8px", background: "transparent", border: "none", borderRadius: "var(--radius)", color: checked ? "var(--text)" : "var(--text-faint)", cursor: "pointer", fontSize: 12.5, fontWeight: checked ? 600 : 500, textAlign: "left" }}
                   onMouseEnter={(event) => { event.currentTarget.style.background = "var(--bg-hover)"; }}
                   onMouseLeave={(event) => { event.currentTarget.style.background = "transparent"; }}
                 >

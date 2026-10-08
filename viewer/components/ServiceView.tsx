@@ -42,7 +42,6 @@ interface Row {
   detail?: string;
   result?: string;
   event_id?: string;
-  record_key?: string;
 }
 
 interface Props {
@@ -156,7 +155,7 @@ export default function ServiceView({
           const pagedEvents = service.events.slice(eventPage * EVENT_PAGE, (eventPage + 1) * EVENT_PAGE);
           const sameDay = service.first.slice(0, 10) === service.last.slice(0, 10);
           return (
-            <section key={service.key} style={{ marginBottom: 10, border: `1px solid ${open ? `color-mix(in srgb, ${tone} 42%, var(--border))` : "var(--border)"}`, borderRadius: "var(--radius-md)", background: "var(--bg-panel)", overflow: "hidden", transition: "border-color .18s ease" }}>
+            <section key={service.key} style={{ marginBottom: 10, border: `1px solid ${open ? `color-mix(in srgb, ${tone} 42%, var(--border))` : "var(--border)"}`, borderRadius: "var(--radius)", background: "var(--bg-panel)", overflow: "hidden", transition: "border-color .18s ease" }}>
               <button
                 type="button"
                 onClick={() => toggle(service.key)}
@@ -166,7 +165,7 @@ export default function ServiceView({
                 onMouseEnter={(event) => { if (!open) event.currentTarget.style.background = "var(--bg-hover)"; }}
                 onMouseLeave={(event) => { event.currentTarget.style.background = open ? `color-mix(in srgb, ${tone} 6%, transparent)` : "transparent"; }}
               >
-                <span aria-hidden="true" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 34, height: 34, flexShrink: 0, borderRadius: "var(--radius-sm)", background: `color-mix(in srgb, ${tone} 15%, transparent)` }}>
+                <span aria-hidden="true" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 34, height: 34, flexShrink: 0, borderRadius: "var(--radius)", background: `color-mix(in srgb, ${tone} 15%, transparent)` }}>
                   <MiscellaneousServicesOutlinedIcon sx={{ fontSize: 17, color: tone }} />
                 </span>
                 <span style={{ flex: 1, minWidth: 0, display: "grid", gap: 3 }}>
@@ -260,5 +259,5 @@ export default function ServiceView({
 }
 
 function CountPill({ color, children }: { color: string; children: React.ReactNode }) {
-  return <span style={{ color, fontWeight: 700, padding: "1px 7px", borderRadius: "var(--radius-sm)", background: `color-mix(in srgb, ${color} 15%, transparent)`, whiteSpace: "nowrap" }}>{children}</span>;
+  return <span style={{ color, fontWeight: 700, padding: "1px 7px", borderRadius: "var(--radius)", background: `color-mix(in srgb, ${color} 15%, transparent)`, whiteSpace: "nowrap" }}>{children}</span>;
 }

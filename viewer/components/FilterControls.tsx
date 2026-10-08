@@ -51,7 +51,7 @@ export function FilterDropdown({
         aria-expanded={open}
         aria-label={ariaLabel ?? label}
         onClick={() => onToggle(!open)}
-        style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", gap: 5, minHeight: 31, padding: "4px 11px", background: active ? "var(--accent-subtle)" : "var(--bg-elevated)", color: active ? "var(--accent)" : "var(--text-dim)", border: `1px solid ${active ? "color-mix(in srgb, var(--accent) 58%, var(--border))" : "var(--border)"}`, borderRadius: "var(--radius-md)", cursor: "pointer", fontSize: 12, fontWeight: active ? 650 : 500, whiteSpace: "nowrap" }}
+        style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", gap: 5, minHeight: 31, padding: "4px 11px", background: active ? "var(--accent-subtle)" : "var(--bg-elevated)", color: active ? "var(--accent)" : "var(--text-dim)", border: `1px solid ${active ? "color-mix(in srgb, var(--accent) 58%, var(--border))" : "var(--border)"}`, borderRadius: "var(--radius)", cursor: "pointer", fontSize: 12, fontWeight: active ? 650 : 500, whiteSpace: "nowrap" }}
       >
         {icon}
         {label}
@@ -60,7 +60,7 @@ export function FilterDropdown({
       {open && (
         <>
           <div onClick={() => onToggle(false)} style={{ position: "fixed", inset: 0, zIndex: 40 }} />
-          <div role="group" aria-label={ariaLabel ?? label} style={{ position: "absolute", top: "calc(100% + 6px)", [align]: 0, zIndex: 41, minWidth, maxHeight: 340, overflowY: "auto", background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", boxShadow: "var(--shadow-panel)", padding: 6 }}>
+          <div role="group" aria-label={ariaLabel ?? label} style={{ position: "absolute", top: "calc(100% + 6px)", [align]: 0, zIndex: 41, minWidth, maxHeight: 340, overflowY: "auto", background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: "var(--radius)", boxShadow: "var(--shadow-panel)", padding: 6 }}>
             {children}
           </div>
         </>
@@ -96,7 +96,7 @@ export function MultiSelectDropdown({
   const toggle = (value: string) => {
     onChange(selected.includes(value) ? selected.filter((entry) => entry !== value) : [...selected, value]);
   };
-  const rowStyle = (on: boolean): React.CSSProperties => ({ width: "100%", display: "flex", alignItems: "center", gap: 7, minHeight: 32, padding: "4px 9px", background: on ? "var(--accent-subtle)" : "transparent", border: "none", borderRadius: "var(--radius-sm)", color: on ? "var(--accent)" : "var(--text)", cursor: "pointer", fontSize: 12.5, fontWeight: on ? 700 : 550, textAlign: "left" });
+  const rowStyle = (on: boolean): React.CSSProperties => ({ width: "100%", display: "flex", alignItems: "center", gap: 7, minHeight: 32, padding: "4px 9px", background: on ? "var(--accent-subtle)" : "transparent", border: "none", borderRadius: "var(--radius)", color: on ? "var(--accent)" : "var(--text)", cursor: "pointer", fontSize: 12.5, fontWeight: on ? 700 : 550, textAlign: "left" });
   return (
     <FilterDropdown icon={icon} label={label} valueLabel={active ? `· ${selected.length}개` : `· ${allLabel}`} active={active} align={align} ariaLabel={ariaLabel ?? label} open={open} onToggle={setOpen}>
       {options.length === 0 && <div style={{ padding: "8px 10px", color: "var(--text-faint)", fontSize: 12 }}>선택할 항목이 없습니다.</div>}
@@ -160,7 +160,7 @@ export function SelectDropdown<T extends string>({
             role="option"
             aria-selected={selected}
             onClick={() => { setOpen(false); onChange(option.value); }}
-            style={{ width: "100%", display: "flex", alignItems: "center", gap: 7, minHeight: 32, padding: "4px 9px", background: selected ? "var(--accent-subtle)" : "transparent", border: "none", borderRadius: "var(--radius-sm)", color: option.color ?? (selected ? "var(--accent)" : "var(--text)"), cursor: "pointer", fontSize: 12.5, fontWeight: selected ? 700 : 550, textAlign: "left" }}
+            style={{ width: "100%", display: "flex", alignItems: "center", gap: 7, minHeight: 32, padding: "4px 9px", background: selected ? "var(--accent-subtle)" : "transparent", border: "none", borderRadius: "var(--radius)", color: option.color ?? (selected ? "var(--accent)" : "var(--text)"), cursor: "pointer", fontSize: 12.5, fontWeight: selected ? 700 : 550, textAlign: "left" }}
             onMouseEnter={(event) => { if (!selected) event.currentTarget.style.background = "var(--bg-hover)"; }}
             onMouseLeave={(event) => { event.currentTarget.style.background = selected ? "var(--accent-subtle)" : "transparent"; }}
           >
@@ -211,7 +211,7 @@ export function DateRangeDropdown({
 }) {
   const [open, setOpen] = useState(false);
   const active = Boolean(start || end);
-  const inputStyle: React.CSSProperties = { width: "100%", minHeight: 30, padding: "0 9px", fontSize: 11.5, fontFamily: "var(--mono)", background: "var(--bg-input)", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", color: "var(--text)" };
+  const inputStyle: React.CSSProperties = { width: "100%", minHeight: 30, padding: "0 9px", fontSize: 11.5, fontFamily: "var(--mono)", background: "var(--bg-input)", border: "1px solid var(--border)", borderRadius: "var(--radius)", color: "var(--text)" };
   return (
     <FilterDropdown icon={<CalendarMonthOutlinedIcon sx={{ fontSize: 15 }} />} label="날짜" valueLabel={active ? "· 적용 중" : undefined} active={active} align={align} minWidth={252} ariaLabel="날짜 필터" open={open} onToggle={setOpen}>
       <div style={{ display: "grid", gap: 7, padding: "4px 4px 2px" }}>
@@ -224,7 +224,7 @@ export function DateRangeDropdown({
           <input value={end} onChange={(event) => onChange({ start, end: event.target.value })} placeholder="YYYY-MM-DD HH:mm:ss" aria-label="종료 시각" style={inputStyle} />
         </label>
         {active && (
-          <button type="button" className="nm-btn" onClick={onReset} style={{ minHeight: 29, padding: "3px 10px", background: "var(--bg-input)", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", color: "var(--accent)", cursor: "pointer", fontSize: 11.5, fontWeight: 650 }}>
+          <button type="button" className="nm-btn" onClick={onReset} style={{ minHeight: 29, padding: "3px 10px", background: "var(--bg-input)", border: "1px solid var(--border)", borderRadius: "var(--radius)", color: "var(--accent)", cursor: "pointer", fontSize: 11.5, fontWeight: 650 }}>
             초기화
           </button>
         )}
@@ -253,7 +253,7 @@ export function HeaderSearchInput({
       onChange={(event) => onChange(event.target.value)}
       placeholder={placeholder}
       aria-label={ariaLabel ?? placeholder}
-      style={{ flex: `0 1 ${width}px`, minWidth: 170, minHeight: 31, padding: "5px 10px", fontSize: 12.5, fontFamily: "var(--mono)", background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", color: "var(--text)", outline: "none" }}
+      style={{ flex: `0 1 ${width}px`, minWidth: 170, minHeight: 31, padding: "5px 10px", fontSize: 12.5, fontFamily: "var(--mono)", background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: "var(--radius)", color: "var(--text)", outline: "none" }}
     />
   );
 }

@@ -67,6 +67,20 @@ export interface DetailSectionSpec {
   };
 }
 
+/**
+ * 상세 전용 자식 표(docs-01: ExecutionTimes·TaskActions·BitsFiles 등) 한 개.
+ * 목록·검색에는 올리지 않고, 행 상세를 열 때만 그 행의 record_id로 조회한다.
+ */
+export interface ChildTableSpec {
+  /** 같은 결과 DB 안의 자식 표 이름. */
+  table: string;
+  heading: string;
+  /** 자식 행 한 건에서 보여 줄 컬럼. 비면 받은 컬럼을 그대로 보여 준다. */
+  fields?: FieldSpec[];
+  /** 자식 행 한 건을 한 줄로 요약한다. 없으면 필드 목록으로 표시한다. */
+  summary?: (row: Record<string, string>) => string;
+}
+
 export interface ArtifactViewSpec {
   title: (row: Record<string, string>) => string;
   /** Optional compact title for the cross-artifact timeline. Detail panels
@@ -101,6 +115,8 @@ export interface ArtifactViewSpec {
   embeddedLinks?: LinkSpec[];
   links?: LinkSpec[];
   sections: DetailSectionSpec[];
+  /** 이 행에 딸린 상세 전용 자식 표. 행 상세에서만 조회한다. */
+  childTables?: ChildTableSpec[];
   /**
    * Column order for the TABLE view — separate from CSV column order on
    * disk. The CSV always leads with time (that's the right convention for
@@ -282,8 +298,11 @@ function accountFromJumpListSource(path: string | undefined): string {
 
 type ExecutionEvidence = "amcache" | "userAssist" | "srum" | "bam" | "prefetch" | "other";
 
+// 실행 이력 파생 행의 증거 종류는 event_type에 들어 있다(저장 계약 docs-01:
+// 기존 source_artifact 값을 그대로 쓴다). 원본 연결은 source_records에 있고,
+// 화면 분기를 위해 조인하지 않는다.
 function executionEvidence(row: Record<string, string>): ExecutionEvidence {
-  const source = (row.source_artifact || "").toLowerCase();
+  const source = (row.event_type || "").toLowerCase();
   if (source.startsWith("amcache")) return "amcache";
   if (source === "userassist") return "userAssist";
   if (source === "srum") return "srum";
@@ -299,7 +318,7 @@ function executionSourceLabel(row: Record<string, string>): string {
     case "srum": return "SRUM";
     case "bam": return "BAM";
     case "prefetch": return "Prefetch";
-    default: return row.source_artifact || "ExecutionHistory";
+    default: return row.event_type || "ExecutionHistory";
   }
 }
 
@@ -392,6 +411,25 @@ function userAssistProgram(r: Record<string, string>): string {
   return decoded;
 }
 
+// 저장 계약(docs-01)의 플래그는 0/1이고 미확인은 NULL이다. 화면은 모르는 값을
+// 한쪽으로 단정하지 않고 "확인 불가"로 남긴다.
+const MFT_DIRECTORY_LABELS: Record<string, string> = { "1": "디렉터리", "0": "파일" };
+const MFT_IN_USE_LABELS: Record<string, string> = { "1": "사용 중 (할당됨)", "0": "미사용 (삭제됨)" };
+const RECYCLE_R_EXISTS_LABELS: Record<string, string> = { "1": "수집본에 $R 있음", "0": "수집본에 $R 없음" };
+
+// 볼륨 값은 파일마다 따로 있는 값이 아니라 $Volume 레코드의 값을 그 볼륨의
+// 파일 행에 연결한 것이다. volume_id는 결과 안에서 볼륨 문맥을 구분하는 내부
+// 키일 뿐, 실제로 같은 볼륨이라는 증거가 아니다(docs-01).
+const MFT_VOLUME_FIELDS: FieldSpec[] = [
+  { key: "volume_id", label: "볼륨 문맥(내부 키)", showWhenEmpty: true, emptyLabel: "확인된 볼륨 문맥 없음" },
+  { key: "volume_label", label: "볼륨 레이블", showWhenEmpty: true, emptyLabel: "$Volume 근거 없음" },
+  { key: "volume_serial", label: "볼륨 일련번호", showWhenEmpty: true, emptyLabel: "별도 증거 없음" },
+  { key: "drive_letter", label: "드라이브 문자", showWhenEmpty: true, emptyLabel: "수집 메타데이터 근거 없음" },
+  { key: "ntfs_major_version", label: "NTFS 주 버전" },
+  { key: "ntfs_minor_version", label: "NTFS 부 버전" },
+  { key: "volume_flags", label: "볼륨 상태 플래그" },
+];
+
 const VIEWS: Record<string, ArtifactViewSpec> = {
   // Windows Error Reporting — every report field lives in one `report` JSON
   // column; WerView parses it into fault-signature / loaded-modules sections.
@@ -412,9 +450,25 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
   // 각자 타임라인에 이미 편입돼 있으므로 여기서는 편입하지 않는다(중복 방지).
   WerReports: {
     customView: "wer",
-    title: (r) => r.AppName || "(WER)",
-    priorityColumns: ["timestamp", "EventType", "AppName", "AppPath", "TargetAppId", "ReportIdentifier", "source"],
-    sections: [{ heading: "보고서", fields: [{ key: "EventType" }, { key: "AppPath" }, { key: "ReportIdentifier" }, { key: "source", label: "출처" }, { key: "app_pid", label: "프로세스 ID (PID)" }, { key: "app_start_time", label: "프로세스 시작 시각" }, { key: "app_uptime", label: "실행 유지 시간" }, { key: "fault_module", label: "오류 모듈" }, { key: "exception_code", label: "예외 코드" }, { key: "report", kind: "json" }] }],
+    title: (r) => r.app_name || "(WER)",
+    priorityColumns: ["timestamp", "error_type", "app_name", "app_path", "target_app_id", "report_identifier", "source"],
+    sections: [{ heading: "보고서", fields: [
+      { key: "error_type", label: "오류 유형" },
+      { key: "app_name", label: "프로그램" },
+      { key: "app_path", label: "프로그램 경로", kind: "path" },
+      { key: "app_path_resolved", label: "프로그램 경로 (환경변수 해석)", kind: "path" },
+      { key: "target_app_id", label: "대상 앱 ID" },
+      { key: "report_identifier", label: "보고서 ID" },
+      { key: "source", label: "출처" },
+      { key: "app_pid", label: "프로세스 ID (PID)" },
+      { key: "app_start_time", label: "프로세스 시작 시각" },
+      // 단위가 확인된 값과 원문을 섞지 않는다(docs-01).
+      { key: "app_uptime_ms", label: "실행 유지 시간", kind: "durationMs" },
+      { key: "app_uptime", label: "실행 유지 시간 원문" },
+      { key: "fault_module", label: "오류 모듈" },
+      { key: "exception_code", label: "예외 코드" },
+      { key: "report", label: "보고서 원문", kind: "json" },
+    ] }],
   },
   // Windows Timeline (ActivitiesCache.db) — 계정별 앱 실행·포커스·문서 활동.
   // 실행/열기(type 5)는 실행 이력(ExecutionHistory)에도 합류한다.
@@ -452,20 +506,16 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
       ]},
     ],
   },
-  // $UsnJrnl:$J — NTFS 변경 저널. 수십만 행 규모라 UsnJrnlView가 서버
-  // 페이지네이션(usnjrnl_page)으로 직접 조회한다.
+  // $UsnJrnl:$J 원본 facts — 화면은 파생 UsnJournal을 쓰고, 이 표는 원본
+  // 레코드 열람용으로 남는다. 타임라인은 파생에서만 받는다(중복 방지).
   UsnJrnl_Records: {
-    customView: "usnJrnl",
     title: (r) => r.filename || "(USN)",
     subtitle: (r) => r.reason || "",
-    timelineField: "timestamp",
     priorityColumns: ["timestamp", "filename", "reason", "file_attributes", "mft_entry", "parent_mft_entry", "usn"],
     sections: [
       { heading: "변경 이벤트", fields: [
         { key: "filename", label: "파일명", kind: "path" },
-        { key: "renamed_from", label: "이전 이름", kind: "path" },
         { key: "reason", label: "변경 사유", kind: "code" },
-        { key: "group_count", label: "묶인 기록 수" },
         { key: "file_attributes", label: "파일 속성" },
         { key: "source_info", label: "소스 정보" },
       ]},
@@ -479,10 +529,43 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
       ]},
     ],
   },
-  // WMI Repository (OBJECTS.DATA) — 이벤트 구독 3요소(바인딩·필터·컨슈머)를
-  // 시그니처 스캔으로 추출한 findings 테이블. 시각 정보는 없다.
+  // NTFS 변경 저널 파생(_OVERVIEW/UsnJournal) — 수십만 행 규모라 UsnJrnlView가
+  // 서버 페이지네이션(usnjrnl_page)으로 직접 조회한다. path·volume_id·
+  // journal_id·계정은 $J 본문에 없는 값이라 근거가 없으면 NULL로 둔다.
+  UsnJournal: {
+    customView: "usnJrnl",
+    title: (r) => r.file_name || "(USN)",
+    subtitle: (r) => r.reason || "",
+    timelineField: "timestamp",
+    timelineTitle: (r) => r.file_name || "(USN)",
+    timelineSubtitle: (r) => r.event_type || r.reason || "",
+    priorityColumns: ["timestamp", "event_type", "file_name", "reason", "file_attributes", "usn"],
+    sections: [
+      { heading: "변경 이벤트", fields: [
+        { key: "file_name", label: "파일명", kind: "path" },
+        { key: "path", label: "전체 경로", kind: "path", showWhenEmpty: true, emptyLabel: "$J에 없는 값 — 외부 근거 없음" },
+        { key: "event_type", label: "변경 종류" },
+        { key: "reason", label: "변경 사유", kind: "code" },
+        { key: "reason_mask", label: "변경 사유 원문 비트마스크" },
+        { key: "renamed_from", label: "이전 이름", kind: "path" },
+        { key: "group_count", label: "묶인 기록 수" },
+        { key: "file_attributes", label: "파일 속성" },
+        { key: "source_info", label: "소스 정보" },
+      ]},
+      { heading: "NTFS 참조", fields: [
+        { key: "usn", label: "USN" },
+        { key: "record_version", label: "레코드 버전" },
+        { key: "file_reference", label: "파일 참조 원문" },
+        { key: "parent_reference", label: "부모 참조 원문" },
+        { key: "security_id", label: "보안 ID (SID 아님)" },
+        { key: "volume_id", label: "볼륨 문맥", showWhenEmpty: true, emptyLabel: "확인된 볼륨 문맥 없음" },
+        { key: "journal_id", label: "저널 식별자", showWhenEmpty: true, emptyLabel: "$Max 등 별도 근거 없음" },
+      ]},
+    ],
+  },
+  // WMI Repository (OBJECTS.DATA) 원본 facts — 시그니처 스캔 결과. 화면은
+  // 파생 WmiSubscriptions를 쓴다.
   WMI_Persistence: {
-    customView: "wmiPersistence",
     title: (r) => r.name || "(WMI)",
     subtitle: (r) => r.kind || "",
     priorityColumns: ["kind", "name", "consumer_type", "filter_name", "consumer_name", "query", "query_language", "namespace", "details"],
@@ -503,21 +586,90 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
       ]},
     ],
   },
-  // $MFT — Explorer-style browse (MftView queries SQLite lazily, since the
-  // table can hold ~1M rows). No timelineField: each record carries eight
-  // timestamps, bookmarked individually, rather than one event time.
+  // WMI 이벤트 구독 파생(_OVERVIEW/WmiSubscriptions) — 필터·컨슈머·바인딩.
+  // 리포지터리에는 시각이 없어 timestamp는 NULL이고 타임라인에 넣지 않는다.
+  WmiSubscriptions: {
+    customView: "wmiPersistence",
+    title: (r) => r.filter_name || r.consumer_name || r.object_path || "(WMI)",
+    subtitle: (r) => r.object_type || "",
+    priorityColumns: ["object_type", "filter_name", "consumer_name", "consumer_type", "query", "namespace", "command"],
+    sections: [
+      { heading: "구독 구성", fields: [
+        { key: "object_type", label: "구분", kind: "badge" },
+        { key: "namespace", label: "네임스페이스" },
+        { key: "object_path", label: "객체 경로" },
+        { key: "filter_name", label: "필터 이름" },
+        { key: "consumer_name", label: "컨슈머 이름" },
+        { key: "consumer_type", label: "컨슈머 클래스" },
+        { key: "creator_sid", label: "생성자 SID", kind: "accountSid" },
+      ]},
+      { heading: "필터 조건", fields: [
+        { key: "query", label: "WQL 쿼리", kind: "code" },
+        { key: "query_language", label: "쿼리 언어" },
+        { key: "event_namespace", label: "이벤트 네임스페이스" },
+      ]},
+      { heading: "컨슈머 동작", fields: [
+        { key: "command", label: "명령", kind: "code" },
+        { key: "command_resolved", label: "명령 (환경변수 해석)", kind: "code" },
+        { key: "script_text", label: "스크립트", kind: "code" },
+        { key: "script_engine", label: "스크립트 엔진" },
+      ]},
+      { heading: "바인딩", fields: [
+        { key: "filter_ref", label: "바인딩 필터 경로" },
+        { key: "consumer_ref", label: "바인딩 컨슈머 경로" },
+      ]},
+    ],
+  },
+  // $MFT 원본 facts(28개 필드) — 화면용 탐색기는 파생 FileSystemEntries를
+  // 쓰고, 이 표는 원본 레코드 열람용으로 남는다. 플래그는 0/1이고 미확인은
+  // NULL이다(Y/N 아님).
   MFT_Records: {
-    customView: "mft",
     title: (r) => r.file_name || (r.path ? r.path.split("\\").filter(Boolean).pop() ?? r.path : "") || "(MFT)",
     subtitle: (r) => r.path || "",
-    priorityColumns: ["path", "file_name", "file_size", "extension", "is_directory", "in_use", "entry", "seq", "parent_entry", "owner_id", "security_id"],
+    priorityColumns: ["path", "file_name", "file_size", "extension", "is_directory", "in_use", "entry", "seq", "parent_entry", "volume_id"],
     sections: [{ heading: "MFT 레코드", fields: [
+      { key: "path", label: "경로", kind: "path" }, { key: "file_size", label: "크기 (Bytes)", kind: "byteSize" },
+      { key: "extension", label: "확장자" },
+      { key: "is_directory", label: "디렉터리", valueLabels: MFT_DIRECTORY_LABELS, showWhenEmpty: true, emptyLabel: "확인 불가" },
+      { key: "in_use", label: "할당 상태", valueLabels: MFT_IN_USE_LABELS, showWhenEmpty: true, emptyLabel: "확인 불가" },
+      { key: "entry", label: "엔트리" }, { key: "seq", label: "시퀀스" },
+      { key: "parent_entry", label: "부모 엔트리", showWhenEmpty: true, emptyLabel: "부모 미확인" },
+      { key: "parent_seq", label: "부모 시퀀스", showWhenEmpty: true, emptyLabel: "원본 정보 없음" },
+    ]}, { heading: "볼륨", fields: MFT_VOLUME_FIELDS },
+    { heading: "$STANDARD_INFORMATION (0x10)", fields: [
+      { key: "si_created", label: "생성", showWhenEmpty: true }, { key: "si_modified", label: "수정", showWhenEmpty: true },
+      { key: "si_mft_modified", label: "MFT 수정", showWhenEmpty: true }, { key: "si_accessed", label: "접근", showWhenEmpty: true },
+      { key: "owner_id", label: "할당량 소유자 ID", showWhenEmpty: true, emptyLabel: "원본 정보 없음" },
+      { key: "security_id", label: "보안 ID ($Secure)", showWhenEmpty: true, emptyLabel: "원본 정보 없음" },
+    ]}, { heading: "$FILE_NAME (0x30)", fields: [
+      { key: "fn_created", label: "생성", showWhenEmpty: true }, { key: "fn_modified", label: "수정", showWhenEmpty: true },
+      { key: "fn_mft_modified", label: "MFT 수정", showWhenEmpty: true }, { key: "fn_accessed", label: "접근", showWhenEmpty: true },
+    ]}],
+  },
+
+  // 파일 시스템 파생(_OVERVIEW/FileSystemEntries) — Explorer 방식 탐색기
+  // (MftView가 SQLite를 지연 조회한다. 수십만~백만 행 규모). 타임라인에는
+  // 넣지 않는다: 레코드마다 시각이 8개이고, 편입하면 파일 시스템 기록이
+  // 사건 연대기를 덮어 버린다.
+  FileSystemEntries: {
+    customView: "mft",
+    title: (r) => r.file_name || (r.path ? r.path.split("\\").filter(Boolean).pop() ?? r.path : "") || "(파일 시스템)",
+    subtitle: (r) => r.path || "",
+    priorityColumns: ["path", "file_name", "file_size", "extension", "is_directory", "in_use", "entry", "seq", "parent_entry", "volume_id"],
+    sections: [{ heading: "파일 시스템 레코드", fields: [
       // 크기는 기본 Bytes로 표기하고 상세에서 KB/MB/GB 토글 변환 (브라우저
       // 다운로드 크기와 동일 위젯, 2026-09-01 사용자 요청).
       { key: "path", label: "경로", kind: "path" }, { key: "file_size", label: "크기 (Bytes)", kind: "byteSize" },
-      { key: "extension", label: "확장자" }, { key: "is_directory", label: "디렉터리" }, { key: "in_use", label: "할당 상태" },
-      { key: "entry", label: "엔트리" }, { key: "seq", label: "시퀀스" }, { key: "parent_entry", label: "부모 엔트리" },
-    ]}, { heading: "$STANDARD_INFORMATION (0x10)", fields: [
+      { key: "extension", label: "확장자" },
+      // 0/1/NULL — 미확인을 "파일"로 단정하지 않는다(docs-01).
+      { key: "is_directory", label: "디렉터리", valueLabels: MFT_DIRECTORY_LABELS, showWhenEmpty: true, emptyLabel: "확인 불가" },
+      { key: "in_use", label: "할당 상태", valueLabels: MFT_IN_USE_LABELS, showWhenEmpty: true, emptyLabel: "확인 불가" },
+      { key: "entry", label: "엔트리" }, { key: "seq", label: "시퀀스" },
+      { key: "parent_entry", label: "부모 엔트리", showWhenEmpty: true, emptyLabel: "부모 미확인" },
+      { key: "parent_seq", label: "부모 시퀀스", showWhenEmpty: true, emptyLabel: "원본 정보 없음" },
+      { key: "event_type", label: "항목 종류" },
+    ]}, { heading: "볼륨", fields: MFT_VOLUME_FIELDS },
+    { heading: "$STANDARD_INFORMATION (0x10)", fields: [
       { key: "si_created", label: "생성", showWhenEmpty: true, bookmarkable: true }, { key: "si_modified", label: "수정", showWhenEmpty: true, bookmarkable: true },
       { key: "si_mft_modified", label: "MFT 수정", showWhenEmpty: true, bookmarkable: true }, { key: "si_accessed", label: "접근", showWhenEmpty: true, bookmarkable: true },
       { key: "owner_id", label: "할당량 소유자 ID", showWhenEmpty: true, emptyLabel: "원본 정보 없음" },
@@ -528,42 +680,92 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     ]}],
   },
 
-  // --- 종합 분석 (_OVERVIEW/): cross-artifact correlation tables built by
-  // common/correlate.py — one row here can come from several different
-  // source artifacts, tagged via `source_artifact`. These summarize;
-  // `links`/`event_record_id` send you back to the full raw record for
-  // detail (e.g. RemoteAccessHistory -> EventLog_Events).
+  // 휴지통 원본 facts(RECYCLEBIN/RecycleBin_Records) — 수집된 $I 한 건.
+  RecycleBin_Records: {
+    title: (r) => (r.original_path ? r.original_path.split("\\").filter(Boolean).pop() ?? r.original_path : "") || r.recycle_name || "(휴지통)",
+    subtitle: (r) => r.original_path || "",
+    priorityColumns: ["timestamp", "original_path", "file_size", "recycle_name", "r_exists", "account_sid", "_status"],
+    sections: [{ heading: "$I 레코드", fields: [
+      { key: "original_path", label: "원래 경로", kind: "path" },
+      { key: "file_size", label: "원래 크기 (Bytes)", kind: "byteSize" },
+      { key: "deleted_time_raw", label: "삭제 시각 원문 (FILETIME)" },
+      { key: "format_version", label: "$I 형식 버전" },
+      { key: "recycle_name", label: "대응 이름" },
+      { key: "r_exists", label: "$R 수집 여부", valueLabels: RECYCLE_R_EXISTS_LABELS, showWhenEmpty: true, emptyLabel: "확인 불가" },
+      { key: "account_sid", label: "계정 SID", kind: "accountSid" },
+      { key: "_status", label: "파싱 상태" },
+      { key: "_error", label: "실패 사유" },
+    ]}],
+  },
+
+  // 휴지통 파생(_OVERVIEW/RecycleBin) — $I 한 건이 한 행. $R의 경로·종류·
+  // 본문은 저장하지 않으므로 화면에도 없다. r_exists는 수집본에 대응 $R이
+  // 있었는지만 말한다(영구 삭제·복구 가능 여부의 증거가 아니다).
+  RecycleBin: {
+    title: (r) => (r.original_path ? r.original_path.split("\\").filter(Boolean).pop() ?? r.original_path : "") || r.recycle_name || "(휴지통)",
+    subtitle: (r) => r.original_path || "",
+    timelineField: "timestamp",
+    timelineTitle: (r) => (r.original_path ? r.original_path.split("\\").filter(Boolean).pop() ?? r.original_path : "") || r.recycle_name || "(휴지통)",
+    timelineSubtitle: (r) => r.original_path || "",
+    tags: (r) => tagsForPath(r.original_path),
+    priorityColumns: ["timestamp", "original_path", "file_size", "account", "recycle_name", "r_exists", "status"],
+    sections: [{ heading: "휴지통 기록", fields: [
+      { key: "original_path", label: "원래 경로", kind: "path" },
+      { key: "original_drive_letter", label: "원래 드라이브 문자", showWhenEmpty: true, emptyLabel: "경로에 없음" },
+      { key: "file_size", label: "원래 크기 (Bytes)", kind: "byteSize" },
+      { key: "deleted_time_raw", label: "삭제 시각 원문 (FILETIME)" },
+      { key: "format_version", label: "$I 형식 버전" },
+      { key: "recycle_name", label: "대응 이름" },
+      // 1/0/NULL — 확인 불가를 "없음"으로 단정하지 않는다(docs-01).
+      { key: "r_exists", label: "$R 수집 여부", valueLabels: RECYCLE_R_EXISTS_LABELS, showWhenEmpty: true, emptyLabel: "확인 불가" },
+      { key: "volume_id", label: "볼륨 문맥", showWhenEmpty: true, emptyLabel: "확인된 볼륨 문맥 없음" },
+    ]}, { heading: "계정", fields: [
+      { key: "account", label: "계정", kind: "account", showWhenEmpty: true, emptyLabel: "계정명 미확인" },
+      { key: "account_sid", label: "계정 SID", kind: "accountSid" },
+    ]}, { heading: "파싱", fields: [
+      { key: "status", label: "상태" },
+      { key: "error", label: "실패 사유" },
+    ]}],
+  },
+
+  // --- 종합 분석 (_OVERVIEW/): 저장 계약(docs-01)의 파생 테이블. 한 행의
+  // 원본 근거는 그 DB의 source_records에 있고, 상세 패널이 그것으로 원본
+  // 레코드를 되짚는다.
   TargetInfo: {
     customView: "targetInfo",
     title: (r) => r.name || "(no name)",
     subtitle: (r) => r.category || "",
     badges: [{ key: "category", kind: "badge" }],
-    priorityColumns: ["category", "name", "value", "timestamp", "source_artifact"],
+    priorityColumns: ["category", "name", "value", "timestamp"],
     sections: [{ heading: "값", fields: [
       { key: "value" },
       { key: "timestamp" },
-      { key: "source_artifact", label: "출처" },
+      { key: "event_type", label: "분류" },
     ]}],
   },
 
   // TargetInfo renders a compact host-oriented dashboard. Network interfaces
   // open this dedicated shared-drawer definition so the list can stay IP-only
-  // without losing any recovered TCP/IP evidence fields.
+  // without losing any recovered TCP/IP evidence fields. 값은 Metadata.sqlite의
+  // network 항목과 그 자식 표(주소·게이트웨이·DNS)에서 온다.
   TargetInfo_NetworkInterface: {
     title: () => "네트워크 어댑터",
     subtitle: (r) => r.value || "",
     overviewTime: "hide",
-    priorityColumns: ["value", "subnet_mask", "gateway", "dns_server", "dhcp_server", "domain"],
+    priorityColumns: ["value", "addresses", "gateways", "dns_servers", "dhcp_server", "domain"],
     sections: [
       { heading: "네트워크 인터페이스", fields: [
-        { key: "value", label: "IP 주소" },
-        { key: "subnet_mask", label: "서브넷 마스크" },
-        { key: "gateway", label: "기본 게이트웨이" },
+        { key: "interface_name", label: "인터페이스 이름" },
+        { key: "addresses", label: "IP 주소" },
+        { key: "subnet_masks", label: "서브넷 마스크" },
+        { key: "gateways", label: "기본 게이트웨이" },
+        { key: "mac_address", label: "MAC 주소" },
       ]},
       { heading: "네트워크 구성", fields: [
-        { key: "dns_server", label: "DNS 서버" },
+        { key: "dns_servers", label: "DNS 서버" },
         { key: "dhcp_server", label: "DHCP 서버" },
-        { key: "dhcp_enabled", label: "DHCP 사용" },
+        { key: "dhcp_enabled", label: "DHCP 사용", valueLabels: { "1": "사용", "0": "사용 안 함" }, showWhenEmpty: true, emptyLabel: "확인 불가" },
+        { key: "network_profile", label: "네트워크 프로필" },
         { key: "domain", label: "도메인" },
       ]},
       { heading: "DHCP 임대", fields: [
@@ -571,25 +773,24 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
         { key: "lease_terminates", label: "임대 만료" },
       ]},
       { heading: "식별 정보", fields: [
-        { key: "name", label: "인터페이스 GUID" },
-        { key: "source_artifact", label: "수집 아티팩트" },
+        { key: "interface_id", label: "인터페이스 식별자" },
+        { key: "observed_at", label: "확인된 관측 시각" },
+        { key: "resolution_status", label: "확인 상태" },
       ]},
     ],
   },
 
   // NetworkList profile evidence is distinct from the TCP/IP interface
-  // configuration above. The parser currently preserves the profile name,
-  // last-connected time, and source artifact — no uncollected registry value
-  // is inferred here.
+  // configuration above. 수집되지 않은 레지스트리 값을 추정하지 않는다.
   TargetInfo_NetworkProfile: {
     title: () => "연결한 네트워크",
     subtitle: (r) => r.timestamp || "",
     overviewTime: "hide",
-    priorityColumns: ["value", "timestamp", "source_artifact"],
+    priorityColumns: ["value", "timestamp"],
     sections: [{ heading: "레지스트리 NetworkList 프로필", fields: [
       { key: "value", label: "프로필 이름" },
       { key: "timestamp", label: "마지막 연결 시각" },
-      { key: "source_artifact", label: "수집 아티팩트" },
+      { key: "name", label: "항목 이름" },
     ]}],
   },
 
@@ -617,7 +818,7 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
       const note = executableNote(r.program_name || basename(r.program_path));
       return note ? base.concat([{ label: note, severity: "info", description: "실행 파일 카탈로그 참고 — 공격자가 자주 쓰는 도구입니다. 실행 자체가 악성이라는 뜻은 아닙니다." }]) : base;
     },
-    priorityColumns: ["timestamp", "program_name", "program_path", "run_count", "source_artifact"],
+    priorityColumns: ["timestamp", "program_name", "program_path", "run_count", "event_type"],
     sections: [
       { heading: "Amcache 프로그램 정보", fields: [
         { key: "program_name", label: "프로그램 이름", compute: (r) => executionValue("amcache", "program_name", r) },
@@ -630,7 +831,7 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
         // KNOWNFOLDERID GUID 접두 경로는 실제 경로로 변환해 함께 보여 준다.
         { key: "program_path", label: "실행 경로 (변환)", kind: "path", compute: (r) => resolveKnownFolderPath(executionValue("userAssist", "program_path", r)) ?? "" },
         { key: "program_path", label: "원본 경로", kind: "path", compute: (r) => executionValue("userAssist", "program_path", r) },
-        { key: "user", label: "실행 계정", kind: "account", compute: (r) => executionValue("userAssist", "user", r) },
+        { key: "account", label: "실행 계정", kind: "account", compute: (r) => executionValue("userAssist", "account", r) },
         { key: "run_count", label: "실행 횟수", compute: (r) => executionValue("userAssist", "run_count", r) },
         { key: "focus_count", label: "포커스 횟수", compute: (r) => executionValue("userAssist", "focus_count", r) },
         { key: "focus_time_ms", label: "포커스 시간", kind: "durationMs", compute: (r) => executionValue("userAssist", "focus_time_ms", r) },
@@ -638,40 +839,41 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
       { heading: "SRUM 사용 정보", fields: [
         { key: "program_name", label: "응용 프로그램", compute: (r) => executionValue("srum", "program_name", r) },
         { key: "program_path", label: "응용 프로그램 경로", kind: "path", compute: (r) => executionValue("srum", "program_path", r) },
-        { key: "user", label: "사용자", kind: "account", compute: (r) => executionValue("srum", "user", r) },
+        { key: "account", label: "사용자", kind: "account", compute: (r) => executionValue("srum", "account", r) },
       ]},
       { heading: "BAM 실행 정보", fields: [
         { key: "program_name", label: "실행 파일", compute: (r) => executionValue("bam", "program_name", r) },
         { key: "program_path", label: "실행 경로", kind: "path", compute: (r) => executionValue("bam", "program_path", r) },
-        { key: "user", label: "실행 계정", kind: "accountSid", compute: (r) => executionValue("bam", "user", r) },
+        { key: "account_sid", label: "실행 계정", kind: "accountSid", compute: (r) => executionValue("bam", "account_sid", r) },
       ]},
       { heading: "Prefetch 실행 정보", fields: [
         { key: "program_name", label: "실행 파일", compute: (r) => executionValue("prefetch", "program_name", r) },
         { key: "run_count", label: "실행 횟수", compute: (r) => executionValue("prefetch", "run_count", r) },
       ]},
-      { heading: "Prefetch 실행 시간", collapsible: {
-        defaultExpanded: false,
-        summary: (r, count) => `${executionValue("prefetch", "timestamp", r) || "시간 정보 없음"} · ${count}건`,
-      }, fields: [
-        { key: "timestamp", label: "최근 실행 시각", compute: (r) => executionValue("prefetch", "timestamp", r) },
-        { key: "run_time_2", label: "이전 실행 1", compute: (r) => executionValue("prefetch", "run_time_2", r) },
-        { key: "run_time_3", label: "이전 실행 2", compute: (r) => executionValue("prefetch", "run_time_3", r) },
-        { key: "run_time_4", label: "이전 실행 3", compute: (r) => executionValue("prefetch", "run_time_4", r) },
-        { key: "run_time_5", label: "이전 실행 4", compute: (r) => executionValue("prefetch", "run_time_5", r) },
-        { key: "run_time_6", label: "이전 실행 5", compute: (r) => executionValue("prefetch", "run_time_6", r) },
-        { key: "run_time_7", label: "이전 실행 6", compute: (r) => executionValue("prefetch", "run_time_7", r) },
-        { key: "run_time_8", label: "이전 실행 7", compute: (r) => executionValue("prefetch", "run_time_8", r) },
-      ]},
-      { heading: "Prefetch 볼륨 정보", fields: [
-        { key: "volume_device_path", label: "볼륨 경로", kind: "path", compute: (r) => executionValue("prefetch", "volume_device_path", r) },
-        { key: "volume_serial_number", label: "볼륨 일련 번호", kind: "hash", compute: (r) => executionValue("prefetch", "volume_serial_number", r) },
-        { key: "volume_creation_time", label: "볼륨 생성 시각", compute: (r) => executionValue("prefetch", "volume_creation_time", r) },
-      ]},
       { heading: "실행 정보", fields: [
         { key: "program_name", label: "항목 이름", compute: (r) => executionEvidence(r) === "other" ? r.program_name : "" },
         { key: "program_path", label: "항목 경로", kind: "path", compute: (r) => executionEvidence(r) === "other" ? r.program_path : "" },
-        { key: "source_artifact", label: "원본 아티팩트", compute: (r) => executionEvidence(r) === "other" ? r.source_artifact : "" },
+        { key: "program_path_resolved", label: "항목 경로 (환경변수 해석)", kind: "path" },
+        { key: "event_type", label: "원본 아티팩트" },
       ]},
+    ],
+    // 대표 시각 외의 실행 시각과 볼륨 정보는 자식 표에 있다 — 한 행에 8개
+    // 시각 컬럼을 늘어놓지 않고, 상세에서 있는 값만 조회해 보여 준다.
+    childTables: [
+      {
+        table: "ExecutionTimes",
+        heading: "이전 실행 시각",
+        summary: (r) => r.execution_time || "",
+      },
+      {
+        table: "ExecutionVolumes",
+        heading: "볼륨 정보",
+        fields: [
+          { key: "device_path", label: "볼륨 경로", kind: "path" },
+          { key: "serial_number", label: "볼륨 일련 번호", kind: "hash" },
+          { key: "created_at", label: "볼륨 생성 시각" },
+        ],
+      },
     ],
     embeddedLinks: [{ key: "prefetch_hash", label: "Prefetch에 기록된 참조 파일", targetFile: "Prefetch_LoadedFiles", targetColumn: "prefetch_hash" }],
   },
@@ -683,90 +885,111 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     title: () => "ScheduledTasks",
     timelineTitle: (r) => r.task_name || "(이름 없음)",
     // The evidence overview stays intentionally terse: task type + the raw
-    // registration timestamp. The action itself belongs in "실행 명령" below.
+    // registration timestamp. The action itself belongs in TaskActions below.
     subtitle: (r) => r.timestamp || "",
     overviewTime: "hide",
-    tags: (r) => tagsForPath(r.actions),
+    tags: (r) => tagsForPath(r.task_path),
     timelineField: "timestamp",
+    priorityColumns: ["timestamp", "event_type", "task_name", "task_path", "run_as", "result"],
     sections: [{ heading: "작업 스케줄러 정보", fields: [
+      { key: "event_type", label: "기록 종류", kind: "badge" },
       { key: "task_name", label: "작업 이름" },
-      { key: "run_as", label: "실행 계정", kind: "accountSid" },
-      { key: "actions", label: "실행 명령", kind: "code" },
+      { key: "task_path", label: "작업 경로" },
+      { key: "run_as", label: "실행 계정", kind: "account" },
+      { key: "run_as_sid", label: "실행 계정 SID", kind: "accountSid" },
+      { key: "run_level", label: "실행 권한" },
+      { key: "logon_type", label: "로그온 유형" },
       {
         key: "enabled",
         label: "작업 상태",
         kind: "badge",
-        compute: (r) => {
-          const value = (r.enabled || "").trim().toLowerCase();
-          if (["1", "true", "yes", "enabled"].includes(value)) return "활성화됨";
-          if (["0", "false", "no", "disabled"].includes(value)) return "비활성화됨";
-          return value ? r.enabled : "설정 정보 없음";
-        },
-        badgeColors: { "활성화됨": "#3fb950", "비활성화됨": "#8a8a8a", "설정 정보 없음": "#8a8a8a" },
+        // 저장 계약의 플래그는 0/1이고 미확인은 NULL이다 — 모르는 값을
+        // "비활성화됨"으로 단정하지 않는다.
+        valueLabels: { "1": "활성화됨", "0": "비활성화됨" },
+        showWhenEmpty: true,
+        emptyLabel: "설정 정보 없음",
+        badgeColors: { "활성화됨": "#3fb950", "비활성화됨": "#8a8a8a" },
       },
       {
         key: "hidden",
         label: "표시 정책",
         kind: "badge",
-        compute: (r) => {
-          const value = (r.hidden || "").trim().toLowerCase();
-          if (["1", "true", "yes"].includes(value)) return "숨김 처리됨";
-          if (["0", "false", "no"].includes(value)) return "일반 표시";
-          return value ? r.hidden : "설정 정보 없음";
-        },
-        badgeColors: { "숨김 처리됨": "#d29922", "일반 표시": "#4fc1ff", "설정 정보 없음": "#8a8a8a" },
+        valueLabels: { "1": "숨김 처리됨", "0": "일반 표시" },
+        showWhenEmpty: true,
+        emptyLabel: "설정 정보 없음",
+        badgeColors: { "숨김 처리됨": "#d29922", "일반 표시": "#4fc1ff" },
       },
-      {
-        key: "trigger_types",
-        label: "트리거 정보",
-        compute: (r) => [r.trigger_types, r.trigger_start && `시작 경계 ${r.trigger_start}`].filter(Boolean).join(" · "),
-      },
+      { key: "is_microsoft", label: "Microsoft 기본 작업", valueLabels: { "1": "예", "0": "아니오" } },
+      { key: "author", label: "작성자" },
+      { key: "uri", label: "URI" },
+      { key: "task_description", label: "작업 설명" },
       { key: "description", label: "설명" },
     ]},
-    // TaskScheduler%4Operational 이벤트(100/102/129/200 등)를 태스크 경로로
-    // 조인한 실행 요약 — "정의만 있고 실제로 언제 돌았는지 모름" 갭 해소.
-    // 수집 로그에 실행 기록이 없는 태스크는 섹션 전체가 자동으로 숨겨진다.
-    { heading: "실행 기록 (이벤트 로그)", fields: [
-      { key: "last_run_time", label: "마지막 실행 시각" },
-      { key: "run_count", label: "실행 횟수 (수집 로그 기준)" },
-      {
-        key: "last_run_result",
-        label: "마지막 실행 결과",
-        kind: "badge",
-        badgeColors: { "성공": "#3fb950", "실패": "#f85149" },
-      },
-      { key: "last_run_action", label: "실제 생성 프로세스", kind: "path" },
+    // 작업 이벤트(100/102/129/200 등) 행이 같은 표에 함께 저장된다 — 정의 행과
+    // 달리 이벤트 ID·결과를 갖는다. "정의만 있고 언제 돌았는지 모름"은 이벤트
+    // 행으로 확인한다.
+    { heading: "이벤트", fields: [
+      { key: "result", label: "결과", kind: "badge", badgeColors: { "성공": "#3fb950", "실패": "#f85149" } },
+      { key: "event_id", label: "이벤트 ID" },
+      { key: "provider", label: "공급자" },
     ]}],
+    // 실행 명령·트리거는 정의 행의 자식 표다(원문도 함께 보존된다).
+    childTables: [
+      {
+        table: "TaskActions",
+        heading: "실행 명령",
+        fields: [
+          { key: "action_type", label: "동작 유형" },
+          { key: "command", label: "명령", kind: "code" },
+          { key: "command_resolved", label: "명령 (환경변수 해석)", kind: "code" },
+          { key: "arguments", label: "인수", kind: "code" },
+          { key: "working_directory", label: "작업 디렉터리", kind: "path" },
+          { key: "raw_action", label: "원문", kind: "code" },
+        ],
+      },
+      {
+        table: "TaskTriggers",
+        heading: "트리거",
+        fields: [
+          { key: "trigger_type", label: "트리거 유형" },
+          { key: "start_time", label: "시작 경계" },
+          { key: "end_time", label: "종료 경계" },
+          { key: "enabled", label: "사용", valueLabels: { "1": "사용", "0": "사용 안 함" } },
+          { key: "raw_trigger", label: "원문", kind: "code" },
+        ],
+      },
+    ],
   },
 
   BrowserActivity: {
     customView: "browserHistory",
     // Browser records use an evidence-type title, not a page title or URL:
     // those vary by source and belong in the browser-specific fields below.
-    title: (r) => `BrowserActivity:${r.kind === "download" ? "Download" : r.kind === "cache" ? "Cache" : "Visit"}`,
+    title: (r) => `BrowserActivity:${r.event_type === "download" ? "Download" : r.event_type === "cache" ? "Cache" : "Visit"}`,
     subtitle: (r) => r.timestamp || "",
     overviewTime: "hide",
     // The timeline already owns the timestamp column. Show the actual URL as
     // the event and keep its type on the secondary line; never reuse the
     // concise detail-panel evidence title here.
     timelineTitle: (r) => r.url || r.url_raw || r.title || "(URL 없음)",
-    timelineSubtitle: (r) => r.kind === "download" ? "Download" : r.kind === "cache" ? "Cache" : "Visit",
+    timelineSubtitle: (r) => r.event_type === "download" ? "Download" : r.event_type === "cache" ? "Cache" : "Visit",
     // BrowserActivity retains cache rows for the browser evidence view, but a
     // cache response is not a defensible browsing event. The master timeline
     // therefore contains only actual visits and downloads.
     timelineField: "timestamp",
-    timelineInclude: (r) => r.kind === "visit" || r.kind === "download",
-    tags: (r) => tagsForDangerType(r.danger).concat(r.kind === "download" ? tagsForPath(r.detail) : []),
-    priorityColumns: ["account", "kind", "timestamp", "title", "url", "size_bytes", "source_url"],
+    timelineInclude: (r) => r.event_type === "visit" || r.event_type === "download",
+    tags: (r) => tagsForDangerType(r.danger).concat(r.event_type === "download" ? tagsForPath(r.detail) : []),
+    priorityColumns: ["account", "event_type", "browser", "timestamp", "title", "url", "size_bytes", "source_url"],
     sections: [{
-      heading: (r) => `브라우저 ${r.kind === "download" ? "다운로드" : r.kind === "cache" ? "캐시" : "접근"}`,
+      heading: (r) => `브라우저 ${r.event_type === "download" ? "다운로드" : r.event_type === "cache" ? "캐시" : "접근"}`,
       fields: [
       { key: "title", label: "방문 Title", compute: (r) => r.title || "" },
+      { key: "browser", label: "브라우저" },
       {
         key: "url_raw",
         label: "URL 원본",
         kind: "path",
-        compute: (r) => r.kind === "cache" ? r.url : r.url_raw || r.url,
+        compute: (r) => r.event_type === "cache" ? r.url : r.url_raw || r.url,
       },
       { key: "account", label: "브라우저 접근 계정", kind: "account" },
       {
@@ -778,30 +1001,33 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
           try { return decodeURIComponent(value); } catch { return value; }
         },
       },
-      { key: "visit_count", label: "방문 횟수", compute: (r) => r.kind === "visit" ? r.visit_count : "" },
+      { key: "visit_count", label: "방문 횟수", compute: (r) => r.event_type === "visit" ? r.visit_count : "" },
       // 주소창에 URL을 직접 입력해 이동한 횟수 — 링크 경유 방문과 달리
       // "의도적으로 찾아간 사이트"임을 입증하는 값(T7).
-      { key: "typed_count", label: "주소창 직접 입력 횟수", compute: (r) => r.kind === "visit" ? r.typed_count : "" },
-      { key: "detail", label: "저장 경로", kind: "path", compute: (r) => r.kind === "download" ? r.detail : "" },
+      { key: "typed_count", label: "주소창 직접 입력 횟수", compute: (r) => r.event_type === "visit" ? r.typed_count : "" },
+      { key: "detail", label: "저장 경로", kind: "path", compute: (r) => r.event_type === "download" ? r.detail : "" },
+      { key: "download_path", label: "다운로드 저장 경로", kind: "path" },
+      { key: "download_path_resolved", label: "다운로드 저장 경로 (환경변수 해석)", kind: "path" },
       {
         key: "size_bytes",
         label: "크기 (Bytes)",
         kind: "byteSize",
-        compute: (r) => r.kind === "download" || r.kind === "cache" ? r.size_bytes || r.size : "",
+        compute: (r) => r.event_type === "download" || r.event_type === "cache" ? r.size_bytes || r.size : "",
       },
-      { key: "mime", label: "다운로드 파일 유형", compute: (r) => r.kind === "download" ? r.mime : "" },
+      { key: "mime", label: "다운로드 파일 유형", compute: (r) => r.event_type === "download" ? r.mime : "" },
+      { key: "http_status", label: "HTTP 상태" },
       {
         key: "cache_file_type",
         label: "파일 유형",
         compute: (r) => {
-          if (r.kind !== "cache") return "";
+          if (r.event_type !== "cache") return "";
           if (r.mime) return r.mime;
           const path = (r.url || "").split(/[?#]/)[0];
           const extension = path.includes(".") ? path.slice(path.lastIndexOf(".") + 1).toLowerCase() : "";
           return extension ? `.${extension}` : "알 수 없음";
         },
       },
-      { key: "cache_data", label: "캐시 데이터", kind: "cacheData", compute: (r) => r.kind === "cache" ? "cache" : "" },
+      { key: "cache_data", label: "캐시 데이터", kind: "cacheData", compute: (r) => r.event_type === "cache" ? "cache" : "" },
     ]}],
   },
 
@@ -904,7 +1130,7 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     // evidence fields below, while attention-only status appears once at the
     // bottom as a hoverable analysis tag.
     tags: tagsForRegistryFinding,
-    priorityColumns: ["category", "status", "name", "value", "timestamp", "detail", "user", "source"],
+    priorityColumns: ["category", "status", "name", "value", "timestamp", "detail", "account", "source"],
     sections: [{ heading: "상세", fields: [
       { key: "category", label: "분류" },
       // Registry-derived findings inherit the source key's LastWrite time.
@@ -918,9 +1144,12 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
       { key: "detail", label: "제조사", compute: (r) => r.subtype === "MsiInstall" ? r.detail : "" },
       { key: "properties", label: "InstallProperties 전체", kind: "json" },
       { key: "value", label: "값", compute: (r) => r.subtype === "MsiInstall" ? "" : r.value },
+      { key: "value_type", label: "값 형식" },
       { key: "command", label: "명령" },
+      { key: "command_resolved", label: "명령 (환경변수 해석)" },
       // SOFTWARE·SYSTEM 하이브 항목은 사용자 계정이 아니라 컴퓨터 전역 설정이다.
-      { key: "user", label: "사용자", compute: (r) => (r.user === MACHINE_SCOPE_USER ? `${MACHINE_SCOPE_LABEL} (HKLM)` : r.user) },
+      { key: "account", label: "사용자", kind: "account", compute: (r) => (r.account === MACHINE_SCOPE_USER ? `${MACHINE_SCOPE_LABEL} (HKLM)` : r.account) },
+      { key: "account_sid", label: "사용자 SID", kind: "accountSid" },
       // 하이브 루트 키 이름을 라이브 마운트 지점으로 바꿔 읽히게 한다.
       { key: "key_path", label: "키 경로", compute: (r) => displayRegistryKeyPath(r.key_path, r.source) },
       { key: "source", label: "하이브" },
@@ -932,21 +1161,26 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     title: (r) => r.title || "(no name)",
     subtitle: (r) => r.detail || "",
     badges: [{ key: "section", kind: "badge" }],
-    links: [{ key: "record_key", label: "원본 이벤트 로그 보기", targetFile: "EventLog_Events", targetColumn: "_record_key" }],
-    priorityColumns: ["section", "timestamp", "title", "detail", "severity", "action", "user"],
+    priorityColumns: ["section", "timestamp", "title", "detail", "severity", "action", "account"],
     sections: [{ heading: "상세", fields: [
       { key: "severity", label: "심각도" },
       { key: "category", label: "분류" },
+      { key: "threat_name", label: "위협 이름" },
+      { key: "target_path", label: "대상 경로", kind: "path" },
+      { key: "detection_type", label: "탐지 유형" },
       { key: "action", label: "조치" },
       { key: "action_time", label: "조치 시각" },
-      // Defender가 요구한 후속 조치(재부팅 필요 등) — 빌더가 만들지만
-      // 스펙에 없어 "전체 필드 보기"에만 묻혀 있던 컬럼(T7). detection_user는
-      // 빌더가 같은 값을 user에도 기록해 "사용자" 필드로 이미 표시된다.
+      { key: "remediation", label: "복구 결과" },
+      // Defender가 요구한 후속 조치(재부팅 필요 등).
       { key: "additional_actions", label: "추가 조치" },
       { key: "process", label: "프로세스" },
-      { key: "user", label: "사용자" },
+      { key: "account", label: "사용자", kind: "account" },
+      { key: "detection_user", label: "탐지 당시 사용자 원문" },
+      { key: "origin", label: "유입 경로" },
       { key: "source", label: "탐지원" },
       { key: "detail", label: "경로/내용" },
+      { key: "result", label: "결과" },
+      { key: "event_id", label: "이벤트 ID" },
       { key: "raw_line", label: "원본 라인", kind: "code" },
     ]}],
   },
@@ -969,15 +1203,18 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
   // + mosaic), split out of the raw RdpBitmapCache table into 종합 분석.
   RdpCache: {
     customView: "rdpCache",
-    title: (r) => (r.kind === "mosaic" ? `${r.source_file} (모자이크)` : `${r.source_file} 복원 조각 ${r.fragment_index}`),
+    title: (r) => `${r.source_file} 복원 조각 ${r.fragment_index}`,
     subtitle: (r) => (r.cols && r.rows ? `${r.cols}×${r.rows} 타일` : ""),
     sections: [{ heading: "복원 조각", fields: [
-      { key: "kind", label: "종류" },
+      { key: "event_type", label: "종류" },
       { key: "source_file", label: "캐시 파일" },
       { key: "fragment_index", label: "조각 번호" },
       { key: "tile_count", label: "타일 수" },
       { key: "cols", label: "가로 타일" },
       { key: "rows", label: "세로 타일" },
+      { key: "width", label: "너비" },
+      { key: "height", label: "높이" },
+      { key: "status", label: "복원 상태" },
     ]}],
   },
 
@@ -988,11 +1225,10 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
       { key: "direction", kind: "badge", badgeColors: DIRECTION_COLORS },
       { key: "result", label: "결과", kind: "badge", badgeColors: RDP_RESULT_COLORS },
     ],
-    links: [{ key: "record_key", label: "이벤트 로그 원본 보기", targetFile: "EventLog_Events", targetColumn: "_record_key" }],
     // Shown as a session-grouped flow instead of a flat table.
     flowView: true,
     // (kept for when the raw table is viewed directly) Only these five are
-    // worth scanning; provider/event_id/result/record_key stay in the data.
+    // worth scanning; provider/event_id/result stay in the data.
     visibleColumns: ["timestamp", "direction", "remote_address", "account", "description"],
     filterTabs: {
       column: "result",
@@ -1004,7 +1240,17 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     },
     priorityColumns: ["timestamp", "direction", "remote_address", "account", "description"],
     sections: [{ heading: "상세", fields: [
-      { key: "account", label: "계정" },
+      { key: "account", label: "계정", kind: "account" },
+      { key: "account_sid", label: "계정 SID", kind: "accountSid" },
+      { key: "remote_computer", label: "원격 컴퓨터" },
+      { key: "remote_port", label: "원격 포트" },
+      { key: "local_address", label: "로컬 주소" },
+      { key: "logon_type", label: "로그온 유형" },
+      { key: "logon_id", label: "로그온 ID" },
+      { key: "session_id", label: "세션 ID" },
+      { key: "start_time", label: "시작 시각" },
+      { key: "end_time", label: "종료 시각" },
+      { key: "event_type", label: "기록 종류" },
       { key: "description", label: "설명" },
       { key: "result", label: "결과" },
       { key: "event_id", label: "이벤트 ID" },
@@ -1026,7 +1272,6 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
       { key: "direction", kind: "badge", badgeColors: DIRECTION_COLORS },
       { key: "result", label: "결과", kind: "badge", badgeColors: RDP_RESULT_COLORS },
     ],
-    links: [{ key: "record_key", label: "이벤트 로그 원본 보기", targetFile: "EventLog_Events", targetColumn: "_record_key" }],
     visibleColumns: ["timestamp", "remote_address", "account", "result", "description"],
     filterTabs: {
       column: "result",
@@ -1039,7 +1284,15 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     priorityColumns: ["timestamp", "remote_address", "account", "result", "description"],
     sections: [{ heading: "상세", fields: [
       { key: "remote_address", label: "클라이언트 주소" },
-      { key: "account", label: "계정" },
+      { key: "remote_port", label: "클라이언트 포트" },
+      { key: "account", label: "계정", kind: "account" },
+      { key: "account_sid", label: "계정 SID", kind: "accountSid" },
+      { key: "share_name", label: "공유 이름" },
+      { key: "share_path", label: "공유 경로", kind: "path" },
+      { key: "target_file", label: "대상 파일", kind: "path" },
+      { key: "access_rights", label: "요청 권한" },
+      { key: "access_mask", label: "요청 권한 원문" },
+      { key: "event_type", label: "기록 종류" },
       { key: "description", label: "설명" },
       { key: "result", label: "결과" },
       { key: "event_id", label: "이벤트 ID" },
@@ -1055,7 +1308,6 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     customView: "service",
     title: (r) => r.service_name || r.description || "(서비스 정보 없음)",
     subtitle: (r) => r.image_path || "",
-    links: [{ key: "record_key", label: "이벤트 로그 원본 보기", targetFile: "EventLog_Events", targetColumn: "_record_key" }],
     visibleColumns: ["timestamp", "service_name", "image_path", "description", "state", "result"],
     priorityColumns: ["timestamp", "service_name", "image_path", "description", "state", "result"],
     sections: [
@@ -1063,17 +1315,21 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
         { key: "service_name", label: "서비스 이름" },
         { key: "service_key", label: "서비스 짧은 이름" },
         { key: "image_path", label: "실행 파일 경로", kind: "path" },
-        { key: "account", label: "실행 계정", kind: "account" },
+        { key: "image_path_resolved", label: "실행 파일 경로 (환경변수 해석)", kind: "path" },
+        { key: "service_account", label: "실행 계정", kind: "account" },
+        { key: "service_account_sid", label: "실행 계정 SID", kind: "accountSid" },
         { key: "service_type", label: "서비스 유형" },
       ]},
       { heading: "기록", fields: [
-        { key: "description", label: "기록 종류" },
+        { key: "event_type", label: "기록 종류" },
+        { key: "description", label: "설명" },
         { key: "state", label: "상태" },
         { key: "start_type_before", label: "이전 시작 유형" },
         { key: "start_type_after", label: "시작 유형" },
         { key: "detail", label: "상세" },
         { key: "result", label: "결과" },
         { key: "event_id", label: "이벤트 ID" },
+        { key: "provider", label: "공급자" },
       ]},
     ],
   },
@@ -1082,7 +1338,6 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     customView: "bits",
     title: (r) => r.job_name || "(작업 이름 없음)",
     subtitle: (r) => r.url || "",
-    links: [{ key: "record_key", label: "이벤트 로그 원본 보기", targetFile: "EventLog_Events", targetColumn: "_record_key" }],
     visibleColumns: ["timestamp", "job_name", "url", "account", "result", "description"],
     priorityColumns: ["timestamp", "job_name", "url", "account", "result", "description"],
     sections: [
@@ -1090,7 +1345,9 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
         { key: "job_name", label: "작업 이름" },
         { key: "job_id", label: "작업 ID" },
         { key: "url", label: "전송 URL", kind: "path" },
-        { key: "account", label: "계정" },
+        { key: "local_path", label: "저장 경로", kind: "path" },
+        { key: "local_path_resolved", label: "저장 경로 (환경변수 해석)", kind: "path" },
+        { key: "account", label: "계정", kind: "account" },
         { key: "process", label: "요청 프로세스", kind: "path" },
       ]},
       { heading: "전송", fields: [
@@ -1099,20 +1356,33 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
         { key: "status", label: "상태 코드" },
       ]},
       { heading: "상세", fields: [
+        { key: "event_type", label: "기록 종류" },
         { key: "description", label: "설명" },
         { key: "result", label: "결과" },
         { key: "event_id", label: "이벤트 ID" },
       ]},
     ],
+    // 한 작업이 옮긴 파일 목록은 BitsFiles 자식 표에 있다 — 부모 행에 합치지
+    // 않고 상세에서만 조회한다(docs-01).
+    childTables: [{
+      table: "BitsFiles",
+      heading: "전송 파일",
+      fields: [
+        { key: "url", label: "URL", kind: "path" },
+        { key: "local_path", label: "저장 경로", kind: "path" },
+        { key: "local_path_resolved", label: "저장 경로 (환경변수 해석)", kind: "path" },
+        { key: "bytes_transferred", label: "전송한 크기", kind: "bytes" },
+        { key: "bytes_total", label: "전체 크기", kind: "bytes" },
+      ],
+    }],
   },
 
   FirewallHistory: {
     customView: "firewall",
     title: (r) => r.rule_name || r.detail || "(규칙 이름 없음)",
     subtitle: (r) => r.detail || "",
-    links: [{ key: "record_key", label: "이벤트 로그 원본 보기", targetFile: "EventLog_Events", targetColumn: "_record_key" }],
-    visibleColumns: ["timestamp", "kind", "rule_name", "direction", "action", "app_path", "account"],
-    priorityColumns: ["timestamp", "kind", "rule_name", "direction", "action", "app_path", "account", "detail"],
+    visibleColumns: ["timestamp", "event_type", "rule_name", "direction", "action", "app_path", "account"],
+    priorityColumns: ["timestamp", "event_type", "rule_name", "direction", "action", "app_path", "account", "detail"],
     sections: [
       { heading: "규칙", fields: [
         { key: "rule_name", label: "규칙 이름" },
@@ -1120,18 +1390,23 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
         { key: "direction", label: "방향" },
         { key: "action", label: "동작" },
         { key: "protocol", label: "프로토콜" },
+        { key: "protocol_number", label: "프로토콜 번호" },
+        { key: "local_address", label: "로컬 주소" },
+        { key: "remote_address", label: "원격 주소" },
         { key: "local_ports", label: "로컬 포트" },
         { key: "remote_ports", label: "원격 포트" },
         { key: "profiles", label: "적용 프로필" },
         { key: "app_path", label: "대상 프로그램", kind: "path" },
+        { key: "app_path_resolved", label: "대상 프로그램 (환경변수 해석)", kind: "path" },
         { key: "service", label: "대상 서비스" },
       ]},
       { heading: "변경 주체", fields: [
         { key: "account", label: "계정", kind: "account" },
+        { key: "account_sid", label: "계정 SID", kind: "accountSid" },
         { key: "modifying_app", label: "변경 프로그램", kind: "path" },
       ]},
       { heading: "상세", fields: [
-        { key: "kind", label: "유형" },
+        { key: "event_type", label: "유형" },
         { key: "detail", label: "설명" },
         { key: "event_id", label: "이벤트 ID" },
         { key: "provider", label: "공급자" },
@@ -1143,37 +1418,41 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     // ScriptBlock and HostApplication can be arbitrarily long. Keep the
     // shared drawer's evidence title stable; both values are first-class
     // fields in the execution section below.
-    title: (r) => r.command || r.kind || "(명령 없음)",
+    title: (r) => r.command || r.event_type || "(명령 없음)",
     subtitle: (r) => [r.account, r.process].filter(Boolean).join(" · "),
     badges: [
-      { key: "kind", kind: "badge" },
+      { key: "event_type", kind: "badge" },
       { key: "event_id", label: "이벤트 ID", kind: "badge" },
     ],
     tags: (r) => tagsForPath(r.script_path),
-    links: [{ key: "record_key", label: "이벤트 로그 원본 보기", targetFile: "EventLog_Events", targetColumn: "_record_key" }],
     // (kept for when the raw table is viewed directly, but the flow view is
     // the default) — the five fields the analyst actually scans.
-    visibleColumns: ["timestamp", "kind", "account", "process", "command"],
-    priorityColumns: ["timestamp", "kind", "account", "process", "command"],
+    visibleColumns: ["timestamp", "event_type", "account", "process", "command"],
+    priorityColumns: ["timestamp", "event_type", "account", "process", "command"],
     sections: [
       { heading: "실행 정보", fields: [
-        { key: "account", label: "수행 계정" },
+        { key: "account", label: "수행 계정", kind: "account" },
+        { key: "account_sid", label: "수행 계정 SID", kind: "accountSid" },
         { key: "process", label: "수행 프로세스" },
         { key: "process_id", label: "프로세스 ID" },
         { key: "host_application", label: "호스트 애플리케이션", kind: "code", showWhenEmpty: true, emptyLabel: "기록되지 않음" },
         { key: "script_path", label: "스크립트 경로", kind: "path" },
+        { key: "script_path_resolved", label: "스크립트 경로 (환경변수 해석)", kind: "path" },
+        { key: "line_number", label: "줄 번호" },
       ]},
       { heading: "명령어", fields: [{ key: "command", kind: "code" }] },
       { heading: "코드 블록 (ScriptBlock)", fields: [
-        // 분할 4104의 조각 누락·중복 불일치 표식 — 잘린 본문이 완전한 원문으로
-        // 오인되지 않도록 기본 "주요 정보" 상세에서 바로 보이게 한다.
-        // 값이 비면(온전한 재조합) 자동으로 숨는다.
-        { key: "script_block_status", label: "재조합 상태", kind: "badge", badgeColor: "#d29922" },
+        // 분할 4104의 재조합 결과·조각 누락 표식은 공통 description에 남는다 —
+        // 잘린 본문을 완전한 원문으로 오인하지 않도록 상세 상단에 보여 준다.
+        { key: "description", label: "재조합 상태" },
         { key: "script_block", kind: "code" },
+        { key: "script_block_id", label: "ScriptBlock ID" },
       ] },
       { heading: "이벤트", fields: [
         { key: "event_id", label: "이벤트 ID" },
         { key: "provider", label: "공급자" },
+        { key: "session_id", label: "세션 ID" },
+        { key: "runspace_id", label: "Runspace ID" },
       ]},
     ],
   },

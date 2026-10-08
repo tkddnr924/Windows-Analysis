@@ -16,10 +16,10 @@ pub fn read_table(db: &Path, table: &str) -> Vec<Row> {
     read_table_inner(db, table, false)
 }
 
-/// Read a table together with each SQLite rowid. Overview tables use this only
-/// to preserve a stable pointer back to the raw parsed record; the additional
-/// column is deliberately private and never emitted as analyst-facing data.
-fn read_table_with_rowid(db: &Path, table: &str) -> Vec<Row> {
+/// Read a table together with each SQLite rowid. 파생은 이 rowid로 원본 행을
+/// 가리키는 근거(source_records)를 만든다 — 추가 컬럼(`__source_rowid`)은
+/// 내부 식별용이며 분석가에게 보여 주는 데이터가 아니다.
+pub fn read_table_with_rowid(db: &Path, table: &str) -> Vec<Row> {
     read_table_inner(db, table, true)
 }
 
@@ -485,7 +485,7 @@ pub fn defender_from_mpdetection(target: &Path) -> Vec<Row> {
         } else {
             String::from_utf8_lossy(&raw).into_owned()
         };
-        for line in text.lines() {
+        for (index, line) in text.lines().enumerate() {
             let Some((ts_raw, rest)) = line.trim().split_once(" DETECTION ") else {
                 continue;
             };
@@ -503,6 +503,9 @@ pub fn defender_from_mpdetection(target: &Path) -> Vec<Row> {
             rec.insert("detail".into(), resource);
             rec.insert("source".into(), "MPDetection".into());
             rec.insert("raw_line".into(), line.trim().to_string());
+            // 수집 로그 파일과 행 번호 — 이 행의 원본 위치다(파생의 원본 연결용).
+            rec.insert("_source_file".into(), path.to_string_lossy().to_string());
+            rec.insert("line_number".into(), (index + 1).to_string());
             rows.push(rec);
         }
     }
@@ -2180,18 +2183,167 @@ fn all_strings(v: &serde_json::Value, out: &mut Vec<String>) {
     }
 }
 
-fn ctx_value(ctx: &str, tokens: &[&str]) -> String {
-    for line in ctx.lines() {
-        if !line.contains('=') {
-            continue;
+// Only known field labels delimit multiline command values.
+const CTX_LABELS: &[&str] = &[
+    "severity",
+    "host name",
+    "host version",
+    "host id",
+    "host application",
+    "engine version",
+    "runspace id",
+    "pipeline id",
+    "command name",
+    "command type",
+    "script name",
+    "command path",
+    "sequence number",
+    "user",
+    "connected user",
+    "shell id",
+    "user data",
+    "심각도",
+    "호스트 이름",
+    "호스트 버전",
+    "호스트 id",
+    "호스트 응용 프로그램",
+    "엔진 버전",
+    "런스페이스 id",
+    "파이프라인 id",
+    "명령 이름",
+    "명령 유형",
+    "스크립트 이름",
+    "명령 경로",
+    "시퀀스 번호",
+    "사용자",
+    "연결된 사용자",
+    "셸 id",
+    "쉘 id",
+];
+
+fn ps_detail_fields(blob: &str, keys: &[&str], separator: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut current: Option<(&str, usize)> = None;
+    let mut offset = 0;
+    let emit = |out: &mut Vec<(String, String)>, key: &str, start: usize, end: usize| {
+        let value = &blob[start..end];
+        // Remove the event-format separator, not command whitespace.
+        let value = value.strip_suffix("\r\n").or_else(|| value.strip_suffix('\n')).unwrap_or(value);
+        out.push((key.to_string(), value.to_string()));
+    };
+    for line in blob.split_inclusive('\n') {
+        if let Some((label, tail)) = line.split_once(separator) {
+            let label = label.trim();
+            if keys.iter().any(|key| key.eq_ignore_ascii_case(label)) {
+                if let Some((key, start)) = current {
+                    emit(&mut out, key, start, offset);
+                }
+                let tail = if separator == " =" { tail.strip_prefix(' ').unwrap_or(tail) } else { tail };
+                current = Some((label, offset + line.len() - tail.len()));
+            }
         }
-        let (label, value) = line.split_once('=').unwrap();
-        let label = label.trim();
-        if tokens.iter().any(|t| !t.is_empty() && label.contains(t)) {
-            return value.trim().to_string();
+        offset += line.len();
+    }
+    if let Some((key, start)) = current {
+        emit(&mut out, key, start, blob.len());
+    }
+    out
+}
+
+fn ctx_fields(ctx: &str) -> Vec<(String, String)> {
+    ps_detail_fields(ctx, CTX_LABELS, " =")
+}
+
+fn ctx_get(fields: &[(String, String)], tokens: &[&str]) -> String {
+    fields.iter()
+        .find(|(label, _)| tokens.iter().any(|token| label.eq_ignore_ascii_case(token)))
+        .map(|(_, value)| value.clone())
+        .unwrap_or_default()
+}
+
+// Classic event detail strings use invariant Key=Value labels.
+const CLASSIC_KEYS: &[&str] = &[
+    "detailsequence",
+    "detailtotal",
+    "sequencenumber",
+    "userid",
+    "user",
+    "hostname",
+    "hostversion",
+    "hostid",
+    "hostapplication",
+    "engineversion",
+    "runspaceid",
+    "pipelineid",
+    "commandname",
+    "commandtype",
+    "scriptname",
+    "commandpath",
+    "commandline",
+    "providername",
+    "newproviderstate",
+    "newenginestate",
+    "previousenginestate",
+    "errormessage",
+    "severity",
+];
+
+fn classic_fields(ed: &serde_json::Map<String, serde_json::Value>) -> Vec<(String, String)> {
+    let mut strings = Vec::new();
+    for value in ed.values() {
+        all_strings(value, &mut strings);
+    }
+    let mut out: Vec<(String, String)> = Vec::new();
+    for blob in &strings {
+        for (key, value) in ps_detail_fields(blob, CLASSIC_KEYS, "=") {
+            if !out.iter().any(|(existing, _)| existing.eq_ignore_ascii_case(&key)) {
+                out.push((key, value));
+            }
         }
     }
-    String::new()
+    out
+}
+
+fn classic_get(fields: &[(String, String)], key: &str) -> String {
+    fields
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(key))
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default()
+}
+
+// Session identifiers must exist in the source.
+fn classic_session(row: &mut Row, fields: &[(String, String)]) {
+    for (field, key) in [("session_id", "HostId"), ("runspace_id", "RunspaceId")] {
+        let value = classic_get(fields, key);
+        if !value.is_empty() {
+            row.insert(field.to_string(), value);
+        }
+    }
+}
+
+// Preserve event context independently of the resolved account.
+fn stamp_event(
+    row: &mut Row,
+    sid: &str,
+    channel: &str,
+    record_id: &str,
+    level: &str,
+    event_data: &str,
+    source_file: &str,
+) {
+    for (field, value) in [
+        ("account_sid", sid),
+        ("event_channel", channel),
+        ("event_record_id", record_id),
+        ("event_level", level),
+        ("event_data", event_data),
+        ("_source_file", source_file),
+    ] {
+        if !value.is_empty() {
+            row.insert(field.to_string(), value.to_string());
+        }
+    }
 }
 
 fn exe_from_host(host: &str) -> String {
@@ -2223,41 +2375,17 @@ fn exe_from_host(host: &str) -> String {
     }
 }
 
-fn first_line(text: &str, limit: usize) -> String {
-    for line in text.lines() {
-        let s = line.trim();
-        if !s.is_empty() {
-            return s.chars().take(limit).collect();
-        }
-    }
-    text.trim().chars().take(limit).collect()
-}
-
-fn find_token(blob: &str, prefix: &str) -> String {
-    // Emulate re.search(r"PREFIX(.+)") — first occurrence, capture to line end.
-    if let Some(pos) = blob.find(prefix) {
-        let after = &blob[pos + prefix.len()..];
-        let line = after.split('\n').next().unwrap_or("");
-        let line = line.trim_end_matches('\r');
-        if !line.is_empty() {
-            return line.trim().to_string();
-        }
-    }
-    String::new()
-}
-
-fn to_int(v: Option<&serde_json::Value>, default: i64) -> i64 {
+/// 이벤트가 남긴 정수 — 없거나 해석할 수 없으면 "모름"(None). 1 같은 기본값을
+/// 넣으면 조각 번호·총수를 지어내는 것이 된다.
+fn opt_int(v: Option<&serde_json::Value>) -> Option<i64> {
     match v {
-        Some(serde_json::Value::Number(n)) => n.as_i64().unwrap_or(default),
-        Some(serde_json::Value::String(s)) => s.trim().parse().unwrap_or(default),
-        _ => default,
+        Some(serde_json::Value::Number(n)) => n.as_i64(),
+        Some(serde_json::Value::String(s)) => s.trim().parse().ok(),
+        _ => None,
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-/// PowerShellHistory 파생 테이블의 고정 컬럼 — 0건에도 스키마를 만들 수
-/// 있게 발행 측(write_ov)이 사용한다. script_block_status는 분할 4104가
-/// 불완전할 때만 값이 생기는 상태 컬럼이다.
+/// PowerShell evidence fields; unknown optional values stay absent.
 pub const PS_KEYS: &[&str] = &[
     "timestamp",
     "account",
@@ -2272,6 +2400,30 @@ pub const PS_KEYS: &[&str] = &[
     "script_path",
     "record_key",
     "script_block_status",
+    // Explicit script and session identifiers.
+    "script_block_id",
+    "session_id",
+    "runspace_id",
+    // Original event context.
+    "account_sid",
+    "context_info",
+    "error_message",
+    "event_data",
+    "event_channel",
+    "event_record_id",
+    "event_level",
+    // Script reassembly evidence.
+    "script_block_expected_parts",
+    "script_block_observed_parts",
+    "script_block_missing",
+    "script_block_conflicts",
+    "script_block_anomalies",
+    "script_block_parts",
+    // Console history has order, not timestamps.
+    "line_number",
+    "console_history_status",
+    "console_lines",
+    "_source_file",
 ];
 
 #[allow(clippy::too_many_arguments)] // PowerShellHistory 행 고정 필드 세트
@@ -2324,116 +2476,190 @@ pub fn build_powershell_history_with_events(
         }
     };
     let mut rows: Vec<Row> = Vec::new();
-    // 재조합 중인 분할 ScriptBlock — 완전성 검증을 위해 기대 조각 수와
-    // 이상(누락·중복·범위 밖·총수 불일치)을 함께 추적한다. EVTX 손상·유실로
-    // 조각이 빠져도 최선의 본문은 남기되 불완전함을 표시해, 잘린 문자열이
-    // 완전한 원문으로 오인되지 않게 한다.
-    struct ScriptBlockParts {
-        parts: std::collections::BTreeMap<i64, String>,
+    // Keep every source event, including conflicting and duplicate fragments.
+    struct ScriptPart {
+        record_key: String,
+        source_file: String,
+        timestamp: String,
+        number: Option<i64>,
+        total: Option<i64>,
+        text: String,
+        event_data: String,
+        event_record_id: String,
+    }
+    struct ScriptBlockGroup {
+        row_index: usize,
+        script_block_id: String,
         timestamp: String,
         sid: String,
         pid: String,
-        record_key: String,
         path: String,
-        expected_total: i64,
+        record_key: String,
+        source_file: String,
+        channel: String,
+        record_id: String,
+        level: String,
+        event_data: String,
+        expected_total: Option<i64>,
+        parts: Vec<ScriptPart>,
+        bodies: std::collections::BTreeMap<i64, String>,
+        conflicts: std::collections::BTreeSet<i64>,
         anomalies: Vec<String>,
     }
-    let mut block_keys: Vec<String> = Vec::new();
-    let mut blocks: std::collections::HashMap<String, ScriptBlockParts> =
+    fn push_once(anomalies: &mut Vec<String>, note: String) {
+        if !anomalies.contains(&note) {
+            anomalies.push(note);
+        }
+    }
+    let mut groups: Vec<ScriptBlockGroup> = Vec::new();
+    let mut group_index: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
 
     for r in events.rows() {
         let provider = r.get("Provider").cloned().unwrap_or_default();
         let event_id = r.get("EventID").cloned().unwrap_or_default();
-        let ed = parse_eventdata(r.get("EventData").map(|s| s.as_str()).unwrap_or(""));
+        if !((provider == "Microsoft-Windows-PowerShell"
+            && matches!(event_id.as_str(), "4100" | "4103" | "4104" | "40961"))
+            || (provider == "PowerShell"
+                && matches!(event_id.as_str(), "400" | "403" | "600" | "800")))
+        {
+            continue;
+        }
+        let raw_data = r.get("EventData").cloned().unwrap_or_default();
+        let ed = parse_eventdata(&raw_data);
         let sid = r.get("UserID").cloned().unwrap_or_default();
         let pid = r.get("ProcessID").cloned().unwrap_or_default();
         let ts = r.get("timestamp").cloned().unwrap_or_default();
         let rk = r.get("_record_key").cloned().unwrap_or_default();
+        let channel = r.get("Channel").cloned().unwrap_or_default();
+        let computer = r.get("Computer").cloned().unwrap_or_default();
+        let record_id = r.get("EventRecordID").cloned().unwrap_or_default();
+        let level = r.get("Level").cloned().unwrap_or_default();
+        let source_file = r.get("_source_file").cloned().unwrap_or_default();
 
         if provider == "Microsoft-Windows-PowerShell" && event_id == "4104" {
             let text = ed.get("ScriptBlockText").map(vstr).unwrap_or_default();
             let path = ed.get("Path").map(vstr).unwrap_or_default();
             let sbid = ed.get("ScriptBlockId").map(vstr).unwrap_or_default();
-            let total = to_int(ed.get("MessageTotal"), 1);
-            let num = to_int(ed.get("MessageNumber"), 1);
-            if !sbid.is_empty() && total > 1 {
-                if !blocks.contains_key(&sbid) {
-                    block_keys.push(sbid.clone());
-                    blocks.insert(
-                        sbid.clone(),
-                        ScriptBlockParts {
-                            parts: std::collections::BTreeMap::new(),
-                            timestamp: ts.clone(),
-                            sid: sid.clone(),
-                            pid: pid.clone(),
-                            record_key: rk.clone(),
-                            path: path.clone(),
-                            expected_total: total,
-                            anomalies: Vec::new(),
-                        },
-                    );
-                }
-                let slot = blocks.get_mut(&sbid).unwrap();
-                if total != slot.expected_total {
-                    let note = format!(
-                        "총 조각 수 불일치({} vs {})",
-                        slot.expected_total, total
-                    );
-                    if !slot.anomalies.contains(&note) {
-                        slot.anomalies.push(note);
-                    }
-                }
-                if num < 1 || num > slot.expected_total.max(total) {
-                    slot.anomalies.push(format!("범위 밖 조각 번호 {}", num));
-                }
-                match slot.parts.get(&num) {
-                    // 같은 번호가 다른 내용으로 오면 어느 쪽이 진짜인지 알 수
-                    // 없다 — 나중 값을 쓰되 이상으로 남긴다. 동일 내용 중복은
-                    // 로그 중복 수집의 정상 잔상이라 조용히 무시한다.
-                    Some(existing) if *existing != text => {
-                        slot.anomalies.push(format!("조각 {} 중복(내용 상이)", num));
-                        slot.parts.insert(num, text);
-                    }
-                    Some(_) => {}
-                    None => {
-                        slot.parts.insert(num, text);
-                    }
-                }
-                if !ts.is_empty() && (slot.timestamp.is_empty() || ts < slot.timestamp) {
-                    slot.timestamp = ts.clone();
-                    slot.record_key = rk.clone();
-                }
-                continue;
-            }
-            rows.push(ps_row(
-                &ts,
-                &account_for(&sid),
-                "powershell.exe",
-                &pid,
-                "",
-                &text,
-                "",
-                "스크립트 블록",
-                &event_id,
-                &provider,
-                &path,
-                &rk,
-            ));
-        } else if provider == "Microsoft-Windows-PowerShell" && event_id == "4103" {
-            let ctx = ed.get("ContextInfo").map(vstr).unwrap_or_default();
-            let host = ctx_value(&ctx, &["Host Application", "호스트 응용"]);
-            let user = ctx_value(&ctx, &["User", "사용자"]);
-            let payload = ed
-                .get("Payload")
-                .map(vstr)
-                .unwrap_or_default()
-                .trim()
-                .to_string();
-            let command = if !payload.is_empty() {
-                payload
+            let total = opt_int(ed.get("MessageTotal"));
+            let number = opt_int(ed.get("MessageNumber"));
+            // Scope block IDs to the source and recorded process identity.
+            let identity = if sbid.is_empty() {
+                format!("\u{1}no-id\u{1}{rk}\u{1}{}", rows.len())
             } else {
-                ctx_value(&ctx, &["Command Name", "명령 이름"])
+                [
+                    rk.rsplit_once("::").map(|(table, _)| table).unwrap_or(""),
+                    source_file.as_str(),
+                    provider.as_str(),
+                    channel.as_str(),
+                    computer.as_str(),
+                    pid.as_str(),
+                    sid.as_str(),
+                    sbid.as_str(),
+                ]
+                .join("\u{1}")
+            };
+            let index = match group_index.get(&identity).copied() {
+                Some(index) => index,
+                None => {
+                    // Emit at the first fragment's position.
+                    rows.push(Row::new());
+                    groups.push(ScriptBlockGroup {
+                        row_index: rows.len() - 1,
+                        script_block_id: sbid.clone(),
+                        timestamp: ts.clone(),
+                        sid: sid.clone(),
+                        pid: pid.clone(),
+                        path: path.clone(),
+                        record_key: rk.clone(),
+                        source_file: source_file.clone(),
+                        channel: channel.clone(),
+                        record_id: record_id.clone(),
+                        level: level.clone(),
+                        event_data: raw_data.clone(),
+                        expected_total: total,
+                        parts: Vec::new(),
+                        bodies: std::collections::BTreeMap::new(),
+                        conflicts: std::collections::BTreeSet::new(),
+                        anomalies: Vec::new(),
+                    });
+                    group_index.insert(identity, groups.len() - 1);
+                    groups.len() - 1
+                }
+            };
+            let slot = &mut groups[index];
+            match (slot.expected_total, total) {
+                (None, Some(_)) => slot.expected_total = total,
+                (Some(prev), Some(now)) if prev != now => push_once(
+                    &mut slot.anomalies,
+                    format!("총 조각 수 불일치({prev} vs {now})"),
+                ),
+                _ => {}
+            }
+            if total.is_none() {
+                push_once(&mut slot.anomalies, "총 조각 수 불명".into());
+            }
+            if total.is_some_and(|value| value <= 0) {
+                push_once(&mut slot.anomalies, "유효하지 않은 총 조각 수".into());
+            }
+            match number {
+                // Never infer an absent ordinal.
+                None => push_once(&mut slot.anomalies, "조각 번호 불명".into()),
+                Some(n) => {
+                    let limit = slot.expected_total.unwrap_or(0).max(total.unwrap_or(0));
+                    if n < 1 || (limit > 0 && n > limit) {
+                        push_once(&mut slot.anomalies, format!("범위 밖 조각 번호 {n}"));
+                    }
+                    match slot.bodies.get(&n) {
+                        // Preserve alternatives; the first body is representative only.
+                        Some(existing) if *existing != text => {
+                            slot.conflicts.insert(n);
+                            push_once(&mut slot.anomalies, format!("조각 {n} 중복(내용 상이)"));
+                        }
+                        Some(_) => {}
+                        None => {
+                            slot.bodies.insert(n, text.clone());
+                        }
+                    }
+                }
+            }
+            slot.parts.push(ScriptPart {
+                record_key: rk.clone(),
+                source_file: source_file.clone(),
+                timestamp: ts.clone(),
+                number,
+                total,
+                text,
+                event_data: raw_data.clone(),
+                event_record_id: record_id.clone(),
+            });
+            // Use the earliest fragment as the representative event.
+            if !ts.is_empty() && (slot.timestamp.is_empty() || ts < slot.timestamp) {
+                slot.timestamp = ts.clone();
+                slot.record_key = rk.clone();
+                slot.record_id = record_id.clone();
+                slot.level = level.clone();
+                slot.event_data = raw_data.clone();
+            }
+            if slot.path.is_empty() && !path.is_empty() {
+                slot.path = path.clone();
+            }
+        } else if provider == "Microsoft-Windows-PowerShell"
+            && (event_id == "4103" || event_id == "4100")
+        {
+            let ctx = ed.get("ContextInfo").map(vstr).unwrap_or_default();
+            let fields = ctx_fields(&ctx);
+            let host = ctx_get(&fields, &["Host Application", "호스트 응용 프로그램"]);
+            let user = ctx_get(&fields, &["User", "사용자"]);
+            let command_name = ctx_get(&fields, &["Command Name", "명령 이름"]);
+            let script_name = ctx_get(&fields, &["Script Name", "스크립트 이름"]);
+            let payload = ed.get("Payload").map(vstr).unwrap_or_default();
+            // An error payload is not an executed command.
+            let is_problem = event_id == "4100";
+            let command = if is_problem || payload.trim().is_empty() {
+                command_name
+            } else {
+                payload.clone()
             };
             let acct = if !user.is_empty() {
                 user
@@ -2448,35 +2674,68 @@ pub fn build_powershell_history_with_events(
                     e
                 }
             };
-            rows.push(ps_row(
+            // Preserve the distinction between errors and warnings.
+            let kind = if !is_problem {
+                "파이프라인"
+            } else {
+                match level.as_str() {
+                    "1" | "2" => "실행 오류",
+                    "3" => "실행 경고",
+                    _ => "실행 오류·경고",
+                }
+            };
+            let mut row = ps_row(
                 &ts,
                 &acct,
                 &proc,
                 &pid,
-                &first_line(&command, 400),
+                &command,
                 "",
                 &host,
-                "파이프라인",
+                kind,
                 &event_id,
                 &provider,
-                "",
+                &script_name,
                 &rk,
-            ));
-        } else if provider == "PowerShell" && event_id == "800" {
-            let mut strs = Vec::new();
-            for value in ed.values() {
-                all_strings(value, &mut strs);
+            );
+            if !ctx.is_empty() {
+                row.insert("context_info".into(), ctx);
             }
-            let blob = strs.join("\n");
-            let host = find_token(&blob, "HostApplication=");
-            let command = find_token(&blob, "CommandLine=");
+            if is_problem && !payload.is_empty() {
+                // Error payload is evidence, not an executed command.
+                row.insert("error_message".into(), payload);
+            }
+            // Never infer session identifiers.
+            for (field, tokens) in [
+                ("session_id", ["Host ID", "호스트 ID"]),
+                ("runspace_id", ["Runspace ID", "런스페이스 ID"]),
+            ] {
+                let value = ctx_get(&fields, &tokens);
+                if !value.is_empty() {
+                    row.insert(field.into(), value);
+                }
+            }
+            stamp_event(
+                &mut row,
+                &sid,
+                &channel,
+                &record_id,
+                &level,
+                &raw_data,
+                &source_file,
+            );
+            rows.push(row);
+        } else if provider == "PowerShell" && event_id == "800" {
+            let fields = classic_fields(&ed);
+            let host = classic_get(&fields, "HostApplication");
+            let command = classic_get(&fields, "CommandLine");
             // Classic 800 events record the invoked .ps1 as ScriptName=; surface
             // it as the row's script path so the PowerShell view shows it beside
             // the host application instead of leaving the column empty.
-            let script_name = find_token(&blob, "ScriptName=");
+            let script_name = classic_get(&fields, "ScriptName");
             // Classic Windows PowerShell events frequently leave the outer
             // UserID empty while carrying the actual user in EventData.
-            let event_user = find_token(&blob, "UserId=");
+            let event_user = classic_get(&fields, "UserId");
             let account = if event_user.is_empty() {
                 account_for(&sid)
             } else {
@@ -2496,12 +2755,12 @@ pub fn build_powershell_history_with_events(
                     e
                 }
             };
-            rows.push(ps_row(
+            let mut row = ps_row(
                 &ts,
                 &account,
                 &proc,
                 &pid,
-                &first_line(&command, 400),
+                &command,
                 "",
                 &host,
                 "명령 실행",
@@ -2509,16 +2768,23 @@ pub fn build_powershell_history_with_events(
                 &provider,
                 &script_name,
                 &rk,
-            ));
+            );
+            classic_session(&mut row, &fields);
+            stamp_event(
+                &mut row,
+                &sid,
+                &channel,
+                &record_id,
+                &level,
+                &raw_data,
+                &source_file,
+            );
+            rows.push(row);
         } else if provider == "PowerShell" && (event_id == "400" || event_id == "403") {
             // 엔진 수명주기 — 400 시작(Available)/403 종료(Stopped). 명령은 없지만
             // HostApplication이 실행 주체를 남기는 독립 증거다.
-            let mut strs = Vec::new();
-            for value in ed.values() {
-                all_strings(value, &mut strs);
-            }
-            let blob = strs.join("\n");
-            let host = find_token(&blob, "HostApplication=");
+            let fields = classic_fields(&ed);
+            let host = classic_get(&fields, "HostApplication");
             let proc = {
                 let e = exe_from_host(&host);
                 if e.is_empty() {
@@ -2532,7 +2798,7 @@ pub fn build_powershell_history_with_events(
             } else {
                 "엔진 종료"
             };
-            rows.push(ps_row(
+            let mut row = ps_row(
                 &ts,
                 &account_for(&sid),
                 &proc,
@@ -2545,18 +2811,29 @@ pub fn build_powershell_history_with_events(
                 &provider,
                 "",
                 &rk,
-            ));
+            );
+            classic_session(&mut row, &fields);
+            stamp_event(
+                &mut row,
+                &sid,
+                &channel,
+                &record_id,
+                &level,
+                &raw_data,
+                &source_file,
+            );
+            rows.push(row);
         } else if provider == "PowerShell" && event_id == "600" {
             // 공급자 시작은 세션마다 여러 건 나와 시끄럽다 — 원격(WinRM) 사용
             // 흔적인 WSMan 공급자만 남긴다.
-            let mut strs = Vec::new();
-            for value in ed.values() {
-                all_strings(value, &mut strs);
-            }
-            let blob = strs.join("\n");
+            let fields = classic_fields(&ed);
             let provider_name = {
-                let token = find_token(&blob, "ProviderName=");
+                let token = classic_get(&fields, "ProviderName");
                 if token.is_empty() {
+                    let mut strs = Vec::new();
+                    for value in ed.values() {
+                        all_strings(value, &mut strs);
+                    }
                     strs.first().cloned().unwrap_or_default()
                 } else {
                     token
@@ -2565,7 +2842,7 @@ pub fn build_powershell_history_with_events(
             if !provider_name.eq_ignore_ascii_case("wsman") {
                 continue;
             }
-            let host = find_token(&blob, "HostApplication=");
+            let host = classic_get(&fields, "HostApplication");
             let proc = {
                 let e = exe_from_host(&host);
                 if e.is_empty() {
@@ -2574,7 +2851,7 @@ pub fn build_powershell_history_with_events(
                     e
                 }
             };
-            rows.push(ps_row(
+            let mut row = ps_row(
                 &ts,
                 &account_for(&sid),
                 &proc,
@@ -2587,10 +2864,21 @@ pub fn build_powershell_history_with_events(
                 &provider,
                 "",
                 &rk,
-            ));
+            );
+            classic_session(&mut row, &fields);
+            stamp_event(
+                &mut row,
+                &sid,
+                &channel,
+                &record_id,
+                &level,
+                &raw_data,
+                &source_file,
+            );
+            rows.push(row);
         } else if provider == "Microsoft-Windows-PowerShell" && event_id == "40961" {
             // 콘솔 시작 — 클래식 400과 달리 UserID(SID)가 남는 실행 증거.
-            rows.push(ps_row(
+            let mut row = ps_row(
                 &ts,
                 &account_for(&sid),
                 "powershell.exe",
@@ -2603,89 +2891,241 @@ pub fn build_powershell_history_with_events(
                 &provider,
                 "",
                 &rk,
-            ));
+            );
+            stamp_event(
+                &mut row,
+                &sid,
+                &channel,
+                &record_id,
+                &level,
+                &raw_data,
+                &source_file,
+            );
+            rows.push(row);
         }
     }
 
-    for k in &block_keys {
-        let slot = &blocks[k];
-        let text: String = slot.parts.values().cloned().collect();
-        let missing: Vec<String> = (1..=slot.expected_total)
-            .filter(|n| !slot.parts.contains_key(n))
-            .map(|n| n.to_string())
-            .collect();
-        let mut anomalies = slot.anomalies.clone();
+    for group in groups {
+        let mut text = String::new();
+        for body in group.bodies.values() {
+            text.push_str(body);
+        }
+        // Append unknown ordinals without claiming their position is known.
+        for part in group.parts.iter().filter(|part| part.number.is_none()) {
+            text.push_str(&part.text);
+        }
+        // Gap ranges scale with observed parts, not the declared total.
+        let missing: Vec<(i64, i64)> = match group.expected_total {
+            Some(expected) if expected >= 1 => {
+                let mut ranges = Vec::new();
+                let mut prev = 0i64;
+                for n in group
+                    .bodies
+                    .keys()
+                    .copied()
+                    .filter(|n| *n >= 1 && *n <= expected)
+                {
+                    if n > prev + 1 {
+                        ranges.push((prev + 1, n - 1));
+                    }
+                    prev = n;
+                }
+                if prev < expected {
+                    ranges.push((prev + 1, expected));
+                }
+                ranges
+            }
+            _ => Vec::new(),
+        };
+        let mut anomalies = group.anomalies.clone();
         if !missing.is_empty() {
-            anomalies.push(format!("누락 조각: {}", missing.join(",")));
+            let spans: Vec<String> = missing
+                .iter()
+                .map(|(start, end)| {
+                    if start == end {
+                        start.to_string()
+                    } else {
+                        format!("{start}-{end}")
+                    }
+                })
+                .collect();
+            anomalies.push(format!("누락 조각: {}", spans.join(",")));
         }
         let mut row = ps_row(
-            &slot.timestamp,
-            &account_for(&slot.sid),
+            &group.timestamp,
+            &account_for(&group.sid),
             "powershell.exe",
-            &slot.pid,
+            &group.pid,
             "",
             &text,
             "",
             "스크립트 블록",
             "4104",
             "Microsoft-Windows-PowerShell",
-            &slot.path,
-            &slot.record_key,
+            &group.path,
+            &group.record_key,
         );
+        if !group.script_block_id.is_empty() {
+            row.insert("script_block_id".into(), group.script_block_id.clone());
+        }
+        if let Some(expected) = group.expected_total {
+            row.insert("script_block_expected_parts".into(), expected.to_string());
+        }
+        // Observed count includes duplicate and conflicting source events.
+        row.insert(
+            "script_block_observed_parts".into(),
+            group.parts.len().to_string(),
+        );
+        if !missing.is_empty() {
+            let spans: Vec<serde_json::Value> = missing
+                .iter()
+                .map(|(start, end)| serde_json::json!({"start": start, "end": end}))
+                .collect();
+            row.insert(
+                "script_block_missing".into(),
+                serde_json::Value::Array(spans).to_string(),
+            );
+        }
+        if !group.conflicts.is_empty() {
+            let numbers: Vec<serde_json::Value> =
+                group.conflicts.iter().map(|n| serde_json::json!(n)).collect();
+            row.insert(
+                "script_block_conflicts".into(),
+                serde_json::Value::Array(numbers).to_string(),
+            );
+        }
         if !anomalies.is_empty() {
+            let notes: Vec<serde_json::Value> = anomalies
+                .iter()
+                .map(|note| serde_json::Value::String(note.clone()))
+                .collect();
+            row.insert(
+                "script_block_anomalies".into(),
+                serde_json::Value::Array(notes).to_string(),
+            );
             row.insert(
                 "script_block_status".into(),
                 format!("불완전 — {}", anomalies.join(" · ")),
             );
         }
-        rows.push(row);
+        // Every child retains its own source coordinate and body.
+        let parts: Vec<serde_json::Value> = group
+            .parts
+            .iter()
+            .map(|part| {
+                let mut obj = serde_json::Map::new();
+                for (field, value) in [
+                    ("record_key", &part.record_key),
+                    ("_source_file", &part.source_file),
+                    ("timestamp", &part.timestamp),
+                    ("script_block", &part.text),
+                    ("event_data", &part.event_data),
+                    ("event_record_id", &part.event_record_id),
+                ] {
+                    if !value.is_empty() {
+                        obj.insert(field.into(), serde_json::Value::String(value.clone()));
+                    }
+                }
+                for (field, value) in
+                    [("message_number", part.number), ("message_total", part.total)]
+                {
+                    if let Some(value) = value {
+                        obj.insert(field.into(), serde_json::Value::String(value.to_string()));
+                    }
+                }
+                serde_json::Value::Object(obj)
+            })
+            .collect();
+        row.insert(
+            "script_block_parts".into(),
+            serde_json::Value::Array(parts).to_string(),
+        );
+        stamp_event(
+            &mut row,
+            &group.sid,
+            &group.channel,
+            &group.record_id,
+            &group.level,
+            &group.event_data,
+            &group.source_file,
+        );
+        rows[group.row_index] = row;
     }
 
-    // PSReadLine ConsoleHost_history — 사용자가 콘솔에 입력한 명령 원문.
-    // 파일에 시각이 없으므로 timestamp는 비워 두고(뷰의 "시간 정보 없음"
-    // 구역으로 분리 표시) 입력 순서는 line_number로 보존한다.
-    let console_db = out_dir
-        .join("POWERSHELL")
-        .join("PowerShell_ConsoleHistory.sqlite");
+    // PSReadLine serializes embedded newlines as a trailing backtick plus EOL.
+    let console_db = out_dir.join("POWERSHELL").join("PowerShell_ConsoleHistory.sqlite");
     let mut console_rows = read_table_with_rowid(&console_db, "PowerShell_ConsoleHistory");
+    let physical_line = |r: &Row| r.get("line_number").and_then(|v| v.parse::<i64>().ok());
     console_rows.sort_by(|a, b| {
-        let user_a = a.get("user").map(String::as_str).unwrap_or("");
-        let user_b = b.get("user").map(String::as_str).unwrap_or("");
-        let line = |r: &Row| {
-            r.get("line_number")
-                .and_then(|v| v.parse::<i64>().ok())
-                .unwrap_or(i64::MAX)
-        };
-        user_a.cmp(user_b).then(line(a).cmp(&line(b)))
+        a.get("_source_file").cmp(&b.get("_source_file"))
+            .then(a.get("user").cmp(&b.get("user")))
+            .then(physical_line(a).cmp(&physical_line(b)))
+            .then(a.get("__source_rowid").cmp(&b.get("__source_rowid")))
     });
-    for r in console_rows {
-        let command = r.get("command").cloned().unwrap_or_default();
-        if command.trim().is_empty() {
+    let mut input = console_rows.into_iter().peekable();
+    while let Some(mut current) = input.next() {
+        if current.get("command").is_none_or(|command| command.trim().is_empty()) {
             continue;
         }
-        let account = r.get("user").cloned().unwrap_or_default();
-        let record_key = r
-            .get("__source_rowid")
-            .map(|rowid| format!("PowerShell_ConsoleHistory::{rowid}"))
-            .unwrap_or_default();
-        let mut row = ps_row(
-            "",
-            &account,
-            "powershell.exe",
-            "",
-            &first_line(&command, 400),
-            "",
-            "",
-            "콘솔 히스토리",
-            "",
-            "PSReadLine",
-            "",
-            &record_key,
-        );
-        row.insert(
-            "line_number".into(),
-            r.get("line_number").cloned().unwrap_or_default(),
-        );
+        let account = current.get("user").cloned().unwrap_or_default();
+        let source = current.get("_source_file").cloned().unwrap_or_default();
+        let first_line = current.get("line_number").cloned().unwrap_or_default();
+        let record_key = current.get("__source_rowid")
+            .map(|rowid| format!("PowerShell_ConsoleHistory::{rowid}")).unwrap_or_default();
+        let mut command = String::new();
+        let mut lines = Vec::new();
+        let mut status = None;
+        loop {
+            let line_number = physical_line(&current);
+            let raw = current.remove("command").unwrap_or_default();
+            let continued = raw.ends_with('`');
+            if let Some(body) = raw.strip_suffix('`') {
+                command.push_str(body);
+                command.push('\n');
+            } else {
+                command.push_str(&raw);
+            }
+            let mut line = Row::new();
+            line.insert("command".into(), raw);
+            for field in ["line_number", "_source_file"] {
+                if let Some(value) = current.remove(field) {
+                    line.insert(field.into(), value);
+                }
+            }
+            if let Some(rowid) = current.remove("__source_rowid") {
+                line.insert("record_key".into(), format!("PowerShell_ConsoleHistory::{rowid}"));
+            }
+            lines.push(line);
+            if !continued {
+                break;
+            }
+            let Some(next) = input.peek() else {
+                status = Some("incomplete_continuation");
+                break;
+            };
+            if source.is_empty()
+                || next.get("_source_file").map(String::as_str) != Some(source.as_str())
+                || next.get("user").map(String::as_str).unwrap_or("") != account
+            {
+                status = Some("incomplete_continuation");
+                break;
+            }
+            if line_number.and_then(|n| n.checked_add(1)).zip(physical_line(next))
+                .is_none_or(|(expected, observed)| expected != observed)
+            {
+                status = Some("missing_line");
+                break;
+            }
+            current = input.next().expect("peeked console line");
+        }
+        let mut row = ps_row("", &account, "powershell.exe", "", &command, "", "",
+            "콘솔 히스토리", "", "PSReadLine", "", &record_key);
+        row.insert("line_number".into(), first_line);
+        row.insert("_source_file".into(), source);
+        row.insert("console_lines".into(), serde_json::to_string(&lines).expect("console evidence rows"));
+        if let Some(status) = status {
+            row.insert("console_history_status".into(), status.into());
+        }
         rows.push(row);
     }
     rows
@@ -2869,8 +3309,9 @@ fn read_cache_entry_meta(db: &Path) -> Vec<Row> {
             }
         }
     }
-    let mut select: Vec<String> = Vec::new();
-    let mut keys: Vec<&str> = Vec::new();
+    // 원본 연결에는 실제 rowid가 필요하다 — 메타 조회에서 함께 읽는다.
+    let mut select: Vec<String> = vec!["CAST(rowid AS TEXT)".to_string()];
+    let mut keys: Vec<&str> = vec!["__source_rowid"];
     for column in META_COLUMNS {
         if present.iter().any(|name| name == column) {
             select.push(format!("\"{}\"", column));
@@ -2931,6 +3372,29 @@ fn ie_download_url(metadata: &str, fallback: &str) -> String {
             .to_string(),
         None => fallback.to_string(),
     }
+}
+
+/// 산출물 파일 stem(`<계정>_<브라우저>[_Cache]`)에서 브라우저 이름을 읽는다.
+/// 이름에 브라우저 표기가 없으면 빈 값 — 추정하지 않는다.
+fn browser_of(db: &Path) -> String {
+    let stem = db
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default()
+        .to_lowercase();
+    for (needle, name) in [
+        ("_chrome", "Chrome"),
+        ("_edge", "Edge"),
+        ("_whale", "Whale"),
+        ("_ie_webcache", "IE"),
+        ("_ie_indexdat", "IE"),
+        ("_unknown", "Unknown"),
+    ] {
+        if stem.contains(needle) {
+            return name.to_string();
+        }
+    }
+    String::new()
 }
 
 pub fn build_browser_history(out_dir: &Path) -> Vec<Row> {
@@ -3005,6 +3469,10 @@ pub fn build_browser_history(out_dir: &Path) -> Vec<Row> {
                     let src = g("_source_file");
                     if src.is_empty() { browser_rel(&db) } else { src }
                 }),
+                ("browser", browser_of(&db)),
+                ("__source_db", browser_rel(&db)),
+                ("__source_table", "CacheEntries".into()),
+                ("__source_rowid", g("__source_rowid")),
             ]));
         }
     }
@@ -3014,7 +3482,7 @@ pub fn build_browser_history(out_dir: &Path) -> Vec<Row> {
         "BROWSER",
         &["_Chrome_History", "_Chrome", "_Edge", "_Whale"],
     ) {
-        for u in read_table(&db, "urls") {
+        for u in read_table_with_rowid(&db, "urls") {
             let g = |k: &str| u.get(k).cloned().unwrap_or_default();
             let raw = g("url");
             // Python: str(x or "") — a 0 count is falsy, rendered blank.
@@ -3036,9 +3504,13 @@ pub fn build_browser_history(out_dir: &Path) -> Vec<Row> {
                 ("typed_count", count(g("typed_count"))),
                 // History 원본 테이블에는 경로 컬럼이 없다 — 1:1 결과 파일로 표기.
                 ("_source_file", browser_rel(&db)),
+                ("browser", browser_of(&db)),
+                ("__source_db", browser_rel(&db)),
+                ("__source_table", "urls".into()),
+                ("__source_rowid", g("__source_rowid")),
             ]));
         }
-        for d in read_table(&db, "downloads") {
+        for d in read_table_with_rowid(&db, "downloads") {
             let g = |k: &str| d.get(k).cloned().unwrap_or_default();
             let tgt = {
                 let t = g("target_path");
@@ -3088,12 +3560,16 @@ pub fn build_browser_history(out_dir: &Path) -> Vec<Row> {
                 ("mime", g("mime_type")),
                 ("danger", danger),
                 ("_source_file", browser_rel(&db)),
+                ("browser", browser_of(&db)),
+                ("__source_db", browser_rel(&db)),
+                ("__source_table", "downloads".into()),
+                ("__source_rowid", g("__source_rowid")),
             ]));
         }
     }
     // IE10+/구형 Edge WebCache — History 컨테이너의 방문과 iedownload 항목.
     for (account, db) in browser_sources(out_dir, "BROWSER", &["_IE_WebCache"]) {
-        for h in read_table(&db, "IEWebCache_History") {
+        for h in read_table_with_rowid(&db, "IEWebCache_History") {
             let g = |k: &str| h.get(k).cloned().unwrap_or_default();
             let raw = g("url");
             let url = ie_visit_url(&raw);
@@ -3120,9 +3596,13 @@ pub fn build_browser_history(out_dir: &Path) -> Vec<Row> {
                     let src = g("_source_file");
                     if src.is_empty() { browser_rel(&db) } else { src }
                 }),
+                ("browser", browser_of(&db)),
+                ("__source_db", browser_rel(&db)),
+                ("__source_table", "IEWebCache_History".into()),
+                ("__source_rowid", g("__source_rowid")),
             ]));
         }
-        for d in read_table(&db, "IEWebCache_Downloads") {
+        for d in read_table_with_rowid(&db, "IEWebCache_Downloads") {
             let g = |k: &str| d.get(k).cloned().unwrap_or_default();
             let ts = {
                 let a = g("accessed_time");
@@ -3148,13 +3628,17 @@ pub fn build_browser_history(out_dir: &Path) -> Vec<Row> {
                     let src = g("_source_file");
                     if src.is_empty() { browser_rel(&db) } else { src }
                 }),
+                ("browser", browser_of(&db)),
+                ("__source_db", browser_rel(&db)),
+                ("__source_table", "IEWebCache_Downloads".into()),
+                ("__source_rowid", g("__source_rowid")),
             ]));
         }
     }
     // IE5~9 index.dat — History 컨테이너(MSHist·History.IE5)의 방문 기록.
     // Content(캐시)·Cookies 컨테이너는 원본 테이블에서 본다.
     for (account, db) in browser_sources(out_dir, "BROWSER", &["_IE_IndexDat"]) {
-        for r in read_table(&db, "IEIndexDat_Records") {
+        for r in read_table_with_rowid(&db, "IEIndexDat_Records") {
             let g = |k: &str| r.get(k).cloned().unwrap_or_default();
             if !g("container").to_lowercase().contains("hist") {
                 continue;
@@ -3187,6 +3671,10 @@ pub fn build_browser_history(out_dir: &Path) -> Vec<Row> {
                     let src = g("_source_file");
                     if src.is_empty() { browser_rel(&db) } else { src }
                 }),
+                ("browser", browser_of(&db)),
+                ("__source_db", browser_rel(&db)),
+                ("__source_table", "IEIndexDat_Records".into()),
+                ("__source_rowid", g("__source_rowid")),
             ]));
         }
     }
@@ -3251,9 +3739,9 @@ pub fn ti_from_hosts_file(target: &Path) -> Vec<Row> {
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
         };
-        for line in text.lines() {
+        for (index, raw_line) in text.lines().enumerate() {
             // '#' 이후는 주석 — 줄 중간 주석도 잘라낸다.
-            let line = line.split('#').next().unwrap_or("").trim();
+            let line = raw_line.split('#').next().unwrap_or("").trim();
             if line.is_empty() {
                 continue;
             }
@@ -3271,6 +3759,10 @@ pub fn ti_from_hosts_file(target: &Path) -> Vec<Row> {
                     ("name", name.into()),
                     ("value", ip.into()),
                     ("source_artifact", "hosts".into()),
+                    // 수집 hosts 파일과 행 번호 — 파생의 원본 연결 근거.
+                    ("_source_file", path.to_string_lossy().to_string()),
+                    ("line_number", (index + 1).to_string()),
+                    ("raw_line", raw_line.trim().to_string()),
                 ]));
             }
         }
@@ -3534,11 +4026,16 @@ fn reg_pick(rows: &[Row], key_suffix: &str, value_name: &str) -> String {
         .unwrap_or_default()
 }
 
+/// SOFTWARE\Microsoft\Windows NT\CurrentVersion에서 TargetInfo로 올리는 값.
+/// `SystemRoot`는 대상 호스트의 실제 Windows 설치 경로다 — 프로필 등에서
+/// `%SystemRoot%`를 펼칠 때 분석 호스트의 `C:\Windows`를 가정하지 않고
+/// 이 값(예: `D:\test`)을 써야 한다.
 const OS_VALUES: &[&str] = &[
     "ProductName",
     "EditionID",
     "DisplayVersion",
     "CurrentBuild",
+    "SystemRoot",
     "RegisteredOwner",
     "InstallDate",
 ];
@@ -3582,38 +4079,42 @@ fn ti_system_info(software: &[Row], system: &[Row]) -> Vec<Row> {
                 ("name", name),
                 ("value", val),
                 ("source_artifact", "SOFTWARE".into()),
+                ("record_key", reg_record_key(r)),
             ]));
         }
     }
-    let cn = reg_pick(
+    if let Some(r) = reg_pick_row(
         system,
         "\\control\\computername\\computername",
         "ComputerName",
-    );
-    if !cn.is_empty() {
+    ) {
         rows.push(ti_row(&[
             ("category", "SystemInfo".into()),
             ("name", "ComputerName".into()),
-            ("value", cn),
+            ("value", r.get("value_data").cloned().unwrap_or_default()),
             ("source_artifact", "SYSTEM".into()),
+            ("record_key", reg_record_key(r)),
         ]));
     }
-    let tz = reg_pick(system, "\\control\\timezoneinformation", "TimeZoneKeyName");
-    if !tz.is_empty() {
+    if let Some(r) = reg_pick_row(system, "\\control\\timezoneinformation", "TimeZoneKeyName") {
         rows.push(ti_row(&[
             ("category", "SystemInfo".into()),
             ("name", "TimeZone".into()),
-            ("value", tz),
+            ("value", r.get("value_data").cloned().unwrap_or_default()),
             ("source_artifact", "SYSTEM".into()),
+            ("record_key", reg_record_key(r)),
         ]));
     }
-    let sd = reg_pick(system, "\\control\\windows", "ShutdownTime");
-    if !sd.is_empty() {
+    if let Some(r) = reg_pick_row(system, "\\control\\windows", "ShutdownTime") {
         rows.push(ti_row(&[
             ("category", "SystemInfo".into()),
             ("name", "LastShutdownTime".into()),
-            ("value", filetime_hex(&sd)),
+            (
+                "value",
+                filetime_hex(&r.get("value_data").cloned().unwrap_or_default()),
+            ),
             ("source_artifact", "SYSTEM".into()),
+            ("record_key", reg_record_key(r)),
         ]));
     }
     rows
@@ -3708,6 +4209,8 @@ fn ti_accounts(sam: &[Row], software: &[Row]) -> Vec<Row> {
     let mut prefix = String::new();
     let mut profile_keys: Vec<String> = Vec::new();
     let mut profiles: HashMap<String, String> = HashMap::new();
+    // 프로필 경로를 남긴 레지스트리 행 — 계정 행의 원본 연결 근거.
+    let mut profile_rk: HashMap<String, String> = HashMap::new();
     for r in software {
         let kp = r.get("key_path").cloned().unwrap_or_default();
         if kp.to_lowercase().contains("\\profilelist\\s-")
@@ -3719,6 +4222,7 @@ fn ti_accounts(sam: &[Row], software: &[Row]) -> Vec<Row> {
             if !profiles.contains_key(&sid) {
                 profile_keys.push(sid.clone());
             }
+            profile_rk.insert(sid.clone(), reg_record_key(r));
             profiles.insert(
                 sid.clone(),
                 r.get("value_data").cloned().unwrap_or_default(),
@@ -3732,7 +4236,8 @@ fn ti_accounts(sam: &[Row], software: &[Row]) -> Vec<Row> {
     }
 
     let mut user_keys: Vec<String> = Vec::new();
-    let mut users: HashMap<String, (Vec<u8>, Vec<u8>)> = HashMap::new(); // rid_hex -> (F, V)
+    // rid_hex -> (F, V, 원본 연결 record_key)
+    let mut users: HashMap<String, (Vec<u8>, Vec<u8>, String)> = HashMap::new();
     let mut names_created: HashMap<String, String> = HashMap::new();
     let hexset = |s: &str| s.chars().all(|c| c.is_ascii_hexdigit());
     for r in sam {
@@ -3755,12 +4260,21 @@ fn ti_accounts(sam: &[Row], software: &[Row]) -> Vec<Row> {
             if tail.len() == 8 && hexset(tail) {
                 if !users.contains_key(tail) {
                     user_keys.push(tail.to_string());
-                    users.insert(tail.to_string(), (Vec::new(), Vec::new()));
+                    users.insert(tail.to_string(), (Vec::new(), Vec::new(), String::new()));
                 }
                 let entry = users.get_mut(tail).unwrap();
                 match r.get("value_name").map(|s| s.as_str()) {
-                    Some("F") => entry.0 = unhex(&r.get("value_data").cloned().unwrap_or_default()),
-                    Some("V") => entry.1 = unhex(&r.get("value_data").cloned().unwrap_or_default()),
+                    Some("F") => {
+                        entry.0 = unhex(&r.get("value_data").cloned().unwrap_or_default());
+                        if entry.2.is_empty() {
+                            entry.2 = reg_record_key(r);
+                        }
+                    }
+                    // 이름·전체 이름을 담은 V 값을 대표 근거로 삼는다.
+                    Some("V") => {
+                        entry.1 = unhex(&r.get("value_data").cloned().unwrap_or_default());
+                        entry.2 = reg_record_key(r);
+                    }
                     _ => {}
                 }
             }
@@ -3770,7 +4284,7 @@ fn ti_accounts(sam: &[Row], software: &[Row]) -> Vec<Row> {
     let mut rows = Vec::new();
     let mut emitted: HashSet<String> = HashSet::new();
     for rid_hex in &user_keys {
-        let (fb, vb) = users.get(rid_hex).unwrap();
+        let (fb, vb, record_key) = users.get(rid_hex).unwrap();
         let rid = u32::from_str_radix(rid_hex, 16).unwrap_or(0);
         let f = sam_f(fb);
         let (username, full_name) = sam_v(vb);
@@ -3804,6 +4318,7 @@ fn ti_accounts(sam: &[Row], software: &[Row]) -> Vec<Row> {
             ("name", sid.clone()),
             ("value", path.clone()),
             ("source_artifact", "SAM".into()),
+            ("record_key", record_key.clone()),
             ("username", username),
             ("full_name", full_name),
             ("rid", rid.to_string()),
@@ -3851,6 +4366,7 @@ fn ti_accounts(sam: &[Row], software: &[Row]) -> Vec<Row> {
             ("value", path.clone()),
             ("source_artifact", "ProfileList".into()),
             ("username", uname),
+            ("record_key", profile_rk.get(sid).cloned().unwrap_or_default()),
             ("home_directory", path),
         ]));
     }
@@ -3880,26 +4396,31 @@ fn iplist(value: &str) -> String {
 
 fn ti_networks(software: &[Row]) -> Vec<Row> {
     let mut keys: Vec<String> = Vec::new();
-    let mut prof: HashMap<String, (String, String)> = HashMap::new(); // kp -> (name, when)
+    // kp -> (ProfileName, DateLastConnected, 원본 연결 record_key)
+    let mut prof: HashMap<String, (String, String, String)> = HashMap::new();
     for r in software {
         let kp = r.get("key_path").cloned().unwrap_or_default();
         if kp.to_lowercase().contains("\\networklist\\profiles\\{") {
             if !prof.contains_key(&kp) {
                 keys.push(kp.clone());
-                prof.insert(kp.clone(), (String::new(), String::new()));
+                prof.insert(kp.clone(), (String::new(), String::new(), String::new()));
             }
             let e = prof.get_mut(&kp).unwrap();
             let name = r.get("value_name").cloned().unwrap_or_default();
             if name.eq_ignore_ascii_case("ProfileName") {
                 e.0 = r.get("value_data").cloned().unwrap_or_default();
+                e.2 = reg_record_key(r);
             } else if name.eq_ignore_ascii_case("DateLastConnected") {
                 e.1 = systemtime_hex(&r.get("value_data").cloned().unwrap_or_default());
+                if e.2.is_empty() {
+                    e.2 = reg_record_key(r);
+                }
             }
         }
     }
     keys.iter()
         .filter_map(|k| {
-            let (name, when) = prof.get(k).unwrap();
+            let (name, when, record_key) = prof.get(k).unwrap();
             if name.is_empty() {
                 None
             } else {
@@ -3909,6 +4430,7 @@ fn ti_networks(software: &[Row]) -> Vec<Row> {
                     ("value", name.clone()),
                     ("timestamp", when.clone()),
                     ("source_artifact", "NetworkList".into()),
+                    ("record_key", record_key.clone()),
                 ]))
             }
         })
@@ -3919,6 +4441,8 @@ fn ti_network_interfaces(system: &[Row]) -> Vec<Row> {
     let mark = "\\services\\tcpip\\parameters\\interfaces\\";
     let mut guids: Vec<String> = Vec::new();
     let mut ifaces: HashMap<String, HashMap<String, String>> = HashMap::new();
+    // 인터페이스별 대표 근거 — 주소 값을 남긴 레지스트리 행.
+    let mut iface_rk: HashMap<String, String> = HashMap::new();
     // 두 ControlSet의 같은 GUID 값을 한 맵에 덮으면 현재 IP와 과거
     // DNS/게이트웨이가 섞인, 실존한 적 없는 네트워크 구성이 만들어진다 —
     // 활성 세트(Select\Current)의 행만 조합한다.
@@ -3941,6 +4465,16 @@ fn ti_network_interfaces(system: &[Row]) -> Vec<Row> {
             }
             // 값 이름은 레지스트리 의미대로 대소문자 무시 — 소문자 키로
             // 정규화해 ipaddress 같은 변형도 같은 속성으로 조회되게 한다.
+            let value_name_lower = r
+                .get("value_name")
+                .cloned()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if matches!(value_name_lower.as_str(), "ipaddress" | "dhcpipaddress")
+                || !iface_rk.contains_key(&guid)
+            {
+                iface_rk.insert(guid.clone(), reg_record_key(r));
+            }
             ifaces.get_mut(&guid).unwrap().insert(
                 r.get("value_name")
                     .cloned()
@@ -3995,6 +4529,7 @@ fn ti_network_interfaces(system: &[Row]) -> Vec<Row> {
             ("domain", or(g("Domain"), g("DhcpDomain"))),
             ("lease_obtained", unixdate(&g("LeaseObtainedTime"))),
             ("lease_terminates", unixdate(&g("LeaseTerminatesTime"))),
+            ("record_key", iface_rk.get(guid).cloned().unwrap_or_default()),
         ]));
     }
     rows
@@ -4341,9 +4876,8 @@ fn eh_from_prefetch(out_dir: &Path) -> Vec<Row> {
 /// WER의 AppSessionGuid에서 디코딩한 프로세스 생성 시각을 실행 증거로 편입한다.
 /// (크래시한 프로그램이 그 시각에 실행됐다는 뜻 — 크래시 시각과의 차이로 실행
 /// 유지 시간도 가늠할 수 있다.) 시작 시각이 디코딩된 보고만 대상으로 한다.
-fn eh_from_wer(out_dir: &Path) -> Vec<Row> {
-    let events = EventLogOverviewCache::load(out_dir);
-    build_wer_reports_with_events(out_dir, &events)
+fn eh_from_wer(out_dir: &Path, events: &EventLogOverviewCache) -> Vec<Row> {
+    build_wer_reports_with_events(out_dir, events)
         .into_iter()
         .filter_map(|r| {
             let start = r.get("app_start_time").cloned().unwrap_or_default();
@@ -4372,19 +4906,20 @@ fn eh_from_wer(out_dir: &Path) -> Vec<Row> {
         .collect()
 }
 
-/// ExecutionHistory 파생 생성 로직 버전. 편입 대상이 바뀌면 올린다 —
-/// 뷰어의 호환 갱신이 이 값으로 구 저장본을 판별해 재생성한다.
-/// 2: WER 보고의 프로세스 시작 시각(AppSessionGuid) 편입.
-pub const EXECUTION_HISTORY_DERIVED_VERSION: i64 = 2;
+/// ExecutionHistory content version; older results require regeneration.
+/// 3 adds process-creation and Shell-Core events in the typed builder.
+pub const EXECUTION_HISTORY_DERIVED_VERSION: i64 = 3;
 
 pub fn build_execution_history(out_dir: &Path) -> Vec<Row> {
     let registry = RegistryOverviewCache::load(out_dir);
-    build_execution_history_with_registry(out_dir, &registry)
+    let events = EventLogOverviewCache::load(out_dir);
+    build_execution_history_with_registry(out_dir, &registry, &events)
 }
 
 pub fn build_execution_history_with_registry(
     out_dir: &Path,
     registry: &RegistryOverviewCache,
+    events: &EventLogOverviewCache,
 ) -> Vec<Row> {
     let mut rows = Vec::new();
     rows.extend(eh_from_amcache(out_dir));
@@ -4397,7 +4932,7 @@ pub fn build_execution_history_with_registry(
     // 에서 그 단서와 함께 표시한다.
     rows.extend(eh_from_prefetch(out_dir));
     rows.extend(eh_from_timeline(out_dir));
-    rows.extend(eh_from_wer(out_dir));
+    rows.extend(eh_from_wer(out_dir, events));
     rows
 }
 
@@ -6398,6 +6933,14 @@ pub const PR_KEYS: &[&str] = &[
     "machine_id",
     "created_time",
     "modified_time",
+    "timestamp_source",
+    "lnk_accessed",
+    "destlist_accessed",
+    "access_count",
+    "hostname",
+    "target_drive_letter",
+    "path_kind",
+    "record_key",
     "_source_file",
     "source_relative",
     "source_table",
@@ -6412,22 +6955,56 @@ fn pr_row() -> Row {
     r
 }
 
-/// "C:\Users\x" → "\users\x" — $MFT 경로와 대조 가능한 볼륨 상대·소문자 키.
-fn to_volume_relative(p: &str) -> String {
-    let low = p.to_lowercase();
+/// Path comparison key and the original path's scope.
+pub(crate) struct PathShape {
+    pub key: String,
+    pub kind: &'static str,
+    /// Uppercase drive plus colon; empty when unknown.
+    pub drive: String,
+}
+
+/// Only local absolute paths become MFT-relative candidate keys.
+pub(crate) fn classify_path(raw: &str) -> PathShape {
+    let mut low = raw.to_lowercase();
     let b = low.as_bytes();
-    if b.len() >= 2 && b[1] == b':' && b[0].is_ascii_alphabetic() {
-        let rest = &low[2..];
-        if rest.is_empty() {
-            "\\".to_string()
-        } else if rest.starts_with('\\') {
-            rest.to_string()
-        } else {
-            format!("\\{}", rest)
-        }
-    } else {
-        low
+    let sep = |c: u8| c == b'\\' || c == b'/';
+    if b.len() >= 2 && sep(b[0]) && sep(b[1]) {
+        return PathShape { key: low, kind: "unc", drive: String::new() };
     }
+    if b.len() >= 2 && b[1] == b':' && b[0].is_ascii_alphabetic() {
+        let drive = format!("{}:", (b[0] as char).to_ascii_uppercase());
+        if b.len() > 2 && sep(b[2]) {
+            low.drain(..2);
+            return PathShape { key: volume_relative_key(low), kind: "drive_absolute", drive };
+        }
+        // Drive-relative paths require an unknown current directory.
+        return PathShape { key: low, kind: "drive_relative", drive };
+    }
+    if !b.is_empty() && sep(b[0]) {
+        return PathShape {
+            key: volume_relative_key(low),
+            kind: "volume_relative",
+            drive: String::new(),
+        };
+    }
+    let kind = if low.starts_with("::{") || low.starts_with("shell:") {
+        "shell_namespace"
+    } else {
+        "relative"
+    };
+    PathShape { key: low, kind, drive: String::new() }
+}
+
+// Normalize separators without changing the raw evidence path.
+fn volume_relative_key(mut key: String) -> String {
+    if key.contains('/') {
+        key = key.replace('/', "\\");
+    }
+    key.truncate(key.trim_end_matches('\\').len());
+    if key.is_empty() {
+        key.push('\\');
+    }
+    key
 }
 
 /// per-user 아티팩트의 계정: LNK/JUMPLIST 수집 폴더 바로 다음 경로 조각.
@@ -6442,6 +7019,69 @@ fn account_from_source(src: &str) -> String {
     String::new()
 }
 
+// Keep parsed JumpList evidence separate from the candidate path key.
+fn jumplist_path_row(r: &Row) -> Option<Row> {
+    let target = r.get("target_path").cloned().unwrap_or_default();
+    if target.is_empty() {
+        return None;
+    }
+    let source = r.get("_source_file").cloned().unwrap_or_default();
+    let shape = classify_path(&target);
+    let mut row = pr_row();
+    row.insert("path".into(), shape.key);
+    row.insert("path_kind".into(), shape.kind.into());
+    row.insert("target_drive_letter".into(), shape.drive);
+    row.insert("kind".into(), "Jumplist".into());
+    row.insert("account".into(), account_from_source(&source));
+    row.insert("label".into(), target.clone());
+    row.insert("target_path".into(), target);
+    for k in [
+        "timestamp",
+        "timestamp_source",
+        "lnk_accessed",
+        "destlist_accessed",
+        "access_count",
+        "hostname",
+        "app_id",
+        "jumplist_type",
+        "arguments",
+        "working_directory",
+        "machine_id",
+        "created_time",
+        "modified_time",
+        "_source_file",
+    ] {
+        if let Some(v) = r.get(k) {
+            row.insert((*k).to_string(), v.clone());
+        }
+    }
+    row.insert(
+        "source_relative".into(),
+        "JUMPLIST/JumpList_Entries.sqlite".into(),
+    );
+    row.insert("source_table".into(), "JumpList_Entries".into());
+    row.insert(
+        "source_rowid".into(),
+        r.get("__source_rowid").cloned().unwrap_or_default(),
+    );
+    Some(row)
+}
+
+// Shellbag references have no representative time; do not substitute hive time.
+fn shellbag_path_row(bag: crate::shellbag::Shellbag) -> Row {
+    let shape = classify_path(&bag.display);
+    let mut row = pr_row();
+    row.insert("path".into(), shape.key);
+    row.insert("path_kind".into(), shape.kind.into());
+    row.insert("target_drive_letter".into(), shape.drive);
+    row.insert("kind".into(), "Shellbag".into());
+    row.insert("account".into(), bag.account);
+    row.insert("label".into(), bag.display);
+    // Preserve the BagMRU value that supplied this folder.
+    row.insert("record_key".into(), bag.record_key);
+    row
+}
+
 /// $MFT 탐색기의 교차 참조(JumpList 대상 경로 + Shellbag 폴더 열람 흔적)를
 /// 파싱 단계에서 미리 조합해 derived로 저장한다 — 화면 진입마다 원본 전수
 /// 스캔·Shellbag 재구성을 하지 않기 위한 협약 이행. 뷰어는 이 테이블을
@@ -6450,42 +7090,9 @@ pub fn build_path_references(out_dir: &Path, registry: &RegistryOverviewCache) -
     let mut rows = Vec::new();
     let jumplist = out_dir.join("JUMPLIST").join("JumpList_Entries.sqlite");
     for r in read_table_with_rowid(&jumplist, "JumpList_Entries") {
-        let target = r.get("target_path").cloned().unwrap_or_default();
-        if target.is_empty() {
-            continue;
+        if let Some(row) = jumplist_path_row(&r) {
+            rows.push(row);
         }
-        let source = r.get("_source_file").cloned().unwrap_or_default();
-        let mut row = pr_row();
-        row.insert("path".into(), to_volume_relative(&target));
-        row.insert("kind".into(), "Jumplist".into());
-        row.insert("account".into(), account_from_source(&source));
-        row.insert("label".into(), target.clone());
-        row.insert("target_path".into(), target);
-        for k in [
-            "timestamp",
-            "app_id",
-            "jumplist_type",
-            "arguments",
-            "working_directory",
-            "machine_id",
-            "created_time",
-            "modified_time",
-            "_source_file",
-        ] {
-            if let Some(v) = r.get(k) {
-                row.insert((*k).to_string(), v.clone());
-            }
-        }
-        row.insert(
-            "source_relative".into(),
-            "JUMPLIST/JumpList_Entries.sqlite".into(),
-        );
-        row.insert("source_table".into(), "JumpList_Entries".into());
-        row.insert(
-            "source_rowid".into(),
-            r.get("__source_rowid").cloned().unwrap_or_else(|| "-1".into()),
-        );
-        rows.push(row);
     }
     // Shellbag — BagMRU 숫자 값(자식 셸 아이템)을 하이브별로 모아 재구성.
     // 계정은 하이브 파일명의 사용자 접두(Administrator_UsrClass.dat 등).
@@ -6516,17 +7123,12 @@ pub fn build_path_references(out_dir: &Path, registry: &RegistryOverviewCache) -
                 value_name,
                 data,
                 account: account.clone(),
+                record_key: reg_record_key(r),
             });
         }
     }
     for bag in crate::shellbag::reconstruct(bag_rows) {
-        let mut row = pr_row();
-        row.insert("path".into(), bag.path);
-        row.insert("kind".into(), "Shellbag".into());
-        row.insert("account".into(), bag.account);
-        row.insert("label".into(), bag.display);
-        row.insert("source_rowid".into(), "-1".into());
-        rows.push(row);
+        rows.push(shellbag_path_row(bag));
     }
     rows
 }
@@ -6628,7 +7230,9 @@ pub fn build_registry_findings_with_registry(registry: &RegistryOverviewCache) -
     let mut rows = Vec::new();
     // rf_credential_protection이 rf_lsa_packages 결과까지 합쳐 반환한다 —
     // 여기서 다시 호출하면 Lsa 확장 행이 전부 두 번 생긴다.
-    rows.extend(rf_credential_protection(system));
+    if !system.is_empty() {
+        rows.extend(rf_credential_protection(system));
+    }
     rows.extend(rf_shares(system));
     rows.extend(rf_sql_auth(software));
     rows.extend(rf_autoruns(registry.hives()));
@@ -6638,7 +7242,9 @@ pub fn build_registry_findings_with_registry(registry: &RegistryOverviewCache) -
     rows.extend(rf_active_setup(software));
     rows.extend(rf_appinit(software, system));
     rows.extend(rf_session_manager(system));
-    rows.extend(rf_security_config(software));
+    if !software.is_empty() {
+        rows.extend(rf_security_config(software));
+    }
     rows.extend(rf_remote_tools(registry.hives()));
     rows.extend(rf_msi_installs(registry.hives()));
     rows.extend(rf_uninstall_installs(registry.hives()));
@@ -6651,6 +7257,104 @@ pub fn build_registry_findings_with_registry(registry: &RegistryOverviewCache) -
 mod tests {
     use super::*;
 
+    #[test]
+    fn classifies_local_absolute_paths_and_keeps_drive() {
+        let c = classify_path("C:\\Users\\Alice\\a.txt");
+        assert_eq!(c.kind, "drive_absolute");
+        assert_eq!(c.key, "\\users\\alice\\a.txt");
+        assert_eq!(c.drive, "C:");
+        // Equal relative paths do not imply equal drives.
+        let d = classify_path("D:/Users/Alice/a.txt");
+        assert_eq!(d.key, c.key);
+        assert_eq!(d.drive, "D:");
+        assert_eq!(d.kind, "drive_absolute");
+        assert_eq!(classify_path("C:\\Users\\Alice\\").key, "\\users\\alice");
+        assert_eq!(classify_path("C:\\").key, "\\");
+    }
+
+    #[test]
+    fn keeps_non_local_paths_out_of_volume_relative_keys() {
+        let unc = classify_path("\\\\SRV\\Share\\f.txt");
+        assert_eq!(unc.kind, "unc");
+        assert_eq!(unc.key, "\\\\srv\\share\\f.txt");
+        assert!(unc.drive.is_empty());
+
+        // A drive-relative path is not an absolute path.
+        let rel_drive = classify_path("C:foo\\bar");
+        assert_eq!(rel_drive.kind, "drive_relative");
+        assert_eq!(rel_drive.key, "c:foo\\bar");
+        assert_eq!(rel_drive.drive, "C:");
+        assert_eq!(classify_path("C:").kind, "drive_relative");
+
+        let rel = classify_path("..\\docs\\a.txt");
+        assert_eq!(rel.kind, "relative");
+        assert_eq!(rel.key, "..\\docs\\a.txt");
+        assert!(rel.drive.is_empty());
+
+        let shell = classify_path("::{20D04FE0-3AEA-1069-A2D8-08002B30309D}\\x");
+        assert_eq!(shell.kind, "shell_namespace");
+        assert!(shell.drive.is_empty());
+
+        let vol = classify_path("\\Users\\Alice");
+        assert_eq!(vol.kind, "volume_relative");
+        assert_eq!(vol.key, "\\users\\alice");
+        assert!(vol.drive.is_empty());
+    }
+
+    #[test]
+    fn jumplist_reference_keeps_parsed_usage_facts() {
+        let mut r = Row::new();
+        r.insert("target_path".into(), "C:\\Users\\Alice\\a.txt".into());
+        r.insert("timestamp".into(), "2026-03-02 11:00:00.000".into());
+        r.insert("timestamp_source".into(), "destlist_accessed".into());
+        r.insert("lnk_accessed".into(), "2026-03-01 10:00:00.000".into());
+        r.insert("destlist_accessed".into(), "2026-03-02 11:00:00.000".into());
+        r.insert("access_count".into(), "7".into());
+        r.insert("hostname".into(), "HOST-01".into());
+        r.insert("_source_file".into(), "/c/JUMPLIST/Alice/x.ms".into());
+        let row = jumplist_path_row(&r).expect("row");
+        assert_eq!(row["path"], "\\users\\alice\\a.txt");
+        assert_eq!(row["path_kind"], "drive_absolute");
+        assert_eq!(row["target_drive_letter"], "C:");
+        // 원본 대상 경로 전문은 그대로 남는다.
+        assert_eq!(row["target_path"], "C:\\Users\\Alice\\a.txt");
+        assert_eq!(row["access_count"], "7");
+        assert_eq!(row["hostname"], "HOST-01");
+        assert_eq!(row["lnk_accessed"], "2026-03-01 10:00:00.000");
+        assert_eq!(row["destlist_accessed"], "2026-03-02 11:00:00.000");
+        assert_eq!(row["timestamp_source"], "destlist_accessed");
+        assert_eq!(row["account"], "Alice");
+        assert!(jumplist_path_row(&Row::new()).is_none());
+    }
+
+    /// Shellbag은 시각 증거가 없다 — 하이브 마지막 쓰기 시각을 끌어오지 않는다.
+    #[test]
+    fn shellbag_reference_has_no_timestamp() {
+        let row = shellbag_path_row(crate::shellbag::Shellbag {
+            path: "\\users\\alice\\desktop".into(),
+            display: "C:\\Users\\Alice\\Desktop".into(),
+            account: "Alice".into(),
+            record_key: "UsrClass::Registry::1".into(),
+        });
+        assert!(row["timestamp"].is_empty());
+        assert!(row["timestamp_source"].is_empty());
+        assert!(row["lnk_accessed"].is_empty());
+        assert!(row["destlist_accessed"].is_empty());
+        assert!(row["access_count"].is_empty());
+        assert_eq!(row["path"], "\\users\\alice\\desktop");
+        assert_eq!(row["path_kind"], "drive_absolute");
+        assert_eq!(row["target_drive_letter"], "C:");
+
+        let no_volume = shellbag_path_row(crate::shellbag::Shellbag {
+            path: "\\desktop".into(),
+            display: "\\Desktop".into(),
+            account: "Alice".into(),
+            record_key: String::new(),
+        });
+        assert_eq!(no_volume["path_kind"], "volume_relative");
+        assert!(no_volume["target_drive_letter"].is_empty());
+    }
+
     /// RegBack 산출물은 facts로 보존하되 파생 입력에서 제외된다 — 판별 회귀.
     #[test]
     fn regback_outputs_are_recognized_for_derived_exclusion() {
@@ -6658,6 +7362,35 @@ mod tests {
         assert!(is_regback_output(Path::new("/x/REGISTRY/SOFTWARE_RegBack_2.sqlite")));
         assert!(!is_regback_output(Path::new("/x/REGISTRY/SYSTEM.sqlite")));
         assert!(!is_regback_output(Path::new("/x/REGISTRY/NTUSER.DAT.sqlite")));
+    }
+
+    /// `%SystemRoot%` 전개는 분석 호스트의 `C:\Windows`가 아니라 대상 호스트
+    /// 레지스트리 값이어야 한다 — SOFTWARE\...\CurrentVersion\SystemRoot를
+    /// TargetInfo SystemInfo 행으로 올려 화면이 실제 경로(D:\test)를 쓰게 한다.
+    #[test]
+    fn system_info_carries_target_system_root_from_registry() {
+        let sw = |name: &str, data: &str| {
+            let mut r = Row::new();
+            r.insert(
+                "key_path".into(),
+                "\\Microsoft\\Windows NT\\CurrentVersion".into(),
+            );
+            r.insert("value_name".into(), name.into());
+            r.insert("value_data".into(), data.into());
+            r
+        };
+        let software = vec![
+            sw("ProductName", "Windows 10 Pro"),
+            sw("SystemRoot", "D:\\test"),
+        ];
+        let out = ti_system_info(&software, &[]);
+        let sr = out
+            .iter()
+            .find(|r| r["name"] == "SystemRoot")
+            .expect("SystemRoot row");
+        assert_eq!(sr["value"], "D:\\test");
+        assert_eq!(sr["category"], "SystemInfo");
+        assert_eq!(sr["source_artifact"], "SOFTWARE");
     }
 
     /// 서비스 이력은 SCM 이벤트를 종류별로 알맞은 필드에 담아야 한다 —
@@ -7828,12 +8561,496 @@ mod tests {
         assert_eq!(status_of("AABB").as_deref(), Some(""));
         let miss = status_of("M1M3").expect("missing-fragment block");
         assert!(miss.contains("불완전") && miss.contains("누락 조각: 2"), "{miss}");
-        let dup = status_of("D-secondD2").expect("duplicate-fragment block");
+        // 충돌한 조각은 어느 쪽이 진짜인지 증명할 수 없다 — 대표 본문이 무엇인지
+        // 고정하지 않고, 이상 표시와 원본 양쪽 보존만 요구한다.
+        let dup_row = rows
+            .iter()
+            .find(|row| row.get("script_block_id").map(String::as_str) == Some("sb-dup"))
+            .expect("duplicate-fragment block");
+        let dup = dup_row
+            .get("script_block_status")
+            .cloned()
+            .unwrap_or_default();
         assert!(dup.contains("조각 1 중복(내용 상이)"), "{dup}");
+        let dup_parts = dup_row.get("script_block_parts").cloned().unwrap_or_default();
+        assert!(
+            dup_parts.contains("D-first") && dup_parts.contains("D-second"),
+            "{dup_parts}"
+        );
         let range = status_of("R1").expect("out-of-range block");
         assert!(range.contains("범위 밖 조각 번호 5"), "{range}");
         let total = status_of("T1T2").expect("total-mismatch block");
         assert!(total.contains("총 조각 수 불일치(2 vs 3)"), "{total}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// PowerShell 회귀 테스트용 임시 케이스 루트 — 동시 실행 충돌을 피한다.
+    fn ps_tmp(tag: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "wina-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    /// 실수집본과 같은 컬럼 집합의 EVENTLOG 팩트 DB(파일 스템 = 테이블명).
+    fn ps_event_facts(root: &std::path::Path) -> Connection {
+        let dir = root.join("EVENTLOG");
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = Connection::open(dir.join("PowerShell.sqlite")).unwrap();
+        conn.execute(
+            "CREATE TABLE PowerShell (timestamp TEXT, Channel TEXT, Provider TEXT, EventID TEXT, \
+             Level TEXT, Computer TEXT, EventRecordID TEXT, ProcessID TEXT, UserID TEXT, \
+             EventData TEXT, _record_key TEXT, _source_file TEXT)",
+            [],
+        )
+        .unwrap();
+        conn
+    }
+
+    fn ps_insert(
+        conn: &Connection,
+        event_id: &str,
+        record_id: &str,
+        pid: &str,
+        data: &str,
+        source_file: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO PowerShell VALUES ('2026-10-08 01:02:03.004', \
+             'Microsoft-Windows-PowerShell/Operational', 'Microsoft-Windows-PowerShell', ?1, '3', \
+             'WIN-HOST', ?2, ?3, 'S-1-5-21-1-2-3-500', ?4, ?5, ?6)",
+            rusqlite::params![
+                event_id,
+                record_id,
+                pid,
+                data,
+                format!("PowerShell::{record_id}"),
+                source_file
+            ],
+        )
+        .unwrap();
+    }
+
+    fn ps_insert_classic(conn: &Connection, event_id: &str, record_id: &str, data: &str) {
+        conn.execute(
+            "INSERT INTO PowerShell VALUES ('2026-10-08 01:02:03.004', 'Windows PowerShell', \
+             'PowerShell', ?1, '4', 'WIN-HOST', ?2, '512', '', ?3, ?4, 'Windows PowerShell.evtx')",
+            rusqlite::params![event_id, record_id, data, format!("PowerShell::{record_id}")],
+        )
+        .unwrap();
+    }
+
+    fn ps_json(row: &Row, key: &str) -> serde_json::Value {
+        let raw = row
+            .get(key)
+            .unwrap_or_else(|| panic!("{key} 키가 없습니다: {row:?}"));
+        serde_json::from_str(raw).unwrap_or_else(|e| panic!("{key} JSON 아님: {raw} ({e})"))
+    }
+
+    /// ScriptBlockId로 4104 행을 찾는다.
+    fn ps_row_of<'a>(rows: &'a [Row], sbid: &str) -> &'a Row {
+        rows.iter()
+            .find(|row| row.get("script_block_id").map(String::as_str) == Some(sbid))
+            .unwrap_or_else(|| panic!("{sbid} 행 없음"))
+    }
+
+    // 실수집본 4100/4103 ContextInfo(ko) 형태 — 호스트 응용 프로그램 값이 여러
+    // 줄이고 그 안에 ' = '와 '='가 모두 들어 있다.
+    const CTX_KO: &str = concat!(
+        "        심각도 = Warning\r\n",
+        "        호스트 이름 = ConsoleHost\r\n",
+        "        호스트 ID = ebf6a673-8b57-4c7e-86b2-43b6d1af9773\r\n",
+        "        호스트 응용 프로그램 = powershell.exe -NoProfile -Command Write-Output \"=== a=b ===\"\n",
+        "; $_ec = if ($null -ne $LASTEXITCODE) { $LASTEXITCODE } else { 1 }\n",
+        "; exit $_ec\r\n",
+        "        엔진 버전 = 5.1.26100.7462\r\n",
+        "        Runspace ID = 3eee4306-36d0-4389-90a1-21d6ca3a7961\r\n",
+        "        파이프라인 ID = 1\r\n",
+        "        명령 이름 = \r\n",
+        "        스크립트 이름 = C:\\scripts\\collect.ps1\r\n",
+        "        사용자 = WIN-HOST\\Administrator\r\n",
+    );
+    const HOST_KO: &str = concat!(
+        "powershell.exe -NoProfile -Command Write-Output \"=== a=b ===\"\n",
+        "; $_ec = if ($null -ne $LASTEXITCODE) { $LASTEXITCODE } else { 1 }\n",
+        "; exit $_ec",
+    );
+
+    #[test]
+    fn powershell_4100_error_row_keeps_payload_and_explicit_ids() {
+        let root = ps_tmp("ps4100-error");
+        let conn = ps_event_facts(&root);
+        let payload = "  Error Message = System error.\r\nfull warning  ";
+        let data = serde_json::json!({
+            "ContextInfo": CTX_KO, "UserData": "", "Payload": payload
+        })
+        .to_string();
+        ps_insert(&conn, "4100", "17", "356", &data, "PowerShell.evtx");
+        drop(conn);
+
+        let rows = build_powershell_history(&root);
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        // Level 3 = 경고 — 수준을 무시하고 전부 "오류"라고 쓰지 않는다.
+        assert_eq!(row.get("kind").map(String::as_str), Some("실행 경고"));
+        assert_eq!(row.get("event_id").map(String::as_str), Some("4100"));
+        // 오류 본문은 원문 그대로(앞뒤 공백 포함) 보존한다.
+        assert_eq!(row.get("error_message").map(String::as_str), Some(payload));
+        // 오류 메시지를 명령으로 둔갑시키지 않는다 — 명령 이름이 비면 비운다.
+        assert_eq!(row.get("command").map(String::as_str), Some(""));
+        assert_eq!(row.get("host_application").map(String::as_str), Some(HOST_KO));
+        assert_eq!(
+            row.get("session_id").map(String::as_str),
+            Some("ebf6a673-8b57-4c7e-86b2-43b6d1af9773")
+        );
+        assert_eq!(
+            row.get("runspace_id").map(String::as_str),
+            Some("3eee4306-36d0-4389-90a1-21d6ca3a7961")
+        );
+        assert_eq!(
+            row.get("account").map(String::as_str),
+            Some("WIN-HOST\\Administrator")
+        );
+        assert_eq!(
+            row.get("account_sid").map(String::as_str),
+            Some("S-1-5-21-1-2-3-500")
+        );
+        assert_eq!(
+            row.get("script_path").map(String::as_str),
+            Some("C:\\scripts\\collect.ps1")
+        );
+        assert_eq!(row.get("context_info").map(String::as_str), Some(CTX_KO));
+        assert_eq!(row.get("event_data").map(String::as_str), Some(data.as_str()));
+        assert_eq!(
+            row.get("event_channel").map(String::as_str),
+            Some("Microsoft-Windows-PowerShell/Operational")
+        );
+        assert_eq!(row.get("event_record_id").map(String::as_str), Some("17"));
+        assert_eq!(row.get("event_level").map(String::as_str), Some("3"));
+        assert_eq!(
+            row.get("_source_file").map(String::as_str),
+            Some("PowerShell.evtx")
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn powershell_4103_keeps_full_payload_and_context_boundaries() {
+        let root = ps_tmp("ps4103-fulltext");
+        let conn = ps_event_facts(&root);
+        let host = "powershell.exe -NoProfile -Command Write-Output 'a=b'\n; Write-Output '두 번째 줄'";
+        let ctx_en = format!(
+            "        Severity = Informational\r\n        Host ID = host-session-1\r\n        \
+             Host Application = {host}\r\n        Engine Version = 5.1\r\n        \
+             Runspace ID = runspace-1\r\n        Command Name = Get-ChildItem\r\n        \
+             User = DOMAIN\\user\r\n"
+        );
+        let payload = format!(
+            "  CommandInvocation(Write-Output): {}\r\n후반 파이프라인  ",
+            "x".repeat(450)
+        );
+        let piped =
+            serde_json::json!({"ContextInfo": ctx_en, "Payload": payload}).to_string();
+        ps_insert(&conn, "4103", "1", "356", &piped, "PowerShell.evtx");
+        // Payload가 공백뿐이면 ContextInfo의 명령 이름으로 되돌아간다.
+        let blank = serde_json::json!({"ContextInfo": ctx_en, "Payload": "   "}).to_string();
+        ps_insert(&conn, "4103", "2", "356", &blank, "PowerShell.evtx");
+        drop(conn);
+
+        let rows = build_powershell_history(&root);
+        assert_eq!(rows.len(), 2);
+        // 400자 자르기·첫 줄 자르기 없이 원문 그대로여야 한다.
+        assert_eq!(rows[0].get("command"), Some(&payload));
+        assert_eq!(rows[0].get("host_application").map(String::as_str), Some(host));
+        assert_eq!(
+            rows[0].get("session_id").map(String::as_str),
+            Some("host-session-1")
+        );
+        assert_eq!(
+            rows[0].get("runspace_id").map(String::as_str),
+            Some("runspace-1")
+        );
+        assert_eq!(rows[0].get("account").map(String::as_str), Some("DOMAIN\\user"));
+        assert_eq!(rows[0].get("kind").map(String::as_str), Some("파이프라인"));
+        assert_eq!(rows[1].get("command").map(String::as_str), Some("Get-ChildItem"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn powershell_classic_800_keeps_multiline_fields_and_session_ids() {
+        let root = ps_tmp("ps800-classic");
+        let conn = ps_event_facts(&root);
+        let host = "powershell.exe -Command $src = @'\nusing System;\npublic class X { int a = 1; }\n'@\n; exit 0";
+        let detail = format!(
+            "\tDetailSequence=1\r\n\tDetailTotal=1\r\n\r\n\tSequenceNumber=21\r\n\r\n\t\
+             UserId=WIN-HOST\\Administrator\r\n\tHostName=ConsoleHost\r\n\t\
+             HostId=110087f2-5fdc-4d5a-bf41-1d330efb0bfe\r\n\tHostApplication={host}\r\n\t\
+             EngineVersion=5.1\r\n\tRunspaceId=a68da8e0-4f30-43d3-966f-0d2dfa99224c\r\n\t\
+             PipelineId=1\r\n\tScriptName=C:\\scripts\\s.ps1\r\n\t\
+             CommandLine=Add-Type -TypeDefinition $src\nSecond-Line\r\n"
+        );
+        // 세 번째 요소(파이프라인 세부)는 필드가 아니다 — 앞 값에 흡수되면 안 된다.
+        let tail = "CommandInvocation(Add-Type): \"Add-Type\"\nParameterBinding(Add-Type): name=\"TypeDefinition\"; value=\"using System;\"";
+        let data = serde_json::json!({
+            "Data": {"#text": ["Add-Type -TypeDefinition $src\n", detail, tail]}
+        })
+        .to_string();
+        ps_insert_classic(&conn, "800", "280", &data);
+        drop(conn);
+
+        let rows = build_powershell_history(&root);
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.get("host_application").map(String::as_str), Some(host));
+        assert_eq!(
+            row.get("command").map(String::as_str),
+            Some("Add-Type -TypeDefinition $src\nSecond-Line")
+        );
+        assert_eq!(
+            row.get("account").map(String::as_str),
+            Some("WIN-HOST\\Administrator")
+        );
+        assert_eq!(
+            row.get("session_id").map(String::as_str),
+            Some("110087f2-5fdc-4d5a-bf41-1d330efb0bfe")
+        );
+        assert_eq!(
+            row.get("runspace_id").map(String::as_str),
+            Some("a68da8e0-4f30-43d3-966f-0d2dfa99224c")
+        );
+        assert_eq!(
+            row.get("script_path").map(String::as_str),
+            Some("C:\\scripts\\s.ps1")
+        );
+        assert_eq!(row.get("event_data").map(String::as_str), Some(data.as_str()));
+        assert_eq!(row.get("event_level").map(String::as_str), Some("4"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn console_history_row_keeps_full_text_and_source_file() {
+        let root = ps_tmp("psconsole-fulltext");
+        let dir = root.join("POWERSHELL");
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = Connection::open(dir.join("PowerShell_ConsoleHistory.sqlite")).unwrap();
+        conn.execute(
+            "CREATE TABLE PowerShell_ConsoleHistory (line_number TEXT, command TEXT, user TEXT, _source_file TEXT)",
+            [],
+        )
+        .unwrap();
+        let command = format!("  Write-Output '{}'\n# 후반 검색 토큰  ", "가".repeat(450));
+        conn.execute(
+            "INSERT INTO PowerShell_ConsoleHistory VALUES ('17', ?1, 'unknown', 'C:\\Users\\a\\ConsoleHost_history.txt')",
+            [&command],
+        )
+        .unwrap();
+        drop(conn);
+
+        let rows = build_powershell_history(&root);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get("command"), Some(&command));
+        assert_eq!(rows[0].get("line_number").map(String::as_str), Some("17"));
+        assert_eq!(
+            rows[0].get("_source_file").map(String::as_str),
+            Some("C:\\Users\\a\\ConsoleHost_history.txt")
+        );
+        // 파일에 시각이 없다 — 지어내지 않는다. 세션 ID도 없다.
+        assert_eq!(rows[0].get("timestamp").map(String::as_str), Some(""));
+        assert_eq!(rows[0].get("session_id"), None);
+        assert_eq!(rows[0].get("event_data"), None);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn script_block_parts_preserve_every_source_event() {
+        let root = ps_tmp("ps4104-provenance");
+        let conn = ps_event_facts(&root);
+        // 번호 1,3,3,1 — 2번 누락, 3번 내용 충돌, 1번 동일 내용 중복.
+        for (id, number, body) in [
+            (1, 1, "first"),
+            (2, 3, "last"),
+            (3, 3, "conflict"),
+            (4, 1, "first"),
+        ] {
+            let data = serde_json::json!({
+                "ScriptBlockId": "block-1", "MessageNumber": number, "MessageTotal": 3,
+                "ScriptBlockText": body, "Path": "C:\\evidence.ps1"
+            })
+            .to_string();
+            ps_insert(&conn, "4104", &id.to_string(), "356", &data, "PowerShell.evtx");
+        }
+        let single = serde_json::json!({
+            "ScriptBlockId": "block-2", "MessageNumber": 1, "MessageTotal": 1,
+            "ScriptBlockText": "solo", "Path": ""
+        })
+        .to_string();
+        ps_insert(&conn, "4104", "5", "356", &single, "PowerShell.evtx");
+        drop(conn);
+
+        let rows = build_powershell_history(&root);
+        let block = ps_row_of(&rows, "block-1");
+        // 충돌 조각의 승자는 증명 대상이 아니다 — 확인된 1번 조각이 앞에 오고
+        // 충돌한 3번의 양쪽 원본이 모두 남아 있으면 된다.
+        let body = block.get("script_block").map(String::as_str).unwrap_or("");
+        assert!(body.starts_with("first"), "{body}");
+        assert!(body == "firstlast" || body == "firstconflict", "{body}");
+        assert_eq!(
+            block.get("script_block_expected_parts").map(String::as_str),
+            Some("3")
+        );
+        // 관측 조각 수는 중복 포함 원본 이벤트 수다.
+        assert_eq!(
+            block.get("script_block_observed_parts").map(String::as_str),
+            Some("4")
+        );
+        assert_eq!(
+            ps_json(block, "script_block_missing"),
+            serde_json::json!([{"start": 2, "end": 2}])
+        );
+        assert_eq!(
+            ps_json(block, "script_block_conflicts"),
+            serde_json::json!([3])
+        );
+        let status = block
+            .get("script_block_status")
+            .map(String::as_str)
+            .unwrap_or_default();
+        assert!(status.contains("불완전"), "{status}");
+        let parts = ps_json(block, "script_block_parts");
+        let parts = parts.as_array().unwrap();
+        assert_eq!(parts.len(), 4);
+        let shape: Vec<(&str, &str, &str)> = parts
+            .iter()
+            .map(|p| {
+                (
+                    p["message_number"].as_str().unwrap(),
+                    p["script_block"].as_str().unwrap(),
+                    p["record_key"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                ("1", "first", "PowerShell::1"),
+                ("3", "last", "PowerShell::2"),
+                ("3", "conflict", "PowerShell::3"),
+                ("1", "first", "PowerShell::4"),
+            ]
+        );
+        assert_eq!(parts[0]["message_total"], "3");
+        assert_eq!(parts[0]["event_record_id"], "1");
+        assert_eq!(parts[0]["_source_file"], "PowerShell.evtx");
+        assert_eq!(parts[0]["timestamp"], "2026-10-08 01:02:03.004");
+        assert!(parts[0]["event_data"].as_str().unwrap().contains("block-1"));
+        assert_eq!(
+            block.get("script_path").map(String::as_str),
+            Some("C:\\evidence.ps1")
+        );
+        // 단일 4104도 조각 1건의 출처를 그대로 가진다.
+        let solo = ps_row_of(&rows, "block-2");
+        assert_eq!(solo.get("script_block_status"), None);
+        assert_eq!(ps_json(solo, "script_block_parts").as_array().unwrap().len(), 1);
+        assert_eq!(
+            solo.get("script_block_observed_parts").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(solo.get("script_block_missing"), None);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn script_block_groups_require_matching_identity() {
+        let root = ps_tmp("ps4104-identity");
+        let conn = ps_event_facts(&root);
+        let data = |sbid: &str, body: &str| {
+            serde_json::json!({
+                "ScriptBlockId": sbid, "MessageNumber": 1, "MessageTotal": 2,
+                "ScriptBlockText": body, "Path": ""
+            })
+            .to_string()
+        };
+        // 같은 ScriptBlockId라도 프로세스·원본 파일이 다르면 다른 실행이다.
+        ps_insert(&conn, "4104", "1", "100", &data("same", "A1"), "PowerShell.evtx");
+        ps_insert(&conn, "4104", "2", "200", &data("same", "B1"), "PowerShell.evtx");
+        ps_insert(&conn, "4104", "3", "100", &data("same", "C1"), "Other.evtx");
+        // ScriptBlockId가 없으면 묶을 근거가 없다 — 각 이벤트가 그대로 한 행.
+        let anon = serde_json::json!({
+            "MessageNumber": 1, "MessageTotal": 2, "ScriptBlockText": "anon", "Path": ""
+        })
+        .to_string();
+        ps_insert(&conn, "4104", "4", "100", &anon, "PowerShell.evtx");
+        ps_insert(&conn, "4104", "5", "100", &anon, "PowerShell.evtx");
+        drop(conn);
+
+        let rows = build_powershell_history(&root);
+        assert_eq!(rows.len(), 5);
+        let bodies: Vec<&str> = rows
+            .iter()
+            .map(|r| r.get("script_block").map(String::as_str).unwrap_or(""))
+            .collect();
+        assert_eq!(bodies, vec!["A1", "B1", "C1", "anon", "anon"]);
+        for row in &rows {
+            assert_eq!(ps_json(row, "script_block_parts").as_array().unwrap().len(), 1);
+        }
+        assert_eq!(rows[3].get("script_block_id"), None);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn script_block_unknown_ordinal_and_huge_total_stay_unknown() {
+        let root = ps_tmp("ps4104-unknown");
+        let conn = ps_event_facts(&root);
+        let unknown = serde_json::json!({
+            "ScriptBlockId": "huge", "MessageNumber": "", "MessageTotal": 4_000_000_000i64,
+            "ScriptBlockText": "U", "Path": ""
+        })
+        .to_string();
+        let second = serde_json::json!({
+            "ScriptBlockId": "huge", "MessageNumber": 2, "MessageTotal": 4_000_000_000i64,
+            "ScriptBlockText": "S", "Path": ""
+        })
+        .to_string();
+        ps_insert(&conn, "4104", "1", "356", &unknown, "PowerShell.evtx");
+        ps_insert(&conn, "4104", "2", "356", &second, "PowerShell.evtx");
+        drop(conn);
+
+        let rows = build_powershell_history(&root);
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(
+            row.get("script_block_expected_parts").map(String::as_str),
+            Some("4000000000")
+        );
+        assert_eq!(
+            row.get("script_block_observed_parts").map(String::as_str),
+            Some("2")
+        );
+        // 번호를 알 수 없는 조각은 자리를 추측하지 않고 본문 끝에 남긴다.
+        assert_eq!(row.get("script_block").map(String::as_str), Some("SU"));
+        // 누락 구간은 범위로만 표현한다 — 40억 번 순회하지 않는다.
+        assert_eq!(
+            ps_json(row, "script_block_missing"),
+            serde_json::json!([{"start": 1, "end": 1}, {"start": 3, "end": 4_000_000_000i64}])
+        );
+        let parts = ps_json(row, "script_block_parts");
+        assert_eq!(parts[0].get("message_number"), None);
+        assert_eq!(parts[0]["message_total"], "4000000000");
+        let anomalies = ps_json(row, "script_block_anomalies");
+        assert!(
+            anomalies
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a.as_str().unwrap_or("").contains("조각 번호 불명")),
+            "{anomalies}"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -8711,7 +9928,7 @@ mod tests {
         );
         assert_eq!(
             build_execution_history(&root),
-            build_execution_history_with_registry(&root, &registry),
+            build_execution_history_with_registry(&root, &registry, &EventLogOverviewCache::load(&root)),
             "sharing the overview cache must not alter execution evidence rows"
         );
         let mut raw_identity = registry

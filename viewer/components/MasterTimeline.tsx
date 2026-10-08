@@ -1,6 +1,6 @@
 "use client";
 
-import { type CSSProperties, useEffect, useMemo, useState } from "react";
+import { type CSSProperties, useContext, useEffect, useMemo, useState } from "react";
 import Checkbox from "@mui/material/Checkbox";
 import CircularProgress from "@mui/material/CircularProgress";
 import Tooltip from "@mui/material/Tooltip";
@@ -9,6 +9,7 @@ import BookmarkIcon from "@mui/icons-material/Bookmark";
 import BugReportOutlinedIcon from "@mui/icons-material/BugReportOutlined";
 import HourglassEmptyOutlinedIcon from "@mui/icons-material/HourglassEmptyOutlined";
 import type { FetchLinkedRows, TimelineEntry, TimelineFacets, TimelinePageRow, TimelineQuery } from "@/lib/types";
+import { RecordScopeContext } from "@/lib/recordScope";
 import { rangeActive as globalRangeActive, type TimeRange } from "@/lib/timeRange";
 import { EXECUTION_SOURCE_LABELS, BROWSER_KIND_LABEL } from "@/lib/timelineKeys";
 import ReportProblemOutlinedIcon from "@mui/icons-material/ReportProblemOutlined";
@@ -96,7 +97,7 @@ const toolbarButtonStyle: CSSProperties = {
   background: "var(--bg-elevated)",
   color: "var(--text-dim)",
   border: "1px solid var(--border)",
-  borderRadius: "var(--radius-md)",
+  borderRadius: "var(--radius)",
   cursor: "pointer",
   fontSize: 12,
   fontWeight: 650,
@@ -186,7 +187,7 @@ function ArtifactFilterCheckbox({
           gap: 8,
           minHeight: 32,
           padding: depth ? "4px 7px 4px 8px" : "4px 7px 4px 9px",
-          borderRadius: "var(--radius-sm)",
+          borderRadius: "var(--radius)",
           background: "transparent",
           color: checked || indeterminate ? "var(--text)" : "var(--text-faint)",
           width: "100%",
@@ -258,6 +259,8 @@ function pageRowToEntry(r: TimelinePageRow): TimelineEntry {
 }
 
 export default function MasterTimeline({ hostDir, onNavigate, onFetchLinkedRows, isBookmarked, onToggleBookmark, globalTimeRange, accountDirectory }: MasterTimelineProps) {
+  // Inherit the result view's open/bookmark actions for source records.
+  const outerScope = useContext(RecordScopeContext);
   const [page, setPage] = useState(0);
   const [sortDir, setSortDir] = useState<"asc" | "desc">("asc");
   const [hiddenTables, setHiddenTables] = useState<Set<string>>(new Set());
@@ -533,7 +536,7 @@ export default function MasterTimeline({ hostDir, onNavigate, onFetchLinkedRows,
             {showArtifactMenu && (
               <>
                 <div onClick={() => setShowArtifactMenu(false)} style={{ position: "fixed", inset: 0, zIndex: 40 }} />
-                <div style={{ position: "absolute", top: "calc(100% + 6px)", right: 0, zIndex: 41, width: 400, maxHeight: 420, overflowY: "auto", overflowX: "hidden", background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", boxShadow: "var(--shadow-panel)", padding: 8 }}>
+                <div style={{ position: "absolute", top: "calc(100% + 6px)", right: 0, zIndex: 41, width: 400, maxHeight: 420, overflowY: "auto", overflowX: "hidden", background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: "var(--radius)", boxShadow: "var(--shadow-panel)", padding: 8 }}>
                   <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "3px 4px 8px", borderBottom: "1px solid var(--border-subtle)" }}>
                     <span style={{ fontSize: 12, fontWeight: 700, color: "var(--text-dim)" }}>표시할 아티팩트</span>
                     <div style={{ display: "flex", alignItems: "center", gap: 8, marginLeft: "auto" }}>
@@ -655,7 +658,7 @@ export default function MasterTimeline({ hostDir, onNavigate, onFetchLinkedRows,
                                 onChange={() => toggleExecutionSource(source)}
                                 style={{
                                   border: "1px solid var(--border-subtle)",
-                                  borderRadius: "var(--radius-sm)",
+                                  borderRadius: "var(--radius)",
                                   marginLeft: 0,
                                   paddingLeft: 10,
                                 }}
@@ -678,7 +681,7 @@ export default function MasterTimeline({ hostDir, onNavigate, onFetchLinkedRows,
           <span style={{ fontWeight: 700, color: "var(--text)" }}>타임라인을 조회하지 못했습니다</span>
           <span style={{ color: "var(--text-dim)", fontSize: 12.5, maxWidth: 560, wordBreak: "break-word" }}>{queryError}</span>
           <span style={{ color: "var(--text-faint)", fontSize: 12 }}>기록이 없다는 뜻이 아닙니다 — 조회 자체가 실패했습니다.</span>
-          <button type="button" onClick={() => { setQueryError(null); setLoading(true); setReloadNonce((value) => value + 1); }} style={{ padding: "5px 12px", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", background: "var(--bg-elevated)", color: "var(--text)", cursor: "pointer", fontSize: 12.5 }}>다시 시도</button>
+          <button type="button" onClick={() => { setQueryError(null); setLoading(true); setReloadNonce((value) => value + 1); }} style={{ padding: "5px 12px", border: "1px solid var(--border)", borderRadius: "var(--radius)", background: "var(--bg-elevated)", color: "var(--text)", cursor: "pointer", fontSize: 12.5 }}>다시 시도</button>
         </div>
       ) : total === 0 ? (
         <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", color: "var(--text-faint)", gap: 8 }}>
@@ -709,7 +712,7 @@ export default function MasterTimeline({ hostDir, onNavigate, onFetchLinkedRows,
                 gap: 12,
                 padding: "9px 14px",
                 border: "1px solid var(--border)",
-                borderRadius: "var(--radius-md)",
+                borderRadius: "var(--radius)",
                 background: "var(--bg-panel)",
                 cursor: "pointer",
                 transition: "background .15s ease, border-color .15s ease",
@@ -717,7 +720,7 @@ export default function MasterTimeline({ hostDir, onNavigate, onFetchLinkedRows,
               onMouseEnter={(e) => { if (!bookmarked) e.currentTarget.style.background = "var(--bg-hover)"; }}
               onMouseLeave={(e) => { if (!bookmarked) e.currentTarget.style.background = "var(--bg-panel)"; }}
             >
-              <span aria-hidden="true" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 34, height: 34, flexShrink: 0, borderRadius: "var(--radius-sm)", background: `color-mix(in srgb, ${chipTone.border} 15%, transparent)` }}>
+              <span aria-hidden="true" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 34, height: 34, flexShrink: 0, borderRadius: "var(--radius)", background: `color-mix(in srgb, ${chipTone.border} 15%, transparent)` }}>
                 <TileIcon sx={{ fontSize: 17, color: chipTone.border }} />
               </span>
               <span
@@ -728,7 +731,7 @@ export default function MasterTimeline({ hostDir, onNavigate, onFetchLinkedRows,
                   fontWeight: 700,
                   padding: "1px 8px",
                   border: `1px solid ${chipTone.border}`,
-                  borderRadius: "var(--radius-sm)",
+                  borderRadius: "var(--radius)",
                   // 라벨은 아웃라인 스타일 — 아티팩트 정체성은 테두리·글자
                   // 색으로 드러낸다.
                   background: "transparent",
@@ -744,7 +747,7 @@ export default function MasterTimeline({ hostDir, onNavigate, onFetchLinkedRows,
               <span style={{ flex: 1, minWidth: 0, overflow: "hidden" }}>
                 <div style={{ display: "flex", alignItems: "center", gap: 7, minWidth: 0 }}>
                   <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 13.5, fontWeight: 650, color: bookmarked ? BOOKMARK_TEXT : undefined }}>{presentation.summary}</span>
-                  {presentation.note && <span title={presentation.note} style={{ flexShrink: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "#5bc8c0", border: "1px solid #5bc8c0", borderRadius: "var(--radius-sm)", padding: "1px 7px", fontSize: 11, fontWeight: 650 }}>{presentation.note}</span>}
+                  {presentation.note && <span title={presentation.note} style={{ flexShrink: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "#5bc8c0", border: "1px solid #5bc8c0", borderRadius: "var(--radius)", padding: "1px 7px", fontSize: 11, fontWeight: 650 }}>{presentation.note}</span>}
                 </div>
                 {presentation.subtitle && (
                   <div
@@ -810,6 +813,9 @@ export default function MasterTimeline({ hostDir, onNavigate, onFetchLinkedRows,
       )}
 
       {selectedEntry && (
+        // Timeline rows span files, so pass the row's own file/table to read
+        // source_records from the right DB.
+        <RecordScopeContext.Provider value={{ ...outerScope, fullPath: selectedEntry.fullPath, tableName: selectedEntry.table }}>
         <RowDetailPanel
           row={selectedEntry.row}
           columns={selectedEntry.columns}
@@ -825,6 +831,7 @@ export default function MasterTimeline({ hostDir, onNavigate, onFetchLinkedRows,
           isBookmarked={isBookmarked(selectedEntry)}
           onToggleBookmark={() => onToggleBookmark(selectedEntry)}
         />
+        </RecordScopeContext.Provider>
       )}
     </div>
   );

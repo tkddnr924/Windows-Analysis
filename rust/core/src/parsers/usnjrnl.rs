@@ -21,6 +21,9 @@ pub const USN_FIELD_ORDER: &[&str] = &[
     "security_id",
     "file_reference",
     "parent_file_reference",
+    "reason_mask",
+    "record_version",
+    "file_attributes_mask",
     "_source_file",
 ];
 
@@ -130,10 +133,6 @@ pub fn parse_usn_stream(path: &Path, out: &Path) -> Result<usize> {
             }
             continue;
         }
-        if data[pos] == 0 {
-            pos += 1;
-            continue;
-        }
         if pos + 4 > n {
             if eof {
                 break;
@@ -141,8 +140,7 @@ pub fn parse_usn_stream(path: &Path, out: &Path) -> Result<usize> {
             continue;
         }
         let reclen = u32le(data, pos) as usize;
-        // A corrupt record length must not hide valid records that follow.
-        // USN records are 8-byte aligned, so resynchronize conservatively.
+        // Skip padding and corrupt lengths without losing 8-byte alignment.
         if !(60..=MAX_RECLEN).contains(&reclen) {
             pos = (pos + 8).min(n);
             continue;
@@ -172,7 +170,7 @@ pub fn parse_usn_stream(path: &Path, out: &Path) -> Result<usize> {
             }
         };
         // <QQIIIIHH at hdr: usn, ts, reason, source_info, security_id, attrs, name_len, name_off
-        if hdr > n || 40 > n.saturating_sub(hdr) {
+        if 36 > reclen.saturating_sub(hdr - pos) {
             pos += advance.min(n - pos);
             continue;
         }
@@ -216,6 +214,9 @@ pub fn parse_usn_stream(path: &Path, out: &Path) -> Result<usize> {
         row.insert("filename".into(), name);
         row.insert("reason".into(), decode_flags(reason, REASON_FLAGS));
         row.insert("file_attributes".into(), decode_flags(attrs, ATTR_FLAGS));
+        row.insert("reason_mask".into(), reason.to_string());
+        row.insert("record_version".into(), major.to_string());
+        row.insert("file_attributes_mask".into(), attrs.to_string());
         row.insert(
             "mft_entry".into(),
             (file_ref & 0xFFFF_FFFF_FFFF).to_string(),
@@ -255,6 +256,75 @@ mod tests {
             b.push(0);
         }
         b
+    }
+
+    #[test]
+    fn zero_padding_preserves_following_record_alignment() {
+        let root = std::env::temp_dir().join(format!("wina-usn-padding-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let long_name = "a".repeat(98);
+        let mut data = vec![0; 16];
+        data.extend(usn_v2(64, 111, "x", 60, 2));
+        data.extend([0; 8]);
+        data.extend(usn_v2(256, 222, &long_name, 60, 196));
+        data.extend([0; 16]);
+        let source = root.join("$J");
+        let output = root.join("usn.sqlite");
+        std::fs::write(&source, data).unwrap();
+        assert_eq!(parse_usn_stream(&source, &output).unwrap(), 2);
+        let db = rusqlite::Connection::open(&output).unwrap();
+        let mut query = db.prepare("SELECT usn, filename FROM UsnJrnl_Records ORDER BY rowid").unwrap();
+        let rows: Vec<(String, String)> = query.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        assert_eq!(rows, vec![("111".into(), "x".into()), ("222".into(), long_name)]);
+        drop(query);
+        drop(db);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn raw_reason_mask_preserves_unknown_flags_and_record_version() {
+        let root = std::env::temp_dir().join(format!("wina-usn-mask-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut data = usn_v2(64, 999, "x", 60, 2);
+        data[40..44].copy_from_slice(&0x01000001u32.to_le_bytes());
+        data[52..56].copy_from_slice(&0x40000020u32.to_le_bytes());
+        let source = root.join("$J");
+        let output = root.join("usn.sqlite");
+        std::fs::write(&source, data).unwrap();
+        assert_eq!(parse_usn_stream(&source, &output).unwrap(), 1);
+        let db = rusqlite::Connection::open(&output).unwrap();
+        let actual: (String, String, String, String, String) = db.query_row(
+            "SELECT reason, reason_mask, record_version, file_attributes, file_attributes_mask FROM UsnJrnl_Records", [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        ).unwrap();
+        assert_eq!(actual, ("DATA_OVERWRITE".into(), "16777217".into(), "2".into(), "ARCHIVE".into(), "1073741856".into()));
+        drop(db);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn zero_low_length_byte_is_not_padding_and_short_v3_is_rejected() {
+        let root = std::env::temp_dir().join(format!("wina-usn-header-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let long_name = "a".repeat(98);
+        let mut data = usn_v2(256, 111, &long_name, 60, 196);
+        let mut short_v3 = usn_v2(60, 333, "", 0, 0);
+        short_v3[4..6].copy_from_slice(&3u16.to_le_bytes());
+        data.extend(short_v3);
+        data.extend(usn_v2(64, 444, "x", 60, 2));
+        let source = root.join("$J");
+        let output = root.join("usn.sqlite");
+        std::fs::write(&source, data).unwrap();
+        assert_eq!(parse_usn_stream(&source, &output).unwrap(), 2);
+        let db = rusqlite::Connection::open(&output).unwrap();
+        let mut query = db.prepare("SELECT usn, filename FROM UsnJrnl_Records ORDER BY rowid").unwrap();
+        let rows: Vec<(String, String)> = query.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        assert_eq!(rows, vec![("111".into(), long_name), ("444".into(), "x".into())]);
+        drop(query);
+        drop(db);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

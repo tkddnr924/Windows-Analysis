@@ -72,7 +72,7 @@ export function groupServiceEvents(
     // 파생이 이름을 비워 둔다. 서비스로 묶을 근거가 없으므로 원본 레코드마다
     // 독립 항목으로 남긴다 — 서로 다른 부팅·드라이버가 한 덩어리로 합쳐지면
     // 카드의 기간과 실패 건수가 과도하게 합산된다.
-    const key = canonical || `${raw.description || "(서비스 정보 없음)"}::${raw.record_key || timestamp}`;
+    const key = canonical || `${raw.description || "(서비스 정보 없음)"}::${raw.record_id || timestamp}`;
     let service = byKey.get(key);
     if (!service) {
       service = {

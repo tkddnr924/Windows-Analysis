@@ -234,7 +234,7 @@ export default function SessionFlowView({
           const accountLabel = resolveAccountDisplay(s.account, accountDirectory) || "계정 정보 없음";
           const sameDay = s.start.slice(0, 10) === s.end.slice(0, 10);
           return (
-            <section key={s.key} style={{ marginBottom: 10, border: `1px solid ${open ? `color-mix(in srgb, ${dirColor} 48%, var(--border))` : "var(--border)"}`, borderRadius: "var(--radius-md)", background: "var(--bg-panel)", overflow: "hidden", transition: "border-color .18s ease" }}>
+            <section key={s.key} style={{ marginBottom: 10, border: `1px solid ${open ? `color-mix(in srgb, ${dirColor} 48%, var(--border))` : "var(--border)"}`, borderRadius: "var(--radius)", background: "var(--bg-panel)", overflow: "hidden", transition: "border-color .18s ease" }}>
               <button
                 type="button"
                 onClick={() => toggle(s.key)}
@@ -246,7 +246,7 @@ export default function SessionFlowView({
                 onFocus={(e) => { e.currentTarget.style.outline = "2px solid var(--accent)"; }}
                 onBlur={(e) => { e.currentTarget.style.outline = "none"; }}
               >
-                <span aria-hidden="true" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 34, height: 34, flexShrink: 0, borderRadius: "var(--radius-sm)", background: `color-mix(in srgb, ${dirColor} 16%, transparent)` }}>
+                <span aria-hidden="true" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 34, height: 34, flexShrink: 0, borderRadius: "var(--radius)", background: `color-mix(in srgb, ${dirColor} 16%, transparent)` }}>
                   <DirIcon sx={{ fontSize: 17, color: dirColor }} />
                 </span>
                 <span style={{ flex: 1, minWidth: 0, display: "grid", gap: 3 }}>
@@ -266,7 +266,7 @@ export default function SessionFlowView({
                     <span style={{ flexShrink: 0, color: "var(--text-faint)" }}>이벤트 {s.events.length.toLocaleString()}건</span>
                   </span>
                 </span>
-                <span style={{ flexShrink: 0, display: "inline-flex", alignItems: "center", gap: 4, fontSize: 11.5, fontWeight: 700, padding: "1px 8px", borderRadius: "var(--radius-sm)", color: dirColor, border: `1px solid ${dirColor}`, whiteSpace: "nowrap" }}>
+                <span style={{ flexShrink: 0, display: "inline-flex", alignItems: "center", gap: 4, fontSize: 11.5, fontWeight: 700, padding: "1px 8px", borderRadius: "var(--radius)", color: dirColor, border: `1px solid ${dirColor}`, whiteSpace: "nowrap" }}>
                   {DIRECTION_LABEL[s.direction] ?? s.direction}
                 </span>
                 <span style={{ display: "flex", gap: 4, alignItems: "center", flexShrink: 0 }}>
@@ -351,7 +351,7 @@ export default function SessionFlowView({
 
 function Pill({ color, children }: { color: string; children: React.ReactNode }) {
   return (
-    <span style={{ color, fontSize: 12, fontWeight: 700, padding: "2px 7px", borderRadius: "var(--radius-sm)", background: `color-mix(in srgb, ${color} 15%, transparent)` }}>
+    <span style={{ color, fontSize: 12, fontWeight: 700, padding: "2px 7px", borderRadius: "var(--radius)", background: `color-mix(in srgb, ${color} 15%, transparent)` }}>
       {children}
     </span>
   );

@@ -1,13 +1,16 @@
-//! wina-core: Rust reimplementation of the Windows-Analysis parsing pipeline.
-//! Produces SQLite output schema-compatible with the Python pipeline so the
-//! existing viewer keeps working while parsers are migrated one by one.
+//! Evidence parsers and typed, provenance-linked overview generation.
+mod account_events;
 pub mod ai_activity;
 pub mod case_store;
 pub mod finder;
 pub mod hex;
 pub mod overview;
+pub mod derived;
+pub mod metadata;
+pub mod parse_eligibility;
 pub mod shellbag;
 pub mod parsers;
+mod powershell_decode;
 pub mod pipeline;
 pub mod sqlite;
 pub mod time;

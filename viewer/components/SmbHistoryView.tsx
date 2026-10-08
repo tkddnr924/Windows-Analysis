@@ -30,7 +30,6 @@ interface Row {
   result?: string;
   description?: string;
   event_id?: string;
-  record_key?: string;
 }
 
 interface Peer {
@@ -180,7 +179,7 @@ export default function SmbHistoryView({
           const accountsLabel = peer.accounts.length ? peer.accounts.map((account) => resolveAccountDisplay(account, accountDirectory)).join(", ") : "계정 정보 없음";
           const sameDay = peer.first.slice(0, 10) === peer.last.slice(0, 10);
           return (
-            <section key={peer.ip} style={{ marginBottom: 10, border: `1px solid ${open ? `color-mix(in srgb, ${peerColor} 42%, var(--border))` : "var(--border)"}`, borderRadius: "var(--radius-md)", background: "var(--bg-panel)", overflow: "hidden", transition: "border-color .18s ease" }}>
+            <section key={peer.ip} style={{ marginBottom: 10, border: `1px solid ${open ? `color-mix(in srgb, ${peerColor} 42%, var(--border))` : "var(--border)"}`, borderRadius: "var(--radius)", background: "var(--bg-panel)", overflow: "hidden", transition: "border-color .18s ease" }}>
               <button
                 type="button"
                 onClick={() => toggle(peer.ip)}
@@ -190,7 +189,7 @@ export default function SmbHistoryView({
                 onMouseEnter={(event) => { if (!open) event.currentTarget.style.background = "var(--bg-hover)"; }}
                 onMouseLeave={(event) => { event.currentTarget.style.background = open ? `color-mix(in srgb, ${peerColor} 6%, transparent)` : "transparent"; }}
               >
-                <span aria-hidden="true" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 34, height: 34, flexShrink: 0, borderRadius: "var(--radius-sm)", background: `color-mix(in srgb, ${peerColor} 15%, transparent)` }}>
+                <span aria-hidden="true" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 34, height: 34, flexShrink: 0, borderRadius: "var(--radius)", background: `color-mix(in srgb, ${peerColor} 15%, transparent)` }}>
                   <DnsOutlinedIcon sx={{ fontSize: 17, color: peerColor }} />
                 </span>
                 <span style={{ flex: 1, minWidth: 0, display: "grid", gap: 3 }}>
@@ -258,5 +257,5 @@ const clearButtonStyle: React.CSSProperties = {
 };
 
 function ResultPill({ color, children }: { color: string; children: React.ReactNode }) {
-  return <span style={{ color, fontWeight: 700, padding: "1px 7px", borderRadius: "var(--radius-sm)", background: `color-mix(in srgb, ${color} 15%, transparent)`, whiteSpace: "nowrap" }}>{children}</span>;
+  return <span style={{ color, fontWeight: 700, padding: "1px 7px", borderRadius: "var(--radius)", background: `color-mix(in srgb, ${color} 15%, transparent)`, whiteSpace: "nowrap" }}>{children}</span>;
 }

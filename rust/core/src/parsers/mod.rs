@@ -9,6 +9,7 @@ pub mod mft;
 pub mod powershell_history;
 pub mod prefetch;
 pub mod rdpcache;
+pub mod recyclebin;
 pub mod registry;
 pub mod srum;
 pub mod taskscheduler;

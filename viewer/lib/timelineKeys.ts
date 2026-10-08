@@ -19,8 +19,10 @@ export const BROWSER_KIND_LABEL: Record<string, string> = {
   other: "BrowserActivity:기타",
 };
 
+// 저장 계약(docs-01)에서 "기록 종류"는 event_type이다 — 실행 이력은 기존
+// source_artifact 값을, 브라우저 활동은 기존 kind 값을 그대로 담는다.
 export function executionSourceKey(row: Record<string, string>): string {
-  const source = (row.source_artifact || "").trim().toLowerCase();
+  const source = (row.event_type || "").trim().toLowerCase();
   if (source.startsWith("amcache")) return "amcache";
   if (source === "userassist") return "userassist";
   if (source === "prefetch") return "prefetch";
@@ -31,7 +33,7 @@ export function executionSourceKey(row: Record<string, string>): string {
 }
 
 export function browserActivityKindKey(row: Record<string, string>): string {
-  const kind = (row.kind || "").trim().toLowerCase();
+  const kind = (row.event_type || "").trim().toLowerCase();
   if (kind === "visit" || kind === "download" || kind === "cache") return kind;
   return "other";
 }

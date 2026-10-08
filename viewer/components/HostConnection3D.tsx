@@ -660,7 +660,7 @@ export default function HostConnection3D({ nodes, edges, hostNets, hostNetInfo, 
       />
       <div
         aria-label="그래프 범례"
-        style={{ position: "absolute", zIndex: 3, top: 10, left: 12, display: "grid", gap: 7, padding: "9px 12px", background: "color-mix(in srgb, var(--bg-panel) 88%, transparent)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", color: "var(--text-dim)", fontSize: 11.5, pointerEvents: "none" }}
+        style={{ position: "absolute", zIndex: 3, top: 10, left: 12, display: "grid", gap: 7, padding: "9px 12px", background: "color-mix(in srgb, var(--bg-panel) 88%, transparent)", border: "1px solid var(--border)", borderRadius: "var(--radius)", color: "var(--text-dim)", fontSize: 11.5, pointerEvents: "none" }}
       >
         <div style={{ display: "flex", gap: 14, alignItems: "center" }}>
           <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
@@ -695,7 +695,7 @@ export default function HostConnection3D({ nodes, edges, hostNets, hostNetInfo, 
         <div
           role="status"
           aria-label="호버한 노드 정보"
-          style={{ position: "absolute", right: 12, top: 10, zIndex: 4, minWidth: 210, maxWidth: 320, padding: "10px 13px", background: "color-mix(in srgb, var(--bg-panel) 92%, transparent)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", boxShadow: "var(--shadow-panel)", pointerEvents: "none", fontSize: 12.5, color: "var(--text-dim)" }}
+          style={{ position: "absolute", right: 12, top: 10, zIndex: 4, minWidth: 210, maxWidth: 320, padding: "10px 13px", background: "color-mix(in srgb, var(--bg-panel) 92%, transparent)", border: "1px solid var(--border)", borderRadius: "var(--radius)", boxShadow: "var(--shadow-panel)", pointerEvents: "none", fontSize: 12.5, color: "var(--text-dim)" }}
         >
           <div style={{ fontFamily: "var(--mono)", fontWeight: 700, fontSize: 13.5, color: "var(--text)", overflowWrap: "anywhere" }}>{hoverTileInfo.label}</div>
           {hoverTileInfo.net && <div style={{ marginTop: 2, color: "var(--text-faint)", fontFamily: "var(--mono)", fontSize: 11.5 }}>{hoverTileInfo.net} 대역</div>}

@@ -11,7 +11,7 @@ const row = (over: Record<string, string>) => ({
   description: "",
   image_path: "",
   result: "정보",
-  record_key: "",
+  record_id: "",
   ...over,
 });
 
@@ -80,8 +80,8 @@ test("표시 이름 대응은 대소문자를 구분하지 않는다", () => {
 // 이름을 비운다. 전부 한 카드로 뭉치면 기간·실패 수가 과도하게 합산된다.
 test("이름 없는 7026 기록은 원본 레코드마다 독립 항목으로 남는다", () => {
   const groups = groupServiceEvents([
-    row({ timestamp: "2026-01-01 01:00:00.000", event_id: "7026", description: "부팅/시스템 시작 드라이버 로드 실패", result: "실패", record_key: "System::1" }),
-    row({ timestamp: "2026-02-01 01:00:00.000", event_id: "7026", description: "부팅/시스템 시작 드라이버 로드 실패", result: "실패", record_key: "System::2" }),
+    row({ timestamp: "2026-01-01 01:00:00.000", event_id: "7026", description: "부팅/시스템 시작 드라이버 로드 실패", result: "실패", record_id: "11111111-1111-4111-8111-111111111111" }),
+    row({ timestamp: "2026-02-01 01:00:00.000", event_id: "7026", description: "부팅/시스템 시작 드라이버 로드 실패", result: "실패", record_id: "22222222-2222-4222-8222-222222222222" }),
   ]);
   assert.equal(groups.length, 2);
   for (const group of groups) assert.equal(group.events.length, 1);

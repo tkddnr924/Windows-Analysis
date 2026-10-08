@@ -94,20 +94,25 @@ export default function WerView({ data, bookmarkedRowids, onToggleBookmark, time
     () =>
       data.rows.map((row) => {
         const report = safeParse(row.report);
-        const appPath = row.AppPath || str(report.AppPath);
+        // 이 화면은 파생 WerReports와 원본 facts WER_Reports를 모두 연다 —
+        // 각 표의 자기 컬럼을 읽는다(파생은 app_path/app_name/error_type,
+        // 원본 facts는 보고서 원문 키와 같은 이름). 보고서 원문(report JSON)의
+        // 키는 WER 파일 원문이므로 그대로 둔다.
+        const appPath = row.app_path || row.AppPath || str(report.AppPath);
         return {
           row,
           rowid: Number((row as unknown as Record<string, unknown>).__rowid),
           report,
           appName:
+            row.app_name ||
             row.AppName ||
             str(report.AppName) ||
             basename(appPath) ||
             sigAppName(report) ||
-            targetAppIdName(str(report.TargetAppId) || row.TargetAppId || "") ||
+            targetAppIdName(str(report.TargetAppId) || row.target_app_id || row.TargetAppId || "") ||
             str(report.OriginalFilename),
           appPath,
-          eventType: row.EventType || str(report.EventType),
+          eventType: row.error_type || row.EventType || str(report.EventType),
           friendly: str(report.FriendlyEventName),
           timestamp: row.timestamp || "",
           // 통합 파생이 남긴 구성 원본 — Report.wer 산출물인지 EventLog
@@ -181,10 +186,10 @@ export default function WerView({ data, bookmarkedRowids, onToggleBookmark, time
               onClick={() => setDetail(p)}
               onMouseEnter={(e) => { if (!bm) e.currentTarget.style.background = "var(--bg-hover)"; }}
               onMouseLeave={(e) => { if (!bm) e.currentTarget.style.background = "var(--bg-panel)"; }}
-              style={{ borderRadius: "var(--radius-md)", display: "flex", alignItems: "center", gap: 12, minHeight: 62, marginBottom: 8, padding: "10px 14px", border: "1px solid var(--border)", background: "var(--bg-panel)", cursor: "pointer", transition: "background .15s ease, border-color .15s ease" }}
+              style={{ borderRadius: "var(--radius)", display: "flex", alignItems: "center", gap: 12, minHeight: 62, marginBottom: 8, padding: "10px 14px", border: "1px solid var(--border)", background: "var(--bg-panel)", cursor: "pointer", transition: "background .15s ease, border-color .15s ease" }}
               title="클릭하면 WER 상세 보기"
             >
-              <span aria-hidden="true" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 34, height: 34, flexShrink: 0, borderRadius: "var(--radius-sm)", background: `color-mix(in srgb, ${tone} 15%, transparent)` }}>
+              <span aria-hidden="true" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 34, height: 34, flexShrink: 0, borderRadius: "var(--radius)", background: `color-mix(in srgb, ${tone} 15%, transparent)` }}>
                 <ReportProblemOutlinedIcon sx={{ fontSize: 17, color: tone }} />
               </span>
               <span style={{ flex: 1, minWidth: 0, display: "grid", gap: 3 }}>
@@ -213,7 +218,7 @@ export default function WerView({ data, bookmarkedRowids, onToggleBookmark, time
           row={detail.row}
           columns={data.columns}
           focusedColumn={null}
-          fileBaseName="WER_Reports"
+          fileBaseName={data.columns.includes("error_type") ? "WerReports" : "WER_Reports"}
           onClose={() => setDetail(null)}
           onNavigate={() => {}}
           isBookmarked={onToggleBookmark ? (bookmarkedRowids?.has(detail.rowid) ?? false) : undefined}
@@ -273,7 +278,7 @@ function WerDetailModal({ p, onClose, isBookmarked, onToggleBookmark }: { p: Par
 
   return (
     <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(1,4,9,0.6)", zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
-      <div onClick={(e) => e.stopPropagation()} style={{ width: 720, maxWidth: "100%", maxHeight: "86vh", overflow: "auto", background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "var(--radius-lg)", boxShadow: "var(--shadow-panel)" }}>
+      <div onClick={(e) => e.stopPropagation()} style={{ width: 720, maxWidth: "100%", maxHeight: "86vh", overflow: "auto", background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "var(--radius)", boxShadow: "var(--shadow-panel)" }}>
         <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "14px 18px", borderBottom: "1px solid var(--border)", borderLeft: `3px solid ${tone}`, position: "sticky", top: 0, background: "var(--bg-panel)", zIndex: 1 }}>
           <span className="dfir-section-label">증거 상세</span>
           <span style={{ fontSize: 15, fontWeight: 700, wordBreak: "break-all" }}>{p.appName || p.friendly || p.eventType || "(이름 없음)"}</span>
@@ -283,7 +288,7 @@ function WerDetailModal({ p, onClose, isBookmarked, onToggleBookmark }: { p: Par
               className={isBookmarked ? "dfir-bookmark-control" : undefined}
               onClick={onToggleBookmark}
               title={isBookmarked ? "북마크 해제" : "북마크에 추가"}
-              style={{ marginLeft: "auto", display: "inline-flex", alignItems: "center", gap: 5, fontSize: 11.5, padding: "4px 10px", background: isBookmarked ? "var(--bookmark-row)" : "transparent", color: isBookmarked ? "var(--bookmark-control)" : "var(--text-dim)", border: `1px solid ${isBookmarked ? "var(--bookmark-outline)" : "var(--border)"}`, borderRadius: "var(--radius-lg)", cursor: "pointer", fontWeight: 600 }}
+              style={{ marginLeft: "auto", display: "inline-flex", alignItems: "center", gap: 5, fontSize: 11.5, padding: "4px 10px", background: isBookmarked ? "var(--bookmark-row)" : "transparent", color: isBookmarked ? "var(--bookmark-control)" : "var(--text-dim)", border: `1px solid ${isBookmarked ? "var(--bookmark-outline)" : "var(--border)"}`, borderRadius: "var(--radius)", cursor: "pointer", fontWeight: 600 }}
             >
               {isBookmarked ? "북마크됨" : "북마크"}
             </button>
@@ -310,7 +315,7 @@ function WerDetailModal({ p, onClose, isBookmarked, onToggleBookmark }: { p: Par
                 {showModules ? "▾" : "▸"} 로드된 모듈 <span style={{ color: "var(--text-faint)" }}>({modules.length})</span>
               </button>
               {showModules && (
-                <div style={{ marginTop: 6, maxHeight: 260, overflow: "auto", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", background: "var(--bg)" }}>
+                <div style={{ marginTop: 6, maxHeight: 260, overflow: "auto", border: "1px solid var(--border)", borderRadius: "var(--radius)", background: "var(--bg)" }}>
                   {modules.map((m, i) => (
                     <div key={i} style={{ fontSize: 11, fontFamily: "var(--mono)", color: "var(--text-dim)", padding: "3px 10px", borderBottom: i < modules.length - 1 ? "1px solid var(--border-subtle)" : "none", wordBreak: "break-all" }}>{m}</div>
                   ))}
@@ -338,7 +343,7 @@ function WerDetailModal({ p, onClose, isBookmarked, onToggleBookmark }: { p: Par
               {showRaw ? "▾" : "▸"} 원본 전체 (JSON)
             </button>
             {showRaw && (
-              <pre style={{ marginTop: 6, maxHeight: 340, overflow: "auto", fontSize: 11, fontFamily: "var(--mono)", color: "var(--text-dim)", background: "var(--bg)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", padding: "10px 12px", whiteSpace: "pre-wrap", wordBreak: "break-all" }}>
+              <pre style={{ marginTop: 6, maxHeight: 340, overflow: "auto", fontSize: 11, fontFamily: "var(--mono)", color: "var(--text-dim)", background: "var(--bg)", border: "1px solid var(--border)", borderRadius: "var(--radius)", padding: "10px 12px", whiteSpace: "pre-wrap", wordBreak: "break-all" }}>
                 {JSON.stringify(d, null, 2)}
               </pre>
             )}
@@ -367,7 +372,7 @@ function KVSection({ heading, pairs, highlight, compact }: { heading: React.Reac
   return (
     <div style={{ marginTop: compact ? 8 : 16 }}>
       <div style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 11, fontWeight: 700, color: "var(--text-faint)", marginBottom: 6 }}>{heading}</div>
-      <div style={{ border: "1px solid var(--border)", borderRadius: "var(--radius-md)", background: "var(--bg)", overflow: "hidden" }}>
+      <div style={{ border: "1px solid var(--border)", borderRadius: "var(--radius)", background: "var(--bg)", overflow: "hidden" }}>
         {pairs.map((p, i) => (
           <div key={i} style={{ display: "flex", gap: 12, padding: "5px 10px", borderTop: i === 0 ? "none" : "1px solid var(--border-subtle)", alignItems: "baseline" }}>
             <span style={{ flex: "0 0 40%", color: "var(--text-faint)", fontSize: 11.5, wordBreak: "break-all" }}>{p.k}</span>
@@ -382,5 +387,5 @@ function KVSection({ heading, pairs, highlight, compact }: { heading: React.Reac
 const collapseBtn: React.CSSProperties = { background: "transparent", border: "none", color: "var(--text-dim)", fontSize: 12, fontWeight: 700, cursor: "pointer", padding: "4px 0" };
 
 function Pill({ text, color }: { text: string; color: string }) {
-  return <span style={{ fontSize: 11.5, fontWeight: 700, color, border: `1px solid ${color}`, borderRadius: "var(--radius-sm)", padding: "0 6px", whiteSpace: "nowrap" }}>{text}</span>;
+  return <span style={{ fontSize: 11.5, fontWeight: 700, color, border: `1px solid ${color}`, borderRadius: "var(--radius)", padding: "0 6px", whiteSpace: "nowrap" }}>{text}</span>;
 }

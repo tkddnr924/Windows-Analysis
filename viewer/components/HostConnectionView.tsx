@@ -659,7 +659,7 @@ function List(
             onClick={() => onSelect(group.key)}
             onMouseEnter={(event) => { if (!isSelected) event.currentTarget.style.background = "var(--bg-hover)"; }}
             onMouseLeave={(event) => { event.currentTarget.style.background = isSelected ? "var(--accent-subtle)" : "var(--bg-panel)"; }}
-            style={{ width: "100%", display: "grid", gap: 4, marginBottom: 6, padding: "8px 10px", border: `1px solid ${isSelected ? "color-mix(in srgb, var(--accent) 58%, var(--border))" : "var(--border)"}`, borderRadius: "var(--radius-md)", background: isSelected ? "var(--accent-subtle)" : "var(--bg-panel)", color: "var(--text)", cursor: "pointer", textAlign: "left", transition: "background .15s ease, border-color .15s ease" }}
+            style={{ width: "100%", display: "grid", gap: 4, marginBottom: 6, padding: "8px 10px", border: `1px solid ${isSelected ? "color-mix(in srgb, var(--accent) 58%, var(--border))" : "var(--border)"}`, borderRadius: "var(--radius)", background: isSelected ? "var(--accent-subtle)" : "var(--bg-panel)", color: "var(--text)", cursor: "pointer", textAlign: "left", transition: "background .15s ease, border-color .15s ease" }}
           >
             <span title={group.label} style={{ display: "block", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontFamily: "var(--mono)", fontSize: 12.5, fontWeight: 700 }}>{group.label}</span>
             <span style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0, fontSize: 11, flexWrap: "wrap" }}>
@@ -722,14 +722,14 @@ function NodeInspector(
         type="button"
         className="nm-btn"
         onClick={onBack}
-        style={{ display: "inline-flex", alignItems: "center", gap: 5, minHeight: 28, marginBottom: 8, padding: "3px 10px", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", background: "var(--bg-elevated)", color: "var(--text-dim)", cursor: "pointer", fontSize: 11.5, fontWeight: 650 }}
+        style={{ display: "inline-flex", alignItems: "center", gap: 5, minHeight: 28, marginBottom: 8, padding: "3px 10px", border: "1px solid var(--border)", borderRadius: "var(--radius)", background: "var(--bg-elevated)", color: "var(--text-dim)", cursor: "pointer", fontSize: 11.5, fontWeight: 650 }}
       >
         ← 목록으로
       </button>
       <strong style={{ display: "block" }}>연결한 호스트</strong>
       <p style={{ display: "flex", alignItems: "center", gap: 6, color: "var(--text-dim)", fontSize: 12, fontFamily: "var(--mono)" }}>
         <span style={{ minWidth: 0, overflowWrap: "anywhere" }}>{label}</span>
-        {registered && <span style={{ flexShrink: 0, fontSize: 10.5, fontWeight: 700, color: "var(--accent)", border: "1px solid var(--accent)", borderRadius: "var(--radius-sm)", padding: "0 6px" }}>등록 호스트</span>}
+        {registered && <span style={{ flexShrink: 0, fontSize: 10.5, fontWeight: 700, color: "var(--accent)", border: "1px solid var(--accent)", borderRadius: "var(--radius)", padding: "0 6px" }}>등록 호스트</span>}
       </p>
       {/* 확정 규칙: 노드 상세는 상대 목록(등록 칩)과 방향·횟수 집계만 —
           총계·계정·호스트 열기 제어는 원격 접근 이력 뷰의 몫이라 두지 않는다. */}
@@ -746,7 +746,7 @@ function NodeInspector(
             <span style={{ minWidth: 0 }}>
               <span style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0 }}>
                 <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontFamily: "var(--mono)", fontSize: 12.5, fontWeight: 650 }}>{r.label}</span>
-                {hosts.has(r.label) && <span style={{ flexShrink: 0, fontSize: 10.5, fontWeight: 700, color: "var(--accent)", border: "1px solid var(--accent)", borderRadius: "var(--radius-sm)", padding: "0 6px" }}>등록</span>}
+                {hosts.has(r.label) && <span style={{ flexShrink: 0, fontSize: 10.5, fontWeight: 700, color: "var(--accent)", border: "1px solid var(--accent)", borderRadius: "var(--radius)", padding: "0 6px" }}>등록</span>}
               </span>
               <span style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 2, fontSize: 10.5 }}>
                 {r.inbound > 0 && <span style={{ color: "#f2a86f", fontWeight: 650 }}>인바운드 {r.inbound.toLocaleString()}건</span>}
@@ -823,7 +823,7 @@ const button: React.CSSProperties = {
   minHeight: 29,
   padding: "3px 8px",
   border: "1px solid var(--border)",
-  borderRadius: "var(--radius-sm)",
+  borderRadius: "var(--radius)",
   background: "var(--bg-elevated)",
   color: "var(--text-dim)",
   cursor: "pointer",
@@ -833,7 +833,7 @@ const field: React.CSSProperties = {
   minHeight: 30,
   padding: "4px 8px",
   border: "1px solid var(--border)",
-  borderRadius: "var(--radius-sm)",
+  borderRadius: "var(--radius)",
   background: "var(--bg-elevated)",
   color: "var(--text)",
   fontSize: 12,

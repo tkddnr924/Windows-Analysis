@@ -12,10 +12,9 @@ use serde::Serialize;
 
 use crate::case_store::{self};
 use crate::finder;
-use crate::overview;
 use crate::parsers::{
     amcache, browser_cache, browser_history, eventlog, ie_indexdat, ie_webcache, jumplist, mft,
-    powershell_history, prefetch, rdpcache, registry, srum, taskscheduler, timeline, usnjrnl,
+    powershell_history, prefetch, rdpcache, recyclebin, registry, srum, taskscheduler, timeline, usnjrnl,
     wer, wmi_repository,
 };
 use crate::sqlite::{write_table, Row};
@@ -124,12 +123,16 @@ fn artifact_output_categories(only: Option<&HashSet<String>>) -> HashSet<&'stati
             "Timeline" => {
                 categories.insert("TIMELINE");
             }
+            "RecycleBin" => {
+                categories.insert("RECYCLEBIN");
+            }
             _ => {}
         }
     }
     // Overview builders replace files in this directory even during a scoped
     // run, so it must never be hard-linked to the published output.
     categories.insert("_OVERVIEW");
+    categories.insert("SUPPLEMENTAL");
     categories
 }
 
@@ -775,6 +778,7 @@ pub const ARTIFACT_NAMES: &[&str] = &[
     "WER",
     "WmiRepository",
     "Timeline",
+    "RecycleBin",
 ];
 
 /// A parser section with neither discovered evidence nor staged output is not
@@ -973,6 +977,37 @@ impl ArtifactOutcome {
     }
 }
 
+/// Every supported evidence file under the target, found with the same rules a
+/// run would plan with. Parse eligibility (UI-01) reuses this instead of
+/// duplicating the rules, so unsupported files never count as new data.
+/// Paths and repeated traversal errors are deduplicated across artifacts.
+pub fn discover_host_inputs(target: &Path) -> finder::Found {
+    let mut found = finder::Found::default();
+    let mut seen_paths = HashSet::new();
+    let mut seen_errors = HashSet::new();
+    for name in ARTIFACT_NAMES {
+        let mut hit = discover_artifact_files(name, target);
+        if *name == "BrowserCache" {
+            // Match the inputs the parser records, not every file named index.
+            let candidates = browser_cache::cache_outputs(&hit.paths);
+            hit.paths = candidates.outputs.into_iter().map(|(_, path)| path)
+                .chain(candidates.rejected.into_iter().map(|(path, _)| path))
+                .collect();
+        }
+        for path in hit.paths {
+            if seen_paths.insert(path.clone()) {
+                found.paths.push(path);
+            }
+        }
+        for error in hit.errors {
+            if seen_errors.insert(error.clone()) {
+                found.errors.push(error);
+            }
+        }
+    }
+    found
+}
+
 /// Locate one artifact's evidence files under the target (path/content rules
 /// unchanged from the sequential pipeline). 탐색 중 만난 접근·순회 실패도
 /// 함께 반환된다 — 파이프라인이 아티팩트 보고서에 기록해 "발견 0건"과
@@ -1021,6 +1056,7 @@ fn discover_artifact_files(name: &str, target: &Path) -> finder::Found {
         "WER" => wer::wer_sources(target),
         "WmiRepository" => wmi_repository::wmi_sources(target),
         "Timeline" => timeline::timeline_sources(target),
+        "RecycleBin" => recyclebin::recyclebin_sources(target),
         _ => finder::Found::default(),
     }
 }
@@ -1478,10 +1514,15 @@ fn parse_usnjrnl_artifact(
 ) -> Result<Vec<String>> {
     entry_record_inputs(entry, paths);
     let mut outputs = Vec::new();
-    // 손상 레코드는 파서가 재동기화로 건너뛴다. 파일 열기/저장 실패만 여기서
-    // 데이터 손상으로 판단해 건너뛴다.
-    if let Some(p) = paths.first() {
-        let relative = "FILESYSTEM/UsnJrnl_Records.sqlite".to_string();
+    for (index, p) in paths.iter().enumerate() {
+        if cancelled() {
+            break;
+        }
+        let relative = if index == 0 {
+            "FILESYSTEM/UsnJrnl_Records.sqlite".to_string()
+        } else {
+            format!("FILESYSTEM/UsnJrnl_Records_{}.sqlite", index + 1)
+        };
         let out = out_dir.join(&relative);
         if let Some(n) = run_unit_or_skip(&p.display().to_string(), &[&out], || {
             usnjrnl::parse_usn_stream(p, &out)
@@ -1497,26 +1538,61 @@ fn parse_usnjrnl_artifact(
 fn parse_mft_artifact(
     paths: &[PathBuf],
     out_dir: &Path,
-    entry: &mut ParseArtifactReport,
+    outcome: &mut ArtifactOutcome,
 ) -> Result<Vec<String>> {
-    entry_record_inputs(entry, paths);
-    let mut outputs = Vec::new();
-    // 손상 엔트리는 파서가 레코드 단위로 건너뛴다. 파일 열기/저장 실패만
-    // 여기서 데이터 손상으로 판단해 건너뛴다.
-    if let Some(p) = paths.first() {
-        let relative = "_OVERVIEW/MFT_Records.sqlite".to_string();
-        let out = out_dir.join(&relative);
-        if let Some(n) = run_unit_or_skip(&p.display().to_string(), &[&out], || {
-            mft::parse_mft_stream(p, &out)
-        })? {
-            entry_record_input_count(entry, p, n);
-            emit(&format!("[+] {} rows -> {}", n, out.display()));
-            outputs.push(relative);
-        }
-    } else {
+    entry_record_inputs(&mut outcome.entry, paths);
+    if paths.is_empty() {
         emit("[*] MFT 원본이 없어 이번 실행에서 MFT 결과를 만들지 않았습니다");
+        return Ok(Vec::new());
     }
-    Ok(outputs)
+    let relative = "_OVERVIEW/MFT_Records.sqlite";
+    let reports = mft::parse_mft_sources(paths, &out_dir.join(relative))?;
+    let has_success = reports.iter().any(|source| source.error.is_none());
+    let mut total = 0;
+    for source in reports {
+        total += source.record_count;
+        entry_record_input_count(&mut outcome.entry, &source.source, source.record_count);
+        if let Some(error) = source.error {
+            entry_record_input_error(&mut outcome.entry, &source.source, &error);
+            outcome.errors.push(format!("MFT {}: {error}", source.source.display()));
+        }
+    }
+    emit(&format!("[+] {total} rows -> {relative}"));
+    if has_success {
+        Ok(vec![relative.to_string()])
+    } else {
+        std::fs::remove_file(out_dir.join(relative))?;
+        Ok(Vec::new())
+    }
+}
+
+fn parse_recyclebin_artifact(
+    paths: &[PathBuf],
+    out_dir: &Path,
+    outcome: &mut ArtifactOutcome,
+) -> Result<Vec<String>> {
+    entry_record_inputs(&mut outcome.entry, paths);
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    let relative = "RECYCLEBIN/RecycleBin_Records.sqlite";
+    let parsed = recyclebin::parse_recyclebin(
+        paths,
+        &out_dir.join(relative),
+        &recyclebin::RecycleBinContext {
+            volume_id: None,
+            accounts: crate::metadata::account_names_from_facts(out_dir)?,
+        },
+    )?;
+    for input in parsed.inputs {
+        entry_record_input_count(&mut outcome.entry, &input.path, input.rows);
+        if let Some(error) = input.error {
+            entry_record_input_error(&mut outcome.entry, &input.path, &error);
+            outcome.errors.push(format!("RecycleBin {}: {error}", input.path.display()));
+        }
+    }
+    emit(&format!("[+] {} rows -> {}", parsed.rows, relative));
+    Ok(vec![relative.to_string()])
 }
 
 fn parse_srum_artifact(
@@ -2150,7 +2226,7 @@ fn parse_artifact_sources(
         "EventLog" => parse_eventlog_artifact(paths, out_dir, &mut outcome.entry),
         "Registry" => parse_registry_artifact(paths, out_dir, outcome),
         "UsnJrnl" => parse_usnjrnl_artifact(paths, out_dir, &mut outcome.entry),
-        "MFT" => parse_mft_artifact(paths, out_dir, &mut outcome.entry),
+        "MFT" => parse_mft_artifact(paths, out_dir, outcome),
         "SRUM" => parse_srum_artifact(paths, out_dir, &mut outcome.entry),
         "JumpList" => parse_jumplist_artifact(paths, out_dir, &mut outcome.entry),
         "TaskScheduler" => parse_taskscheduler_artifact(paths, out_dir, &mut outcome.entry),
@@ -2164,6 +2240,7 @@ fn parse_artifact_sources(
         "WER" => parse_wer_artifact(paths, out_dir, &mut outcome.entry),
         "WmiRepository" => parse_wmi_repository_artifact(paths, out_dir, &mut outcome.entry),
         "Timeline" => parse_timeline_artifact(paths, out_dir, &mut outcome.entry),
+        "RecycleBin" => parse_recyclebin_artifact(paths, out_dir, outcome),
         other => anyhow::bail!("unknown artifact {other}"),
     }
 }
@@ -2188,6 +2265,7 @@ fn run_artifact_job(
     paths: &[PathBuf],
     discovery_errors: &[String],
     out_dir: &Path,
+    dataset_id: &str,
 ) -> ArtifactOutcome {
     let mut outcome = ArtifactOutcome::new(name);
     // 탐색 중 만난 접근·순회 실패는 이 아티팩트 보고서에 남는다 — 접근 불가
@@ -2204,7 +2282,14 @@ fn run_artifact_job(
     }
     emit(&format!("[시작] {}", name));
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        parse_artifact_sources(name, paths, out_dir, &mut outcome)
+        let outputs = parse_artifact_sources(name, paths, out_dir, &mut outcome)?;
+        for output in &outputs {
+            let path = out_dir.join(output);
+            if path.extension().is_some_and(|extension| extension == "sqlite") {
+                crate::derived::stamp_facts_generation(&path, dataset_id)?;
+            }
+        }
+        Ok::<_, anyhow::Error>(outputs)
     }));
     match result {
         Ok(Ok(outputs)) => {
@@ -2278,6 +2363,7 @@ pub fn run_host_with_log_id(
     CANCEL.store(false, Ordering::Relaxed);
     let started = std::time::Instant::now();
     let run_id = run_id.map(safe_run_id).unwrap_or_else(new_parse_run_id);
+    let dataset_id = uuid::Uuid::new_v4().to_string();
     let mut persistent_log =
         PersistentRunLog::begin(&live_dir, &run_id, case_id, host_id, only.as_ref());
     let mut report = ParseReport {
@@ -2388,15 +2474,18 @@ pub fn run_host_with_log_id(
     append_current_log_lifecycle("discovery_finished");
 
     // ---- 2단계: 아티팩트 병렬 파싱 — 각 아티팩트의 원본 데이터베이스 저장 ----
-    // BrowserHistory와 BrowserCache는 같은 BROWSER/<account>.sqlite 파일을
-    // 공유할 수 있어 한 체인 안에서 순서대로 실행한다(마지막 성공 기록이
-    // 남는 기존 규칙 유지). 나머지 아티팩트는 서로 독립적으로 병렬 실행된다.
+    // Serialize shared browser DB writes and registry-backed SID resolution.
     let mut chains: Vec<Vec<&'static str>> = Vec::new();
     for &name in &wanted {
-        if name == "BrowserCache" {
+        let prerequisite = match name {
+            "BrowserCache" => Some("BrowserHistory"),
+            "RecycleBin" => Some("Registry"),
+            _ => None,
+        };
+        if let Some(prerequisite) = prerequisite {
             if let Some(chain) = chains
                 .iter_mut()
-                .find(|chain| chain.contains(&"BrowserHistory"))
+                .find(|chain| chain.contains(&prerequisite))
             {
                 chain.push(name);
                 continue;
@@ -2424,7 +2513,7 @@ pub fn run_host_with_log_id(
                             .get(name)
                             .map(|found| (found.paths.as_slice(), found.errors.as_slice()))
                             .unwrap_or((&[], &[]));
-                        let outcome = run_artifact_job(name, paths, discovery_errors, &out_dir);
+                        let outcome = run_artifact_job(name, paths, discovery_errors, &out_dir, &dataset_id);
                         let mut collected = outcomes
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -2474,163 +2563,19 @@ pub fn run_host_with_log_id(
         append_current_log_lifecycle("overview_started");
         let ov = out_dir.join("_OVERVIEW");
         reset_stage_overview(&ov)?;
-        // TargetInfo, BAM execution history, and RegistryFindings all inspect
-        // the same recovered Registry SQLite rows.  Keep one in-memory cache
-        // for this overview pass only, preserving rowids/source identities.
-        let registry_overview = overview::RegistryOverviewCache::load(&out_dir);
-        // columns: 0건에도 스키마를 만들 고정 컬럼 목록. 모든 개요 테이블은
-        // 0건이어도 스키마와 함께 발행한다 — "해당 활동 없음"이 그 자체로
-        // 확인 가능한 정보로 남는다 (2026-08-31 사용자 확정, 통일).
-        // 스트리밍으로 쓰는 파생(write_ov 밖 경로)의 보고 항목 — report가
-        // write_ov 클로저에 이미 가변 차용돼 있어 별도 목록에 모았다가 합친다.
-        let mut extra_overview: Vec<OverviewTableReport> = Vec::new();
-        let mut write_ov = |name: &str, rows: Vec<Row>, columns: &[&str]| -> Result<()> {
-            let out = ov.join(format!("{}.sqlite", name));
-            write_table(&out, name, &rows, columns)?;
-            emit(&format!("[+] {} rows -> {}", rows.len(), out.display()));
-            report.overview.push(OverviewTableReport {
-                name: name.to_string(),
-                row_count: rows.len(),
-            });
-            Ok(())
-        };
-        let overview_result = (|| -> Result<()> {
-            // 이벤트 로그 행은 여러 빌더가 공유한다 — 한 번만 로드.
-            let events = overview::EventLogOverviewCache::load(&out_dir);
-            write_ov(
-                "ScheduledTasks",
-                overview::build_scheduled_tasks_with_events(&out_dir, &events),
-                overview::ST_KEYS,
-            )?;
-            write_ov("RdpCache", overview::build_rdp_cache(&out_dir), overview::RC_KEYS)?;
-            write_ov(
-                "Defender",
-                {
-                    let mut defender_rows = overview::build_defender_with_events(&events);
-                    // MPDetection-*.log의 DETECTION 라인 합류 (source=MPDetection).
-                    defender_rows.extend(overview::defender_from_mpdetection(&target));
-                    defender_rows
-                },
-                overview::DEF_KEYS,
-            )?;
-            write_ov(
-                "RemoteDesktopHistory",
-                overview::build_remote_desktop_history_with_events(&events),
-                overview::RDP_KEYS,
-            )?;
-            write_ov(
-                "SmbHistory",
-                overview::build_smb_history_with_events(&events),
-                overview::SMB_KEYS,
-            )?;
-            write_ov(
-                "BitsHistory",
-                overview::build_bits_history_with_events(&events),
-                overview::BITS_KEYS,
-            )?;
-            write_ov(
-                "ServiceHistory",
-                overview::build_service_history_with_events(&events),
-                overview::SVC_KEYS,
-            )?;
-            write_ov(
-                "FirewallHistory",
-                overview::build_firewall_history_with_events(&out_dir, &events),
-                overview::FW_KEYS,
-            )?;
-            write_ov(
-                "PowerShellHistory",
-                overview::build_powershell_history_with_events(&out_dir, &events),
-                overview::PS_KEYS,
-            )?;
-            write_ov(
-                "WerReports",
-                overview::build_wer_reports_with_events(&out_dir, &events),
-                overview::WER_OV_KEYS,
-            )?;
-            if let Err(error) = crate::sqlite::stamp_derived_version(
-                &ov.join("WerReports.sqlite"),
-                "WerReports",
-                overview::WER_REPORTS_DERIVED_VERSION,
-            ) {
-                emit(&format!("[!] WerReports 파생 버전 기록 실패: {error}"));
-            }
-            drop(events);
-            write_ov(
-                "BrowserActivity",
-                overview::build_browser_history(&out_dir),
-                overview::BH_KEYS,
-            )?;
-            write_ov(
-                "TargetInfo",
-                {
-                    let mut ti_rows =
-                        overview::build_target_info_with_registry(&registry_overview);
-                    // hosts 파일 수동 등록 항목 합류 (유효 엔트리 없으면 0행).
-                    ti_rows.extend(overview::ti_from_hosts_file(&target));
-                    ti_rows
-                },
-                overview::TI_KEYS,
-            )?;
-            write_ov(
-                "ExecutionHistory",
-                overview::build_execution_history_with_registry(&out_dir, &registry_overview),
-                overview::ROW_KEYS,
-            )?;
-            // 파생 생성 로직 버전을 산출물에 남긴다 — 뷰어의 호환 갱신이 구
-            // 저장본(컬럼은 같지만 편입 대상이 적던 버전)을 판별해 재생성한다.
-            if let Err(error) = crate::sqlite::stamp_derived_version(
-                &ov.join("ExecutionHistory.sqlite"),
-                "ExecutionHistory",
-                overview::EXECUTION_HISTORY_DERIVED_VERSION,
-            ) {
-                emit(&format!("[!] ExecutionHistory 파생 버전 기록 실패: {error}"));
-            }
-            write_ov(
-                "RegistryFindings",
-                overview::build_registry_findings_with_registry(&registry_overview),
-                overview::RF_KEYS,
-            )?;
-            write_ov(
-                "PathReferences",
-                overview::build_path_references(&out_dir, &registry_overview),
-                overview::PR_KEYS,
-            )?;
-            // AI 대화 — 지원 브라우저 캐시 facts 전량 판별(상한 없음). 원문
-            // JSON을 메모리에 모으지 않도록 스트리밍 기록하고, 표시 순서
-            // (관찰 시각 내림차순 + URL)는 저장 후 SQLite 정렬로 만든다.
-            // 뷰어는 이 파생 테이블만 기간·페이지 조건으로 조회한다.
-            {
-                let name = crate::ai_activity::AI_TABLE;
-                let out = ov.join(format!("{}.sqlite", name));
-                let mut writer = crate::sqlite::StreamWriter::create(
-                    &out,
-                    name,
-                    crate::ai_activity::AI_KEYS,
-                    crate::ai_activity::AI_KEYS,
-                )?;
-                crate::ai_activity::build_ai_conversations_stream(&out_dir, &mut |row| {
-                    writer.push(row)
-                })?;
-                let total = writer.finish()?;
-                if total > 0 {
-                    let conn = rusqlite::Connection::open(&out)?;
-                    let table = crate::sqlite::quote_ident(name);
-                    conn.execute_batch(&format!(
-                        "CREATE TABLE \"__wina_sorted\" AS SELECT * FROM {table} ORDER BY date DESC, url ASC;\n                         DROP TABLE {table};\n                         ALTER TABLE \"__wina_sorted\" RENAME TO {table};"
-                    ))?;
-                }
-                emit(&format!("[+] {} rows -> {}", total, out.display()));
-                extra_overview.push(OverviewTableReport {
-                    name: name.to_string(),
-                    row_count: total,
-                });
-            }
-            Ok(())
+        let overview_result = (|| {
+            let ancillary = crate::derived::prepare_ancillary_facts(&out_dir, &target, &dataset_id)?;
+            sealed_outputs.extend(seal_artifact_outputs(&out_dir, "Supplemental", &ancillary)?);
+            crate::derived::build_all(&out_dir, &target, host_id, &dataset_id)
         })();
-        report.overview.append(&mut extra_overview);
         match overview_result {
-            Ok(()) => append_current_log_lifecycle("overview_finished status=completed"),
+            Ok(tables) => {
+                for (name, row_count) in tables {
+                    emit(&format!("[+] {row_count} rows -> {}", ov.join(format!("{name}.sqlite")).display()));
+                    report.overview.push(OverviewTableReport { name, row_count });
+                }
+                append_current_log_lifecycle("overview_finished status=completed");
+            }
             Err(error) => {
                 had_error = true;
                 report.errors.push(format!("_OVERVIEW: {error}"));
@@ -2643,14 +2588,21 @@ pub fn run_host_with_log_id(
         // Seal the freshly-built correlation tables so a partial run (some raw
         // artifact failed) still publishes them through the per-file path. On a
         // clean run they publish with the rest of the staging tree instead.
-        let overview_outputs: Vec<String> = report
+        let mut overview_outputs: Vec<String> = report
             .overview
             .iter()
             .map(|table| format!("_OVERVIEW/{}.sqlite", table.name))
             .collect();
+        if !wanted.contains(&"MFT") && ov.join("MFT_Records.sqlite").is_file() {
+            overview_outputs.push("_OVERVIEW/MFT_Records.sqlite".to_string());
+        }
         match seal_artifact_outputs(&out_dir, "_OVERVIEW", &overview_outputs) {
             Ok(sealed) => sealed_outputs.extend(sealed),
-            Err(error) => emit(&format!("[!] _OVERVIEW seal failed: {error}")),
+            Err(error) => {
+                had_error = true;
+                report.errors.push(format!("_OVERVIEW seal: {error}"));
+                emit(&format!("[!] _OVERVIEW seal failed: {error}"));
+            }
         }
     } else {
         emit("=== 취소됨 — 종합 분석 건너뜀 ===");
@@ -2800,7 +2752,7 @@ mod persistent_log_tests {
     // These tests exercise the process-global worker log sink. The GUI runs
     // hosts in separate child processes, but unit tests share this process, so
     // serialize only this fixture to avoid cross-test log routing.
-    static PIPELINE_LOG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static PIPELINE_LOG_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
     fn temporary_directory(label: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -2811,6 +2763,67 @@ mod persistent_log_tests {
                 .unwrap_or_default()
                 .as_nanos(),
         ))
+    }
+
+    #[test]
+    fn failed_mft_inputs_leave_no_publishable_empty_database() {
+        let _serial = PIPELINE_LOG_TEST_LOCK.lock();
+        CANCEL.store(false, Ordering::Relaxed);
+        let root = temporary_directory("failed-mft-inputs");
+        std::fs::create_dir_all(&root).unwrap();
+        let sources = [root.join("first-MFT"), root.join("second-MFT")];
+        for source in &sources {
+            std::fs::write(source, b"not an MFT").unwrap();
+        }
+        let output = root.join("output");
+        let outcome = run_artifact_job("MFT", &sources, &[], &output, "fixture-generation");
+        assert_eq!(outcome.errors.len(), 2);
+        assert_eq!(outcome.entry.inputs.len(), 2);
+        assert!(outcome.entry.inputs.iter().all(|input| input.error.is_some()));
+        assert!(outcome.sealed.is_empty());
+        assert!(!output.join("_OVERVIEW/MFT_Records.sqlite").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recyclebin_retains_valid_metadata_when_another_input_is_corrupt() {
+        let _serial = PIPELINE_LOG_TEST_LOCK.lock();
+        CANCEL.store(false, Ordering::Relaxed);
+        let root = temporary_directory("recyclebin-inputs");
+        std::fs::create_dir_all(&root).unwrap();
+        let good = root.join("$Igood.txt");
+        let bad = root.join("$Ibad.txt");
+        let name: Vec<u16> = "C:\\temp\\file.txt\0".encode_utf16().collect();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&2u64.to_le_bytes());
+        bytes.extend_from_slice(&128u64.to_le_bytes());
+        bytes.extend_from_slice(&133000000000000000u64.to_le_bytes());
+        bytes.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        for value in name {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        std::fs::write(&good, bytes).unwrap();
+        std::fs::write(&bad, b"broken").unwrap();
+        let output = root.join("output");
+        let outcome = run_artifact_job("RecycleBin", &[good.clone(), bad.clone()], &[], &output, "fixture-generation");
+        assert!(!outcome.errors.is_empty());
+        assert_eq!(outcome.sealed.len(), 1);
+        let db = rusqlite::Connection::open(
+            output.join("RECYCLEBIN/RecycleBin_Records.sqlite"),
+        ).unwrap();
+        let record: (String, i64, i64) = db.query_row(
+            "SELECT original_path, file_size, r_exists FROM RecycleBin_Records WHERE _source_file=?1",
+            [good.to_string_lossy().as_ref()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        assert_eq!(record, ("C:\\temp\\file.txt".to_string(), 128, 0));
+        let failed: String = db.query_row(
+            "SELECT _status FROM RecycleBin_Records WHERE _source_file=?1",
+            [bad.to_string_lossy().as_ref()], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(failed, "corrupted");
+        drop(db);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// 대소문자를 구분하지 않는 파일시스템에서 케이스만 다른 산출물이 서로를
@@ -2889,7 +2902,7 @@ mod persistent_log_tests {
 
     #[test]
     fn run_log_is_append_only_and_marks_unfinished_runs() {
-        let _serial = PIPELINE_LOG_TEST_LOCK.lock().unwrap();
+        let _serial = PIPELINE_LOG_TEST_LOCK.lock();
         let root = temporary_directory("log-test");
         std::fs::create_dir_all(&root).unwrap();
         let run_id = "20260823_010203_004_00001";
@@ -3293,8 +3306,43 @@ mod persistent_log_tests {
     }
 
     #[test]
+    fn scoped_partial_run_preserves_retained_mft_facts_and_generation() {
+        let _serial = PIPELINE_LOG_TEST_LOCK.lock();
+        CANCEL.store(false, Ordering::Relaxed);
+        let root = temporary_directory("partial-retained-mft");
+        let cases = root.join("cases");
+        let target = root.join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("$IBROKEN.txt"), b"corrupt").unwrap();
+        let case = case_store::create_case("case", "2026-10-07 00:00:00", &cases).unwrap();
+        let host = case_store::create_host(&case.id, "host", &target.to_string_lossy(), "2026-10-07 00:00:00", &cases).unwrap();
+        let live = case_store::host_dir(&cases, &case.id, &host.id);
+        let mft_path = live.join("_OVERVIEW/MFT_Records.sqlite");
+        mft::parse_mft_sources(&[], &mft_path).unwrap();
+        let db = rusqlite::Connection::open(&mft_path).unwrap();
+        db.execute(
+            "INSERT INTO MFT_Records(volume_id, file_name, file_size, data, entry, seq, _source_file) VALUES ('volume', 'retained.txt', 0, X'', 42, 1, 'evidence-MFT')",
+            [],
+        ).unwrap();
+        drop(db);
+        crate::derived::stamp_facts_generation(&mft_path, "prior-generation").unwrap();
+        let only = HashSet::from(["RecycleBin".to_string()]);
+        assert!(run_host_with_log_id(&case.id, &host.id, &cases, Some(only), Some("partial-reparse")).is_err());
+        assert!(mft_path.is_file(), "retained facts must survive partial publication");
+        assert_eq!(crate::derived::facts_dataset_id(&mft_path).unwrap(), "prior-generation");
+        let db = rusqlite::Connection::open(live.join("_OVERVIEW/FileSystemEntries.sqlite")).unwrap();
+        let source: (String, i64) = db.query_row(
+            "SELECT source_dataset_id, source_rowid FROM source_records", [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(source, ("prior-generation".to_string(), 1));
+        drop(db);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn empty_selected_artifact_persists_no_input_in_terminal_report() {
-        let _serial = PIPELINE_LOG_TEST_LOCK.lock().unwrap();
+        let _serial = PIPELINE_LOG_TEST_LOCK.lock();
         let root = temporary_directory("no-input");
         let cases_dir = root.join("cases");
         let target_dir = root.join("target");
@@ -3333,7 +3381,7 @@ mod persistent_log_tests {
 
     #[test]
     fn corrupted_registry_and_srum_sources_are_skipped_and_run_completes() {
-        let _serial = PIPELINE_LOG_TEST_LOCK.lock().unwrap();
+        let _serial = PIPELINE_LOG_TEST_LOCK.lock();
         let root = temporary_directory("source-errors");
         let cases_dir = root.join("cases");
         let target_dir = root.join("target");

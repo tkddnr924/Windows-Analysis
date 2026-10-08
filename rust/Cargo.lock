@@ -1774,6 +1774,7 @@ version = "1.24.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2cefc03fd367c0c6d4305de1b312cf00248c4114f4a0418ce6a6af769e3b0bd9"
 dependencies = [
+ "getrandom 0.4.3",
  "js-sys",
  "wasm-bindgen",
 ]
@@ -1858,6 +1859,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "serde_json",
+ "uuid",
  "wina-core",
 ]
 
@@ -1879,6 +1881,7 @@ dependencies = [
  "mft",
  "nom",
  "notatin",
+ "parking_lot",
  "png",
  "prefetch-core",
  "rayon",
@@ -1886,6 +1889,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "uuid",
  "walkdir",
 ]
 

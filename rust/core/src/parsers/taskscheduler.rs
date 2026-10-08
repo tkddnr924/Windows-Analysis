@@ -22,6 +22,8 @@ pub const TASK_FIELD_ORDER: &[&str] = &[
     "actions",
     "trigger_types",
     "trigger_start",
+    "actions_json",
+    "triggers_json",
     "author",
     "description",
     "logon_type",
@@ -81,6 +83,43 @@ fn text(node: roxmltree::Node, name: &str) -> String {
         .unwrap_or("")
         .trim()
         .to_string()
+}
+
+/// 증거에 값이 없으면 JSON null. 빈 문자열("")을 만들어 내지 않는다.
+fn json_opt(s: &str) -> serde_json::Value {
+    if s.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::Value::String(s.to_string())
+    }
+}
+
+/// xs:boolean 텍스트 → true/false. 값이 없거나 해석 불가면 null.
+fn json_bool(s: &str) -> serde_json::Value {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" => serde_json::Value::Bool(true),
+        "false" | "0" => serde_json::Value::Bool(false),
+        _ => serde_json::Value::Null,
+    }
+}
+
+/// 액션/트리거 요소의 원본 XML 조각. roxmltree의 positions 기능이 주는 바이트
+/// 범위를 그대로 잘라 쓴다(범위를 쓸 수 없으면 표시용 조각으로 대체).
+fn node_raw(src: &str, node: roxmltree::Node, fallback: &str) -> String {
+    match src.get(node.range()) {
+        Some(s) => s.to_string(),
+        None => fallback.to_string(),
+    }
+}
+
+/// actions_json/triggers_json 직렬화 규칙:
+/// 부모 요소(Actions/Triggers)가 아예 없었으면 빈 문자열,
+/// 부모는 있는데 자식이 하나도 없었으면 "[]". 두 경우를 구분해 둔다.
+fn json_array(parent_present: bool, items: &[serde_json::Value]) -> String {
+    if !parent_present {
+        return String::new();
+    }
+    serde_json::to_string(items).unwrap_or_else(|_| "[]".to_string())
 }
 
 /// Decode a task file to a UTF-8 string (task XML is usually UTF-16LE w/ BOM).
@@ -146,33 +185,69 @@ fn parse_task(path: &Path) -> Result<Row> {
         logon_type = text(pr, "LogonType");
     }
 
+    // 표시용 조각(actions 컬럼)과 구조화 증거(actions_json)를 함께 만든다.
     let mut action_parts: Vec<String> = Vec::new();
+    let mut action_objs: Vec<serde_json::Value> = Vec::new();
     if let Some(ae) = actions_el {
         for act in ae.children().filter(|c| c.is_element()) {
-            match act.tag_name().name() {
+            let name = act.tag_name().name().to_string();
+            if name.is_empty() {
+                continue;
+            }
+            // frag = 기존 표시 문자열 조각(= raw 대체값), 나머지는 구조화 필드.
+            let (frag, command, arguments, workdir) = match name.as_str() {
                 "Exec" => {
                     let cmd = text(act, "Command");
                     let args = text(act, "Arguments");
-                    action_parts.push(format!("{} {}", cmd, args).trim().to_string());
+                    let wd = text(act, "WorkingDirectory");
+                    (format!("{} {}", cmd, args).trim().to_string(), cmd, args, wd)
                 }
-                "ComHandler" => action_parts.push(format!("COM:{}", text(act, "ClassId"))),
-                other if !other.is_empty() => action_parts.push(other.to_string()),
-                _ => {}
-            }
+                "ComHandler" => {
+                    let class_id = text(act, "ClassId");
+                    (
+                        format!("COM:{class_id}"),
+                        class_id,
+                        String::new(),
+                        String::new(),
+                    )
+                }
+                // Exec/ComHandler 외(SendEmail, ShowMessage…)는 요소 이름만 남는다.
+                _ => (name.clone(), String::new(), String::new(), String::new()),
+            };
+            action_parts.push(frag.clone());
+            action_objs.push(serde_json::json!({
+                "action_type": name,
+                "command": json_opt(&command),
+                "arguments": json_opt(&arguments),
+                "working_directory": json_opt(&workdir),
+                "raw": node_raw(content, act, &frag),
+            }));
         }
     }
 
     let mut trigger_types: Vec<String> = Vec::new();
     let mut trigger_start = String::new();
+    let mut trigger_objs: Vec<serde_json::Value> = Vec::new();
     if let Some(te) = triggers_el {
         for trig in te.children().filter(|c| c.is_element()) {
-            trigger_types.push(trig.tag_name().name().to_string());
-            if trigger_start.is_empty() {
-                let sb = text(trig, "StartBoundary");
-                if !sb.is_empty() {
-                    trigger_start = sb;
-                }
+            let name = trig.tag_name().name().to_string();
+            trigger_types.push(name.clone());
+            // trigger_start는 기존대로 "첫 StartBoundary"만 유지하고,
+            // 트리거별 경계/활성 여부는 triggers_json에 그대로 보존한다.
+            let sb = text(trig, "StartBoundary");
+            if trigger_start.is_empty() && !sb.is_empty() {
+                trigger_start = sb.clone();
             }
+            let eb = text(trig, "EndBoundary");
+            let en = text(trig, "Enabled");
+            let raw = node_raw(content, trig, &name);
+            trigger_objs.push(serde_json::json!({
+                "trigger_type": name,
+                "start_time": json_opt(&fmt_task_time(&sb)),
+                "end_time": json_opt(&fmt_task_time(&eb)),
+                "enabled": json_bool(&en),
+                "raw": raw,
+            }));
         }
     }
 
@@ -205,6 +280,14 @@ fn parse_task(path: &Path) -> Result<Row> {
     );
     row.insert("trigger_types".into(), trigger_types.join(", "));
     row.insert("trigger_start".into(), fmt_task_time(&trigger_start));
+    row.insert(
+        "actions_json".into(),
+        json_array(actions_el.is_some(), &action_objs),
+    );
+    row.insert(
+        "triggers_json".into(),
+        json_array(triggers_el.is_some(), &trigger_objs),
+    );
     row.insert("author".into(), author);
     row.insert("description".into(), description);
     row.insert("logon_type".into(), logon_type);
@@ -223,6 +306,9 @@ const JOB_FLAG_DISABLED: u32 = 0x4;
 const JOB_FLAG_HIDDEN: u32 = 0x200;
 const JOB_FIXED_LEN: usize = 0x44;
 const JOB_TRIGGER_LEN: usize = 48;
+// TASK_TRIGGER.rgFlags(오프셋 0x1C) — MS-TSCH에 문서화된 비트만 사용한다.
+const JOB_TRIGGER_FLAG_HAS_END_DATE: u32 = 0x1;
+const JOB_TRIGGER_FLAG_DISABLED: u32 = 0x4;
 
 fn job_u16(b: &[u8], off: usize) -> u16 {
     b.get(off..off + 2)
@@ -307,7 +393,7 @@ fn parse_job(path: &Path) -> Result<Row> {
     let app_off = job_u16(&b, 0x14) as usize;
     let (application, next) = job_lpstring(&b, app_off);
     let (parameters, next) = job_lpstring(&b, next);
-    let (_working_dir, next) = job_lpstring(&b, next);
+    let (working_dir, next) = job_lpstring(&b, next);
     let (author, next) = job_lpstring(&b, next);
     let (comment, _) = job_lpstring(&b, next);
 
@@ -316,20 +402,60 @@ fn parse_job(path: &Path) -> Result<Row> {
     let trig_count = job_u16(&b, trig_off) as usize;
     let mut trigger_types: Vec<String> = Vec::new();
     let mut trigger_start = String::new();
+    let mut trigger_objs: Vec<serde_json::Value> = Vec::new();
     for i in 0..trig_count.min(64) {
         let o = trig_off + 2 + i * JOB_TRIGGER_LEN;
         if o + JOB_TRIGGER_LEN > b.len() {
             break;
         }
-        trigger_types.push(job_trigger_name(job_u32(&b, o + 0x20)));
+        let name = job_trigger_name(job_u32(&b, o + 0x20));
+        trigger_types.push(name.clone());
+        let (by, bm, bd) = (job_u16(&b, o + 4), job_u16(&b, o + 6), job_u16(&b, o + 8));
+        let (sh, sm) = (job_u16(&b, o + 0x10), job_u16(&b, o + 0x12));
+        let start = if by != 0 {
+            format!("{by:04}-{bm:02}-{bd:02} {sh:02}:{sm:02}:00.000")
+        } else {
+            String::new()
+        };
         if trigger_start.is_empty() {
-            let (by, bm, bd) = (job_u16(&b, o + 4), job_u16(&b, o + 6), job_u16(&b, o + 8));
-            let (sh, sm) = (job_u16(&b, o + 0x10), job_u16(&b, o + 0x12));
-            if by != 0 {
-                trigger_start = format!("{by:04}-{bm:02}-{bd:02} {sh:02}:{sm:02}:00.000");
-            }
+            trigger_start = start.clone();
         }
+        // 종료일은 HAS_END_DATE 플래그가 선 경우에만 유효하다. 구조에 종료 '시각'
+        // 필드가 없으므로 날짜까지만 적고 시각을 지어내지 않는다.
+        let rg_flags = job_u32(&b, o + 0x1C);
+        let (ey, em, ed) = (
+            job_u16(&b, o + 0x0A),
+            job_u16(&b, o + 0x0C),
+            job_u16(&b, o + 0x0E),
+        );
+        let end = if rg_flags & JOB_TRIGGER_FLAG_HAS_END_DATE != 0 && ey != 0 {
+            format!("{ey:04}-{em:02}-{ed:02}")
+        } else {
+            String::new()
+        };
+        // raw: 48바이트 TASK_TRIGGER 레코드 원문(헥스). XML 경로의 원본 XML 조각에 대응.
+        let raw: String = b[o..o + JOB_TRIGGER_LEN]
+            .iter()
+            .map(|x| format!("{x:02X}"))
+            .collect();
+        trigger_objs.push(serde_json::json!({
+            "trigger_type": name,
+            "start_time": json_opt(&start),
+            "end_time": json_opt(&end),
+            "enabled": serde_json::Value::Bool(rg_flags & JOB_TRIGGER_FLAG_DISABLED == 0),
+            "raw": raw,
+        }));
     }
+
+    // .job은 액션이 항상 정확히 하나(AppName/Parameters/WorkingDirectory).
+    let action_display = format!("{} {}", application, parameters).trim().to_string();
+    let action_objs = vec![serde_json::json!({
+        "action_type": "Exec",
+        "command": json_opt(&application),
+        "arguments": json_opt(&parameters),
+        "working_directory": json_opt(&working_dir),
+        "raw": action_display.clone(),
+    })];
 
     let mut row = Row::new();
     row.insert("timestamp".into(), last_run);
@@ -355,12 +481,12 @@ fn parse_job(path: &Path) -> Result<Row> {
             "false".to_string()
         },
     );
-    row.insert(
-        "actions".into(),
-        format!("{} {}", application, parameters).trim().to_string(),
-    );
+    row.insert("actions".into(), action_display);
     row.insert("trigger_types".into(), trigger_types.join(", "));
     row.insert("trigger_start".into(), trigger_start);
+    // .job은 액션/트리거 구조가 항상 존재한다(트리거 0개면 "[]").
+    row.insert("actions_json".into(), json_array(true, &action_objs));
+    row.insert("triggers_json".into(), json_array(true, &trigger_objs));
     row.insert("author".into(), author);
     row.insert("description".into(), comment);
     row.insert("_source_file".into(), path.to_string_lossy().to_string());
@@ -569,6 +695,46 @@ mod job_tests {
     }
 
     #[test]
+    fn job_emits_structured_action_and_trigger_json() {
+        let dir = temp_dir("json");
+        let path = dir.join("At3.job");
+        std::fs::write(&path, synthetic_job(0, 2004)).unwrap();
+        let row = parse_job(&path).unwrap();
+
+        let acts: serde_json::Value =
+            serde_json::from_str(row.get("actions_json").unwrap()).unwrap();
+        assert_eq!(acts.as_array().unwrap().len(), 1);
+        assert_eq!(acts[0]["action_type"], "Exec");
+        assert_eq!(acts[0]["command"], "C:\\WINDOWS\\system32\\evil.exe");
+        assert_eq!(acts[0]["arguments"], "-run");
+        assert_eq!(acts[0]["working_directory"], "C:\\WINDOWS");
+        assert_eq!(acts[0]["raw"], "C:\\WINDOWS\\system32\\evil.exe -run");
+
+        let trigs: serde_json::Value =
+            serde_json::from_str(row.get("triggers_json").unwrap()).unwrap();
+        assert_eq!(trigs.as_array().unwrap().len(), 1);
+        assert_eq!(trigs[0]["trigger_type"], "AT_LOGON");
+        assert_eq!(trigs[0]["start_time"], "2004-07-15 09:30:00.000");
+        // HAS_END_DATE 플래그가 없으므로 종료일은 null.
+        assert!(trigs[0]["end_time"].is_null());
+        assert_eq!(trigs[0]["enabled"], true);
+        // raw = 48바이트 TASK_TRIGGER 헥스(cbTriggerSize=0x0030 선행).
+        assert_eq!(trigs[0]["raw"].as_str().unwrap().len(), JOB_TRIGGER_LEN * 2);
+        assert!(trigs[0]["raw"].as_str().unwrap().starts_with("3000"));
+
+        // 기존 표시 컬럼은 그대로.
+        assert_eq!(
+            row.get("actions").map(String::as_str),
+            Some("C:\\WINDOWS\\system32\\evil.exe -run")
+        );
+        assert_eq!(
+            row.get("trigger_start").map(String::as_str),
+            Some("2004-07-15 09:30:00.000")
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn disabled_hidden_flags_and_never_run() {
         let dir = temp_dir("flags");
         let path = dir.join("At2.job");
@@ -602,6 +768,148 @@ mod job_tests {
             rows[0].get("trigger_types").map(String::as_str),
             Some("AT_LOGON")
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod xml_tests {
+    use super::*;
+
+    fn temp_dir(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "wina-taskxml-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_task(dir: &Path, name: &str, xml: &str) -> std::path::PathBuf {
+        let p = dir.join(name);
+        std::fs::write(&p, xml).unwrap();
+        p
+    }
+
+    const TWO_EXEC_TWO_TRIGGERS: &str = r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Date>2024-01-02T03:04:05</Date>
+    <Author>attacker</Author>
+    <URI>\Microsoft\Windows\Evil\Pwn</URI>
+  </RegistrationInfo>
+  <Triggers>
+    <TimeTrigger>
+      <StartBoundary>2024-03-01T09:00:00</StartBoundary>
+      <EndBoundary>2024-03-02T10:00:00</EndBoundary>
+      <Enabled>true</Enabled>
+    </TimeTrigger>
+    <LogonTrigger>
+      <StartBoundary>2024-04-05T06:07:08</StartBoundary>
+      <Enabled>false</Enabled>
+    </LogonTrigger>
+  </Triggers>
+  <Actions Context="Author">
+    <Exec>
+      <Command>C:\Windows\System32\cmd.exe</Command>
+      <Arguments>/c whoami</Arguments>
+      <WorkingDirectory>C:\Temp</WorkingDirectory>
+    </Exec>
+    <Exec>
+      <Command>powershell.exe</Command>
+    </Exec>
+  </Actions>
+</Task>
+"#;
+
+    #[test]
+    fn xml_actions_and_triggers_json() {
+        let dir = temp_dir("pair");
+        let path = write_task(&dir, "Pwn", TWO_EXEC_TWO_TRIGGERS);
+        let row = parse_task(&path).unwrap();
+
+        // 기존 표시 컬럼은 값이 변하지 않아야 한다.
+        assert_eq!(
+            row.get("actions").map(String::as_str),
+            Some("C:\\Windows\\System32\\cmd.exe /c whoami | powershell.exe")
+        );
+        assert_eq!(
+            row.get("trigger_types").map(String::as_str),
+            Some("TimeTrigger, LogonTrigger")
+        );
+        assert_eq!(
+            row.get("trigger_start").map(String::as_str),
+            Some("2024-03-01 09:00:00.000")
+        );
+
+        let acts: serde_json::Value =
+            serde_json::from_str(row.get("actions_json").unwrap()).unwrap();
+        assert_eq!(acts.as_array().unwrap().len(), 2);
+        assert_eq!(acts[0]["action_type"], "Exec");
+        assert_eq!(acts[0]["command"], "C:\\Windows\\System32\\cmd.exe");
+        assert_eq!(acts[0]["arguments"], "/c whoami");
+        assert_eq!(acts[0]["working_directory"], "C:\\Temp");
+        assert!(acts[0]["raw"].as_str().unwrap().starts_with("<Exec>"));
+        assert!(acts[0]["raw"].as_str().unwrap().ends_with("</Exec>"));
+        assert_eq!(acts[1]["command"], "powershell.exe");
+        // 증거에 없는 값은 "" 가 아니라 null.
+        assert!(acts[1]["arguments"].is_null());
+        assert!(acts[1]["working_directory"].is_null());
+
+        let trigs: serde_json::Value =
+            serde_json::from_str(row.get("triggers_json").unwrap()).unwrap();
+        assert_eq!(trigs.as_array().unwrap().len(), 2);
+        assert_eq!(trigs[0]["trigger_type"], "TimeTrigger");
+        assert_eq!(trigs[0]["start_time"], "2024-03-01 09:00:00.000");
+        assert_eq!(trigs[0]["end_time"], "2024-03-02 10:00:00.000");
+        assert_eq!(trigs[0]["enabled"], true);
+        assert!(trigs[0]["raw"].as_str().unwrap().starts_with("<TimeTrigger>"));
+        // 두 번째 트리거의 고유한 StartBoundary가 보존된다(표시 컬럼은 첫 번째만 보관).
+        assert_eq!(trigs[1]["trigger_type"], "LogonTrigger");
+        assert_eq!(trigs[1]["start_time"], "2024-04-05 06:07:08.000");
+        assert!(trigs[1]["end_time"].is_null());
+        assert_eq!(trigs[1]["enabled"], false);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn com_handler_action_and_empty_vs_missing_arrays() {
+        let dir = temp_dir("empty");
+        // Actions는 있으나 자식이 없고, Triggers 요소 자체가 없는 태스크.
+        let xml = r#"<Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo><URI>\NoKids</URI></RegistrationInfo>
+  <Actions Context="Author"></Actions>
+</Task>"#;
+        let row = parse_task(&write_task(&dir, "NoKids", xml)).unwrap();
+        assert_eq!(row.get("actions_json").map(String::as_str), Some("[]"));
+        assert_eq!(row.get("triggers_json").map(String::as_str), Some(""));
+        assert_eq!(row.get("actions").map(String::as_str), Some(""));
+
+        let com = r#"<Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo><URI>\Com</URI></RegistrationInfo>
+  <Triggers></Triggers>
+  <Actions Context="Author">
+    <ComHandler>
+      <ClassId>{11111111-2222-3333-4444-555555555555}</ClassId>
+    </ComHandler>
+  </Actions>
+</Task>"#;
+        let row = parse_task(&write_task(&dir, "Com", com)).unwrap();
+        assert_eq!(
+            row.get("actions").map(String::as_str),
+            Some("COM:{11111111-2222-3333-4444-555555555555}")
+        );
+        assert_eq!(row.get("triggers_json").map(String::as_str), Some("[]"));
+        let acts: serde_json::Value =
+            serde_json::from_str(row.get("actions_json").unwrap()).unwrap();
+        assert_eq!(acts[0]["action_type"], "ComHandler");
+        assert_eq!(acts[0]["command"], "{11111111-2222-3333-4444-555555555555}");
+        assert!(acts[0]["arguments"].is_null());
+        assert!(acts[0]["working_directory"].is_null());
         let _ = std::fs::remove_dir_all(dir);
     }
 }

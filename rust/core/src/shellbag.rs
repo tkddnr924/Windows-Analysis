@@ -20,6 +20,8 @@ pub struct Shellbag {
     /// Display path with drive when known (e.g. `C:\Users\Administrator\Desktop`).
     pub display: String,
     pub account: String,
+    /// 이 폴더를 가리킨 BagMRU 값 행의 원본 연결 키(`<하이브>::Registry::<rowid>`).
+    pub record_key: String,
 }
 
 /// A BagMRU numbered value: the shell item naming child node `key_path\value_name`.
@@ -28,6 +30,8 @@ pub struct BagRow {
     pub value_name: String,
     pub data: Vec<u8>,
     pub account: String,
+    /// 이 값을 읽은 레지스트리 산출물 행의 record_key — 파생의 원본 연결용.
+    pub record_key: String,
 }
 
 enum Name {
@@ -173,11 +177,13 @@ pub fn reconstruct(rows: Vec<BagRow>) -> Vec<Shellbag> {
     let mut item: HashMap<String, Vec<u8>> = HashMap::new();
     let mut parent: HashMap<String, String> = HashMap::new();
     let mut account: HashMap<String, String> = HashMap::new();
+    let mut record_key: HashMap<String, String> = HashMap::new();
     for r in &rows {
         let node = lower(&format!("{}\\{}", r.key_path, r.value_name));
         parent.insert(node.clone(), lower(&r.key_path));
         item.insert(node.clone(), r.data.clone());
-        account.insert(node, r.account.clone());
+        account.insert(node.clone(), r.account.clone());
+        record_key.insert(node, r.record_key.clone());
     }
 
     let mut out = Vec::new();
@@ -233,6 +239,7 @@ pub fn reconstruct(rows: Vec<BagRow>) -> Vec<Shellbag> {
             path: rel.to_lowercase(),
             display,
             account: account.get(node).cloned().unwrap_or_default(),
+            record_key: record_key.get(node).cloned().unwrap_or_default(),
         });
     }
     // De-dup identical (path, account).

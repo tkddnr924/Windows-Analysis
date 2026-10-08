@@ -1,20 +1,19 @@
 "use client";
 import PaginationControls from "@/components/PaginationControls";
 
-import { useEffect, useId, useMemo, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import AddIcon from "@mui/icons-material/Add";
 import CancelOutlinedIcon from "@mui/icons-material/CancelOutlined";
 import DeleteOutlineIcon from "@mui/icons-material/DeleteOutlineOutlined";
-import DeselectIcon from "@mui/icons-material/Deselect";
+import DescriptionOutlinedIcon from "@mui/icons-material/DescriptionOutlined";
 import DnsOutlinedIcon from "@mui/icons-material/DnsOutlined";
 import ErrorOutlineIcon from "@mui/icons-material/ErrorOutlineOutlined";
 import EditOutlinedIcon from "@mui/icons-material/EditOutlined";
 import ExpandLessIcon from "@mui/icons-material/ExpandLess";
 import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
 import FolderOpenOutlinedIcon from "@mui/icons-material/FolderOpenOutlined";
-import MemoryOutlinedIcon from "@mui/icons-material/MemoryOutlined";
+import OpenInNewOutlinedIcon from "@mui/icons-material/OpenInNewOutlined";
 import PlayArrowIcon from "@mui/icons-material/PlayArrow";
-import SelectAllIcon from "@mui/icons-material/SelectAll";
 import TaskAltIcon from "@mui/icons-material/TaskAlt";
 import TimerOutlinedIcon from "@mui/icons-material/TimerOutlined";
 import VisibilityOutlinedIcon from "@mui/icons-material/VisibilityOutlined";
@@ -22,8 +21,8 @@ import { FaWindows } from "react-icons/fa";
 import CircularProgress from "@mui/material/CircularProgress";
 import type { Case, Host, ParseReport } from "@/lib/types";
 import { isHostReportSyncPending, selectVisibleHostReport, shouldLoadHostReport, type HostReportCacheEntry } from "@/lib/hostReportCache";
+import { allParseBlocked, canStartParse, parseBlockedLabel, type ParseEligibilityEntry } from "@/lib/parseEligibility";
 import type { PipelineRun, PipelineRunItem } from "@/lib/usePipelineRun";
-import { formatEvidenceTimestamp } from "@/lib/timeRange";
 import { useModalDialog } from "@/lib/useModalDialog";
 
 interface RunPipelineProps {
@@ -44,7 +43,7 @@ const primaryButtonStyle: React.CSSProperties = {
   color: "#eaf3ff",
   fontWeight: 600,
   border: "none",
-  borderRadius: "var(--radius-md)",
+  borderRadius: "var(--radius)",
   cursor: "pointer",
   fontSize: 12.5,
   whiteSpace: "nowrap",
@@ -59,7 +58,7 @@ const dangerButtonStyle: React.CSSProperties = {
   background: "var(--danger)",
   color: "#fff1ef",
   border: "none",
-  borderRadius: "var(--radius-md)",
+  borderRadius: "var(--radius)",
   cursor: "pointer",
   fontSize: 12.5,
   whiteSpace: "nowrap",
@@ -74,7 +73,7 @@ const neutralButtonStyle: React.CSSProperties = {
   background: "var(--bg-elevated)",
   color: "var(--text)",
   border: "1px solid var(--border)",
-  borderRadius: "var(--radius-md)",
+  borderRadius: "var(--radius)",
   cursor: "pointer",
   fontSize: 12.5,
   whiteSpace: "nowrap",
@@ -126,7 +125,7 @@ function StatusPill({ status }: { status: string | null }) {
 
 function statusPillStyle(color: string, _background: string): React.CSSProperties {
   // 라벨은 아웃라인 스타일 — 채움 배경 대신 색 테두리 + 투명 배경.
-  return { display: "inline-flex", alignItems: "center", justifyContent: "center", gap: 4, fontSize: 11, fontWeight: 600, color, background: "transparent", border: `1px solid color-mix(in srgb, ${color} 55%, transparent)`, padding: "2px 8px", borderRadius: "var(--radius-sm)", textAlign: "center" };
+  return { display: "inline-flex", alignItems: "center", justifyContent: "center", gap: 4, fontSize: 11, fontWeight: 600, color, background: "transparent", border: `1px solid color-mix(in srgb, ${color} 55%, transparent)`, padding: "2px 8px", borderRadius: "var(--radius)", textAlign: "center" };
 }
 
 function folderName(path: string): string {
@@ -185,26 +184,22 @@ function terminalStatusLabel(status: string): string {
   return "취소";
 }
 
-function RunLogDetail({ host, report, autoOpen = false }: { host: Host; report: ParseReport; autoOpen?: boolean }) {
-  const [open, setOpen] = useState(false);
+/** Mounted only while the stored log panel is open. */
+function RunLogDetail({ host, report }: { host: Host; report: ParseReport }) {
   const [text, setText] = useState<string | null>(null);
   const [truncated, setTruncated] = useState(false);
   const [loaded, setLoaded] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">("idle");
-  // 부모 패널이 열리며 마운트되는 경우엔 클릭 한 번으로 바로 로그를 보여준다.
-  useEffect(() => {
-    if (autoOpen && report.runId) void load();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  const [openError, setOpenError] = useState<string | null>(null);
+  const [opening, setOpening] = useState(false);
+  const runId = report.runId;
 
-  if (!report.runId) return null;
   async function load() {
-    setOpen(true);
+    if (!runId) return;
     setLoaded(false);
     setError(null);
     try {
-      const preview = await window.api.parseRunLog(host.dir, report.runId!);
+      const preview = await window.api.parseRunLog(host.dir, runId);
       setText(preview.text);
       setTruncated(preview.truncated);
       setLoaded(true);
@@ -212,66 +207,51 @@ function RunLogDetail({ host, report, autoOpen = false }: { host: Host; report: 
       setError(errorMessage(cause, "실행 로그를 불러오지 못했습니다."));
     }
   }
-  const copy = async () => {
-    if (!text) return;
+
+  useEffect(() => {
+    void load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [runId]);
+
+  if (!runId) return null;
+
+  async function openLogFile() {
+    setOpening(true);
+    setOpenError(null);
     try {
-      await navigator.clipboard.writeText(text);
-      setCopyState("copied");
-    } catch {
-      setCopyState("failed");
+      await window.api.openParseRunLog(host.dir, runId!);
+    } catch (cause) {
+      setOpenError(errorMessage(cause, "로그 파일을 열지 못했습니다."));
+    } finally {
+      setOpening(false);
     }
-  };
+  }
 
   return <div style={{ display: "grid", gap: 5, marginTop: 2 }}>
-    <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
-      {!autoOpen && <button className="nm-btn" type="button" aria-label={`${host.name} 실행 로그 ${open ? "닫기" : "보기"}`} onClick={open ? () => setOpen(false) : () => void load()} style={{ ...neutralButtonStyle, width: "fit-content", padding: "4px 8px", fontSize: 11.5 }}>{open ? "실행 로그 닫기" : "실행 로그 보기"}</button>}
-      {open && text && <button className="nm-btn" type="button" onClick={copy} style={{ ...neutralButtonStyle, width: "fit-content", padding: "4px 8px", fontSize: 11.5 }}>로그 복사</button>}
-    </div>
-    {copyState === "copied" && <span role="status">로그를 복사했습니다.</span>}
-    {copyState === "failed" && <span role="alert">로그 복사에 실패했습니다.</span>}
-    {open && !loaded && !error && <span role="status">로그를 불러오는 중…</span>}
+    {!loaded && !error && <span role="status" style={{ display: "inline-flex", alignItems: "center", gap: 6, color: "var(--text-faint)" }}><CircularProgress size={12} thickness={5} aria-hidden="true" />로그를 불러오는 중…</span>}
     {error && <span role="alert" style={{ color: "var(--danger)" }}>{error} <button type="button" onClick={() => void load()} style={linkButtonStyle}>다시 시도</button></span>}
-    {open && loaded && <pre aria-label={`${host.name} 실행 로그 내용`} style={{ maxHeight: 168, overflow: "auto", margin: 0, padding: "8px 10px", background: "var(--bg-input)", border: "1px solid var(--border-subtle)", borderRadius: "var(--radius-sm)", color: "var(--text-dim)", fontFamily: "var(--mono)", fontSize: 11, whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{text || "기록된 로그 행이 없습니다."}{truncated ? "\n\n… 앞부분 24KB만 표시합니다." : ""}</pre>}
+    {loaded && <pre aria-label={`${host.name} 실행 로그 내용`} style={{ maxHeight: 168, overflow: "auto", margin: 0, padding: "8px 10px", background: "var(--bg-input)", border: "1px solid var(--border-subtle)", borderRadius: "var(--radius)", color: "var(--text-dim)", fontFamily: "var(--mono)", fontSize: 11, whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{text || "기록된 로그 행이 없습니다."}{truncated ? "\n\n… 앞부분 24KB만 표시합니다." : ""}</pre>}
+    <button className="nm-btn" type="button" onClick={() => void openLogFile()} disabled={opening} aria-label={`${host.name} 실행 로그 파일 열기`} style={{ ...neutralButtonStyle, width: "fit-content", padding: "4px 10px", fontSize: 11.5, opacity: opening ? .5 : 1 }}><OpenInNewOutlinedIcon sx={{ fontSize: 15 }} />로그보기</button>
+    {openError && <span role="alert" style={{ color: "var(--danger)" }}>{openError}</span>}
   </div>;
 }
 
-function RunOutcomeSummary({
-  host,
-  report,
-  onRetryMft,
-}: {
-  host: Host;
-  report?: ParseReport;
-  onRetryMft?: () => void;
-}) {
-  const duration = host.lastRunDurationSecs ?? 0;
-  const terminalStatus = report?.status ?? host.lastRunStatus;
-  const failed = terminalStatus === "error";
-  const partial = terminalStatus === "partial";
-  const cancelled = terminalStatus === "cancelled";
-  const mft = report?.artifacts.find((artifact) => artifact.name === "MFT");
-  // 정상 완료 실행도 로그를 볼 수 있어야 한다 — 항상 렌더.
-  const retryMft = report?.status === "partial" && report.artifacts.some((artifact) => artifact.name === "MFT" && artifact.status === "failed");
-  const summaryColor = failed ? "var(--danger)" : partial ? "var(--warning)" : cancelled ? "var(--text-dim)" : "var(--success)";
-  // 오류 원문은 여기에 표기하지 않는다 — 세부 내용은 실행 로그로 확인한다.
-  return <RunOutcomeSummaryBody summaryColor={summaryColor} duration={duration} mft={mft} host={host} report={report} retryMft={retryMft} onRetryMft={onRetryMft} />;
-}
-
-function RunOutcomeSummaryBody({ summaryColor, duration, mft, host, report, retryMft, onRetryMft }: { summaryColor: string; duration: number; mft?: { status: string }; host: Host; report?: ParseReport; retryMft: boolean; onRetryMft?: () => void }) {
-  const [open, setOpen] = useState(false);
-  return <div style={{ margin: "2px 0 0", fontSize: 12 }}>
-    <button type="button" className="nm-btn" aria-expanded={open} onClick={() => setOpen((value) => !value)} style={{ cursor: "pointer", width: "fit-content", display: "inline-flex", alignItems: "center", gap: 7, padding: "3px 11px", minHeight: 26, background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", color: "var(--text-dim)", fontSize: 11.5, fontWeight: 600, whiteSpace: "nowrap" }}>
-      <span aria-hidden="true" style={{ width: 7, height: 7, borderRadius: "50%", background: summaryColor }} />
-      실행 로그
-      <span style={{ color: "var(--text-faint)", fontWeight: 500 }}>총 소요 {formatDuration(duration)}</span>
-    </button>
-    {open && <div style={{ display: "grid", gap: 6, marginTop: 8, padding: "10px 12px", color: "var(--text-dim)", border: "1px solid var(--border)", borderLeft: `3px solid ${summaryColor}`, borderRadius: "var(--radius-md)", background: "var(--bg)" }}>
-      {mft?.status === "no_input" && <span>MFT: 원본 $MFT 파일 미수집 · 이번 실행에서는 결과를 만들지 않았습니다.</span>}
-      {mft?.status === "failed" && <span>MFT: 파싱 실패 · MFT 결과는 공개되지 않았습니다.</span>}
-      {report && <RunLogDetail host={host} report={report} autoOpen />}
-      {retryMft && onRetryMft && <button className="nm-btn" type="button" onClick={onRetryMft} style={{ ...neutralButtonStyle, width: "fit-content", padding: "4px 8px", fontSize: 11.5 }}>MFT만 재시도</button>}
-      {!report && <span>세부 보고서를 불러오는 중이거나 이전 실행에는 구조화된 보고서가 없습니다.</span>}
-    </div>}
+function RunLogPanel({ id, host, report, onRetryMft }: { id: string; host: Host; report: ParseReport; onRetryMft?: () => void }) {
+  const terminalStatus = report.status ?? host.lastRunStatus;
+  const summaryColor = terminalStatus === "error"
+    ? "var(--danger)"
+    : terminalStatus === "partial"
+      ? "var(--warning)"
+      : terminalStatus === "cancelled" ? "var(--text-dim)" : "var(--success)";
+  const mft = report.artifacts.find((artifact) => artifact.name === "MFT");
+  const retryMft = report.status === "partial" && report.artifacts.some((artifact) => artifact.name === "MFT" && artifact.status === "failed");
+  // 오류 원문은 여기 요약하지 않는다 — 세부 내용은 아래 실행 로그 본문으로 본다.
+  return <div id={id} style={{ display: "grid", gap: 6, marginTop: 2, padding: "10px 12px", color: "var(--text-dim)", border: "1px solid var(--border)", borderLeft: `3px solid ${summaryColor}`, borderRadius: "var(--radius)", background: "var(--bg)", fontSize: 12 }}>
+    <span style={{ color: "var(--text-faint)" }}>총 소요 {formatDuration(host.lastRunDurationSecs ?? 0)}</span>
+    {mft?.status === "no_input" && <span>MFT: 원본 $MFT 파일 미수집 · 이번 실행에서는 결과를 만들지 않았습니다.</span>}
+    {mft?.status === "failed" && <span>MFT: 파싱 실패 · MFT 결과는 공개되지 않았습니다.</span>}
+    <RunLogDetail host={host} report={report} />
+    {retryMft && onRetryMft && <button className="nm-btn" type="button" onClick={onRetryMft} style={{ ...neutralButtonStyle, width: "fit-content", padding: "4px 10px", fontSize: 11.5 }}>MFT만 재시도</button>}
   </div>;
 }
 
@@ -298,7 +278,7 @@ function RenameHostDialog({
       <h2 id={titleId} style={{ margin: "0 0 6px", fontSize: 15 }}>호스트 이름 변경</h2>
       <p style={{ margin: "0 0 14px", color: "var(--text-dim)", fontSize: 12.5 }}>표시 이름만 바뀝니다. 수집 원본, 결과, 북마크 경로는 변경되지 않습니다.</p>
       <label style={{ display: "grid", gap: 6, fontSize: 12, color: "var(--text-dim)" }}>호스트 이름
-        <input data-dialog-autofocus value={value} onChange={(event) => onChange(event.target.value)} disabled={saving} style={{ padding: "8px 10px", background: "var(--bg-input)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", color: "var(--text)" }} />
+        <input data-dialog-autofocus value={value} onChange={(event) => onChange(event.target.value)} disabled={saving} style={{ padding: "8px 10px", background: "var(--bg-input)", border: "1px solid var(--border)", borderRadius: "var(--radius)", color: "var(--text)" }} />
       </label>
       {error && <div role="alert" style={{ marginTop: 9, color: "var(--danger)", fontSize: 12 }}>{error}</div>}
         <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 16 }}>
@@ -308,6 +288,46 @@ function RenameHostDialog({
       </form>
     </div>
   </div>;
+}
+
+function DeleteHostDialog({
+  host,
+  deleting,
+  error,
+  onClose,
+  onConfirm,
+}: {
+  host: Host;
+  deleting: boolean;
+  error: string | null;
+  onClose: () => void;
+  onConfirm: () => void;
+}) {
+  const titleId = useId();
+  const descriptionId = useId();
+  const dialogRef = useModalDialog(onClose);
+  return <div onClick={onClose} style={{ position: "fixed", inset: 0, zIndex: 1400, display: "grid", placeItems: "center", padding: 18, background: "rgba(0, 0, 0, 0.46)" }}>
+    <div ref={dialogRef} role="dialog" aria-modal="true" aria-labelledby={titleId} aria-describedby={descriptionId} tabIndex={-1} onClick={(event) => event.stopPropagation()} className="dfir-surface" style={{ width: "min(420px, 100%)", padding: 18 }}>
+      <h2 id={titleId} style={{ margin: "0 0 6px", fontSize: 15 }}>정말 삭제하시겠습니까?</h2>
+      <p id={descriptionId} style={{ margin: "0 0 14px", color: "var(--text-dim)", fontSize: 12.5 }}>{host.name}의 분석 결과와 이 호스트 북마크를 삭제합니다. 원본 수집 데이터는 그대로 둡니다.</p>
+      {error && <div role="alert" style={{ margin: "0 0 9px", color: "var(--danger)", fontSize: 12 }}>{error}</div>}
+      <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 16 }}>
+        {/* 파괴적 동작이므로 최초 포커스는 취소에 둔다 — Enter 오입력이 삭제가 되지 않게. */}
+        <button data-dialog-autofocus className="nm-btn" type="button" onClick={onClose} disabled={deleting} style={{ ...neutralButtonStyle, opacity: deleting ? .5 : 1 }}>취소</button>
+        <button className="nm-btn" type="button" onClick={onConfirm} disabled={deleting} style={{ ...dangerButtonStyle, opacity: deleting ? .5 : 1 }}><DeleteOutlineIcon sx={{ fontSize: 16 }} />{deleting ? "삭제 중" : "삭제"}</button>
+      </div>
+    </div>
+  </div>;
+}
+
+/** Failed checks never grant permission to parse. */
+async function checkHostEligibility(caseId: string, hostId: string): Promise<ParseEligibilityEntry> {
+  try {
+    const verdict = await window.api.hostParseEligibility(caseId, hostId);
+    return { status: "ready", canParse: verdict.canParse, reason: verdict.reason };
+  } catch (error) {
+    return { status: "error", message: errorMessage(error, "새 데이터 여부를 확인하지 못했습니다.") };
+  }
 }
 
 export default function RunPipeline({ activeCase, onChanged, onOpenHost, run }: RunPipelineProps) {
@@ -321,10 +341,11 @@ export default function RunPipeline({ activeCase, onChanged, onOpenHost, run }: 
   const [artifacts, setArtifacts] = useState<string[]>([]);
   const [artifactLoading, setArtifactLoading] = useState(true);
   const [artifactLoadAttempt, setArtifactLoadAttempt] = useState(0);
-  const [selectedArtifacts, setSelectedArtifacts] = useState<Set<string>>(new Set());
-  const [artifactControlsExpanded, setArtifactControlsExpanded] = useState(false);
   const [artifactError, setArtifactError] = useState<string | null>(null);
-  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  const [eligibility, setEligibility] = useState<Record<string, ParseEligibilityEntry | undefined>>({});
+  const [eligibilityAttempt, setEligibilityAttempt] = useState(0);
+  const [runAllChecking, setRunAllChecking] = useState(false);
+  const [deleteTarget, setDeleteTarget] = useState<Host | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [hostQuery, setHostQuery] = useState("");
@@ -335,9 +356,9 @@ export default function RunPipeline({ activeCase, onChanged, onOpenHost, run }: 
   const [renameError, setRenameError] = useState<string | null>(null);
   const [reportsByHost, setReportsByHost] = useState<Record<string, HostReportCacheEntry<ParseReport>>>({});
 
-  // The parse state (runningHostId, logs, progress, …) lives in the `run` hook
-  // hoisted to Home so it survives navigating away mid-parse.
-  const { runningHostId, runningArtifacts, runs } = run;
+  // The parse state (logs, progress, queue, …) lives in the `run` hook hoisted
+  // to Home so it survives navigating away mid-parse.
+  const { runs } = run;
   const hasActiveRuns = runs.some((entry) => entry.status === "queued" || entry.status === "running");
   const runsByHost = useMemo(() => new Map(hosts.map((host) => [host.id, activeRunForHost(runs, host.id)])), [hosts, runs]);
   const terminalRunsByHost = useMemo(() => new Map(hosts.map((host) => [host.id, terminalRunForHost(runs, host.id)])), [hosts, runs]);
@@ -349,7 +370,6 @@ export default function RunPipeline({ activeCase, onChanged, onOpenHost, run }: 
     window.api.listArtifacts().then((names) => {
       if (cancelled) return;
       setArtifacts(names);
-      setSelectedArtifacts(new Set(names));
       setArtifactLoading(false);
     }).catch((error) => {
       if (!cancelled) {
@@ -413,6 +433,39 @@ export default function RunPipeline({ activeCase, onChanged, onOpenHost, run }: 
     return () => { cancelled = true; };
   }, [reportsByHost, runs, visibleHostRunStamp]);
 
+  // Evidence may change while the window is inactive.
+  useEffect(() => {
+    const recheck = () => setEligibilityAttempt((attempt) => attempt + 1);
+    const recheckIfVisible = () => { if (!document.hidden) recheck(); };
+    window.addEventListener("focus", recheck);
+    document.addEventListener("visibilitychange", recheckIfVisible);
+    return () => {
+      window.removeEventListener("focus", recheck);
+      document.removeEventListener("visibilitychange", recheckIfVisible);
+    };
+  }, []);
+
+  // Coalesce lifecycle/focus changes and discard stale verdicts.
+  useEffect(() => {
+    const hostIds = visibleHosts.map((host) => host.id);
+    if (!hostIds.length) return;
+    let cancelled = false;
+    setEligibility((previous) => {
+      const next = { ...previous };
+      for (const hostId of hostIds) next[hostId] = { status: "checking" };
+      return next;
+    });
+    const timer = window.setTimeout(() => {
+      void Promise.all(hostIds.map(async (hostId) =>
+        [hostId, await checkHostEligibility(activeCase.id, hostId)] as const
+      )).then((entries) => {
+        if (!cancelled) setEligibility((previous) => ({ ...previous, ...Object.fromEntries(entries) }));
+      });
+    }, 100);
+    return () => { cancelled = true; window.clearTimeout(timer); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeCase.id, eligibilityAttempt, visibleHostRunStamp]);
+
   async function pickTarget() {
     setFormError(null);
     try {
@@ -442,18 +495,10 @@ export default function RunPipeline({ activeCase, onChanged, onOpenHost, run }: 
     }
   }
 
-  function toggleArtifact(name: string) {
-    setSelectedArtifacts((prev) => {
-      const next = new Set(prev);
-      if (next.has(name)) next.delete(name);
-      else next.add(name);
-      return next;
-    });
-  }
-
   function handleRun(hostId: string) {
-    const host = hosts.find((h) => h.id === hostId);
-    const only = selectedArtifacts.size === artifacts.length ? undefined : Array.from(selectedArtifacts);
+    const host = hosts.find((item) => item.id === hostId);
+    // Full parsing requires a positive eligibility verdict.
+    if (!host || hasActiveRuns || artifacts.length === 0 || !canStartParse(eligibility[hostId])) return;
     setReportsByHost((previous) => {
       const next = { ...previous };
       delete next[hostId];
@@ -461,9 +506,10 @@ export default function RunPipeline({ activeCase, onChanged, onOpenHost, run }: 
     });
     // run.start awaits the child process and refreshes the case list (Home's
     // onDone) on completion — so the host list here updates without onChanged.
-    run.start({ caseId: activeCase.id, hostId, hostName: host?.name ?? "", only, totalArtifacts: artifacts.length });
+    run.start({ caseId: activeCase.id, hostId, hostName: host.name, totalArtifacts: artifacts.length });
   }
 
+  // Preserve the existing explicit MFT-only retry.
   function handleRetryMft(hostId: string) {
     const host = hosts.find((item) => item.id === hostId);
     if (!host) return;
@@ -523,15 +569,34 @@ export default function RunPipeline({ activeCase, onChanged, onOpenHost, run }: 
 
   // Submit all runs. The backend owns the max-2 scheduling and the immutable
   // run ids, so this component cannot advance a hidden local queue on unmount.
+  // Bulk parsing must not bypass individual eligibility.
   async function handleRunAll() {
-    const only = selectedArtifacts.size === artifacts.length ? undefined : Array.from(selectedArtifacts);
-    await Promise.all(hosts.map((h) => run.start({
+    if (hasActiveRuns || artifacts.length === 0 || runAllChecking) return;
+    setRunAllChecking(true);
+    setActionError(null);
+    const checked = await Promise.all(hosts.map(async (host) => [host.id, await checkHostEligibility(activeCase.id, host.id)] as const));
+    setRunAllChecking(false);
+    setEligibility((previous) => ({ ...previous, ...Object.fromEntries(checked) }));
+    const startable = checked.filter(([, entry]) => canStartParse(entry)).map(([hostId]) => hostId);
+    const unchecked = checked.filter(([, entry]) => entry.status === "error").length;
+    if (!startable.length) {
+      setActionError(unchecked
+        ? `${unchecked.toLocaleString()}개 호스트의 새 데이터 여부를 확인하지 못해 전체 파싱을 시작하지 않았습니다.`
+        : "새로 추가된 데이터가 있는 호스트가 없어 전체 파싱을 시작하지 않았습니다.");
+      return;
+    }
+    if (unchecked) setActionError(`${unchecked.toLocaleString()}개 호스트는 새 데이터 여부를 확인하지 못해 제외했습니다.`);
+    await Promise.all(startable.map((hostId) => run.start({
       caseId: activeCase.id,
-      hostId: h.id,
-      hostName: h.name,
-      only,
+      hostId,
+      hostName: hosts.find((host) => host.id === hostId)?.name ?? "",
       totalArtifacts: artifacts.length,
     })));
+  }
+
+  function openDeleteConfirm(host: Host) {
+    setActionError(null);
+    setDeleteTarget(host);
   }
 
   async function handleDelete(hostId: string) {
@@ -539,21 +604,29 @@ export default function RunPipeline({ activeCase, onChanged, onOpenHost, run }: 
     setActionError(null);
     try {
       await window.api.deleteHost(activeCase.id, hostId);
+      setDeleteTarget(null);
       onChanged();
     } catch (error) {
       setActionError(errorMessage(error, "호스트를 삭제하지 못했습니다."));
     } finally {
       setDeleting(false);
-      setConfirmDeleteId(null);
     }
   }
+
+  // Artifact names provide the progress denominator, not a selection UI.
+  const artifactsReady = !artifactLoading && !artifactError && artifacts.length > 0;
+  const allParseDisabled = !artifactsReady || runAllChecking || allParseBlocked(hosts.map((host) => host.id), eligibility);
+  const allParseHint = !artifactsReady
+    ? "실행할 아티팩트 목록을 확인하지 못해 파싱을 시작할 수 없습니다."
+    : runAllChecking
+      ? "새 데이터 여부를 확인하는 중입니다."
+      : undefined;
 
   return (
     <div className="dfir-view" style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", padding: "18px 20px", gap: 12, overflow: "hidden", width: "100%" }}>
       <header style={{ display: "flex", alignItems: "center", gap: 9, minHeight: 30, flexShrink: 0 }}>
         <FaWindows size={17} style={{ color: "var(--accent)", flexShrink: 0 }} aria-hidden="true" />
         <strong className="dfir-page-title" style={{ fontSize: 17 }}>호스트 등록</strong>
-        <span style={{ display: "inline-flex", alignItems: "center", gap: 4, marginLeft: "auto", color: "var(--text-dim)", fontSize: 12 }}><DnsOutlinedIcon sx={{ fontSize: 16 }} />{hosts.length.toLocaleString()}개 등록됨</span>
       </header>
 
       {/* add host */}
@@ -565,9 +638,9 @@ export default function RunPipeline({ activeCase, onChanged, onOpenHost, run }: 
             placeholder="호스트 이름 (예: WEB-01)"
             value={newHostName}
             onChange={(e) => setNewHostName(e.target.value)}
-            style={{ padding: "7px 10px", background: "var(--bg-input)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", color: "var(--text)", minWidth: 180 }}
+            style={{ padding: "7px 10px", background: "var(--bg-input)", border: "1px solid var(--border)", borderRadius: "var(--radius)", color: "var(--text)", minWidth: 180 }}
           />
-          <button type="button" className="nm-btn" onClick={pickTarget} style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", gap: 5, padding: "7px 12px", background: "var(--bg-elevated)", color: "var(--text)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", cursor: "pointer" }}>
+          <button type="button" className="nm-btn" onClick={pickTarget} style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", gap: 5, padding: "7px 12px", background: "var(--bg-elevated)", color: "var(--text)", border: "1px solid var(--border)", borderRadius: "var(--radius)", cursor: "pointer" }}>
             <FolderOpenOutlinedIcon sx={{ fontSize: 16 }} />수집 데이터 폴더
           </button>
           <span style={{ fontSize: 12, color: "var(--text-dim)", maxWidth: 340, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={newHostTarget ?? ""}>
@@ -585,38 +658,19 @@ export default function RunPipeline({ activeCase, onChanged, onOpenHost, run }: 
         {formError && <div role="alert" style={{ marginTop: 9, color: "var(--danger)", fontSize: 12 }}>{formError}</div>}
       </section>
 
-      {/* artifact selection */}
-      <section className="dfir-surface" aria-labelledby="artifact-select-title" style={{ padding: "12px 14px", flexShrink: 0 }}>
-        <div style={{ fontSize: 13, display: "flex", alignItems: "center" }}>
-          <span id="artifact-select-title" style={{ fontWeight: 700 }}>실행할 아티팩트</span>
-          {!artifactLoading && <span className="dfir-tag" style={{ marginLeft: 4, display: "inline-flex", alignItems: "center", gap: 4 }}><MemoryOutlinedIcon sx={{ fontSize: 14 }} />{selectedArtifacts.size}/{artifacts.length}</span>}
-          {artifactLoading ? <span role="status" style={{ display: "inline-flex", alignItems: "center", gap: 6, marginLeft: 8, color: "var(--text-faint)", fontSize: 11.5 }}><CircularProgress size={13} thickness={5} />아티팩트 목록 확인 중</span> : <button type="button" onClick={() => setArtifactControlsExpanded((expanded) => !expanded)} aria-expanded={artifactControlsExpanded} aria-controls="artifact-selection-options" style={{ ...linkButtonStyle, marginLeft: "auto" }}>{artifactControlsExpanded ? <ExpandLessIcon sx={{ fontSize: 15 }} /> : <ExpandMoreIcon sx={{ fontSize: 15 }} />}{artifactControlsExpanded ? "접기" : "선택 변경"}</button>}
-        </div>
-        {artifactControlsExpanded && artifacts.length > 0 && <>
-          <div style={{ fontSize: 13, marginTop: 10, marginBottom: 10, display: "flex", alignItems: "center" }}>
-            <button type="button" className="nm-btn" onClick={() => setSelectedArtifacts(new Set(artifacts))} disabled={hasActiveRuns} style={{ ...linkButtonStyle, background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", padding: "3px 9px", justifyContent: "center", opacity: hasActiveRuns ? 0.5 : 1 }}><SelectAllIcon sx={{ fontSize: 14 }} />전체 선택</button>
-            <button type="button" className="nm-btn" onClick={() => setSelectedArtifacts(new Set())} disabled={hasActiveRuns} style={{ ...linkButtonStyle, background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", padding: "3px 9px", justifyContent: "center", opacity: hasActiveRuns ? 0.5 : 1 }}><DeselectIcon sx={{ fontSize: 14 }} />전체 해제</button>
-          </div>
-          <div id="artifact-selection-options" style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(130px, 1fr))", gap: 8, maxHeight: 260, overflow: "auto", paddingRight: 4 }}>{artifacts.map((name) => {
-            const isCurrent = runningArtifacts.includes(name);
-            const checked = selectedArtifacts.has(name);
-            return <button key={name} type="button" aria-pressed={checked} onClick={() => toggleArtifact(name)} disabled={hasActiveRuns} style={{ display: "flex", alignItems: "center", justifyContent: "center", minWidth: 0, padding: "7px 12px", border: `1px solid ${isCurrent || checked ? "color-mix(in srgb, var(--accent) 58%, var(--border))" : "var(--border-subtle)"}`, borderRadius: "var(--radius-md)", fontSize: 12.5, cursor: hasActiveRuns ? "default" : "pointer", background: isCurrent ? "color-mix(in srgb, var(--accent) 20%, var(--bg-elevated))" : checked ? "var(--accent-subtle)" : "color-mix(in srgb, var(--bg-input) 72%, var(--bg))", color: checked ? "var(--accent)" : "var(--text-faint)", fontWeight: checked ? 650 : 500, textAlign: "center", opacity: hasActiveRuns && !isCurrent ? .62 : 1 }}>{name}</button>;
-          })}</div>
-        </>}
-        {!artifactLoading && !artifactError && artifacts.length === 0 && <div role="status" style={{ marginTop: 8, color: "var(--warning)", fontSize: 12 }}>실행 가능한 아티팩트가 없습니다. 파싱을 시작할 수 없습니다.</div>}
-        {artifactError && <div role="alert" style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 9, color: "var(--danger)", fontSize: 12 }}>{artifactError}<button type="button" onClick={() => setArtifactLoadAttempt((attempt) => attempt + 1)} style={{ ...linkButtonStyle, marginLeft: 0 }}>다시 시도</button></div>}
-      </section>
-
       {/* Host ledger is intentionally the only independently scrolling region. */}
       <section aria-labelledby="host-ledger-title" style={{ flex: "1 1 0", minHeight: 0, display: "flex", flexDirection: "column", overflow: "hidden", containerType: "inline-size" }}>
         <div className="host-ledger-toolbar" style={{ display: "flex", alignItems: "center", gap: 9, padding: "10px 2px", flexShrink: 0 }}>
           <h2 id="host-ledger-title" style={{ margin: 0, fontSize: 13.5 }}>등록 호스트</h2>
           <span style={{ color: "var(--text-faint)", fontSize: 11.5 }}>{filteredHosts.length.toLocaleString()}개 표시</span>
           {runs.some((entry) => entry.status === "queued" || entry.status === "running") && <span aria-live="polite" style={{ display: "inline-flex", alignItems: "center", gap: 5, color: "var(--text-dim)", fontSize: 11.5, whiteSpace: "nowrap" }}><CircularProgress size={13} thickness={5} />{runs.filter((entry) => entry.status === "running").length}개 실행 · {runs.filter((entry) => entry.status === "queued").length}개 대기</span>}
-          <input className="host-ledger-search" aria-label="호스트 또는 증거 경로 검색" value={hostQuery} onChange={(event) => { setHostQuery(event.target.value); setHostPage(0); }} placeholder="호스트·증거 경로 검색" style={{ width: 230, marginLeft: "auto", padding: "6px 9px", background: "var(--bg-input)", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", color: "var(--text)", fontSize: 12 }} />
-          {hasActiveRuns ? <button className="nm-btn" type="button" onClick={handleCancel} style={{ ...dangerButtonStyle, padding: "5px 10px", fontSize: 12 }}><CancelOutlinedIcon sx={{ fontSize: 15 }} />전체 실행·대기 항목 중지</button> : hosts.length > 1 && <button className="nm-btn" type="button" onClick={handleRunAll} disabled={selectedArtifacts.size === 0} style={{ ...primaryButtonStyle, padding: "5px 10px", fontSize: 12, opacity: selectedArtifacts.size === 0 ? 0.5 : 1 }}><PlayArrowIcon sx={{ fontSize: 15 }} />전체 파싱</button>}
+          <input className="host-ledger-search" aria-label="호스트 또는 증거 경로 검색" value={hostQuery} onChange={(event) => { setHostQuery(event.target.value); setHostPage(0); }} placeholder="호스트·증거 경로 검색" style={{ width: 230, marginLeft: "auto", padding: "6px 9px", background: "var(--bg-input)", border: "1px solid var(--border)", borderRadius: "var(--radius)", color: "var(--text)", fontSize: 12 }} />
+          {hasActiveRuns ? <button className="nm-btn" type="button" onClick={handleCancel} style={{ ...dangerButtonStyle, padding: "5px 10px", fontSize: 12 }}><CancelOutlinedIcon sx={{ fontSize: 15 }} />전체 실행·대기 항목 중지</button> : hosts.length > 1 && <button className="nm-btn" type="button" onClick={() => void handleRunAll()} disabled={allParseDisabled} title={allParseHint} style={{ ...primaryButtonStyle, padding: "5px 10px", fontSize: 12, opacity: allParseDisabled ? 0.5 : 1 }}>{runAllChecking ? <CircularProgress size={13} thickness={5} aria-hidden="true" /> : <PlayArrowIcon sx={{ fontSize: 15 }} />}{runAllChecking ? "새 데이터 확인 중" : "전체 파싱"}</button>}
         </div>
-        {actionError && <div role="alert" style={{ margin: "0 0 8px", padding: "8px 12px", border: "1px solid color-mix(in srgb, var(--danger) 45%, var(--border))", borderRadius: "var(--radius-md)", background: "color-mix(in srgb, var(--danger) 7%, var(--bg-panel))", color: "var(--danger)", fontSize: 12 }}>{actionError}</div>}
+        {actionError && <div role="alert" style={{ margin: "0 0 8px", padding: "8px 12px", border: "1px solid color-mix(in srgb, var(--danger) 45%, var(--border))", borderRadius: "var(--radius)", background: "color-mix(in srgb, var(--danger) 7%, var(--bg-panel))", color: "var(--danger)", fontSize: 12 }}>{actionError}</div>}
+        {artifactLoading && <div role="status" style={{ display: "flex", alignItems: "center", gap: 6, margin: "0 0 8px", color: "var(--text-faint)", fontSize: 11.5 }}><CircularProgress size={13} thickness={5} aria-hidden="true" />실행할 아티팩트 목록 확인 중</div>}
+        {artifactError && <div role="alert" style={{ display: "flex", alignItems: "center", gap: 8, margin: "0 0 8px", padding: "8px 12px", border: "1px solid color-mix(in srgb, var(--danger) 45%, var(--border))", borderRadius: "var(--radius)", background: "color-mix(in srgb, var(--danger) 7%, var(--bg-panel))", color: "var(--danger)", fontSize: 12 }}>{artifactError} 파싱을 시작할 수 없습니다.<button type="button" onClick={() => setArtifactLoadAttempt((attempt) => attempt + 1)} style={{ ...linkButtonStyle, marginLeft: 0 }}>다시 시도</button></div>}
+        {!artifactLoading && !artifactError && artifacts.length === 0 && <div role="status" style={{ margin: "0 0 8px", color: "var(--warning)", fontSize: 12 }}>실행 가능한 아티팩트가 없습니다. 파싱을 시작할 수 없습니다.</div>}
         <div style={{ flex: 1, minHeight: 0, overflow: "auto", padding: "2px 2px 4px" }}>
           <div>
             {hosts.length === 0 && <div role="status" style={{ padding: 28, textAlign: "center", color: "var(--text-faint)", fontSize: 12.5 }}>등록된 호스트가 없습니다. 위에서 증거 폴더를 선택해 추가하세요.</div>}
@@ -627,20 +681,21 @@ export default function RunPipeline({ activeCase, onChanged, onOpenHost, run }: 
               const cached = reportsByHost[host.id];
               const report = selectVisibleHostReport(cached, host.lastRunAt, Boolean(activeRun), terminalRun?.runId);
               const reportSyncPending = isHostReportSyncPending(cached, host.lastRunAt, Boolean(activeRun), terminalRun?.runId);
-              return <HostLedgerRow key={host.id} host={host} report={report} reportSyncPending={reportSyncPending} activeRun={activeRun} terminalRun={terminalRun} hasActiveRuns={hasActiveRuns} selectedArtifacts={selectedArtifacts.size} confirmDeleteId={confirmDeleteId} deleting={deleting} onRun={handleRun} onRetryMft={handleRetryMft} onCancel={handleCancelRun} onOpenHost={onOpenHost} onConfirmDelete={setConfirmDeleteId} onDelete={handleDelete} onRename={openRename} />;
+              return <HostLedgerRow key={host.id} host={host} report={report} reportSyncPending={reportSyncPending} activeRun={activeRun} terminalRun={terminalRun} hasActiveRuns={hasActiveRuns} artifactsReady={artifactsReady} eligibility={eligibility[host.id]} onRun={handleRun} onRetryMft={handleRetryMft} onCancel={handleCancelRun} onOpenHost={onOpenHost} onRequestDelete={openDeleteConfirm} onRecheckEligibility={() => setEligibilityAttempt((attempt) => attempt + 1)} onRename={openRename} />;
             })}
           </div>
         </div>
         {filteredHosts.length > HOSTS_PER_PAGE && <div style={{ display: "flex", justifyContent: "flex-end", padding: "8px 2px", flexShrink: 0 }}><PaginationControls ariaLabel="호스트 목록 페이지" page={hostPage} pageCount={pageCount} onChange={setHostPage} summary={`(${(pageStart + 1).toLocaleString()}–${Math.min(pageStart + HOSTS_PER_PAGE, filteredHosts.length).toLocaleString()} / ${filteredHosts.length.toLocaleString()})`} /></div>}
       </section>
       {renameHost && <RenameHostDialog value={renameName} saving={renaming} error={renameError} onChange={setRenameName} onClose={() => { if (!renaming) setRenameHost(null); }} onSave={() => void handleRenameHost()} />}
+      {deleteTarget && <DeleteHostDialog host={deleteTarget} deleting={deleting} error={actionError} onClose={() => { if (!deleting) { setDeleteTarget(null); setActionError(null); } }} onConfirm={() => void handleDelete(deleteTarget.id)} />}
     </div>
   );
 }
 
 function HostLedgerRow({
-  host, report, reportSyncPending, activeRun, terminalRun, hasActiveRuns, selectedArtifacts, confirmDeleteId, deleting,
-  onRun, onRetryMft, onCancel, onOpenHost, onConfirmDelete, onDelete, onRename,
+  host, report, reportSyncPending, activeRun, terminalRun, hasActiveRuns, artifactsReady, eligibility,
+  onRun, onRetryMft, onCancel, onOpenHost, onRequestDelete, onRecheckEligibility, onRename,
 }: {
   host: Host;
   report?: ParseReport | null;
@@ -649,17 +704,18 @@ function HostLedgerRow({
   /** Last in-session terminal update fills the small refresh gap only. */
   terminalRun?: PipelineRunItem;
   hasActiveRuns: boolean;
-  selectedArtifacts: number;
-  confirmDeleteId: string | null;
-  deleting: boolean;
+  artifactsReady: boolean;
+  eligibility?: ParseEligibilityEntry;
   onRun: (hostId: string) => void;
   onRetryMft: (hostId: string) => void;
   onCancel: (runId: string) => void;
   onOpenHost: (host: Host) => void;
-  onConfirmDelete: (hostId: string | null) => void;
-  onDelete: (hostId: string) => void;
+  onRequestDelete: (host: Host) => void;
+  onRecheckEligibility: () => void;
   onRename: (host: Host) => void;
 }) {
+  const [logOpen, setLogOpen] = useState(false);
+  const logPanelId = useId();
   // A partial/error attempt may preserve earlier files, but it must not offer
   // an unqualified "결과" action as if this attempt published a coherent view.
   const hasResult = report?.status === "ok" && (report.published === true || report.published === undefined);
@@ -670,7 +726,15 @@ function HostLedgerRow({
   // 재동기화를 기다리지 않고 즉시 결과를 열 수 있게 한다.
   const canOpenResult = hasResult || hasPublishedRaw || terminalRun?.status === "complete";
   const isQueued = activeRun?.status === "queued";
-  const confirmingDelete = confirmDeleteId === host.id;
+  const blockedLabel = parseBlockedLabel(eligibility);
+  const parseDisabled = hasActiveRuns || !artifactsReady || !canStartParse(eligibility);
+  const parseHint = !artifactsReady
+    ? "실행할 아티팩트 목록을 확인하지 못했습니다."
+    : hasActiveRuns
+      ? "다른 호스트 파싱이 끝난 뒤 실행할 수 있습니다."
+      : blockedLabel ?? undefined;
+  // Only expose the confirmed run's stored log.
+  const showLogAction = Boolean(report) && !activeRun && !reportSyncPending;
   const terminalStatus = terminalRun?.status === "complete" ? "ok" : terminalRun?.status;
   const displayStatus = activeRun?.status ?? terminalStatus ?? host.lastRunStatus;
   const progressLabel = isQueued
@@ -685,14 +749,13 @@ function HostLedgerRow({
     : Math.min(99, Math.round((activeRun.completedSteps / activeRun.totalSteps) * 100));
   // 카드 타일 색 = 실행 상태 신호.
   const tileColor = activeRun ? "var(--accent)" : displayStatus === "ok" ? "var(--success)" : displayStatus === "error" ? "var(--danger)" : displayStatus ? "var(--warning)" : "var(--text-dim)";
-  {/* 카드 = 세로 구성: [헤더 행 + 우측 액션] 위, 실행 로그(요약·패널) 아래
-      전체 폭. 로그 패널을 좌측 컬럼에 가두면 펼쳤을 때 우측 액션 아래가
-      크게 비어 보인다. */}
-  return <article style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 8, padding: "11px 14px", border: `1px solid ${activeRun ? "color-mix(in srgb, var(--accent) 45%, var(--border))" : "var(--border)"}`, borderRadius: "var(--radius-md)", background: activeRun ? "color-mix(in srgb, var(--accent) 5%, var(--bg-panel))" : "var(--bg-panel)", transition: "border-color .18s ease" }}>
+  // 카드 = 세로 구성: [헤더 행 + 우측 액션] 위, 펼친 실행 로그 패널이 아래
+  // 전체 폭. 로그 패널을 좌측 컬럼에 가두면 우측 액션 밑이 크게 비어 보인다.
+  return <article style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 8, padding: "11px 14px", border: `1px solid ${activeRun ? "color-mix(in srgb, var(--accent) 45%, var(--border))" : "var(--border)"}`, borderRadius: "var(--radius)", background: activeRun ? "color-mix(in srgb, var(--accent) 5%, var(--bg-panel))" : "var(--bg-panel)", transition: "border-color .18s ease" }}>
     <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
     <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", alignItems: "stretch", gap: 6 }}>
     <div style={{ display: "flex", alignItems: "center", gap: 12, minWidth: 0 }}>
-      <span aria-hidden="true" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 34, height: 34, flexShrink: 0, borderRadius: "var(--radius-sm)", background: `color-mix(in srgb, ${tileColor} 15%, transparent)` }}>
+      <span aria-hidden="true" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 34, height: 34, flexShrink: 0, borderRadius: "var(--radius)", background: `color-mix(in srgb, ${tileColor} 15%, transparent)` }}>
         <DnsOutlinedIcon sx={{ fontSize: 17, color: tileColor }} />
       </span>
       <div style={{ flex: 1, minWidth: 0, display: "grid", gap: 3 }}>
@@ -711,19 +774,24 @@ function HostLedgerRow({
     {activeRun && !isQueued && <div style={{ gridColumn: "1 / -1" }}><InlineParseProgress stepLabel={progressLabel} percent={percent} completedSteps={activeRun.completedSteps} totalSteps={activeRun.totalSteps} /></div>}
     {activeRun?.failedArtifacts.length ? <div role="alert" style={{ gridColumn: "1 / -1", padding: "0 0 6px", color: "var(--danger)", fontSize: 12 }}>파싱 실패: {activeRun.failedArtifacts.join(", ")}</div> : null}
     </div>
-    {confirmingDelete ? <div className="host-ledger-confirm"><span style={{ color: "var(--danger)", fontSize: 11.5 }}>분석 결과와 이 호스트 북마크를 삭제합니다.</span><div style={{ display: "flex", gap: 7 }}><button className="nm-btn" type="button" onClick={() => onDelete(host.id)} disabled={deleting} style={{ ...dangerButtonStyle, padding: "5px 9px", fontSize: 11.5, opacity: deleting ? .5 : 1 }}><DeleteOutlineIcon sx={{ fontSize: 14 }} />삭제</button><button type="button" onClick={() => onConfirmDelete(null)} disabled={deleting} style={{ ...linkButtonStyle, marginLeft: 0 }}>취소</button></div></div> : <div className="host-ledger-actions">
-        {canOpenResult ? <button className="nm-btn" type="button" onClick={() => onOpenHost(host)} style={{ ...neutralButtonStyle, padding: "8px 14px", fontSize: 12.5 }}><VisibilityOutlinedIcon sx={{ fontSize: 16 }} />결과 보기</button> : <span aria-hidden="true" className="host-ledger-action-placeholder" />}
-        {activeRun ? <button className="nm-btn" type="button" onClick={() => onCancel(activeRun.runId)} style={{ ...dangerButtonStyle, padding: "8px 14px", fontSize: 12.5 }}><CancelOutlinedIcon sx={{ fontSize: 16 }} />{isQueued ? "대기 취소" : "취소"}</button> : <button className="nm-btn" type="button" onClick={() => onRun(host.id)} disabled={hasActiveRuns || selectedArtifacts === 0} style={{ ...primaryButtonStyle, padding: "8px 14px", fontSize: 12.5, opacity: hasActiveRuns || selectedArtifacts === 0 ? .5 : 1 }}><PlayArrowIcon sx={{ fontSize: 16 }} />파싱</button>}
-        <span aria-hidden="true" className="host-ledger-action-divider" />
-        <button type="button" onClick={() => onRename(host)} disabled={!!activeRun} aria-label={`${host.name} 이름 변경`} title="호스트 표시 이름 변경" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 34, height: 34, padding: 0, background: "transparent", color: "var(--text-faint)", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", cursor: activeRun ? "default" : "pointer", opacity: activeRun ? .4 : 1 }}><EditOutlinedIcon sx={{ fontSize: 18 }} /></button>
-        <button type="button" onClick={() => onConfirmDelete(host.id)} disabled={!!activeRun} aria-label={`${host.name} 삭제`} title="호스트 삭제 (원본 수집 데이터는 유지)" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 34, height: 34, padding: 0, background: "transparent", color: "var(--text-faint)", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", cursor: activeRun ? "default" : "pointer", opacity: activeRun ? .4 : 1 }}><DeleteOutlineIcon sx={{ fontSize: 18 }} /></button>
-      </div>}
+    <div className="host-ledger-actions">
+      {canOpenResult && <button className="nm-btn" type="button" onClick={() => onOpenHost(host)} aria-label={`${host.name} 결과 보기`} style={{ ...neutralButtonStyle, padding: "8px 14px", fontSize: 12.5 }}><VisibilityOutlinedIcon sx={{ fontSize: 16 }} />결과 보기</button>}
+      {activeRun ? <button className="nm-btn" type="button" onClick={() => onCancel(activeRun.runId)} style={{ ...dangerButtonStyle, padding: "8px 14px", fontSize: 12.5 }}><CancelOutlinedIcon sx={{ fontSize: 16 }} />{isQueued ? "대기 취소" : "취소"}</button> : <button className="nm-btn" type="button" onClick={() => onRun(host.id)} disabled={parseDisabled} title={parseHint} aria-label={`${host.name} 파싱`} style={{ ...primaryButtonStyle, padding: "8px 14px", fontSize: 12.5, opacity: parseDisabled ? .5 : 1 }}><PlayArrowIcon sx={{ fontSize: 16 }} />파싱</button>}
+      {/* UI-01: 실행 로그 토글은 결과 보기·파싱과 같은 행에 둔다. */}
+      {showLogAction && <button className="nm-btn" type="button" aria-expanded={logOpen} aria-controls={logPanelId} aria-label={`${host.name} 로그 확인`} onClick={() => setLogOpen((open) => !open)} style={{ ...neutralButtonStyle, padding: "8px 14px", fontSize: 12.5 }}><DescriptionOutlinedIcon sx={{ fontSize: 16 }} />로그 확인{logOpen ? <ExpandLessIcon sx={{ fontSize: 15 }} /> : <ExpandMoreIcon sx={{ fontSize: 15 }} />}</button>}
+      <span aria-hidden="true" className="host-ledger-action-divider" />
+      <button className="nm-btn" type="button" onClick={() => onRename(host)} disabled={!!activeRun} aria-label={`${host.name} 수정`} title="호스트 표시 이름 변경" style={{ ...neutralButtonStyle, padding: "8px 14px", fontSize: 12.5, cursor: activeRun ? "default" : "pointer", opacity: activeRun ? .4 : 1 }}><EditOutlinedIcon sx={{ fontSize: 16 }} />수정</button>
+      <button className="nm-btn" type="button" onClick={() => onRequestDelete(host)} disabled={!!activeRun} aria-label={`${host.name} 삭제`} title="호스트 삭제 (원본 수집 데이터는 유지)" style={{ ...neutralButtonStyle, padding: "8px 14px", fontSize: 12.5, color: "var(--danger)", cursor: activeRun ? "default" : "pointer", opacity: activeRun ? .4 : 1 }}><DeleteOutlineIcon sx={{ fontSize: 16 }} />삭제</button>
+      {!activeRun && blockedLabel && <span role={eligibility?.status === "error" ? "alert" : undefined} style={{ flexBasis: "100%", display: "inline-flex", alignItems: "center", justifyContent: "flex-end", gap: 5, color: eligibility?.status === "error" ? "var(--danger)" : "var(--text-faint)", fontSize: 11.5 }}>
+        {blockedLabel}
+        {eligibility?.status === "error" && <button type="button" onClick={onRecheckEligibility} style={{ ...linkButtonStyle, marginLeft: 0 }}>다시 확인</button>}
+      </span>}
+    </div>
     </div>
     {/* A host-level fallback status can belong to the previous run. Do not
         surface it until the exact terminal manifest has passed the same
         cache/run-id gate as the publication controls above.
-        헤더 행 아래 전체 폭 — 로그 패널이 우측 액션 밑 빈 공간 없이 카드
-        폭을 다 쓴다. */}
-    {report && !activeRun && !reportSyncPending && <RunOutcomeSummary host={host} report={report} onRetryMft={() => onRetryMft(host.id)} />}
+        UI-01: 우측 `로그 확인`으로 여는 패널은 헤더 행 아래 전체 폭을 쓴다. */}
+    {showLogAction && logOpen && report && <RunLogPanel id={logPanelId} host={host} report={report} onRetryMft={() => onRetryMft(host.id)} />}
   </article>;
 }

@@ -17,7 +17,9 @@ use crate::time::fmt_filetime;
 pub const JUMPLIST_TABLE: &str = "JumpList_Entries";
 pub const JUMPLIST_FIELD_ORDER: &[&str] = &[
     "timestamp",
+    "timestamp_source",
     "lnk_accessed",
+    "destlist_accessed",
     "created_time",
     "modified_time",
     "access_count",
@@ -263,7 +265,20 @@ fn parse_lnk(data: &[u8], tmp: &Path) -> Result<LnkFields> {
 fn row_ok(fields: LnkFields, app_id: &str, jl_type: &str, stream_id: &str, source: &str) -> Row {
     let (target, created, modified, accessed, args, wdir, machine_id) = fields;
     let mut r = Row::new();
-    r.insert("timestamp".into(), accessed);
+    // Preserve the LNK time independently for both destination formats.
+    r.insert("timestamp".into(), accessed.clone());
+    r.insert(
+        "timestamp_source".into(),
+        if accessed.is_empty() {
+            String::new()
+        } else {
+            "lnk_accessed".into()
+        },
+    );
+    r.insert("lnk_accessed".into(), accessed);
+    r.insert("destlist_accessed".into(), String::new());
+    r.insert("access_count".into(), String::new());
+    r.insert("hostname".into(), String::new());
     r.insert("created_time".into(), created);
     r.insert("modified_time".into(), modified);
     r.insert("app_id".into(), app_id.into());
@@ -354,18 +369,16 @@ fn parse_destlist(data: &[u8]) -> std::collections::HashMap<String, DestEntry> {
     map
 }
 
-/// LNK 헤더 접근 시각을 lnk_accessed로 보존하고, DestList 기록이 있으면
-/// timestamp를 실제 마지막 사용 시각으로 바꾼다(없으면 LNK 시각 유지).
+// DestList time takes precedence without discarding the LNK time.
 fn apply_destlist(row: &mut Row, entry: Option<&DestEntry>) {
-    let lnk_accessed = row.get("timestamp").cloned().unwrap_or_default();
-    row.insert("lnk_accessed".into(), lnk_accessed);
-    if let Some(entry) = entry {
-        if !entry.access_time.is_empty() {
-            row.insert("timestamp".into(), entry.access_time.clone());
-        }
-        row.insert("access_count".into(), entry.access_count.clone());
-        row.insert("hostname".into(), entry.hostname.clone());
+    let Some(entry) = entry else { return };
+    if !entry.access_time.is_empty() {
+        row.insert("timestamp".into(), entry.access_time.clone());
+        row.insert("destlist_accessed".into(), entry.access_time.clone());
+        row.insert("timestamp_source".into(), "destlist_accessed".into());
     }
+    row.insert("access_count".into(), entry.access_count.clone());
+    row.insert("hostname".into(), entry.hostname.clone());
 }
 
 fn parse_automatic(path: &Path, rows: &mut Vec<Row>) {
@@ -552,6 +565,115 @@ mod tests {
             assert!(!entry.access_time.is_empty(), "v{version} access time");
         }
         assert!(parse_destlist(b"tiny").is_empty());
+    }
+
+    fn lnk_fields(accessed: &str) -> LnkFields {
+        (
+            "C:\\a.txt".into(),
+            "2026-01-01 00:00:00.000".into(),
+            "2026-01-02 00:00:00.000".into(),
+            accessed.into(),
+            String::new(),
+            String::new(),
+            String::new(),
+        )
+    }
+
+    fn dest_entry(access_time: &str) -> DestEntry {
+        DestEntry {
+            access_time: access_time.into(),
+            access_count: "7".into(),
+            hostname: "HOST-01".into(),
+        }
+    }
+
+    #[test]
+    fn destlist_time_overrides_but_keeps_lnk_accessed_and_source() {
+        let mut row = row_ok(
+            lnk_fields("2026-03-01 10:00:00.000"),
+            "app",
+            "Automatic",
+            "1a",
+            "src",
+        );
+        apply_destlist(&mut row, Some(&dest_entry("2026-03-02 11:00:00.000")));
+        assert_eq!(row["timestamp"], "2026-03-02 11:00:00.000");
+        assert_eq!(row["destlist_accessed"], "2026-03-02 11:00:00.000");
+        assert_eq!(row["lnk_accessed"], "2026-03-01 10:00:00.000");
+        assert_eq!(row["timestamp_source"], "destlist_accessed");
+        assert_eq!(row["access_count"], "7");
+        assert_eq!(row["hostname"], "HOST-01");
+    }
+
+    // Equal timestamps still need independent provenance.
+    #[test]
+    fn equal_destlist_and_lnk_times_stay_distinguishable() {
+        let same = "2026-03-01 10:00:00.000";
+        let mut row = row_ok(lnk_fields(same), "app", "Automatic", "1a", "src");
+        apply_destlist(&mut row, Some(&dest_entry(same)));
+        assert_eq!(row["timestamp_source"], "destlist_accessed");
+        assert_eq!(row["destlist_accessed"], same);
+        assert_eq!(row["lnk_accessed"], same);
+    }
+
+    #[test]
+    fn missing_destlist_time_falls_back_to_lnk_accessed() {
+        let mut row = row_ok(
+            lnk_fields("2026-03-01 10:00:00.000"),
+            "app",
+            "Automatic",
+            "1a",
+            "src",
+        );
+        apply_destlist(&mut row, Some(&dest_entry("")));
+        assert_eq!(row["timestamp"], "2026-03-01 10:00:00.000");
+        assert_eq!(row["timestamp_source"], "lnk_accessed");
+        assert!(row["destlist_accessed"].is_empty());
+        // An untimed DestList entry still has usage evidence.
+        assert_eq!(row["access_count"], "7");
+        assert_eq!(row["hostname"], "HOST-01");
+
+        let mut no_entry = row_ok(
+            lnk_fields("2026-03-01 10:00:00.000"),
+            "app",
+            "Automatic",
+            "2b",
+            "src",
+        );
+        apply_destlist(&mut no_entry, None);
+        assert_eq!(no_entry["timestamp"], "2026-03-01 10:00:00.000");
+        assert_eq!(no_entry["timestamp_source"], "lnk_accessed");
+        assert!(no_entry["destlist_accessed"].is_empty());
+        assert!(no_entry["access_count"].is_empty());
+        assert!(no_entry["hostname"].is_empty());
+    }
+
+    #[test]
+    fn custom_rows_preserve_lnk_accessed() {
+        let row = row_ok(
+            lnk_fields("2026-03-01 10:00:00.000"),
+            "app",
+            "Custom",
+            "0",
+            "src",
+        );
+        assert_eq!(row["lnk_accessed"], "2026-03-01 10:00:00.000");
+        assert_eq!(row["timestamp"], "2026-03-01 10:00:00.000");
+        assert_eq!(row["timestamp_source"], "lnk_accessed");
+        assert!(row["destlist_accessed"].is_empty());
+    }
+
+    /// 시각이 없으면 만들어 내지 않는다.
+    #[test]
+    fn absent_times_are_not_invented() {
+        let mut row = row_ok(lnk_fields(""), "app", "Automatic", "1a", "src");
+        assert!(row["timestamp"].is_empty());
+        assert!(row["lnk_accessed"].is_empty());
+        assert!(row["timestamp_source"].is_empty());
+        apply_destlist(&mut row, Some(&dest_entry("")));
+        assert!(row["timestamp"].is_empty());
+        assert!(row["destlist_accessed"].is_empty());
+        assert!(row["timestamp_source"].is_empty());
     }
 
     fn write_u32(data: &mut [u8], offset: usize, value: u32) {

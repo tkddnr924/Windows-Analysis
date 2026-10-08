@@ -70,7 +70,7 @@ function clusterSessions(data: CsvData, timeRange: TimeRange): PsSession[] {
       command: row.command ?? "",
       scriptBlock: row.script_block ?? "",
       hostApplication: row.host_application ?? "",
-      kind: row.kind ?? "",
+      kind: row.event_type ?? "",
     }))
     .filter((event) => event.timestamp && inRange(event.timestamp, timeRange))
     .sort((left, right) => left.timestamp.localeCompare(right.timestamp));
@@ -193,11 +193,11 @@ export default function PowerShellFlowView({
     return (data.rows as Record<string, string>[])
       .filter((row) => !(row.timestamp ?? "").trim())
       .filter((row) => {
-        if (kindFilter && (row.kind ?? "") !== kindFilter) return false;
+        if (kindFilter && (row.event_type ?? "") !== kindFilter) return false;
         if (hiddenAccounts.has(row.account ?? "")) return false;
         if (!needle) return true;
         if (serverMatches?.has(Number((row as Record<string, unknown>).__rowid))) return true;
-        return [row.account, row.command, row.kind].some((value) => (value ?? "").toLowerCase().includes(needle));
+        return [row.account, row.command, row.event_type].some((value) => (value ?? "").toLowerCase().includes(needle));
       })
       .sort((a, b) => (a.account ?? "").localeCompare(b.account ?? "") || (Number(a.line_number) || 0) - (Number(b.line_number) || 0));
   }, [data.rows, kindFilter, hiddenAccounts, query, serverMatches]);
@@ -259,7 +259,7 @@ export default function PowerShellFlowView({
 
       <main style={{ flex: 1, minHeight: 0, overflow: "auto", padding: 14 }}>
         {untimed.length > 0 && (
-          <section style={{ marginBottom: 10, border: "1px solid var(--border)", borderRadius: "var(--radius-md)", background: "var(--bg-panel)", overflow: "hidden" }}>
+          <section style={{ marginBottom: 10, border: "1px solid var(--border)", borderRadius: "var(--radius)", background: "var(--bg-panel)", overflow: "hidden" }}>
             <button
               type="button"
               onClick={() => setUntimedOpen((open) => !open)}
@@ -317,7 +317,7 @@ export default function PowerShellFlowView({
           const accountLabel = resolveAccountDisplay(session.account, accountDirectory) || "계정 정보 없음";
           const sameDay = session.start.slice(0, 10) === session.end.slice(0, 10);
           return (
-            <section key={session.key} style={{ marginBottom: 10, border: `1px solid ${open ? "color-mix(in srgb, var(--accent) 48%, var(--border))" : "var(--border)"}`, borderRadius: "var(--radius-md)", background: "var(--bg-panel)", overflow: "hidden", transition: "border-color .18s ease" }}>
+            <section key={session.key} style={{ marginBottom: 10, border: `1px solid ${open ? "color-mix(in srgb, var(--accent) 48%, var(--border))" : "var(--border)"}`, borderRadius: "var(--radius)", background: "var(--bg-panel)", overflow: "hidden", transition: "border-color .18s ease" }}>
               <button
                 type="button"
                 className="ps-session-summary"
@@ -329,7 +329,7 @@ export default function PowerShellFlowView({
                 onMouseEnter={(event) => { if (!open) event.currentTarget.style.background = "var(--bg-hover)"; }}
                 onMouseLeave={(event) => { event.currentTarget.style.background = open ? "color-mix(in srgb, var(--accent) 7%, transparent)" : "transparent"; }}
               >
-                <span aria-hidden="true" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 34, height: 34, flexShrink: 0, borderRadius: "var(--radius-sm)", background: "var(--accent-subtle)" }}>
+                <span aria-hidden="true" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 34, height: 34, flexShrink: 0, borderRadius: "var(--radius)", background: "var(--accent-subtle)" }}>
                   <TerminalOutlinedIcon sx={{ fontSize: 18, color: "var(--accent)" }} />
                 </span>
                 <span style={{ flex: 1, minWidth: 0, display: "grid", gap: 3 }}>
@@ -346,7 +346,7 @@ export default function PowerShellFlowView({
                 <span className="ps-session-kinds" style={{ display: "flex", alignItems: "center", gap: 5, flexShrink: 0 }}>
                   {[...kindCounts.entries()].map(([kindLabel, count]) => {
                     const kindColor = kindLabel === "스크립트 블록" ? "var(--accent)" : kindLabel === "파이프라인" ? "var(--warning)" : kindLabel === "명령 실행" ? "var(--success)" : "var(--text-dim)";
-                    return <span key={kindLabel} style={{ fontSize: 11.5, fontWeight: 700, color: kindColor, border: `1px solid ${kindColor}`, borderRadius: "var(--radius-sm)", padding: "1px 8px", whiteSpace: "nowrap" }}>{kindLabel} {count.toLocaleString()}</span>;
+                    return <span key={kindLabel} style={{ fontSize: 11.5, fontWeight: 700, color: kindColor, border: `1px solid ${kindColor}`, borderRadius: "var(--radius)", padding: "1px 8px", whiteSpace: "nowrap" }}>{kindLabel} {count.toLocaleString()}</span>;
                   })}
                 </span>
                 <span className="ps-session-range" style={{ flexShrink: 0, color: "var(--text-time)", fontFamily: "var(--mono)", fontSize: 12, whiteSpace: "nowrap" }}>
@@ -367,12 +367,12 @@ export default function PowerShellFlowView({
                       <div key={`${event.rowid}-${event.timestamp}`} className={bookmarked ? "dfir-bookmarked-row ps-session-event" : "ps-session-event"} onClick={() => openDetail(event.row)} style={{ borderRadius: 0, display: "flex", alignItems: "center", gap: 8, minHeight: 46, padding: "8px 14px 8px 60px", borderTop: eventIndex === 0 ? "none" : "1px solid var(--border-subtle)", background: "transparent", cursor: "pointer", transition: "background .15s ease" }} onMouseEnter={(mouseEvent) => { if (!bookmarked) mouseEvent.currentTarget.style.background = "var(--bg-hover)"; }} onMouseLeave={(mouseEvent) => { if (!bookmarked) mouseEvent.currentTarget.style.background = "transparent"; }}>
                         <button type="button" className="ps-session-child" onClick={(clickEvent) => { clickEvent.stopPropagation(); openDetail(event.row); }} aria-label={`${formatEvidenceTimestamp(event.timestamp)} ${kindLabel} 상세 보기`} style={{ flex: 1, display: "grid", gridTemplateColumns: "158px 104px minmax(0, 1fr)", gap: 10, alignItems: "center", minWidth: 0, padding: 0, color: "var(--text)", cursor: "pointer", border: "none", background: "transparent", textAlign: "left", outlineOffset: 2 }}>
                           <span className="ps-session-child-time" style={{ color: "var(--text-time)", fontFamily: "var(--mono)", fontSize: 12.5, whiteSpace: "nowrap" }}>{formatEvidenceTimestamp(event.timestamp)}</span>
-                          <span className="ps-session-child-type" style={{ justifySelf: "start", fontSize: 11.5, fontWeight: 700, color: kindColor, border: `1px solid ${kindColor}`, borderRadius: "var(--radius-sm)", padding: "1px 8px", whiteSpace: "nowrap" }}>{kindLabel}</span>
+                          <span className="ps-session-child-type" style={{ justifySelf: "start", fontSize: 11.5, fontWeight: 700, color: kindColor, border: `1px solid ${kindColor}`, borderRadius: "var(--radius)", padding: "1px 8px", whiteSpace: "nowrap" }}>{kindLabel}</span>
                           <span className="ps-session-child-content" style={{ minWidth: 0, display: "grid", gap: 3 }}>
                             <span style={{ minWidth: 0, display: "flex", alignItems: "center", gap: 6 }}>
                               {/* 분할 4104 재조합이 불완전한 행 — 잘린 본문이 완전한
                                   원문으로 읽히지 않게 목록에서 바로 경고한다. */}
-                              {event.row.script_block_status && <span title={event.row.script_block_status} style={{ flexShrink: 0, fontSize: 10.5, fontWeight: 700, color: "var(--warning)", border: "1px solid var(--warning)", borderRadius: "var(--radius-sm)", padding: "0 6px", whiteSpace: "nowrap" }}>불완전</span>}
+                              {event.row.description && <span title={event.row.description} style={{ flexShrink: 0, fontSize: 10.5, fontWeight: 700, color: "var(--warning)", border: "1px solid var(--warning)", borderRadius: "var(--radius)", padding: "0 6px", whiteSpace: "nowrap" }}>불완전</span>}
                               <span title={evidence.value} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: evidence.label === "HostApplication" ? "var(--accent)" : "var(--text)", fontFamily: "var(--mono)", fontSize: 12.5 }}>{evidence.value}</span>
                             </span>
                             {hostApplicationSecondary && <span title={event.hostApplication} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text-faint)", fontFamily: "var(--mono)", fontSize: 11 }}>HostApplication · {hostApplicationSecondary}</span>}

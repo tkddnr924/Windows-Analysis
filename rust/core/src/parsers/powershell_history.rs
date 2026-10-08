@@ -1,8 +1,5 @@
-//! PowerShell console history — the PSReadLine `ConsoleHost_history.txt` file,
-//! one typed command per line in execution order. No timestamps exist in the
-//! file (PSReadLine stores only the command text), so order is the only
-//! temporal signal, preserved as `line_number`. Port of
-//! parsers/powershell_history_parser.py.
+//! Preserve PSReadLine physical lines, including continuation markers and blanks.
+//! Derived generation reconstructs commands while retaining every source line.
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -73,9 +70,6 @@ pub fn parse_console_history(paths: &[PathBuf]) -> Result<Vec<Row>> {
             }
         };
         for (i, line) in splitlines(&text).into_iter().enumerate() {
-            if line.is_empty() {
-                continue;
-            }
             let mut r = Row::new();
             r.insert("line_number".into(), (i + 1).to_string());
             r.insert("command".into(), line);

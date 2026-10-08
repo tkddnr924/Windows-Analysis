@@ -5094,6 +5094,7 @@ dependencies = [
  "mft",
  "nom",
  "notatin",
+ "parking_lot",
  "png 0.17.16",
  "prefetch-core",
  "rayon",
@@ -5101,6 +5102,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "uuid",
  "walkdir",
 ]
 

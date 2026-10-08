@@ -44,7 +44,7 @@ interface Props {
 
 const ALL_ITEMS = "전체 항목";
 const PAGE = 10;
-const TAB_FIELD: Record<string, string> = { "자동 실행": "user", "보안 설정": "subtype", "원격 접속": "subtype", "기타 레지스트리": "subtype" };
+const TAB_FIELD: Record<string, string> = { "자동 실행": "account", "보안 설정": "subtype", "원격 접속": "subtype", "기타 레지스트리": "subtype" };
 const CATEGORY_ORDER = ["자격 증명 보호", "보안 설정", "공유 폴더", "SQL 인증", "자동 실행", "원격 접속", "Sysinternals 도구", "설치 프로그램 (MSI)", "기타 레지스트리"];
 const CATEGORY_META: Record<string, CategoryMeta> = {
   [ALL_ITEMS]: { icon: ManageSearchOutlinedIcon, label: ALL_ITEMS },
@@ -147,16 +147,16 @@ export default function RegistryFindingsView({ data, bookmarkedRowids, onToggleB
   const tabField = currentGroup ? TAB_FIELD[currentGroup.category] : undefined;
   const tabs = useMemo(() => !currentGroup || !tabField ? [] : [...new Set(currentGroup.rows.map((row) => row[tabField] || "(기타)"))], [currentGroup, tabField]);
   const allAccounts = useMemo(
-    () => [...new Set(allRows.map((row) => (row.user || "").trim()))].sort((a, b) => a.localeCompare(b)),
+    () => [...new Set(allRows.map((row) => (row.account || row.account_sid || "").trim()))].sort((a, b) => a.localeCompare(b)),
     [allRows],
   );
   const { rows, untimedExcluded } = useMemo(() => {
     if (!currentGroup) return { rows: [], untimedExcluded: 0 };
     const needle = search.trim().toLowerCase();
     const filtered = currentGroup.rows.filter((row) => {
-      if (hiddenAccounts.has((row.user || "").trim())) return false;
+      if (hiddenAccounts.has((row.account || row.account_sid || "").trim())) return false;
       if (tabField && selectedTab !== "전체" && (row[tabField] || "(기타)") !== selectedTab) return false;
-      return !needle || [row.name, row.value, row.key_path, displayRegistryKeyPath(row.key_path, row.source), row.command, row.detail, row.source, row.user, row.subtype]
+      return !needle || [row.name, row.value, row.key_path, displayRegistryKeyPath(row.key_path, row.source), row.command, row.detail, row.source, row.account, row.account_sid, row.subtype]
         .some((value) => (value || "").toLowerCase().includes(needle));
     });
     const untimedExcluded = rangeOn
@@ -205,7 +205,7 @@ function CategoryNavigation({ groups, selected, onSelect }: { groups: { category
 function CategoryButton({ category, active, onClick }: { category: string; active: boolean; onClick: () => void }) {
   const meta = categoryMeta(category);
   const Icon = meta.icon;
-  return <button type="button" onClick={onClick} className={active ? "nm-btn" : undefined} style={{ width: "100%", minHeight: 36, marginBottom: 2, padding: "0 10px", display: "flex", alignItems: "center", justifyContent: "flex-start", gap: 8, border: active ? "1px solid color-mix(in srgb, var(--accent) 45%, var(--border))" : "1px solid transparent", borderRadius: "var(--radius-md)", background: active ? "var(--accent-subtle)" : "transparent", color: active ? "var(--text)" : "var(--text-dim)", cursor: "pointer", textAlign: "left" }}>
+  return <button type="button" onClick={onClick} className={active ? "nm-btn" : undefined} style={{ width: "100%", minHeight: 36, marginBottom: 2, padding: "0 10px", display: "flex", alignItems: "center", justifyContent: "flex-start", gap: 8, border: active ? "1px solid color-mix(in srgb, var(--accent) 45%, var(--border))" : "1px solid transparent", borderRadius: "var(--radius)", background: active ? "var(--accent-subtle)" : "transparent", color: active ? "var(--text)" : "var(--text-dim)", cursor: "pointer", textAlign: "left" }}>
     <Icon sx={{ fontSize: 16, flexShrink: 0, color: active ? "var(--accent)" : "inherit" }} />
     <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 12.5, fontWeight: active ? 700 : 550 }}>{meta.label}</span>
   </button>;
@@ -231,19 +231,19 @@ function RegistryLedger({ rows, untimedExcluded, category, onSelect, bookmarkedR
         const bookmarked = bookmarkedRowids?.has(rowId(row)) ?? false;
         const tone = statusColor(row.status);
         const value = row.command || row.value;
-        const userLabel = resolveUserDisplay(row.user, accountDirectory) || "계정 정보 없음";
+        const userLabel = resolveUserDisplay(row.account || row.account_sid, accountDirectory) || "계정 정보 없음";
         // 하이브 루트 키 이름 대신 라이브 마운트 지점(HKLM\SOFTWARE·HKCU…)으로 보여준다.
         const keyPath = displayRegistryKeyPath(row.key_path, row.source);
         // 행 전체(여백 포함)가 상세 열기 클릭 대상 — 북마크는 전파 차단.
-        return <div key={stableKey || `${safePage}-${index}`} className={bookmarked ? "dfir-bookmarked-row" : undefined} onClick={() => onSelect(row)} style={{ borderRadius: "var(--radius-md)", minHeight: 62, marginBottom: 8, display: "flex", alignItems: "center", gap: 12, padding: "0 14px", border: "1px solid var(--border)", background: "var(--bg-panel)", color: "var(--text)", cursor: "pointer", transition: "background .15s ease, border-color .15s ease" }} onMouseEnter={(event) => { if (!bookmarked) event.currentTarget.style.background = "var(--bg-hover)"; }} onMouseLeave={(event) => { if (!bookmarked) event.currentTarget.style.background = "var(--bg-panel)"; }}>
+        return <div key={stableKey || `${safePage}-${index}`} className={bookmarked ? "dfir-bookmarked-row" : undefined} onClick={() => onSelect(row)} style={{ borderRadius: "var(--radius)", minHeight: 62, marginBottom: 8, display: "flex", alignItems: "center", gap: 12, padding: "0 14px", border: "1px solid var(--border)", background: "var(--bg-panel)", color: "var(--text)", cursor: "pointer", transition: "background .15s ease, border-color .15s ease" }} onMouseEnter={(event) => { if (!bookmarked) event.currentTarget.style.background = "var(--bg-hover)"; }} onMouseLeave={(event) => { if (!bookmarked) event.currentTarget.style.background = "var(--bg-panel)"; }}>
           <div role="button" tabIndex={0} aria-label={`${row.name || "레지스트리 항목"} 상세 보기`} onClick={() => onSelect(row)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); onSelect(row); } }} style={{ flex: 1, minWidth: 0, display: "flex", alignItems: "center", gap: 12, padding: "10px 0", cursor: "pointer", outlineOffset: -3 }}>
-            <span aria-hidden="true" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 34, height: 34, flexShrink: 0, borderRadius: "var(--radius-sm)", background: `color-mix(in srgb, ${tone} 15%, transparent)` }}>
+            <span aria-hidden="true" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 34, height: 34, flexShrink: 0, borderRadius: "var(--radius)", background: `color-mix(in srgb, ${tone} 15%, transparent)` }}>
               <KeyOutlinedIcon sx={{ fontSize: 17, color: tone }} />
             </span>
             <span style={{ flex: 1, minWidth: 0, display: "grid", gap: 3 }}>
               <span style={{ minWidth: 0, display: "flex", alignItems: "center", gap: 7, overflow: "hidden" }}>
                 <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text)", fontSize: 13.5, fontWeight: 700 }}>{row.name || "값 이름 없음"}</span>
-                <span style={{ flexShrink: 0, fontSize: 11.5, fontWeight: 700, color: tone, border: `1px solid ${tone}`, borderRadius: "var(--radius-sm)", padding: "1px 8px", whiteSpace: "nowrap" }}>{row.status || "정보"}</span>
+                <span style={{ flexShrink: 0, fontSize: 11.5, fontWeight: 700, color: tone, border: `1px solid ${tone}`, borderRadius: "var(--radius)", padding: "1px 8px", whiteSpace: "nowrap" }}>{row.status || "정보"}</span>
               </span>
               <span title={value || undefined} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: value ? (looksLikePath(value) ? "var(--accent)" : "var(--text-dim)") : "var(--text-faint)", fontFamily: "var(--mono)", fontSize: 12 }}>{value || "값 없음"}</span>
             </span>
@@ -254,7 +254,7 @@ function RegistryLedger({ rows, untimedExcluded, category, onSelect, bookmarkedR
                 한다(상세를 열어야만 보이면 정렬·필터를 검증할 수 없다). */}
             <span title={row.timestamp || undefined} style={{ width: 148, flexShrink: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: row.timestamp ? "var(--text-time)" : "var(--text-faint)", fontFamily: "var(--mono)", fontSize: 11.5, textAlign: "right" }}>{row.timestamp || "시간 정보 없음"}</span>
           </div>
-          <Tooltip title={bookmarked ? "북마크 해제" : "북마크"}><span><IconButton className={bookmarked ? "dfir-bookmark-control" : undefined} aria-label={bookmarked ? "북마크 해제" : "북마크"} disabled={!onToggleBookmark} size="small" onClick={(clickEvent) => { clickEvent.stopPropagation(); onToggleBookmark?.(rowId(row)); }} sx={{ color: bookmarked ? "var(--bookmark-control)" : "var(--text-faint)", borderRadius: "var(--radius-sm)" }}>{bookmarked ? <BookmarkIcon sx={{ fontSize: 17 }} /> : <BookmarkBorderOutlinedIcon sx={{ fontSize: 17 }} />}</IconButton></span></Tooltip>
+          <Tooltip title={bookmarked ? "북마크 해제" : "북마크"}><span><IconButton className={bookmarked ? "dfir-bookmark-control" : undefined} aria-label={bookmarked ? "북마크 해제" : "북마크"} disabled={!onToggleBookmark} size="small" onClick={(clickEvent) => { clickEvent.stopPropagation(); onToggleBookmark?.(rowId(row)); }} sx={{ color: bookmarked ? "var(--bookmark-control)" : "var(--text-faint)", borderRadius: "var(--radius)" }}>{bookmarked ? <BookmarkIcon sx={{ fontSize: 17 }} /> : <BookmarkBorderOutlinedIcon sx={{ fontSize: 17 }} />}</IconButton></span></Tooltip>
         </div>;
       })}
     </div>

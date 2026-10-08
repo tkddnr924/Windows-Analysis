@@ -7,7 +7,9 @@ import DnsOutlinedIcon from "@mui/icons-material/DnsOutlined";
 import ViewListOutlinedIcon from "@mui/icons-material/ViewListOutlined";
 import Checkbox from "@mui/material/Checkbox";
 
-import { useEffect, useRef, useState } from "react";
+import { RecordScopeContext } from "@/lib/recordScope";
+
+import { useContext, useEffect, useRef, useState } from "react";
 import OpenInNewOutlinedIcon from "@mui/icons-material/OpenInNewOutlined";
 import RefreshOutlinedIcon from "@mui/icons-material/RefreshOutlined";
 import CircularProgress from "@mui/material/CircularProgress";
@@ -33,7 +35,7 @@ const PAGE_SIZE = 10;
 
 // A few raw category folder names read awkwardly on their own (mirrors the
 // sidebar's mapping); everything else uses the folder name verbatim.
-const CATEGORY_LABELS: Record<string, string> = { POWERSHELL: "ConsoleHistory" };
+const CATEGORY_LABELS: Record<string, string> = { POWERSHELL: "ConsoleHistory", RECYCLEBIN: "휴지통" };
 function categoryLabel(name: string): string {
   return CATEGORY_LABELS[name.toUpperCase()] ?? name;
 }
@@ -49,10 +51,12 @@ function hostDirForHit(hit: SearchHit, hosts: Host[]): string | undefined {
 }
 
 function Button({ children, onClick, disabled = false, primary = false, ariaLabel }: { children: React.ReactNode; onClick: () => void; disabled?: boolean; primary?: boolean; ariaLabel?: string }) {
-  return <button type="button" className="nm-btn" onClick={onClick} disabled={disabled} aria-label={ariaLabel} style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", gap: 5, minHeight: 30, padding: "4px 9px", border: `1px solid ${primary ? "var(--accent)" : "var(--border)"}`, borderRadius: "var(--radius-md)", background: primary ? "var(--accent-subtle)" : "var(--bg-elevated)", color: primary ? "var(--accent)" : "var(--text-dim)", cursor: disabled ? "default" : "pointer", opacity: disabled ? 0.55 : 1, fontSize: 11.5, fontWeight: primary ? 700 : 600 }}>{children}</button>;
+  return <button type="button" className="nm-btn" onClick={onClick} disabled={disabled} aria-label={ariaLabel} style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", gap: 5, minHeight: 30, padding: "4px 9px", border: `1px solid ${primary ? "var(--accent)" : "var(--border)"}`, borderRadius: "var(--radius)", background: primary ? "var(--accent-subtle)" : "var(--bg-elevated)", color: primary ? "var(--accent)" : "var(--text-dim)", cursor: disabled ? "default" : "pointer", opacity: disabled ? 0.55 : 1, fontSize: 11.5, fontWeight: primary ? 700 : 600 }}>{children}</button>;
 }
 
 export default function CaseSearchView({ hosts, currentHostId, timeRange, isBookmarked, onOpenSource, onToggleBookmark, onFetchLinkedRows, accountDirectoryForHost }: Props) {
+  // Inherit the result view's open/bookmark actions for source records.
+  const outerScope = useContext(RecordScopeContext);
   const [query, setQuery] = useState("");
   const [ran, setRan] = useState("");
   const [hits, setHits] = useState<SearchHit[]>([]);
@@ -194,7 +198,7 @@ export default function CaseSearchView({ hosts, currentHostId, timeRange, isBook
   return (
     <main className="dfir-view" aria-labelledby="case-search-title" style={{ display: "flex", flexDirection: "column", flex: 1, minHeight: 0, minWidth: 0 }}>
       <ViewHeader icon={SearchOutlinedIcon} title="케이스 전체 검색" titleId="case-search-title" right={<span style={{ color: "var(--text-faint)", fontSize: 11.5 }}>{rangeActive(timeRange) ? "전역 기간 필터 적용" : "전체 기간"}</span>}>
-        <label style={{ flex: "0 1 380px", minWidth: 230 }}><input value={query} autoFocus onChange={(event) => setQuery(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") startSearch(); }} aria-label="케이스 전체 검색어" placeholder="IP · 계정 · 파일명 · 명령 검색 (2자 이상)" style={{ width: "100%", minHeight: 31, padding: "5px 10px", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", background: "var(--bg-elevated)", color: "var(--text)", fontFamily: "var(--mono)", fontSize: 12.5 }} /></label>
+        <label style={{ flex: "0 1 380px", minWidth: 230 }}><input value={query} autoFocus onChange={(event) => setQuery(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") startSearch(); }} aria-label="케이스 전체 검색어" placeholder="IP · 계정 · 파일명 · 명령 검색 (2자 이상)" style={{ width: "100%", minHeight: 31, padding: "5px 10px", border: "1px solid var(--border)", borderRadius: "var(--radius)", background: "var(--bg-elevated)", color: "var(--text)", fontFamily: "var(--mono)", fontSize: 12.5 }} /></label>
         <Button onClick={startSearch} disabled={loading || query.trim().length < 2} primary>{loading ? <CircularProgress size={14} thickness={5} aria-label="검색 중" /> : "검색"}</Button>
         <MultiSelectDropdown
           icon={<DnsOutlinedIcon sx={{ fontSize: 15 }} />}
@@ -235,7 +239,13 @@ export default function CaseSearchView({ hosts, currentHostId, timeRange, isBook
       </section>
 
       {detail && !detail.result && <DetailStatus detail={detail} onClose={closeDetail} onRetry={() => void openDetail(detail.hit)} />}
-      {detail?.result && <RowDetailPanel row={detail.result.row!} columns={detail.result.columns} focusedColumn={detail.hit.matchColumn || null} fileBaseName={detail.hit.tableName} onClose={closeDetail} onNavigate={() => {}} onFetchLinkedRows={onFetchLinkedRows} hostDir={hostDirForHit(detail.hit, hosts)} accountDirectory={accountDirectoryForHost?.(detail.hit.hostId)} isBookmarked={isBookmarked(detail.hit)} onToggleBookmark={() => onToggleBookmark(detail.hit)} />}
+      {detail?.result && (
+        // The hit's own coordinates — source_records can only be read from the
+        // DB that holds the row.
+        <RecordScopeContext.Provider value={{ ...outerScope, fullPath: detail.hit.fullPath, tableName: detail.hit.tableName }}>
+          <RowDetailPanel row={detail.result.row!} columns={detail.result.columns} focusedColumn={detail.hit.matchColumn || null} fileBaseName={detail.hit.tableName} onClose={closeDetail} onNavigate={() => {}} onFetchLinkedRows={onFetchLinkedRows} hostDir={hostDirForHit(detail.hit, hosts)} accountDirectory={accountDirectoryForHost?.(detail.hit.hostId)} isBookmarked={isBookmarked(detail.hit)} onToggleBookmark={() => onToggleBookmark(detail.hit)} />
+        </RecordScopeContext.Provider>
+      )}
     </main>
   );
 }
@@ -243,18 +253,18 @@ export default function CaseSearchView({ hosts, currentHostId, timeRange, isBook
 function SearchLedgerRow({ hit, bookmarked, currentHostId, onOpen, onOpenSource }: { hit: SearchHit; bookmarked: boolean; currentHostId: string | null; onOpen: () => void; onOpenSource: () => void }) {
   const hostColor = hit.hostId === currentHostId ? "var(--accent)" : "var(--text-dim)";
   return (
-    <article className={bookmarked ? "dfir-bookmarked-row" : undefined} style={{ borderRadius: "var(--radius-md)", display: "flex", alignItems: "center", gap: 12, minHeight: 62, marginBottom: 8, padding: "10px 14px", border: "1px solid var(--border)", background: "var(--bg-panel)", transition: "background .15s ease, border-color .15s ease" }}
+    <article className={bookmarked ? "dfir-bookmarked-row" : undefined} style={{ borderRadius: "var(--radius)", display: "flex", alignItems: "center", gap: 12, minHeight: 62, marginBottom: 8, padding: "10px 14px", border: "1px solid var(--border)", background: "var(--bg-panel)", transition: "background .15s ease, border-color .15s ease" }}
       onMouseEnter={(event) => { if (!bookmarked) event.currentTarget.style.background = "var(--bg-hover)"; }}
       onMouseLeave={(event) => { if (!bookmarked) event.currentTarget.style.background = "var(--bg-panel)"; }}>
       <button type="button" onClick={onOpen} aria-label={`${hit.hostName} ${hit.fileName} 검색 결과 상세 보기`} style={{ flex: 1, display: "flex", alignItems: "center", gap: 12, minWidth: 0, padding: 0, border: "none", background: "transparent", color: "inherit", cursor: "pointer", textAlign: "left" }}>
-        <span aria-hidden="true" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 34, height: 34, flexShrink: 0, borderRadius: "var(--radius-sm)", background: "var(--accent-subtle)" }}>
+        <span aria-hidden="true" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 34, height: 34, flexShrink: 0, borderRadius: "var(--radius)", background: "var(--accent-subtle)" }}>
           <SearchOutlinedIcon sx={{ fontSize: 17, color: "var(--accent)" }} />
         </span>
         <span style={{ flex: 1, minWidth: 0, display: "grid", gap: 3 }}>
           <span title={hit.matchValue} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text)", fontFamily: "var(--mono)", fontSize: 12.5, fontWeight: 650 }}>{hit.matchValue || "값 없음"}</span>
           <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text-faint)", fontSize: 12 }}>{hit.fileName || hit.tableName} · {hit.matchColumn || "일치 필드 없음"}</span>
         </span>
-        <span style={{ flexShrink: 0, maxWidth: 130, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 11.5, fontWeight: 700, color: hostColor, border: `1px solid ${hostColor}`, borderRadius: "var(--radius-sm)", padding: "1px 8px" }}>{hit.hostName || "알 수 없는 호스트"}</span>
+        <span style={{ flexShrink: 0, maxWidth: 130, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 11.5, fontWeight: 700, color: hostColor, border: `1px solid ${hostColor}`, borderRadius: "var(--radius)", padding: "1px 8px" }}>{hit.hostName || "알 수 없는 호스트"}</span>
         <time style={{ flexShrink: 0, width: 172, textAlign: "right", color: hit.timestamp ? "var(--text-time)" : "var(--text-faint)", fontFamily: "var(--mono)", fontSize: 12.5, whiteSpace: "nowrap" }}>{hit.timestamp ? formatEvidenceTimestamp(hit.timestamp) : "시간 정보 없음"}</time>
       </button>
       <span style={{ flexShrink: 0 }}><Button onClick={onOpenSource} ariaLabel={`${hit.fileName || hit.tableName} 원본 위치 열기`}><OpenInNewOutlinedIcon sx={{ fontSize: 15 }} /></Button></span>
@@ -267,7 +277,7 @@ function DetailStatus({ detail, onClose, onRetry }: { detail: DetailState; onClo
   const message = loading ? "원본 행을 불러오는 중입니다." : detail.error === "missing" ? "원본 행을 찾을 수 없습니다. 결과가 다시 파싱되었을 수 있습니다." : "원본 행을 불러오지 못했습니다.";
   // Keep this non-modal: a source-row fetch must not block the rest of the
   // analysis workspace. The common RowDetailPanel opens as soon as it resolves.
-  return <aside role={loading ? "status" : "alert"} aria-live="polite" aria-label="검색 결과 상세 불러오기" style={{ position: "fixed", zIndex: 70, right: 18, bottom: 18, width: "min(420px, calc(100vw - 36px))", padding: 14, border: "1px solid var(--border)", borderRadius: "var(--radius-lg)", background: "var(--bg-panel)", boxShadow: "var(--shadow-panel)" }}><div style={{ display: "flex", alignItems: "center", gap: 8, color: "var(--text-dim)", fontSize: 12.5 }}>{loading && <CircularProgress size={17} thickness={5} aria-label="원본 행 로딩" />}{message}</div><div style={{ display: "flex", justifyContent: "flex-end", gap: 6, marginTop: 14 }}>{!loading && <Button onClick={onRetry}><RefreshOutlinedIcon sx={{ fontSize: 15 }} />다시 시도</Button>}<Button onClick={onClose}>닫기</Button></div></aside>;
+  return <aside role={loading ? "status" : "alert"} aria-live="polite" aria-label="검색 결과 상세 불러오기" style={{ position: "fixed", zIndex: 70, right: 18, bottom: 18, width: "min(420px, calc(100vw - 36px))", padding: 14, border: "1px solid var(--border)", borderRadius: "var(--radius)", background: "var(--bg-panel)", boxShadow: "var(--shadow-panel)" }}><div style={{ display: "flex", alignItems: "center", gap: 8, color: "var(--text-dim)", fontSize: 12.5 }}>{loading && <CircularProgress size={17} thickness={5} aria-label="원본 행 로딩" />}{message}</div><div style={{ display: "flex", justifyContent: "flex-end", gap: 6, marginTop: 14 }}>{!loading && <Button onClick={onRetry}><RefreshOutlinedIcon sx={{ fontSize: 15 }} />다시 시도</Button>}<Button onClick={onClose}>닫기</Button></div></aside>;
 }
 
 // Mirrors the master timeline's artifact filter: a color-dotted checkbox per
@@ -275,7 +285,7 @@ function DetailStatus({ detail, onClose, onRetry }: { detail: DetailState; onClo
 function ArtifactCheckRow({ label, checked, tone, onChange }: { label: string; checked: boolean; tone: ArtifactChipTone; onChange: () => void }) {
   return (
     <label
-      style={{ display: "flex", alignItems: "center", gap: 8, minHeight: 32, padding: "4px 7px 4px 9px", borderRadius: "var(--radius-sm)", background: "transparent", color: checked ? "var(--text)" : "var(--text-faint)", width: "100%", minWidth: 0, cursor: "pointer", userSelect: "none", transition: "background .12s ease" }}
+      style={{ display: "flex", alignItems: "center", gap: 8, minHeight: 32, padding: "4px 7px 4px 9px", borderRadius: "var(--radius)", background: "transparent", color: checked ? "var(--text)" : "var(--text-faint)", width: "100%", minWidth: 0, cursor: "pointer", userSelect: "none", transition: "background .12s ease" }}
       onMouseEnter={(event) => { event.currentTarget.style.background = "var(--bg-hover)"; }}
       onMouseLeave={(event) => { event.currentTarget.style.background = "transparent"; }}
     >

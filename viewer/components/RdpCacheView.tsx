@@ -59,8 +59,11 @@ export default function RdpCacheView({ data, mode = "fragments" }: RdpCacheViewP
         g = { account, source, mosaic: null, fragments: [], tiles: [] };
         byFile.set(key, g);
       }
-      if (r.kind === "mosaic") g.mosaic = r;
-      else if (r.kind === "fragment") g.fragments.push(r);
+      // 원본 타일 표(RdpBitmapCache)는 kind, 파생 표(RdpCache)는 event_type에
+      // 종류를 담는다 — 열고 있는 표에 맞는 컬럼만 읽는다.
+      const kind = isTiles ? r.kind : r.event_type;
+      if (kind === "mosaic") g.mosaic = r;
+      else if (kind === "fragment") g.fragments.push(r);
       else if (r.image) g.tiles.push(r);
     }
     for (const g of byFile.values()) {
@@ -121,7 +124,7 @@ export default function RdpCacheView({ data, mode = "fragments" }: RdpCacheViewP
         <section key={`${g.account} ${g.source}`} style={{ marginBottom: 30 }}>
           <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10, borderBottom: "1px solid var(--border-subtle)", paddingBottom: 6 }}>
             {g.account && (
-              <span style={{ fontSize: 11.5, fontWeight: 700, color: "var(--accent)", border: "1px solid var(--accent)", borderRadius: "var(--radius-lg)", padding: "1px 8px" }}>
+              <span style={{ fontSize: 11.5, fontWeight: 700, color: "var(--accent)", border: "1px solid var(--accent)", borderRadius: "var(--radius)", padding: "1px 8px" }}>
                 <PersonOutlineIcon aria-hidden="true" sx={{ fontSize: 14 }} /> {g.account}
               </span>
             )}
@@ -140,7 +143,7 @@ export default function RdpCacheView({ data, mode = "fragments" }: RdpCacheViewP
                 <div
                   onClick={() => setZoom({ img: src(g.mosaic!.image), label: `${g.source} · 전체 모자이크` })}
                   title="클릭하면 원본 크기로 확대"
-                  style={{ border: "1px solid var(--border)", borderRadius: "var(--radius-md)", overflow: "hidden", cursor: "zoom-in", background: "var(--bg)", lineHeight: 0 }}
+                  style={{ border: "1px solid var(--border)", borderRadius: "var(--radius)", overflow: "hidden", cursor: "zoom-in", background: "var(--bg)", lineHeight: 0 }}
                 >
                   <img src={src(g.mosaic.image)} alt="모자이크" style={{ width: "100%", display: "block", imageRendering: "pixelated" }} />
                 </div>
@@ -157,10 +160,10 @@ export default function RdpCacheView({ data, mode = "fragments" }: RdpCacheViewP
                     alt={`타일 ${t.tile_index}`}
                     title={`타일 ${t.tile_index} · ${t.width}×${t.height}${Number(t.count) > 1 ? ` · ${t.count}회` : ""} · 클릭하면 확대`}
                     onClick={() => setZoom({ img: src(t.image), label: `${g.source} · 타일 ${t.tile_index}` })}
-                    style={{ width: 64, height: 64, objectFit: "none", objectPosition: "top left", border: "1px solid var(--border-subtle)", borderRadius: "var(--radius-xs)", cursor: "zoom-in", background: "var(--bg)", imageRendering: "pixelated" }}
+                    style={{ width: 64, height: 64, objectFit: "none", objectPosition: "top left", border: "1px solid var(--border-subtle)", borderRadius: "var(--radius)", cursor: "zoom-in", background: "var(--bg)", imageRendering: "pixelated" }}
                   />
                   {Number(t.count) > 1 && (
-                    <span style={{ position: "absolute", right: 1, bottom: 1, background: "rgba(0,0,0,0.7)", color: "#fff", fontSize: 9, padding: "0 3px", borderRadius: "var(--radius-xs)" }}>×{t.count}</span>
+                    <span style={{ position: "absolute", right: 1, bottom: 1, background: "rgba(0,0,0,0.7)", color: "#fff", fontSize: 9, padding: "0 3px", borderRadius: "var(--radius)" }}>×{t.count}</span>
                   )}
                 </div>
               )}
@@ -177,7 +180,7 @@ export default function RdpCacheView({ data, mode = "fragments" }: RdpCacheViewP
                   type="button"
                   onClick={() => setZoom({ img: src(f.image), label: `${g.source} · 복원 조각 ${f.fragment_index} (${f.tile_count} 타일)` })}
                   title={`${f.tile_count} 타일 · ${f.cols}×${f.rows} · 클릭하면 확대`}
-                  style={{ display: "flex", alignItems: "center", justifyContent: "center", height: 180, padding: 6, border: "1px solid var(--border)", borderRadius: "var(--radius-md)", background: "var(--bg)", cursor: "zoom-in", overflow: "hidden" }}
+                  style={{ display: "flex", alignItems: "center", justifyContent: "center", height: 180, padding: 6, border: "1px solid var(--border)", borderRadius: "var(--radius)", background: "var(--bg)", cursor: "zoom-in", overflow: "hidden" }}
                 >
                   <img src={src(f.image)} alt={`복원 조각 ${f.fragment_index}`} style={{ maxWidth: "100%", maxHeight: "100%", imageRendering: "pixelated" }} />
                 </button>
@@ -203,7 +206,7 @@ export default function RdpCacheView({ data, mode = "fragments" }: RdpCacheViewP
           >
             <div style={{ width: "100%", display: "flex", alignItems: "center", gap: 10, color: "#fff", fontSize: 13, marginBottom: 10, flexShrink: 0 }}>
               <span id={zoomTitleId} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{zoom.label}</span>
-              <button type="button" onClick={() => setZoom(null)} data-dialog-autofocus aria-label="확대 이미지 닫기" title="닫기 (Esc)" style={{ marginLeft: "auto", display: "inline-flex", alignItems: "center", justifyContent: "center", width: 30, height: 30, padding: 0, border: "1px solid rgba(255,255,255,.24)", borderRadius: "var(--radius-sm)", background: "rgba(0,0,0,.28)", color: "#fff", cursor: "pointer" }}><CloseOutlinedIcon sx={{ fontSize: 18 }} /></button>
+              <button type="button" onClick={() => setZoom(null)} data-dialog-autofocus aria-label="확대 이미지 닫기" title="닫기 (Esc)" style={{ marginLeft: "auto", display: "inline-flex", alignItems: "center", justifyContent: "center", width: 30, height: 30, padding: 0, border: "1px solid rgba(255,255,255,.24)", borderRadius: "var(--radius)", background: "rgba(0,0,0,.28)", color: "#fff", cursor: "pointer" }}><CloseOutlinedIcon sx={{ fontSize: 18 }} /></button>
             </div>
             <img
               src={zoom.img}

@@ -12,6 +12,7 @@ import TimelineIcon from "@mui/icons-material/Timeline";
 import InfoOutlinedIcon from "@mui/icons-material/InfoOutlined";
 import FolderOpenOutlinedIcon from "@mui/icons-material/FolderOpenOutlined";
 import DesktopWindowsOutlinedIcon from "@mui/icons-material/DesktopWindowsOutlined";
+import HomeOutlinedIcon from "@mui/icons-material/HomeOutlined";
 import BoltOutlinedIcon from "@mui/icons-material/BoltOutlined";
 import ManageSearchOutlinedIcon from "@mui/icons-material/ManageSearchOutlined";
 import TerminalOutlinedIcon from "@mui/icons-material/TerminalOutlined";
@@ -26,8 +27,10 @@ import DeviceHubOutlinedIcon from "@mui/icons-material/DeviceHubOutlined";
 import HistoryOutlinedIcon from "@mui/icons-material/HistoryOutlined";
 import ReportProblemOutlinedIcon from "@mui/icons-material/ReportProblemOutlined";
 import ShieldOutlinedIcon from "@mui/icons-material/ShieldOutlined";
+import DeleteOutlineOutlinedIcon from "@mui/icons-material/DeleteOutlineOutlined";
 import type { Case, Host, CategoryEntry, ResultFileEntry } from "@/lib/types";
 import { EMPTY_TIME_RANGE, rangeActive, type TimeRange } from "@/lib/timeRange";
+import { browsableResultFiles } from "@/lib/resultTables";
 import DateTimeInput from "./DateTimeInput";
 
 const timeInputStyle: React.CSSProperties = {
@@ -35,7 +38,7 @@ const timeInputStyle: React.CSSProperties = {
   padding: "5px 8px",
   background: "var(--bg-input)",
   border: "1px solid var(--border)",
-  borderRadius: "var(--radius-sm)",
+  borderRadius: "var(--radius)",
   color: "var(--text)",
   fontSize: 11.5,
   fontFamily: "var(--mono)",
@@ -48,7 +51,7 @@ const timeInputStyle: React.CSSProperties = {
 // Category defaults to the artifact name; only UsnJrnl files under FileSystem.
 const ARTIFACT_CATEGORY: Record<string, string> = {
   UsnJrnl: "FILESYSTEM",
-  // MFT is a 종합 분석 item (_OVERVIEW/MFT_Records.sqlite → "파일 시스템 정보"),
+  // MFT is a 종합 분석 item (_OVERVIEW/FileSystemEntries → "파일 시스템 정보"),
   // not a raw category — map it there so it never shows as an empty "MFT"
   // placeholder in the 원본 데이터 list.
   MFT: "_OVERVIEW",
@@ -71,6 +74,7 @@ function categoryForArtifact(name: string): string {
 // PowerShell *event logs* live under EVENTLOG), so label it accordingly.
 const CATEGORY_LABELS: Record<string, string> = {
   POWERSHELL: "ConsoleHistory",
+  RECYCLEBIN: "휴지통",
 };
 
 /// 승격 분석 항목(WER·WMI·USN)의 결과 없음 표시 — 개요 테이블의 "0건에도
@@ -130,7 +134,8 @@ function EmptyCategoryRow({ name, label }: { name: string; label?: string }) {
 // name). Anything not listed (e.g. BrowserActivity) sorts after these.
 const OVERVIEW_ORDER: string[] = [
   "TargetInfo",
-  "MFT_Records",
+  "FileSystemEntries",
+  "RecycleBin",
   "RemoteDesktopHistory",
   "ExecutionHistory",
   "Defender",
@@ -159,7 +164,9 @@ const OVERVIEW_TABLE_NAMES: Record<string, string> = {
   RdpCache: "RDP Cache",
   ScheduledTasks: "작업 스케줄러",
   ServiceHistory: "서비스 이력",
-  MFT_Records: "파일 시스템 정보",
+  FileSystemEntries: "파일 시스템 정보",
+  RecycleBin: "휴지통",
+  MFT_Records: "파일 시스템 원본 레코드",
 };
 
 // 호스트 분석 소그룹 — 분석 관점별 묶음 (2026-08-31 사용자 확정, RDP Cache는
@@ -167,7 +174,7 @@ const OVERVIEW_TABLE_NAMES: Record<string, string> = {
 // 나머지는 _OVERVIEW 테이블 이름. 목록에 없는 테이블은 그룹 뒤에 그대로
 // 나열되는 안전망을 둔다 (새 테이블이 추가돼도 사라지지 않게).
 const ANALYSIS_GROUPS: { title: string; items: string[] }[] = [
-  { title: "파일 시스템", items: ["MFT_Records", "@USN"] },
+  { title: "파일 시스템", items: ["FileSystemEntries", "@USN", "RecycleBin"] },
   { title: "실행 흔적", items: ["ExecutionHistory", "PowerShellHistory", "ServiceHistory", "ScheduledTasks", "@WMI"] },
   { title: "네트워크 · 원격", items: ["RemoteDesktopHistory", "SmbHistory", "BitsHistory", "FirewallHistory", "BrowserActivity", "RdpCache"] },
   { title: "시스템 · 보안", items: ["RegistryFindings", "Defender", "@WER"] },
@@ -179,7 +186,9 @@ function OverviewTableIcon({ name }: { name: string }) {
     case "TargetInfo": return <InfoOutlinedIcon {...props} />;
     // This icon identifies a file-system evidence view, rather than decorating
     // the navigation label.
+    case "FileSystemEntries": return <FolderOpenOutlinedIcon {...props} />;
     case "MFT_Records": return <FolderOpenOutlinedIcon {...props} />;
+    case "RecycleBin": return <DeleteOutlineOutlinedIcon {...props} />;
     case "RemoteDesktopHistory": return <DesktopWindowsOutlinedIcon {...props} />;
     case "ExecutionHistory": return <BoltOutlinedIcon {...props} />;
     // Defender 뷰 헤더와 동일한 방패 아이콘.
@@ -359,11 +368,12 @@ function CategoryNode({ category, selectedFile, onSelectFile, displayName, pinne
   const [files, setFiles] = useState<ResultFileEntry[] | null>(null);
 
   useEffect(() => {
+    // 상세 전용 자식 표(source_records·ExecutionTimes…)는 열람 대상이 아니다.
     if (preloadedFiles) {
-      setFiles(preloadedFiles);
+      setFiles(browsableResultFiles(preloadedFiles));
       return;
     }
-    window.api.listResultFiles(category.fullPath).then(setFiles);
+    window.api.listResultFiles(category.fullPath).then((list) => setFiles(browsableResultFiles(list)));
   }, [category.fullPath, preloadedFiles]);
 
   // Group the per-table entries back by their source file, so one .sqlite is
@@ -553,9 +563,16 @@ export default function Sidebar({
   // 독립 화면이 없는 백데이터라 제외).
   const overviewByFile = useMemo(() => {
     const map = new Map<string, ResultFileEntry[]>();
-    for (const file of effectiveOverviewFiles ?? []) {
-      // WerReports는 "@WER"(오류 보고) 승격 항목이 열므로 일반 목록에서 제외.
-      if (file.name === "TargetInfo" || file.fileName === "PathReferences" || file.fileName === "AiConversations" || file.fileName === "WerReports") continue;
+    for (const file of browsableResultFiles(effectiveOverviewFiles ?? [])) {
+      // 승격 항목(@WER·@USN·@WMI)이 여는 파생 테이블과 화면이 없는 백데이터
+      // (경로 참조·AI 대화·공통 참조 정보 Metadata)는 일반 목록에서 제외한다.
+      if (file.name === "TargetInfo"
+        || file.fileName === "PathReferences"
+        || file.fileName === "AiConversations"
+        || file.fileName === "Metadata"
+        || file.fileName === "WerReports"
+        || file.fileName === "UsnJournal"
+        || file.fileName === "WmiSubscriptions") continue;
       if (!map.has(file.fileName)) map.set(file.fileName, []);
       map.get(file.fileName)!.push(file);
     }
@@ -592,42 +609,14 @@ export default function Sidebar({
   const effectiveWerEntry =
     (werOverviewEntry && werOverviewEntry.rowCount > 0 ? werOverviewEntry : null) ??
     (werEntry && werEntry.rowCount > 0 ? werEntry : null);
-  // USN 저널(FILESYSTEM/UsnJrnl_Records)도 전용 뷰가 있는 분석 항목이라
-  // 호스트 분석 목록으로 승격한다.
-  const fsCategory = categories.find((c) => c.name === "FILESYSTEM");
-  const [usnEntry, setUsnEntry] = useState<ResultFileEntry | null>(null);
-  useEffect(() => {
-    if (!fsCategory) {
-      setUsnEntry(null);
-      return;
-    }
-    let cancelled = false;
-    window.api.listResultFiles(fsCategory.fullPath).then((files) => {
-      if (!cancelled) setUsnEntry(files.find((file) => file.name === "UsnJrnl_Records") ?? files[0] ?? null);
-    });
-    return () => {
-      cancelled = true;
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [fsCategory?.fullPath]);
-  // WMI 이벤트 구독도 전용 뷰가 있는 분석 항목이라 같은 방식으로 승격한다.
-  const wmiCategory = categories.find((c) => c.name === "WMI");
-  const [wmiEntry, setWmiEntry] = useState<ResultFileEntry | null>(null);
-  useEffect(() => {
-    if (!wmiCategory) {
-      setWmiEntry(null);
-      return;
-    }
-    let cancelled = false;
-    window.api.listResultFiles(wmiCategory.fullPath).then((files) => {
-      if (!cancelled) setWmiEntry(files.find((file) => file.name === "WMI_Persistence") ?? files[0] ?? null);
-    });
-    return () => {
-      cancelled = true;
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [wmiCategory?.fullPath]);
-  const rawCategories = categories.filter((c) => c.name !== "_OVERVIEW" && c.name !== "WER" && c.name !== "WMI" && c.name !== "FILESYSTEM");
+  // USN 저널은 화면용 파생(_OVERVIEW/UsnJournal)을 연다 — 원본 facts
+  // (FILESYSTEM/UsnJrnl_Records)는 원본 데이터 목록에 그대로 남는다.
+  const usnEntry = effectiveOverviewFiles?.find((file) => file.fileName === "UsnJournal") ?? null;
+  // WMI 이벤트 구독도 화면용 파생(_OVERVIEW/WmiSubscriptions)을 연다.
+  const wmiEntry = effectiveOverviewFiles?.find((file) => file.fileName === "WmiSubscriptions") ?? null;
+  // FILESYSTEM(원본 USN facts)은 원본 데이터 목록에 남긴다 — 승격 항목이
+  // 파생 테이블을 열므로 원본은 여기서만 접근한다.
+  const rawCategories = categories.filter((c) => c.name !== "_OVERVIEW" && c.name !== "WER" && c.name !== "WMI");
 
   // Every artifact that ran, mapped to its category, in run order — so the
   // "원본 데이터" list is 1:1 with the run list. Categories with real output
@@ -639,7 +628,7 @@ export default function Sidebar({
   const seenNames = new Set<string>();
   for (const artifact of activeHost.artifactsRun ?? []) {
     const cat = categoryForArtifact(artifact);
-    if (cat === "_OVERVIEW" || cat === "WER" || cat === "WMI" || cat === "FILESYSTEM" || seenNames.has(cat)) continue;
+    if (cat === "_OVERVIEW" || cat === "WER" || cat === "WMI" || seenNames.has(cat)) continue;
     seenNames.add(cat);
     orderedNames.push(cat);
   }
@@ -662,15 +651,16 @@ export default function Sidebar({
       <div style={{ padding: 12, borderBottom: "1px solid var(--border)" }}>
         {/* Current host control. The internal session case is intentionally not shown. */}
         <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 8, fontSize: 11.5 }}>
-          <button className="nm-btn" onClick={onBackToHosts} title="호스트 목록" style={{ background: "var(--bg-elevated)", border: "1px solid var(--border)", color: "var(--accent)", cursor: "pointer", fontWeight: 600, fontSize: 11, padding: "3px 10px", borderRadius: "var(--radius-md)" }}>
-            호스트 등록
+          <button type="button" className="nm-btn" onClick={onBackToHosts} title="홈" style={{ display: "inline-flex", alignItems: "center", gap: 5, background: "var(--bg-elevated)", border: "1px solid var(--border)", color: "var(--accent)", cursor: "pointer", fontWeight: 600, fontSize: 11, padding: "3px 10px", borderRadius: "var(--radius)" }}>
+            <HomeOutlinedIcon sx={{ fontSize: 16 }} />
+            홈
           </button>
         </div>
         {/* host selector — switch between machines in this case */}
         <HostPicker hosts={activeCase.hosts} activeHost={activeHost} onSelectHost={onSelectHost} />
         <div
           className="sidebar-time-range-head"
-          style={{ marginTop: 10, padding: "8px 9px 9px", background: "var(--bg-elevated)", border: `1px solid ${hasTimeRange ? "color-mix(in srgb, var(--accent) 48%, var(--border))" : "var(--border)"}`, borderRadius: "var(--radius-md)" }}
+          style={{ marginTop: 10, padding: "8px 9px 9px", background: "var(--bg-elevated)", border: `1px solid ${hasTimeRange ? "color-mix(in srgb, var(--accent) 48%, var(--border))" : "var(--border)"}`, borderRadius: "var(--radius)" }}
         >
           <div style={{ display: "flex", alignItems: "center", gap: 6, minHeight: 22, marginBottom: 7 }}>
             <FilterAltOutlinedIcon sx={{ fontSize: 15, color: hasTimeRange ? "var(--accent)" : "var(--text-faint)" }} />
@@ -678,7 +668,7 @@ export default function Sidebar({
               기간 필터
             </span>
             {hasTimeRange && (
-              <button type="button" className="nm-btn" onClick={() => onTimeRangeChange(EMPTY_TIME_RANGE)} title="기간 초기화" aria-label="기간 초기화" style={{ padding: "2px 9px", fontSize: 10.5, background: "var(--bg-input)", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", color: "var(--accent)", cursor: "pointer", fontWeight: 650 }}>
+              <button type="button" className="nm-btn" onClick={() => onTimeRangeChange(EMPTY_TIME_RANGE)} title="기간 초기화" aria-label="기간 초기화" style={{ padding: "2px 9px", fontSize: 10.5, background: "var(--bg-input)", border: "1px solid var(--border)", borderRadius: "var(--radius)", color: "var(--accent)", cursor: "pointer", fontWeight: 650 }}>
                 초기화
               </button>
             )}
@@ -795,7 +785,6 @@ export default function Sidebar({
                   >
                     {open ? <KeyboardArrowDownIcon sx={{ fontSize: 18, color: "var(--text-faint)", flexShrink: 0 }} /> : <KeyboardArrowRightIcon sx={{ fontSize: 18, color: "var(--text-faint)", flexShrink: 0 }} />}
                     <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{group.title}</span>
-                    <span style={{ color: "var(--text-faint)", fontWeight: 400, fontSize: 11.5 }}>{rows.length}</span>
                   </button>
                   {open && (
                     <div style={{ margin: "0 0 6px 17px", paddingLeft: 3, borderLeft: "1px solid var(--border)" }}>{rows}</div>
@@ -849,7 +838,7 @@ function HostPicker({ hosts, activeHost, onSelectHost }: { hosts: Host[]; active
         aria-expanded={open}
         aria-label="호스트 전환"
         onClick={() => setOpen((value) => !value)}
-        style={{ width: "100%", display: "flex", alignItems: "center", gap: 8, minHeight: 34, padding: "6px 10px", background: "var(--bg-input)", color: "var(--text)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", cursor: "pointer", fontWeight: 600, fontSize: 13, textAlign: "left" }}
+        style={{ width: "100%", display: "flex", alignItems: "center", gap: 8, minHeight: 34, padding: "6px 10px", background: "var(--bg-input)", color: "var(--text)", border: "1px solid var(--border)", borderRadius: "var(--radius)", cursor: "pointer", fontWeight: 600, fontSize: 13, textAlign: "left" }}
       >
         <span aria-hidden="true" style={{ width: 7, height: 7, borderRadius: "50%", flexShrink: 0, background: activeHost.lastRunStatus === "ok" ? "var(--success)" : activeHost.lastRunStatus ? "var(--warning)" : "var(--text-faint)" }} />
         <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{activeHost.name}</span>
@@ -858,7 +847,7 @@ function HostPicker({ hosts, activeHost, onSelectHost }: { hosts: Host[]; active
       {open && (
         <>
           <div onClick={() => setOpen(false)} style={{ position: "fixed", inset: 0, zIndex: 60 }} />
-          <div role="listbox" aria-label="호스트 목록" style={{ position: "absolute", top: "calc(100% + 6px)", left: 0, right: 0, zIndex: 61, maxHeight: 340, overflowY: "auto", background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", boxShadow: "var(--shadow-panel)", padding: 5 }}>
+          <div role="listbox" aria-label="호스트 목록" style={{ position: "absolute", top: "calc(100% + 6px)", left: 0, right: 0, zIndex: 61, maxHeight: 340, overflowY: "auto", background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: "var(--radius)", boxShadow: "var(--shadow-panel)", padding: 5 }}>
             {hosts.map((host) => {
               const current = host.id === activeHost.id;
               return (
@@ -868,7 +857,7 @@ function HostPicker({ hosts, activeHost, onSelectHost }: { hosts: Host[]; active
                   role="option"
                   aria-selected={current}
                   onClick={() => { setOpen(false); if (!current) onSelectHost(host); }}
-                  style={{ width: "100%", display: "flex", alignItems: "center", gap: 8, minHeight: 34, padding: "5px 9px", background: current ? "var(--accent-subtle)" : "transparent", border: "none", borderRadius: "var(--radius-sm)", color: current ? "var(--accent)" : "var(--text)", cursor: "pointer", fontSize: 12.5, fontWeight: current ? 700 : 550, textAlign: "left" }}
+                  style={{ width: "100%", display: "flex", alignItems: "center", gap: 8, minHeight: 34, padding: "5px 9px", background: current ? "var(--accent-subtle)" : "transparent", border: "none", borderRadius: "var(--radius)", color: current ? "var(--accent)" : "var(--text)", cursor: "pointer", fontSize: 12.5, fontWeight: current ? 700 : 550, textAlign: "left" }}
                   onMouseEnter={(event) => { if (!current) event.currentTarget.style.background = "var(--bg-hover)"; }}
                   onMouseLeave={(event) => { if (!current) event.currentTarget.style.background = "transparent"; }}
                 >

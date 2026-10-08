@@ -271,7 +271,7 @@ export default function DataTable({
               background: "var(--accent-subtle)",
               color: "var(--accent)",
               border: "1px solid var(--accent)",
-              borderRadius: "var(--radius-lg)",
+              borderRadius: "var(--radius)",
               cursor: "pointer",
               fontWeight: 600,
             }}
@@ -289,7 +289,7 @@ export default function DataTable({
                 background: onlySuspicious ? "var(--danger-subtle)" : "transparent",
                 color: onlySuspicious ? "var(--danger)" : "var(--text-dim)",
                 border: `1px solid ${onlySuspicious ? "var(--danger)" : "var(--border)"}`,
-                borderRadius: "var(--radius-lg)",
+                borderRadius: "var(--radius)",
               }}
             >
               ⚠ 의심만
@@ -303,7 +303,7 @@ export default function DataTable({
               background: dense ? "var(--accent-subtle)" : "transparent",
               color: dense ? "var(--accent)" : "var(--text-dim)",
               border: `1px solid ${dense ? "var(--accent)" : "var(--border)"}`,
-              borderRadius: "var(--radius-lg)",
+              borderRadius: "var(--radius)",
             }}
           >
             {dense ? "촘촘" : "보통"}
@@ -322,7 +322,7 @@ export default function DataTable({
               padding: "6px 8px 6px 28px",
               background: "var(--bg-input)",
               border: "1px solid var(--border)",
-              borderRadius: "var(--radius-md)",
+              borderRadius: "var(--radius)",
               color: "var(--text)",
             }}
           />
@@ -347,7 +347,7 @@ export default function DataTable({
                   background: active ? "var(--accent-subtle)" : "transparent",
                   color: active ? "var(--accent)" : "var(--text-dim)",
                   border: `1px solid ${active ? "var(--accent)" : "var(--border)"}`,
-                  borderRadius: "var(--radius-lg)",
+                  borderRadius: "var(--radius)",
                   cursor: "pointer",
                   fontWeight: active ? 700 : 500,
                 }}

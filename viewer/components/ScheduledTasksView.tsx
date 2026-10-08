@@ -2,7 +2,7 @@
 import VisibilityOutlinedIcon from "@mui/icons-material/VisibilityOutlined";
 import AccountFilterChips from "@/components/AccountFilterChips";
 
-import { useEffect, useMemo, useState, type CSSProperties } from "react";
+import { useContext, useEffect, useMemo, useState, type CSSProperties } from "react";
 import KeyboardArrowDownOutlinedIcon from "@mui/icons-material/KeyboardArrowDownOutlined";
 import BookmarkBorderOutlinedIcon from "@mui/icons-material/BookmarkBorderOutlined";
 import BookmarkOutlinedIcon from "@mui/icons-material/BookmarkOutlined";
@@ -14,6 +14,7 @@ import { inRange, rangeActive, EMPTY_TIME_RANGE, type TimeRange } from "@/lib/ti
 import { tagsForPath, type Tag } from "@/lib/tagging";
 import type { CsvData, FetchLinkedRows } from "@/lib/types";
 import type { AccountDirectory } from "@/lib/accountIdentity";
+import { RecordScopeContext } from "@/lib/recordScope";
 import PaginationControls from "@/components/PaginationControls";
 import { HeaderSearchInput, SelectDropdown, SortDropdown, ViewHeader } from "@/components/FilterControls";
 
@@ -37,8 +38,10 @@ interface Entry {
   row: Row;
   rowid: number;
   name: string;
-  actions: string;
-  trigger: string;
+  taskPath: string;
+  /** 기록 종류 — 작업 정의 행과 작업 이벤트 행이 같은 표에 함께 있다. */
+  eventType: string;
+  result: string;
   runAs: string;
   isMicrosoft: boolean;
   enabled: boolean | null;
@@ -50,33 +53,35 @@ interface Entry {
 function truthValue(value: string | undefined): boolean | null {
   const normalized = value?.trim().toLowerCase();
   if (!normalized) return null;
-  if (["1", "true", "yes", "enabled", "사용", "예"].includes(normalized)) return true;
-  if (["0", "false", "no", "disabled", "미사용", "아니오"].includes(normalized)) return false;
+  if (normalized === "1") return true;
+  if (normalized === "0") return false;
   return null;
 }
 
 function buildEntry(row: Row): Entry {
-  const tags = tagsForPath(row.actions || "");
+  // 실행 명령은 TaskActions 자식 표에 있다(저장 계약 docs-01) — 목록은 보이는
+  // 쪽만 따로 조회하므로, 경로 기반 위험 태그는 그 조회 결과로 붙인다.
   const hidden = truthValue(row.hidden) === true;
   return {
     row,
     rowid: Number((row as Record<string, unknown>).__rowid),
     name: row.task_name || "(작업 이름 없음)",
-    actions: row.actions || "",
-    trigger: row.trigger_types || "",
-    runAs: row.run_as || "",
+    taskPath: row.task_path || "",
+    eventType: row.event_type || "",
+    result: row.result || "",
+    runAs: row.run_as || row.run_as_sid || "",
     isMicrosoft: row.is_microsoft === "1",
     enabled: truthValue(row.enabled),
     hidden,
-    tags,
-    review: hidden || tags.length > 0,
+    tags: [],
+    review: hidden,
   };
 }
 
 function FilterButton({ active, children, onClick }: { active: boolean; children: React.ReactNode; onClick: () => void }) {
   return (
     <button type="button" onClick={onClick} aria-pressed={active} style={{
-      height: 30, padding: "0 10px", borderRadius: "var(--radius-sm)", border: `1px solid ${active ? "var(--accent)" : "var(--border)"}`,
+      height: 30, padding: "0 10px", borderRadius: "var(--radius)", border: `1px solid ${active ? "var(--accent)" : "var(--border)"}`,
       background: active ? "var(--accent-subtle)" : "transparent", color: active ? "var(--accent)" : "var(--text-dim)",
       fontSize: 11.5, fontWeight: active ? 700 : 500, cursor: "pointer", whiteSpace: "nowrap",
     }}>
@@ -87,7 +92,7 @@ function FilterButton({ active, children, onClick }: { active: boolean; children
 
 function Signal({ children, tone = "neutral" }: { children: React.ReactNode; tone?: "neutral" | "warning" | "danger" | "success" }) {
   const color = tone === "danger" ? "var(--danger)" : tone === "warning" ? "var(--warning)" : tone === "success" ? "var(--success)" : "var(--text-dim)";
-  return <span style={{ color, fontSize: 11.5, fontWeight: 700, border: `1px solid ${color}`, borderRadius: "var(--radius-sm)", padding: "1px 8px", whiteSpace: "nowrap" }}>{children}</span>;
+  return <span style={{ color, fontSize: 11.5, fontWeight: 700, border: `1px solid ${color}`, borderRadius: "var(--radius)", padding: "1px 8px", whiteSpace: "nowrap" }}>{children}</span>;
 }
 
 function taskState(entry: Entry): React.ReactNode {
@@ -154,7 +159,9 @@ export default function ScheduledTasksView({ data, onNavigate, onFetchLinkedRows
         if (enabledFilter === "enabled" && entry.enabled !== true) return false;
         if (enabledFilter === "disabled" && entry.enabled !== false) return false;
         if (!query) return true;
-        return [entry.name, entry.actions, entry.runAs, entry.trigger, entry.row.author || ""].some((value) => value.toLowerCase().includes(query));
+        // 실행 명령은 자식 표라 전체 검색 대상이 아니다 — 보이는 행의 명령은
+        // 아래에서 따로 조회해 보여 주고, 상세에는 전체가 나온다.
+        return [entry.name, entry.taskPath, entry.runAs, entry.eventType, entry.row.author || ""].some((value) => value.toLowerCase().includes(query));
       })
       .sort((left, right) => {
         // 등록 시각 기준 정렬 — 시각 없는 작업은 방향과 무관하게 뒤로.
@@ -177,28 +184,54 @@ export default function ScheduledTasksView({ data, onNavigate, onFetchLinkedRows
   const pageStart = timed.length ? safePage * PAGE + 1 : 0;
   const pageEnd = Math.min((safePage + 1) * PAGE, timed.length);
 
+  // 보이는 행의 실행 명령만 TaskActions에서 조회한다 — 목록 전체를 조인하지
+  // 않고, 조회된 명령으로만 경로 위험 태그를 붙인다(없는 값을 지어내지 않음).
+  const scope = useContext(RecordScopeContext);
+  const [actionsByRowid, setActionsByRowid] = useState<Record<number, string>>({});
+  const pageRowidKey = pageRows.map((entry) => entry.rowid).join(",");
+  useEffect(() => {
+    if (!scope?.fullPath) return;
+    const missing = pageRows.filter((entry) => Number.isFinite(entry.rowid) && actionsByRowid[entry.rowid] === undefined);
+    if (missing.length === 0) return;
+    let alive = true;
+    Promise.all(missing.map(async (entry) => {
+      const actionRows = await window.api.readRecordChildren(scope.fullPath, scope.tableName, entry.rowid, "TaskActions").catch(() => []);
+      const text = actionRows
+        .map((action) => [action.command, action.arguments].filter(Boolean).join(" "))
+        .filter(Boolean)
+        .join(" · ");
+      return [entry.rowid, text] as const;
+    })).then((loaded) => {
+      if (alive) setActionsByRowid((previous) => ({ ...previous, ...Object.fromEntries(loaded) }));
+    });
+    return () => { alive = false; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scope, pageRowidKey, actionsByRowid]);
+
   const renderEntry = (entry: Entry) => {
           const bookmarked = bookmarkedRowids?.has(entry.rowid) ?? false;
           const canBookmark = onToggleBookmark && Number.isFinite(entry.rowid);
-          const tileColor = entryColor(entry);
+          const actions = actionsByRowid[entry.rowid] ?? "";
+          const commandTags = actions ? tagsForPath(actions) : [];
+          const tileColor = entryColor({ ...entry, tags: commandTags, review: entry.review || commandTags.length > 0 });
           return (
             // 행 전체(여백 포함)가 상세 열기 클릭 대상 — 북마크는 전파 차단.
-            <div key={Number.isFinite(entry.rowid) ? entry.rowid : entry.name} className={bookmarked ? "dfir-bookmarked-row" : undefined} onClick={() => setSelected(entry)} style={{ borderRadius: "var(--radius-md)", display: "flex", alignItems: "center", gap: 12, minHeight: 62, marginBottom: 8, padding: "10px 14px", border: "1px solid var(--border)", background: "var(--bg-panel)", cursor: "pointer", transition: "background .15s ease, border-color .15s ease" }}
+            <div key={Number.isFinite(entry.rowid) ? entry.rowid : entry.name} className={bookmarked ? "dfir-bookmarked-row" : undefined} onClick={() => setSelected(entry)} style={{ borderRadius: "var(--radius)", display: "flex", alignItems: "center", gap: 12, minHeight: 62, marginBottom: 8, padding: "10px 14px", border: "1px solid var(--border)", background: "var(--bg-panel)", cursor: "pointer", transition: "background .15s ease, border-color .15s ease" }}
               onMouseEnter={(event) => { if (!bookmarked) event.currentTarget.style.background = "var(--bg-hover)"; }}
               onMouseLeave={(event) => { if (!bookmarked) event.currentTarget.style.background = "var(--bg-panel)"; }}>
               <button type="button" onClick={() => setSelected(entry)} aria-label={`${entry.name} 상세 보기`} style={{ flex: 1, display: "flex", alignItems: "center", gap: 12, minWidth: 0, padding: 0, border: 0, background: "transparent", color: "inherit", textAlign: "left", cursor: "pointer", outlineOffset: 2 }}>
-                <span aria-hidden="true" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 34, height: 34, flexShrink: 0, borderRadius: "var(--radius-sm)", background: `color-mix(in srgb, ${tileColor} 15%, transparent)` }}>
+                <span aria-hidden="true" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 34, height: 34, flexShrink: 0, borderRadius: "var(--radius)", background: `color-mix(in srgb, ${tileColor} 15%, transparent)` }}>
                   <TaskOutlinedIcon sx={{ fontSize: 17, color: tileColor }} />
                 </span>
                 <span style={{ flex: 1, minWidth: 0, display: "grid", gap: 3 }}>
                   <span style={{ display: "flex", alignItems: "center", gap: 7, minWidth: 0 }}>
                     <span title={entry.name} style={cellStyle({ color: "var(--text)", fontSize: 13.5, fontWeight: 700 })}>{entry.name}</span>
-                    {taskState(entry)}
+                    {taskState({ ...entry, tags: commandTags })}
                   </span>
-                  <span title={entry.actions || "동작 정보 없음"} style={cellStyle({ color: entry.actions ? "var(--text-dim)" : "var(--text-faint)", fontSize: 12, fontFamily: "var(--mono)" })}>{entry.actions || "동작 정보 없음"}</span>
+                  <span title={actions || "동작 정보 없음"} style={cellStyle({ color: actions ? "var(--text-dim)" : "var(--text-faint)", fontSize: 12, fontFamily: "var(--mono)" })}>{actions || (entry.taskPath || "동작 정보 없음")}</span>
                 </span>
                 <span title={entry.runAs || "계정 정보 없음"} style={cellStyle({ width: 150, flexShrink: 0, color: entry.runAs ? "var(--text-dim)" : "var(--text-faint)", fontSize: 12 })}>{entry.runAs || "계정 정보 없음"}</span>
-                <span title={entry.trigger || "트리거 정보 없음"} style={cellStyle({ width: 138, flexShrink: 0, color: entry.trigger ? "var(--text-dim)" : "var(--text-faint)", fontSize: 12 })}>{entry.trigger || "트리거 정보 없음"}</span>
+                <span title={entry.eventType || "기록 종류 없음"} style={cellStyle({ width: 138, flexShrink: 0, color: entry.eventType ? "var(--text-dim)" : "var(--text-faint)", fontSize: 12 })}>{[entry.eventType, entry.result].filter(Boolean).join(" · ") || "기록 종류 없음"}</span>
                 <time style={cellStyle({ width: 176, flexShrink: 0, textAlign: "right", color: entry.row.timestamp ? "var(--text-time)" : "var(--text-faint)", fontSize: 12, fontFamily: "var(--mono)" })}>{entry.row.timestamp || "시간 정보 없음"}</time>
               </button>
               {canBookmark && <button type="button" className={bookmarked ? "dfir-bookmark-control" : undefined} onClick={(clickEvent) => { clickEvent.stopPropagation(); onToggleBookmark(entry.rowid); }} aria-label={bookmarked ? "북마크 해제" : "북마크"} title={bookmarked ? "북마크 해제" : "북마크"} style={{ flexShrink: 0, width: 28, height: 28, display: "grid", placeItems: "center", border: 0, background: "transparent", color: bookmarked ? "var(--bookmark-control)" : "var(--text-faint)", cursor: "pointer" }}>{bookmarked ? <BookmarkOutlinedIcon sx={{ fontSize: 18 }} /> : <BookmarkBorderOutlinedIcon sx={{ fontSize: 18 }} />}</button>}
@@ -209,7 +242,7 @@ export default function ScheduledTasksView({ data, onNavigate, onFetchLinkedRows
   return (
     <div className="dfir-view" style={{ flex: 1, minHeight: 0, minWidth: 0, display: "flex", flexDirection: "column", background: "var(--bg)" }}>
       <ViewHeader icon={TaskOutlinedIcon} title="작업 스케줄러" meta={rangeOn ? `등록 시각 기준 ${filtered.length.toLocaleString()}건` : `등록 작업 ${counts.total.toLocaleString()}건`}>
-          <HeaderSearchInput value={search} onChange={setSearch} placeholder="작업 이름 · 명령 · 계정 · 트리거 검색" ariaLabel="작업 스케줄러 검색" width={300} />
+          <HeaderSearchInput value={search} onChange={setSearch} placeholder="작업 이름 · 경로 · 계정 · 기록 종류 검색" ariaLabel="작업 스케줄러 검색" width={300} />
           <AccountFilterChips accounts={allAccounts} hidden={hiddenAccounts} onToggle={(account: string) => setHiddenAccounts((previous) => { const next = new Set(previous); if (next.has(account)) next.delete(account); else next.add(account); return next; })} onReset={() => setHiddenAccounts(new Set())} accountDirectory={accountDirectory} />
           <SortDropdown value={sortDir} onChange={(next) => setSortDir(next as "asc" | "desc")} />
           <SelectDropdown
@@ -241,7 +274,7 @@ export default function ScheduledTasksView({ data, onNavigate, onFetchLinkedRows
 
       <section aria-label="예약 작업 목록" style={{ flex: 1, minHeight: 0, overflow: "auto", padding: 14 }}>
         {untimed.length > 0 && (
-          <div style={{ marginBottom: 10, border: "1px solid var(--border)", borderRadius: "var(--radius-md)", background: "var(--bg-panel)", overflow: "hidden" }}>
+          <div style={{ marginBottom: 10, border: "1px solid var(--border)", borderRadius: "var(--radius)", background: "var(--bg-panel)", overflow: "hidden" }}>
             <button
               type="button"
               onClick={() => setUntimedOpen((open) => !open)}

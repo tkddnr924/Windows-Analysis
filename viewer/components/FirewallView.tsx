@@ -42,7 +42,7 @@ const ACTION_COLOR: Record<string, string> = {
 interface Row {
   __rowid?: number;
   timestamp?: string;
-  kind?: string;
+  event_type?: string;
   rule_name?: string;
   rule_id?: string;
   app_path?: string;
@@ -58,7 +58,6 @@ interface Row {
   detail?: string;
   event_id?: string;
   provider?: string;
-  record_key?: string;
 }
 
 interface Props {
@@ -101,7 +100,7 @@ export default function FirewallView({
 
   const kindOptions = useMemo(() => {
     const counts = new Map<string, number>();
-    for (const row of inRangeRows) counts.set(row.kind || "(유형 없음)", (counts.get(row.kind || "(유형 없음)") ?? 0) + 1);
+    for (const row of inRangeRows) counts.set(row.event_type || "(유형 없음)", (counts.get(row.event_type || "(유형 없음)") ?? 0) + 1);
     return [
       { value: "all", label: "전체", count: inRangeRows.length },
       ...[...counts.entries()].sort((a, b) => b[1] - a[1]).map(([kind, count]) => ({ value: kind, label: kind, count, color: KIND_COLOR[kind] })),
@@ -111,7 +110,7 @@ export default function FirewallView({
   const shown = useMemo(() => {
     const needle = query.trim().toLowerCase();
     const filtered = inRangeRows.filter((row) => {
-      if (kindFilter !== "all" && (row.kind || "(유형 없음)") !== kindFilter) return false;
+      if (kindFilter !== "all" && (row.event_type || "(유형 없음)") !== kindFilter) return false;
       if (!needle) return true;
       return [row.rule_name, row.app_path, row.account, row.modifying_app, row.local_ports, row.remote_ports, row.detail]
         .some((value) => (value ?? "").toLowerCase().includes(needle));
@@ -149,7 +148,7 @@ export default function FirewallView({
         ) : paged.map((row, index) => {
           const rowid = Number((row as Record<string, unknown>).__rowid);
           const bookmarked = Number.isFinite(rowid) && (bookmarkedRowids?.has(rowid) ?? false);
-          const kindColor = KIND_COLOR[row.kind ?? ""] ?? "var(--text-dim)";
+          const kindColor = KIND_COLOR[row.event_type ?? ""] ?? "var(--text-dim)";
           const title = row.rule_name || row.detail || "(규칙 이름 없음)";
           const detailLine = row.detail && row.detail !== title ? row.detail : "";
           const line2 = row.app_path || row.modifying_app || detailLine;
@@ -159,15 +158,15 @@ export default function FirewallView({
             <div key={`${rowid}-${index}`} className={bookmarked ? "dfir-bookmarked-row" : undefined}
               onMouseEnter={(event) => { if (!bookmarked) event.currentTarget.style.background = "var(--bg-hover)"; }}
               onMouseLeave={(event) => { if (!bookmarked) event.currentTarget.style.background = "var(--bg-panel)"; }}
-              style={{ display: "flex", alignItems: "center", gap: 10, minHeight: 58, marginBottom: 8, padding: "8px 12px", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", background: "var(--bg-panel)", transition: "background .15s ease, border-color .15s ease" }}>
+              style={{ display: "flex", alignItems: "center", gap: 10, minHeight: 58, marginBottom: 8, padding: "8px 12px", border: "1px solid var(--border)", borderRadius: "var(--radius)", background: "var(--bg-panel)", transition: "background .15s ease, border-color .15s ease" }}>
               <div role="button" tabIndex={0} onClick={() => setSelected(row as Record<string, string>)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); setSelected(row as Record<string, string>); } }} aria-label={`${title} 상세 보기`} style={{ flex: 1, display: "flex", alignItems: "center", gap: 12, minWidth: 0, cursor: "pointer", outlineOffset: -2 }}>
-                <span aria-hidden="true" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 34, height: 34, flexShrink: 0, borderRadius: "var(--radius-sm)", background: `color-mix(in srgb, ${kindColor} 15%, transparent)` }}>
+                <span aria-hidden="true" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 34, height: 34, flexShrink: 0, borderRadius: "var(--radius)", background: `color-mix(in srgb, ${kindColor} 15%, transparent)` }}>
                   <SecurityOutlinedIcon sx={{ fontSize: 17, color: kindColor }} />
                 </span>
                 <span style={{ flex: 1, minWidth: 0, display: "grid", gap: 2 }}>
                   <span style={{ display: "flex", alignItems: "center", gap: 7, minWidth: 0 }}>
                     <span title={title} style={{ minWidth: 0, fontSize: 13.5, fontWeight: 700, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{title}</span>
-                    {row.kind && <Pill color={kindColor}>{row.kind}</Pill>}
+                    {row.event_type && <Pill color={kindColor}>{row.event_type}</Pill>}
                     {row.direction && <Pill color={DIRECTION_COLOR[row.direction] ?? "var(--text-dim)"}>{row.direction}</Pill>}
                     {row.action && <Pill color={ACTION_COLOR[row.action] ?? "var(--text-dim)"}>{row.action}</Pill>}
                   </span>
@@ -203,5 +202,5 @@ export default function FirewallView({
 }
 
 function Pill({ color, children }: { color: string; children: React.ReactNode }) {
-  return <span style={{ flexShrink: 0, fontSize: 11.5, fontWeight: 700, color, border: `1px solid ${color}`, borderRadius: "var(--radius-sm)", padding: "1px 8px", whiteSpace: "nowrap" }}>{children}</span>;
+  return <span style={{ flexShrink: 0, fontSize: 11.5, fontWeight: 700, color, border: `1px solid ${color}`, borderRadius: "var(--radius)", padding: "1px 8px", whiteSpace: "nowrap" }}>{children}</span>;
 }

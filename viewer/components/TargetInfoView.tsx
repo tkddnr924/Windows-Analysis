@@ -3,13 +3,14 @@ import { lookupEventCatalog } from "@/lib/eventCatalog";
 import EventNoteOutlinedIcon from "@mui/icons-material/EventNoteOutlined";
 import { ViewHeader } from "@/components/FilterControls";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useContext, useEffect, useMemo, useRef, useState } from "react";
 import ArrowBackOutlinedIcon from "@mui/icons-material/ArrowBackOutlined";
 import BookmarkBorderOutlinedIcon from "@mui/icons-material/BookmarkBorderOutlined";
 import BookmarkIcon from "@mui/icons-material/Bookmark";
 import ChevronLeftOutlinedIcon from "@mui/icons-material/ChevronLeftOutlined";
 import ChevronRightOutlinedIcon from "@mui/icons-material/ChevronRightOutlined";
 import CircularProgress from "@mui/material/CircularProgress";
+import Tooltip from "@mui/material/Tooltip";
 import DesktopWindowsOutlinedIcon from "@mui/icons-material/DesktopWindowsOutlined";
 import DnsOutlinedIcon from "@mui/icons-material/DnsOutlined";
 import LanOutlinedIcon from "@mui/icons-material/LanOutlined";
@@ -19,14 +20,17 @@ import SettingsOutlinedIcon from "@mui/icons-material/SettingsOutlined";
 import WarningAmberOutlinedIcon from "@mui/icons-material/WarningAmberOutlined";
 import WifiOutlinedIcon from "@mui/icons-material/WifiOutlined";
 import InfoOutlinedIcon from "@mui/icons-material/InfoOutlined";
-import type { AccountEventPage, AccountEventQuery, CsvData, Bookmark } from "@/lib/types";
+import type { AccountEventPage, AccountEventQuery, CsvData, Bookmark, DBRow, HostMetadata } from "@/lib/types";
 import type { FetchLinkedRows } from "@/lib/types";
+import { RecordScopeContext } from "@/lib/recordScope";
+import { hostDirOfResultPath } from "@/lib/resultTables";
 import { toBound, type TimeRange } from "@/lib/timeRange";
 import RowDetailPanel from "./RowDetailPanel";
 import { useModalDialog } from "@/lib/useModalDialog";
 import type { AccountDirectory } from "@/lib/accountIdentity";
 import { basename } from "@/lib/viewShared";
 import PaginationControls from "@/components/PaginationControls";
+import { expandAccountPath } from "@/lib/accountPath";
 
 interface TargetInfoViewProps {
   data: CsvData;
@@ -39,8 +43,9 @@ interface TargetInfoViewProps {
    * panel (RowDetailPanel) as every other view. */
   onNavigate?: (targetFile: string, targetColumn: string, value: string) => void;
   onFetchLinkedRows?: FetchLinkedRows;
-  /** Per-timestamp bookmarking of account rows (생성/최근 로그인/비밀번호 …). */
-  tableBookmarks?: Bookmark[];
+  /** Bookmark state of the source record a row (optionally one timestamp
+   *  field) points at. */
+  isRowBookmarked?: (row: Row, field?: string) => boolean;
   onToggleBookmark?: (rowid: number, field: string) => void;
   /** Account EventLog rows come from a raw source table, not TargetInfo. */
   eventBookmarks?: Bookmark[];
@@ -66,6 +71,7 @@ const SYSTEM_LABELS: Record<string, string> = {
   ComputerName: "컴퓨터 이름",
   TimeZone: "표준 시간대",
   LastShutdownTime: "마지막 종료 시각",
+  SystemRoot: "Windows 디렉터리",
 };
 
 // Display order for the system card — anything not listed falls to the end.
@@ -82,9 +88,12 @@ const SYSTEM_ORDER = [
 ];
 
 interface Account {
+  /** The TargetInfo row this entry came from; carries its source coordinates. */
+  row: Row;
   rowid: number;
   sid: string;
   path: string;
+  rawPath: string;
   username: string;
   /** Interactive human account (built-in Administrator or RID ≥ 1000) vs a
    * machine/service identity (LocalSystem, LocalService, ...). */
@@ -111,35 +120,43 @@ interface Account {
 }
 
 
-function buildAccount(r: Row): Account {
-  const sid = r.name || "";
+/**
+ * 계정·네트워크 속성은 Metadata.sqlite(공통 참조 정보)에서 온다 — TargetInfo
+ * 행은 표시값과 metadata_id 참조만 들고 있다(docs-01 #16). 계정명이 확인되지
+ * 않으면(NULL) 이름을 지어내지 않고 화면이 SID를 표시한다.
+ */
+function buildAccount(r: Row, meta?: DBRow, groups?: string): Account {
+  const sid = meta?.account_sid || r.name || "";
   const ridMatch = sid.match(/-(\d+)$/);
   const ridNum = ridMatch ? Number(ridMatch[1]) : NaN;
   // S-1-5-21-… is a machine/domain-issued account; RID 500 is the built-in
   // Administrator, RID ≥ 1000 are created users. Everything else (S-1-5-18/19/20)
   // is a service identity.
   const isUser = /^S-1-5-21-/.test(sid) && (ridNum === 500 || ridNum >= 1000);
+  const profilePath = meta?.profile_path_resolved || meta?.profile_path || r.value || "";
   return {
+    row: r,
     rowid: Number((r as unknown as Record<string, unknown>).__rowid),
     sid,
-    path: r.value || "",
-    username: r.username || basename(r.value || ""),
+    path: profilePath,
+    rawPath: meta?.profile_path || r.value || "",
+    username: meta?.account_name || meta?.value || "",
     isUser,
-    fullName: r.full_name || "",
-    rid: r.rid || (Number.isFinite(ridNum) ? String(ridNum) : ""),
-    ridSam: r.rid_sam || "",
-    homeDir: r.home_directory || r.value || "",
-    created: r.created || "",
-    lastLogin: r.last_login || "",
-    passwordLastSet: r.password_last_set || "",
-    lastFailedLogin: r.last_failed_login || "",
-    loginCount: r.login_count || "",
-    failedLoginCount: r.failed_login_count || "",
-    disabled: r.disabled || "",
-    specialAccount: r.special_account || "",
-    groups: r.groups || "",
-    accountFlags: r.account_flags || "",
-    sourceArtifact: r.source_artifact || "",
+    fullName: meta?.full_name || "",
+    rid: meta?.rid || (Number.isFinite(ridNum) ? String(ridNum) : ""),
+    ridSam: meta?.rid_sam || "",
+    homeDir: meta?.home_directory || profilePath,
+    created: meta?.created || "",
+    lastLogin: meta?.last_login || "",
+    passwordLastSet: meta?.password_last_set || "",
+    lastFailedLogin: meta?.last_failed_login || "",
+    loginCount: meta?.login_count || "",
+    failedLoginCount: meta?.failed_login_count || "",
+    disabled: meta?.disabled || "",
+    specialAccount: meta?.special_account || "",
+    groups: groups || "",
+    accountFlags: meta?.account_flags || "",
+    sourceArtifact: meta?.name_source || "",
   };
 }
 
@@ -154,7 +171,7 @@ function KeyVal({ label, children }: { label: string; children: React.ReactNode 
 
 function DetailSurface({ title, count, trailing, children }: { title: string; count?: number; trailing?: React.ReactNode; children: React.ReactNode }) {
   return (
-    <section style={{ background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", boxShadow: "var(--shadow-card)", overflow: "hidden" }}>
+    <section style={{ background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "var(--radius)", boxShadow: "var(--shadow-card)", overflow: "hidden" }}>
       <div style={{ minHeight: 40, display: "flex", alignItems: "center", padding: "0 14px", borderBottom: "1px solid var(--border-subtle)", fontSize: 13, fontWeight: 700 }}>
         {title}
         {count !== undefined && <span style={{ marginLeft: 7, color: "var(--text-faint)", fontSize: 11.5, fontWeight: 500 }}>{count.toLocaleString()}건</span>}
@@ -185,8 +202,12 @@ interface NetworkProfile {
   timestamp: string;
 }
 
-export default function TargetInfoView({ data, loadAccountEvents, timeRange, onNavigate, onFetchLinkedRows, tableBookmarks, onToggleBookmark, eventBookmarks, onToggleEventBookmark, accountDirectory }: TargetInfoViewProps) {
-  const bmRowids = useMemo(() => new Set((tableBookmarks ?? []).map((b) => b.rowid)), [tableBookmarks]);
+export default function TargetInfoView({ data, loadAccountEvents, timeRange, onNavigate, onFetchLinkedRows, isRowBookmarked, onToggleBookmark, eventBookmarks, onToggleEventBookmark, accountDirectory }: TargetInfoViewProps) {
+  // 북마크는 원본 레코드에 붙으므로 행이 실어 온 원본 좌표로 맞춘다.
+  const bmRowids = useMemo(
+    () => new Set((data.rows as Row[]).filter((row) => isRowBookmarked?.(row)).map((row) => Number((row as Record<string, unknown>).__rowid))),
+    [data.rows, isRowBookmarked],
+  );
   const [selectedAccount, setSelectedAccount] = useState<Account | null>(null);
   // 좌측 범주 내비게이션(25%)에서 고른 섹션을 우측(75%)에 표시한다.
   const [section, setSection] = useState<"accounts" | "system" | "interfaces" | "networks" | "hosts">("accounts");
@@ -194,7 +215,46 @@ export default function TargetInfoView({ data, loadAccountEvents, timeRange, onN
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [selectedInterface, setSelectedInterface] = useState<NetInterface | null>(null);
   const [selectedNetwork, setSelectedNetwork] = useState<NetworkProfile | null>(null);
-  const { system, users, services, networks, interfaces, hostsEntries, computerName, osSummary } = useMemo(() => {
+  // 호스트 공통 참조 정보(Metadata.sqlite) — 계정·네트워크 상세 속성의 출처다.
+  // 열려 있는 결과 파일 경로에서 호스트 폴더를 얻는다.
+  const scope = useContext(RecordScopeContext);
+  const hostDir = scope ? hostDirOfResultPath(scope.fullPath) : "";
+  const [hostMeta, setHostMeta] = useState<HostMetadata | null>(null);
+  const [hostMetaError, setHostMetaError] = useState<string | null>(null);
+  useEffect(() => {
+    setHostMeta(null);
+    setHostMetaError(null);
+    if (!hostDir) return;
+    let alive = true;
+    window.api.hostMetadata(hostDir)
+      .then((meta) => { if (alive) setHostMeta(meta); })
+      // 조회 실패를 "정보 없음"으로 보여 주면 없는 사실로 오인된다.
+      .catch(() => { if (alive) setHostMetaError("호스트 공통 참조 정보(metadata)를 불러오지 못했습니다."); });
+    return () => { alive = false; };
+  }, [hostDir]);
+  const metaIndex = useMemo(() => {
+    const byId = new Map<string, DBRow>();
+    for (const row of hostMeta?.rows ?? []) byId.set(row.metadata_id, row);
+    const join = (rows: DBRow[] | undefined, key: string) => {
+      const map = new Map<string, string[]>();
+      for (const row of rows ?? []) {
+        const value = row[key];
+        if (!value) continue;
+        const list = map.get(row.metadata_id);
+        if (list) list.push(value); else map.set(row.metadata_id, [value]);
+      }
+      return map;
+    };
+    return {
+      byId,
+      addresses: join(hostMeta?.addresses, "address"),
+      subnetMasks: join(hostMeta?.addresses, "subnet_mask"),
+      gateways: join(hostMeta?.gateways, "address"),
+      dnsServers: join(hostMeta?.dnsServers, "address"),
+      groups: join(hostMeta?.groups, "group_name"),
+    };
+  }, [hostMeta]);
+  const { system, users, services, networks, interfaces, hostsEntries, computerName } = useMemo(() => {
     const rows = data.rows as Row[];
 
     // The source hives are parsed once per copy, so identical facts repeat —
@@ -224,7 +284,8 @@ export default function TargetInfoView({ data, loadAccountEvents, timeRange, onN
         const prev = system.get(r.name);
         if (!prev || (!prev.value && value)) system.set(r.name, { value, timestamp: r.timestamp });
       } else if (cat === "Account") {
-        accounts.push(buildAccount(r));
+        const meta = r.metadata_id ? metaIndex.byId.get(r.metadata_id) : undefined;
+        accounts.push(buildAccount(r, meta, (metaIndex.groups.get(r.metadata_id) ?? []).join(", ")));
       } else if (cat === "Network") {
         const name = r.value || "";
         const existing = netMap.get(name);
@@ -236,21 +297,52 @@ export default function TargetInfoView({ data, loadAccountEvents, timeRange, onN
       } else if (cat === "NetworkInterface" && r.value) {
         const key = `${r.value}|${r.name}`;
         if (!ifaceMap.has(key)) {
+          // 주소·게이트웨이·DNS는 metadata의 자식 표에 있다(한 인터페이스가
+          // 여러 주소를 가질 수 있다). 상세 서랍이 읽을 수 있게 합쳐 둔다.
+          const metadataId = r.metadata_id || "";
+          const meta = metadataId ? metaIndex.byId.get(metadataId) : undefined;
+          const addresses = (metaIndex.addresses.get(metadataId) ?? []).join(", ");
+          const gateways = (metaIndex.gateways.get(metadataId) ?? []).join(", ");
+          const dnsServers = (metaIndex.dnsServers.get(metadataId) ?? []).join(", ");
+          const subnetMasks = (metaIndex.subnetMasks.get(metadataId) ?? []).join(", ");
           ifaceMap.set(key, {
-            row: r,
-            guid: r.name ?? "",
-            ip: r.value ?? "",
-            subnet: r.subnet_mask ?? "",
-            gateway: r.gateway ?? "",
-            dns: r.dns_server ?? "",
-            dhcpServer: r.dhcp_server ?? "",
-            domain: r.domain ?? "",
-            dhcp: r.dhcp_enabled ?? "",
-            leaseObtained: r.lease_obtained ?? "",
-            leaseTerminates: r.lease_terminates ?? "",
+            row: {
+              ...r,
+              interface_id: meta?.interface_id ?? "",
+              interface_name: meta?.interface_name ?? meta?.value ?? "",
+              mac_address: meta?.mac_address ?? "",
+              network_profile: meta?.network_profile ?? "",
+              dhcp_enabled: meta?.dhcp_enabled ?? "",
+              dhcp_server: meta?.dhcp_server ?? "",
+              lease_obtained: meta?.lease_obtained ?? "",
+              lease_terminates: meta?.lease_terminates ?? "",
+              domain: meta?.domain ?? "",
+              observed_at: meta?.observed_at ?? "",
+              resolution_status: meta?.resolution_status ?? "",
+              addresses,
+              subnet_masks: subnetMasks,
+              gateways,
+              dns_servers: dnsServers,
+            },
+            guid: meta?.interface_id || r.name || "",
+            ip: addresses || r.value || "",
+            subnet: subnetMasks,
+            gateway: gateways,
+            dns: dnsServers,
+            dhcpServer: meta?.dhcp_server ?? "",
+            domain: meta?.domain ?? "",
+            dhcp: meta?.dhcp_enabled ?? "",
+            leaseObtained: meta?.lease_obtained ?? "",
+            leaseTerminates: meta?.lease_terminates ?? "",
           });
         }
       }
+    }
+
+    const systemRoot = system.get("SystemRoot")?.value || "";
+    for (const account of accounts) {
+      account.path = expandAccountPath(account.path, systemRoot);
+      account.homeDir = expandAccountPath(account.homeDir, systemRoot);
     }
 
     const users = accounts.filter((a) => a.isUser).sort((a, b) => a.username.localeCompare(b.username));
@@ -260,12 +352,9 @@ export default function TargetInfoView({ data, loadAccountEvents, timeRange, onN
     const interfaces = [...ifaceMap.values()].sort((a, b) => a.ip.localeCompare(b.ip));
 
     const computerName = system.get("ComputerName")?.value || "알 수 없는 시스템";
-    const product = system.get("ProductName")?.value || "";
-    const build = system.get("CurrentBuild")?.value || "";
-    const osSummary = [product, build && `Build ${build}`].filter(Boolean).join(" · ");
 
-    return { system, users, services, networks, interfaces, hostsEntries, computerName, osSummary };
-  }, [data.rows]);
+    return { system, users, services, networks, interfaces, hostsEntries, computerName };
+  }, [data.rows, metaIndex]);
 
   const orderedSystem = useMemo(() => {
     const keys = [...system.keys()];
@@ -280,7 +369,7 @@ export default function TargetInfoView({ data, loadAccountEvents, timeRange, onN
   // Clicking an account opens a full page (not a modal) — account detail plus
   // the EventLog activity for its SID.
   if (selectedAccount) {
-    return <AccountDetailPage account={selectedAccount} onBack={() => setSelectedAccount(null)} loadEvents={loadAccountEvents} timeRange={timeRange} onNavigate={onNavigate} onFetchLinkedRows={onFetchLinkedRows} tableBookmarks={tableBookmarks} onToggleBookmark={onToggleBookmark} eventBookmarks={eventBookmarks} onToggleEventBookmark={onToggleEventBookmark} accountDirectory={accountDirectory} />;
+    return <AccountDetailPage account={selectedAccount} onBack={() => setSelectedAccount(null)} loadEvents={loadAccountEvents} timeRange={timeRange} onNavigate={onNavigate} onFetchLinkedRows={onFetchLinkedRows} isRowBookmarked={isRowBookmarked} onToggleBookmark={onToggleBookmark} eventBookmarks={eventBookmarks} onToggleEventBookmark={onToggleEventBookmark} accountDirectory={accountDirectory} />;
   }
 
   const accounts = [...users, ...services];
@@ -295,7 +384,8 @@ export default function TargetInfoView({ data, loadAccountEvents, timeRange, onN
 
   return (
     <div className="dfir-view" style={{ flex: 1, minWidth: 0, minHeight: 0, display: "flex", flexDirection: "column", overflow: "hidden", background: "var(--bg)" }}>
-      <ViewHeader icon={InfoOutlinedIcon} title={<>호스트 정보 <span aria-hidden="true" style={{ color: "var(--text-faint)", padding: "0 2px" }}>|</span> {computerName}</>} right={osSummary ? <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text-dim)", fontSize: 12.5 }}>{osSummary}</span> : undefined} />
+      <ViewHeader icon={InfoOutlinedIcon} title={<>호스트 정보 <span aria-hidden="true" style={{ color: "var(--text-faint)", padding: "0 2px" }}>|</span> {computerName}</>} />
+      {hostMetaError && <div role="alert" style={{ padding: "6px 14px", color: "var(--danger)", fontSize: 12 }}>{hostMetaError}</div>}
 
       <div style={{ flex: 1, minHeight: 0, display: "grid", gridTemplateColumns: "minmax(170px, 15%) minmax(0, 1fr)", overflow: "hidden" }}>
         <nav aria-label="호스트 정보 범주" style={{ minHeight: 0, overflow: "auto", padding: 10, borderRight: "1px solid var(--border)" }}>
@@ -303,7 +393,7 @@ export default function TargetInfoView({ data, loadAccountEvents, timeRange, onN
           {sections.map(({ key, label, icon: Icon }) => {
             const active = section === key;
             return (
-              <button key={key} type="button" onClick={() => setSection(key)} className={active ? "nm-btn" : undefined} style={{ width: "100%", minHeight: 36, marginBottom: 2, padding: "0 10px", display: "flex", alignItems: "center", justifyContent: "flex-start", gap: 8, border: active ? "1px solid color-mix(in srgb, var(--accent) 45%, var(--border))" : "1px solid transparent", borderRadius: "var(--radius-md)", background: active ? "var(--accent-subtle)" : "transparent", color: active ? "var(--text)" : "var(--text-dim)", cursor: "pointer", textAlign: "left" }}>
+              <button key={key} type="button" onClick={() => setSection(key)} className={active ? "nm-btn" : undefined} style={{ width: "100%", minHeight: 36, marginBottom: 2, padding: "0 10px", display: "flex", alignItems: "center", justifyContent: "flex-start", gap: 8, border: active ? "1px solid color-mix(in srgb, var(--accent) 45%, var(--border))" : "1px solid transparent", borderRadius: "var(--radius)", background: active ? "var(--accent-subtle)" : "transparent", color: active ? "var(--text)" : "var(--text-dim)", cursor: "pointer", textAlign: "left" }}>
                 <Icon sx={{ fontSize: 16, flexShrink: 0, color: active ? "var(--accent)" : "inherit" }} />
                 <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 12.5, fontWeight: active ? 700 : 550 }}>{label}</span>
               </button>
@@ -316,12 +406,15 @@ export default function TargetInfoView({ data, loadAccountEvents, timeRange, onN
 
           {section === "hosts" && (
             <div style={{ display: "grid", gridTemplateColumns: "1fr", gap: 8, alignContent: "start" }}>
-              <div style={{ color: "var(--text-faint)", fontSize: 11.5, padding: "0 2px 2px" }}>hosts 파일에 수동 등록된 이름-주소 매핑 {hostsEntries.length}건</div>
               {hostsEntries.map((entry, index) => (
-                <div key={`${entry.ip}-${entry.name}-${index}`} style={{ display: "flex", alignItems: "center", gap: 12, minHeight: 46, padding: "0 14px", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", background: "var(--bg-panel)" }}>
-                  <DnsOutlinedIcon sx={{ fontSize: 17, color: "var(--accent)", flexShrink: 0 }} />
-                  <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 13.5, fontWeight: 700 }}>{entry.name || "이름 없음"}</span>
-                  <span style={{ flexShrink: 0, color: "var(--text-dim)", fontFamily: "var(--mono)", fontSize: 12.5 }}>{entry.ip}</span>
+                <div key={`${entry.ip}-${entry.name}-${index}`} style={{ display: "flex", alignItems: "center", gap: 12, minHeight: 62, padding: "10px 14px", border: "1px solid var(--border)", borderRadius: "var(--radius)", background: "var(--bg-panel)" }}>
+                  <span aria-hidden="true" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 34, height: 34, flexShrink: 0, borderRadius: "var(--radius)", background: "color-mix(in srgb, var(--text-dim) 14%, transparent)" }}>
+                    <DnsOutlinedIcon sx={{ fontSize: 17, color: "var(--text-dim)" }} />
+                  </span>
+                  <span style={{ flex: 1, minWidth: 0, display: "grid", gap: 3 }}>
+                    <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 13.5, fontWeight: 700 }} title={entry.name}>{entry.name || "이름 없음"}</span>
+                    <span style={{ color: "var(--text-dim)", fontFamily: "var(--mono)", fontSize: 12, overflowWrap: "anywhere" }}>{entry.ip}</span>
+                  </span>
                 </div>
               ))}
             </div>
@@ -350,12 +443,17 @@ export default function TargetInfoView({ data, loadAccountEvents, timeRange, onN
                           setTimeout(() => setCopiedKey((current) => (current === k ? null : current)), 1200);
                         });
                       }}
-                      style={{ border: `1px solid ${copied ? "color-mix(in srgb, var(--success) 55%, var(--border))" : "var(--border)"}`, borderRadius: "var(--radius-md)", background: "var(--bg-panel)", padding: "10px 14px", display: "flex", alignItems: "center", gap: 12, color: "inherit", cursor: value ? "pointer" : "default", textAlign: "left", fontFamily: "inherit", transition: "background .15s ease, border-color .15s ease" }}
+                      style={{ border: `1px solid ${copied ? "color-mix(in srgb, var(--success) 55%, var(--border))" : "var(--border)"}`, borderRadius: "var(--radius)", background: "var(--bg-panel)", padding: "10px 14px", display: "flex", alignItems: "center", gap: 12, color: "inherit", cursor: value ? "pointer" : "default", textAlign: "left", fontFamily: "inherit", transition: "background .15s ease, border-color .15s ease" }}
                       onMouseEnter={(e) => { e.currentTarget.style.background = "var(--bg-hover)"; }}
                       onMouseLeave={(e) => { e.currentTarget.style.background = "var(--bg-panel)"; }}
                     >
-                      <span style={{ width: 150, flexShrink: 0, color: "var(--text-faint)", fontSize: 11.5, fontWeight: 700, letterSpacing: 0.3 }}>{SYSTEM_LABELS[k] ?? k}</span>
-                      <span style={{ flex: 1, minWidth: 0, color: value ? "var(--text)" : "var(--text-faint)", fontSize: 14, fontWeight: 650, fontFamily: mono ? "var(--mono)" : undefined, wordBreak: "break-all" }}>{value || "정보 없음"}</span>
+                      <span aria-hidden="true" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 34, height: 34, flexShrink: 0, borderRadius: "var(--radius)", background: "color-mix(in srgb, var(--text-dim) 14%, transparent)" }}>
+                        <DesktopWindowsOutlinedIcon sx={{ fontSize: 17, color: "var(--text-dim)" }} />
+                      </span>
+                      <span style={{ flex: 1, minWidth: 0, display: "grid", gap: 3 }}>
+                        <span style={{ color: "var(--text-dim)", fontSize: 12 }}>{SYSTEM_LABELS[k] ?? k}</span>
+                        <span style={{ color: value ? "var(--text)" : "var(--text-faint)", fontSize: 13.5, fontWeight: 700, fontFamily: mono ? "var(--mono)" : undefined, wordBreak: "break-all" }}>{value || "정보 없음"}</span>
+                      </span>
                       {copied && <span style={{ flexShrink: 0, color: "var(--success)", fontSize: 11.5, fontWeight: 700 }}>복사됨</span>}
                     </button>
                   );
@@ -374,11 +472,11 @@ export default function TargetInfoView({ data, loadAccountEvents, timeRange, onN
                   key={`${n.ip}|${n.guid}`}
                   onClick={() => { setSelectedNetwork(null); setSelectedInterface(n); }}
                   aria-label={`${n.ip} 어댑터 상세 보기`}
-                  style={{ borderRadius: "var(--radius-md)", width: "100%", display: "flex", alignItems: "center", gap: 12, minHeight: 58, marginBottom: 8, padding: "9px 14px", border: `1px solid ${active ? "var(--accent)" : "var(--border)"}`, background: active ? "var(--bg-selected)" : "var(--bg-panel)", color: "var(--text)", cursor: "pointer", textAlign: "left", fontFamily: "inherit", transition: "background .15s ease, border-color .15s ease" }}
+                  style={{ borderRadius: "var(--radius)", width: "100%", display: "flex", alignItems: "center", gap: 12, minHeight: 58, marginBottom: 8, padding: "9px 14px", border: `1px solid ${active ? "var(--accent)" : "var(--border)"}`, background: active ? "var(--bg-selected)" : "var(--bg-panel)", color: "var(--text)", cursor: "pointer", textAlign: "left", fontFamily: "inherit", transition: "background .15s ease, border-color .15s ease" }}
                   onMouseEnter={(e) => { if (!active) e.currentTarget.style.background = "var(--bg-hover)"; }}
                   onMouseLeave={(e) => { e.currentTarget.style.background = active ? "var(--bg-selected)" : "var(--bg-panel)"; }}
                 >
-                  <span aria-hidden="true" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 34, height: 34, flexShrink: 0, borderRadius: "var(--radius-sm)", background: "var(--accent-subtle)" }}>
+                  <span aria-hidden="true" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 34, height: 34, flexShrink: 0, borderRadius: "var(--radius)", background: "var(--accent-subtle)" }}>
                     <LanOutlinedIcon sx={{ fontSize: 17, color: "var(--accent)" }} />
                   </span>
                   <span style={{ flex: 1, minWidth: 0, display: "grid", gap: 3 }}>
@@ -401,11 +499,11 @@ export default function TargetInfoView({ data, loadAccountEvents, timeRange, onN
                   title={`${n.name} 상세 보기`}
                   aria-label={`${n.name} 네트워크 프로필 상세 보기`}
                   onClick={() => { setSelectedInterface(null); setSelectedNetwork(n); }}
-                  style={{ borderRadius: "var(--radius-md)", width: "100%", display: "flex", alignItems: "center", gap: 12, minHeight: 52, marginBottom: 8, padding: "8px 14px", border: `1px solid ${active ? "var(--accent)" : "var(--border)"}`, background: active ? "var(--bg-selected)" : "var(--bg-panel)", color: "var(--text)", cursor: "pointer", textAlign: "left", fontFamily: "inherit", transition: "background .15s ease, border-color .15s ease" }}
+                  style={{ borderRadius: "var(--radius)", width: "100%", display: "flex", alignItems: "center", gap: 12, minHeight: 52, marginBottom: 8, padding: "8px 14px", border: `1px solid ${active ? "var(--accent)" : "var(--border)"}`, background: active ? "var(--bg-selected)" : "var(--bg-panel)", color: "var(--text)", cursor: "pointer", textAlign: "left", fontFamily: "inherit", transition: "background .15s ease, border-color .15s ease" }}
                   onMouseEnter={(e) => { if (!active) e.currentTarget.style.background = "var(--bg-hover)"; }}
                   onMouseLeave={(e) => { e.currentTarget.style.background = active ? "var(--bg-selected)" : "var(--bg-panel)"; }}
                 >
-                  <span aria-hidden="true" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 34, height: 34, flexShrink: 0, borderRadius: "var(--radius-sm)", background: "color-mix(in srgb, var(--text-dim) 14%, transparent)" }}>
+                  <span aria-hidden="true" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 34, height: 34, flexShrink: 0, borderRadius: "var(--radius)", background: "color-mix(in srgb, var(--text-dim) 14%, transparent)" }}>
                     <WifiOutlinedIcon sx={{ fontSize: 17, color: "var(--text-dim)" }} />
                   </span>
                   <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 13, fontWeight: 600 }}>{n.name}</span>
@@ -458,8 +556,9 @@ function AccountRegistry({ accounts, bookmarkedRowids, onSelect }: { accounts: A
 }
 
 function AccountRow({ account, bookmarked, onSelect }: { account: Account; bookmarked?: boolean; onSelect: () => void }) {
-  // 타일 색: 사용자 계정=블루, 시스템 계정=중립, 숨김(특수) 계정=옐로 경고.
-  const tileColor = account.specialAccount.startsWith("예") ? "var(--warning)" : account.isUser ? "var(--accent)" : "var(--text-dim)";
+  // Keep system accounts achromatic; blue identifies user accounts.
+  const accountColor = account.isUser ? "var(--accent)" : "#d0d0d0";
+  const tileColor = account.specialAccount.startsWith("예") ? "var(--warning)" : accountColor;
   return (
     <button
       type="button"
@@ -467,21 +566,21 @@ function AccountRow({ account, bookmarked, onSelect }: { account: Account; bookm
       title="자세히 보기"
       aria-label={`${account.username || "이름 없는 계정"} 계정 상세 보기${bookmarked ? ", 북마크됨" : ""}`}
       className={bookmarked ? "dfir-bookmarked-row" : undefined}
-      style={{ borderRadius: "var(--radius-md)", width: "100%", display: "flex", alignItems: "center", gap: 12, minHeight: 62, marginBottom: 8, padding: "10px 14px", border: "1px solid var(--border)", background: "var(--bg-panel)", color: "inherit", cursor: "pointer", textAlign: "left", fontFamily: "inherit", transition: "background .15s ease, border-color .15s ease" }}
+      style={{ borderRadius: "var(--radius)", width: "100%", display: "flex", alignItems: "center", gap: 12, minHeight: 62, marginBottom: 8, padding: "10px 14px", border: "1px solid var(--border)", background: "var(--bg-panel)", color: "inherit", cursor: "pointer", textAlign: "left", fontFamily: "inherit", transition: "background .15s ease, border-color .15s ease" }}
       onMouseEnter={(e) => { if (!bookmarked) e.currentTarget.style.background = "var(--bg-hover)"; }}
       onMouseLeave={(e) => { if (!bookmarked) e.currentTarget.style.background = "var(--bg-panel)"; }}
     >
-      <span aria-hidden="true" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 34, height: 34, flexShrink: 0, borderRadius: "var(--radius-sm)", background: `color-mix(in srgb, ${tileColor} 15%, transparent)` }}>
+      <span aria-hidden="true" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 34, height: 34, flexShrink: 0, borderRadius: "var(--radius)", background: `color-mix(in srgb, ${tileColor} 15%, transparent)` }}>
         {account.isUser ? <PersonOutlineIcon sx={{ fontSize: 17, color: tileColor }} /> : <SettingsOutlinedIcon sx={{ fontSize: 17, color: tileColor }} />}
       </span>
       <span style={{ flex: 1, minWidth: 0, display: "grid", gap: 3 }}>
         <span style={{ display: "flex", alignItems: "center", gap: 7, minWidth: 0 }}>
           <span title={account.username} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 13.5, fontWeight: 700, color: "var(--text)" }}>{account.username || "(이름 없음)"}</span>
-          <span style={{ flexShrink: 0, fontSize: 11.5, fontWeight: 700, color: account.isUser ? "var(--accent)" : "var(--text-dim)", border: `1px solid ${account.isUser ? "var(--accent)" : "var(--border)"}`, borderRadius: "var(--radius-sm)", padding: "1px 8px", whiteSpace: "nowrap" }}>{account.isUser ? "사용자" : "시스템"}</span>
-          {account.disabled === "예" && <span style={{ flexShrink: 0, fontSize: 11.5, fontWeight: 700, color: "var(--text-faint)", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", padding: "1px 8px", whiteSpace: "nowrap" }}>비활성</span>}
-          {account.specialAccount.startsWith("예") && <span title={account.specialAccount} style={{ flexShrink: 0, fontSize: 11.5, fontWeight: 700, color: "var(--warning)", border: "1px solid var(--warning)", borderRadius: "var(--radius-sm)", padding: "1px 8px", whiteSpace: "nowrap" }}>숨김</span>}
+          <span style={{ flexShrink: 0, fontSize: 11.5, fontWeight: 700, color: "var(--bg-input)", background: accountColor, border: `1px solid ${accountColor}`, borderRadius: "var(--radius)", padding: "1px 8px", whiteSpace: "nowrap" }}>{account.isUser ? "사용자" : "시스템"}</span>
+          {account.disabled === "예" && <span style={{ flexShrink: 0, fontSize: 11.5, fontWeight: 700, color: "var(--text-dim)", background: "var(--bg-input)", border: "1px solid var(--text-faint)", borderRadius: "var(--radius)", padding: "1px 8px", whiteSpace: "nowrap" }}>비활성</span>}
+          {account.specialAccount.startsWith("예") && <span title={account.specialAccount} style={{ flexShrink: 0, fontSize: 11.5, fontWeight: 700, color: "var(--warning)", border: "1px solid var(--warning)", borderRadius: "var(--radius)", padding: "1px 8px", whiteSpace: "nowrap" }}>숨김</span>}
         </span>
-        <span title={account.path || undefined} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: account.path ? "var(--text-dim)" : "var(--text-faint)", fontSize: 12, fontFamily: "var(--mono)" }}>{account.path || "프로필 경로 없음"}</span>
+        <span title={account.rawPath || undefined} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: account.path ? "var(--text-dim)" : "var(--text-faint)", fontSize: 12, fontFamily: "var(--mono)" }}>{account.path || "프로필 경로 없음"}</span>
       </span>
       <span title={account.sid} style={{ width: 330, flexShrink: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text-dim)", fontSize: 12, fontFamily: "var(--mono)" }}>{account.sid}</span>
       <span style={{ width: 172, flexShrink: 0, textAlign: "right", color: account.created ? "var(--text-time)" : "var(--text-faint)", fontSize: 12, fontFamily: "var(--mono)", whiteSpace: "nowrap" }}>{account.created || "생성 시간 없음"}</span>
@@ -490,19 +589,42 @@ function AccountRow({ account, bookmarked, onSelect }: { account: Account; bookm
   );
 }
 
-function DetailRow({ label, value, mono, bm }: { label: string; value: string; mono?: boolean; bm?: { active: boolean; onToggle: () => void } }) {
+const ACCOUNT_FLAG_DESCRIPTIONS: Record<string, string> = {
+  Disabled: "비활성화된 계정입니다.",
+  HomeDirRequired: "로그온 시 홈 디렉터리가 필요한 계정입니다.",
+  PwNotRequired: "암호가 필수는 아니라는 속성입니다. 현재 암호가 없다는 뜻은 아닙니다.",
+  TempDuplicate: "다른 도메인의 기본 계정을 대신하는 로컬 계정입니다.",
+  Normal: "일반 사용자 계정 유형입니다. 관리자 권한 여부를 뜻하지 않습니다.",
+  MNSLogon: "MNS(Majority Node Set) 로그온 계정 유형입니다.",
+  DomainTrust: "다른 도메인과의 신뢰 관계에 사용하는 계정입니다.",
+  WorkstationTrust: "도메인에 가입한 워크스테이션 또는 멤버 서버의 컴퓨터 계정입니다.",
+  ServerTrust: "도메인 컨트롤러의 컴퓨터 계정입니다.",
+  PwNoExpire: "계정 암호가 만료되지 않도록 설정되어 있습니다.",
+  AutoLocked: "자동 잠금 상태의 계정입니다.",
+};
+
+function AccountFlags({ value }: { value: string }) {
+  return <>{value.split(",").map((part, index) => {
+    const flag = part.trim();
+    return <span key={`${index}:${flag}`}>{index > 0 && ", "}<Tooltip title={ACCOUNT_FLAG_DESCRIPTIONS[flag] ?? "이 속성에 대한 설명이 등록되어 있지 않습니다."} describeChild arrow>
+      <span tabIndex={0} style={{ cursor: "help", borderBottom: "1px dotted var(--text-faint)" }}>{flag}</span>
+    </Tooltip></span>;
+  })}</>;
+}
+
+function DetailRow({ label, value, mono, bm, children }: { label: string; value: string; mono?: boolean; bm?: { active: boolean; onToggle: () => void }; children?: React.ReactNode }) {
   return (
-    <div className={bm?.active ? "dfir-bookmarked-row" : undefined} style={{ display: "flex", gap: 12, padding: "8px 10px", margin: "0 -10px", borderBottom: "1px solid var(--border-subtle)", borderLeft: "3px solid transparent", background: "transparent", alignItems: "center" }}>
+    <div className={bm?.active ? "target-info-detail-row dfir-bookmarked-row" : "target-info-detail-row"} style={{ display: "flex", gap: 12, padding: "8px 10px", margin: "0 -10px", borderBottom: "1px solid var(--border-subtle)", borderLeft: "3px solid transparent", background: "transparent", alignItems: "center" }}>
       <span style={{ flex: "0 0 142px", color: "var(--text-dim)", fontSize: 12 }}>{label}</span>
       <span style={{ flex: 1, color: "var(--text)", fontSize: 12.5, wordBreak: "break-all", fontFamily: mono ? "var(--mono)" : "var(--sans)" }}>
-        {value || "—"}
+        {children ?? (value || "—")}
       </span>
       {bm && value && (
         <button
           className={bm.active ? "dfir-bookmark-control" : undefined}
           onClick={bm.onToggle}
           title={bm.active ? "이 시각 북마크 해제" : "이 시각 북마크"}
-          style={{ flexShrink: 0, display: "inline-flex", alignItems: "center", justifyContent: "center", width: 25, height: 24, padding: 0, borderRadius: "var(--radius-sm)", cursor: "pointer", background: bm.active ? "var(--bookmark-row)" : "transparent", color: bm.active ? "var(--bookmark-control)" : "var(--text-dim)", border: `1px solid ${bm.active ? "var(--bookmark-outline)" : "var(--border)"}` }}
+          style={{ flexShrink: 0, display: "inline-flex", alignItems: "center", justifyContent: "center", width: 25, height: 24, padding: 0, borderRadius: "var(--radius)", cursor: "pointer", background: bm.active ? "var(--bookmark-row)" : "transparent", color: bm.active ? "var(--bookmark-control)" : "var(--text-dim)", border: `1px solid ${bm.active ? "var(--bookmark-outline)" : "var(--border)"}` }}
         >
           {bm.active ? <BookmarkIcon sx={{ fontSize: 15 }} /> : <BookmarkBorderOutlinedIcon sx={{ fontSize: 15 }} />}
         </button>
@@ -519,7 +641,7 @@ const EVENT_LABELS: Record<string, string> = {
   "4624": "로그온", "4625": "로그온 실패", "4634": "로그오프", "4647": "로그오프", "4648": "명시적 자격증명 로그온",
   "4672": "특수 권한 부여", "4776": "자격증명 검증",
 };
-const evPgBtn = (disabled: boolean): React.CSSProperties => ({ fontSize: 11.5, padding: "3px 10px", background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", color: "var(--text-dim)", cursor: disabled ? "default" : "pointer", opacity: disabled ? 0.4 : 1 });
+const evPgBtn = (disabled: boolean): React.CSSProperties => ({ fontSize: 11.5, padding: "3px 10px", background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: "var(--radius)", color: "var(--text-dim)", cursor: disabled ? "default" : "pointer", opacity: disabled ? 0.4 : 1 });
 
 function DetailGroup({ title, children }: { title: string; children: React.ReactNode }) {
   return (
@@ -581,7 +703,7 @@ function eventSummary(row: Row): string {
   return parts.join(" · ");
 }
 
-function AccountDetailPage({ account, onBack, loadEvents, timeRange, onNavigate, onFetchLinkedRows, tableBookmarks, onToggleBookmark, eventBookmarks, onToggleEventBookmark, accountDirectory }: { account: Account; onBack: () => void; loadEvents?: (sid: string, username: string, query: Omit<AccountEventQuery, "sid" | "username">) => Promise<AccountEventPage>; timeRange: TimeRange; onNavigate?: (targetFile: string, targetColumn: string, value: string) => void; onFetchLinkedRows?: FetchLinkedRows; tableBookmarks?: Bookmark[]; onToggleBookmark?: (rowid: number, field: string) => void; eventBookmarks?: Bookmark[]; onToggleEventBookmark?: (fullPath: string, tableName: string, rowid: number) => void; accountDirectory?: AccountDirectory }) {
+function AccountDetailPage({ account, onBack, loadEvents, timeRange, onNavigate, onFetchLinkedRows, isRowBookmarked, onToggleBookmark, eventBookmarks, onToggleEventBookmark, accountDirectory }: { account: Account; onBack: () => void; loadEvents?: (sid: string, username: string, query: Omit<AccountEventQuery, "sid" | "username">) => Promise<AccountEventPage>; timeRange: TimeRange; onNavigate?: (targetFile: string, targetColumn: string, value: string) => void; onFetchLinkedRows?: FetchLinkedRows; isRowBookmarked?: (row: Row, field?: string) => boolean; onToggleBookmark?: (rowid: number, field: string) => void; eventBookmarks?: Bookmark[]; onToggleEventBookmark?: (fullPath: string, tableName: string, rowid: number) => void; accountDirectory?: AccountDirectory }) {
   const [events, setEvents] = useState<AccountEventPage | null>(null);
   const [eventsAccountKey, setEventsAccountKey] = useState("");
   const [loading, setLoading] = useState(false);
@@ -602,10 +724,9 @@ function AccountDetailPage({ account, onBack, loadEvents, timeRange, onNavigate,
   const requestedPage = pageFilterKey === filterKey ? evPage : 0;
 
   // Per-timestamp bookmark state for this account's SAM/profile row.
-  const bmKeys = useMemo(() => new Set((tableBookmarks ?? []).map((b) => `${b.rowid}@${b.field ?? ""}`)), [tableBookmarks]);
-  const mkBm = (field: string) =>
-    onToggleBookmark && Number.isFinite(account.rowid)
-      ? { active: bmKeys.has(`${account.rowid}@${field}`), onToggle: () => onToggleBookmark(account.rowid, field) }
+  const fieldBookmark = (field: string) =>
+    onToggleBookmark
+      ? { active: isRowBookmarked?.(account.row, field) ?? false, onToggle: () => onToggleBookmark(account.rowid, field) }
       : undefined;
   const eventBookmarkKeys = useMemo(() => new Set((eventBookmarks ?? [])
     .filter((bookmark) => !bookmark.field)
@@ -715,24 +836,21 @@ function AccountDetailPage({ account, onBack, loadEvents, timeRange, onNavigate,
   return (
     <div className="dfir-view" style={{ flex: 1, minWidth: 0, minHeight: 0, display: "flex", flexDirection: "column", overflow: "hidden" }}>
       <header style={{ flexShrink: 0, display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", padding: "12px 16px 10px", minHeight: 24, background: "var(--bg-panel)", borderBottom: "1px solid var(--border)", zIndex: 2 }}>
-        <button className="nm-btn" onClick={onBack} title="호스트 정보로 돌아가기" aria-label="호스트 정보로 돌아가기" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 31, height: 31, background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", color: "var(--accent)", cursor: "pointer", padding: 0, marginRight: 2 }}>
+        <button className="nm-btn" onClick={onBack} title="호스트 정보로 돌아가기" aria-label="호스트 정보로 돌아가기" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 31, height: 31, background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: "var(--radius)", color: "var(--accent)", cursor: "pointer", padding: 0, marginRight: 2 }}>
           <ArrowBackOutlinedIcon sx={{ fontSize: 17 }} />
         </button>
         <ManageAccountsOutlinedIcon sx={{ fontSize: 18, color: "var(--accent)" }} aria-hidden="true" />
         <strong style={{ fontSize: 15, color: "var(--text)", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>계정 상세 <span aria-hidden="true" style={{ color: "var(--text-faint)", padding: "0 2px" }}>|</span> {account.username || "(이름 없음)"}</strong>
+        <span style={{ flexShrink: 0, fontSize: 11.5, fontWeight: 700, color: "var(--bg-input)", background: account.isUser ? "var(--accent)" : "#d0d0d0", border: `1px solid ${account.isUser ? "var(--accent)" : "#d0d0d0"}`, borderRadius: "var(--radius)", padding: "1px 8px" }}>{account.isUser ? "사용자" : "시스템"}</span>
+        {account.disabled === "예" && <span style={{ flexShrink: 0, fontSize: 11.5, fontWeight: 700, padding: "1px 8px", border: "1px solid var(--text-faint)", borderRadius: "var(--radius)", color: "var(--text-dim)", background: "var(--bg-input)" }}>비활성</span>}
         {account.fullName && account.fullName !== account.username && <span style={{ color: "var(--text-faint)", fontSize: 12 }}>{account.fullName}</span>}
         <span style={{ marginLeft: "auto", display: "inline-flex", alignItems: "center", gap: 6 }}>
-          {account.disabled === "예"
-            ? <span style={{ flexShrink: 0, fontSize: 11.5, fontWeight: 700, padding: "1px 8px", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", color: "var(--text-faint)", whiteSpace: "nowrap" }}>비활성</span>
-            : account.disabled === "아니오"
-              ? <span style={{ flexShrink: 0, fontSize: 11.5, fontWeight: 700, padding: "1px 8px", border: "1px solid var(--success)", borderRadius: "var(--radius-sm)", color: "var(--success)", whiteSpace: "nowrap" }}>활성</span>
-              : null}
-          {account.specialAccount.startsWith("예") && <span title={account.specialAccount} style={{ flexShrink: 0, fontSize: 11.5, fontWeight: 700, padding: "1px 8px", border: "1px solid var(--warning)", borderRadius: "var(--radius-sm)", color: "var(--warning)", whiteSpace: "nowrap" }}>숨김 계정</span>}
+          {account.specialAccount.startsWith("예") && <span title={account.specialAccount} style={{ flexShrink: 0, fontSize: 11.5, fontWeight: 700, padding: "1px 8px", border: "1px solid var(--warning)", borderRadius: "var(--radius)", color: "var(--warning)", whiteSpace: "nowrap" }}>숨김 계정</span>}
         </span>
       </header>
       <div className="target-info-account-detail-scroll" style={{ flex: 1, minHeight: 0, overflowY: "auto", overflowX: "hidden", overscrollBehavior: "contain", padding: "14px 24px 32px" }}>
       {hijack && (
-        <div style={{ background: "var(--danger-subtle)", border: "1px solid var(--danger)", borderRadius: "var(--radius-md)", padding: "10px 14px", marginBottom: 16 }}>
+        <div style={{ background: "var(--danger-subtle)", border: "1px solid var(--danger)", borderRadius: "var(--radius)", padding: "10px 14px", marginBottom: 16 }}>
           <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13, fontWeight: 700, color: "var(--danger)" }}><WarningAmberOutlinedIcon sx={{ fontSize: 17 }} /> RID Hijacking 의심</div>
           <div style={{ fontSize: 12, color: "var(--text)", marginTop: 3 }}>
             SAM 키(폴더) RID <b>{account.rid}</b> 와 F 레코드 RID <b>{account.ridSam}</b> 가 다릅니다.
@@ -750,10 +868,10 @@ function AccountDetailPage({ account, onBack, loadEvents, timeRange, onNavigate,
             {sameRid && <DetailRow label="RID" value={account.rid} mono />}
             {!sameRid && account.rid && <DetailRow label="RID (SAM 키 / 폴더)" value={account.rid} mono />}
             {!sameRid && account.ridSam && <DetailRow label="RID (SAM F 레코드)" value={account.ridSam} mono />}
-            {stateRows.filter(([, value]) => Boolean(value)).map(([label, value]) => <DetailRow key={label} label={label} value={value} />)}
+            {stateRows.filter(([, value]) => Boolean(value)).map(([label, value]) => <DetailRow key={label} label={label} value={value}>{label === "권한 / 속성" ? <AccountFlags value={value} /> : undefined}</DetailRow>)}
           </DetailGroup>}
           <DetailGroup title="시간 정보">
-            {timeRows.map(([label, value, field]) => <DetailRow key={field} label={label} value={value} mono bm={mkBm(field)} />)}
+            {timeRows.map(([label, value, field]) => <DetailRow key={field} label={label} value={value} mono bm={fieldBookmark(field)} />)}
           </DetailGroup>
         </DetailSurface>
 
@@ -765,14 +883,14 @@ function AccountDetailPage({ account, onBack, loadEvents, timeRange, onNavigate,
             onChange={(event) => setEventSearchDraft(event.target.value)}
             placeholder="이벤트명, ID, Provider 검색"
             aria-label="EventLog 활동 검색"
-            style={{ boxSizing: "border-box", width: "100%", height: 32, marginBottom: 8, padding: "0 10px", background: "var(--bg)", color: "var(--text)", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", fontFamily: "var(--sans)", fontSize: 12.5, outline: "none" }}
+            style={{ boxSizing: "border-box", width: "100%", height: 32, marginBottom: 8, padding: "0 10px", background: "var(--bg)", color: "var(--text)", border: "1px solid var(--border)", borderRadius: "var(--radius)", fontFamily: "var(--sans)", fontSize: 12.5, outline: "none" }}
           />}
           {loadEvents && initialLoading && <div style={{ display: "flex", alignItems: "center", gap: 8, minHeight: 48, color: "var(--text-dim)", fontSize: 12.5 }}><CircularProgress size={16} thickness={4} /> 이 계정의 EventLog 활동을 불러오는 중…</div>}
           {loadEvents && refreshing && <div style={{ display: "flex", alignItems: "center", gap: 6, minHeight: 24, marginBottom: 6, color: "var(--text-dim)", fontSize: 11.5 }}><CircularProgress size={14} thickness={4} /> 결과 갱신 중… {showingPriorQuery ? "이전 결과 표시 중" : "현재 결과 확인 중"}</div>}
           {loadEvents && sourceFailures.length > 0 && <div title={`일부 EventLog 원본을 열 수 없어 결과가 불완전할 수 있습니다 · 읽기 실패: ${sourceFailures.map((failure) => `${failure.logName} / ${failure.tableName} (${failure.reason})`).join(" · ")}`} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", marginBottom: 8, padding: "6px 8px", borderLeft: "2px solid var(--warning)", background: "var(--warning-subtle)", color: "var(--warning)", fontSize: 11.5, lineHeight: 1.35 }}>일부 EventLog 원본을 열 수 없어 결과가 불완전할 수 있습니다 · 읽기 실패: {failedSourceText}{failedSourceMore}</div>}
           {loadEvents && eventsError && <div title={eventsError} style={{ paddingBottom: 8, color: "var(--danger)", fontSize: 12.5 }}>{visibleEvents ? "새 EventLog 결과를 불러오지 못했습니다. 이전 결과 표시 중." : `EventLog 활동을 불러오지 못했습니다: ${eventsError}`}</div>}
           {loadEvents && !initialLoading && visibleEvents && evCount === 0 && <div style={{ fontSize: 12.5, color: allSourcesUnreadable ? "var(--warning)" : "var(--text-faint)" }}>{allSourcesUnreadable ? "읽을 수 있는 EventLog 원본이 없습니다. 원본 읽기 실패를 확인하세요." : eventSearch.trim() ? "검색 조건과 기간 필터에 일치하는 EventLog가 없습니다." : "선택한 기간에 이 계정과 관련된 EventLog가 없습니다."}</div>}
-          {loadEvents && visibleEvents && evCount > 0 && <div style={{ overflowX: "auto", pointerEvents: refreshing ? "none" : "auto", opacity: refreshing ? 0.65 : 1 }}><div style={{ minWidth: 660 }}>
+          {loadEvents && visibleEvents && evCount > 0 && <div style={{ minWidth: 0, pointerEvents: refreshing ? "none" : "auto", opacity: refreshing ? 0.65 : 1 }}>
           {pagedEvents.map((r, i) => {
             const eid = r.EventID || "";
             const catalogNote = lookupEventCatalog(r.Provider, eid)?.label || (EVENT_LABELS[eid] && EVENT_LABELS[eid] !== `Event ${eid}` ? EVENT_LABELS[eid] : "");
@@ -786,15 +904,15 @@ function AccountDetailPage({ account, onBack, loadEvents, timeRange, onNavigate,
                 onClick={() => setSelectedEvent(r)}
                 onMouseEnter={(e) => { if (!bookmarked) e.currentTarget.style.background = "var(--bg-hover)"; }}
                 onMouseLeave={(e) => { if (!bookmarked) e.currentTarget.style.background = "transparent"; }}
-                style={{ borderRadius: "var(--radius-sm)", display: "flex", alignItems: "center", gap: 10, width: "100%", minHeight: 50, padding: "7px 4px", background: "transparent", border: "none", borderBottom: i < pagedEvents.length - 1 ? "1px solid var(--border-subtle)" : "none", color: "inherit", cursor: "pointer", fontFamily: "inherit", textAlign: "left", transition: "background .15s ease" }}
+                style={{ borderRadius: "var(--radius)", display: "flex", alignItems: "center", gap: 10, width: "100%", minHeight: 50, padding: "7px 4px", background: "transparent", border: "none", borderBottom: i < pagedEvents.length - 1 ? "1px solid var(--border-subtle)" : "none", color: "inherit", cursor: "pointer", fontFamily: "inherit", textAlign: "left", transition: "background .15s ease" }}
               >
-                <span aria-hidden="true" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 30, height: 30, flexShrink: 0, borderRadius: "var(--radius-sm)", background: "rgba(174, 189, 255, 0.14)" }}>
+                <span aria-hidden="true" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 30, height: 30, flexShrink: 0, borderRadius: "var(--radius)", background: "rgba(174, 189, 255, 0.14)" }}>
                   <EventNoteOutlinedIcon sx={{ fontSize: 16, color: "#aebdff" }} />
                 </span>
                 <span style={{ flex: 1, minWidth: 0, display: "grid", gap: 2 }}>
                   <span style={{ display: "flex", alignItems: "center", gap: 7, minWidth: 0 }}>
                     <span style={{ flexShrink: 0, fontSize: 13, fontWeight: 700, color: "var(--text)" }}>Event {eid || "—"}</span>
-                    {catalogNote && <span title={catalogNote} style={{ flexShrink: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "#5bc8c0", border: "1px solid #5bc8c0", borderRadius: "var(--radius-sm)", padding: "1px 7px", fontSize: 11, fontWeight: 650 }}>{catalogNote}</span>}
+                    {catalogNote && <span title={catalogNote} style={{ flexShrink: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "#5bc8c0", border: "1px solid #5bc8c0", borderRadius: "var(--radius)", padding: "1px 7px", fontSize: 11, fontWeight: 650 }}>{catalogNote}</span>}
                   </span>
                   <span title={summary || undefined} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 11.5, color: "var(--text-faint)" }}>{[r.Provider || r._log, summary].filter(Boolean).join(" · ") || "—"}</span>
                 </span>
@@ -803,9 +921,9 @@ function AccountDetailPage({ account, onBack, loadEvents, timeRange, onNavigate,
               </button>
             );
           })}
-          </div></div>}
+          </div>}
           {loadEvents && visibleEvents && evPageCount > 1 && (
-            <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 10 }}>
+            <div style={{ display: "flex", justifyContent: "center", marginTop: 10 }}>
               <PaginationControls ariaLabel="이벤트 페이지" page={renderedSafePage} pageCount={evPageCount} disabled={refreshing} onChange={(next) => { setPageFilterKey(filterKey); setEvPage(next); }} summary={`(${evCount.toLocaleString()}건)`} />
             </div>
           )}
@@ -855,7 +973,7 @@ function EventDetailModal({ row, onClose }: { row: Row; onClose: () => void }) {
 
   return (
     <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(1,4,9,0.7)", zIndex: 300, display: "flex", alignItems: "center", justifyContent: "center", padding: 24 }}>
-      <div ref={dialogRef} role="dialog" aria-modal="true" aria-label="이벤트 상세" onClick={(e) => e.stopPropagation()} style={{ width: "min(720px, 96vw)", maxHeight: "88vh", display: "flex", flexDirection: "column", background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", boxShadow: "var(--shadow-panel)", overflow: "hidden" }}>
+      <div ref={dialogRef} role="dialog" aria-modal="true" aria-label="이벤트 상세" onClick={(e) => e.stopPropagation()} style={{ width: "min(720px, 96vw)", maxHeight: "88vh", display: "flex", flexDirection: "column", background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "var(--radius)", boxShadow: "var(--shadow-panel)", overflow: "hidden" }}>
         <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "12px 16px", borderBottom: "1px solid var(--border)", background: "var(--bg-elevated)", flexShrink: 0 }}>
           <span style={{ fontSize: 14.5, fontWeight: 700 }}>{label}</span>
           <span style={{ fontSize: 11, color: "var(--text-faint)" }}>EventID {eid} · {row._log || row.Channel || ""}</span>

@@ -146,7 +146,7 @@ function GraphNodeCard({ laid, selected, onSelect }: { laid: LaidNode; selected:
         alignItems: "stretch",
         gap: 3,
         padding: "8px 10px",
-        borderRadius: "var(--radius-md)",
+        borderRadius: "var(--radius)",
         border: `1px solid ${border}`,
         background: n.isTarget ? "color-mix(in srgb, var(--danger) 8%, var(--bg-elevated))" : "var(--bg-elevated)",
         boxShadow: selected
@@ -161,17 +161,17 @@ function GraphNodeCard({ laid, selected, onSelect }: { laid: LaidNode; selected:
       }}
     >
       <span style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0 }}>
-        <span style={{ flexShrink: 0, fontFamily: "var(--mono)", fontSize: 10, fontWeight: 700, color: accent, padding: "0px 5px", borderRadius: "var(--radius-sm)", background: `color-mix(in srgb, ${accent} 13%, transparent)` }}>
+        <span style={{ flexShrink: 0, fontFamily: "var(--mono)", fontSize: 10, fontWeight: 700, color: accent, padding: "0px 5px", borderRadius: "var(--radius)", background: `color-mix(in srgb, ${accent} 13%, transparent)` }}>
           {n.visitId || "?"}
         </span>
         <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontFamily: "var(--mono)", fontSize: 10, color: "var(--text-time)" }}>{n.time || "시간 미상"}</span>
         {n.reloads > 0 && (
-          <span title={`같은 URL로 ${n.reloads}회 재이동(리다이렉트·리로드)이 이 방문에 접혀 있습니다`} style={{ flexShrink: 0, marginLeft: "auto", display: "inline-flex", alignItems: "center", gap: 2, fontSize: 9.5, fontFamily: "var(--mono)", fontWeight: 700, color: "var(--text-faint)", padding: "0 4px", borderRadius: 999, border: "1px solid var(--border-subtle)", background: "var(--bg-input)" }}>
+          <span title={`같은 URL로 ${n.reloads}회 재이동(리다이렉트·리로드)이 이 방문에 접혀 있습니다`} style={{ flexShrink: 0, marginLeft: "auto", display: "inline-flex", alignItems: "center", gap: 2, fontSize: 9.5, fontFamily: "var(--mono)", fontWeight: 700, color: "var(--text-faint)", padding: "0 4px", borderRadius: "var(--radius)", border: "1px solid var(--border-subtle)", background: "var(--bg-input)" }}>
             <ReplayOutlinedIcon sx={{ fontSize: 10 }} />{n.reloads}
           </span>
         )}
         {n.isTarget && (
-          <span style={{ flexShrink: 0, marginLeft: n.reloads > 0 ? 0 : "auto", fontSize: 9, fontWeight: 800, letterSpacing: 0.3, color: "var(--danger)", padding: "0 5px", borderRadius: "var(--radius-sm)", background: "color-mix(in srgb, var(--danger) 14%, transparent)" }}>이 항목</span>
+          <span style={{ flexShrink: 0, marginLeft: n.reloads > 0 ? 0 : "auto", fontSize: 9, fontWeight: 800, letterSpacing: 0.3, color: "var(--danger)", padding: "0 5px", borderRadius: "var(--radius)", background: "color-mix(in srgb, var(--danger) 14%, transparent)" }}>이 항목</span>
         )}
       </span>
       <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 11.5, fontWeight: n.isTarget ? 700 : 600 }}>
@@ -207,7 +207,7 @@ function NodeDetail({ node, parentEdge }: { node: VisitGraphNode; parentEdge?: V
   return (
     <div style={{ flexShrink: 0, maxHeight: 168, overflowY: "auto", borderTop: "1px solid var(--border)", padding: "10px 16px 12px", background: "var(--bg-panel)" }}>
       <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-        {node.isTarget && <span style={{ fontSize: 10, fontWeight: 800, letterSpacing: 0.3, color: "var(--danger)", padding: "1px 6px", borderRadius: "var(--radius-sm)", background: "color-mix(in srgb, var(--danger) 14%, transparent)" }}>이 항목의 방문</span>}
+        {node.isTarget && <span style={{ fontSize: 10, fontWeight: 800, letterSpacing: 0.3, color: "var(--danger)", padding: "1px 6px", borderRadius: "var(--radius)", background: "color-mix(in srgb, var(--danger) 14%, transparent)" }}>이 항목의 방문</span>}
         {node.title && <span style={{ fontSize: 12.5, fontWeight: 700, overflowWrap: "anywhere" }}>{node.title}</span>}
       </div>
       <div style={{ marginTop: 4, display: "flex", alignItems: "flex-start", gap: 5, fontFamily: "var(--mono)", fontSize: 11.5, color: "var(--text-dim)", overflowWrap: "anywhere", wordBreak: "break-all", userSelect: "text" }}>
@@ -400,7 +400,7 @@ function GraphCanvas({ graph }: { graph: BrowserVisitGraph }) {
           ))}
         </div>
         {overflowing && (
-          <div style={{ position: "absolute", top: 10, left: 10, padding: "4px 9px", borderRadius: "var(--radius-md)", border: "1px solid var(--border-subtle)", background: "color-mix(in srgb, var(--bg-panel) 88%, transparent)", color: "var(--text-faint)", fontSize: 10.5, pointerEvents: "none" }}>
+          <div style={{ position: "absolute", top: 10, left: 10, padding: "4px 9px", borderRadius: "var(--radius)", border: "1px solid var(--border-subtle)", background: "color-mix(in srgb, var(--bg-panel) 88%, transparent)", color: "var(--text-faint)", fontSize: 10.5, pointerEvents: "none" }}>
             화면 밖에 더 있습니다 — 드래그·휠로 이동 · ⤢ 전체 보기
           </div>
         )}
@@ -412,13 +412,13 @@ function GraphCanvas({ graph }: { graph: BrowserVisitGraph }) {
             ["⌖", () => centerOn(selectedId), "선택 항목으로 이동"],
             ["⤢", fit, "전체 보기"],
           ] as Array<[string, () => void, string]>).map(([label, onClick, title]) => (
-            <button key={title} type="button" onClick={onClick} title={title} aria-label={title} style={{ width: 26, height: 26, display: "inline-flex", alignItems: "center", justifyContent: "center", borderRadius: "var(--radius-sm)", border: "1px solid var(--border)", background: "var(--bg-elevated)", color: "var(--text-dim)", cursor: "pointer", fontSize: 13, fontWeight: 700 }}>
+            <button key={title} type="button" onClick={onClick} title={title} aria-label={title} style={{ width: 26, height: 26, display: "inline-flex", alignItems: "center", justifyContent: "center", borderRadius: "var(--radius)", border: "1px solid var(--border)", background: "var(--bg-elevated)", color: "var(--text-dim)", cursor: "pointer", fontSize: 13, fontWeight: 700 }}>
               {label}
             </button>
           ))}
         </div>
         {/* 범례 + 규모 요약 */}
-        <div style={{ position: "absolute", left: 10, bottom: 10, display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap", padding: "5px 10px", borderRadius: "var(--radius-md)", border: "1px solid var(--border-subtle)", background: "color-mix(in srgb, var(--bg-panel) 88%, transparent)", fontSize: 10.5, color: "var(--text-faint)", pointerEvents: "none" }}>
+        <div style={{ position: "absolute", left: 10, bottom: 10, display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap", padding: "5px 10px", borderRadius: "var(--radius)", border: "1px solid var(--border-subtle)", background: "color-mix(in srgb, var(--bg-panel) 88%, transparent)", fontSize: 10.5, color: "var(--text-faint)", pointerEvents: "none" }}>
           <span style={{ display: "inline-flex", alignItems: "center", gap: 5 }}>
             <span style={{ width: 16, height: 0, borderTop: "2px solid var(--accent)" }} />같은 탭 이동 (from_visit)
           </span>
@@ -441,7 +441,7 @@ export default function VisitFlowGraphModal({ state, graph, isCache, onRetry, on
   const hasGraph = state === "ready" && graph && graph.nodes.length > 0;
   return (
     <div onClick={onClose} style={{ position: "fixed", inset: 0, zIndex: 1100, display: "flex", alignItems: "center", justifyContent: "center", padding: 20, background: "rgba(1,4,9,0.6)" }}>
-      <div ref={dialogRef} role="dialog" aria-modal="true" aria-label="브라우저 유입 흐름 그래프" onClick={(event) => event.stopPropagation()} style={{ display: "flex", flexDirection: "column", width: "min(1240px, 96vw)", height: hasGraph ? "86vh" : undefined, maxHeight: "86vh", minHeight: 0, overflow: "hidden", background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", boxShadow: "var(--shadow-panel)" }}>
+      <div ref={dialogRef} role="dialog" aria-modal="true" aria-label="브라우저 유입 흐름 그래프" onClick={(event) => event.stopPropagation()} style={{ display: "flex", flexDirection: "column", width: "min(1240px, 96vw)", height: hasGraph ? "86vh" : undefined, maxHeight: "86vh", minHeight: 0, overflow: "hidden", background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "var(--radius)", boxShadow: "var(--shadow-panel)" }}>
         <header style={{ display: "flex", flexShrink: 0, alignItems: "center", gap: 10, padding: "12px 16px", borderBottom: "1px solid var(--border)" }}>
           <AccountTreeOutlinedIcon sx={{ fontSize: 18, color: "var(--accent)" }} />
           <span style={{ fontSize: 14, fontWeight: 700 }}>유입 흐름 · 페이지 이동 그래프</span>
@@ -454,7 +454,7 @@ export default function VisitFlowGraphModal({ state, graph, isCache, onRetry, on
         {state === "error" && (
           <div role="alert" style={{ display: "flex", flexDirection: "column", gap: 10, padding: 24, color: "var(--text-dim)", fontSize: 12.5 }}>
             유입 흐름을 불러오지 못했습니다.
-            <button type="button" onClick={onRetry} style={{ alignSelf: "flex-start", padding: "5px 10px", borderRadius: "var(--radius-sm)", border: "1px solid var(--border)", background: "var(--bg-elevated)", color: "var(--text)", cursor: "pointer", fontSize: 12 }}>다시 시도</button>
+            <button type="button" onClick={onRetry} style={{ alignSelf: "flex-start", padding: "5px 10px", borderRadius: "var(--radius)", border: "1px solid var(--border)", background: "var(--bg-elevated)", color: "var(--text)", cursor: "pointer", fontSize: 12 }}>다시 시도</button>
           </div>
         )}
         {state === "ready" && !hasGraph && <div role="status" style={{ padding: 24, color: "var(--text-faint)", fontSize: 12.5, lineHeight: 1.6 }}>{graph?.note || "이 항목에 대한 방문 유입 흐름을 찾지 못했습니다."}</div>}

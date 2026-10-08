@@ -1,4 +1,5 @@
 import { resolveArtifactView } from "./artifactViews";
+import { browsableResultFiles } from "./resultTables";
 import { executionSourceKey, browserActivityKindKey } from "./timelineKeys";
 import type { CategoryEntry, TimelineSourcePage } from "./types";
 
@@ -25,8 +26,10 @@ function yieldToEventLoop(): Promise<void> {
 const YIELD_EVERY = 8000;
 
 // 백엔드 TIMELINE_LOGIC_VERSION(main.rs)과 동기화한다 — 구조 로직(필터키·검색
-// blob·include 규칙)이 바뀌면 양쪽을 올려 기존 캐시를 무효화(재빌드)한다.
-export const TIMELINE_LOGIC_VERSION = 2;
+// blob·include 규칙·원본 식별자)이 바뀌면 양쪽을 올려 기존 캐시를
+// 무효화(재빌드)한다. 3 = 저장 계약(docs-01) 전환: 파생 행은 record_id로
+// 식별하고 원본 포인터는 source_records에 있다.
+export const TIMELINE_LOGIC_VERSION = 3;
 
 // 소스 테이블을 페이지로 읽는 청크 크기. 이 청크 하나가 빌드 중 프런트 메모리
 // 피크의 상한이다(전체 테이블을 한 번에 올리지 않는다).
@@ -81,7 +84,8 @@ export async function streamBuildTimeline(
     let sinceYield = 0;
     for (const category of categories) {
       throwIfAborted();
-      const files = await window.api.listResultFiles(category.fullPath);
+      // 상세 전용 자식 표(source_records·ExecutionTimes…)는 사건 행이 아니다.
+      const files = browsableResultFiles(await window.api.listResultFiles(category.fullPath));
       for (const file of files) {
         throwIfAborted();
         // A named spec is known up-front; an unnamed table (per-file EventLog)
@@ -123,7 +127,11 @@ export async function streamBuildTimeline(
               has_tags: (spec.tags?.(row) ?? []).length ? 1 : 0,
               full_path: file.fullPath,
               rowid_src: Number((row as unknown as Record<string, unknown>).__rowid) || 0,
-              record_key: row.record_key || row._record_key || "",
+              // 원시 테이블(EventLog 등)만 행에 `<테이블>::<rowid>` 포인터를
+              // 들고 있다. 파생 행의 식별자는 record_id이고 원본 근거는 그 DB의
+              // source_records에 있으므로, 여기서 포인터를 지어내지 않는다.
+              record_key: row._record_key || "",
+              record_id: row.record_id || "",
               event_time: row.timestamp || "",
               // 행 사본(row_json)과 검색 문자열(search_blob)은 보내지 않는다 —
               // 같은 증거를 두 벌 더 만들어 IPC로 나르면 원본보다 큰 payload가

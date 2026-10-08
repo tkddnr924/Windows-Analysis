@@ -34,7 +34,7 @@ function PrivilegeList({ raw }: { raw: string }) {
     <div
       style={{
         border: "1px solid var(--border)",
-        borderRadius: "var(--radius-md)",
+        borderRadius: "var(--radius)",
         background: "var(--bg-input)",
         overflow: "hidden",
       }}
@@ -166,7 +166,7 @@ function CodeOrJsonBlock({ raw, expandTitle }: { raw: string; expandTitle?: stri
     background: "transparent",
     color: "var(--accent)",
     border: "1px solid var(--border)",
-    borderRadius: "var(--radius-sm)",
+    borderRadius: "var(--radius)",
     cursor: "pointer",
   };
 
@@ -197,7 +197,7 @@ function CodeOrJsonBlock({ raw, expandTitle }: { raw: string; expandTitle?: stri
           padding: 8,
           background: "var(--bg-input)",
           border: "1px solid var(--border)",
-          borderRadius: "var(--radius-md)",
+          borderRadius: "var(--radius)",
           fontFamily: "var(--mono)",
           fontSize: 12,
           whiteSpace: "pre-wrap",
@@ -257,7 +257,7 @@ function CopyButton({ value }: { value: string }) {
         background: "transparent",
         color: copyError ? "var(--danger)" : "var(--text-faint)",
         border: "none",
-        borderRadius: "var(--radius-sm)",
+        borderRadius: "var(--radius)",
         cursor: "pointer",
         flexShrink: 0,
         transition: "background .12s ease, color .12s ease",
@@ -320,9 +320,9 @@ function ByteSizeValue({ value }: { value: string }) {
   return (
     <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
       <span style={{ fontFamily: "var(--mono)", fontSize: 12.5 }}>{display}</span>
-      <div role="group" aria-label="크기 단위" style={{ display: "inline-flex", gap: 2, padding: 2, background: "var(--bg-input)", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)" }}>
+      <div role="group" aria-label="크기 단위" style={{ display: "inline-flex", gap: 2, padding: 2, background: "var(--bg-input)", border: "1px solid var(--border)", borderRadius: "var(--radius)" }}>
         {(["Bytes", "KB", "MB", "GB"] as const).map((nextUnit) => (
-          <button key={nextUnit} type="button" onClick={() => setUnit(nextUnit)} aria-pressed={unit === nextUnit} style={{ padding: "3px 6px", border: "none", borderRadius: "var(--radius-sm)", cursor: "pointer", fontSize: 10.5, fontWeight: 650, background: unit === nextUnit ? "var(--accent-subtle)" : "transparent", color: unit === nextUnit ? "var(--accent)" : "var(--text-faint)" }}>
+          <button key={nextUnit} type="button" onClick={() => setUnit(nextUnit)} aria-pressed={unit === nextUnit} style={{ padding: "3px 6px", border: "none", borderRadius: "var(--radius)", cursor: "pointer", fontSize: 10.5, fontWeight: 650, background: unit === nextUnit ? "var(--accent-subtle)" : "transparent", color: unit === nextUnit ? "var(--accent)" : "var(--text-faint)" }}>
             {nextUnit}
           </button>
         ))}
@@ -418,12 +418,12 @@ function CacheDataValue({ row, hostDir }: { row: Record<string, string>; hostDir
     if (!(row.cache_key || "").trim()) return <span style={{ color: "var(--text-faint)", fontSize: 12 }}>캐시 식별자 없음 · 재파싱 필요</span>;
     return (
       <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-        <button type="button" onClick={loadRecoveredBody} style={{ padding: "4px 8px", borderRadius: "var(--radius-sm)", border: "1px solid var(--border)", background: "var(--bg-elevated)", color: "var(--accent)", cursor: "pointer", fontSize: 11.5, fontWeight: 650 }}>복구 데이터 열기</button>
+        <button type="button" onClick={loadRecoveredBody} style={{ padding: "4px 8px", borderRadius: "var(--radius)", border: "1px solid var(--border)", background: "var(--bg-elevated)", color: "var(--accent)", cursor: "pointer", fontSize: 11.5, fontWeight: 650 }}>복구 데이터 열기</button>
       </div>
     );
   }
   if (!body) return null;
-  if (/^image\//i.test(contentType) && !body.truncated) return <img src={`data:${contentType.split(";")[0]};base64,${body.bodyB64}`} alt="복구된 캐시 데이터" style={{ display: "block", maxWidth: "100%", maxHeight: 360, border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", background: "var(--bg-input)" }} />;
+  if (/^image\//i.test(contentType) && !body.truncated) return <img src={`data:${contentType.split(";")[0]};base64,${body.bodyB64}`} alt="복구된 캐시 데이터" style={{ display: "block", maxWidth: "100%", maxHeight: 360, border: "1px solid var(--border)", borderRadius: "var(--radius)", background: "var(--bg-input)" }} />;
   if (/^text\//i.test(contentType) || /json|javascript|xml|svg/i.test(contentType)) return <div><CodeOrJsonBlock raw={textPreview} expandTitle="캐시 데이터" />{textPreviewTruncated && <div style={{ marginTop: 6, color: "var(--text-faint)", fontSize: 11.5 }}>복구된 본문 {body.decodedSize.toLocaleString()} Bytes 중 성능 보호용 미리보기만 표시합니다.</div>}</div>;
   const byteLength = parseByteSize(row.size_bytes || row.size || "");
   return <span style={{ color: "var(--text-dim)", fontSize: 12.5 }}>바이너리 데이터 복구됨{byteLength !== null ? ` · ${byteLength.toLocaleString()} Bytes` : body.decodedSize ? ` · ${body.decodedSize.toLocaleString()} Bytes` : ""}{body.truncated ? " (미리보기 제한)" : ""}</span>;
@@ -495,7 +495,7 @@ function FieldRow({ field, row, onFetchLinkedRows, hostDir, accountDirectory, on
   }
 
   return (
-    <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0, maxWidth: "100%", padding: "8px 11px", marginBottom: 6, background: "var(--bg-elevated)", border: "1px solid color-mix(in srgb, var(--text-faint) 38%, transparent)", borderRadius: "var(--radius-sm)" }}>
+    <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0, maxWidth: "100%", padding: "8px 11px", marginBottom: 6, background: "var(--bg-elevated)", border: "1px solid color-mix(in srgb, var(--text-faint) 38%, transparent)", borderRadius: "var(--radius)" }}>
       <div style={{ flex: 1, minWidth: 0 }}>
         <div style={{ minWidth: 0, fontSize: 11.5, fontWeight: 650, color: "var(--text-faint)", overflowWrap: "anywhere" }}>{label}</div>
         <div style={{ minWidth: 0, maxWidth: "100%", marginTop: 3, overflowWrap: "anywhere", wordBreak: "break-word" }}>{content}</div>
@@ -510,7 +510,7 @@ function FieldRow({ field, row, onFetchLinkedRows, hostDir, accountDirectory, on
               onClick={() => onToggleFieldBookmark(field.key)}
               aria-label={`${label} ${isFieldBookmarked?.(field.key) ? "북마크 해제" : "북마크"}`}
               title={isFieldBookmarked?.(field.key) ? "이 시각 북마크 해제" : "이 시각 북마크"}
-              style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 24, height: 22, padding: 0, border: `1px solid ${isFieldBookmarked?.(field.key) ? "var(--bookmark-outline)" : "var(--border)"}`, borderRadius: "var(--radius-sm)", background: isFieldBookmarked?.(field.key) ? "var(--bookmark-row)" : "var(--bg-elevated)", color: isFieldBookmarked?.(field.key) ? "var(--bookmark-control)" : "var(--text-faint)", cursor: "pointer" }}
+              style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 24, height: 22, padding: 0, border: `1px solid ${isFieldBookmarked?.(field.key) ? "var(--bookmark-outline)" : "var(--border)"}`, borderRadius: "var(--radius)", background: isFieldBookmarked?.(field.key) ? "var(--bookmark-row)" : "var(--bg-elevated)", color: isFieldBookmarked?.(field.key) ? "var(--bookmark-control)" : "var(--text-faint)", cursor: "pointer" }}
             >
               {isFieldBookmarked?.(field.key) ? <BookmarkOutlinedIcon sx={{ fontSize: 14 }} /> : <BookmarkBorderOutlinedIcon sx={{ fontSize: 14 }} />}
             </button>
@@ -574,7 +574,7 @@ function LinkPagination({
   const end = Math.min((page + 1) * pageSize, rowCount);
   const buttonStyle: React.CSSProperties = {
     padding: "3px 8px",
-    borderRadius: "var(--radius-sm)",
+    borderRadius: "var(--radius)",
     border: "1px solid var(--border)",
     background: "var(--bg-elevated)",
     color: "var(--text-dim)",
@@ -618,7 +618,7 @@ function LinkAccordion({ link, value, onFetchLinkedRows }: { link: LinkSpec; val
   }, [expanded, link, onFetchLinkedRows, page, value]);
 
   return (
-    <div style={{ border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", overflow: "hidden" }}>
+    <div style={{ border: "1px solid var(--border)", borderRadius: "var(--radius)", overflow: "hidden" }}>
       <button type="button" onClick={() => { setExpanded((current) => !current); setPage(0); }} style={{ width: "100%", textAlign: "left", display: "flex", alignItems: "center", gap: 8, fontSize: 12, padding: "8px 10px", background: "var(--accent-subtle)", color: "var(--accent)", border: "none", cursor: "pointer", fontWeight: 600 }}>
         <span style={{ fontSize: 9 }}>{expanded ? "▾" : "▸"}</span>
         <span style={{ flex: 1 }}>{link.label}</span>
@@ -696,10 +696,10 @@ function EmbeddedLinkRows({ link, value, onFetchLinkedRows }: { link: LinkSpec; 
     <div ref={sectionRef} style={{ padding: "14px 16px", borderBottom: "1px solid var(--border-subtle)" }}>
       <div className="dfir-section-label" style={{ marginBottom: 8 }}>{link.label}</div>
       <form onSubmit={submitSearch} style={{ display: "flex", gap: 6, marginBottom: 8 }}>
-        <input value={queryInput} onChange={(event) => setQueryInput(event.target.value)} aria-label="참조 파일 검색" placeholder="파일명 또는 경로 검색" style={{ minWidth: 0, flex: 1, height: 30, padding: "0 9px", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", background: "var(--bg-input)", color: "var(--text)", fontSize: 12 }} />
-        <button type="submit" style={{ height: 30, padding: "0 10px", border: "1px solid var(--accent)", borderRadius: "var(--radius-sm)", background: "var(--accent-subtle)", color: "var(--accent)", fontSize: 12, cursor: "pointer" }}>검색</button>
+        <input value={queryInput} onChange={(event) => setQueryInput(event.target.value)} aria-label="참조 파일 검색" placeholder="파일명 또는 경로 검색" style={{ minWidth: 0, flex: 1, height: 30, padding: "0 9px", border: "1px solid var(--border)", borderRadius: "var(--radius)", background: "var(--bg-input)", color: "var(--text)", fontSize: 12 }} />
+        <button type="submit" style={{ height: 30, padding: "0 10px", border: "1px solid var(--accent)", borderRadius: "var(--radius)", background: "var(--accent-subtle)", color: "var(--accent)", fontSize: 12, cursor: "pointer" }}>검색</button>
       </form>
-      <div style={{ border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", overflow: "hidden" }}>
+      <div style={{ border: "1px solid var(--border)", borderRadius: "var(--radius)", overflow: "hidden" }}>
         <div aria-live="polite" style={{ maxHeight: 240, overflowY: "auto", overscrollBehavior: "contain" }}>
           {loading && <div style={{ display: "flex", alignItems: "center", gap: 8, minHeight: 52, padding: "10px", color: "var(--text-dim)", fontSize: 12 }}><CircularProgress size={14} thickness={5} /> 참조 파일을 불러오는 중</div>}
           {failed && <div style={{ minHeight: 52, padding: "10px", color: "var(--danger)", fontSize: 12 }}>참조 파일을 조회하지 못했습니다.</div>}
@@ -771,7 +771,7 @@ function VisitFlowLauncher({ row, hostDir }: { row: Record<string, string>; host
   const [state, setState] = useState<"idle" | "loading" | "ready" | "error">("idle");
   const [graph, setGraph] = useState<BrowserVisitGraph | null>(null);
   const [open, setOpen] = useState(false);
-  const isCache = row.kind === "cache";
+  const isCache = row.event_type === "cache";
 
   function load() {
     if (!hostDir || !row.account) return;
@@ -790,7 +790,7 @@ function VisitFlowLauncher({ row, hostDir }: { row: Record<string, string>; host
       <button
         type="button"
         onClick={load}
-        style={{ display: "inline-flex", alignItems: "center", gap: 7, padding: "8px 13px", borderRadius: "var(--radius-md)", border: "1px solid var(--accent)", background: "var(--accent-subtle)", color: "var(--accent)", cursor: "pointer", fontSize: 12.5, fontWeight: 650 }}
+        style={{ display: "inline-flex", alignItems: "center", gap: 7, padding: "8px 13px", borderRadius: "var(--radius)", border: "1px solid var(--accent)", background: "var(--accent-subtle)", color: "var(--accent)", cursor: "pointer", fontSize: 12.5, fontWeight: 650 }}
       >
         <AccountTreeOutlinedIcon sx={{ fontSize: 16 }} />유입 흐름 보기
       </button>
@@ -819,7 +819,7 @@ export default function ArtifactDetailView({ spec, row, evidenceTime, onNavigate
     <div style={{ minWidth: 0, maxWidth: "100%" }}>
       <div style={{ padding: "18px 16px 14px", borderBottom: "1px solid var(--border-subtle)" }}>
         <div className="dfir-section-label" style={{ marginBottom: 8 }}>증거 개요</div>
-        <div style={{ padding: "12px 14px", background: "var(--bg-elevated)", border: "1px solid color-mix(in srgb, var(--text-faint) 38%, transparent)", borderRadius: "var(--radius-md)" }}>
+        <div style={{ padding: "12px 14px", background: "var(--bg-elevated)", border: "1px solid color-mix(in srgb, var(--text-faint) 38%, transparent)", borderRadius: "var(--radius)" }}>
           <div style={{ minWidth: 0, maxWidth: "100%", fontSize: 16, fontWeight: 700, overflowWrap: "anywhere", wordBreak: "break-word" }}>{title}</div>
           {showTime && (
             <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12.5, color: "var(--text-time)", fontFamily: "var(--mono)", fontWeight: 550, marginTop: 7 }}>
@@ -851,7 +851,7 @@ export default function ArtifactDetailView({ spec, row, evidenceTime, onNavigate
                     background: "var(--accent-subtle)",
                     color: "var(--accent)",
                     border: "1px solid var(--accent)",
-                    borderRadius: "var(--radius-md)",
+                    borderRadius: "var(--radius)",
                     cursor: "pointer",
                   }}
                 >
@@ -887,7 +887,7 @@ export default function ArtifactDetailView({ spec, row, evidenceTime, onNavigate
         </div>
       )}
 
-      {hostDir && row.account && (row.kind === "visit" || row.kind === "cache") && (
+      {hostDir && row.account && (row.event_type === "visit" || row.event_type === "cache") && (
         <div style={{ padding: "14px 16px 18px" }}>
           <VisitFlowLauncher row={row} hostDir={hostDir} />
         </div>

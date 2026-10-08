@@ -32,7 +32,7 @@ interface DefenderEntry {
   title: string;
   detail: string;
   action: string;
-  user: string;
+  account: string;
   attention: boolean;
 }
 
@@ -59,7 +59,8 @@ function entryFor(row: Row): DefenderEntry | null {
     title: row.title || "(제목 없음)",
     detail: row.detail || row.process || row.source || "",
     action,
-    user: row.user || "",
+    // 계정명이 확인되지 않으면 SID를 그대로 보여 준다(docs-01).
+    account: row.account || row.account_sid || "",
     attention: section === "threat" ? Boolean(action) && !isNeutralized(action) : section === "protection" && protectionNeedsAttention(row),
   };
 }
@@ -76,7 +77,7 @@ function newestScanByType(entries: DefenderEntry[]): DefenderEntry[] {
 }
 
 function FilterButton({ active, children, onClick }: { active: boolean; children: React.ReactNode; onClick: () => void }) {
-  return <button type="button" onClick={onClick} aria-pressed={active} style={{ height: 30, padding: "0 10px", borderRadius: "var(--radius-sm)", border: `1px solid ${active ? "var(--accent)" : "var(--border)"}`, background: active ? "var(--accent-subtle)" : "transparent", color: active ? "var(--accent)" : "var(--text-dim)", fontSize: 11.5, fontWeight: active ? 700 : 500, cursor: "pointer", whiteSpace: "nowrap" }}>{children}</button>;
+  return <button type="button" onClick={onClick} aria-pressed={active} style={{ height: 30, padding: "0 10px", borderRadius: "var(--radius)", border: `1px solid ${active ? "var(--accent)" : "var(--border)"}`, background: active ? "var(--accent-subtle)" : "transparent", color: active ? "var(--accent)" : "var(--text-dim)", fontSize: 11.5, fontWeight: active ? 700 : 500, cursor: "pointer", whiteSpace: "nowrap" }}>{children}</button>;
 }
 
 function cellStyle(extra?: CSSProperties): CSSProperties {
@@ -107,15 +108,15 @@ export default function DefenderView({ data, onNavigate, onFetchLinkedRows, book
   const counts = useMemo(() => ({ all: periodEntries.length, threat: periodEntries.filter((entry) => entry.section === "threat").length, protection: periodEntries.filter((entry) => entry.section === "protection").length, scan: periodEntries.filter((entry) => entry.section === "scan").length }), [periodEntries]);
   const latestProtection = useMemo(() => periodEntries.find((entry) => entry.section === "protection") ?? null, [periodEntries]);
   const allAccounts = useMemo(
-    () => [...new Set(periodEntries.map((entry) => entry.user || ""))].sort((a, b) => a.localeCompare(b)),
+    () => [...new Set(periodEntries.map((entry) => entry.account || ""))].sort((a, b) => a.localeCompare(b)),
     [periodEntries],
   );
   const filtered = useMemo(() => {
     const query = search.trim().toLocaleLowerCase();
     const kept = periodEntries.filter((entry) => {
       if (filter !== "all" && entry.section !== filter) return false;
-      if (hiddenAccounts.has(entry.user || "")) return false;
-      return !query || [entry.title, entry.detail, entry.action, entry.user, entry.row.process || "", entry.row.category || ""].some((value) => value.toLocaleLowerCase().includes(query));
+      if (hiddenAccounts.has(entry.account || "")) return false;
+      return !query || [entry.title, entry.detail, entry.action, entry.account, entry.row.process || "", entry.row.category || ""].some((value) => value.toLocaleLowerCase().includes(query));
     });
     // 시각 없는 기록은 정렬 방향과 무관하게 뒤로 보낸다.
     return kept.sort((left, right) => {
@@ -151,20 +152,20 @@ export default function DefenderView({ data, onNavigate, onFetchLinkedRows, book
         const tone = entry.attention ? "var(--danger)" : entry.section === "protection" ? "var(--warning)" : entry.section === "scan" ? "var(--accent)" : "var(--success)";
         const actionLabel = entry.action || (entry.section === "threat" ? "조치 확인 필요" : "조치 이벤트 미확인");
         return (
-          <button key={`${entry.rowid}-${entry.timestamp}-${entry.title}`} type="button" className={bookmarked ? "dfir-bookmarked-row" : undefined} onClick={() => setSelected(entry)} aria-label={`${entry.title} 상세 보기`} style={{ borderRadius: "var(--radius-md)", width: "100%", display: "flex", alignItems: "center", gap: 12, minHeight: 62, marginBottom: 8, padding: "10px 14px", border: "1px solid var(--border)", background: "var(--bg-panel)", color: "var(--text)", cursor: "pointer", textAlign: "left", transition: "background .15s ease, border-color .15s ease" }} onMouseEnter={(event) => { if (!bookmarked) event.currentTarget.style.background = "var(--bg-hover)"; }} onMouseLeave={(event) => { if (!bookmarked) event.currentTarget.style.background = "var(--bg-panel)"; }}>
-            <span aria-hidden="true" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 34, height: 34, flexShrink: 0, borderRadius: "var(--radius-sm)", background: `color-mix(in srgb, ${tone} 15%, transparent)` }}>
+          <button key={`${entry.rowid}-${entry.timestamp}-${entry.title}`} type="button" className={bookmarked ? "dfir-bookmarked-row" : undefined} onClick={() => setSelected(entry)} aria-label={`${entry.title} 상세 보기`} style={{ borderRadius: "var(--radius)", width: "100%", display: "flex", alignItems: "center", gap: 12, minHeight: 62, marginBottom: 8, padding: "10px 14px", border: "1px solid var(--border)", background: "var(--bg-panel)", color: "var(--text)", cursor: "pointer", textAlign: "left", transition: "background .15s ease, border-color .15s ease" }} onMouseEnter={(event) => { if (!bookmarked) event.currentTarget.style.background = "var(--bg-hover)"; }} onMouseLeave={(event) => { if (!bookmarked) event.currentTarget.style.background = "var(--bg-panel)"; }}>
+            <span aria-hidden="true" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 34, height: 34, flexShrink: 0, borderRadius: "var(--radius)", background: `color-mix(in srgb, ${tone} 15%, transparent)` }}>
               <ShieldOutlinedIcon sx={{ fontSize: 17, color: tone }} />
             </span>
             <span style={{ flex: 1, minWidth: 0, display: "grid", gap: 3 }}>
               <span style={{ display: "flex", alignItems: "center", gap: 7, minWidth: 0 }}>
                 <span style={cellStyle({ fontSize: 13.5, fontWeight: 700, color: "var(--text)" })}>{entry.title}</span>
-                <span style={{ flexShrink: 0, fontSize: 11.5, fontWeight: 700, color: tone, border: `1px solid ${tone}`, borderRadius: "var(--radius-sm)", padding: "1px 8px", whiteSpace: "nowrap" }}>{FILTER_LABELS[entry.section]}</span>
-                {entry.row.source && <span style={{ flexShrink: 0, fontSize: 11, fontWeight: 700, color: "var(--text-dim)", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", padding: "1px 7px", whiteSpace: "nowrap" }}>{entry.row.source}</span>}
+                <span style={{ flexShrink: 0, fontSize: 11.5, fontWeight: 700, color: tone, border: `1px solid ${tone}`, borderRadius: "var(--radius)", padding: "1px 8px", whiteSpace: "nowrap" }}>{FILTER_LABELS[entry.section]}</span>
+                {entry.row.source && <span style={{ flexShrink: 0, fontSize: 11, fontWeight: 700, color: "var(--text-dim)", border: "1px solid var(--border)", borderRadius: "var(--radius)", padding: "1px 7px", whiteSpace: "nowrap" }}>{entry.row.source}</span>}
               </span>
               {entry.detail && <span title={entry.detail} style={cellStyle({ fontSize: 12, color: "var(--text-dim)", fontFamily: "var(--mono)" })}>{entry.detail}</span>}
             </span>
             <span title={actionLabel} style={cellStyle({ width: 168, flexShrink: 0, color: entry.attention ? "var(--danger)" : "var(--text-dim)", fontSize: 12, fontWeight: entry.attention ? 700 : 500 })}>{actionLabel}</span>
-            <span style={cellStyle({ width: 128, flexShrink: 0, color: entry.user ? "var(--text-dim)" : "var(--text-faint)", fontSize: 12 })}>{resolveAccountDisplay(entry.user, accountDirectory) || "계정 정보 없음"}</span>
+            <span style={cellStyle({ width: 128, flexShrink: 0, color: entry.account ? "var(--text-dim)" : "var(--text-faint)", fontSize: 12 })}>{resolveAccountDisplay(entry.account, accountDirectory) || "계정 정보 없음"}</span>
             <span style={{ width: 172, flexShrink: 0, textAlign: "right", fontFamily: "var(--mono)", fontSize: 12.5, color: entry.timestamp ? "var(--text-time)" : "var(--text-faint)", whiteSpace: "nowrap" }}>{formatEvidenceTimestamp(entry.timestamp) || "시간 정보 없음"}</span>
           </button>
         );

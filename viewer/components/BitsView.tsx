@@ -37,7 +37,6 @@ interface Row {
   result?: string;
   description?: string;
   event_id?: string;
-  record_key?: string;
 }
 
 interface Job {
@@ -210,7 +209,7 @@ export default function BitsView({
           const accountsLabel = job.accounts.length ? job.accounts.map((account) => resolveAccountDisplay(account, accountDirectory)).join(", ") : "계정 정보 없음";
           const sameDay = job.first.slice(0, 10) === job.last.slice(0, 10);
           return (
-            <section key={job.key} style={{ marginBottom: 10, border: `1px solid ${open ? `color-mix(in srgb, ${jobColor} 42%, var(--border))` : "var(--border)"}`, borderRadius: "var(--radius-md)", background: "var(--bg-panel)", overflow: "hidden", transition: "border-color .18s ease" }}>
+            <section key={job.key} style={{ marginBottom: 10, border: `1px solid ${open ? `color-mix(in srgb, ${jobColor} 42%, var(--border))` : "var(--border)"}`, borderRadius: "var(--radius)", background: "var(--bg-panel)", overflow: "hidden", transition: "border-color .18s ease" }}>
               <button
                 type="button"
                 onClick={() => toggle(job.key)}
@@ -220,7 +219,7 @@ export default function BitsView({
                 onMouseEnter={(event) => { if (!open) event.currentTarget.style.background = "var(--bg-hover)"; }}
                 onMouseLeave={(event) => { event.currentTarget.style.background = open ? `color-mix(in srgb, ${jobColor} 6%, transparent)` : "transparent"; }}
               >
-                <span aria-hidden="true" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 34, height: 34, flexShrink: 0, borderRadius: "var(--radius-sm)", background: `color-mix(in srgb, ${jobColor} 15%, transparent)` }}>
+                <span aria-hidden="true" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 34, height: 34, flexShrink: 0, borderRadius: "var(--radius)", background: `color-mix(in srgb, ${jobColor} 15%, transparent)` }}>
                   <CloudDownloadOutlinedIcon sx={{ fontSize: 17, color: jobColor }} />
                 </span>
                 <span style={{ flex: 1, minWidth: 0, display: "grid", gap: 3 }}>
@@ -290,5 +289,5 @@ export default function BitsView({
 }
 
 function ResultPill({ color, children }: { color: string; children: React.ReactNode }) {
-  return <span style={{ color, fontWeight: 700, padding: "1px 7px", borderRadius: "var(--radius-sm)", background: `color-mix(in srgb, ${color} 15%, transparent)`, whiteSpace: "nowrap" }}>{children}</span>;
+  return <span style={{ color, fontWeight: 700, padding: "1px 7px", borderRadius: "var(--radius)", background: `color-mix(in srgb, ${color} 15%, transparent)`, whiteSpace: "nowrap" }}>{children}</span>;
 }

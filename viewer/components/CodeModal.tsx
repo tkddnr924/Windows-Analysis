@@ -46,7 +46,7 @@ export default function CodeModal({
     background: "var(--bg-elevated)",
     color: "var(--text-dim)",
     border: "1px solid var(--border)",
-    borderRadius: "var(--radius-md)",
+    borderRadius: "var(--radius)",
     cursor: "pointer",
   };
 
@@ -78,7 +78,7 @@ export default function CodeModal({
           flexDirection: "column",
           background: "var(--bg-panel)",
           border: "1px solid var(--border)",
-          borderRadius: "var(--radius-md)",
+          borderRadius: "var(--radius)",
           boxShadow: "var(--shadow-panel)",
           overflow: "hidden",
         }}

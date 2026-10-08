@@ -14,6 +14,7 @@ use wina_core::parsers::eventlog::parse_evtx_stream;
 use wina_core::parsers::jumplist::{parse_jumplists, JUMPLIST_FIELD_ORDER, JUMPLIST_TABLE};
 use wina_core::parsers::mft::parse_mft_stream;
 use wina_core::parsers::rdpcache::{parse_rdpcache, RDP_FIELD_ORDER, RDP_TABLE};
+use wina_core::parsers::recyclebin::{parse_recyclebin, recyclebin_sources, RecycleBinContext};
 use wina_core::parsers::registry::parse_hive_stream;
 use wina_core::parsers::srum::parse_srum_stream;
 use wina_core::parsers::taskscheduler::{parse_tasks, TASK_FIELD_ORDER, TASK_TABLE};
@@ -114,6 +115,17 @@ fn debug_parse(args: &[String]) -> Result<()> {
             let n = parse_mft_stream(&inp, &out)?;
             eprintln!("MFT: {} rows", n);
         }
+        "parse-recyclebin" => {
+            let found = recyclebin_sources(&inp);
+            if !found.errors.is_empty() {
+                bail!("RecycleBin discovery: {}", found.errors.join("; "));
+            }
+            let parsed = parse_recyclebin(&found.paths, &out, &RecycleBinContext::default())?;
+            eprintln!("RecycleBin: {} rows, {} failed", parsed.rows, parsed.failed_rows);
+            if parsed.failed_rows > 0 {
+                bail!("RecycleBin contains failed inputs");
+            }
+        }
         "parse-reg" => {
             let n = parse_hive_stream(&inp, &out)?;
             eprintln!("Registry: {} rows", n);
@@ -177,5 +189,6 @@ fn debug_parse(args: &[String]) -> Result<()> {
         }
         other => bail!("unknown command: {}", other),
     }
+    wina_core::derived::stamp_facts_generation(&out, &uuid::Uuid::new_v4().to_string())?;
     Ok(())
 }

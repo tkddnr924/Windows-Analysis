@@ -46,6 +46,12 @@ const KIND_META: Record<string, { icon: typeof LinkOutlinedIcon; tone: string }>
   // WMI-Activity 이벤트 로그의 구독 이벤트 — OBJECTS.DATA 추출과 달리 시각이 있다.
   "구독 이벤트": { icon: EventNoteOutlinedIcon, tone: "#7490e2" },
 };
+// 저장 계약(docs-01)의 object_type → 기존 화면 구분 표기.
+const OBJECT_TYPE_LABELS: Record<string, string> = {
+  binding: "바인딩",
+  filter: "이벤트 필터",
+  consumer: "이벤트 컨슈머",
+};
 const EVENTLOG_FILE = "Microsoft-Windows-WMI-Activity%4Operational";
 // 구독 관련 EventID와 기능 명칭 (5857/5858 등 일반 동작 기록은 제외).
 const SUB_EVENT_LABELS: Record<string, string> = {
@@ -134,12 +140,19 @@ export default function WmiPersistenceView({ data, dbPath, bookmarkedRowids, onT
   }, [dbPath]);
 
   const entries = useMemo<DisplayEntry[]>(() => {
+    // 파생 WmiSubscriptions의 object_type은 filter/consumer/binding이고,
+    // 화면 구분 라벨은 기존 표기를 유지한다(원문 값을 바꿔 쓰지 않는다).
     const persisted = (data.rows as Row[]).map((row, index) => ({
       key: `wmi-${(row as Record<string, unknown>).__rowid ?? index}`,
-      display: row,
+      display: {
+        ...row,
+        kind: OBJECT_TYPE_LABELS[row.object_type || ""] ?? row.object_type ?? "",
+        name: row.filter_name || row.consumer_name || row.object_path || "",
+        details: row.command || row.script_text || "",
+      },
       detailRow: row,
       detailColumns: data.columns,
-      detailFile: "WMI_Persistence",
+      detailFile: "WmiSubscriptions",
       bookmarkable: true,
       timestamp: "",
     }));
@@ -264,7 +277,7 @@ export default function WmiPersistenceView({ data, dbPath, bookmarkedRowids, onT
                   className={bookmarked ? "dfir-bookmarked-row" : undefined}
                   // 행 전체(여백 포함)가 상세 열기 클릭 대상 — 북마크는 전파 차단.
                   onClick={() => setDetail(entry)}
-                  style={{ borderRadius: "var(--radius-md)", minHeight: 62, marginBottom: 8, display: "flex", alignItems: "center", gap: 12, padding: "0 14px", border: "1px solid var(--border)", background: "var(--bg-panel)", color: "var(--text)", cursor: "pointer", transition: "background .15s ease, border-color .15s ease" }}
+                  style={{ borderRadius: "var(--radius)", minHeight: 62, marginBottom: 8, display: "flex", alignItems: "center", gap: 12, padding: "0 14px", border: "1px solid var(--border)", background: "var(--bg-panel)", color: "var(--text)", cursor: "pointer", transition: "background .15s ease, border-color .15s ease" }}
                   onMouseEnter={(event) => { if (!bookmarked) event.currentTarget.style.background = "var(--bg-hover)"; }}
                   onMouseLeave={(event) => { if (!bookmarked) event.currentTarget.style.background = "var(--bg-panel)"; }}
                 >
@@ -276,13 +289,13 @@ export default function WmiPersistenceView({ data, dbPath, bookmarkedRowids, onT
                     onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); setDetail(entry); } }}
                     style={{ flex: 1, minWidth: 0, display: "flex", alignItems: "center", gap: 12, padding: "10px 0", cursor: "pointer", outlineOffset: -3 }}
                   >
-                    <span aria-hidden="true" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 34, height: 34, flexShrink: 0, borderRadius: "var(--radius-sm)", background: `color-mix(in srgb, ${meta.tone} 15%, transparent)` }}>
+                    <span aria-hidden="true" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 34, height: 34, flexShrink: 0, borderRadius: "var(--radius)", background: `color-mix(in srgb, ${meta.tone} 15%, transparent)` }}>
                       <Icon sx={{ fontSize: 17, color: meta.tone }} />
                     </span>
                     <span style={{ flex: 1, minWidth: 0, display: "grid", gap: 3 }}>
                       <span style={{ minWidth: 0, display: "flex", alignItems: "center", gap: 7, overflow: "hidden" }}>
                         <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text)", fontSize: 13.5, fontWeight: 700 }}>{row.name || "이름 정보 없음"}</span>
-                        <span style={{ flexShrink: 0, fontSize: 11.5, fontWeight: 700, color: meta.tone, border: `1px solid ${meta.tone}`, borderRadius: "var(--radius-sm)", padding: "1px 8px", whiteSpace: "nowrap" }}>{row.kind || "정보"}</span>
+                        <span style={{ flexShrink: 0, fontSize: 11.5, fontWeight: 700, color: meta.tone, border: `1px solid ${meta.tone}`, borderRadius: "var(--radius)", padding: "1px 8px", whiteSpace: "nowrap" }}>{row.kind || "정보"}</span>
                       </span>
                       <span title={summary || undefined} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: summary ? "var(--text-dim)" : "var(--text-faint)", fontFamily: "var(--mono)", fontSize: 12 }}>{summary || "세부 값 없음"}</span>
                     </span>
@@ -291,7 +304,7 @@ export default function WmiPersistenceView({ data, dbPath, bookmarkedRowids, onT
                   {canBookmark && (
                     <Tooltip title={bookmarked ? "북마크 해제" : "북마크"}>
                       <span>
-                        <IconButton className={bookmarked ? "dfir-bookmark-control" : undefined} aria-label={bookmarked ? "북마크 해제" : "북마크"} size="small" onClick={toggleBookmark} sx={{ color: bookmarked ? "var(--bookmark-control)" : "var(--text-faint)", borderRadius: "var(--radius-sm)" }}>
+                        <IconButton className={bookmarked ? "dfir-bookmark-control" : undefined} aria-label={bookmarked ? "북마크 해제" : "북마크"} size="small" onClick={toggleBookmark} sx={{ color: bookmarked ? "var(--bookmark-control)" : "var(--text-faint)", borderRadius: "var(--radius)" }}>
                           {bookmarked ? <BookmarkIcon sx={{ fontSize: 17 }} /> : <BookmarkBorderOutlinedIcon sx={{ fontSize: 17 }} />}
                         </IconButton>
                       </span>

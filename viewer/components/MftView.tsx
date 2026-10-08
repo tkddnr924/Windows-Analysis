@@ -5,9 +5,9 @@ import AccountFilterChips from "@/components/AccountFilterChips";
 import { DateRangeDropdown, HeaderSearchInput, SelectDropdown, ViewHeader } from "@/components/FilterControls";
 import PaginationControls from "@/components/PaginationControls";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import type { Bookmark, MftRecordsPage, PathReference } from "@/lib/types";
+import type { Bookmark, MftRecordBody, MftRecordsPage, MftVolume, PathReference } from "@/lib/types";
 import CircularProgress from "@mui/material/CircularProgress";
 import IconButton from "@mui/material/IconButton";
 import useMediaQuery from "@mui/material/useMediaQuery";
@@ -21,10 +21,12 @@ import SearchOutlinedIcon from "@mui/icons-material/SearchOutlined";
 import AccountTreeOutlinedIcon from "@mui/icons-material/AccountTreeOutlined";
 import ViewListOutlinedIcon from "@mui/icons-material/ViewListOutlined";
 import RowDetailPanel from "./RowDetailPanel";
+import { RecordScopeContext } from "@/lib/recordScope";
+import { isRecordBookmarked, parseSourceRefs } from "@/lib/sourceRefs";
 
-// File-system information is read from the MFT_Records overview table. The
-// table can hold ~1M rows, so folders load lazily and search queries SQLite
-// directly instead of materializing all records in the browser.
+// 파일 시스템 정보는 화면용 파생 테이블(_OVERVIEW/FileSystemEntries)에서
+// 읽는다. 수십만~백만 행 규모라 폴더는 지연 로딩하고, 검색·목록은 SQLite를
+// 직접 조회한다. 플래그는 0/1이고 미확인은 NULL이다(Y/N 아님).
 
 type Row = Record<string, string>;
 
@@ -32,6 +34,8 @@ type Row = Record<string, string>;
 const MFT_CHILDREN_PAGE = 100;
 
 const ROOT_ENTRY = 5;
+// 부모를 확인하지 못한 레코드(parent_entry IS NULL) 묶음의 내부 키.
+const ORPHAN_KEY = "__orphans__";
 const LIST_FETCH_SIZE = 200; // lazy 로딩 배치 크기
 // 스크롤 이어받기로 재귀 목록에 상주시킬 행 상한. 원본 테이블 경로의
 // MAX_RESIDENT_RAW_ROWS(app/page.tsx)와 같은 값·같은 계약이다 — 수백만 행
@@ -55,9 +59,10 @@ const MFT_TIME_SORTS: Record<string, { label: string; column: string }> = {
 
 interface Props {
   dbPath: string;
-  /** Bookmarks already scoped to this MFT table — which records (and which
-   *  specific timestamps) are starred. */
-  tableBookmarks: Bookmark[];
+  /** Bookmark identities of the current host — matched against the source
+   *  record each row points at. Bookmarks live on the raw facts row
+   *  (MFT_Records); this screen only shares their display state. */
+  bookmarkKeys: Set<string>;
   onToggleBookmark: (rowid: number, field: string) => void;
   /** All bookmarks for the case (any table) — lets the JumpList/Shellbag detail
    *  modal show whether a reference's timestamp is already bookmarked. */
@@ -68,8 +73,8 @@ interface Props {
 }
 
 
-/** dbPath is <hostDir>/_OVERVIEW/MFT_Records.sqlite — strip the tail to get
- *  the host folder the other artifacts live under. */
+/** dbPath는 <hostDir>/_OVERVIEW/FileSystemEntries.sqlite — 뒤 두 조각을 떼면
+ *  다른 아티팩트가 있는 호스트 폴더다. */
 function hostDirOf(dbPath: string): string {
   const parts = dbPath.split(/[\\/]/);
   return parts.slice(0, Math.max(0, parts.length - 2)).join("/");
@@ -110,8 +115,18 @@ function referenceTagTitle(tags: { account: string; kind: string }[]) {
   return tags.map((tag) => `${tag.kind} · ${tag.account || "미상"}`).join(", ");
 }
 
+/** 0/1/NULL — 미확인(null)을 파일로 단정하지 않는다. */
+function dirFlag(r: Row): boolean | null {
+  if (r.is_directory === "1") return true;
+  if (r.is_directory === "0") return false;
+  return null;
+}
 function isDir(r: Row): boolean {
-  return r.is_directory === "Y";
+  return dirFlag(r) === true;
+}
+/** 할당 해제(삭제) 여부 — 확인 불가는 삭제됨으로 표시하지 않는다. */
+function isDeleted(r: Row): boolean {
+  return r.in_use === "0";
 }
 function fmtSize(v: string): string {
   const n = Number(v);
@@ -122,7 +137,14 @@ function fmtSize(v: string): string {
   return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }
 
-export default function MftView({ dbPath, tableBookmarks, onToggleBookmark, allBookmarks, onBookmarkRef }: Props) {
+export default function MftView({ dbPath, bookmarkKeys, onToggleBookmark, allBookmarks, onBookmarkRef }: Props) {
+  // Coordinates of what this screen shows; the detail panel reads
+  // source_records with them. The outer "open source record" action is kept.
+  const outerScope = useContext(RecordScopeContext);
+  const recordScope = useMemo(
+    () => ({ ...outerScope, fullPath: dbPath, tableName: "FileSystemEntries" }),
+    [dbPath, outerScope],
+  );
   const [root, setRoot] = useState<{ rows: Row[]; total: number } | null>(null);
   const [childrenCache, setChildrenCache] = useState<Record<string, { rows: Row[]; total: number }>>({});
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
@@ -133,6 +155,7 @@ export default function MftView({ dbPath, tableBookmarks, onToggleBookmark, allB
   const [loadMoreFailed, setLoadMoreFailed] = useState<Set<string>>(new Set());
   const [rootError, setRootError] = useState<string | null>(null);
   const [selected, setSelected] = useState<Row | null>(null);
+  const selectedRowid = selected ? Number(selected.__rowid) : null;
   const [referenceDetail, setReferenceDetail] = useState<PathReference | null>(null);
   // Cross-artifact sightings of a path (JumpList today), indexed by lowercased
   // path so the tree can tag rows without a query per row.
@@ -145,6 +168,34 @@ export default function MftView({ dbPath, tableBookmarks, onToggleBookmark, allB
   // JumpList/Shellbag tags stop cluttering the tree.
   const [refAccounts, setRefAccounts] = useState<string[]>([]);
   const [selAccounts, setSelAccounts] = useState<Set<string>>(new Set());
+  // 결과가 담은 볼륨 문맥. 여러 $MFT가 한 결과에 들어오면 entry·parent_entry는
+  // 볼륨 안에서만 의미가 있으므로(docs-01), 분석가가 고른 볼륨 안에서만
+  // 경로·부모를 해석한다. 볼륨이 하나뿐이면 선택기를 보여 주지 않는다.
+  const [volumes, setVolumes] = useState<MftVolume[]>([]);
+  const [volumeId, setVolumeId] = useState<string>("");
+  const [volumesError, setVolumesError] = useState<string | null>(null);
+  useEffect(() => {
+    let alive = true;
+    setVolumes([]);
+    setVolumeId("");
+    setVolumesError(null);
+    window.api.mftVolumes(dbPath).then((list) => {
+      if (!alive) return;
+      setVolumes(list);
+      // 볼륨이 여럿이면 첫 볼륨으로 시작한다 — 볼륨을 섞어 한 트리로 보여
+      // 주면 서로 다른 볼륨의 엔트리 번호가 한 부모 아래 섞인다.
+      setVolumeId(list.length > 1 ? list[0].volume_id : "");
+    }).catch(() => {
+      if (!alive) return;
+      setVolumesError("볼륨 목록을 불러오지 못했습니다.");
+    });
+    return () => { alive = false; };
+  }, [dbPath]);
+  const volumeArg = volumeId || undefined;
+  const volumeLabel = (volume: MftVolume): string =>
+    [volume.drive_letter, volume.volume_label, `${Number(volume.record_count || 0).toLocaleString()}건`]
+      .filter(Boolean)
+      .join(" · ") || volume.volume_id;
 
   // 교차 참조는 파싱 단계에서 만든 _OVERVIEW/PathReferences 파생 테이블을
   // "지금 화면에 로드된 경로"만 배치로 조회한다 — 화면 진입 시 전체
@@ -252,7 +303,7 @@ export default function MftView({ dbPath, tableBookmarks, onToggleBookmark, allB
     setLoadMoreFailed(new Set());
     setSelected(null);
     setReferenceDetail(null);
-    window.api.mftChildren(dbPath, ROOT_ENTRY, 0, MFT_CHILDREN_PAGE).then((page) => {
+    window.api.mftChildren(dbPath, ROOT_ENTRY, 0, MFT_CHILDREN_PAGE, volumeArg).then((page) => {
       if (!cancelled) setRoot(page);
     }).catch(() => {
       if (!cancelled) {
@@ -263,7 +314,7 @@ export default function MftView({ dbPath, tableBookmarks, onToggleBookmark, allB
     return () => {
       cancelled = true;
     };
-  }, [dbPath]);
+  }, [dbPath, volumeArg]);
 
   const loadChildren = useCallback(
     async (entry: string) => {
@@ -271,7 +322,9 @@ export default function MftView({ dbPath, tableBookmarks, onToggleBookmark, allB
       setLoadingEntry((s) => new Set(s).add(entry));
       setFailedEntries((s) => { const next = new Set(s); next.delete(entry); return next; });
       try {
-        const page = await window.api.mftChildren(dbPath, Number(entry), 0, MFT_CHILDREN_PAGE);
+        // parentEntry=null은 "부모 미확인" 묶음이다 — 부모를 못 찾은 레코드가
+        // 트리에서 조용히 사라지지 않게 따로 조회한다(docs-01: 미확인은 NULL).
+        const page = await window.api.mftChildren(dbPath, entry === ORPHAN_KEY ? null : Number(entry), 0, MFT_CHILDREN_PAGE, volumeArg);
         setChildrenCache((c) => ({ ...c, [entry]: page }));
       } catch {
         setFailedEntries((s) => new Set(s).add(entry));
@@ -283,7 +336,7 @@ export default function MftView({ dbPath, tableBookmarks, onToggleBookmark, allB
         });
       }
     },
-    [dbPath, childrenCache],
+    [dbPath, childrenCache, volumeArg],
   );
 
   // 대형 폴더(수만 자식)에서 전체를 한 번에 IPC로 받지 않도록 페이지로 이어
@@ -294,7 +347,7 @@ export default function MftView({ dbPath, tableBookmarks, onToggleBookmark, allB
       if (!cached || cached.rows.length >= cached.total || loadingEntry.has(entry)) return;
       setLoadingEntry((s) => new Set(s).add(entry));
       try {
-        const page = await window.api.mftChildren(dbPath, Number(entry), cached.rows.length, MFT_CHILDREN_PAGE);
+        const page = await window.api.mftChildren(dbPath, entry === ORPHAN_KEY ? null : Number(entry), cached.rows.length, MFT_CHILDREN_PAGE, volumeArg);
         // 후속 페이지는 서버가 COUNT를 생략하고 total=-1을 준다 — 첫 페이지의
         // 값을 유지한다.
         const merged = { rows: [...cached.rows, ...page.rows], total: page.total >= 0 ? page.total : cached.total };
@@ -311,8 +364,9 @@ export default function MftView({ dbPath, tableBookmarks, onToggleBookmark, allB
         });
       }
     },
-    [dbPath, childrenCache, root, loadingEntry],
+    [dbPath, childrenCache, root, loadingEntry, volumeArg],
   );
+
 
   const toggle = useCallback(
     (r: Row) => {
@@ -344,7 +398,7 @@ export default function MftView({ dbPath, tableBookmarks, onToggleBookmark, allB
     setSearching(true);
     setSearchError(null);
     const t = setTimeout(() => {
-      window.api.mftSearch(dbPath, q, 500).then((rows) => {
+      window.api.mftSearch(dbPath, q, 500, volumeArg).then((rows) => {
         if (seq === searchSeq.current) {
           setResults(rows);
           setSearching(false);
@@ -358,7 +412,7 @@ export default function MftView({ dbPath, tableBookmarks, onToggleBookmark, allB
       });
     }, 250);
     return () => clearTimeout(t);
-  }, [search, dbPath, viewMode]);
+  }, [search, dbPath, viewMode, volumeArg]);
 
   // The recursive list owns its own bounded SQLite page. It intentionally
   // does not reuse tree search results, which are capped and may omit paths.
@@ -373,8 +427,9 @@ export default function MftView({ dbPath, tableBookmarks, onToggleBookmark, allB
       timeKey: listTimeKey,
       timeStart: toBound(listTimeStart, "start") || undefined,
       timeEnd: toBound(listTimeEnd, "end") || undefined,
+      volumeId: volumeArg,
     }),
-    [listSortKey, listSortDesc, listFilesOnly, listPattern, listTimeKey, listTimeStart, listTimeEnd],
+    [listSortKey, listSortDesc, listFilesOnly, listPattern, listTimeKey, listTimeStart, listTimeEnd, volumeArg],
   );
   // 필터·정렬·검색이 바뀌면 처음부터 다시, 스크롤이 끝에 닿으면 이어서 불러온다.
   useEffect(() => {
@@ -413,23 +468,31 @@ export default function MftView({ dbPath, tableBookmarks, onToggleBookmark, allB
     });
   }, [dbPath, listQuery, listOptions, listLoading, listRows.length, listTotal]);
 
-  const bmRowids = useMemo(() => new Set(tableBookmarks.map((b) => b.rowid)), [tableBookmarks]);
-  const bmFieldKeys = useMemo(() => new Set(tableBookmarks.map((b) => `${b.rowid}@${b.field ?? ""}`)), [tableBookmarks]);
-  const selectedRowid = selected ? Number(selected.__rowid) : null;
+  // Bookmarks live on the raw facts record (MFT_Records), so each display row
+  // matches its state through the source coordinates it carries.
+  const isRowBookmarked = useCallback(
+    (row: Row, field?: string) => isRecordBookmarked(
+      bookmarkKeys,
+      { fullPath: dbPath, tableName: "FileSystemEntries", rowid: Number(row.__rowid) },
+      parseSourceRefs(row.__source_refs),
+      field,
+    ),
+    [bookmarkKeys, dbPath],
+  );
   const stackedInspector = useMediaQuery("(max-width: 960px)");
   const detailPanel = selected ? (
     <RowDetailPanel
       row={selected}
       columns={Object.keys(selected).filter((key) => key !== "__rowid")}
       focusedColumn={null}
-      fileBaseName="MFT_Records"
+      fileBaseName="FileSystemEntries"
       variant="docked"
       onClose={() => setSelected(null)}
       onNavigate={() => {}}
-      isBookmarked={bmRowids.has(Number(selected.__rowid))}
+      isBookmarked={isRowBookmarked(selected)}
       onToggleBookmark={() => onToggleBookmark(Number(selected.__rowid), "")}
       onToggleFieldBookmark={(field) => onToggleBookmark(Number(selected.__rowid), field)}
-      isFieldBookmarked={(field) => bmFieldKeys.has(`${selected.__rowid}@${field}`)}
+      isFieldBookmarked={(field) => isRowBookmarked(selected, field)}
       relatedEvidence={refsFor(pathRefs.map, selected, selAccounts).map((reference, index) => ({
         id: `${reference.fullPath}:${reference.tableName}:${reference.rowid}:${index}`,
         label: `${reference.kind} · ${reference.account || "미상"}`,
@@ -440,17 +503,27 @@ export default function MftView({ dbPath, tableBookmarks, onToggleBookmark, allB
   ) : (
     <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 9, minHeight: "100%", padding: 24, color: "var(--text-faint)", fontSize: 13 }}>
       <InsertDriveFileOutlinedIcon sx={{ fontSize: 30, color: "var(--text-faint)" }} />
-      파일을 선택하면 MFT 정보를 표시합니다.
+      파일을 선택하면 파일 시스템 레코드 정보를 표시합니다.
     </div>
   );
 
   return (
+    <RecordScopeContext.Provider value={recordScope}>
     <div className="dfir-view" style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
       <ViewHeader icon={FolderOpenOutlinedIcon} title="파일 시스템 정보" meta="$MFT" right={<div role="group" aria-label="MFT 보기 방식" style={{ display: "flex", gap: 4 }}>
-            <button type="button" aria-pressed={viewMode === "tree"} className={viewMode === "tree" ? "nm-btn" : undefined} onClick={() => setViewMode("tree")} style={{ display: "inline-flex", alignItems: "center", gap: 5, minHeight: 30, padding: "3px 11px", border: `1px solid ${viewMode === "tree" ? "var(--accent)" : "var(--border)"}`, borderRadius: "var(--radius-md)", background: viewMode === "tree" ? "var(--accent-subtle)" : "transparent", color: viewMode === "tree" ? "var(--accent)" : "var(--text-dim)", cursor: "pointer", fontSize: 11.5, fontWeight: 650 }}><AccountTreeOutlinedIcon sx={{ fontSize: 15 }} />탐색기</button>
-            <button type="button" aria-pressed={viewMode === "list"} className={viewMode === "list" ? "nm-btn" : undefined} onClick={() => setViewMode("list")} style={{ display: "inline-flex", alignItems: "center", gap: 5, minHeight: 30, padding: "3px 11px", border: `1px solid ${viewMode === "list" ? "var(--accent)" : "var(--border)"}`, borderRadius: "var(--radius-md)", background: viewMode === "list" ? "var(--accent-subtle)" : "transparent", color: viewMode === "list" ? "var(--accent)" : "var(--text-dim)", cursor: "pointer", fontSize: 11.5, fontWeight: 650 }}><ViewListOutlinedIcon sx={{ fontSize: 15 }} />전체 목록</button>
+            <button type="button" aria-pressed={viewMode === "tree"} className={viewMode === "tree" ? "nm-btn" : undefined} onClick={() => setViewMode("tree")} style={{ display: "inline-flex", alignItems: "center", gap: 5, minHeight: 30, padding: "3px 11px", border: `1px solid ${viewMode === "tree" ? "var(--accent)" : "var(--border)"}`, borderRadius: "var(--radius)", background: viewMode === "tree" ? "var(--accent-subtle)" : "transparent", color: viewMode === "tree" ? "var(--accent)" : "var(--text-dim)", cursor: "pointer", fontSize: 11.5, fontWeight: 650 }}><AccountTreeOutlinedIcon sx={{ fontSize: 15 }} />탐색기</button>
+            <button type="button" aria-pressed={viewMode === "list"} className={viewMode === "list" ? "nm-btn" : undefined} onClick={() => setViewMode("list")} style={{ display: "inline-flex", alignItems: "center", gap: 5, minHeight: 30, padding: "3px 11px", border: `1px solid ${viewMode === "list" ? "var(--accent)" : "var(--border)"}`, borderRadius: "var(--radius)", background: viewMode === "list" ? "var(--accent-subtle)" : "transparent", color: viewMode === "list" ? "var(--accent)" : "var(--text-dim)", cursor: "pointer", fontSize: 11.5, fontWeight: 650 }}><ViewListOutlinedIcon sx={{ fontSize: 15 }} />전체 목록</button>
           </div>}>
           <HeaderSearchInput value={search} onChange={setSearch} placeholder="파일명 · 경로 검색 (2자 이상)" ariaLabel="파일명 또는 경로 검색" width={300} />
+          {volumes.length > 1 && (
+            <SelectDropdown
+              label="볼륨"
+              options={volumes.map((volume) => ({ value: volume.volume_id, label: volumeLabel(volume) }))}
+              value={volumeId}
+              defaultValue={volumes[0]?.volume_id ?? ""}
+              onChange={setVolumeId}
+            />
+          )}
           {refAccounts.length > 0 && (
             <AccountFilterChips
               accounts={refAccounts}
@@ -461,18 +534,19 @@ export default function MftView({ dbPath, tableBookmarks, onToggleBookmark, allB
               ariaLabel="교차 참조 계정 필터"
             />
           )}
+        {volumesError && <div role="status" style={{ marginTop: 8, color: "var(--warning)", fontSize: 11.5 }}>{volumesError}</div>}
         {pathRefsError && <div role="status" style={{ marginTop: 8, color: "var(--warning)", fontSize: 11.5 }}>{pathRefsError}</div>}
       
       </ViewHeader>
 
       <div className={`mft-content mft-content--${viewMode}`} style={{ flex: 1, minHeight: 0, display: "grid", gap: 10, padding: 14, background: "var(--bg)", gridTemplateColumns: stackedInspector ? "minmax(0, 1fr)" : "minmax(0, 7fr) minmax(300px, 3fr)", gridTemplateRows: stackedInspector ? "minmax(300px, 1fr) minmax(260px, .75fr)" : undefined }}>
-        <aside aria-label={viewMode === "tree" ? "파일 탐색기" : "재귀 파일 시스템 목록"} style={{ minWidth: 0, minHeight: 0, overflow: "hidden", padding: viewMode === "tree" ? "8px 10px 14px" : "0", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", background: "var(--bg-panel)", display: "flex", flexDirection: "column" }}>
+        <aside aria-label={viewMode === "tree" ? "파일 탐색기" : "재귀 파일 시스템 목록"} style={{ minWidth: 0, minHeight: 0, overflow: "hidden", padding: viewMode === "tree" ? "8px 10px 14px" : "0", border: "1px solid var(--border)", borderRadius: "var(--radius)", background: "var(--bg-panel)", display: "flex", flexDirection: "column" }}>
           {viewMode === "list" ? (
-            <MftRecordList rows={listRows} total={listTotal} loading={listLoading} error={listError} query={listQuery} bmRowids={bmRowids} selectedRowid={selectedRowid} refs={pathRefs.map} accountFilter={selAccounts} onSelect={setSelected} onLoadMore={loadMoreList} sortKey={listSortKey} onSortKey={setListSortKey} sortDesc={listSortDesc} onSortDesc={setListSortDesc} filesOnly={listFilesOnly} onFilesOnly={setListFilesOnly} pattern={listPattern} onPattern={setListPattern} timeStart={listTimeStart} timeEnd={listTimeEnd} onTimeRange={(next) => { setListTimeStart(next.start); setListTimeEnd(next.end); }} timeLabel={MFT_TIME_SORTS[listTimeKey]?.label ?? "생성 시각"} />
+            <MftRecordList rows={listRows} total={listTotal} loading={listLoading} error={listError} query={listQuery} isBookmarked={isRowBookmarked} selectedRowid={selectedRowid} refs={pathRefs.map} accountFilter={selAccounts} onSelect={setSelected} onLoadMore={loadMoreList} sortKey={listSortKey} onSortKey={setListSortKey} sortDesc={listSortDesc} onSortDesc={setListSortDesc} filesOnly={listFilesOnly} onFilesOnly={setListFilesOnly} pattern={listPattern} onPattern={setListPattern} timeStart={listTimeStart} timeEnd={listTimeEnd} onTimeRange={(next) => { setListTimeStart(next.start); setListTimeEnd(next.end); }} timeLabel={MFT_TIME_SORTS[listTimeKey]?.label ?? "생성 시각"} />
           ) : <>
             <div style={{ flex: 1, minHeight: 0, overflow: "auto" }}>
               {results !== null ? (
-                <SearchResults rows={results} searching={searching} error={searchError} bmRowids={bmRowids} selectedRowid={selectedRowid} onSelect={setSelected} refs={pathRefs.map} accountFilter={selAccounts} />
+                <SearchResults rows={results} searching={searching} error={searchError} isBookmarked={isRowBookmarked} selectedRowid={selectedRowid} onSelect={setSelected} refs={pathRefs.map} accountFilter={selAccounts} />
               ) : root === null ? (
                 <div style={{ minHeight: 100, display: "flex", alignItems: "center", justifyContent: "center", gap: 8, color: "var(--text-dim)", fontSize: 12.5 }}>
                   <CircularProgress size={17} thickness={4} />
@@ -492,7 +566,7 @@ export default function MftView({ dbPath, tableBookmarks, onToggleBookmark, allB
                       loadingEntry={loadingEntry}
                       failedEntries={failedEntries}
                       loadMoreFailed={loadMoreFailed}
-                      bmRowids={bmRowids}
+                      isBookmarked={isRowBookmarked}
                       selectedRowid={selectedRowid}
                       onToggle={toggle}
                       onSelect={setSelected}
@@ -506,7 +580,7 @@ export default function MftView({ dbPath, tableBookmarks, onToggleBookmark, allB
                       type="button"
                       disabled={loadingEntry.has(String(ROOT_ENTRY))}
                       onClick={() => loadMoreChildren(String(ROOT_ENTRY))}
-                      style={{ display: "block", marginLeft: 27, minHeight: 27, padding: "2px 10px", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", background: "var(--bg-elevated)", color: "var(--accent)", cursor: "pointer", fontSize: 11.5 }}
+                      style={{ display: "block", marginLeft: 27, minHeight: 27, padding: "2px 10px", border: "1px solid var(--border)", borderRadius: "var(--radius)", background: "var(--bg-elevated)", color: "var(--accent)", cursor: "pointer", fontSize: 11.5 }}
                     >
                       {loadingEntry.has(String(ROOT_ENTRY))
                         ? "불러오는 중…"
@@ -515,12 +589,36 @@ export default function MftView({ dbPath, tableBookmarks, onToggleBookmark, allB
                           : `더 불러오기 (${root.rows.length.toLocaleString()}/${root.total.toLocaleString()})`}
                     </button>
                   )}
+                  {/* 부모를 확인하지 못한 레코드는 트리 어디에도 붙지 않는다 —
+                      묶음으로 따로 보여 주지 않으면 조용히 사라진다. */}
+                  <OrphanBucket
+                    open={expanded.has(ORPHAN_KEY)}
+                    page={childrenCache[ORPHAN_KEY]}
+                    loading={loadingEntry.has(ORPHAN_KEY)}
+                    failed={failedEntries.has(ORPHAN_KEY)}
+                    loadMoreFailed={loadMoreFailed.has(ORPHAN_KEY)}
+                    onToggle={() => setExpanded((previous) => {
+                      const next = new Set(previous);
+                      if (next.has(ORPHAN_KEY)) next.delete(ORPHAN_KEY);
+                      else { next.add(ORPHAN_KEY); void loadChildren(ORPHAN_KEY); }
+                      return next;
+                    })}
+                    onLoadMore={() => loadMoreChildren(ORPHAN_KEY)}
+                    isBookmarked={isRowBookmarked}
+                    selectedRowid={selectedRowid}
+                    onSelect={setSelected}
+                    refs={pathRefs.map}
+                    accountFilter={selAccounts}
+                  />
                 </>
               )}
             </div>
           </>}
         </aside>
-        <section aria-label="선택 항목 MFT 정보" style={{ minWidth: 0, minHeight: 0, overflow: "auto", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", background: "var(--bg-panel)" }}>{detailPanel}</section>
+        <section aria-label="선택 항목 파일 시스템 정보" style={{ minWidth: 0, minHeight: 0, overflow: "auto", border: "1px solid var(--border)", borderRadius: "var(--radius)", background: "var(--bg-panel)" }}>
+          {detailPanel}
+          {selected && <ResidentBody dbPath={dbPath} rowid={Number(selected.__rowid)} volumeId={volumeArg} />}
+        </section>
       </div>
       {referenceDetail && (
         <RowDetailPanel
@@ -535,16 +633,17 @@ export default function MftView({ dbPath, tableBookmarks, onToggleBookmark, allB
         />
       )}
     </div>
+    </RecordScopeContext.Provider>
   );
 }
 
-function MftRecordList({ rows, total, loading, error, query, bmRowids, selectedRowid, refs, accountFilter, onSelect, onLoadMore, sortKey, onSortKey, sortDesc, onSortDesc, filesOnly, onFilesOnly, pattern, onPattern, timeStart, timeEnd, onTimeRange, timeLabel }: {
+function MftRecordList({ rows, total, loading, error, query, isBookmarked, selectedRowid, refs, accountFilter, onSelect, onLoadMore, sortKey, onSortKey, sortDesc, onSortDesc, filesOnly, onFilesOnly, pattern, onPattern, timeStart, timeEnd, onTimeRange, timeLabel }: {
   rows: Row[];
   total: number | null;
   loading: boolean;
   error: string | null;
   query: string;
-  bmRowids: Set<number>;
+  isBookmarked: (row: Row) => boolean;
   selectedRowid: number | null;
   refs: RefMap;
   accountFilter: Set<string> | null;
@@ -592,7 +691,7 @@ function MftRecordList({ rows, total, loading, error, query, bmRowids, selectedR
         onChange={(event) => onPattern(event.target.value)}
         placeholder="파일명 패턴 (예: *.txt)"
         aria-label="파일명 패턴 필터"
-        style={{ flex: "0 1 190px", minWidth: 130, minHeight: 30, padding: "4px 10px", fontSize: 12, fontFamily: "var(--mono)", background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", color: "var(--text)", outline: "none" }}
+        style={{ flex: "0 1 190px", minWidth: 130, minHeight: 30, padding: "4px 10px", fontSize: 12, fontFamily: "var(--mono)", background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: "var(--radius)", color: "var(--text)", outline: "none" }}
       />
       <SelectDropdown
         icon={<SortOutlinedIcon sx={{ fontSize: 15 }} />}
@@ -626,7 +725,7 @@ function MftRecordList({ rows, total, loading, error, query, bmRowids, selectedR
         aria-pressed={!filesOnly}
         onClick={() => onFilesOnly(!filesOnly)}
         title={filesOnly ? "폴더도 함께 표시" : "파일만 표시"}
-        style={{ display: "inline-flex", alignItems: "center", gap: 5, minHeight: 31, padding: "4px 11px", background: filesOnly ? "var(--bg-elevated)" : "var(--accent-subtle)", color: filesOnly ? "var(--text-dim)" : "var(--accent)", border: `1px solid ${filesOnly ? "var(--border)" : "color-mix(in srgb, var(--accent) 58%, var(--border))"}`, borderRadius: "var(--radius-md)", cursor: "pointer", fontSize: 12, fontWeight: filesOnly ? 500 : 650, whiteSpace: "nowrap" }}
+        style={{ display: "inline-flex", alignItems: "center", gap: 5, minHeight: 31, padding: "4px 11px", background: filesOnly ? "var(--bg-elevated)" : "var(--accent-subtle)", color: filesOnly ? "var(--text-dim)" : "var(--accent)", border: `1px solid ${filesOnly ? "var(--border)" : "color-mix(in srgb, var(--accent) 58%, var(--border))"}`, borderRadius: "var(--radius)", cursor: "pointer", fontSize: 12, fontWeight: filesOnly ? 500 : 650, whiteSpace: "nowrap" }}
       >
         <FolderOutlinedIcon sx={{ fontSize: 15 }} />폴더 포함
       </button>
@@ -645,15 +744,15 @@ function MftRecordList({ rows, total, loading, error, query, bmRowids, selectedR
         <div aria-hidden="true" style={{ display: "grid", gridTemplateColumns: grid, gap: 10, alignItems: "center", minHeight: 32, padding: "0 12px", borderBottom: "1px solid var(--border)", color: "var(--text-faint)", fontSize: 10.5, fontWeight: 700 }}><span>파일 이름 / 경로</span>{sortValue && <span>{sortValue.label}</span>}<span>교차 참조</span></div>
         <div style={{ position: "relative", height: virtualizer.getTotalSize() }}>{virtualItems.map((virtualRow) => {
           const row = rows[virtualRow.index];
-          const bookmarked = bmRowids.has(Number(row.__rowid));
+          const bookmarked = isBookmarked(row);
           const selected = selectedRowid !== null && Number(row.__rowid) === selectedRowid;
           const tags = referenceTags(refs, row, accountFilter).slice(0, 2);
           const path = row.path || row.file_name || "경로 정보 없음";
-          const isFolder = row.is_directory === "Y";
+          const isFolder = isDir(row);
           return <div key={virtualRow.key} className={bookmarked ? `dfir-bookmarked-row${selected ? " dfir-bookmarked-row--selected" : ""}` : undefined} style={{ position: "absolute", top: 0, left: 0, width: "100%", height: LIST_ROW_HEIGHT, transform: `translateY(${virtualRow.start}px)`, borderBottom: "1px solid var(--border-subtle)", background: selected ? "var(--bg-selected)" : "transparent" }}>
             <button type="button" onClick={() => onSelect(row)} title={path} aria-label={`${row.file_name || path} MFT 정보 보기`} style={{ display: "grid", gridTemplateColumns: grid, gap: 10, alignItems: "center", width: "100%", height: "100%", padding: "0 12px", border: 0, background: "transparent", color: "inherit", cursor: "pointer", textAlign: "left" }}>
               <span style={{ minWidth: 0, display: "grid", gridTemplateRows: "18px 16px", gap: 2 }}>
-                <span style={{ minWidth: 0, display: "flex", alignItems: "center", gap: 6, color: "var(--text)", fontSize: 12.5, fontWeight: 650 }}>{isFolder && <FolderOutlinedIcon sx={{ flexShrink: 0, fontSize: 14, color: "var(--text-faint)" }} />}<span title={row.file_name || "(이름 없음)"} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{row.file_name || "(이름 없음)"}</span>{row.in_use === "N" && <span style={{ flexShrink: 0, color: "var(--danger)", fontSize: 10.5, fontWeight: 650 }}>삭제됨</span>}</span>
+                <span style={{ minWidth: 0, display: "flex", alignItems: "center", gap: 6, color: "var(--text)", fontSize: 12.5, fontWeight: 650 }}>{isFolder && <FolderOutlinedIcon sx={{ flexShrink: 0, fontSize: 14, color: "var(--text-faint)" }} />}<span title={row.file_name || "(이름 없음)"} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{row.file_name || "(이름 없음)"}</span>{isDeleted(row) && <span style={{ flexShrink: 0, color: "var(--danger)", fontSize: 10.5, fontWeight: 650 }}>삭제됨</span>}</span>
                 <span title={path} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text-faint)", fontSize: 10.5, fontFamily: "var(--mono)" }}>{path}</span>
               </span>
               {sortValue && <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: row[sortValue.column] ? "var(--text-time)" : "var(--text-faint)", fontSize: 12, fontFamily: "var(--mono)", fontVariantNumeric: "tabular-nums" }}>{sortValue.column === "file_size" ? fmtSize(row.file_size) : row[sortValue.column] || "시간 정보 없음"}</span>}
@@ -673,7 +772,7 @@ function TreeNode({
   loadingEntry,
   failedEntries,
   loadMoreFailed,
-  bmRowids,
+  isBookmarked,
   selectedRowid,
   onToggle,
   onSelect,
@@ -688,7 +787,7 @@ function TreeNode({
   loadingEntry: Set<string>;
   failedEntries: Set<string>;
   loadMoreFailed: Set<string>;
-  bmRowids: Set<number>;
+  isBookmarked: (row: Row) => boolean;
   selectedRowid: number | null;
   onToggle: (r: Row) => void;
   onSelect: (r: Row) => void;
@@ -699,8 +798,8 @@ function TreeNode({
   const dir = isDir(row);
   const open = expanded.has(row.entry);
   const kids = childrenCache[row.entry];
-  const deleted = row.in_use === "N";
-  const bm = bmRowids.has(Number(row.__rowid));
+  const deleted = isDeleted(row);
+  const bm = isBookmarked(row);
   const isSel = selectedRowid !== null && Number(row.__rowid) === selectedRowid;
 
   // A folder click updates the same shared MFT inspector and expands/collapses
@@ -717,7 +816,7 @@ function TreeNode({
     <>
       <div
         className={bm ? `dfir-bookmarked-row${isSel ? " dfir-bookmarked-row--selected" : ""}` : undefined}
-        style={{ minHeight: 32, padding: "2px 7px", paddingLeft: 7 + depth * 16, borderRadius: "var(--radius-sm)", opacity: deleted ? 0.55 : 1, background: isSel ? "var(--bg-selected)" : "transparent", borderLeft: "2px solid transparent" }}
+        style={{ minHeight: 32, padding: "2px 7px", paddingLeft: 7 + depth * 16, borderRadius: "var(--radius)", opacity: deleted ? 0.55 : 1, background: isSel ? "var(--bg-selected)" : "transparent", borderLeft: "2px solid transparent" }}
         onMouseEnter={(e) => { if (!isSel && !bm) e.currentTarget.style.background = "var(--bg-hover)"; }}
         onMouseLeave={(e) => { if (!isSel && !bm) e.currentTarget.style.background = "transparent"; }}
       >
@@ -729,7 +828,7 @@ function TreeNode({
               aria-expanded={open}
               aria-controls={childRegionId}
               onClick={() => onToggle(row)}
-              sx={{ flexShrink: 0, width: 20, height: 20, p: 0, color: "var(--text-faint)", borderRadius: "var(--radius-sm)" }}
+              sx={{ flexShrink: 0, width: 20, height: 20, p: 0, color: "var(--text-faint)", borderRadius: "var(--radius)" }}
             >
               {open ? <KeyboardArrowDownOutlinedIcon sx={{ fontSize: 17 }} /> : <KeyboardArrowRightOutlinedIcon sx={{ fontSize: 17 }} />}
             </IconButton>
@@ -746,8 +845,8 @@ function TreeNode({
               ? (open ? <FolderOpenOutlinedIcon aria-hidden="true" sx={{ flexShrink: 0, fontSize: 17, color: "var(--accent)" }} /> : <FolderOutlinedIcon aria-hidden="true" sx={{ flexShrink: 0, fontSize: 17, color: "var(--text-faint)" }} />)
               : <InsertDriveFileOutlinedIcon aria-hidden="true" sx={{ flexShrink: 0, fontSize: 16, color: "var(--text-faint)" }} />}
             <span style={{ flex: "1 1 0", minInlineSize: "8ch", minWidth: 0, fontSize: 13, color: "var(--text)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{row.file_name || "(이름 없음)"}</span>
-            {deleted && <span style={{ flexShrink: 0, fontSize: 10.5, fontWeight: 700, color: "var(--danger)", border: "1px solid var(--danger)", borderRadius: "var(--radius-sm)", padding: "0 6px" }}>삭제됨</span>}
-            {tagSummary && <span title={referenceTagTitle(rowTags)} style={{ flex: "0 1 176px", maxWidth: 176, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 10.5, fontWeight: 700, color: "var(--accent)", border: "1px solid var(--accent)", borderRadius: "var(--radius-sm)", padding: "1px 7px", textAlign: "center" }}>{tagSummary}</span>}
+            {deleted && <span style={{ flexShrink: 0, fontSize: 10.5, fontWeight: 700, color: "var(--danger)", border: "1px solid var(--danger)", borderRadius: "var(--radius)", padding: "0 6px" }}>삭제됨</span>}
+            {tagSummary && <span title={referenceTagTitle(rowTags)} style={{ flex: "0 1 176px", maxWidth: 176, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 10.5, fontWeight: 700, color: "var(--accent)", border: "1px solid var(--accent)", borderRadius: "var(--radius)", padding: "1px 7px", textAlign: "center" }}>{tagSummary}</span>}
           </button>
         </div>
       </div>
@@ -771,7 +870,7 @@ function TreeNode({
                 loadingEntry={loadingEntry}
                 failedEntries={failedEntries}
                 loadMoreFailed={loadMoreFailed}
-                bmRowids={bmRowids}
+                isBookmarked={isBookmarked}
                 selectedRowid={selectedRowid}
                 onToggle={onToggle}
                 onSelect={onSelect}
@@ -785,7 +884,7 @@ function TreeNode({
                 type="button"
                 disabled={loadingEntry.has(row.entry)}
                 onClick={() => onLoadMore(row.entry)}
-                style={{ display: "block", marginLeft: 7 + (depth + 1) * 16 + 20, minHeight: 27, padding: "2px 10px", border: `1px solid ${loadMoreFailed.has(row.entry) ? "var(--danger)" : "var(--border)"}`, borderRadius: "var(--radius-sm)", background: "var(--bg-elevated)", color: loadMoreFailed.has(row.entry) ? "var(--danger)" : "var(--accent)", cursor: "pointer", fontSize: 11.5 }}
+                style={{ display: "block", marginLeft: 7 + (depth + 1) * 16 + 20, minHeight: 27, padding: "2px 10px", border: `1px solid ${loadMoreFailed.has(row.entry) ? "var(--danger)" : "var(--border)"}`, borderRadius: "var(--radius)", background: "var(--bg-elevated)", color: loadMoreFailed.has(row.entry) ? "var(--danger)" : "var(--accent)", cursor: "pointer", fontSize: 11.5 }}
               >
                 {loadingEntry.has(row.entry)
                   ? "불러오는 중…"
@@ -802,7 +901,7 @@ function TreeNode({
   );
 }
 
-function SearchResults({ rows, searching, error, bmRowids, selectedRowid, onSelect, refs, accountFilter }: { rows: Row[]; searching: boolean; error: string | null; bmRowids: Set<number>; selectedRowid: number | null; onSelect: (r: Row) => void; refs: RefMap; accountFilter: Set<string> | null }) {
+function SearchResults({ rows, searching, error, isBookmarked, selectedRowid, onSelect, refs, accountFilter }: { rows: Row[]; searching: boolean; error: string | null; isBookmarked: (row: Row) => boolean; selectedRowid: number | null; onSelect: (r: Row) => void; refs: RefMap; accountFilter: Set<string> | null }) {
   if (searching && rows.length === 0) return <div style={{ display: "flex", alignItems: "center", gap: 7, padding: "16px 8px", color: "var(--text-faint)", fontSize: 12.5 }}><CircularProgress size={15} thickness={4} /> 검색 중</div>;
   if (error) return <div style={{ padding: "16px 8px", color: "var(--danger)", fontSize: 12.5 }}>{error}</div>;
   if (rows.length === 0) return <div style={{ padding: "16px 8px", color: "var(--text-faint)", fontSize: 12.5 }}>일치하는 항목이 없습니다.</div>;
@@ -810,9 +909,9 @@ function SearchResults({ rows, searching, error, bmRowids, selectedRowid, onSele
     <div style={{ paddingTop: 4 }}>
       <div style={{ fontSize: 11, color: "var(--text-faint)", padding: "6px 7px" }}>검색 결과 {rows.length}건{rows.length >= 500 ? " (상위 500건)" : ""}</div>
       {rows.map((r) => {
-        const deleted = r.in_use === "N";
+        const deleted = isDeleted(r);
         const isSel = selectedRowid !== null && Number(r.__rowid) === selectedRowid;
-        const bookmarked = bmRowids.has(Number(r.__rowid));
+        const bookmarked = isBookmarked(r);
         const rowTags = referenceTags(refs, r, accountFilter);
         const tagSummary = referenceTagSummary(rowTags);
         return (
@@ -827,14 +926,14 @@ function SearchResults({ rows, searching, error, bmRowids, selectedRowid, onSele
             }}
             onMouseEnter={(e) => { if (!isSel && !bookmarked) e.currentTarget.style.background = "var(--bg-hover)"; }}
             onMouseLeave={(e) => { if (!isSel && !bookmarked) e.currentTarget.style.background = "transparent"; }}
-            style={{ minHeight: 34, padding: "3px 7px", borderRadius: "var(--radius-sm)", cursor: "pointer", opacity: deleted ? 0.55 : 1, background: isSel ? "var(--bg-selected)" : "transparent", borderLeft: "2px solid transparent" }}
+            style={{ minHeight: 34, padding: "3px 7px", borderRadius: "var(--radius)", cursor: "pointer", opacity: deleted ? 0.55 : 1, background: isSel ? "var(--bg-selected)" : "transparent", borderLeft: "2px solid transparent" }}
           >
             <div style={{ minWidth: 0 }}>
               <div style={{ minWidth: 0, display: "flex", alignItems: "center", gap: 6 }}>
               {isDir(r) ? <FolderOutlinedIcon aria-hidden="true" sx={{ flexShrink: 0, fontSize: 16, color: "var(--text-faint)" }} /> : <InsertDriveFileOutlinedIcon aria-hidden="true" sx={{ flexShrink: 0, fontSize: 15, color: "var(--text-faint)" }} />}
               <span style={{ flex: "1 1 0", minInlineSize: "8ch", minWidth: 0, fontSize: 12.5, color: "var(--text)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{r.file_name || "(이름 없음)"}</span>
-              {deleted && <span style={{ fontSize: 9.5, fontWeight: 700, color: "var(--danger)", border: "1px solid var(--danger)", borderRadius: "var(--radius-xs)", padding: "1px 5px", textAlign: "center" }}>삭제됨</span>}
-              {tagSummary && <span title={referenceTagTitle(rowTags)} style={{ flex: "0 1 156px", maxWidth: 156, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 9.5, fontWeight: 700, color: "var(--accent)", border: "1px solid var(--accent)", borderRadius: "var(--radius-sm)", padding: "0 4px" }}>{tagSummary}</span>}
+              {deleted && <span style={{ fontSize: 9.5, fontWeight: 700, color: "var(--danger)", border: "1px solid var(--danger)", borderRadius: "var(--radius)", padding: "1px 5px", textAlign: "center" }}>삭제됨</span>}
+              {tagSummary && <span title={referenceTagTitle(rowTags)} style={{ flex: "0 1 156px", maxWidth: 156, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 9.5, fontWeight: 700, color: "var(--accent)", border: "1px solid var(--accent)", borderRadius: "var(--radius)", padding: "0 4px" }}>{tagSummary}</span>}
               </div>
               <div style={{ fontSize: 10.5, color: "var(--text-faint)", fontFamily: "var(--mono)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", marginTop: 1 }}>{r.path}</div>
             </div>
@@ -842,5 +941,120 @@ function SearchResults({ rows, searching, error, bmRowids, selectedRowid, onSele
         );
       })}
     </div>
+  );
+}
+
+/**
+ * 부모를 확인하지 못한 레코드(parent_entry IS NULL) 묶음. 트리의 어느 폴더에도
+ * 붙지 않으므로 별도 묶음으로 열어 본다 — 미확인을 0(루트)으로 단정하지
+ * 않는다(docs-01).
+ */
+function OrphanBucket({ open, page, loading, failed, loadMoreFailed, onToggle, onLoadMore, isBookmarked, selectedRowid, onSelect, refs, accountFilter }: {
+  open: boolean;
+  page?: { rows: Row[]; total: number };
+  loading: boolean;
+  failed: boolean;
+  loadMoreFailed: boolean;
+  onToggle: () => void;
+  onLoadMore: () => void;
+  isBookmarked: (row: Row) => boolean;
+  selectedRowid: number | null;
+  onSelect: (row: Row) => void;
+  refs: RefMap;
+  accountFilter: Set<string> | null;
+}) {
+  const regionId = "mft-orphan-records";
+  return (
+    <div style={{ marginTop: 6, borderTop: "1px solid var(--border-subtle)", paddingTop: 6 }}>
+      <button
+        type="button"
+        onClick={onToggle}
+        aria-expanded={open}
+        aria-controls={regionId}
+        style={{ display: "flex", alignItems: "center", gap: 6, width: "100%", minHeight: 30, padding: "2px 7px", border: 0, background: "transparent", color: "var(--text-dim)", cursor: "pointer", fontSize: 12.5, fontWeight: 650, textAlign: "left" }}
+      >
+        {open ? <KeyboardArrowDownOutlinedIcon sx={{ fontSize: 17, color: "var(--text-faint)" }} /> : <KeyboardArrowRightOutlinedIcon sx={{ fontSize: 17, color: "var(--text-faint)" }} />}
+        부모 미확인 레코드{page ? ` (${page.total.toLocaleString()})` : ""}
+      </button>
+      <div id={regionId} hidden={!open}>
+        {open && (loading && !page ? (
+          <div style={{ display: "flex", alignItems: "center", gap: 6, paddingLeft: 27, minHeight: 27, fontSize: 11.5, color: "var(--text-faint)" }}><CircularProgress size={13} thickness={4} /> 불러오는 중</div>
+        ) : failed && !page ? (
+          <div style={{ paddingLeft: 27, minHeight: 27, lineHeight: "27px", fontSize: 11.5, color: "var(--danger)" }}>부모 미확인 레코드를 읽지 못했습니다. 접었다가 다시 펼쳐 재시도할 수 있습니다.</div>
+        ) : page && page.rows.length === 0 ? (
+          <div style={{ paddingLeft: 27, minHeight: 27, lineHeight: "27px", fontSize: 11.5, color: "var(--text-faint)" }}>부모를 확인하지 못한 레코드가 없습니다.</div>
+        ) : (
+          <>
+            <SearchResults rows={page?.rows ?? []} searching={false} error={null} isBookmarked={isBookmarked} selectedRowid={selectedRowid} onSelect={onSelect} refs={refs} accountFilter={accountFilter} />
+            {page && page.rows.length < page.total && (
+              <button
+                type="button"
+                disabled={loading}
+                onClick={onLoadMore}
+                style={{ display: "block", marginLeft: 27, minHeight: 27, padding: "2px 10px", border: `1px solid ${loadMoreFailed ? "var(--danger)" : "var(--border)"}`, borderRadius: "var(--radius)", background: "var(--bg-elevated)", color: loadMoreFailed ? "var(--danger)" : "var(--accent)", cursor: "pointer", fontSize: 11.5 }}
+              >
+                {loading ? "불러오는 중…" : loadMoreFailed ? `이어받기 실패 — 다시 시도 (${page.rows.length.toLocaleString()}/${page.total.toLocaleString()})` : `더 불러오기 (${page.rows.length.toLocaleString()}/${page.total.toLocaleString()})`}
+              </button>
+            )}
+          </>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * 이름 없는 상주 $DATA 본문. 목록·검색에는 싣지 않고(수십만 행에 본문을
+ * 끼워 나르지 않는다), 분석가가 이 레코드에서 요청할 때만 받는다.
+ * NULL(비상주·미확보)과 길이 0 상주 본문은 다른 상태로 표시한다.
+ */
+function ResidentBody({ dbPath, rowid, volumeId }: { dbPath: string; rowid: number; volumeId?: string }) {
+  const [body, setBody] = useState<MftRecordBody | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    setBody(null);
+    setError(null);
+    setLoading(false);
+  }, [dbPath, rowid, volumeId]);
+  if (!Number.isSafeInteger(rowid)) return null;
+  return (
+    <section aria-label="상주 본문" style={{ padding: "12px 16px 16px", borderTop: "1px solid var(--border-subtle)" }}>
+      <div className="dfir-section-label" style={{ marginBottom: 7 }}>상주 $DATA 본문</div>
+      {!body && !error && (
+        <button
+          type="button"
+          className="nm-btn"
+          disabled={loading}
+          onClick={() => {
+            setLoading(true);
+            setError(null);
+            window.api.mftRecordBody(dbPath, rowid, volumeId)
+              .then(setBody)
+              .catch(() => setError("상주 본문을 불러오지 못했습니다."))
+              .finally(() => setLoading(false));
+          }}
+          style={{ minHeight: 30, padding: "4px 11px", border: "1px solid var(--border)", borderRadius: "var(--radius)", background: "var(--bg-elevated)", color: "var(--accent)", cursor: "pointer", fontSize: 12 }}
+        >
+          {loading ? "불러오는 중…" : "본문 확인"}
+        </button>
+      )}
+      {error && <div role="alert" style={{ color: "var(--danger)", fontSize: 11.5 }}>{error}</div>}
+      {body && (body.dataPresent === null ? (
+        <div style={{ fontSize: 12, color: "var(--text-faint)" }}>비상주이거나 본문을 확보하지 못했습니다 (내용이 빈 상주 본문과 다릅니다).</div>
+      ) : (
+        <div style={{ display: "grid", gap: 6 }}>
+          <div style={{ fontSize: 12, color: "var(--text-dim)" }}>
+            상주 본문 {Number(body.dataLen ?? 0).toLocaleString()} Bytes{body.truncated ? " · 표시는 앞부분만" : ""}
+          </div>
+          <textarea
+            readOnly
+            aria-label="상주 본문 (base64)"
+            value={body.bodyB64 ?? ""}
+            style={{ width: "100%", minHeight: 96, padding: 8, background: "var(--bg-input)", border: "1px solid var(--border)", borderRadius: "var(--radius)", color: "var(--text)", fontFamily: "var(--mono)", fontSize: 11.5, resize: "vertical" }}
+          />
+        </div>
+      ))}
+    </section>
   );
 }

@@ -41,7 +41,7 @@ export default function ColumnFilterControl({ value, onChange }: ColumnFilterCon
         alignItems: "stretch",
         background: "var(--bg-input)",
         border: `1px solid ${active ? "var(--accent)" : "var(--border)"}`,
-        borderRadius: "var(--radius-sm)",
+        borderRadius: "var(--radius)",
         overflow: "hidden",
       }}
     >

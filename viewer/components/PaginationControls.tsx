@@ -17,7 +17,7 @@ function controlStyle(disabled: boolean, active = false): CSSProperties {
     height: 27,
     padding: "0 7px",
     border: `1px solid ${active ? "color-mix(in srgb, var(--accent) 58%, var(--border))" : "var(--border)"}`,
-    borderRadius: "var(--radius-sm)",
+    borderRadius: "var(--radius)",
     background: active ? "var(--accent-subtle)" : "var(--bg-elevated)",
     color: active ? "var(--accent)" : "var(--text-dim)",
     fontSize: 11,

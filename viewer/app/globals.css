@@ -60,10 +60,16 @@
   --tag-neutral-bg: rgba(139, 148, 158, 0.12);
   --tag-neutral-fg: #c8d2dc;
 
-  --radius-xs: 5px;
-  --radius-sm: 8px;
-  --radius-md: 10px;
-  --radius-lg: 16px;
+  /* 모서리는 하나다 — 박스·패널·버튼·배지·칩이 모두 이 값을 쓴다. 기존
+     스케일(xs/sm/md/lg)에서 가장 많이 쓰이던 8px을 그대로 올려, 통일하면서도
+     밀도 높은 증거 화면의 작은 칩·배지가 알약처럼 보이지 않게 한다.
+     예외는 셋뿐이다.
+       1) 기능상 원형: 스피너, 상태 점, 그래프 노드 표식 → 50%
+       2) 컨테이너에 꽉 차는 하위 행(이벤트 원장 행, 사이드바 그룹 헤더)
+          → 0. 모서리가 보이지 않는 전폭 행이라 둥글리면 호버 강조만 떠 보인다.
+       3) 12px 이하 범례 스와치 → 3px. 이 값에 8px을 주면 원으로 뭉개져
+          "사각 노드" 색상 키가 점 표식으로 잘못 읽힌다. */
+  --radius: 8px;
 
   --neu-light: rgba(103, 138, 174, 0.10);
   --neu-shadow: rgba(4, 8, 13, 0.72);
@@ -142,6 +148,11 @@ button:not(:disabled):active {
   background: rgba(244, 213, 120, 0.18) !important;
 }
 
+.target-info-detail-row.dfir-bookmarked-row {
+  border-bottom-color: var(--border-subtle) !important;
+  border-left-color: var(--bookmark-control) !important;
+}
+
 .dfir-bookmarked-row--warning {
   background: var(--warning-subtle) !important;
 }
@@ -173,7 +184,7 @@ button:not(:disabled):active {
 .parse-progress__track {
   height: 7px;
   overflow: hidden;
-  border-radius: 999px;
+  border-radius: var(--radius);
   background: var(--bg-elevated);
 }
 .parse-progress__fill {
@@ -251,12 +262,18 @@ input:focus, select:focus {
    workspace, then become one readable column before either surface clips. */
 .target-info-account-detail-grid {
   display: grid;
-  grid-template-columns: minmax(350px, 5fr) minmax(480px, 7fr);
+  grid-template-columns: minmax(0, 4fr) minmax(0, 6fr);
   gap: 12px;
-  align-items: start;
+  align-items: stretch;
+  flex: 1 0 auto;
+}
+.target-info-account-detail-grid > section {
+  min-width: 0;
 }
 .target-info-account-detail-scroll {
   container-type: inline-size;
+  display: flex;
+  flex-direction: column;
 }
 @media (max-width: 980px) {
   .target-info-account-detail-grid {
@@ -323,23 +340,17 @@ input:focus, select:focus {
   line-height: 1.45;
 }
 .host-ledger-actions {
-  display: grid;
-  grid-template-columns: minmax(72px, 1fr) minmax(72px, 1fr) 1px 28px 28px;
-  gap: 6px;
+  /* 라벨이 붙은 액션 버튼이 5개(결과 보기·파싱·로그 확인·수정·삭제)라 고정
+     그리드로는 좁은 폭에서 넘친다 — 한 줄에 못 담으면 접어 내린다. */
+  display: flex;
+  flex-wrap: wrap;
   align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
   min-width: 248px;
 }
 .host-ledger-actions > button { min-width: 0; }
-.host-ledger-action-placeholder { min-width: 0; min-height: 28px; }
-.host-ledger-action-divider { align-self: stretch; background: var(--border); }
-.host-ledger-confirm {
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 9px;
-  min-width: 248px;
-  white-space: nowrap;
-}
+.host-ledger-action-divider { align-self: stretch; width: 1px; background: var(--border); }
 @container (max-width: 1119px) {
   .host-ledger-heading { display: none; }
   .host-ledger-toolbar { flex-wrap: wrap; }
@@ -351,8 +362,7 @@ input:focus, select:focus {
 }
 @container (max-width: 759px) {
   .host-ledger-row { grid-template-columns: minmax(0, 1fr); gap: 8px; }
-  .host-ledger-actions { min-width: 0; width: min(100%, 248px); }
-  .host-ledger-confirm { width: 100%; min-width: 0; justify-content: space-between; }
+  .host-ledger-actions { min-width: 0; width: min(100%, 360px); }
 }
 @media (max-width: 720px) {
   .target-info-header {
@@ -398,7 +408,7 @@ input:focus, select:focus {
 .dfir-surface {
   background: var(--bg-panel);
   border: 1px solid rgba(154, 188, 222, 0.08);
-  border-radius: var(--radius-lg);
+  border-radius: var(--radius);
   box-shadow: var(--shadow-card);
 }
 .dfir-toolbar {
@@ -427,7 +437,7 @@ input:focus, select:focus {
   padding: 2px 8px;
   /* 라벨은 아웃라인 스타일 — 채움은 버튼의 몫이다. */
   border: 1px solid color-mix(in srgb, var(--tag-neutral-fg) 45%, var(--border));
-  border-radius: var(--radius-sm);
+  border-radius: var(--radius);
   background: transparent;
   color: var(--tag-neutral-fg);
   font-size: 11px;
@@ -499,7 +509,7 @@ input:focus, select:focus {
   min-height: 248px;
   padding: 28px;
   border: 1px solid rgba(154, 188, 222, .08);
-  border-radius: var(--radius-lg);
+  border-radius: var(--radius);
   background: var(--bg-panel);
   box-shadow: var(--shadow-card);
 }
@@ -514,7 +524,7 @@ input:focus, select:focus {
   height: 46px;
   padding: 0 11px;
   border: 1px solid transparent;
-  border-radius: var(--radius-md);
+  border-radius: var(--radius);
   background: var(--bg-input);
   box-shadow: var(--shadow-inset);
   color: var(--text);
@@ -524,7 +534,7 @@ input:focus, select:focus {
 .case-row__actions button,
 .case-row__confirm button {
   min-height: 42px;
-  border-radius: var(--radius-md);
+  border-radius: var(--radius);
   cursor: pointer;
   font-size: 14px;
   font-weight: 700;
@@ -544,7 +554,7 @@ input:focus, select:focus {
   margin: 0 0 16px;
   padding: 12px 14px;
   border: 1px solid rgba(248,81,73,.7);
-  border-radius: var(--radius-md);
+  border-radius: var(--radius);
   background: var(--danger-subtle);
   color: #ffb4af;
   font-size: 12.5px;
@@ -569,7 +579,7 @@ input:focus, select:focus {
   min-height: 92px;
   padding: 18px 18px 18px 22px;
   border: 1px solid rgba(154, 188, 222, .08);
-  border-radius: var(--radius-lg);
+  border-radius: var(--radius);
   background: var(--bg-panel);
   box-shadow: var(--shadow-card);
   cursor: pointer;
@@ -612,7 +622,7 @@ input:focus, select:focus {
 
 ::-webkit-scrollbar-thumb {
   background: #30363d;
-  border-radius: var(--radius-sm);
+  border-radius: var(--radius);
   border: 2px solid transparent;
   background-clip: padding-box;
 }
@@ -675,9 +685,9 @@ input:focus, select:focus {
   .ps-session-child-content { grid-area: content; }
 }
 
-/* --- 버튼 공통: Apple 근사 radius + 텍스트 가운데 --- */
+/* --- 버튼 공통: 전역 통일 radius + 텍스트 가운데 --- */
 button {
-  border-radius: var(--radius-md);
+  border-radius: var(--radius);
   text-align: center;
 }
 
@@ -689,7 +699,7 @@ button {
   align-items: center;
   justify-content: center;
   gap: 6px;
-  border-radius: var(--radius-md);
+  border-radius: var(--radius);
   /* 상단 안쪽 하이라이트가 채움색과 무관하게 볼록감을 만든다 — 파란
      강조 버튼처럼 밝은 채움에서도 neumorphism이 읽히게. */
   box-shadow:
@@ -707,6 +717,14 @@ button {
 }
 .nm-btn:disabled {
   box-shadow: none;
+}
+
+/* MUI 기본 표면만 자체 radius(아이콘 버튼 원형, 툴팁 4px)를 써서 앱의 다른
+   박스와 어긋난다 — 토큰으로 되돌린다. 원형이 의미를 갖는 스피너
+   (CircularProgress)·체크박스 글리프는 MUI가 SVG로 그리므로 영향 없다. */
+.MuiIconButton-root,
+.MuiTooltip-tooltip {
+  border-radius: var(--radius);
 }
 
 /* 실행 로그 접기: 기본 ▶ 마커 대신 버튼형 summary를 쓴다. */

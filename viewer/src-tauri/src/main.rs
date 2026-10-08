@@ -26,8 +26,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tauri::{AppHandle, Emitter};
 use url::Url;
-use wina_core::sqlite::write_table;
-use wina_core::{case_store, overview, pipeline};
+use wina_core::{case_store, parse_eligibility, pipeline};
 
 // --- paths -----------------------------------------------------------------
 
@@ -223,8 +222,47 @@ fn checked_table_names(conn: &Connection) -> Result<Vec<String>, String> {
         .collect())
 }
 
-fn first_table(conn: &Connection) -> Option<String> {
-    table_names(conn).into_iter().next()
+/// Common contract marker of a derived result DB (docs-01 `overview_contract`).
+/// Without it the file is not read as the new schema: the viewer never rebuilds
+/// a result, it only reports that a re-parse is needed.
+const OVERVIEW_CONTRACT_NAME: &str = "overview_contract";
+const OVERVIEW_CONTRACT_VERSION: i64 = 1;
+
+fn overview_contract_version(conn: &Connection) -> Option<i64> {
+    conn.query_row(
+        "SELECT version FROM _wina_derived_version WHERE name = ?1",
+        rusqlite::params![OVERVIEW_CONTRACT_NAME],
+        |row| row.get::<_, i64>(0),
+    )
+    .ok()
+}
+
+/// Analyst-facing table of a contract DB = file stem (Metadata.sqlite → metadata).
+fn primary_table_name(path: &Path) -> Option<String> {
+    path.file_stem().map(|stem| stem.to_string_lossy().to_string())
+}
+
+/// Tables exposed to listing, search and the timeline.
+///
+/// A contract DB publishes exactly one table (the file stem); `source_records`
+/// and child tables (AiMessages, ExecutionTimes, …) are detail-only. Raw
+/// artifact DBs without the marker keep exposing every table.
+fn visible_table_names(conn: &Connection, path: &Path) -> Vec<String> {
+    let names = table_names(conn);
+    if overview_contract_version(conn).is_none() {
+        return names;
+    }
+    let Some(primary) = primary_table_name(path) else {
+        return names;
+    };
+    names
+        .into_iter()
+        .filter(|name| name.eq_ignore_ascii_case(&primary))
+        .collect()
+}
+
+fn first_table(conn: &Connection, path: &Path) -> Option<String> {
+    visible_table_names(conn, path).into_iter().next()
 }
 
 fn table_columns(conn: &Connection, table: &str) -> Vec<String> {
@@ -236,12 +274,59 @@ fn table_columns(conn: &Connection, table: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Columns kept out of generic reads (list, page, search, timeline).
+///
+/// Declared-BLOB columns hold body bytes (FileSystemEntries.data). docs-21:
+/// bodies are read only by an explicit detail request, never hex-expanded into
+/// every listed row. CacheEntries.body_b64 is TEXT but follows the same rule.
+fn excluded_payload_columns(conn: &Connection, table: &str) -> Vec<String> {
+    let mut excluded: Vec<String> = conn
+        .prepare(&format!("PRAGMA table_info({})", q(table)))
+        .and_then(|mut stmt| {
+            stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+            })
+            .map(|rows| {
+                rows.filter_map(|row| row.ok())
+                    .filter(|(_, declared)| declared.trim().eq_ignore_ascii_case("BLOB"))
+                    .map(|(name, _)| name)
+                    .collect()
+            })
+        })
+        .unwrap_or_default();
+    if table == "CacheEntries" {
+        excluded.push("body_b64".to_string());
+    }
+    excluded
+}
+
+/// Columns to serialize into a response (body BLOBs excluded).
+fn payload_columns(conn: &Connection, table: &str) -> Vec<String> {
+    let excluded = excluded_payload_columns(conn, table);
+    table_columns(conn, table)
+        .into_iter()
+        .filter(|column| !excluded.iter().any(|skip| skip == column))
+        .collect()
+}
+
+/// `payload_columns` as a SELECT projection. None (instead of `*`) when the
+/// columns cannot be read, so callers return an empty result explicitly.
+fn payload_projection(columns: &[String]) -> Option<String> {
+    (!columns.is_empty()).then(|| {
+        columns
+            .iter()
+            .map(|column| q(column))
+            .collect::<Vec<_>>()
+            .join(", ")
+    })
+}
+
 // --- account identity directory ------------------------------------------
 
-/// A compact, display-only SID directory read from the already parsed
-/// TargetInfo overview.  This is deliberately not a second parser: when a
-/// host has no SAM/ProfileList result (or a partial one), the caller simply
-/// keeps the original SID visible.
+/// A compact, display-only SID directory read from the host's `Metadata`
+/// result (docs-01 §1, docs-24 §3).  This is deliberately not a second
+/// parser: when a host has no resolved account rows (or a partial set), the
+/// caller simply keeps the original SID visible.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AccountDirectoryEntry {
@@ -326,33 +411,36 @@ fn account_directory_from_rows(
         .collect()
 }
 
+/// SID → display account name. docs-01 runtime lookup: Metadata.sqlite row with
+/// kind='account', scope='machine', key=lower(SID). A NULL value stays
+/// unresolved and the UI shows the SID; no name is invented. The old TargetInfo
+/// composition is gone — metadata is the single source for account names.
 #[tauri::command]
 fn account_directory(host_dir: String) -> Result<Vec<AccountDirectoryEntry>, String> {
-    let path = Path::new(&host_dir)
-        .join("_OVERVIEW")
-        .join("TargetInfo.sqlite");
+    let path = metadata_db_path(&host_dir);
     if !path.is_file() {
-        return Ok(Vec::new());
+        return Ok(account_directory_from_rows(Vec::new()));
     }
     let conn = open_ro(&path.to_string_lossy())?;
-    let tables = checked_table_names(&conn)?;
-    let Some(table) = tables.into_iter().find(|table| table == "TargetInfo") else {
-        return Ok(Vec::new());
-    };
-    let columns = table_columns(&conn, &table);
-    if !["category", "name", "username", "source_artifact"]
-        .iter()
-        .all(|required| columns.iter().any(|column| column == required))
-    {
-        return Ok(Vec::new());
+    if overview_contract_version(&conn) != Some(OVERVIEW_CONTRACT_VERSION) {
+        // No marker: never read a legacy result as the new schema.
+        return Ok(account_directory_from_rows(Vec::new()));
     }
+    let Some(table) = checked_table_names(&conn)?
+        .into_iter()
+        .find(|name| name.eq_ignore_ascii_case("metadata"))
+    else {
+        return Ok(account_directory_from_rows(Vec::new()));
+    };
     let rows = query_rows(
         &conn,
         &format!(
-            "SELECT name, username, source_artifact FROM {} WHERE category = ?1",
+            "SELECT account_sid, value, COALESCE(name_source, '') AS name_source FROM {} \
+             WHERE kind = 'account' AND scope = 'machine' \
+             AND account_sid IS NOT NULL AND value IS NOT NULL",
             q(&table)
         ),
-        &[&"Account"],
+        &[],
     )?;
     Ok(account_directory_from_rows(rows.into_iter().map(|row| {
         let get = |key: &str| {
@@ -361,8 +449,146 @@ fn account_directory(host_dir: String) -> Result<Vec<AccountDirectoryEntry>, Str
                 .unwrap_or_default()
                 .to_string()
         };
-        (get("name"), get("username"), get("source_artifact"))
+        (get("account_sid"), get("value"), get("name_source"))
     })))
+}
+
+fn metadata_db_path(host_dir: &str) -> PathBuf {
+    Path::new(host_dir).join("_OVERVIEW").join("Metadata.sqlite")
+}
+
+/// One metadata bundle for the host view: the selected rows (by metadata_id or
+/// kind) plus their child tables, read in one batch instead of reopening the DB
+/// per TargetInfo.metadata_id (docs-24 §2.4). Cross-file FKs are not enforced
+/// by SQLite, so caller-supplied metadata_id values are returned only when they
+/// actually exist.
+#[derive(Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HostMetadata {
+    rows: Vec<Map<String, Value>>,
+    addresses: Vec<Map<String, Value>>,
+    gateways: Vec<Map<String, Value>>,
+    dns_servers: Vec<Map<String, Value>>,
+    groups: Vec<Map<String, Value>>,
+    candidates: Vec<Map<String, Value>>,
+    /// Whether metadata is stored under the common contract (overview_contract=1).
+    /// false means "re-parse needed", which the UI separates from an empty result.
+    contract_ok: bool,
+}
+
+fn host_metadata_blocking(
+    host_dir: String,
+    metadata_ids: Option<Vec<String>>,
+    kind: Option<String>,
+) -> Result<HostMetadata, String> {
+    let path = metadata_db_path(&host_dir);
+    if !path.is_file() {
+        return Ok(HostMetadata::default());
+    }
+    let conn = open_ro(&path.to_string_lossy())?;
+    if overview_contract_version(&conn) != Some(OVERVIEW_CONTRACT_VERSION) {
+        return Ok(HostMetadata::default());
+    }
+    let Some(table) = checked_table_names(&conn)?
+        .into_iter()
+        .find(|name| name.eq_ignore_ascii_case("metadata"))
+    else {
+        return Ok(HostMetadata::default());
+    };
+    let mut clauses: Vec<String> = Vec::new();
+    let mut params: Vec<String> = Vec::new();
+    if let Some(kind) = kind.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+        params.push(kind.to_string());
+        clauses.push(format!("kind = ?{}", params.len()));
+    }
+    if let Some(ids) = metadata_ids.as_ref() {
+        let ids: Vec<&String> = ids.iter().filter(|id| !id.trim().is_empty()).collect();
+        if ids.is_empty() {
+            // Explicitly empty selection — nothing to read.
+            return Ok(HostMetadata {
+                contract_ok: true,
+                ..HostMetadata::default()
+            });
+        }
+        let placeholders = ids
+            .iter()
+            .map(|id| {
+                params.push((*id).clone());
+                format!("?{}", params.len())
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        clauses.push(format!("metadata_id IN ({placeholders})"));
+    }
+    let where_clause = if clauses.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", clauses.join(" AND "))
+    };
+    let refs: Vec<&dyn rusqlite::ToSql> = params
+        .iter()
+        .map(|value| value as &dyn rusqlite::ToSql)
+        .collect();
+    let rows = query_rows(
+        &conn,
+        &format!(
+            "SELECT rowid AS __rowid, * FROM {}{where_clause} ORDER BY kind, scope, key",
+            q(&table)
+        ),
+        refs.as_slice(),
+    )?;
+    let selected: Vec<String> = rows
+        .iter()
+        .filter_map(|row| {
+            row.get("metadata_id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect();
+    let mut result = HostMetadata {
+        rows,
+        contract_ok: true,
+        ..HostMetadata::default()
+    };
+    if selected.is_empty() {
+        return Ok(result);
+    }
+    let available = checked_table_names(&conn)?;
+    for (child, target) in [
+        ("MetadataAddresses", &mut result.addresses),
+        ("MetadataGateways", &mut result.gateways),
+        ("MetadataDnsServers", &mut result.dns_servers),
+        ("MetadataGroups", &mut result.groups),
+        ("MetadataCandidates", &mut result.candidates),
+    ] {
+        if !available.iter().any(|name| name == child) {
+            continue;
+        }
+        for chunk in selected.chunks(400) {
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+            let sql = format!(
+                "SELECT rowid AS __rowid, * FROM {} WHERE metadata_id IN ({placeholders}) ORDER BY metadata_id, ordinal",
+                q(child)
+            );
+            let chunk_refs: Vec<&dyn rusqlite::ToSql> = chunk
+                .iter()
+                .map(|id| id as &dyn rusqlite::ToSql)
+                .collect();
+            target.extend(query_rows(&conn, &sql, chunk_refs.as_slice())?);
+        }
+    }
+    Ok(result)
+}
+
+#[tauri::command]
+async fn host_metadata(
+    host_dir: String,
+    metadata_ids: Option<Vec<String>>,
+    kind: Option<String>,
+) -> Result<HostMetadata, String> {
+    tauri::async_runtime::spawn_blocking(move || host_metadata_blocking(host_dir, metadata_ids, kind))
+        .await
+        .map_err(|error| format!("호스트 메타데이터 조회가 중단되었습니다: {error}"))?
 }
 
 const EMPTY_SQLITE_MAX_BYTES: u64 = 100;
@@ -727,6 +953,22 @@ async fn run_host(
     // that start a parse without first opening the host list.
     let cd = cases_dir();
     case_store::ensure_direct_host_store(&cd).map_err(|error| error.to_string())?;
+    // Enforce the UI-01 rule here too, so a click made before the host list
+    // refreshed (or any other caller) cannot bypass it. A scoped run (the
+    // existing MFT-only retry) names its artifact explicitly and is exempt.
+    let scoped_run = options.only.as_ref().is_some_and(|only| !only.is_empty());
+    if !scoped_run {
+        let (case_id, host_id, cases) = (options.case_id.clone(), options.host_id.clone(), cd.clone());
+        let eligibility = tauri::async_runtime::spawn_blocking(move || {
+            parse_eligibility::host_parse_eligibility(&case_id, &host_id, &cases)
+        })
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())?;
+        if !eligibility.can_parse {
+            return Err(eligibility.reason);
+        }
+    }
     let run_id = options.run_id.unwrap_or_else(pipeline::new_parse_run_id);
     if !valid_id(&run_id) {
         return Err("invalid pipeline run identifier".into());
@@ -1171,15 +1413,15 @@ fn read_sqlite_page(
     limit: i64,
     max_bytes: Option<usize>,
 ) -> Result<SqlitePage, String> {
-    let mut columns = table_columns(conn, table);
-    let is_cache = table == "CacheEntries";
-    if is_cache {
-        columns.retain(|c| c != "body_b64");
-    }
-    let select = if is_cache {
-        columns.iter().map(|c| q(c)).collect::<Vec<_>>().join(", ")
-    } else {
-        "*".into()
+    // Body BLOBs (FileSystemEntries.data) and cache bodies stay out of list
+    // responses; detail-only commands read them.
+    let columns = payload_columns(conn, table);
+    let Some(select) = payload_projection(&columns) else {
+        return Ok(SqlitePage {
+            columns,
+            rows: Vec::new(),
+            budget_stopped: false,
+        });
     };
     let sql = format!(
         "SELECT rowid AS __rowid, {} FROM {} ORDER BY rowid LIMIT ? OFFSET ?",
@@ -1233,7 +1475,7 @@ fn timeline_source_page_blocking(
     limit: i64,
 ) -> Result<TimelineSourcePage, String> {
     let conn = open_ro(&full_path)?;
-    let table = match table_name.or_else(|| first_table(&conn)) {
+    let table = match table_name.or_else(|| first_table(&conn, Path::new(&full_path))) {
         Some(t) => t,
         None => {
             return Ok(TimelineSourcePage {
@@ -1245,13 +1487,14 @@ fn timeline_source_page_blocking(
     };
     let limit = limit.clamp(1, 100_000);
     let offset = offset.max(0);
-    let page = read_sqlite_page(
+    let mut page = read_sqlite_page(
         &conn,
         &table,
         offset,
         limit,
         Some(TIMELINE_SOURCE_PAGE_MAX_BYTES),
     )?;
+    decorate_source_refs(&conn, Path::new(&full_path), &mut page.rows)?;
     let consumed = page.rows.len() as i64;
     // 예산으로 끊겼거나 요청한 행 수를 채웠으면 뒤가 더 있을 수 있다.
     let next_offset = if page.budget_stopped || consumed == limit {
@@ -1287,7 +1530,9 @@ async fn timeline_source_page(
 // 대신 트랜잭션 insert를 수행한다.
 
 /// 구조 로직(필터키·검색 blob·include 규칙) 버전. 규칙이 바뀌면 올려 재빌드 유도.
-const TIMELINE_LOGIC_VERSION: i64 = 2;
+/// 3 = _OVERVIEW contract cutover (primary tables only, body BLOBs excluded,
+/// source_records instead of record_key for raw evidence).
+const TIMELINE_LOGIC_VERSION: i64 = 3;
 
 fn timeline_db_path(host_dir: &str) -> PathBuf {
     Path::new(host_dir).join("_master_timeline.sqlite")
@@ -1319,14 +1564,10 @@ fn read_source_rows_by_rowid(
     let mut out = std::collections::HashMap::new();
     for ((path, table), rowids) in by_file {
         let Ok(conn) = open_ro(&path) else { continue };
-        let mut columns = table_columns(&conn, &table);
-        if table == "CacheEntries" {
-            columns.retain(|c| c != "body_b64");
-        }
-        let select = if table == "CacheEntries" {
-            columns.iter().map(|c| q(c)).collect::<Vec<_>>().join(", ")
-        } else {
-            "*".to_string()
+        // Timeline search text and display never carry body BLOBs either.
+        let columns = payload_columns(&conn, &table);
+        let Some(select) = payload_projection(&columns) else {
+            continue;
         };
         // rowid 묶음은 100개씩 나눠 조회한다(플레이스홀더·SQL 길이 상한).
         for chunk in rowids.chunks(100) {
@@ -1383,7 +1624,8 @@ const TIMELINE_SCHEMA: &str = "CREATE TABLE master_timeline (\
  ts TEXT NOT NULL, category TEXT NOT NULL, source_table TEXT NOT NULL,\
  artifact_group TEXT NOT NULL, filter_key TEXT NOT NULL DEFAULT '',\
  has_tags INTEGER NOT NULL, full_path TEXT NOT NULL, rowid_src INTEGER NOT NULL,\
- record_key TEXT NOT NULL DEFAULT '', event_time TEXT NOT NULL DEFAULT '',\
+ record_key TEXT NOT NULL DEFAULT '', record_id TEXT NOT NULL DEFAULT '',\
+ event_time TEXT NOT NULL DEFAULT '',\
  search_blob TEXT NOT NULL);\
  CREATE TABLE _meta (key TEXT PRIMARY KEY, value TEXT);";
 
@@ -1398,8 +1640,12 @@ struct TimelineInsertRow {
     has_tags: i64,
     full_path: String,
     rowid_src: i64,
+    /// `<table>::<rowid>` pointer of a raw (facts) row. Empty for contract DBs.
     #[serde(default)]
     record_key: String,
+    /// Derived row id; its raw evidence is looked up through source_records.
+    #[serde(default)]
+    record_id: String,
     #[serde(default)]
     event_time: String,
 }
@@ -1537,7 +1783,7 @@ fn timeline_build_insert_impl(
             {
                 let mut stmt = tx
                     .prepare_cached(
-                        "INSERT INTO master_timeline (ts,category,source_table,artifact_group,filter_key,has_tags,full_path,rowid_src,record_key,event_time,search_blob) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                        "INSERT INTO master_timeline (ts,category,source_table,artifact_group,filter_key,has_tags,full_path,rowid_src,record_key,record_id,event_time,search_blob) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
                     )
                     .map_err(|e| format!("타임라인 insert 준비 실패: {e}"))?;
                 for r in &rows {
@@ -1547,7 +1793,7 @@ fn timeline_build_insert_impl(
                         .unwrap_or_default();
                     stmt.execute(rusqlite::params![
                         r.ts, r.category, r.source_table, r.artifact_group, r.filter_key,
-                        r.has_tags, r.full_path, r.rowid_src, r.record_key, r.event_time,
+                        r.has_tags, r.full_path, r.rowid_src, r.record_key, r.record_id, r.event_time,
                         blob
                     ])
                     .map_err(|e| format!("타임라인 insert 실패: {e}"))?;
@@ -1867,6 +2113,7 @@ struct TimelinePageRow {
     full_path: String,
     rowid_src: i64,
     record_key: String,
+    record_id: String,
     event_time: String,
     /// 원본 행 — 타임라인 DB에 사본을 두지 않고 페이지마다 원본에서 읽어 붙인다.
     row: Map<String, Value>,
@@ -1952,7 +2199,7 @@ fn timeline_page_impl(host_dir: &str, query: TimelineQuery) -> Result<TimelinePa
         .map_err(|e| format!("타임라인 건수 조회 실패: {e}"))?;
     let dir = if query.sort_desc { "DESC" } else { "ASC" };
     let sql = format!(
-        "SELECT ts,category,source_table,artifact_group,full_path,rowid_src,record_key,event_time \
+        "SELECT ts,category,source_table,artifact_group,full_path,rowid_src,record_key,record_id,event_time \
          FROM master_timeline{where_clause} ORDER BY ts {dir}, source_table, rowid_src LIMIT {limit} OFFSET {offset}"
     );
     let mut stmt = conn
@@ -1968,7 +2215,8 @@ fn timeline_page_impl(host_dir: &str, query: TimelineQuery) -> Result<TimelinePa
                 full_path: r.get(4)?,
                 rowid_src: r.get(5)?,
                 record_key: r.get(6)?,
-                event_time: r.get(7)?,
+                record_id: r.get(7)?,
+                event_time: r.get(8)?,
                 row: Map::new(),
             })
         })
@@ -1986,6 +2234,27 @@ fn timeline_page_impl(host_dir: &str, query: TimelineQuery) -> Result<TimelinePa
     for row in &mut rows {
         if let Some(values) = sources.get(&(row.full_path.clone(), row.rowid_src)) {
             row.row = values.iter().cloned().collect();
+        }
+    }
+    // Timeline rows carry the same raw evidence identities as the raw/overview
+    // screens, so bookmark state matches. One lookup per source file.
+    let mut by_file: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (index, row) in rows.iter().enumerate() {
+        if contract_row_record_id(&row.row).is_some() {
+            by_file.entry(row.full_path.clone()).or_default().push(index);
+        }
+    }
+    for (path, indexes) in by_file {
+        let Ok(source_conn) = open_ro(&path) else {
+            continue;
+        };
+        let mut page: Vec<Map<String, Value>> = indexes
+            .iter()
+            .map(|index| rows[*index].row.clone())
+            .collect();
+        decorate_source_refs(&source_conn, Path::new(&path), &mut page)?;
+        for (slot, index) in indexes.into_iter().enumerate() {
+            rows[index].row = page[slot].clone();
         }
     }
     Ok(TimelinePage { rows, total })
@@ -2048,7 +2317,9 @@ fn find_result_files(dir: &Path, base: &Path, out: &mut Vec<ResultFileEntry>) {
             .unwrap_or(&p)
             .to_string_lossy()
             .to_string();
-        for t in table_names(&conn) {
+        // A contract DB contributes one sidebar entry: source_records and child
+        // tables are detail-only, not separate result files.
+        for t in visible_table_names(&conn, &p) {
             let count: i64 = conn
                 .query_row(&format!("SELECT COUNT(*) FROM {}", q(&t)), [], |r| r.get(0))
                 .unwrap_or(0);
@@ -2090,107 +2361,73 @@ async fn list_result_files(category_dir: String) -> Vec<ResultFileEntry> {
     .unwrap_or_default()
 }
 
-/// Upgrade only the derived ExecutionHistory table when it predates source
-/// record keys or the complete Prefetch execution-cache fields. This avoids an
-/// expensive evidence reparse while making existing saved hosts participate in
-/// cross-view bookmark synchronization and full Prefetch detail.
-#[tauri::command]
-async fn refresh_execution_history_overview(host_dir: String) -> Result<bool, String> {
-    // 구버전 호스트에서는 파생 테이블 재빌드+쓰기까지 돌아 무겁다 — 메인
-    // 스레드 밖에서 수행한다 (최신 호스트는 컬럼 확인 후 즉시 반환).
-    tauri::async_runtime::spawn_blocking(move || refresh_execution_history_overview_blocking(host_dir))
-        .await
-        .map_err(|error| format!("실행 이력 개요 갱신 작업이 중단되었습니다: {error}"))?
+/// The 21 derived result files of docs-01. Used only to decide whether a file
+/// is a contract result; other `_OVERVIEW` files (raw facts such as
+/// MFT_Records.sqlite) are out of scope.
+const DERIVED_OVERVIEW_FILES: [&str; 21] = [
+    "Metadata",
+    "ExecutionHistory",
+    "PowerShellHistory",
+    "BrowserActivity",
+    "AiConversations",
+    "RegistryFindings",
+    "RemoteDesktopHistory",
+    "SmbHistory",
+    "ScheduledTasks",
+    "ServiceHistory",
+    "Defender",
+    "FirewallHistory",
+    "BitsHistory",
+    "WerReports",
+    "RdpCache",
+    "TargetInfo",
+    "WmiSubscriptions",
+    "FileSystemEntries",
+    "UsnJournal",
+    "PathReferences",
+    "RecycleBin",
+];
+
+/// Reports whether stored results follow the common contract (overview_contract=1).
+///
+/// The read-time rebuild paths (refresh_*) are gone: opening a screen must not
+/// overwrite evidence. Legacy results are only *reported* as needing a
+/// re-parse (docs-24 §2.1).
+#[derive(Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OverviewContractStatus {
+    contract_ok: bool,
+    /// Derived files with a missing or different contract marker (host-relative).
+    legacy_files: Vec<String>,
 }
 
-/// 파생 테이블의 생성 로직 버전을 읽는다. 마커가 없는 구 저장본은 0으로 본다.
-fn derived_version_of(db: &Path, name: &str) -> i64 {
-    open_ro(&db.to_string_lossy())
-        .ok()
-        .and_then(|conn| {
-            conn.query_row(
-                "SELECT version FROM _wina_derived_version WHERE name = ?1",
-                rusqlite::params![name],
-                |row| row.get::<_, i64>(0),
-            )
+fn overview_contract_status_blocking(host_dir: String) -> OverviewContractStatus {
+    let overview_dir = Path::new(&host_dir).join("_OVERVIEW");
+    let mut legacy_files = Vec::new();
+    for name in DERIVED_OVERVIEW_FILES {
+        let path = overview_dir.join(format!("{name}.sqlite"));
+        if !path.is_file() {
+            // A view that was never produced may simply have no evidence.
+            continue;
+        }
+        let current = open_ro(&path.to_string_lossy())
             .ok()
-        })
-        .unwrap_or(0)
-}
-
-/// 기존 호스트의 `WerReports` 파생을 현재 버전으로 재생성한다. 오류 보고 화면과
-/// 실행 이력이 서로 다른 파생 버전을 보지 않게 한다 — 실행 정보(app_start_time
-/// 등)가 편입된 뒤 파싱한 호스트만 새 컬럼을 갖는데, 구 저장본은 컬럼 자체가
-/// 없어 화면이 이전 행을 그대로 쓴다.
-fn refresh_wer_reports_overview_blocking(host_dir: String) -> Result<bool, String> {
-    let out_dir = PathBuf::from(host_dir);
-    let overview_path = out_dir.join("_OVERVIEW").join("WerReports.sqlite");
-    if !overview_path.exists() {
-        return Ok(false);
+            .and_then(|conn| overview_contract_version(&conn));
+        if current != Some(OVERVIEW_CONTRACT_VERSION) {
+            legacy_files.push(format!("_OVERVIEW/{name}.sqlite"));
+        }
     }
-    if derived_version_of(&overview_path, "WerReports") >= overview::WER_REPORTS_DERIVED_VERSION {
-        return Ok(false);
+    OverviewContractStatus {
+        contract_ok: legacy_files.is_empty(),
+        legacy_files,
     }
-    // 0건이어도 고정 스키마로 발행해 구 컬럼·구 행이 남지 않게 한다.
-    let rows = overview::build_wer_reports(&out_dir);
-    write_table(&overview_path, "WerReports", &rows, overview::WER_OV_KEYS)
-        .map_err(|error| error.to_string())?;
-    wina_core::sqlite::stamp_derived_version(
-        &overview_path,
-        "WerReports",
-        overview::WER_REPORTS_DERIVED_VERSION,
-    )
-    .map_err(|error| error.to_string())?;
-    Ok(true)
 }
 
 #[tauri::command]
-async fn refresh_wer_reports_overview(host_dir: String) -> Result<bool, String> {
-    tauri::async_runtime::spawn_blocking(move || refresh_wer_reports_overview_blocking(host_dir))
+async fn overview_contract_status(host_dir: String) -> OverviewContractStatus {
+    tauri::async_runtime::spawn_blocking(move || overview_contract_status_blocking(host_dir))
         .await
-        .map_err(|error| format!("오류 보고 개요 갱신 작업이 중단되었습니다: {error}"))?
-}
-
-fn refresh_execution_history_overview_blocking(host_dir: String) -> Result<bool, String> {
-    let out_dir = PathBuf::from(host_dir);
-    let overview_path = out_dir.join("_OVERVIEW").join("ExecutionHistory.sqlite");
-    if !overview_path.exists() {
-        return Ok(false);
-    }
-    let conn = open_ro(&overview_path.to_string_lossy())?;
-    let columns = table_columns(&conn, "ExecutionHistory");
-    // 컬럼 존재만으로는 최신 여부를 알 수 없다 — 스키마가 같아도 편입 대상이
-    // 늘어난 버전이 있다(WER 보고의 프로세스 시작 시각). 파생 버전 마커를
-    // 함께 보고, 마커가 없는 구 저장본은 항상 재생성 대상으로 본다.
-    let derived_version: i64 = conn
-        .query_row(
-            "SELECT version FROM _wina_derived_version WHERE name = 'ExecutionHistory'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
-    if columns.iter().any(|column| column == "record_key")
-        && columns.iter().any(|column| column == "prefetch_hash")
-        && derived_version >= overview::EXECUTION_HISTORY_DERIVED_VERSION
-    {
-        return Ok(false);
-    }
-    drop(conn);
-
-    let rows = overview::build_execution_history(&out_dir);
-    if rows.is_empty() {
-        return Ok(false);
-    }
-    write_table(&overview_path, "ExecutionHistory", &rows, &[])
-        .map_err(|error| error.to_string())?;
-    // 재생성한 저장본에도 버전을 남긴다 — 다음 진입에서 다시 재생성하지 않는다.
-    wina_core::sqlite::stamp_derived_version(
-        &overview_path,
-        "ExecutionHistory",
-        overview::EXECUTION_HISTORY_DERIVED_VERSION,
-    )
-    .map_err(|error| error.to_string())?;
-    Ok(true)
+        .unwrap_or_default()
 }
 
 /// One source file represented in a parsed result table. `recovery` is the
@@ -2203,22 +2440,45 @@ struct ResultProvenance {
     recovery: String,
 }
 
-/// Reads one parser-recorded source path without materialising or aggregating
-/// the table. This intentionally avoids `COUNT`/`GROUP BY`: an Amcache table
-/// can contain millions of rows and the dashboard needs the source identity,
-/// not another expensive statistical pass.
+/// Reads the parser-recorded source paths without materialising or aggregating
+/// the table. This intentionally avoids `COUNT`: an Amcache table can contain
+/// millions of rows and the dashboard needs the source identity, not another
+/// expensive statistical pass.
+///
+/// A contract DB's primary table has no `_source_file` column — the origins are
+/// rows in source_records, so the verified collection files are returned from
+/// there without duplicates. Every origin is shown; no representative is picked
+/// (docs-24 §4). `recovery` is a registry-parser marker and stays empty here.
 #[tauri::command]
 fn result_provenance(
     full_path: String,
     table_name: String,
 ) -> Result<Vec<ResultProvenance>, String> {
     let conn = open_ro(&full_path)?;
-    if !table_names(&conn).iter().any(|name| name == &table_name) {
+    let tables = table_names(&conn);
+    if !tables.iter().any(|name| name == &table_name) {
         return Ok(Vec::new());
     }
     let columns = table_columns(&conn, &table_name);
     if !columns.iter().any(|column| column == "_source_file") {
-        return Ok(Vec::new());
+        if !tables.iter().any(|name| name == "source_records") {
+            return Ok(Vec::new());
+        }
+        let sql = "SELECT DISTINCT source_file FROM \"source_records\" \
+                   WHERE source_file IS NOT NULL AND source_file <> '' \
+                   ORDER BY source_file LIMIT 20";
+        let mut stmt = conn.prepare(sql).map_err(|error| error.to_string())?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(ResultProvenance {
+                    source_file: row.get(0)?,
+                    recovery: String::new(),
+                })
+            })
+            .map_err(|error| error.to_string())?
+            .filter_map(Result::ok)
+            .collect();
+        return Ok(rows);
     }
     let recovery = if columns.iter().any(|column| column == "_recovery") {
         "COALESCE(NULLIF(_recovery, ''), 'live')"
@@ -2331,6 +2591,98 @@ fn parse_run_log(host_dir: String, run_id: String) -> Result<ParseLogPreview, St
     bytes.truncate(MAX_BYTES);
     let text = String::from_utf8_lossy(&bytes).to_string();
     Ok(ParseLogPreview { text, truncated })
+}
+
+/// Whether this host has new data to parse (UI-01). The rule and its Korean
+/// reason live in `wina_core::parse_eligibility`; `run_host` calls the same
+/// function, so button state and what the backend allows cannot drift.
+/// Discovery walks the collection folder, so it runs off the main thread.
+#[tauri::command]
+async fn host_parse_eligibility(
+    case_id: String,
+    host_id: String,
+) -> Result<parse_eligibility::ParseEligibility, String> {
+    if !valid_id(&case_id) || !valid_id(&host_id) {
+        return Err("잘못된 케이스 또는 호스트 식별자입니다".to_string());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        parse_eligibility::host_parse_eligibility(&case_id, &host_id, &cases_dir())
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// Resolve a stored run log inside its host boundary, so this can never become
+/// a way to open an arbitrary path: the host folder must be a direct child of
+/// the cases root holding `host.json`, and the log must be an existing file
+/// under that host's `parse_logs/`.
+fn parse_run_log_file_in(cases: &Path, host_dir: &str, run_id: &str) -> Result<PathBuf, String> {
+    if !valid_id(run_id) {
+        return Err("잘못된 실행 식별자입니다".to_string());
+    }
+    let cases = cases
+        .canonicalize()
+        .map_err(|error| format!("케이스 폴더를 찾을 수 없습니다: {error}"))?;
+    let host = Path::new(host_dir)
+        .canonicalize()
+        .map_err(|error| format!("호스트 폴더를 찾을 수 없습니다: {error}"))?;
+    if host.parent() != Some(cases.as_path()) || !host.join("host.json").is_file() {
+        return Err("등록된 호스트 폴더가 아닙니다".to_string());
+    }
+    let logs = host.join(pipeline::PARSE_LOG_DIRECTORY);
+    let path = pipeline::parse_run_log_path(&host, run_id)
+        .canonicalize()
+        .map_err(|error| format!("실행 로그 파일을 찾을 수 없습니다: {error}"))?;
+    if !path.starts_with(&logs) || !path.is_file() {
+        return Err("실행 로그 파일을 찾을 수 없습니다".to_string());
+    }
+    Ok(path)
+}
+
+/// Open a file with the OS default application. Arguments go through argv, not
+/// a shell, so path metacharacters cannot be interpreted as commands (Windows
+/// uses the rundll32 handler instead of `cmd /C start` for the same reason).
+fn open_with_default_app(path: &Path) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = Command::new("open");
+        command.arg(path);
+        command
+    };
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = Command::new("rundll32.exe");
+        command.arg("url.dll,FileProtocolHandler").arg(path);
+        command
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let mut command = {
+        let mut command = Command::new("xdg-open");
+        command.arg(path);
+        command
+    };
+    let status = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| format!("기본 앱으로 로그를 열지 못했습니다: {error}"))?;
+    if !status.success() {
+        return Err("이 파일을 열 기본 앱이 없습니다".to_string());
+    }
+    Ok(())
+}
+
+/// Open the stored run log (parse_logs/<run_id>.txt) with the default app (UI-05).
+#[tauri::command]
+async fn open_parse_run_log(host_dir: String, run_id: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = parse_run_log_file_in(&cases_dir(), &host_dir, &run_id)?;
+        open_with_default_app(&path)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[derive(Serialize)]
@@ -3190,7 +3542,8 @@ fn browser_activity_where(query: &BrowserActivityQuery) -> (String, Vec<String>)
     }
     if !query.kinds.is_empty() {
         clauses.push(format!(
-            "kind IN ({})",
+            // 활동 종류는 공통 컬럼 event_type이다(docs-01 "기존 컬럼의 이동").
+            "event_type IN ({})",
             (0..query.kinds.len())
                 .map(|_| "?")
                 .collect::<Vec<_>>()
@@ -3471,9 +3824,9 @@ fn browser_visit_domains_cached(
         .map(|value| value as &dyn rusqlite::ToSql)
         .collect();
     let visit_where = if where_.is_empty() {
-        " WHERE kind = 'visit'".to_owned()
+        " WHERE event_type = 'visit'".to_owned()
     } else {
-        format!("{where_} AND kind = 'visit'")
+        format!("{where_} AND event_type = 'visit'")
     };
     let domains = browser_visit_domains(&conn, table_name, &visit_where, refs.as_slice())?;
     browser_domain_cache_put(key, domains.clone());
@@ -3524,9 +3877,9 @@ fn browser_activity_insights_blocking(
         .sum();
     top_visited_domains.truncate(8);
     let download_where = if where_.is_empty() {
-        " WHERE kind = 'download'".to_owned()
+        " WHERE event_type = 'download'".to_owned()
     } else {
-        format!("{where_} AND kind = 'download'")
+        format!("{where_} AND event_type = 'download'")
     };
     let download_total = conn
         .query_row(
@@ -3652,7 +4005,8 @@ fn browser_activity_page_blocking(
         q(&table_name),
         where_
     );
-    let rows = query_rows(&conn, &sql, &refs)?;
+    let mut rows = query_rows(&conn, &sql, &refs)?;
+    decorate_source_refs(&conn, Path::new(&full_path), &mut rows)?;
     Ok(CsvData {
         columns,
         rows,
@@ -3706,17 +4060,20 @@ fn ai_referrals_blocking(
     params.push(offset.max(0).to_string());
     let refs: Vec<&dyn rusqlite::ToSql> =
         params.iter().map(|v| v as &dyn rusqlite::ToSql).collect();
-    let rows = query_rows(
+    let mut rows = query_rows(
         &conn,
         &format!(
-            "SELECT rowid AS __rowid, * FROM {} WHERE {} ORDER BY timestamp ASC LIMIT ? OFFSET ?",
+            "SELECT rowid AS __rowid, {} FROM {} WHERE {} ORDER BY timestamp ASC LIMIT ? OFFSET ?",
+            payload_projection(&payload_columns(&conn, &table_name))
+                .unwrap_or_else(|| "*".to_string()),
             q(&table_name),
             where_
         ),
         &refs,
     )?;
+    decorate_source_refs(&conn, Path::new(&full_path), &mut rows)?;
     Ok(CsvData {
-        columns: table_columns(&conn, &table_name),
+        columns: payload_columns(&conn, &table_name),
         rows,
         row_count,
     })
@@ -3767,7 +4124,7 @@ async fn wmi_subscription_events(host_dir: String) -> Result<WmiSubscriptionEven
             return Ok(empty);
         }
         let conn = open_ro(&path.to_string_lossy())?;
-        let Some(table) = first_table(&conn) else {
+        let Some(table) = first_table(&conn, &path) else {
             return Ok(empty);
         };
         let columns = table_columns(&conn, &table);
@@ -3831,7 +4188,7 @@ async fn read_result_file(full_path: String, table_name: Option<String>) -> Resu
 
 fn read_result_file_blocking(full_path: String, table_name: Option<String>) -> Result<CsvData, String> {
     let conn = open_ro(&full_path)?;
-    let table = match table_name.or_else(|| first_table(&conn)) {
+    let table = match table_name.or_else(|| first_table(&conn, Path::new(&full_path))) {
         Some(t) => t,
         None => {
             return Ok(CsvData {
@@ -3841,21 +4198,21 @@ fn read_result_file_blocking(full_path: String, table_name: Option<String>) -> R
             })
         }
     };
-    let mut columns = table_columns(&conn, &table);
-    // Raw Chrome cache bodies can each be several MB. They are fetched on
-    // demand by `cache_entry_body`; never serialize all bodies into the table.
+    // Body BLOBs and cache bodies are detail-only, never in list responses.
+    let columns = payload_columns(&conn, &table);
+    let Some(projection) = payload_projection(&columns) else {
+        return Ok(CsvData {
+            columns,
+            rows: vec![],
+            row_count: 0,
+        });
+    };
     let is_cache = table == "CacheEntries";
-    if is_cache {
-        columns.retain(|c| c != "body_b64");
-    }
     // 4104 ScriptBlock 본문은 행당 수 KB~수백 KB — 대량 스크립트 블록 로깅
     // 호스트에서 전량 직렬화하면 웹뷰 메모리가 고갈돼 앱이 강제 종료된다.
     // 목록/세션 묶음에는 앞부분 미리보기만 싣고, 상세 패널은 result_row로
     // 전체 원문을 다시 받는다 (증거 원문은 절단 없이 유지).
-    let is_powershell = table == "PowerShellHistory";
-    let select = if is_cache {
-        columns.iter().map(|c| q(c)).collect::<Vec<_>>().join(", ")
-    } else if is_powershell {
+    let select = if table == "PowerShellHistory" {
         columns
             .iter()
             .map(|c| match c.as_str() {
@@ -3867,7 +4224,7 @@ fn read_result_file_blocking(full_path: String, table_name: Option<String>) -> R
             .collect::<Vec<_>>()
             .join(", ")
     } else {
-        "*".into()
+        projection
     };
     let row_count: i64 = conn
         .query_row(&format!("SELECT COUNT(*) FROM {}", q(&table)), [], |r| {
@@ -3880,12 +4237,13 @@ fn read_result_file_blocking(full_path: String, table_name: Option<String>) -> R
             select,
             q(&table)
         )
-    } else if is_powershell {
-        format!("SELECT rowid AS __rowid, {} FROM {}", select, q(&table))
     } else {
-        format!("SELECT rowid AS __rowid, * FROM {}", q(&table))
+        format!("SELECT rowid AS __rowid, {} FROM {}", select, q(&table))
     };
-    let rows = query_rows(&conn, &sql, &[])?;
+    let mut rows = query_rows(&conn, &sql, &[])?;
+    // Attach this page's raw evidence identities in one batch so raw, overview,
+    // timeline and search share the same bookmark key.
+    decorate_source_refs(&conn, Path::new(&full_path), &mut rows)?;
     Ok(CsvData {
         columns,
         rows,
@@ -3920,7 +4278,7 @@ fn read_result_file_page_blocking(
     limit: i64,
 ) -> Result<CsvData, String> {
     let conn = open_ro(&full_path)?;
-    let table = match table_name.or_else(|| first_table(&conn)) {
+    let table = match table_name.or_else(|| first_table(&conn, Path::new(&full_path))) {
         Some(t) => t,
         None => {
             return Ok(CsvData {
@@ -3937,13 +4295,14 @@ fn read_result_file_page_blocking(
         .unwrap_or(0);
     // 열 선택·정렬·값 변환은 타임라인 빌드 경로와 같은 리더를 쓴다. 일반 표는
     // 바이트 예산 없이 요청한 행 수만큼 받는다(페이지 계약이 행 수 기준).
-    let page = read_sqlite_page(
+    let mut page = read_sqlite_page(
         &conn,
         &table,
         offset.max(0),
         limit.clamp(1, 100_000),
         None,
     )?;
+    decorate_source_refs(&conn, Path::new(&full_path), &mut page.rows)?;
     Ok(CsvData {
         columns: page.columns,
         rows: page.rows,
@@ -3987,10 +4346,10 @@ fn linked_result_rows_blocking(
     limit: i64,
 ) -> Result<LinkedRowsPage, String> {
     let conn = open_ro(&full_path)?;
-    let columns = table_columns(&conn, &table_name);
-    if columns.is_empty() {
+    let columns = payload_columns(&conn, &table_name);
+    let Some(projection) = payload_projection(&columns) else {
         return Err("linked result table was not found".to_owned());
-    }
+    };
     if !columns.iter().any(|column| column == &match_column) {
         return Err("linked result match column was not found".to_owned());
     }
@@ -4033,11 +4392,13 @@ fn linked_result_rows_blocking(
         .map(|value| value as &dyn rusqlite::ToSql)
         .collect();
     let sql = format!(
-        "SELECT rowid AS __rowid, * FROM {} WHERE {} ORDER BY rowid LIMIT ? OFFSET ?",
+        "SELECT rowid AS __rowid, {} FROM {} WHERE {} ORDER BY rowid LIMIT ? OFFSET ?",
+        projection,
         q(&table_name),
         where_clause,
     );
-    let rows = query_rows(&conn, &sql, page_params.as_slice())?;
+    let mut rows = query_rows(&conn, &sql, page_params.as_slice())?;
+    decorate_source_refs(&conn, Path::new(&full_path), &mut rows)?;
     Ok(LinkedRowsPage { rows, row_count })
 }
 
@@ -4057,15 +4418,20 @@ fn result_row_blocking(
     rowid: i64,
 ) -> Result<ResultRow, String> {
     let conn = open_ro(&full_path)?;
-    let columns = table_columns(&conn, &table_name);
-    if columns.is_empty() {
+    // A detail row carries no body BLOB either; bytes leave only through an
+    // explicit request (mft_record_body / cache_entry_body).
+    let columns = payload_columns(&conn, &table_name);
+    let Some(projection) = payload_projection(&columns) else {
         return Ok(ResultRow { columns, row: None });
-    }
+    };
     let sql = format!(
-        "SELECT rowid AS __rowid, * FROM {} WHERE rowid = ?1",
+        "SELECT rowid AS __rowid, {} FROM {} WHERE rowid = ?1",
+        projection,
         q(&table_name)
     );
-    let row = query_rows(&conn, &sql, &[&rowid])?.into_iter().next();
+    let mut rows = query_rows(&conn, &sql, &[&rowid])?;
+    decorate_source_refs(&conn, Path::new(&full_path), &mut rows)?;
+    let row = rows.into_iter().next();
     Ok(ResultRow { columns, row })
 }
 
@@ -4112,11 +4478,12 @@ fn list_column_values_blocking(
         Ok(c) => c,
         Err(_) => return vec![],
     };
-    let table = match table_name.or_else(|| first_table(&conn)) {
+    let table = match table_name.or_else(|| first_table(&conn, Path::new(&full_path))) {
         Some(t) => t,
         None => return vec![],
     };
-    if !table_columns(&conn, &table).contains(&column) {
+    // Body BLOBs are not filter candidates: never GROUP BY raw bytes.
+    if !payload_columns(&conn, &table).contains(&column) {
         return vec![];
     }
     // 필터 드롭다운은 최빈값 상위 N개만 필요하다. 고카디널리티 컬럼(MFT path,
@@ -4151,12 +4518,67 @@ fn list_column_values_blocking(
     }
 }
 
-const MFT_TABLE: &str = "MFT_Records";
+/// Display-facing derived table (docs-01 §18); the MFT screens read this.
+const FILE_SYSTEM_TABLE: &str = "FileSystemEntries";
+/// Raw facts (docs-21), used only when a facts file is opened directly.
+const MFT_FACTS_TABLE: &str = "MFT_Records";
+
+fn file_system_table(conn: &Connection) -> Result<String, String> {
+    let names = table_names(conn);
+    for candidate in [FILE_SYSTEM_TABLE, MFT_FACTS_TABLE] {
+        if names.iter().any(|name| name == candidate) {
+            return Ok(candidate.to_string());
+        }
+    }
+    Err("파일 시스템 레코드 테이블을 찾을 수 없습니다".to_string())
+}
+
+/// Volume scope for a query. `entry`/`parent_entry` are meaningful only inside
+/// one volume_id (docs-01 §18), so the chosen volume is applied as a condition.
+/// Without a chosen volume, or without the column, no scope is applied — record
+/// numbers of different volumes are never merged, and no volume is inferred.
+fn volume_scope(columns: &[String], volume_id: Option<String>) -> Option<String> {
+    let volume = volume_id
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())?;
+    columns
+        .iter()
+        .any(|column| column == "volume_id")
+        .then_some(volume)
+}
+
+/// Seq of the parent record. The tree link is narrowed only when the child's
+/// `parent_seq` and the parent's `seq` are both known; a NULL on either side
+/// leaves the link ambiguous and unfiltered (docs-04 §4).
+fn parent_entry_seq(
+    conn: &Connection,
+    table: &str,
+    columns: &[String],
+    parent: i64,
+    volume: Option<&str>,
+) -> Option<i64> {
+    if !columns.iter().any(|column| column == "seq")
+        || !columns.iter().any(|column| column == "parent_seq")
+    {
+        return None;
+    }
+    let mut sql = format!("SELECT seq FROM {} WHERE entry = ?1", q(table));
+    if volume.is_some() {
+        sql.push_str(" AND volume_id = ?2");
+    }
+    sql.push_str(" LIMIT 1");
+    let seq: rusqlite::Result<Option<i64>> = match volume {
+        Some(volume) => conn.query_row(&sql, rusqlite::params![parent, volume], |row| row.get(0)),
+        None => conn.query_row(&sql, rusqlite::params![parent], |row| row.get(0)),
+    };
+    seq.ok().flatten()
+}
 
 #[tauri::command]
 async fn mft_children(
     full_path: String,
-    parent_entry: i64,
+    parent_entry: Option<i64>,
+    volume_id: Option<String>,
     offset: Option<i64>,
     limit: Option<i64>,
 ) -> Result<MftChildrenPage, String> {
@@ -4166,6 +4588,7 @@ async fn mft_children(
         mft_children_blocking(
             full_path,
             parent_entry,
+            volume_id,
             offset.unwrap_or(0),
             limit.unwrap_or(100),
         )
@@ -4178,62 +4601,169 @@ async fn mft_children(
 /// 누락·손상 판단 기능이라, 실패를 "비어 있음"으로 표시하면 잘못된 증거
 /// 해석으로 이어진다. UI는 기존 failedEntries/rootError 경로로 재시도를
 /// 안내한다.
+///
+/// `parent_entry` None returns records with an unverified parent
+/// (parent_entry IS NULL). The old -1 convention is gone, and NULL (distinct
+/// from 0) can never be found by equality (docs-01 §18).
 fn mft_children_blocking(
     full_path: String,
-    parent_entry: i64,
+    parent_entry: Option<i64>,
+    volume_id: Option<String>,
     offset: i64,
     limit: i64,
 ) -> Result<MftChildrenPage, String> {
     let conn = open_ro(&full_path)?;
-    if !table_names(&conn).iter().any(|name| name == MFT_TABLE) {
-        return Err("MFT 레코드 테이블을 찾을 수 없습니다".to_string());
-    }
+    let table = file_system_table(&conn)?;
+    // Resident bodies (data BLOB) are detail-only, never in a listing.
+    let columns = payload_columns(&conn, &table);
+    let Some(projection) = payload_projection(&columns) else {
+        return Err("파일 시스템 레코드 컬럼을 읽지 못했습니다".to_string());
+    };
     // NTFS에는 자식 수만~수십만 개짜리 디렉터리가 실존한다 — 폴더 하나
     // 펼치기가 무제한 IPC가 되지 않게 서버에서 상한을 강제하고, UI가
     // "더 불러오기"로 이어 받는다. rowid 2차 정렬로 페이지 순서를 고정하며,
-    // 파싱 단계에서 만든 (parent_entry, is_directory, file_name) 인덱스를
-    // 그대로 탄다.
+    // (volume_id, parent_entry, is_directory, file_name) 인덱스를 그대로 탄다.
     let limit = limit.clamp(1, 500);
     let offset = offset.max(0);
-    let pe = parent_entry.to_string();
+    let volume = volume_scope(&columns, volume_id);
+    let parent_seq = parent_entry
+        .and_then(|parent| parent_entry_seq(&conn, &table, &columns, parent, volume.as_deref()));
+
+    let mut conditions: Vec<String> = Vec::new();
+    let mut binds: Vec<&dyn rusqlite::ToSql> = Vec::new();
+    if let Some(parent) = parent_entry.as_ref() {
+        binds.push(parent);
+        let n = binds.len();
+        conditions.push(format!("parent_entry = ?{n} AND entry <> ?{n}"));
+    } else {
+        conditions.push("parent_entry IS NULL".to_string());
+    }
+    if let Some(volume) = volume.as_ref() {
+        binds.push(volume);
+        conditions.push(format!("volume_id = ?{}", binds.len()));
+    }
+    if let Some(seq) = parent_seq.as_ref() {
+        binds.push(seq);
+        conditions.push(format!("(parent_seq IS NULL OR parent_seq = ?{})", binds.len()));
+    }
+    let where_clause = conditions.join(" AND ");
+
     // 전체 건수는 첫 페이지에서만 계산한다 — "더 불러오기"마다 COUNT를
     // 반복하지 않도록 후속 페이지는 -1을 반환하고 UI가 보관한 값을 쓴다.
     let total: i64 = if offset == 0 {
         conn.query_row(
-            &format!(
-                "SELECT COUNT(*) FROM {} WHERE parent_entry = ?1 AND entry != ?1",
-                q(MFT_TABLE)
-            ),
-            [&pe],
-            |r| r.get(0),
+            &format!("SELECT COUNT(*) FROM {} WHERE {where_clause}", q(&table)),
+            binds.as_slice(),
+            |row| row.get(0),
         )
         .map_err(|error| format!("MFT 자식 수 조회 실패: {error}"))?
     } else {
         -1
     };
-    let sql = format!("SELECT rowid AS __rowid, * FROM {} WHERE parent_entry = ?1 AND entry != ?1 ORDER BY is_directory DESC, file_name COLLATE NOCASE, rowid LIMIT ?2 OFFSET ?3", q(MFT_TABLE));
-    let rows = query_rows(&conn, &sql, &[&pe, &limit, &offset])?;
+    binds.push(&limit);
+    let limit_index = binds.len();
+    binds.push(&offset);
+    let offset_index = binds.len();
+    // is_directory is 0/1/NULL: DESC puts directories first, unknown last.
+    let sql = format!(
+        "SELECT rowid AS __rowid, {projection} FROM {} WHERE {where_clause} \
+         ORDER BY is_directory DESC, file_name COLLATE NOCASE, rowid \
+         LIMIT ?{limit_index} OFFSET ?{offset_index}",
+        q(&table)
+    );
+    let mut rows = query_rows(&conn, &sql, binds.as_slice())?;
+    decorate_source_refs(&conn, Path::new(&full_path), &mut rows)?;
     Ok(MftChildrenPage { rows, total })
 }
 
 #[tauri::command]
-async fn mft_search(full_path: String, query: String, limit: i64) -> Result<Vec<Map<String, Value>>, String> {
+async fn mft_search(
+    full_path: String,
+    query: String,
+    volume_id: Option<String>,
+    limit: i64,
+) -> Result<Vec<Map<String, Value>>, String> {
     // 수백만 행 MFT의 LIKE 풀스캔 — 검색이 메인 스레드를 막지 않게 blocking
     // 풀에서 돈다.
-    tauri::async_runtime::spawn_blocking(move || mft_search_blocking(full_path, query, limit))
-        .await
-        .map_err(|error| format!("MFT 검색 작업이 중단되었습니다: {error}"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        mft_search_blocking(full_path, query, volume_id, limit)
+    })
+    .await
+    .map_err(|error| format!("MFT 검색 작업이 중단되었습니다: {error}"))?
 }
 
-fn mft_search_blocking(full_path: String, query: String, limit: i64) -> Result<Vec<Map<String, Value>>, String> {
+fn mft_search_blocking(
+    full_path: String,
+    query: String,
+    volume_id: Option<String>,
+    limit: i64,
+) -> Result<Vec<Map<String, Value>>, String> {
     // DB 열기·쿼리 실패를 빈 결과로 위장하지 않는다 — "일치 없음"과
     // "조회 실패"는 분석 판단이 달라지는 별개의 상태다.
     let conn = open_ro(&full_path)?;
+    let table = file_system_table(&conn)?;
+    let columns = payload_columns(&conn, &table);
+    let Some(projection) = payload_projection(&columns) else {
+        return Err("파일 시스템 레코드 컬럼을 읽지 못했습니다".to_string());
+    };
     // 호출자 값에 의존하지 않는 서버 측 상한.
     let limit = limit.clamp(1, 500);
     let like = format!("%{}%", query);
-    let sql = format!("SELECT rowid AS __rowid, * FROM {} WHERE file_name LIKE ?1 OR path LIKE ?1 ORDER BY is_directory DESC, path COLLATE NOCASE LIMIT ?2", q(MFT_TABLE));
-    query_rows(&conn, &sql, &[&like, &limit])
+    let volume = volume_scope(&columns, volume_id);
+    let mut binds: Vec<&dyn rusqlite::ToSql> = vec![&like];
+    let mut conditions = vec!["(file_name LIKE ?1 OR path LIKE ?1)".to_string()];
+    if let Some(volume) = volume.as_ref() {
+        binds.push(volume);
+        conditions.push(format!("volume_id = ?{}", binds.len()));
+    }
+    binds.push(&limit);
+    let sql = format!(
+        "SELECT rowid AS __rowid, {projection} FROM {} WHERE {} \
+         ORDER BY is_directory DESC, path COLLATE NOCASE LIMIT ?{}",
+        q(&table),
+        conditions.join(" AND "),
+        binds.len()
+    );
+    let mut rows = query_rows(&conn, &sql, binds.as_slice())?;
+    decorate_source_refs(&conn, Path::new(&full_path), &mut rows)?;
+    Ok(rows)
+}
+
+/// Volume selector list: the internal key that separates volumes inside one
+/// result, plus label and drive letter when `$Volume`/collection metadata
+/// confirmed them. Unknown values stay NULL and are never guessed from the
+/// collection folder name (docs-01 §18).
+#[tauri::command]
+async fn mft_volumes(db_path: String) -> Result<Vec<Map<String, Value>>, String> {
+    tauri::async_runtime::spawn_blocking(move || mft_volumes_blocking(db_path))
+        .await
+        .map_err(|error| format!("볼륨 목록 조회가 중단되었습니다: {error}"))?
+}
+
+fn mft_volumes_blocking(db_path: String) -> Result<Vec<Map<String, Value>>, String> {
+    let conn = open_ro(&db_path)?;
+    let table = file_system_table(&conn)?;
+    let columns = table_columns(&conn, &table);
+    if !columns.iter().any(|column| column == "volume_id") {
+        // No volume column: nothing to build a selector from.
+        return Ok(Vec::new());
+    }
+    let label = if columns.iter().any(|column| column == "volume_label") {
+        "MAX(volume_label)"
+    } else {
+        "NULL"
+    };
+    let drive = if columns.iter().any(|column| column == "drive_letter") {
+        "MAX(drive_letter)"
+    } else {
+        "NULL"
+    };
+    let sql = format!(
+        "SELECT volume_id, {label} AS volume_label, {drive} AS drive_letter, \
+         COUNT(*) AS record_count FROM {} GROUP BY volume_id ORDER BY volume_id",
+        q(&table)
+    );
+    query_rows(&conn, &sql, &[])
 }
 
 /// A bounded, recursive MFT record page for the file-system ledger. Unlike
@@ -4290,11 +4820,16 @@ fn usnjrnl_page_blocking(
     limit: i64,
 ) -> Result<CsvData, String> {
     let conn = open_ro(&full_path)?;
-    let table = "UsnJrnl_Records";
+    // Display-facing derived table (docs-01 §19). Raw `UsnJrnl_Records` stays in
+    // the raw table view; this screen reads file_name and the full references.
+    let table = "UsnJournal";
     if !table_names(&conn).iter().any(|name| name == table) {
         return Err("USN 저널 테이블을 찾을 수 없습니다".to_string());
     }
-    let mut columns = table_columns(&conn, table);
+    let mut columns = payload_columns(&conn, table);
+    let Some(projection) = payload_projection(&columns) else {
+        return Err("USN 저널 컬럼을 읽지 못했습니다".to_string());
+    };
     columns.push("renamed_from".to_string());
     columns.push("group_count".to_string());
     let limit = limit.clamp(1, 500);
@@ -4304,7 +4839,7 @@ fn usnjrnl_page_blocking(
     let mut params: Vec<String> = Vec::new();
     if !search.trim().is_empty() {
         params.push(format!("%{}%", search.trim()));
-        clauses.push(format!("filename LIKE ?{}", params.len()));
+        clauses.push(format!("file_name LIKE ?{}", params.len()));
     }
     // 상태(대표 유형) 필터 — 뷰의 배지 판정과 같은 우선순위(삭제 > 생성 >
     // 이름 변경 > 데이터 > 정보 > 보안)로 걸어 배지와 필터 결과가 일치한다.
@@ -4344,7 +4879,11 @@ fn usnjrnl_page_blocking(
     // USN 레코드는 파일 핸들이 닫힐 때까지 사유가 누적되며 여러 행으로
     // 남는다. 같은 파일(참조 번호)·같은 시각의 기록을 한 행동으로 묶는다 —
     // 누적 체인과 이름 변경(OLD/NEW 쌍)이 모두 하나로 합쳐진다.
-    let base = format!("SELECT rowid AS __rowid, * FROM {}{}", q(table), where_clause);
+    let base = format!(
+        "SELECT rowid AS __rowid, {projection} FROM {}{}",
+        q(table),
+        where_clause
+    );
     let refs: Vec<&dyn rusqlite::ToSql> =
         params.iter().map(|value| value as &dyn rusqlite::ToSql).collect();
 
@@ -4420,7 +4959,7 @@ fn usnjrnl_page_blocking(
         let mut flags: Vec<String> = Vec::new();
         let mut renamed_from = String::new();
         let rep_name = representative
-            .get("filename")
+            .get("file_name")
             .and_then(Value::as_str)
             .unwrap_or("");
         for member in &group {
@@ -4431,7 +4970,7 @@ fn usnjrnl_page_blocking(
                 }
             }
             if member_reason.contains("RENAME_OLD_NAME") {
-                let old = member.get("filename").and_then(Value::as_str).unwrap_or("");
+                let old = member.get("file_name").and_then(Value::as_str).unwrap_or("");
                 if !old.is_empty() && old != rep_name {
                     renamed_from = old.to_string();
                 }
@@ -4458,6 +4997,7 @@ fn usnjrnl_page_blocking(
 async fn mft_records_page(
     full_path: String,
     query: String,
+    volume_id: Option<String>,
     offset: i64,
     limit: i64,
     sort_key: Option<String>,
@@ -4472,8 +5012,8 @@ async fn mft_records_page(
     // 수행한다.
     tauri::async_runtime::spawn_blocking(move || {
         mft_records_page_blocking(
-            full_path, query, offset, limit, sort_key, sort_desc, files_only, name_pattern,
-            time_key, time_start, time_end,
+            full_path, query, volume_id, offset, limit, sort_key, sort_desc, files_only,
+            name_pattern, time_key, time_start, time_end,
         )
     })
     .await
@@ -4484,6 +5024,7 @@ async fn mft_records_page(
 fn mft_records_page_blocking(
     full_path: String,
     query: String,
+    volume_id: Option<String>,
     offset: i64,
     limit: i64,
     sort_key: Option<String>,
@@ -4495,9 +5036,12 @@ fn mft_records_page_blocking(
     time_end: Option<String>,
 ) -> Result<MftRecordsPage, String> {
     let conn = open_ro(&full_path)?;
-    if !table_names(&conn).iter().any(|name| name == MFT_TABLE) {
-        return Err("MFT 레코드 테이블을 찾을 수 없습니다".to_string());
-    }
+    let table = file_system_table(&conn)?;
+    // Resident bodies (data BLOB) are never listed.
+    let columns = payload_columns(&conn, &table);
+    let Some(projection) = payload_projection(&columns) else {
+        return Err("파일 시스템 레코드 컬럼을 읽지 못했습니다".to_string());
+    };
     let limit = limit.clamp(1, 500);
     let offset = offset.max(0);
     let query = query.trim();
@@ -4510,8 +5054,13 @@ fn mft_records_page_blocking(
         let n = params.len();
         clauses.push(format!("(file_name LIKE ?{n} OR path LIKE ?{n})"));
     }
+    if let Some(volume) = volume_scope(&columns, volume_id) {
+        params.push(volume);
+        clauses.push(format!("volume_id = ?{}", params.len()));
+    }
     if files_only.unwrap_or(false) {
-        clauses.push("is_directory != 'Y'".to_string());
+        // Of 0/1/NULL only 0 is a file; unknown is not claimed to be one.
+        clauses.push("is_directory = 0".to_string());
     }
     if let Some(pattern) = name_pattern.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
         // 간단 글롭 → SQL LIKE: LIKE 메타문자를 이스케이프한 뒤 * → %, ? → _.
@@ -4531,7 +5080,8 @@ fn mft_records_page_blocking(
         let n = params.len();
         clauses.push(format!("file_name LIKE ?{n} ESCAPE '\\'"));
     }
-    // 시간 범위 필터 — 지정한 시각 컬럼 기준. 빈 시각은 자연히 제외된다.
+    // Time range filter on the selected time column. Records without that time
+    // (NULL) drop out of a range query and stay visible in the full range.
     let time_column = match time_key.as_deref().unwrap_or("created") {
         "modified" => "si_modified",
         "accessed" => "si_accessed",
@@ -4558,14 +5108,14 @@ fn mft_records_page_blocking(
         format!(" WHERE {}", clauses.join(" AND "))
     };
 
-    let count_sql = format!("SELECT COUNT(*) FROM {}{}", q(MFT_TABLE), where_clause);
+    let count_sql = format!("SELECT COUNT(*) FROM {}{}", q(&table), where_clause);
     let count_refs: Vec<&dyn rusqlite::ToSql> =
         params.iter().map(|value| value as &dyn rusqlite::ToSql).collect();
     let total = conn
         .query_row(&count_sql, count_refs.as_slice(), |row| row.get(0))
         .map_err(|error| format!("MFT 레코드 수를 읽지 못했습니다: {error}"))?;
 
-    // 정렬 키 화이트리스트 — 시간 정렬은 값 없는 레코드를 항상 뒤로 보낸다.
+    // Sort whitelist; records without a value (NULL) sort last in both directions.
     let order_by = match sort_key.as_deref().unwrap_or("path") {
         "name" => "file_name COLLATE NOCASE".to_string(),
         key @ ("created" | "modified" | "accessed" | "mft_modified" | "fn_created"
@@ -4578,16 +5128,18 @@ fn mft_records_page_blocking(
                 // fn_* 키는 컬럼명과 동일 ($FILE_NAME 타임스탬프).
                 other => other,
             };
-            format!("CASE WHEN {column} = '' THEN 1 ELSE 0 END, {column}")
+            format!("{column} IS NULL, {column}")
         }
-        "size" => "CAST(file_size AS INTEGER)".to_string(),
+        // file_size is INTEGER bytes: no CAST or lexical ordering needed.
+        "size" => "file_size IS NULL, file_size".to_string(),
         _ => "path COLLATE NOCASE".to_string(),
     };
     let direction = if sort_desc.unwrap_or(false) { "DESC" } else { "ASC" };
 
     let page_sql = format!(
-        "SELECT rowid AS __rowid, * FROM {}{} ORDER BY {} {}, rowid LIMIT ?{} OFFSET ?{}",
-        q(MFT_TABLE),
+        "SELECT rowid AS __rowid, {} FROM {}{} ORDER BY {} {}, rowid LIMIT ?{} OFFSET ?{}",
+        projection,
+        q(&table),
         where_clause,
         order_by,
         direction,
@@ -4598,21 +5150,411 @@ fn mft_records_page_blocking(
     params.push(offset.to_string());
     let page_refs: Vec<&dyn rusqlite::ToSql> =
         params.iter().map(|value| value as &dyn rusqlite::ToSql).collect();
-    let rows = query_rows(&conn, &page_sql, page_refs.as_slice())
+    let mut rows = query_rows(&conn, &page_sql, page_refs.as_slice())
         .map_err(|error| format!("MFT 레코드 페이지를 읽지 못했습니다: {error}"))?;
+    decorate_source_refs(&conn, Path::new(&full_path), &mut rows)?;
     Ok(MftRecordsPage { rows, total })
 }
 
+/// One detail row. With `volume_id` the row is returned only when it belongs to
+/// that volume, so a rowid from another volume context opens nothing.
 #[tauri::command]
-fn mft_row(full_path: String, rowid: i64) -> Option<Map<String, Value>> {
+fn mft_row(
+    full_path: String,
+    rowid: i64,
+    volume_id: Option<String>,
+) -> Option<Map<String, Value>> {
     let conn = open_ro(&full_path).ok()?;
+    let table = file_system_table(&conn).ok()?;
+    let columns = payload_columns(&conn, &table);
+    let projection = payload_projection(&columns)?;
+    let volume = volume_scope(&columns, volume_id);
+    let mut binds: Vec<&dyn rusqlite::ToSql> = vec![&rowid];
+    let mut conditions = vec!["rowid = ?1".to_string()];
+    if let Some(volume) = volume.as_ref() {
+        binds.push(volume);
+        conditions.push(format!("volume_id = ?{}", binds.len()));
+    }
     let sql = format!(
-        "SELECT rowid AS __rowid, * FROM {} WHERE rowid = ?1",
-        q(MFT_TABLE)
+        "SELECT rowid AS __rowid, {projection} FROM {} WHERE {}",
+        q(&table),
+        conditions.join(" AND ")
     );
-    query_rows(&conn, &sql, &[&rowid])
-        .ok()
-        .and_then(|mut v| v.drain(..).next())
+    let mut rows = query_rows(&conn, &sql, binds.as_slice()).ok()?;
+    decorate_source_refs(&conn, Path::new(&full_path), &mut rows).ok()?;
+    rows.into_iter().next()
+}
+
+/// One resident `$DATA` body. The only path that reads the bytes excluded from
+/// list, search and page responses, and only on an explicit request
+/// (docs-21 "data and size").
+///
+/// `dataPresent` is true or null: null means non-resident or not captured,
+/// while a zero-length BLOB is a valid empty body (`dataPresent=true,
+/// dataLen=0`). The two are never shown as the same thing.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MftRecordBody {
+    data_present: Option<bool>,
+    data_len: Option<i64>,
+    truncated: bool,
+    body_b64: Option<String>,
+}
+
+/// Cap for one body transfer. Beyond it only the prefix is sent with
+/// `truncated`; `dataLen` is always the full length.
+const MFT_BODY_MAX_BYTES: usize = 1024 * 1024;
+
+#[tauri::command]
+async fn mft_record_body(
+    full_path: String,
+    rowid: i64,
+    volume_id: Option<String>,
+) -> Result<MftRecordBody, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        mft_record_body_blocking(full_path, rowid, volume_id)
+    })
+    .await
+    .map_err(|error| format!("본문 조회가 중단되었습니다: {error}"))?
+}
+
+fn mft_record_body_blocking(
+    full_path: String,
+    rowid: i64,
+    volume_id: Option<String>,
+) -> Result<MftRecordBody, String> {
+    let conn = open_ro(&full_path)?;
+    let table = file_system_table(&conn)?;
+    let columns = table_columns(&conn, &table);
+    if !columns.iter().any(|column| column == "data") {
+        return Err("이 저장본에는 상주 본문 컬럼이 없습니다".to_string());
+    }
+    let volume = volume_scope(&columns, volume_id);
+    let mut binds: Vec<&dyn rusqlite::ToSql> = vec![&rowid];
+    let mut conditions = vec!["rowid = ?1".to_string()];
+    if let Some(volume) = volume.as_ref() {
+        binds.push(volume);
+        conditions.push(format!("volume_id = ?{}", binds.len()));
+    }
+    let sql = format!(
+        "SELECT data FROM {} WHERE {}",
+        q(&table),
+        conditions.join(" AND ")
+    );
+    let body: Option<Vec<u8>> = conn
+        .query_row(&sql, binds.as_slice(), |row| {
+            row.get::<_, Option<Vec<u8>>>(0)
+        })
+        .map_err(|error| match error {
+            rusqlite::Error::QueryReturnedNoRows => "레코드를 찾을 수 없습니다".to_string(),
+            other => format!("상주 본문을 읽지 못했습니다: {other}"),
+        })?;
+    let Some(body) = body else {
+        return Ok(MftRecordBody {
+            data_present: None,
+            data_len: None,
+            truncated: false,
+            body_b64: None,
+        });
+    };
+    use base64::Engine as _;
+    let data_len = i64::try_from(body.len()).unwrap_or(i64::MAX);
+    let truncated = body.len() > MFT_BODY_MAX_BYTES;
+    let slice = &body[..body.len().min(MFT_BODY_MAX_BYTES)];
+    Ok(MftRecordBody {
+        data_present: Some(true),
+        data_len: Some(data_len),
+        truncated,
+        body_b64: Some(base64::engine::general_purpose::STANDARD.encode(slice)),
+    })
+}
+
+// --- evidence links (source_records) and child tables ----------------------
+
+/// Reads the `record_id` of a selected result row. Verifying the main row first
+/// prevents inventing evidence for a row that does not exist; None when absent.
+fn record_id_of(
+    conn: &Connection,
+    table: &str,
+    rowid: i64,
+) -> Result<Option<String>, String> {
+    if !table_columns(conn, table)
+        .iter()
+        .any(|column| column == "record_id")
+    {
+        return Ok(None);
+    }
+    let sql = format!("SELECT record_id FROM {} WHERE rowid = ?1", q(table));
+    match conn.query_row(&sql, rusqlite::params![rowid], |row| {
+        row.get::<_, Option<String>>(0)
+    }) {
+        Ok(value) => Ok(value.filter(|id| !id.is_empty())),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(error) => Err(format!("레코드를 읽지 못했습니다: {error}")),
+    }
+}
+
+/// Resolves `source_db` to a real path inside the host root only. Outside the
+/// root, or when the file is missing, the result is empty — source_db is a
+/// host-relative source DB path, not an instruction to open any path (docs-24 §4).
+fn resolve_source_db(host_root: &Path, source_db: &str) -> String {
+    let relative = Path::new(source_db.trim());
+    if source_db.trim().is_empty() || relative.is_absolute() {
+        return String::new();
+    }
+    let joined = normalize_bookmark_path(&host_root.join(relative));
+    if !joined.starts_with(host_root) || !joined.is_file() {
+        return String::new();
+    }
+    joined.to_string_lossy().to_string()
+}
+
+/// One raw evidence identity — the same three parts as a bookmark key (source
+/// SQLite path, table, rowid). It does not replace a derived record_id; the UI
+/// uses it to keep raw, overview, timeline and search in the same state.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SourcePointer {
+    full_path: String,
+    table_name: String,
+    rowid: i64,
+}
+
+/// Key of the evidence identity bundle (JSON string) added to page rows.
+const SOURCE_REFS_KEY: &str = "__source_refs";
+/// Max record_id values per source_records lookup.
+const SOURCE_REFS_ID_CHUNK: usize = 400;
+
+/// Whether this is a primary contract row, decided from the row's own keys:
+/// `overview_name` + `record_id`, or metadata's `metadata_id` + `host_id` +
+/// `dataset_id`. Child tables and source_records rows are never decorated, so
+/// paging a parent does not fan out one lookup per child.
+fn contract_row_record_id(row: &Map<String, Value>) -> Option<String> {
+    let text = |key: &str| {
+        row.get(key)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    if row.contains_key("overview_name") {
+        return text("record_id");
+    }
+    if row.contains_key("host_id") && row.contains_key("dataset_id") {
+        return text("metadata_id");
+    }
+    None
+}
+
+/// Host root = grandparent of `<host>/<category>/<file>.sqlite`.
+fn host_root_of(db_path: &Path) -> Option<PathBuf> {
+    db_path
+        .parent()
+        .and_then(Path::parent)
+        .map(normalize_bookmark_path)
+}
+
+/// Reads the raw evidence identities of this page's rows from the same DB's
+/// source_records in one batch, instead of a lookup per row. Only stored links
+/// are read; raw DBs are never reopened and recomposed.
+///
+/// All origins are returned (no representative is chosen). Duplicates pointing
+/// at the same (path, table, rowid) are kept once, and origins outside the host
+/// root or missing from the collection are dropped because they cannot be opened.
+fn source_pointers_for(
+    conn: &Connection,
+    db_path: &Path,
+    record_ids: &[String],
+) -> Result<BTreeMap<String, Vec<SourcePointer>>, String> {
+    let mut out: BTreeMap<String, Vec<SourcePointer>> = BTreeMap::new();
+    if record_ids.is_empty() || !table_names(conn).iter().any(|name| name == "source_records") {
+        return Ok(out);
+    }
+    let Some(host_root) = host_root_of(db_path) else {
+        return Ok(out);
+    };
+    for chunk in record_ids.chunks(SOURCE_REFS_ID_CHUNK) {
+        let placeholders = vec!["?"; chunk.len()].join(", ");
+        let sql = format!(
+            "SELECT record_id, source_db, source_table, source_rowid FROM \"source_records\" \
+             WHERE record_id IN ({placeholders}) ORDER BY record_id, ordinal"
+        );
+        let params: Vec<&dyn rusqlite::ToSql> = chunk
+            .iter()
+            .map(|id| id as &dyn rusqlite::ToSql)
+            .collect();
+        for row in query_rows(conn, &sql, params.as_slice())? {
+            let text = |key: &str| {
+                row.get(key)
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            let record_id = text("record_id");
+            let table_name = text("source_table");
+            let Some(rowid) = row.get("source_rowid").and_then(Value::as_i64) else {
+                continue;
+            };
+            let full_path = resolve_source_db(&host_root, &text("source_db"));
+            if record_id.is_empty() || table_name.is_empty() || full_path.is_empty() {
+                continue;
+            }
+            let pointer = SourcePointer {
+                full_path,
+                table_name,
+                rowid,
+            };
+            let pointers = out.entry(record_id).or_default();
+            if !pointers.contains(&pointer) {
+                pointers.push(pointer);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Adds `__source_refs` (evidence identities as a JSON string) to page rows so
+/// raw, overview, timeline and search share one bookmark key. Rows that are not
+/// primary contract rows are left untouched.
+fn decorate_source_refs(
+    conn: &Connection,
+    db_path: &Path,
+    rows: &mut [Map<String, Value>],
+) -> Result<(), String> {
+    let ids: Vec<String> = rows
+        .iter()
+        .filter_map(contract_row_record_id)
+        .collect::<std::collections::BTreeSet<String>>()
+        .into_iter()
+        .collect();
+    let pointers = source_pointers_for(conn, db_path, &ids)?;
+    if pointers.is_empty() {
+        return Ok(());
+    }
+    for row in rows.iter_mut() {
+        let Some(id) = contract_row_record_id(row) else {
+            continue;
+        };
+        let Some(refs) = pointers.get(&id) else {
+            continue;
+        };
+        let Ok(serialized) = serde_json::to_string(refs) else {
+            continue;
+        };
+        row.insert(SOURCE_REFS_KEY.to_string(), Value::from(serialized));
+    }
+    Ok(())
+}
+
+/// Evidence links of one result row: `source_records` of the same file, by
+/// `record_id`, in ordinal order. A row may have several origins and no
+/// representative is chosen. Raw tables without `source_records` return empty —
+/// they are the evidence, so no origin is invented.
+#[tauri::command]
+async fn read_record_sources(
+    full_path: String,
+    table_name: String,
+    rowid: i64,
+) -> Result<Vec<Map<String, Value>>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        read_record_sources_blocking(full_path, table_name, rowid)
+    })
+    .await
+    .map_err(|error| format!("원본 근거 조회가 중단되었습니다: {error}"))?
+}
+
+fn read_record_sources_blocking(
+    full_path: String,
+    table_name: String,
+    rowid: i64,
+) -> Result<Vec<Map<String, Value>>, String> {
+    let path = PathBuf::from(&full_path);
+    let conn = open_ro(&full_path)?;
+    let tables = table_names(&conn);
+    if !tables.iter().any(|name| name == &table_name) {
+        return Ok(Vec::new());
+    }
+    if !tables.iter().any(|name| name == "source_records") {
+        return Ok(Vec::new());
+    }
+    let Some(record_id) = record_id_of(&conn, &table_name, rowid)? else {
+        return Ok(Vec::new());
+    };
+    let columns = payload_columns(&conn, "source_records");
+    let Some(projection) = payload_projection(&columns) else {
+        return Ok(Vec::new());
+    };
+    let sql = format!(
+        "SELECT {projection} FROM \"source_records\" WHERE record_id = ?1 ORDER BY ordinal"
+    );
+    let mut rows = query_rows(&conn, &sql, &[&record_id])?;
+    let host_root = host_root_of(&path);
+    for row in &mut rows {
+        let source_db = row
+            .get("source_db")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let resolved = host_root
+            .as_deref()
+            .map(|root| resolve_source_db(root, &source_db))
+            .unwrap_or_default();
+        row.insert("source_full_path".to_string(), Value::from(resolved));
+    }
+    Ok(rows)
+}
+
+/// Child rows of one result row (ExecutionTimes, TaskActions, AiMessages, …).
+/// Values kept as child rows instead of being forced into the common columns
+/// are read only in detail. `child_table` is validated against the file's own
+/// tables and the primary table is rejected, so listing cannot be bypassed.
+#[tauri::command]
+async fn read_record_children(
+    full_path: String,
+    table_name: String,
+    rowid: i64,
+    child_table: String,
+) -> Result<Vec<Map<String, Value>>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        read_record_children_blocking(full_path, table_name, rowid, child_table)
+    })
+    .await
+    .map_err(|error| format!("자식 레코드 조회가 중단되었습니다: {error}"))?
+}
+
+fn read_record_children_blocking(
+    full_path: String,
+    table_name: String,
+    rowid: i64,
+    child_table: String,
+) -> Result<Vec<Map<String, Value>>, String> {
+    let conn = open_ro(&full_path)?;
+    let tables = table_names(&conn);
+    if !tables.iter().any(|name| name == &table_name) {
+        return Ok(Vec::new());
+    }
+    if child_table == table_name || !tables.iter().any(|name| name == &child_table) {
+        return Ok(Vec::new());
+    }
+    let Some(record_id) = record_id_of(&conn, &table_name, rowid)? else {
+        return Ok(Vec::new());
+    };
+    let columns = payload_columns(&conn, &child_table);
+    if !columns.iter().any(|column| column == "record_id") {
+        return Ok(Vec::new());
+    }
+    let Some(projection) = payload_projection(&columns) else {
+        return Ok(Vec::new());
+    };
+    let order = if columns.iter().any(|column| column == "ordinal") {
+        " ORDER BY ordinal"
+    } else {
+        ""
+    };
+    let sql = format!(
+        "SELECT rowid AS __rowid, {projection} FROM {} WHERE record_id = ?1{order}",
+        q(&child_table)
+    );
+    query_rows(&conn, &sql, &[&record_id])
 }
 
 #[derive(Deserialize, Clone)]
@@ -4634,7 +5576,15 @@ struct SearchHit {
     match_column: String,
     match_value: String,
     timestamp: String,
+    /// `<table>::<rowid>` pointer of a raw (facts) table. Empty for derived rows.
     record_key: String,
+    /// Derived row id. Opening the raw row and bookmarking resolve it through
+    /// source_records; it is not itself a bookmark key.
+    record_id: String,
+    /// Raw evidence identities this hit points at. Search results carry no row
+    /// body, so bookmark state needs this list. Empty for raw hits, where the
+    /// caller uses (full_path, table_name, rowid) directly.
+    source_refs: Vec<SourcePointer>,
 }
 
 #[derive(Serialize)]
@@ -4733,6 +5683,7 @@ fn search_case_blocking(
                 .file_stem()
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_default();
+            // An unreadable source is reported, never hidden as "no match".
             let mut tables = match checked_table_names(&conn) {
                 Ok(tables) => tables,
                 Err(_) => {
@@ -4740,6 +5691,13 @@ fn search_case_blocking(
                     continue;
                 }
             };
+            // Contract DBs are searched through their primary table only;
+            // scanning children would duplicate one event per evidence row.
+            if let (Some(_), Some(primary)) =
+                (overview_contract_version(&conn), primary_table_name(&fp))
+            {
+                tables.retain(|name| name.eq_ignore_ascii_case(&primary));
+            }
             tables.sort();
             for table in tables {
                 if has_next {
@@ -4756,7 +5714,9 @@ fn search_case_blocking(
                     }
                     continue;
                 }
-                let cols = table_columns(&conn, &table);
+                // Body BLOBs are excluded: LIKE over hex-expanded bytes would
+                // match text the analyst never typed.
+                let cols = payload_columns(&conn, &table);
                 if cols.is_empty() {
                     continue;
                 }
@@ -4830,9 +5790,10 @@ fn search_case_blocking(
                 let timestamp_expr = timestamp_sql
                     .clone()
                     .unwrap_or_else(|| "''".to_string());
-                // Overview tables retain a raw-evidence pointer. Carry only a
-                // bounded copy so the renderer can bookmark that exact source
-                // record without materialising the complete overview row.
+                // Raw (facts) tables keep the record_key pointer. Derived rows
+                // do not: their raw evidence is reached through record_id and
+                // source_records, so a UUID never acts as a '<table>::<rowid>'
+                // pointer (docs-01 column moves).
                 let record_key_column = cols.iter().find(|column| {
                     column.eq_ignore_ascii_case("record_key")
                         || column.eq_ignore_ascii_case("_record_key")
@@ -4846,6 +5807,13 @@ fn search_case_blocking(
                         )
                     })
                     .unwrap_or_else(|| "''".to_string());
+                // Lookup key of a derived row; detail and bookmarks resolve it
+                // through source_records.
+                let record_id_expr = if cols.iter().any(|column| column == "record_id") {
+                    "\"record_id\""
+                } else {
+                    "''"
+                };
                 if range_active && timestamp_column.is_none() {
                     // A table without a usable evidence time cannot be placed
                     // inside the incident window, so do not leak it into an
@@ -4869,11 +5837,12 @@ fn search_case_blocking(
                 // rows in memory.
                 let query_limit = if has_next { 1 } else { scan_target };
                 let sql = format!(
-                    "SELECT rowid AS __rowid, CASE {} ELSE '' END AS __match_column, CASE {} ELSE '' END AS __match_value, {} AS __timestamp, {} AS __record_key FROM {} WHERE {} ORDER BY rowid LIMIT {}",
+                    "SELECT rowid AS __rowid, CASE {} ELSE '' END AS __match_column, CASE {} ELSE '' END AS __match_value, {} AS __timestamp, {} AS __record_key, {} AS __record_id FROM {} WHERE {} ORDER BY rowid LIMIT {}",
                     match_column,
                     match_value,
                     timestamp_expr,
                     record_key_expr,
+                    record_id_expr,
                     q(&table),
                     conditions.join(" AND "),
                     query_limit,
@@ -4928,8 +5897,55 @@ fn search_case_blocking(
                             .and_then(|value| value.as_str())
                             .unwrap_or_default()
                             .to_string(),
+                        record_id: row
+                            .get("__record_id")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        source_refs: Vec::new(),
                     });
                 }
+            }
+        }
+    }
+    // Search hits carry no row body, so attach only the evidence identities,
+    // batched per file. Stored source_records are read; raw DBs are never
+    // reopened and recomposed.
+    let mut by_file: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (index, hit) in hits.iter().enumerate() {
+        if !hit.record_id.is_empty() {
+            by_file
+                .entry(hit.full_path.clone())
+                .or_default()
+                .push(index);
+        }
+    }
+    for (path, indexes) in by_file {
+        let Ok(conn) = open_ro(&path) else {
+            continue;
+        };
+        let ids: Vec<String> = indexes
+            .iter()
+            .map(|index| hits[*index].record_id.clone())
+            .collect();
+        let pointers = match source_pointers_for(&conn, Path::new(&path), &ids) {
+            Ok(pointers) => pointers,
+            Err(_) => {
+                // Unreadable evidence links are reported, not shown as "none".
+                source_failures.push(format!(
+                    "{}: 원본 연결",
+                    Path::new(&path)
+                        .file_stem()
+                        .map(|stem| stem.to_string_lossy().to_string())
+                        .unwrap_or_default()
+                ));
+                continue;
+            }
+        };
+        for index in indexes {
+            let key = hits[index].record_id.clone();
+            if let Some(refs) = pointers.get(&key) {
+                hits[index].source_refs = refs.clone();
             }
         }
     }
@@ -6057,17 +7073,17 @@ struct AiConversation {
     provider: String,
     account: String,
     title: String,
-    /// Cache observation time. This is the evidence timestamp used by range filters.
-    date: String,
+    /// 대표 시각(공통 컬럼). 기간 필터가 쓰는 증거 시각이다.
+    timestamp: String,
     /// Conversation-authored timestamps are preserved separately from the cache time.
     created_at: String,
     updated_at: String,
     url: String,
     /// 파생 테이블 rowid — 상세(원문) 단건 조회 키.
     row_id: i64,
-    /// 원본 캐시 행(`<파일>::CacheEntries::<rowid>`) — 다른 화면과 북마크를
-    /// 공유하는 식별자. 파생 행은 이 키로만 원본 증거에 고정된다.
-    source_record_key: String,
+    /// 결과 세대 내 레코드 ID. 원본 증거는 이 ID로 source_records를 조회해
+    /// 연다 — 화면 조회 키일 뿐 원본 북마크 키를 대신하지 않는다.
+    record_id: String,
     /// 목록 표시용 메시지 수(파생 시점 계산). 원문은 상세에서만 읽는다.
     message_count: i64,
 }
@@ -6125,11 +7141,11 @@ fn ai_conversations_blocking(
     let mut clauses: Vec<&str> = Vec::new();
     let mut params: Vec<String> = Vec::new();
     if let Some(start) = query.start.as_ref().filter(|s| !s.is_empty()) {
-        clauses.push("date >= ?");
+        clauses.push("timestamp >= ?");
         params.push(start.clone());
     }
     if let Some(end) = query.end.as_ref().filter(|s| !s.is_empty()) {
-        clauses.push("date <= ?");
+        clauses.push("timestamp <= ?");
         params.push(end.clone());
     }
     let where_sql = if clauses.is_empty() {
@@ -6150,16 +7166,14 @@ fn ai_conversations_blocking(
     // 원문(raw_json)은 목록에 싣지 않는다 — 대화 한 건의 크기에 상한이 없어
     // 페이지 행 수만으로는 전송 바이트·파싱 비용이 제한되지 않는다. 원문은
     // 분석가가 대화를 열 때 rowid로 단건 조회한다.
-    let has_message_count = table_columns(&conn, "AiConversations")
-        .iter()
-        .any(|column| column == "message_count");
-    let message_count_expr = if has_message_count {
-        "CAST(COALESCE(message_count,'0') AS INTEGER)"
-    } else {
-        "0"
-    };
+    //
+    // The representative time is the common `timestamp`; the conversation's own
+    // created_at/updated_at are preserved (docs-01 column moves). Evidence links
+    // live in source_records, so only record_id is carried here.
     let sql = format!(
-        "SELECT rowid, date, provider, account, title, created_at, updated_at, url, COALESCE(source_record_key,''), {message_count_expr} FROM \"AiConversations\"{where_sql} ORDER BY date DESC, url ASC LIMIT ? OFFSET ?"
+        "SELECT rowid, timestamp, provider, account, title, created_at, updated_at, url, \
+         COALESCE(record_id,''), COALESCE(message_count, 0) FROM \"AiConversations\"{where_sql} \
+         ORDER BY timestamp IS NULL, timestamp DESC, url ASC LIMIT ? OFFSET ?"
     );
     let mut stmt = conn
         .prepare(&sql)
@@ -6173,14 +7187,14 @@ fn ai_conversations_blocking(
         .query_map(bind_page.as_slice(), |r| {
             Ok(AiConversation {
                 row_id: r.get::<_, i64>(0)?,
-                date: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                timestamp: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
                 provider: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
                 account: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
                 title: r.get::<_, Option<String>>(4)?.unwrap_or_default(),
                 created_at: r.get::<_, Option<String>>(5)?.unwrap_or_default(),
                 updated_at: r.get::<_, Option<String>>(6)?.unwrap_or_default(),
                 url: r.get::<_, Option<String>>(7)?.unwrap_or_default(),
-                source_record_key: r.get::<_, Option<String>>(8)?.unwrap_or_default(),
+                record_id: r.get::<_, Option<String>>(8)?.unwrap_or_default(),
                 message_count: r.get::<_, i64>(9)?,
             })
         })
@@ -6202,7 +7216,7 @@ fn ai_conversations_blocking(
 #[serde(rename_all = "camelCase")]
 struct AiConversationDetail {
     raw_json: String,
-    source_record_key: String,
+    record_id: String,
 }
 
 fn ai_conversation_detail_blocking(
@@ -6218,12 +7232,12 @@ fn ai_conversation_detail_blocking(
     let conn = open_ro(&db.to_string_lossy())
         .map_err(|error| format!("AI 대화 파생 테이블을 열 수 없습니다: {error}"))?;
     conn.query_row(
-        "SELECT COALESCE(raw_json,''), COALESCE(source_record_key,'') FROM \"AiConversations\" WHERE rowid = ?1",
+        "SELECT COALESCE(raw_json,''), COALESCE(record_id,'') FROM \"AiConversations\" WHERE rowid = ?1",
         rusqlite::params![row_id],
         |row| {
             Ok(AiConversationDetail {
                 raw_json: row.get(0)?,
-                source_record_key: row.get(1)?,
+                record_id: row.get(1)?,
             })
         },
     )
@@ -6324,6 +7338,7 @@ fn path_references_blocking(
     let mut keys: Vec<String> = paths.iter().map(|p| to_volume_relative(p)).collect();
     keys.sort();
     keys.dedup();
+    let host_root = normalize_bookmark_path(Path::new(&host_dir));
     let mut out = Vec::new();
     // SQLite 바인딩 수 제한을 고려해 청크로 조회한다.
     for chunk in keys.chunks(400) {
@@ -6333,46 +7348,91 @@ fn path_references_blocking(
         );
         let params: Vec<&dyn rusqlite::ToSql> =
             chunk.iter().map(|k| k as &dyn rusqlite::ToSql).collect();
-        for r in query_rows(&conn, &sql, &params)? {
+        let rows = query_rows(&conn, &sql, &params)?;
+        // Raw rows live in source_records: read the record_ids of this page in
+        // one batch instead of reopening the DB per row. With several origins
+        // the first one (ordinal 0) is the open target; the rest are chosen from
+        // the detail evidence list (docs-24 §4).
+        let record_ids: Vec<String> = rows
+            .iter()
+            .filter_map(|row| {
+                row.get("record_id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_string)
+            })
+            .collect();
+        let mut first_source: BTreeMap<String, (String, String, i64)> = BTreeMap::new();
+        if !record_ids.is_empty() && table_names(&conn).iter().any(|n| n == "source_records") {
+            let source_placeholders = vec!["?"; record_ids.len()].join(", ");
+            let source_sql = format!(
+                "SELECT record_id, source_db, source_table, source_rowid FROM \"source_records\" \
+                 WHERE record_id IN ({source_placeholders}) ORDER BY record_id, ordinal DESC"
+            );
+            let source_params: Vec<&dyn rusqlite::ToSql> = record_ids
+                .iter()
+                .map(|id| id as &dyn rusqlite::ToSql)
+                .collect();
+            for source in query_rows(&conn, &source_sql, &source_params)? {
+                let text = |key: &str| {
+                    source
+                        .get(key)
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string()
+                };
+                let record_id = text("record_id");
+                if record_id.is_empty() {
+                    continue;
+                }
+                let resolved = resolve_source_db(&host_root, &text("source_db"));
+                let rowid = source
+                    .get("source_rowid")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(-1);
+                // Ordinal is descending, so the value kept last is ordinal 0.
+                first_source.insert(record_id, (resolved, text("source_table"), rowid));
+            }
+        }
+        for r in rows {
             let get = |k: &str| r.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
             let mut fields = Map::new();
             for k in [
                 "target_path",
+                "target_path_resolved",
                 "app_id",
                 "jumplist_type",
                 "arguments",
                 "working_directory",
                 "machine_id",
                 "timestamp",
+                "timestamp_kind",
                 "created_time",
                 "modified_time",
-                "_source_file",
+                "description",
                 "path",
                 "account",
+                "account_sid",
             ] {
                 let v = get(k);
                 if !v.is_empty() {
                     fields.insert(k.to_string(), Value::from(v));
                 }
             }
-            let source_relative = get("source_relative");
-            let full_path = if source_relative.is_empty() {
-                String::new()
-            } else {
-                PathBuf::from(&host_dir)
-                    .join(&source_relative)
-                    .to_string_lossy()
-                    .to_string()
-            };
+            let (full_path, table_name, rowid) = first_source
+                .get(&get("record_id"))
+                .cloned()
+                .unwrap_or_else(|| (String::new(), String::new(), -1));
             out.push(PathReference {
                 path: get("path"),
-                kind: get("kind"),
+                // The record kind is the common column event_type.
+                kind: get("event_type"),
                 account: get("account"),
                 label: get("label"),
                 fields,
                 full_path,
-                table_name: get("source_table"),
-                rowid: get("source_rowid").parse().unwrap_or(-1),
+                table_name,
+                rowid,
             });
         }
     }
@@ -6392,7 +7452,9 @@ async fn path_reference_accounts(host_dir: String) -> Result<Vec<String>, String
         let conn = open_ro(&db.to_string_lossy())?;
         let mut stmt = conn
             .prepare(
-                "SELECT DISTINCT account FROM PathReferences WHERE account != '' ORDER BY account LIMIT 500",
+                // Exclude unknown (NULL) and empty accounts: chips list only
+                // confirmed accounts, unknown is not a filter value.
+                "SELECT DISTINCT account FROM PathReferences WHERE account IS NOT NULL AND account <> '' ORDER BY account LIMIT 500",
             )
             .map_err(|error| format!("교차 참조 계정 조회 실패: {error}"))?;
         let accounts = stmt
@@ -6612,6 +7674,22 @@ struct BookmarkInput {
     host_name: Option<String>,
 }
 
+/// Whether a bookmark target is a derived row (a contract DB's primary table).
+/// A derived record_id is reissued per result generation, so it cannot stand in
+/// for the raw bookmark key: the analyst picks the raw row/field from the detail
+/// evidence list (docs-24 §5). Already stored bookmarks, including removal, are
+/// unaffected by this check.
+fn is_derived_contract_target(full_path: &str, table_name: &str) -> bool {
+    let Ok(conn) = open_ro(full_path) else {
+        return false;
+    };
+    if overview_contract_version(&conn) != Some(OVERVIEW_CONTRACT_VERSION) {
+        return false;
+    }
+    primary_table_name(Path::new(full_path))
+        .is_some_and(|primary| primary.eq_ignore_ascii_case(table_name))
+}
+
 #[tauri::command]
 fn toggle_bookmark(case_dir: String, entry: BookmarkInput) -> Result<Vec<Value>, String> {
     let _guard = lock_bookmarks();
@@ -6626,6 +7704,12 @@ fn toggle_bookmark(case_dir: String, entry: BookmarkInput) -> Result<Vec<Value>,
     if let Some(i) = idx {
         bookmarks.remove(i);
     } else {
+        if is_derived_contract_target(&entry.full_path, &entry.table_name) {
+            return Err(
+                "분석 결과 행은 직접 북마크하지 않습니다. 상세의 원본 근거에서 원본 행을 선택해 북마크하세요."
+                    .to_string(),
+            );
+        }
         let id = bookmark_id_v2(&entry.full_path, &entry.table_name, entry.rowid, &field);
         let mut b = Map::new();
         b.insert("id".into(), Value::from(id));
@@ -7610,86 +8694,6 @@ mod search_case_tests {
     }
 }
 
-
-#[cfg(test)]
-mod execution_history_upgrade_tests {
-    use super::*;
-
-    /// 구 저장본은 record_key·prefetch_hash 컬럼을 이미 갖고 있어 컬럼 검사만
-    /// 으로는 최신으로 오판된다 — WER 실행 증거가 편입된 버전보다 낮으면
-    /// 재생성해야 한다(재파싱 없이 파생을 갱신한다는 이 경로의 목적).
-    #[test]
-    fn legacy_execution_history_without_version_marker_is_rebuilt() {
-        let root = std::env::temp_dir().join(format!("wina-eh-up-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let ov = root.join("_OVERVIEW");
-        std::fs::create_dir_all(&ov).unwrap();
-        let db = ov.join("ExecutionHistory.sqlite");
-        {
-            let conn = Connection::open(&db).unwrap();
-            // v1.3.10 형태: 컬럼은 최신과 같고 버전 마커만 없다.
-            conn.execute_batch(
-                "CREATE TABLE ExecutionHistory (timestamp TEXT, program_name TEXT, program_path TEXT, user TEXT, source_artifact TEXT, record_key TEXT, prefetch_hash TEXT);
-                 INSERT INTO ExecutionHistory VALUES ('2026-01-01 00:00:00.000','old.exe','','','Prefetch','k','h')",
-            )
-            .unwrap();
-        }
-        // 재생성 입력이 없으면 rows가 비어 false를 돌려주므로, 갱신 판정이
-        // 조기 반환(컬럼만 보고 최신 판정)에 걸리지 않았음을 별도로 확인한다.
-        let conn = open_ro(&db.to_string_lossy()).unwrap();
-        let version: i64 = conn
-            .query_row(
-                "SELECT version FROM _wina_derived_version WHERE name = 'ExecutionHistory'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-        drop(conn);
-        assert_eq!(version, 0, "구 저장본에는 파생 버전 마커가 없다");
-        assert!(
-            version < overview::EXECUTION_HISTORY_DERIVED_VERSION,
-            "마커 없는 저장본은 현재 파생 버전보다 낮아 재생성 대상이어야 한다"
-        );
-
-        // WerReports도 같은 계약이다 — 마커가 없는 구 저장본은 재생성 대상.
-        let wer_db = ov.join("WerReports.sqlite");
-        {
-            let conn = Connection::open(&wer_db).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE WerReports (timestamp TEXT, EventType TEXT, AppName TEXT, report TEXT);
-                 INSERT INTO WerReports VALUES ('2026-01-01 00:00:00.000','APPCRASH','old.exe','{}')",
-            )
-            .unwrap();
-        }
-        assert_eq!(derived_version_of(&wer_db, "WerReports"), 0);
-        assert!(derived_version_of(&wer_db, "WerReports") < overview::WER_REPORTS_DERIVED_VERSION);
-        wina_core::sqlite::stamp_derived_version(
-            &wer_db,
-            "WerReports",
-            overview::WER_REPORTS_DERIVED_VERSION,
-        )
-        .unwrap();
-        assert_eq!(
-            refresh_wer_reports_overview_blocking(root.to_string_lossy().to_string()),
-            Ok(false),
-            "현재 버전 마커가 있으면 재생성하지 않는다"
-        );
-
-        // 마커를 현재 버전으로 찍으면 최신으로 판정돼 재생성하지 않는다.
-        wina_core::sqlite::stamp_derived_version(
-            &db,
-            "ExecutionHistory",
-            overview::EXECUTION_HISTORY_DERIVED_VERSION,
-        )
-        .unwrap();
-        assert_eq!(
-            refresh_execution_history_overview_blocking(root.to_string_lossy().to_string()),
-            Ok(false),
-            "현재 버전 마커가 있으면 재생성하지 않는다"
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-}
 
 #[cfg(test)]
 mod timeline_build_tests {
@@ -8689,17 +9693,28 @@ mod browser_activity_tests {
         let ov = root.join("_OVERVIEW");
         std::fs::create_dir_all(&ov).unwrap();
         let conn = Connection::open(ov.join("AiConversations.sqlite")).unwrap();
-        conn.execute_batch("CREATE TABLE AiConversations (date TEXT, provider TEXT, account TEXT, title TEXT, created_at TEXT, updated_at TEXT, url TEXT, raw_json TEXT, message_count TEXT, source_record_key TEXT, _source_file TEXT)").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE AiConversations (record_id TEXT, host_id TEXT, dataset_id TEXT, timestamp TEXT, overview_name TEXT, account TEXT, account_sid TEXT, timestamp_kind TEXT, event_type TEXT, description TEXT, provider TEXT, title TEXT, created_at TEXT, updated_at TEXT, url TEXT, raw_json TEXT, message_count INTEGER);
+             CREATE TABLE source_records (record_id TEXT NOT NULL, ordinal INTEGER NOT NULL, source_dataset_id TEXT NOT NULL, source_artifact TEXT NOT NULL, source_db TEXT NOT NULL, source_table TEXT NOT NULL, source_rowid INTEGER NOT NULL, source_field TEXT, source_record_key TEXT, source_file TEXT, source_label TEXT);
+             CREATE TABLE _wina_derived_version (name TEXT NOT NULL PRIMARY KEY, version INTEGER NOT NULL);
+             INSERT INTO _wina_derived_version(name,version) VALUES ('overview_contract',1)",
+        )
+        .unwrap();
         // 원문은 목록 응답에 실리면 안 되므로 크게 만들어 둔다.
         let big_raw = format!("{{\"pad\":\"{}\"}}", "x".repeat(200_000));
-        for (date, url) in [
-            ("2026-07-01 10:00:00.000", "https://chatgpt.com/backend-api/conversation/a"),
-            ("2026-07-02 10:00:00.000", "https://chatgpt.com/backend-api/conversation/b"),
-            ("2026-07-03 10:00:00.000", "https://chatgpt.com/backend-api/conversation/c"),
+        for (record_id, timestamp, url) in [
+            ("rec-a", "2026-07-01 10:00:00.000", "https://chatgpt.com/backend-api/conversation/a"),
+            ("rec-b", "2026-07-02 10:00:00.000", "https://chatgpt.com/backend-api/conversation/b"),
+            ("rec-c", "2026-07-03 10:00:00.000", "https://chatgpt.com/backend-api/conversation/c"),
         ] {
             conn.execute(
-                "INSERT INTO AiConversations VALUES (?1, 'ChatGPT', 'alice', 't', '', '', ?2, ?3, '4', 'u_Chrome_Cache::CacheEntries::7', '')",
-                rusqlite::params![date, url, big_raw],
+                "INSERT INTO AiConversations VALUES (?1, 'h', 'd', ?2, 'AiConversations', 'alice', NULL, 'cache_observed', 'conversation', NULL, 'ChatGPT', 't', NULL, NULL, ?3, ?4, 4)",
+                rusqlite::params![record_id, timestamp, url, big_raw],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO source_records VALUES (?1, 0, 'd0', 'Browser', 'BROWSER/u_Chrome_Cache.sqlite', 'CacheEntries', 7, NULL, 'u_Chrome_Cache::CacheEntries::7', NULL, NULL)",
+                rusqlite::params![record_id],
             )
             .unwrap();
         }
@@ -8719,7 +9734,7 @@ mod browser_activity_tests {
         assert_eq!(page.total, 2);
         assert_eq!(page.conversations.len(), 1);
         // 관찰 시각 내림차순 — 첫 페이지는 최신.
-        assert_eq!(page.conversations[0].date, "2026-07-03 10:00:00.000");
+        assert_eq!(page.conversations[0].timestamp, "2026-07-03 10:00:00.000");
         let second = ai_conversations_blocking(
             root.to_string_lossy().to_string(),
             AiConversationQuery {
@@ -8730,12 +9745,12 @@ mod browser_activity_tests {
             },
         )
         .unwrap();
-        assert_eq!(second.conversations[0].date, "2026-07-02 10:00:00.000");
+        assert_eq!(second.conversations[0].timestamp, "2026-07-02 10:00:00.000");
 
-        // 목록은 원문을 싣지 않고(전송 바이트가 대화 크기에 비례하지 않음),
-        // 원본 증거를 가리키는 북마크 식별자와 표시용 메시지 수만 전달한다.
+        // The list carries no raw JSON, only the record id and the message count;
+        // raw evidence is opened through record_id and source_records.
         let listed = &page.conversations[0];
-        assert_eq!(listed.source_record_key, "u_Chrome_Cache::CacheEntries::7");
+        assert_eq!(listed.record_id, "rec-c");
         assert_eq!(listed.message_count, 4);
         assert!(listed.row_id > 0);
         let serialized = serde_json::to_string(&page).unwrap();
@@ -8751,7 +9766,30 @@ mod browser_activity_tests {
             ai_conversation_detail_blocking(root.to_string_lossy().to_string(), listed.row_id)
                 .unwrap();
         assert!(detail.raw_json.contains("pad"));
-        assert_eq!(detail.source_record_key, "u_Chrome_Cache::CacheEntries::7");
+        assert_eq!(detail.record_id, "rec-c");
+
+        // Evidence links come from source_records; nothing outside the host root
+        // is resolved.
+        let sources = read_record_sources_blocking(
+            ov.join("AiConversations.sqlite").to_string_lossy().to_string(),
+            "AiConversations".to_string(),
+            listed.row_id,
+        )
+        .unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(
+            sources[0].get("source_record_key").and_then(Value::as_str),
+            Some("u_Chrome_Cache::CacheEntries::7")
+        );
+        assert_eq!(
+            sources[0].get("source_rowid").and_then(Value::as_i64),
+            Some(7)
+        );
+        // The collection file does not exist here, so no openable path.
+        assert_eq!(
+            sources[0].get("source_full_path").and_then(Value::as_str),
+            Some("")
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -8800,14 +9838,14 @@ mod browser_activity_tests {
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join("Browser.sqlite");
         let conn = Connection::open(&path).unwrap();
-        conn.execute_batch("CREATE TABLE BrowserActivity (account TEXT, kind TEXT, timestamp TEXT, title TEXT, url TEXT, url_raw TEXT)").unwrap();
+        conn.execute_batch("CREATE TABLE BrowserActivity (account TEXT, event_type TEXT, timestamp TEXT, title TEXT, url TEXT, url_raw TEXT)").unwrap();
         for (account, kind, timestamp) in [
             ("alice", "visit", "2024-06-01 10:00:00.000"),
             ("alice", "download", "2024-06-01 11:00:00.000"),
             ("bob", "cache", "2024-06-02 09:00:00.000"),
         ] {
             conn.execute(
-                "INSERT INTO BrowserActivity (account, kind, timestamp, title, url, url_raw) VALUES (?, ?, ?, '', '', '')",
+                "INSERT INTO BrowserActivity (account, event_type, timestamp, title, url, url_raw) VALUES (?, ?, ?, '', '', '')",
                 rusqlite::params![account, kind, timestamp],
             ).unwrap();
         }
@@ -8853,7 +9891,7 @@ mod browser_activity_tests {
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join("Browser.sqlite");
         let conn = Connection::open(&path).unwrap();
-        conn.execute_batch("CREATE TABLE BrowserActivity (account TEXT, kind TEXT, timestamp TEXT, title TEXT, url TEXT, url_raw TEXT, visit_count TEXT)").unwrap();
+        conn.execute_batch("CREATE TABLE BrowserActivity (account TEXT, event_type TEXT, timestamp TEXT, title TEXT, url TEXT, url_raw TEXT, visit_count INTEGER)").unwrap();
         for (account, kind, timestamp, title, url, visits) in [
             (
                 "alice",
@@ -8897,7 +9935,7 @@ mod browser_activity_tests {
             ),
         ] {
             conn.execute(
-                "INSERT INTO BrowserActivity (account, kind, timestamp, title, url, url_raw, visit_count) VALUES (?, ?, ?, ?, ?, '', ?)",
+                "INSERT INTO BrowserActivity (account, event_type, timestamp, title, url, url_raw, visit_count) VALUES (?, ?, ?, ?, ?, '', ?)",
                 rusqlite::params![account, kind, timestamp, title, url, visits],
             ).unwrap();
         }
@@ -8938,7 +9976,7 @@ mod browser_activity_tests {
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join("Browser.sqlite");
         let conn = Connection::open(&path).unwrap();
-        conn.execute_batch("CREATE TABLE BrowserActivity (account TEXT, kind TEXT, timestamp TEXT, title TEXT, url TEXT, url_raw TEXT, visit_count TEXT)").unwrap();
+        conn.execute_batch("CREATE TABLE BrowserActivity (account TEXT, event_type TEXT, timestamp TEXT, title TEXT, url TEXT, url_raw TEXT, visit_count INTEGER)").unwrap();
         for (account, timestamp, url, visits) in [
             (
                 "alice",
@@ -8978,7 +10016,7 @@ mod browser_activity_tests {
             ),
         ] {
             conn.execute(
-                "INSERT INTO BrowserActivity (account, kind, timestamp, title, url, url_raw, visit_count) VALUES (?, 'visit', ?, '', ?, '', ?)",
+                "INSERT INTO BrowserActivity (account, event_type, timestamp, title, url, url_raw, visit_count) VALUES (?, 'visit', ?, '', ?, '', ?)",
                 rusqlite::params![account, timestamp, url, visits],
             ).unwrap();
         }
@@ -9061,7 +10099,7 @@ mod browser_activity_tests {
         // account and period are unchanged.
         let conn = Connection::open(&path).unwrap();
         conn.execute(
-            "INSERT INTO BrowserActivity (account, kind, timestamp, title, url, url_raw, visit_count) VALUES ('alice', 'visit', '2024-07-02 00:00:00.000', '', 'https://new.example/', '', '1')",
+            "INSERT INTO BrowserActivity (account, event_type, timestamp, title, url, url_raw, visit_count) VALUES ('alice', 'visit', '2024-07-02 00:00:00.000', '', 'https://new.example/', '', '1')",
             [],
         ).unwrap();
         drop(conn);
@@ -9196,6 +10234,42 @@ mod pipeline_log_supervision_tests {
         .unwrap();
         assert!(preview.truncated);
         assert_eq!(preview.text.len(), 24 * 1024);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Only a log that really exists inside a registered host under the cases
+    /// root may be opened; this must never become an arbitrary file opener.
+    #[test]
+    fn open_parse_run_log_rejects_paths_outside_a_registered_host() {
+        let root = std::env::temp_dir().join(format!(
+            "windows-analysis-log-open-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        ));
+        let cases = root.join("cases");
+        let host = cases.join("HOST_1");
+        std::fs::create_dir_all(&host).unwrap();
+        std::fs::write(host.join("host.json"), b"{}").unwrap();
+        let log = pipeline::parse_run_log_path(&host, "run-1");
+        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+        std::fs::write(&log, b"log").unwrap();
+
+        let resolved =
+            parse_run_log_file_in(&cases, &host.to_string_lossy(), "run-1").expect("stored log");
+        assert_eq!(resolved, log.canonicalize().unwrap());
+
+        // Non-host folder, unregistered folder, escaping run id, missing log.
+        let outsider = root.join("elsewhere");
+        std::fs::create_dir_all(&outsider).unwrap();
+        assert!(parse_run_log_file_in(&cases, &outsider.to_string_lossy(), "run-1").is_err());
+        let unregistered = cases.join("not-a-host");
+        std::fs::create_dir_all(&unregistered).unwrap();
+        assert!(parse_run_log_file_in(&cases, &unregistered.to_string_lossy(), "run-1").is_err());
+        assert!(parse_run_log_file_in(&cases, &host.to_string_lossy(), "../run-1").is_err());
+        assert!(parse_run_log_file_in(&cases, &host.to_string_lossy(), "missing-run").is_err());
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -9369,6 +10443,472 @@ mod account_directory_tests {
     }
 }
 
+#[cfg(test)]
+mod overview_contract_tests {
+    use super::*;
+
+    fn temp_root(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "wina-contract-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        ))
+    }
+
+    #[test]
+    fn host_metadata_does_not_silently_drop_large_host_records() {
+        let root = temp_root("metadata-complete");
+        let mut conn = wina_core::derived::create_database(&root.join("_OVERVIEW"), "Metadata").unwrap();
+        let tx = conn.transaction().unwrap();
+        {
+            let mut insert = tx.prepare(
+                "INSERT INTO metadata(metadata_id, host_id, dataset_id, kind, scope, key, value, resolution_status) VALUES (?1, 'host', 'generation', 'env', 'machine', ?2, ?3, 'resolved')",
+            ).unwrap();
+            for index in 0..=5000 {
+                insert.execute(rusqlite::params![
+                    format!("env-{index}"), format!("KEY_{index:05}"), format!("value-{index}"),
+                ]).unwrap();
+            }
+        }
+        tx.commit().unwrap();
+        drop(conn);
+        let result = host_metadata_blocking(root.to_string_lossy().into(), None, Some("env".into())).unwrap();
+        assert!(result.contract_ok);
+        assert_eq!(result.rows.len(), 5001);
+        assert!(result.rows.iter().any(|row|
+            row.get("key").and_then(Value::as_str) == Some("KEY_05000")
+                && row.get("value").and_then(Value::as_str) == Some("value-5000")
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// One docs-01 §18 FileSystemEntries set: typed flags and byte sizes, NULL
+    /// semantics (unverified parent, unknown time), a resident body, two volumes.
+    fn write_file_system_entries(overview: &Path) -> PathBuf {
+        let path = overview.join("FileSystemEntries.sqlite");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE FileSystemEntries (record_id TEXT NOT NULL, host_id TEXT NOT NULL, dataset_id TEXT NOT NULL, timestamp TEXT, overview_name TEXT NOT NULL, account TEXT, account_sid TEXT, timestamp_kind TEXT, event_type TEXT, description TEXT, path TEXT, file_name TEXT, extension TEXT, is_directory INTEGER, in_use INTEGER, file_size INTEGER, data BLOB, volume_id TEXT, volume_label TEXT, volume_serial TEXT, drive_letter TEXT, ntfs_major_version INTEGER, ntfs_minor_version INTEGER, volume_flags TEXT, entry INTEGER, seq INTEGER, parent_entry INTEGER, parent_seq INTEGER, si_created TEXT, si_modified TEXT, si_mft_modified TEXT, si_accessed TEXT, owner_id INTEGER, security_id INTEGER, fn_created TEXT, fn_modified TEXT, fn_mft_modified TEXT, fn_accessed TEXT);
+             CREATE TABLE source_records (record_id TEXT NOT NULL, ordinal INTEGER NOT NULL, source_dataset_id TEXT NOT NULL, source_artifact TEXT NOT NULL, source_db TEXT NOT NULL, source_table TEXT NOT NULL, source_rowid INTEGER NOT NULL, source_field TEXT, source_record_key TEXT, source_file TEXT, source_label TEXT);
+             CREATE TABLE _wina_derived_version (name TEXT NOT NULL PRIMARY KEY, version INTEGER NOT NULL);
+             INSERT INTO _wina_derived_version(name,version) VALUES ('overview_contract',1);",
+        )
+        .unwrap();
+        let insert = "INSERT INTO FileSystemEntries (record_id, host_id, dataset_id, timestamp, overview_name, timestamp_kind, path, file_name, is_directory, in_use, file_size, data, volume_id, volume_label, entry, seq, parent_entry, si_modified) \
+             VALUES (?1, 'h', 'd', ?2, 'FileSystemEntries', ?3, ?4, ?5, ?6, 1, ?7, ?8, ?9, ?10, ?11, 1, ?12, ?2)";
+        // Root (unverified parent), file with a resident body, directory, file on
+        // another volume, file with an unverified parent, zero-length body file.
+        let rows: Vec<(&str, Option<&str>, Option<&str>, &str, &str, Option<i64>, Option<i64>, Option<Vec<u8>>, &str, Option<&str>, i64, Option<i64>)> = vec![
+            ("r1", None, None, "\\", ".", Some(1), Some(0), None, "v1", Some("SYSTEM"), 5, None),
+            ("r2", Some("2026-01-02 00:00:00.000"), Some("si_modified"), "\\a.txt", "a.txt", Some(0), Some(3), Some(b"abc".to_vec()), "v1", Some("SYSTEM"), 10, Some(5)),
+            ("r3", Some("2026-01-01 00:00:00.000"), Some("si_modified"), "\\dir", "dir", Some(1), Some(0), None, "v1", Some("SYSTEM"), 11, Some(5)),
+            ("r4", None, None, "\\other.txt", "other.txt", Some(0), Some(7), None, "v2", None, 10, Some(5)),
+            ("r5", None, None, "\\orphan.bin", "orphan.bin", Some(0), None, None, "v1", Some("SYSTEM"), 12, None),
+            ("r6", Some("2026-01-03 00:00:00.000"), Some("si_modified"), "\\empty.txt", "empty.txt", Some(0), Some(0), Some(Vec::new()), "v1", Some("SYSTEM"), 13, Some(5)),
+        ];
+        for (record_id, timestamp, kind, path_value, name, is_dir, size, data, volume, label, entry, parent) in rows {
+            conn.execute(
+                insert,
+                rusqlite::params![
+                    record_id, timestamp, kind, path_value, name, is_dir, size, data, volume,
+                    label, entry, parent
+                ],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO source_records VALUES ('r2', 0, 'd0', 'MFT', '_OVERVIEW/MFT_Records.sqlite', 'MFT_Records', 2, NULL, NULL, 'C:\\$MFT', NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO source_records VALUES ('r2', 1, 'd0', 'MFT', '../outside.sqlite', 'MFT_Records', 9, NULL, NULL, NULL, NULL)",
+            [],
+        )
+        .unwrap();
+        path
+    }
+
+    fn row_names(rows: &[Map<String, Value>]) -> Vec<String> {
+        rows.iter()
+            .map(|row| {
+                row.get("file_name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn contract_db_publishes_only_its_primary_table() {
+        let root = temp_root("tables");
+        let overview = root.join("_OVERVIEW");
+        std::fs::create_dir_all(&overview).unwrap();
+        let db = write_file_system_entries(&overview);
+        let conn = open_ro(&db.to_string_lossy()).unwrap();
+        // source_records and the version table never appear as separate entries
+        // in listing, search or the timeline.
+        assert_eq!(visible_table_names(&conn, &db), vec!["FileSystemEntries"]);
+        assert_eq!(
+            first_table(&conn, &db).as_deref(),
+            Some("FileSystemEntries")
+        );
+        assert_eq!(overview_contract_version(&conn), Some(1));
+
+        let mut listed = Vec::new();
+        find_result_files(&overview, &overview, &mut listed);
+        assert_eq!(
+            listed
+                .iter()
+                .map(|entry| entry.table_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["FileSystemEntries"]
+        );
+
+        // A generic page response carries no body BLOB.
+        let page = read_result_file_page_blocking(
+            db.to_string_lossy().to_string(),
+            None,
+            0,
+            10,
+        )
+        .unwrap();
+        assert!(!page.columns.iter().any(|column| column == "data"));
+        assert!(page.rows.iter().all(|row| !row.contains_key("data")));
+
+        let status = overview_contract_status_blocking(root.to_string_lossy().to_string());
+        assert!(status.contract_ok, "legacy: {:?}", status.legacy_files);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mft_queries_are_typed_volume_scoped_and_body_free() {
+        let root = temp_root("mft");
+        let overview = root.join("_OVERVIEW");
+        std::fs::create_dir_all(&overview).unwrap();
+        let db = write_file_system_entries(&overview);
+        let full = db.to_string_lossy().to_string();
+
+        // Choosing a volume never mixes the same parent number from another one.
+        let children =
+            mft_children_blocking(full.clone(), Some(5), Some("v1".into()), 0, 100).unwrap();
+        assert_eq!(children.total, 3);
+        // is_directory is 0/1 INTEGER; directories come first.
+        assert_eq!(row_names(&children.rows), vec!["dir", "a.txt", "empty.txt"]);
+        assert!(children.rows.iter().all(|row| !row.contains_key("data")));
+        assert_eq!(
+            children.rows[0].get("is_directory").and_then(Value::as_i64),
+            Some(1)
+        );
+
+        // An unverified parent (NULL) is unreachable by equality: separate mode.
+        let orphans = mft_children_blocking(full.clone(), None, Some("v1".into()), 0, 100).unwrap();
+        assert_eq!(orphans.total, 2);
+        assert_eq!(row_names(&orphans.rows), vec![".", "orphan.bin"]);
+
+        // Files-only keeps is_directory = 0 (unknown is not treated as a file).
+        let files = mft_records_page_blocking(
+            full.clone(),
+            String::new(),
+            Some("v1".into()),
+            0,
+            100,
+            Some("modified".into()),
+            Some(false),
+            Some(true),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(files.total, 3);
+        // Records with a NULL time sort last even ascending.
+        assert_eq!(row_names(&files.rows), vec!["a.txt", "empty.txt", "orphan.bin"]);
+
+        let descending = mft_records_page_blocking(
+            full.clone(),
+            String::new(),
+            Some("v1".into()),
+            0,
+            100,
+            Some("modified".into()),
+            Some(true),
+            Some(true),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            row_names(&descending.rows),
+            vec!["empty.txt", "a.txt", "orphan.bin"],
+            "NULL 시각은 방향과 무관하게 뒤로 간다"
+        );
+
+        let searched = mft_search_blocking(full.clone(), "txt".into(), Some("v1".into()), 50).unwrap();
+        assert_eq!(row_names(&searched), vec!["a.txt", "empty.txt"]);
+        assert!(searched.iter().all(|row| !row.contains_key("data")));
+
+        let volumes = mft_volumes_blocking(full.clone()).unwrap();
+        assert_eq!(volumes.len(), 2);
+        assert_eq!(
+            volumes[0].get("volume_id").and_then(Value::as_str),
+            Some("v1")
+        );
+        assert_eq!(
+            volumes[0].get("record_count").and_then(Value::as_i64),
+            Some(5)
+        );
+        // Drive letter stays NULL without evidence; never an empty string.
+        assert_eq!(volumes[0].get("drive_letter"), Some(&Value::Null));
+
+        // A rowid from another volume context opens nothing.
+        let other_volume_rowid = mft_children_blocking(full.clone(), Some(5), Some("v2".into()), 0, 10)
+            .unwrap()
+            .rows[0]
+            .get("__rowid")
+            .and_then(Value::as_i64)
+            .unwrap();
+        assert!(mft_row(full.clone(), other_volume_rowid, Some("v1".into())).is_none());
+        assert!(mft_row(full, other_volume_rowid, Some("v2".into())).is_some());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resident_body_separates_absent_from_empty_and_is_detail_only() {
+        let root = temp_root("body");
+        let overview = root.join("_OVERVIEW");
+        std::fs::create_dir_all(&overview).unwrap();
+        let db = write_file_system_entries(&overview);
+        let full = db.to_string_lossy().to_string();
+        let rowid_of = |name: &str| {
+            mft_search_blocking(full.clone(), name.to_string(), None, 10)
+                .unwrap()
+                .into_iter()
+                .next()
+                .and_then(|row| row.get("__rowid").and_then(Value::as_i64))
+                .unwrap()
+        };
+
+        let resident = mft_record_body_blocking(full.clone(), rowid_of("a.txt"), None).unwrap();
+        assert_eq!(resident.data_present, Some(true));
+        assert_eq!(resident.data_len, Some(3));
+        assert!(!resident.truncated);
+
+        let empty = mft_record_body_blocking(full.clone(), rowid_of("empty.txt"), None).unwrap();
+        assert_eq!(empty.data_present, Some(true));
+        assert_eq!(empty.data_len, Some(0), "길이 0 상주 본문은 정상 값이다");
+
+        let absent = mft_record_body_blocking(full.clone(), rowid_of("orphan.bin"), None).unwrap();
+        assert_eq!(absent.data_present, None, "비상주·미확보는 NULL이다");
+        assert_eq!(absent.data_len, None);
+        assert!(absent.body_b64.is_none());
+
+        // All evidence links are returned in ordinal order, and a source_db
+        // outside the host root never resolves to an openable path.
+        let facts = overview.join("MFT_Records.sqlite");
+        Connection::open(&facts)
+            .unwrap()
+            .execute_batch("CREATE TABLE MFT_Records (volume_id TEXT NOT NULL, _source_file TEXT NOT NULL)")
+            .unwrap();
+        let sources = read_record_sources_blocking(
+            full.clone(),
+            "FileSystemEntries".to_string(),
+            rowid_of("a.txt"),
+        )
+        .unwrap();
+        assert_eq!(sources.len(), 2);
+        assert_eq!(
+            sources[0].get("source_full_path").and_then(Value::as_str),
+            Some(facts.to_string_lossy().to_string().as_str())
+        );
+        assert_eq!(
+            sources[1].get("source_full_path").and_then(Value::as_str),
+            Some("")
+        );
+        // A raw table has no source_records: no origin is invented.
+        assert!(read_record_sources_blocking(
+            facts.to_string_lossy().to_string(),
+            "MFT_Records".to_string(),
+            1,
+        )
+        .unwrap()
+        .is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn derived_rows_are_not_bookmark_targets_but_raw_rows_still_are() {
+        let root = temp_root("bookmark");
+        let overview = root.join("_OVERVIEW");
+        std::fs::create_dir_all(&overview).unwrap();
+        let db = write_file_system_entries(&overview);
+        let case_dir = root.to_string_lossy().to_string();
+        let entry = |full_path: &Path, table: &str| BookmarkInput {
+            full_path: full_path.to_string_lossy().to_string(),
+            table_name: table.to_string(),
+            rowid: 2,
+            field: None,
+            event_time: None,
+            host_id: Some("host-1".to_string()),
+            host_name: Some("HOST-1".to_string()),
+        };
+
+        // A derived row gets a new record_id per generation, so it is not a
+        // bookmark target; the analyst picks the raw evidence instead.
+        assert!(toggle_bookmark(case_dir.clone(), entry(&db, "FileSystemEntries")).is_err());
+
+        // Raw facts rows stay bookmarkable.
+        let facts = overview.join("MFT_Records.sqlite");
+        Connection::open(&facts)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE MFT_Records (volume_id TEXT NOT NULL, _source_file TEXT NOT NULL);
+                 INSERT INTO MFT_Records VALUES ('v1','C:\\$MFT');
+                 INSERT INTO MFT_Records VALUES ('v1','C:\\$MFT')",
+            )
+            .unwrap();
+        let saved = toggle_bookmark(case_dir.clone(), entry(&facts, "MFT_Records")).unwrap();
+        assert_eq!(saved.len(), 1);
+        // Stored bookmarks can still be removed.
+        let cleared = toggle_bookmark(case_dir, entry(&facts, "MFT_Records")).unwrap();
+        assert!(cleared.is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Regression for the shared bookmark key across raw, overview and search.
+    /// It checks identity sharing, not column wiring: duplicate evidence for the
+    /// same raw row collapses, distinct artifacts are all kept, and origins
+    /// outside the host root are dropped.
+    #[test]
+    fn page_rows_carry_deduped_raw_source_identities_shared_with_search() {
+        let root = temp_root("refs");
+        let overview = root.join("_OVERVIEW");
+        std::fs::create_dir_all(&overview).unwrap();
+        let db = write_file_system_entries(&overview);
+
+        // The two collection files the evidence links point at.
+        let facts = overview.join("MFT_Records.sqlite");
+        Connection::open(&facts)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE MFT_Records (volume_id TEXT NOT NULL, _source_file TEXT NOT NULL);
+                 INSERT INTO MFT_Records VALUES ('v1','C:\\$MFT');
+                 INSERT INTO MFT_Records VALUES ('v1','C:\\$MFT')",
+            )
+            .unwrap();
+        let eventlog = root.join("EVENTLOG");
+        std::fs::create_dir_all(&eventlog).unwrap();
+        let security = eventlog.join("Security.sqlite");
+        Connection::open(&security)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE Security (timestamp TEXT, detail TEXT);
+                 INSERT INTO Security VALUES ('2026-01-02 00:00:00.000','needle-a.txt')",
+            )
+            .unwrap();
+        {
+            let conn = Connection::open(&db).unwrap();
+            // ordinal 2: same raw row again, as field-level evidence.
+            conn.execute(
+                "INSERT INTO source_records VALUES ('r2', 2, 'd0', 'MFT', '_OVERVIEW/MFT_Records.sqlite', 'MFT_Records', 2, 'file_size', NULL, NULL, NULL)",
+                [],
+            )
+            .unwrap();
+            // ordinal 3: a different artifact — not reduced to one representative.
+            conn.execute(
+                "INSERT INTO source_records VALUES ('r2', 3, 'd0', 'EventLog', 'EVENTLOG/Security.sqlite', 'Security', 1, NULL, NULL, NULL, NULL)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let expected = vec![
+            SourcePointer {
+                full_path: facts.to_string_lossy().to_string(),
+                table_name: "MFT_Records".to_string(),
+                rowid: 2,
+            },
+            SourcePointer {
+                full_path: security.to_string_lossy().to_string(),
+                table_name: "Security".to_string(),
+                rowid: 1,
+            },
+        ];
+
+        let page =
+            read_result_file_page_blocking(db.to_string_lossy().to_string(), None, 0, 50).unwrap();
+        let find = |record_id: &str| {
+            page.rows
+                .iter()
+                .find(|row| row.get("record_id").and_then(Value::as_str) == Some(record_id))
+                .expect("row")
+        };
+        let decorated: Vec<SourcePointer> = serde_json::from_str(
+            find("r2")
+                .get(SOURCE_REFS_KEY)
+                .and_then(Value::as_str)
+                .expect("source refs"),
+        )
+        .unwrap();
+        assert_eq!(decorated, expected);
+        // A row without evidence has no key at all: an empty array would look
+        // like "evidence exists".
+        assert!(!find("r1").contains_key(SOURCE_REFS_KEY));
+        // Child and evidence tables are not decorated (no per-child fan-out).
+        let child = read_result_file_page_blocking(
+            db.to_string_lossy().to_string(),
+            Some("source_records".to_string()),
+            0,
+            50,
+        )
+        .unwrap();
+        assert!(child
+            .rows
+            .iter()
+            .all(|row| !row.contains_key(SOURCE_REFS_KEY)));
+
+        // Search carries the same identity: one evidence entry of the derived hit
+        // must equal the raw hit's (path, table, rowid) for bookmark state to match.
+        let hosts = vec![SearchHost {
+            id: "host-1".to_string(),
+            name: "HOST-1".to_string(),
+            dir: root.to_string_lossy().to_string(),
+        }];
+        let found = search_case_blocking("a.txt".to_string(), hosts, 0, 50, None, None, None);
+        let derived_hit = found
+            .hits
+            .iter()
+            .find(|hit| hit.table_name == "FileSystemEntries")
+            .expect("derived hit");
+        let raw_hit = found
+            .hits
+            .iter()
+            .find(|hit| hit.table_name == "Security")
+            .expect("raw hit");
+        assert_eq!(derived_hit.source_refs, expected);
+        assert!(
+            raw_hit.source_refs.is_empty(),
+            "원본 적중은 자기 자신이 북마크 키다"
+        );
+        assert!(
+            derived_hit.source_refs.iter().any(|pointer| {
+                pointer.full_path == raw_hit.full_path
+                    && pointer.table_name == raw_hit.table_name
+                    && pointer.rowid == raw_hit.rowid
+            }),
+            "파생 적중의 근거는 원본 적중과 같은 북마크 키여야 한다"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
 fn main() {
     if let Some(code) = run_as_parse_worker() {
         std::process::exit(code);
@@ -9397,13 +10937,15 @@ fn main() {
             master_timeline_facets,
             master_timeline_page,
             list_result_files,
-            refresh_execution_history_overview,
-            refresh_wer_reports_overview,
+            overview_contract_status,
             account_directory,
+            host_metadata,
             result_provenance,
             artifact_input_files,
             parse_report,
             parse_run_log,
+            open_parse_run_log,
+            host_parse_eligibility,
             read_result_file,
             read_result_file_page,
             linked_result_rows,
@@ -9414,6 +10956,10 @@ fn main() {
             usnjrnl_page,
             mft_records_page,
             mft_row,
+            mft_record_body,
+            mft_volumes,
+            read_record_sources,
+            read_record_children,
             search_case,
             list_bookmarks,
             toggle_bookmark,

@@ -55,7 +55,7 @@ interface Entry {
   runCount: string;
   timestamp: string;
   source: string;
-  user: string;
+  account: string;
   tags: Tag[];
   unsigned: boolean;
   risk: number;
@@ -73,19 +73,19 @@ function isWindowsSystemPath(path: string): boolean {
 }
 
 function accountDisplayLabel(row: Row, accountDirectory?: AccountDirectory): string {
-  const raw = (row.user || "").trim();
-  const mapped = [row.account_name, row.username, row.user_name, row.profile_name]
-    .map((value) => (value || "").trim())
-    .find((value) => value && !/^S-\d+(?:-\d+)+$/i.test(value));
-  if (mapped) return mapped;
-  if (!raw) return "계정 정보 없음";
-  return resolveAccountDisplay(raw, accountDirectory);
+  // 계정명은 metadata 조회값(account)이고, 확인되지 않았으면 SID를 그대로
+  // 보여 준다(docs-01). 다른 이름 컬럼을 추측해 채우지 않는다.
+  const name = (row.account || "").trim();
+  if (name) return name;
+  const sid = (row.account_sid || "").trim();
+  if (!sid) return "계정 정보 없음";
+  return resolveAccountDisplay(sid, accountDirectory);
 }
 function buildEntry(row: Row): Entry {
   const path = row.program_path || "";
   const name = row.program_name || basename(path) || "(이름 없음)";
   const publisher = (row.publisher || "").trim();
-  const source = /^Amcache/.test(row.source_artifact || "") ? "Amcache" : row.source_artifact || "";
+  const source = /^Amcache/.test(row.event_type || "") ? "Amcache" : row.event_type || "";
   const executable = EXECUTABLE_RE.test(name) || EXECUTABLE_RE.test(path);
   // Publisher metadata is an Amcache field. Other execution artifacts do not
   // collect it, so absence there is not a signature warning.
@@ -94,13 +94,13 @@ function buildEntry(row: Row): Entry {
   const risk = Math.max(unsigned ? 1 : 0, ...tags.map((tag) => tag.severity === "danger" ? 2 : 1));
   return {
     rowid: Number((row as Record<string, unknown>).__rowid), name, path, publisher, runCount: row.run_count || "", timestamp: row.timestamp || "",
-    source, user: row.user || "", tags, unsigned, risk,
+    source, account: (row.account || row.account_sid || ""), tags, unsigned, risk,
     winPath: isWindowsSystemPath(path), row,
   };
 }
 
 
-const artifactTagStyle: React.CSSProperties = { flexShrink: 0, padding: "1px 7px", borderRadius: "var(--radius-sm)", fontSize: 11, fontWeight: 700, lineHeight: 1.4, whiteSpace: "nowrap" };
+const artifactTagStyle: React.CSSProperties = { flexShrink: 0, padding: "1px 7px", borderRadius: "var(--radius)", fontSize: 11, fontWeight: 700, lineHeight: 1.4, whiteSpace: "nowrap" };
 export default function ExecutionHistoryView({ data, onNavigate, onFetchLinkedRows, bookmarkedRowids, onToggleBookmark, timeRange, accountDirectory }: ExecutionHistoryViewProps) {
   const [disabledSources, setDisabledSources] = useState<Set<string>>(new Set());
   // 계정별 체크 필터 — 기본은 전체 표시, 체크 해제한 계정만 숨긴다.
@@ -133,15 +133,15 @@ export default function ExecutionHistoryView({ data, onNavigate, onFetchLinkedRo
     [all, timeRange],
   );
   const allAccounts = useMemo(
-    () => [...new Set(inGlobalRange.map((entry) => (entry.user || "").trim()))].sort((a, b) => a.localeCompare(b)),
+    () => [...new Set(inGlobalRange.map((entry) => (entry.account || "").trim()))].sort((a, b) => a.localeCompare(b)),
     [inGlobalRange],
   );
   const { filtered, untimed } = useMemo(() => {
     const needle = search.trim().toLowerCase();
     const kept = inGlobalRange.filter((entry) => {
       if (disabledSources.has(entry.source) || (excludeWindows && entry.winPath) || (onlyRisk && entry.risk === 0) || (onlyUnsigned && !entry.unsigned)) return false;
-      if (hiddenAccounts.has((entry.user || "").trim())) return false;
-      return !needle || [entry.name, entry.path, entry.publisher, entry.user, entry.source].some((value) => value.toLowerCase().includes(needle));
+      if (hiddenAccounts.has((entry.account || "").trim())) return false;
+      return !needle || [entry.name, entry.path, entry.publisher, entry.account, entry.source].some((value) => value.toLowerCase().includes(needle));
     });
     const timed = kept.filter((entry) => entry.timestamp).sort((left, right) => {
       if (sort === "risk" && left.risk !== right.risk) return right.risk - left.risk;
@@ -185,7 +185,7 @@ export default function ExecutionHistoryView({ data, onNavigate, onFetchLinkedRo
           { label: "게시자 정보 없음만", checked: onlyUnsigned, toggle: () => setOnlyUnsigned((value) => !value) },
           { label: "Windows 경로 제외", checked: excludeWindows, toggle: () => setExcludeWindows((value) => !value) },
         ].map((condition) => (
-          <button key={condition.label} type="button" aria-pressed={condition.checked} onClick={condition.toggle} style={{ width: "100%", display: "flex", alignItems: "center", gap: 7, minHeight: 32, padding: "4px 9px", background: "transparent", border: "none", borderRadius: "var(--radius-sm)", color: condition.checked ? "var(--text)" : "var(--text-faint)", cursor: "pointer", fontSize: 12.5, fontWeight: condition.checked ? 650 : 500, textAlign: "left" }}
+          <button key={condition.label} type="button" aria-pressed={condition.checked} onClick={condition.toggle} style={{ width: "100%", display: "flex", alignItems: "center", gap: 7, minHeight: 32, padding: "4px 9px", background: "transparent", border: "none", borderRadius: "var(--radius)", color: condition.checked ? "var(--text)" : "var(--text-faint)", cursor: "pointer", fontSize: 12.5, fontWeight: condition.checked ? 650 : 500, textAlign: "left" }}
             onMouseEnter={(event) => { event.currentTarget.style.background = "var(--bg-hover)"; }}
             onMouseLeave={(event) => { event.currentTarget.style.background = "transparent"; }}>
             <span aria-hidden="true" style={{ color: condition.checked ? "var(--accent)" : "var(--text-faint)", fontSize: 13 }}>{condition.checked ? "☑" : "☐"}</span>
@@ -193,12 +193,12 @@ export default function ExecutionHistoryView({ data, onNavigate, onFetchLinkedRo
           </button>
         ))}
       </FilterDropdown>
-      <Tooltip title="출처 필터"><button type="button" className="nm-btn" onClick={(event) => setSourceAnchor(event.currentTarget)} aria-haspopup="dialog" aria-expanded={Boolean(sourceAnchor)} style={{ minHeight: 31, display: "inline-flex", alignItems: "center", gap: 5, padding: "4px 11px", border: `1px solid ${disabledSources.size > 0 ? "color-mix(in srgb, var(--accent) 58%, var(--border))" : "var(--border)"}`, borderRadius: "var(--radius-md)", color: disabledSources.size > 0 ? "var(--accent)" : "var(--text-dim)", background: disabledSources.size > 0 ? "var(--accent-subtle)" : "var(--bg-elevated)", cursor: "pointer", fontSize: 12, fontWeight: disabledSources.size > 0 ? 650 : 500 }}><FilterListOutlinedIcon sx={{ fontSize: 16 }} />출처</button></Tooltip>
-      {filtersActive && <Tooltip title="화면 내 필터 초기화"><IconButton aria-label="화면 내 필터 초기화" size="small" onClick={clearFilters} sx={{ color: "var(--text-dim)", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)" }}><ClearOutlinedIcon sx={{ fontSize: 17 }} /></IconButton></Tooltip>}
+      <Tooltip title="출처 필터"><button type="button" className="nm-btn" onClick={(event) => setSourceAnchor(event.currentTarget)} aria-haspopup="dialog" aria-expanded={Boolean(sourceAnchor)} style={{ minHeight: 31, display: "inline-flex", alignItems: "center", gap: 5, padding: "4px 11px", border: `1px solid ${disabledSources.size > 0 ? "color-mix(in srgb, var(--accent) 58%, var(--border))" : "var(--border)"}`, borderRadius: "var(--radius)", color: disabledSources.size > 0 ? "var(--accent)" : "var(--text-dim)", background: disabledSources.size > 0 ? "var(--accent-subtle)" : "var(--bg-elevated)", cursor: "pointer", fontSize: 12, fontWeight: disabledSources.size > 0 ? 650 : 500 }}><FilterListOutlinedIcon sx={{ fontSize: 16 }} />출처</button></Tooltip>
+      {filtersActive && <Tooltip title="화면 내 필터 초기화"><IconButton aria-label="화면 내 필터 초기화" size="small" onClick={clearFilters} sx={{ color: "var(--text-dim)", border: "1px solid var(--border)", borderRadius: "var(--radius)" }}><ClearOutlinedIcon sx={{ fontSize: 17 }} /></IconButton></Tooltip>}
     
       </ViewHeader>
 
-    <Popover open={Boolean(sourceAnchor)} anchorEl={sourceAnchor} onClose={() => setSourceAnchor(null)} anchorOrigin={{ vertical: "bottom", horizontal: "left" }} transformOrigin={{ vertical: "top", horizontal: "left" }} slotProps={{ paper: { sx: { mt: 0.75, width: 270, bgcolor: "var(--bg-panel)", color: "var(--text)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", boxShadow: "var(--shadow-panel)" } } }}>
+    <Popover open={Boolean(sourceAnchor)} anchorEl={sourceAnchor} onClose={() => setSourceAnchor(null)} anchorOrigin={{ vertical: "bottom", horizontal: "left" }} transformOrigin={{ vertical: "top", horizontal: "left" }} slotProps={{ paper: { sx: { mt: 0.75, width: 270, bgcolor: "var(--bg-panel)", color: "var(--text)", border: "1px solid var(--border)", borderRadius: "var(--radius)", boxShadow: "var(--shadow-panel)" } } }}>
       <div style={{ padding: "10px 10px 7px", display: "flex", alignItems: "center", borderBottom: "1px solid var(--border-subtle)" }}><span style={{ fontSize: 12.5, fontWeight: 700 }}>실행 이력 출처</span><span style={{ marginLeft: "auto", color: "var(--text-faint)", fontSize: 11.5 }}>{activeSourceCount}개 선택</span></div>
       <label style={{ minHeight: 36, padding: "0 8px", display: "flex", alignItems: "center", gap: 6, cursor: "pointer", borderBottom: "1px solid var(--border-subtle)" }}><Checkbox size="small" checked={allSourcesSelected} indeterminate={sourceSelectionPartial} onChange={() => setDisabledSources(allSourcesSelected ? new Set(sources.map(([source]) => source)) : new Set())} sx={{ p: "3px", color: "var(--text-faint)", "&.Mui-checked, &.MuiCheckbox-indeterminate": { color: "var(--accent)" } }} /><span style={{ fontSize: 12, fontWeight: 650 }}>전체 선택</span></label>
       <div style={{ padding: "4px 0 6px" }}>{sources.map(([source]) => {
@@ -208,7 +208,7 @@ export default function ExecutionHistoryView({ data, onNavigate, onFetchLinkedRo
     </Popover>
 
     {untimed.length > 0 && (
-      <section style={{ margin: "12px 14px 4px", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", background: "var(--bg-panel)", overflow: "hidden", flexShrink: 0 }}>
+      <section style={{ margin: "12px 14px 4px", border: "1px solid var(--border)", borderRadius: "var(--radius)", background: "var(--bg-panel)", overflow: "hidden", flexShrink: 0 }}>
         <button
           type="button"
           onClick={() => setUntimedOpen((open) => !open)}
@@ -225,7 +225,7 @@ export default function ExecutionHistoryView({ data, onNavigate, onFetchLinkedRo
               const bookmarked = bookmarkedRowids?.has(entry.rowid) ?? false;
               const selectedRow = selected?.rowid === entry.rowid && selected.source === entry.source;
               return (
-                <div key={`${entry.source}:${entry.rowid}`} role="button" tabIndex={0} aria-label={`${entry.name} 상세 보기`} className={bookmarked ? `dfir-bookmarked-row${selectedRow ? " dfir-bookmarked-row--selected" : ""}` : undefined} style={{ display: "grid", gridTemplateColumns: "minmax(205px, 1fr) minmax(330px, 1.7fr) 112px minmax(145px, .75fr) 34px", gap: 12, alignItems: "center", minHeight: 38, padding: "0 12px", borderBottom: "1px solid var(--border-subtle)", borderRadius: "var(--radius-sm)", cursor: "pointer" }}
+                <div key={`${entry.source}:${entry.rowid}`} role="button" tabIndex={0} aria-label={`${entry.name} 상세 보기`} className={bookmarked ? `dfir-bookmarked-row${selectedRow ? " dfir-bookmarked-row--selected" : ""}` : undefined} style={{ display: "grid", gridTemplateColumns: "minmax(205px, 1fr) minmax(330px, 1.7fr) 112px minmax(145px, .75fr) 34px", gap: 12, alignItems: "center", minHeight: 38, padding: "0 12px", borderBottom: "1px solid var(--border-subtle)", borderRadius: "var(--radius)", cursor: "pointer" }}
                   onClick={() => setSelected(entry)}
                   onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); setSelected(entry); } }}
                   onMouseEnter={(event) => { if (!bookmarked) event.currentTarget.style.background = "var(--bg-hover)"; }}
@@ -259,16 +259,16 @@ export default function ExecutionHistoryView({ data, onNavigate, onFetchLinkedRo
             const tileColor = entry.risk >= 2 ? "var(--danger)" : entry.risk === 1 ? "var(--warning)" : "var(--text-dim)";
             return (
               /* 행 전체가 상세 열기 클릭 대상 — 북마크는 전파 차단. */
-              <div key={`${entry.source}:${entry.rowid}`} className={bookmarked ? `dfir-bookmarked-row${selectedRow ? " dfir-bookmarked-row--selected" : ""}` : undefined} onClick={() => setSelected(entry)} style={{ borderRadius: "var(--radius-md)", minHeight: 62, marginBottom: 8, display: "flex", alignItems: "center", gap: 12, padding: "0 14px", border: `1px solid ${selectedRow ? "var(--accent)" : "var(--border)"}`, background: selectedRow ? "var(--bg-selected)" : "var(--bg-panel)", color: "var(--text)", cursor: "pointer", transition: "background .15s ease, border-color .15s ease" }} onMouseEnter={(event) => { if (!selectedRow && !bookmarked) event.currentTarget.style.background = "var(--bg-hover)"; }} onMouseLeave={(event) => { if (!selectedRow && !bookmarked) event.currentTarget.style.background = "var(--bg-panel)"; }}>
+              <div key={`${entry.source}:${entry.rowid}`} className={bookmarked ? `dfir-bookmarked-row${selectedRow ? " dfir-bookmarked-row--selected" : ""}` : undefined} onClick={() => setSelected(entry)} style={{ borderRadius: "var(--radius)", minHeight: 62, marginBottom: 8, display: "flex", alignItems: "center", gap: 12, padding: "0 14px", border: `1px solid ${selectedRow ? "var(--accent)" : "var(--border)"}`, background: selectedRow ? "var(--bg-selected)" : "var(--bg-panel)", color: "var(--text)", cursor: "pointer", transition: "background .15s ease, border-color .15s ease" }} onMouseEnter={(event) => { if (!selectedRow && !bookmarked) event.currentTarget.style.background = "var(--bg-hover)"; }} onMouseLeave={(event) => { if (!selectedRow && !bookmarked) event.currentTarget.style.background = "var(--bg-panel)"; }}>
                 <div role="button" tabIndex={0} aria-label={`${entry.name} 상세 보기`} onClick={() => setSelected(entry)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); setSelected(entry); } }} style={{ flex: 1, minWidth: 0, display: "flex", alignItems: "center", gap: 12, cursor: "pointer", outlineOffset: -3 }}>
-                  <span aria-hidden="true" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 34, height: 34, flexShrink: 0, borderRadius: "var(--radius-sm)", background: `color-mix(in srgb, ${tileColor} 14%, transparent)` }}>
+                  <span aria-hidden="true" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 34, height: 34, flexShrink: 0, borderRadius: "var(--radius)", background: `color-mix(in srgb, ${tileColor} 14%, transparent)` }}>
                     <BoltOutlinedIcon sx={{ fontSize: 17, color: tileColor }} />
                   </span>
                   <span style={{ flex: 1, minWidth: 0, display: "grid", gap: 3 }}>
                     <span style={{ minWidth: 0, display: "flex", alignItems: "center", gap: 6, overflow: "hidden" }}>
                       <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 13.5, fontWeight: 700 }}>{entry.name}</span>
                       {entry.tags.map((tag) => { const tagColor = tag.severity === "danger" ? "var(--danger)" : "var(--warning)"; return <span key={tag.label} title={tag.description} style={{ ...artifactTagStyle, color: tagColor, border: `1px solid ${tagColor}` }}>{tag.label}</span>; })}
-                      {executableNote(entry.name) && <span title={executableNote(entry.name)} style={{ flexShrink: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "#5bc8c0", border: "1px solid #5bc8c0", borderRadius: "var(--radius-sm)", padding: "1px 7px", fontSize: 11, fontWeight: 650 }}>{executableNote(entry.name)}</span>}
+                      {executableNote(entry.name) && <span title={executableNote(entry.name)} style={{ flexShrink: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "#5bc8c0", border: "1px solid #5bc8c0", borderRadius: "var(--radius)", padding: "1px 7px", fontSize: 11, fontWeight: 650 }}>{executableNote(entry.name)}</span>}
                     </span>
                     <span title={entry.path || undefined} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: entry.path ? "var(--text-dim)" : "var(--text-faint)", fontSize: 12, fontFamily: "var(--mono)" }}>{resolveKnownFolderPath(entry.path) ?? entry.path ?? "경로 정보 없음"}</span>
                   </span>
@@ -276,7 +276,7 @@ export default function ExecutionHistoryView({ data, onNavigate, onFetchLinkedRo
                   <span style={{ width: 148, flexShrink: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: accountLabel === "계정 정보 없음" ? "var(--text-faint)" : "var(--text-dim)", fontSize: 12 }}>{accountLabel}</span>
                   <span style={{ width: 172, flexShrink: 0, textAlign: "right", color: "var(--text-time)", fontSize: 12.5, fontFamily: "var(--mono)", fontVariantNumeric: "tabular-nums", whiteSpace: "nowrap" }}>{entry.timestamp}</span>
                 </div>
-                <Tooltip title={bookmarked ? "북마크 해제" : "북마크"}><span><IconButton className={bookmarked ? "dfir-bookmark-control" : undefined} aria-label={bookmarked ? "북마크 해제" : "북마크"} disabled={!onToggleBookmark} size="small" onClick={(clickEvent) => { clickEvent.stopPropagation(); onToggleBookmark?.(entry.rowid); }} sx={{ color: bookmarked ? "var(--bookmark-control)" : "var(--text-faint)", borderRadius: "var(--radius-sm)" }}>{bookmarked ? <BookmarkIcon sx={{ fontSize: 17 }} /> : <BookmarkBorderOutlinedIcon sx={{ fontSize: 17 }} />}</IconButton></span></Tooltip>
+                <Tooltip title={bookmarked ? "북마크 해제" : "북마크"}><span><IconButton className={bookmarked ? "dfir-bookmark-control" : undefined} aria-label={bookmarked ? "북마크 해제" : "북마크"} disabled={!onToggleBookmark} size="small" onClick={(clickEvent) => { clickEvent.stopPropagation(); onToggleBookmark?.(entry.rowid); }} sx={{ color: bookmarked ? "var(--bookmark-control)" : "var(--text-faint)", borderRadius: "var(--radius)" }}>{bookmarked ? <BookmarkIcon sx={{ fontSize: 17 }} /> : <BookmarkBorderOutlinedIcon sx={{ fontSize: 17 }} />}</IconButton></span></Tooltip>
               </div>
             );
           })}

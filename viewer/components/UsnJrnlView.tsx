@@ -1,7 +1,8 @@
 "use client";
-// USN 저널($UsnJrnl:$J) 뷰 — NTFS 변경 저널의 생성·삭제·이름 변경·데이터 변경
-// 이벤트를 원장 형태로 보여준다. 수십만 행 규모라 서버 페이지네이션
-// (usnjrnl_page)으로 필터·검색·기간을 SQLite 쪽에서 처리한다.
+// USN 저널 뷰 — NTFS 변경 저널($UsnJrnl:$J)의 생성·삭제·이름 변경·데이터 변경
+// 기록을 원장 형태로 보여준다. 화면용 파생 테이블(_OVERVIEW/UsnJournal)을
+// 읽으며, 수십만 행 규모라 서버 페이지네이션(usnjrnl_page)으로 필터·검색·
+// 기간을 SQLite 쪽에서 처리한다.
 import { useEffect, useMemo, useRef, useState } from "react";
 import AddCircleOutlineOutlinedIcon from "@mui/icons-material/AddCircleOutlineOutlined";
 import CircularProgress from "@mui/material/CircularProgress";
@@ -27,7 +28,8 @@ type ReasonMeta = { label: string; icon: typeof HistoryOutlinedIcon; tone: strin
 interface Props {
   dbPath: string;
   timeRange?: TimeRange;
-  bookmarkedRowids?: Set<number>;
+  /** Bookmark state of the source record a row points at (never the derived row). */
+  isRowBookmarked?: (row: Row) => boolean;
   onToggleBookmark?: (rowid: number) => void;
 }
 
@@ -64,7 +66,7 @@ function reasonMeta(reason: string): ReasonMeta {
   return { label: first, icon: HistoryOutlinedIcon, tone: "var(--text-dim)" };
 }
 
-export default function UsnJrnlView({ dbPath, timeRange, bookmarkedRowids, onToggleBookmark }: Props) {
+export default function UsnJrnlView({ dbPath, timeRange, isRowBookmarked, onToggleBookmark }: Props) {
   const [search, setSearch] = useState("");
   const [debouncedSearch, setDebouncedSearch] = useState("");
   const [reasonLabel, setReasonLabel] = useState(REASON_ALL);
@@ -148,12 +150,13 @@ export default function UsnJrnlView({ dbPath, timeRange, bookmarkedRowids, onTog
           <div ref={scrollRef} style={{ flex: 1, minHeight: 0, overflow: "auto", padding: "12px 12px 4px" }}>
             {rows.map((row, index) => {
               const stableKey = rowId(row);
-              const bookmarked = bookmarkedRowids?.has(stableKey) ?? false;
+              const bookmarked = isRowBookmarked?.(row) ?? false;
               const meta = reasonMeta(row.reason || "");
               const Icon = meta.icon;
+              // 파생 테이블의 파일명 컬럼은 file_name이다(전체 경로가 아니다).
               const displayName = row.renamed_from
-                ? `${row.renamed_from} → ${row.filename}`
-                : row.filename;
+                ? `${row.renamed_from} → ${row.file_name}`
+                : row.file_name;
               const memberCount = Number(row.group_count) || 0;
               return (
                 <div
@@ -161,35 +164,35 @@ export default function UsnJrnlView({ dbPath, timeRange, bookmarkedRowids, onTog
                   className={bookmarked ? "dfir-bookmarked-row" : undefined}
                   // 행 전체(여백 포함)가 상세 열기 클릭 대상 — 북마크는 전파 차단.
                   onClick={() => setDetail(row)}
-                  style={{ borderRadius: "var(--radius-md)", minHeight: 56, marginBottom: 8, display: "flex", alignItems: "center", gap: 12, padding: "0 14px", border: "1px solid var(--border)", background: "var(--bg-panel)", color: "var(--text)", cursor: "pointer", transition: "background .15s ease, border-color .15s ease" }}
+                  style={{ borderRadius: "var(--radius)", minHeight: 56, marginBottom: 8, display: "flex", alignItems: "center", gap: 12, padding: "0 14px", border: "1px solid var(--border)", background: "var(--bg-panel)", color: "var(--text)", cursor: "pointer", transition: "background .15s ease, border-color .15s ease" }}
                   onMouseEnter={(event) => { if (!bookmarked) event.currentTarget.style.background = "var(--bg-hover)"; }}
                   onMouseLeave={(event) => { if (!bookmarked) event.currentTarget.style.background = "var(--bg-panel)"; }}
                 >
                   <div
                     role="button"
                     tabIndex={0}
-                    aria-label={`${row.filename || "USN 기록"} 상세 보기`}
+                    aria-label={`${row.file_name || "USN 기록"} 상세 보기`}
                     onClick={() => setDetail(row)}
                     onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); setDetail(row); } }}
                     style={{ flex: 1, minWidth: 0, display: "flex", alignItems: "center", gap: 12, padding: "9px 0", cursor: "pointer", outlineOffset: -3 }}
                   >
-                    <span aria-hidden="true" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 32, height: 32, flexShrink: 0, borderRadius: "var(--radius-sm)", background: `color-mix(in srgb, ${meta.tone} 15%, transparent)` }}>
+                    <span aria-hidden="true" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 32, height: 32, flexShrink: 0, borderRadius: "var(--radius)", background: `color-mix(in srgb, ${meta.tone} 15%, transparent)` }}>
                       <Icon sx={{ fontSize: 17, color: meta.tone }} />
                     </span>
                     <span style={{ flex: 1, minWidth: 0, display: "grid", gap: 3 }}>
                       <span style={{ minWidth: 0, display: "flex", alignItems: "center", gap: 7, overflow: "hidden" }}>
                         <span title={displayName || undefined} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text)", fontSize: 13, fontWeight: 700, fontFamily: "var(--mono)" }}>{displayName || "파일명 없음"}</span>
-                        <span style={{ flexShrink: 0, fontSize: 11.5, fontWeight: 700, color: meta.tone, border: `1px solid ${meta.tone}`, borderRadius: "var(--radius-sm)", padding: "1px 8px", whiteSpace: "nowrap" }}>{meta.label}</span>
+                        <span style={{ flexShrink: 0, fontSize: 11.5, fontWeight: 700, color: meta.tone, border: `1px solid ${meta.tone}`, borderRadius: "var(--radius)", padding: "1px 8px", whiteSpace: "nowrap" }}>{meta.label}</span>
                         {memberCount > 1 && <span style={{ flexShrink: 0, color: "var(--text-faint)", fontSize: 11 }}>기록 {memberCount}건</span>}
                       </span>
                       <span title={row.reason || undefined} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text-faint)", fontFamily: "var(--mono)", fontSize: 11.5 }}>{row.reason || "-"}</span>
                     </span>
-                    <span title={`MFT 엔트리 ${row.mft_entry || "-"}`} style={{ width: 96, flexShrink: 0, textAlign: "right", color: "var(--text-faint)", fontFamily: "var(--mono)", fontSize: 11.5 }}>#{row.mft_entry || "-"}</span>
+                    <span title={`파일 참조 ${row.file_reference || "-"}`} style={{ width: 128, flexShrink: 0, textAlign: "right", color: "var(--text-faint)", fontFamily: "var(--mono)", fontSize: 11.5 }}>{row.file_reference || "-"}</span>
                     <span style={{ width: 172, flexShrink: 0, textAlign: "right", color: row.timestamp ? "var(--text-time)" : "var(--text-faint)", fontSize: 12, fontFamily: "var(--mono)", fontVariantNumeric: "tabular-nums", whiteSpace: "nowrap" }}>{row.timestamp || "시간 정보 없음"}</span>
                   </div>
                   <Tooltip title={bookmarked ? "북마크 해제" : "북마크"}>
                     <span>
-                      <IconButton className={bookmarked ? "dfir-bookmark-control" : undefined} aria-label={bookmarked ? "북마크 해제" : "북마크"} disabled={!onToggleBookmark} size="small" onClick={(clickEvent) => { clickEvent.stopPropagation(); onToggleBookmark?.(rowId(row)); }} sx={{ color: bookmarked ? "var(--bookmark-control)" : "var(--text-faint)", borderRadius: "var(--radius-sm)" }}>
+                      <IconButton className={bookmarked ? "dfir-bookmark-control" : undefined} aria-label={bookmarked ? "북마크 해제" : "북마크"} disabled={!onToggleBookmark} size="small" onClick={(clickEvent) => { clickEvent.stopPropagation(); onToggleBookmark?.(rowId(row)); }} sx={{ color: bookmarked ? "var(--bookmark-control)" : "var(--text-faint)", borderRadius: "var(--radius)" }}>
                         {bookmarked ? <BookmarkIcon sx={{ fontSize: 17 }} /> : <BookmarkBorderOutlinedIcon sx={{ fontSize: 17 }} />}
                       </IconButton>
                     </span>
@@ -214,10 +217,10 @@ export default function UsnJrnlView({ dbPath, timeRange, bookmarkedRowids, onTog
           row={detail}
           columns={data?.columns ?? []}
           focusedColumn={null}
-          fileBaseName="UsnJrnl_Records"
+          fileBaseName="UsnJournal"
           onClose={() => setDetail(null)}
           onNavigate={() => {}}
-          isBookmarked={onToggleBookmark ? bookmarkedRowids?.has(rowId(detail)) ?? false : undefined}
+          isBookmarked={onToggleBookmark ? isRowBookmarked?.(detail) ?? false : undefined}
           onToggleBookmark={onToggleBookmark ? () => onToggleBookmark(rowId(detail)) : undefined}
         />
       )}

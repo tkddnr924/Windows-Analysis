@@ -45,7 +45,7 @@ export default function GlobalProgress({ hostName, stepLabel, percent, complete,
         maxWidth: "90vw",
         background: "var(--bg-elevated)",
         border: "1px solid var(--border)",
-        borderRadius: "var(--radius-lg)",
+        borderRadius: "var(--radius)",
         boxShadow: "var(--shadow-panel)",
         padding: "10px 14px",
         display: "flex",
@@ -64,7 +64,7 @@ export default function GlobalProgress({ hostName, stepLabel, percent, complete,
         </div>
         {!hasLiveRuns || liveCount === 1 ? <span style={{ fontSize: 15, fontWeight: 700, fontVariantNumeric: "tabular-nums", color }}>{percent}%</span> : null}
         {onOpen && (
-          <button type="button" onClick={onOpen} style={{ display: "inline-flex", alignItems: "center", gap: 4, fontSize: 11, fontWeight: 600, padding: "3px 9px", background: "var(--accent-subtle)", color: "var(--accent)", border: "1px solid var(--accent)", borderRadius: "var(--radius-md)", cursor: "pointer", whiteSpace: "nowrap" }}>
+          <button type="button" onClick={onOpen} style={{ display: "inline-flex", alignItems: "center", gap: 4, fontSize: 11, fontWeight: 600, padding: "3px 9px", background: "var(--accent-subtle)", color: "var(--accent)", border: "1px solid var(--accent)", borderRadius: "var(--radius)", cursor: "pointer", whiteSpace: "nowrap" }}>
             <OpenInNewIcon sx={{ fontSize: 14 }} />진행 화면으로
           </button>
         )}
@@ -72,8 +72,8 @@ export default function GlobalProgress({ hostName, stepLabel, percent, complete,
             <CloseIcon sx={{ fontSize: 16 }} />
         </button>
       </div>
-      {(!hasLiveRuns || liveCount === 1) && <div style={{ height: 5, background: "var(--bg)", borderRadius: 999, overflow: "hidden" }}>
-        <div style={{ height: "100%", width: `${percent}%`, background: color, borderRadius: 999, transition: "width 0.3s ease" }} />
+      {(!hasLiveRuns || liveCount === 1) && <div style={{ height: 5, background: "var(--bg)", borderRadius: "var(--radius)", overflow: "hidden" }}>
+        <div style={{ height: "100%", width: `${percent}%`, background: color, borderRadius: "var(--radius)", transition: "width 0.3s ease" }} />
       </div>}
     </div>
   );
