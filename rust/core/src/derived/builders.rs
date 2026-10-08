@@ -115,7 +115,7 @@ pub(super) fn build_event_backed(
         ("SmbHistory".into(), smb_history(ctx, events)?),
         (
             "RemoteDesktopHistory".into(),
-            remote_desktop_history(ctx, events)?,
+            super::remote_access::build(ctx, events)?,
         ),
         ("BitsHistory".into(), bits_history(ctx, events)?),
         ("FirewallHistory".into(), firewall_history(ctx, events)?),
@@ -331,28 +331,6 @@ fn smb_history(ctx: &Ctx, events: &EventLogOverviewCache) -> Result<usize> {
     db.finish()
 }
 
-// --- RemoteDesktopHistory ---------------------------------------------------
-
-fn remote_desktop_history(ctx: &Ctx, events: &EventLogOverviewCache) -> Result<usize> {
-    let spec = spec_of("RemoteDesktopHistory");
-    let mut db = DerivedDb::create(&ctx.overview_dir(), "RemoteDesktopHistory")?;
-    for row in overview::build_remote_desktop_history_with_events(events) {
-        let description = g(&row, "description");
-        let mut rec = ctx.record(spec);
-        rec.timestamp(g(&row, "timestamp"), "이벤트 기록 시각");
-        rec.set("event_type", text(description));
-        rec.set("description", text(description));
-        rec.account(g(&row, "account"), &ctx.meta);
-        rec.set("direction", text(g(&row, "direction")));
-        rec.set("remote_address", text(g(&row, "remote_address")));
-        rec.set("result", text(g(&row, "result")));
-        rec.set("event_id", int(g(&row, "event_id")));
-        rec.set("provider", text(g(&row, "provider")));
-        rec.source(source_of(ctx, &row, "record_key", "_source_file", description)?);
-        db.write(rec)?;
-    }
-    db.finish()
-}
 
 // --- BitsHistory ------------------------------------------------------------
 

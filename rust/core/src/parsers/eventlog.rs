@@ -61,6 +61,8 @@ pub const EVENT_COLUMNS: &[&str] = &[
     "ProcessID",
     "ThreadID",
     "UserID",
+    "ActivityID",
+    "RelatedActivityID",
     "EventData",
     "_record_key",
     "_status",
@@ -227,6 +229,16 @@ pub fn parse_evtx_stream(path: &Path, out: &Path, table: &str) -> Result<usize> 
                 }
                 if let Some(v) = cell(get(sys, &["Execution", "#attributes", "ThreadID"])) {
                     row.insert("ThreadID".into(), v);
+                }
+                // System/Correlation — the provider's own activity id. RDP and
+                // Security records use it to tie one connection's events
+                // together, so it must survive into facts.
+                if let Some(v) = cell(get(sys, &["Correlation", "#attributes", "ActivityID"])) {
+                    row.insert("ActivityID".into(), v);
+                }
+                if let Some(v) = cell(get(sys, &["Correlation", "#attributes", "RelatedActivityID"]))
+                {
+                    row.insert("RelatedActivityID".into(), v);
                 }
                 if let Some(v) = cell(get(sys, &["Security", "#attributes", "UserID"])) {
                     row.insert("UserID".into(), v);

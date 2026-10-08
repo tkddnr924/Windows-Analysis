@@ -12,6 +12,7 @@ pub mod parse_eligibility;
 pub mod shellbag;
 pub mod parsers;
 mod powershell_decode;
+mod remote_access;
 pub mod pipeline;
 pub mod sqlite;
 pub mod time;

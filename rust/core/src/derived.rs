@@ -14,6 +14,7 @@ mod builders;
 mod browser_activity;
 mod ai_conversations;
 mod registry_explorer;
+mod remote_access;
 mod stream;
 mod usn;
 mod path_candidates;
@@ -2318,5 +2319,36 @@ mod tests {
         assert_eq!(artifact, ancillary::DEFENDER_ARTIFACT);
         assert_eq!(rowid, 1);
         let _ = std::fs::remove_dir_all(out_dir.parent().unwrap());
+    }
+
+    #[test]
+    fn remote_access_retains_unknown_time_zero_port_and_target_identity() {
+        let (out_dir, target) = fixture("remote-access-identity");
+        let path = facts_db(&out_dir, "EVENTLOG/Security.sqlite",
+            "CREATE TABLE Security(timestamp TEXT, Channel TEXT, Provider TEXT, EventID TEXT,
+             Computer TEXT, EventRecordID TEXT, ProcessID TEXT, ThreadID TEXT, UserID TEXT,
+             EventData TEXT, _record_key TEXT, _source_file TEXT);");
+        let facts = Connection::open(path).unwrap();
+        let payload = r#"{"TargetUserName":"alice","TargetDomainName":"DOMAIN","TargetUserSid":"S-1-5-21-1-2-3-1001","TargetLogonId":"0x123","LogonType":10,"IpAddress":"10.0.0.8","IpPort":0}"#;
+        facts.execute("INSERT INTO Security VALUES(NULL,'Security',
+            'Microsoft-Windows-Security-Auditing','4624','host','12','800','801',
+            'S-1-5-18',?1,'Security::1','C:\\Evidence\\Security.evtx')", [payload]).unwrap();
+        drop(facts);
+        build_all(&out_dir, &target, "host", "derived-generation").unwrap();
+        let db = open(&out_dir, "RemoteDesktopHistory");
+        let observed: (Option<String>, i64, String, String, String, String) = db.query_row(
+            "SELECT timestamp,remote_port,account_sid,system_user_sid,account_domain,logon_id
+             FROM RemoteDesktopHistory", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,
+             r.get(3)?,r.get(4)?,r.get(5)?))).unwrap();
+        assert_eq!(observed, (None, 0, "S-1-5-21-1-2-3-1001".into(),
+            "S-1-5-18".into(), "DOMAIN".into(), "0x123".into()));
+        let evidence: (String, String, String) = db.query_row(
+            "SELECT d.event_data,s.source_file,s.source_dataset_id
+             FROM RemoteAccessDetails d JOIN source_records s ON s.record_id=d.record_id",
+            [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+        assert_eq!(evidence, (payload.into(), r"C:\Evidence\Security.evtx".into(), "facts-gen-1".into()));
+        assert_eq!(db.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| r.get::<_,i64>(0)).unwrap(), 0);
+        drop(db);
+        std::fs::remove_dir_all(out_dir.parent().unwrap()).unwrap();
     }
 }
