@@ -368,6 +368,69 @@ fn observations(ctx: &Ctx, db: &mut DerivedDb, items: &[WerRecord]) -> Result<()
     Ok(())
 }
 
+/// A collected dump relates to the report stored in the same collected
+/// directory. The match is that report file's own path — never a file name,
+/// a process name, a bucket or a nearby timestamp.
+const DUMP_RELATION: &str = "collected_dump_in_report_directory";
+
+fn dump_relations(
+    items: &[WerRecord],
+    records: &[Record],
+    dumps: &[super::wer_dumps::DumpRecord],
+    rows: &mut Vec<Vec<Cell>>,
+    counts: &mut [i64],
+) {
+    let base = records.len();
+    for link in super::wer_dumps::links(dumps) {
+        let Some(report) = items.iter().position(|item| {
+            item.origin == Origin::ReportFile && item.source_file == link.report_source_file
+        }) else {
+            continue;
+        };
+        let dump = &dumps[link.dump_index];
+        let dump_index = base + link.dump_index;
+        let dump_time = match dump.record.get("timestamp") {
+            Some(Cell::Text(value)) => Cell::Text(value.clone()),
+            _ => Cell::Null,
+        };
+        rows.push(vec![
+            Cell::Text(dump.record.record_id.clone()),
+            Cell::Int(counts[dump_index]),
+            Cell::Text(records[report].record_id.clone()),
+            Cell::Text(DUMP_RELATION.to_string()),
+            Cell::Text("collected_directory".to_string()),
+            Cell::Text("source_file".to_string()),
+            Cell::Text(link.directory.clone()),
+            Cell::Text(items[report].origin.key().to_string()),
+            Cell::Text(items[report].origin.stage().to_string()),
+            text(&items[report].timestamp),
+        ]);
+        counts[dump_index] += 1;
+        rows.push(vec![
+            Cell::Text(records[report].record_id.clone()),
+            Cell::Int(counts[report]),
+            Cell::Text(dump.record.record_id.clone()),
+            Cell::Text(DUMP_RELATION.to_string()),
+            Cell::Text("source_file".to_string()),
+            Cell::Text("collected_directory".to_string()),
+            Cell::Text(link.directory.clone()),
+            Cell::Text(super::wer_dumps::ORIGIN.to_string()),
+            Cell::Text(super::wer_dumps::STAGE.to_string()),
+            dump_time,
+        ]);
+        counts[report] += 1;
+    }
+}
+
+/// Collected dump evidence is stored as facts before the overview reads it.
+pub(super) fn prepare_inputs(
+    out_dir: &std::path::Path,
+    target: &std::path::Path,
+    dataset_id: &str,
+) -> Result<Vec<String>> {
+    super::wer_dumps::prepare_inputs(out_dir, target, dataset_id)
+}
+
 pub(super) fn build(ctx: &Ctx, events: &EventLogOverviewCache) -> Result<usize> {
     let mut items = wer_evidence::collect(ctx.out_dir, events)?;
     for item in items.iter_mut() {
@@ -380,16 +443,75 @@ pub(super) fn build(ctx: &Ctx, events: &EventLogOverviewCache) -> Result<usize> 
     for item in &items {
         records.push(record(ctx, item)?);
     }
-    let (relation_rows, counts) = relations(&items, &records);
+    let dumps = super::wer_dumps::build(ctx)?;
+    let dump_observation = super::wer_dumps::observation(ctx, &dumps)?;
+    let (mut relation_rows, mut counts) = relations(&items, &records);
+    counts.resize(records.len() + dumps.len(), 0);
+    dump_relations(&items, &records, &dumps, &mut relation_rows, &mut counts);
+    let base = records.len();
     for (index, mut record) in records.into_iter().enumerate() {
         record.set("relation_count", Cell::Int(counts[index]));
+        db.write(record)?;
+    }
+    for (index, dump) in dumps.into_iter().enumerate() {
+        let mut record = dump.record;
+        record.set("relation_count", Cell::Int(counts[base + index]));
         db.write(record)?;
     }
     for row in relation_rows {
         db.insert_child("WerRelations", &row)?;
     }
     observations(ctx, &mut db, &items)?;
+    dump_observation_row(ctx, &mut db, dump_observation)?;
     db.finish()
+}
+
+/// The dump scope keeps its own collection evidence row.
+fn dump_observation_row(
+    ctx: &Ctx,
+    db: &mut DerivedDb,
+    observation: super::wer_dumps::Observation,
+) -> Result<()> {
+    let source = observation.source;
+    db.insert_child(
+        "WerObservations",
+        &[
+            Cell::Text(uuid::Uuid::new_v4().to_string()),
+            Cell::Text(ctx.host_id.to_string()),
+            Cell::Text(ctx.dataset_id.to_string()),
+            Cell::Text("crash_dump".to_string()),
+            Cell::Text(observation.source_name.to_string()),
+            observation.facts_db.map(Cell::Text).unwrap_or(Cell::Null),
+            observation.facts_table.map(Cell::Text).unwrap_or(Cell::Null),
+            observation
+                .facts_generation
+                .map(Cell::Text)
+                .unwrap_or(Cell::Null),
+            Cell::Text(observation.collection_state.to_string()),
+            Cell::Int(observation.record_count),
+            Cell::Null,
+            Cell::Null,
+            Cell::Null,
+            Cell::Null,
+            Cell::Int(observation.failed_count),
+            Cell::Null,
+            Cell::Null,
+            Cell::Text(observation.note),
+            source
+                .as_ref()
+                .map(|source| Cell::Text(source.dataset.clone()))
+                .unwrap_or(Cell::Null),
+            source
+                .as_ref()
+                .map(|source| Cell::Text(source.db.clone()))
+                .unwrap_or(Cell::Null),
+            source
+                .as_ref()
+                .map(|source| Cell::Text(source.table.clone()))
+                .unwrap_or(Cell::Null),
+            source.as_ref().map(|source| Cell::Int(source.rowid)).unwrap_or(Cell::Null),
+        ],
+    )
 }
 
 const DDL: &str = r#"PRAGMA foreign_keys=ON;
@@ -537,13 +659,57 @@ CREATE TABLE "WerReports" (
   "signature_count" INTEGER NOT NULL,
   "path_count" INTEGER NOT NULL,
   "relation_count" INTEGER NOT NULL,
+  "dump_format" TEXT,
+  "dump_parse_status" TEXT,
+  "dump_parse_error" TEXT,
+  "dump_signature_hex" TEXT,
+  "dump_version_raw" INTEGER,
+  "dump_flags_hex" TEXT,
+  "dump_byte_count" INTEGER,
+  "dump_sha256" TEXT,
+  "dump_hash_state" TEXT,
+  "dump_stream_count" INTEGER,
+  "dump_stream_unknown_count" INTEGER,
+  "dump_thread_count" INTEGER,
+  "dump_module_count" INTEGER,
+  "dump_unloaded_module_count" INTEGER,
+  "dump_memory_region_count" INTEGER,
+  "dump_counter_count" INTEGER,
+  "dump_issue_count" INTEGER,
+  "dump_issues" TEXT,
+  "dump_directory_state" TEXT,
+  "dump_time_date_stamp_raw" INTEGER,
+  "dump_os_version" TEXT,
+  "dump_os_build" INTEGER,
+  "dump_platform" TEXT,
+  "dump_architecture" TEXT,
+  "dump_processor_count" INTEGER,
+  "dump_product_type" TEXT,
+  "dump_build_string" TEXT,
+  "dump_misc_revision" INTEGER,
+  "dump_process_id" INTEGER,
+  "dump_process_create_time" TEXT,
+  "dump_first_module_path" TEXT,
+  "dump_first_module_name" TEXT,
+  "dump_process_integrity_level" INTEGER,
+  "dump_protected_process" INTEGER,
+  "dump_exception_thread_id" INTEGER,
+  "dump_exception_code_hex" TEXT,
+  "dump_exception_code_name" TEXT,
+  "dump_exception_address_hex" TEXT,
+  "dump_exception_parameters" TEXT,
+  "dump_exception_thread_in_list" INTEGER,
+  "dump_file_name" TEXT,
+  "dump_location_role" TEXT,
+  "dump_collected_directory" TEXT,
+  "dump_report_file" TEXT,
   "record_key" TEXT,
   "source_file" TEXT,
   "search_text" TEXT,
   PRIMARY KEY(record_id),
   CHECK(overview_name = 'WerReports'),
   CHECK(timestamp IS NULL OR timestamp_kind IS NOT NULL),
-  CHECK(origin IN ('report_file','eventlog_1001','eventlog_1000','eventlog_1002')),
+  CHECK(origin IN ('report_file','eventlog_1001','eventlog_1000','eventlog_1002','crash_dump')),
   CHECK(app_path_status IS NULL OR app_path_status IN ('recorded','not_recorded')),
   CHECK(signature_schema IS NULL OR signature_schema_status = 'mapped')
 );
@@ -601,9 +767,9 @@ CREATE TABLE "WerPaths" (
   "path_basis" TEXT NOT NULL,
   PRIMARY KEY(record_id, ordinal),
   CHECK(ordinal >= 0),
-  CHECK(path_role IN ('app_path','module_path','loaded_module','store_path','attached_file','report_file')),
+  CHECK(path_role IN ('app_path','module_path','loaded_module','store_path','attached_file','report_file','dump_file','dump_first_module_path')),
   CHECK(resolution_status IN ('resolved','literal','unresolved')),
-  CHECK(path_basis IN ('report_scalar','report_entry','event_payload','collected_file_location')),
+  CHECK(path_basis IN ('report_scalar','report_entry','event_payload','collected_file_location','module_list_index_0')),
   FOREIGN KEY(record_id) REFERENCES "WerReports"("record_id") ON DELETE CASCADE
 );
 CREATE INDEX "idx_WerPaths_name" ON "WerPaths"(file_name_lower, path_role);
@@ -620,7 +786,7 @@ CREATE TABLE "WerRelations" (
   "related_timestamp" TEXT,
   PRIMARY KEY(record_id, ordinal),
   CHECK(ordinal >= 0),
-  CHECK(relation_kind = 'identifier_match'),
+  CHECK(relation_kind IN ('identifier_match','collected_dump_in_report_directory')),
   CHECK(record_id <> related_record_id),
   FOREIGN KEY(record_id) REFERENCES "WerReports"("record_id") ON DELETE CASCADE,
   FOREIGN KEY(related_record_id) REFERENCES "WerReports"("record_id") ON DELETE CASCADE
@@ -650,15 +816,140 @@ CREATE TABLE "WerObservations" (
   "source_table" TEXT,
   "source_rowid" INTEGER,
   PRIMARY KEY(observation_id),
-  CHECK(scope IN ('report_file','eventlog')),
+  CHECK(scope IN ('report_file','eventlog','crash_dump')),
   CHECK(collection_state IN ('collected','collected_empty','not_collected')),
   CHECK((source_dataset_id IS NULL AND source_db IS NULL AND source_table IS NULL AND source_rowid IS NULL)
      OR (source_dataset_id IS NOT NULL AND source_db IS NOT NULL AND source_table IS NOT NULL AND source_rowid IS NOT NULL))
 );
+CREATE TABLE "WerDumpStreams" (
+  "record_id" TEXT NOT NULL,
+  "ordinal" INTEGER NOT NULL,
+  "stream_index" INTEGER NOT NULL,
+  "stream_type" INTEGER NOT NULL,
+  "stream_type_name" TEXT,
+  "data_size" INTEGER NOT NULL,
+  "stream_rva" INTEGER NOT NULL,
+  "range_state" TEXT NOT NULL,
+  "parse_state" TEXT NOT NULL,
+  "overlaps" INTEGER NOT NULL CHECK(overlaps IN (0,1)),
+  "header_size" INTEGER,
+  "entry_size" INTEGER,
+  "declared_entries" INTEGER,
+  "stored_entries" INTEGER,
+  "sha256" TEXT,
+  "prefix_hex" TEXT,
+  "text_value" TEXT,
+  "note" TEXT,
+  PRIMARY KEY(record_id, ordinal),
+  CHECK(ordinal >= 0),
+  FOREIGN KEY(record_id) REFERENCES "WerReports"("record_id") ON DELETE CASCADE
+);
+CREATE INDEX "idx_WerDumpStreams_type" ON "WerDumpStreams"(stream_type, parse_state);
+CREATE TABLE "WerDumpThreads" (
+  "record_id" TEXT NOT NULL,
+  "ordinal" INTEGER NOT NULL,
+  "thread_index" INTEGER NOT NULL,
+  "source_stream" TEXT NOT NULL,
+  "thread_id" INTEGER NOT NULL,
+  "suspend_count" INTEGER,
+  "priority_class" INTEGER,
+  "priority" INTEGER,
+  "teb" INTEGER,
+  "teb_hex" TEXT,
+  "stack_start" INTEGER,
+  "stack_start_hex" TEXT,
+  "stack_size" INTEGER,
+  "stack_rva" INTEGER,
+  "context_rva" INTEGER,
+  "context_size" INTEGER,
+  "thread_name" TEXT,
+  "is_exception_thread" INTEGER NOT NULL CHECK(is_exception_thread IN (0,1)),
+  "dump_flags" INTEGER,
+  "dump_error" INTEGER,
+  "exit_status" INTEGER,
+  "create_time_raw" INTEGER,
+  "create_time" TEXT,
+  "exit_time_raw" INTEGER,
+  "exit_time" TEXT,
+  "kernel_time_100ns" INTEGER,
+  "user_time_100ns" INTEGER,
+  "start_address_hex" TEXT,
+  "affinity_hex" TEXT,
+  PRIMARY KEY(record_id, ordinal),
+  CHECK(ordinal >= 0),
+  FOREIGN KEY(record_id) REFERENCES "WerReports"("record_id") ON DELETE CASCADE
+);
+CREATE INDEX "idx_WerDumpThreads_id" ON "WerDumpThreads"(thread_id);
+CREATE TABLE "WerDumpModules" (
+  "record_id" TEXT NOT NULL,
+  "ordinal" INTEGER NOT NULL,
+  "module_index" INTEGER NOT NULL,
+  "module_kind" TEXT NOT NULL CHECK(module_kind IN ('loaded','unloaded')),
+  "base_of_image" INTEGER,
+  "base_of_image_hex" TEXT,
+  "size_of_image" INTEGER,
+  "checksum" INTEGER,
+  "time_date_stamp" INTEGER,
+  "time_date_stamp_kst" TEXT,
+  "module_path" TEXT,
+  "module_path_state" TEXT NOT NULL,
+  "file_name" TEXT,
+  "file_name_lower" TEXT,
+  "file_version" TEXT,
+  "product_version" TEXT,
+  "file_flags" INTEGER,
+  "file_os" INTEGER,
+  "file_type" INTEGER,
+  "file_subtype" INTEGER,
+  "cv_signature" TEXT,
+  "cv_guid" TEXT,
+  "cv_age" INTEGER,
+  "pdb_file_name" TEXT,
+  "cv_state" TEXT,
+  PRIMARY KEY(record_id, ordinal),
+  CHECK(ordinal >= 0),
+  FOREIGN KEY(record_id) REFERENCES "WerReports"("record_id") ON DELETE CASCADE
+);
+CREATE INDEX "idx_WerDumpModules_name" ON "WerDumpModules"(file_name_lower, module_kind);
+CREATE TABLE "WerDumpMemoryRegions" (
+  "record_id" TEXT NOT NULL,
+  "ordinal" INTEGER NOT NULL,
+  "region_index" INTEGER NOT NULL,
+  "source_stream" TEXT NOT NULL,
+  "base_address" INTEGER,
+  "base_address_hex" TEXT NOT NULL,
+  "allocation_base" INTEGER,
+  "allocation_base_hex" TEXT,
+  "allocation_protect" INTEGER,
+  "region_size" INTEGER,
+  "state" INTEGER,
+  "state_name" TEXT,
+  "protect" INTEGER,
+  "protect_name" TEXT,
+  "region_type" INTEGER,
+  "region_type_name" TEXT,
+  "stored_data_size" INTEGER,
+  PRIMARY KEY(record_id, ordinal),
+  CHECK(ordinal >= 0),
+  FOREIGN KEY(record_id) REFERENCES "WerReports"("record_id") ON DELETE CASCADE
+);
+CREATE TABLE "WerDumpCounters" (
+  "record_id" TEXT NOT NULL,
+  "ordinal" INTEGER NOT NULL,
+  "stream_type" INTEGER NOT NULL,
+  "struct_name" TEXT NOT NULL,
+  "field_name" TEXT NOT NULL,
+  "value" INTEGER,
+  "value_hex" TEXT NOT NULL,
+  PRIMARY KEY(record_id, ordinal),
+  CHECK(ordinal >= 0),
+  FOREIGN KEY(record_id) REFERENCES "WerReports"("record_id") ON DELETE CASCADE
+);
+
 
 CREATE TABLE _wina_derived_version (name TEXT NOT NULL PRIMARY KEY, version INTEGER NOT NULL);
 INSERT INTO _wina_derived_version(name,version) VALUES ('overview_contract',1);
-INSERT INTO _wina_derived_version(name,version) VALUES ('wer_reports',3);
+INSERT INTO _wina_derived_version(name,version) VALUES ('wer_reports',4);
 "#;
 
 const MAIN: &[&str] = &[
@@ -700,6 +991,19 @@ const MAIN: &[&str] = &[
     "report_byte_size", "report_line_count", "report_entry_count", "report_unparsed_line_count",
     "parse_status", "parse_error",
     "signature_count", "path_count", "relation_count",
+    "dump_format", "dump_parse_status", "dump_parse_error", "dump_signature_hex",
+    "dump_version_raw", "dump_flags_hex", "dump_byte_count", "dump_sha256", "dump_hash_state",
+    "dump_stream_count", "dump_stream_unknown_count", "dump_thread_count", "dump_module_count",
+    "dump_unloaded_module_count", "dump_memory_region_count", "dump_counter_count",
+    "dump_issue_count", "dump_issues", "dump_directory_state", "dump_time_date_stamp_raw",
+    "dump_os_version", "dump_os_build", "dump_platform", "dump_architecture",
+    "dump_processor_count", "dump_product_type", "dump_build_string", "dump_misc_revision",
+    "dump_process_id", "dump_process_create_time", "dump_first_module_path",
+    "dump_first_module_name",
+    "dump_process_integrity_level", "dump_protected_process", "dump_exception_thread_id",
+    "dump_exception_code_hex", "dump_exception_code_name", "dump_exception_address_hex",
+    "dump_exception_parameters", "dump_exception_thread_in_list", "dump_file_name",
+    "dump_location_role", "dump_collected_directory", "dump_report_file",
     "record_key", "source_file", "search_text",
 ];
 
@@ -732,6 +1036,40 @@ const WER_OBSERVATIONS: &[&str] = &[
     "source_table", "source_rowid",
 ];
 
+const WER_DUMP_STREAMS: &[&str] = &[
+    "record_id", "ordinal", "stream_index", "stream_type", "stream_type_name", "data_size",
+    "stream_rva", "range_state", "parse_state", "overlaps", "header_size", "entry_size",
+    "declared_entries", "stored_entries", "sha256", "prefix_hex", "text_value", "note",
+];
+
+const WER_DUMP_THREADS: &[&str] = &[
+    "record_id", "ordinal", "thread_index", "source_stream", "thread_id", "suspend_count",
+    "priority_class", "priority", "teb", "teb_hex", "stack_start", "stack_start_hex",
+    "stack_size", "stack_rva", "context_rva", "context_size", "thread_name",
+    "is_exception_thread", "dump_flags", "dump_error", "exit_status", "create_time_raw",
+    "create_time", "exit_time_raw", "exit_time", "kernel_time_100ns", "user_time_100ns",
+    "start_address_hex", "affinity_hex",
+];
+
+const WER_DUMP_MODULES: &[&str] = &[
+    "record_id", "ordinal", "module_index", "module_kind", "base_of_image", "base_of_image_hex",
+    "size_of_image", "checksum", "time_date_stamp", "time_date_stamp_kst", "module_path",
+    "module_path_state", "file_name", "file_name_lower", "file_version", "product_version",
+    "file_flags", "file_os", "file_type", "file_subtype", "cv_signature", "cv_guid", "cv_age",
+    "pdb_file_name", "cv_state",
+];
+
+const WER_DUMP_MEMORY_REGIONS: &[&str] = &[
+    "record_id", "ordinal", "region_index", "source_stream", "base_address", "base_address_hex",
+    "allocation_base", "allocation_base_hex", "allocation_protect", "region_size", "state",
+    "state_name", "protect", "protect_name", "region_type", "region_type_name",
+    "stored_data_size",
+];
+
+const WER_DUMP_COUNTERS: &[&str] = &[
+    "record_id", "ordinal", "stream_type", "struct_name", "field_name", "value", "value_hex",
+];
+
 pub(super) const SPEC: DbSpec = DbSpec {
     name: "WerReports",
     table: "WerReports",
@@ -742,6 +1080,11 @@ pub(super) const SPEC: DbSpec = DbSpec {
         ChildSpec { table: "WerPaths", columns: WER_PATHS },
         ChildSpec { table: "WerRelations", columns: WER_RELATIONS },
         ChildSpec { table: "WerObservations", columns: WER_OBSERVATIONS },
+        ChildSpec { table: "WerDumpStreams", columns: WER_DUMP_STREAMS },
+        ChildSpec { table: "WerDumpThreads", columns: WER_DUMP_THREADS },
+        ChildSpec { table: "WerDumpModules", columns: WER_DUMP_MODULES },
+        ChildSpec { table: "WerDumpMemoryRegions", columns: WER_DUMP_MEMORY_REGIONS },
+        ChildSpec { table: "WerDumpCounters", columns: WER_DUMP_COUNTERS },
     ],
     ddl: DDL,
 };
@@ -1232,6 +1575,7 @@ mod tests {
         assert_eq!(
             states,
             vec![
+                ("crash_dump".to_string(), "not_collected".to_string()),
                 ("eventlog".to_string(), "not_collected".to_string()),
                 ("report_file".to_string(), "not_collected".to_string()),
             ]
@@ -1305,5 +1649,325 @@ mod tests {
         );
         drop(db);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A08: collected dumps are their own records, related to a report only by
+    /// the directory that actually holds that report file.
+    #[test]
+    fn collected_dumps_become_records_related_by_their_directory() {
+        let root = facts_root("dumps");
+        let report_dir = root.join("WER/ReportQueue/abc");
+        let crash_dir = root.join("Users/u/AppData/Local/CrashDumps");
+        std::fs::create_dir_all(&report_dir).unwrap();
+        std::fs::create_dir_all(&crash_dir).unwrap();
+        let report_file = report_dir.join("Report.wer");
+        std::fs::write(&report_file, b"Version=1").unwrap();
+        let fixture = crate::parsers::wer_dump::test_fixture_bytes();
+        std::fs::write(report_dir.join("crash.dmp"), &fixture).unwrap();
+        std::fs::write(crash_dir.join("app.exe.4242.dmp"), &fixture).unwrap();
+        // A kernel dump keeps its own row and is never parsed as a minidump.
+        let mut kernel = b"PAGEDU64".to_vec();
+        kernel.extend_from_slice(&[0u8; 512]);
+        std::fs::write(crash_dir.join("MEMORY.DMP"), &kernel).unwrap();
+
+        let published = super::super::wer_dumps::prepare_inputs(&root, &root, "facts-new").unwrap();
+        assert_eq!(
+            published,
+            vec![super::super::wer_dumps::DUMP_DB.to_string()]
+        );
+
+        let source = report_file.display().to_string();
+        write_report_facts(
+            &root,
+            &[(
+                "2026-06-24 05:34:15.200",
+                "APPCRASH",
+                "aaaaaaaa-0000-0000-0000-000000000001",
+                r#"{"EventType":"APPCRASH","ReportIdentifier":"aaaaaaaa-0000-0000-0000-000000000001"}"#,
+                APPCRASH_ENTRIES,
+                source.as_str(),
+            )],
+        );
+        write_event_facts(&root);
+        crate::derived::create_database(&root.join("_OVERVIEW"), "Metadata").unwrap();
+        let events = crate::overview::EventLogOverviewCache::from_rows_for_tests(Vec::new());
+        let ctx = Ctx {
+            out_dir: &root,
+            target: &root,
+            host_id: "host",
+            dataset_id: "new",
+            facts: FactsIndex::load(&root).unwrap(),
+            meta: MetaLookup::load(&root).unwrap(),
+        };
+        // One report plus three collected dump files.
+        assert_eq!(build(&ctx, &events).unwrap(), 4);
+        let db = open(&root);
+
+        let dumps: Vec<(String, String, Option<String>, String, i64)> = db
+            .prepare(
+                "SELECT dump_file_name,dump_location_role,dump_report_file,dump_format,
+                 relation_count FROM WerReports WHERE origin='crash_dump'
+                 ORDER BY dump_file_name",
+            )
+            .unwrap()
+            .query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            dumps,
+            vec![
+                (
+                    "MEMORY.DMP".to_string(),
+                    "crash_dumps_directory".to_string(),
+                    None,
+                    "kernel_dump_x64".to_string(),
+                    0
+                ),
+                (
+                    "app.exe.4242.dmp".to_string(),
+                    "crash_dumps_directory".to_string(),
+                    None,
+                    "user_minidump".to_string(),
+                    0
+                ),
+                (
+                    "crash.dmp".to_string(),
+                    "wer_report_directory".to_string(),
+                    Some(source.clone()),
+                    "user_minidump".to_string(),
+                    1
+                ),
+            ]
+        );
+
+        // Values decoded from the dump itself, not from the report.
+        let decoded: (
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            Option<i64>,
+        ) = db
+            .query_row(
+                "SELECT dump_exception_code_hex,dump_exception_code_name,dump_process_id,
+                 dump_first_module_path,dump_architecture,dump_thread_count,dump_module_count
+                 FROM WerReports WHERE dump_file_name='crash.dmp'",
+                [],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            decoded,
+            (
+                Some("0xc0000005".to_string()),
+                Some("EXCEPTION_ACCESS_VIOLATION".to_string()),
+                Some(4242),
+                Some("C:\\Windows\\System32\\app.exe".to_string()),
+                Some("x64".to_string()),
+                Some(2),
+                Some(2),
+            )
+        );
+
+        // The module list is a loaded-module array: entry 0 never becomes the
+        // record's application identity, whatever binary happens to sit there.
+        let identity: (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            Option<String>,
+        ) = db
+            .query_row(
+                "SELECT app_path,app_name,app_path_status,app_name_field,app_pid,app_start_time
+                 FROM WerReports WHERE dump_file_name='crash.dmp'",
+                [],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            identity,
+            (None, None, None, None, Some(4242), Some("2023-11-15 07:13:20.000".to_string()))
+        );
+        let path_rows: Vec<(String, String, String)> = db
+            .prepare(
+                "SELECT p.path_role,p.path_basis,p.path_raw FROM WerPaths p
+                 JOIN WerReports w USING(record_id)
+                 WHERE w.dump_file_name='crash.dmp' ORDER BY p.ordinal",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            path_rows,
+            vec![
+                (
+                    "dump_file".to_string(),
+                    "collected_file_location".to_string(),
+                    report_dir.join("crash.dmp").display().to_string()
+                ),
+                (
+                    "dump_first_module_path".to_string(),
+                    "module_list_index_0".to_string(),
+                    "C:\\Windows\\System32\\app.exe".to_string()
+                ),
+            ]
+        );
+
+        // The kernel container is refused, with no invented stream evidence.
+        let kernel_row: (String, Option<i64>, Option<i64>) = db
+            .query_row(
+                "SELECT dump_parse_status,dump_stream_count,dump_thread_count FROM WerReports
+                 WHERE dump_file_name='MEMORY.DMP'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(kernel_row, ("unsupported_format".to_string(), None, Some(0)));
+
+        // Child evidence of the minidump record.
+        let counts: Vec<(String, i64)> = [
+            "WerDumpStreams",
+            "WerDumpThreads",
+            "WerDumpModules",
+            "WerDumpMemoryRegions",
+            "WerPaths",
+        ]
+        .iter()
+        .map(|table| {
+            let value: i64 = db
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM \"{table}\" JOIN WerReports USING(record_id)
+                         WHERE dump_file_name='crash.dmp'"
+                    ),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            (table.to_string(), value)
+        })
+        .collect();
+        assert_eq!(
+            counts,
+            vec![
+                ("WerDumpStreams".to_string(), 12),
+                ("WerDumpThreads".to_string(), 2),
+                ("WerDumpModules".to_string(), 3),
+                ("WerDumpMemoryRegions".to_string(), 1),
+                ("WerPaths".to_string(), 2),
+            ]
+        );
+        let unloaded: (String, String) = db
+            .query_row(
+                "SELECT module_kind,WerDumpModules.module_path FROM WerDumpModules JOIN WerReports USING(record_id)
+                 WHERE dump_file_name='crash.dmp' AND module_kind='unloaded'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            unloaded,
+            (
+                "unloaded".to_string(),
+                "C:\\Windows\\System32\\gone.dll".to_string()
+            )
+        );
+
+        // Both sides of the directory relation, and nothing for the dump that
+        // merely shares a process name with the report.
+        let relations: Vec<(String, String, String)> = db
+            .prepare(
+                "SELECT w.origin,r.relation_kind,r.matched_value FROM WerRelations r
+                 JOIN WerReports w USING(record_id) ORDER BY w.origin",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let directory = report_dir.display().to_string();
+        assert_eq!(
+            relations,
+            vec![
+                (
+                    "crash_dump".to_string(),
+                    "collected_dump_in_report_directory".to_string(),
+                    directory.clone()
+                ),
+                (
+                    "report_file".to_string(),
+                    "collected_dump_in_report_directory".to_string(),
+                    directory
+                ),
+            ]
+        );
+
+        // Provenance points at the stored dump facts row, with its generation.
+        let provenance: (String, String, String, String) = db
+            .query_row(
+                "SELECT s.source_dataset_id,s.source_artifact,s.source_db,s.source_table
+                 FROM source_records s JOIN WerReports w USING(record_id)
+                 WHERE w.dump_file_name='crash.dmp'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            provenance,
+            (
+                "facts-new".to_string(),
+                "WerCrashDump".to_string(),
+                super::super::wer_dumps::DUMP_DB.to_string(),
+                "Wer_Dump_Files".to_string()
+            )
+        );
+
+        let observation: (String, i64, i64, Option<String>) = db
+            .query_row(
+                "SELECT collection_state,record_count,failed_count,facts_generation
+                 FROM WerObservations WHERE scope='crash_dump'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            observation,
+            (
+                "collected".to_string(),
+                3,
+                1,
+                Some("facts-new".to_string())
+            )
+        );
+        drop(db);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

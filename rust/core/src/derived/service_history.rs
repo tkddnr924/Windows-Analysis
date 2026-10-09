@@ -45,9 +45,7 @@ fn semantics(event_id: &str) -> Sem {
         "7026" => ("부팅/시스템 시작 드라이버 로드 실패", Some("실패"), "mapped"),
         "7030" => ("대화형 서비스 표시", Some("정보"), "mapped"),
         "7031" => ("서비스 비정상 종료(복구 동작)", Some("실패"), "mapped"),
-        // The corrective-action message numbers its inserts differently from
-        // the other events; only the meaning is confirmed, so no field is read.
-        "7032" => ("서비스 복구 조치 실패", Some("실패"), "partial"),
+        "7032" => ("서비스 복구 조치 실패", Some("실패"), "mapped"),
         "7034" => ("서비스 비정상 종료", Some("실패"), "mapped"),
         "7035" => ("서비스 제어 요청 전송", Some("정보"), "mapped"),
         "7036" => ("서비스 상태 변경", Some("정보"), "mapped"),
@@ -558,7 +556,6 @@ pub(super) fn build(ctx: &Ctx, events: &EventLogOverviewCache) -> Result<usize> 
         let mut state = String::new();
         let mut start_before = String::new();
         let mut start_after = String::new();
-        let start_before_raw = String::new();
         let mut start_after_raw = String::new();
         let mut service_type = String::new();
         let mut service_type_raw = String::new();
@@ -685,6 +682,15 @@ pub(super) fn build(ctx: &Ctx, events: &EventLogOverviewCache) -> Result<usize> 
                 action_raw = fields.param(4);
                 action_text = fields.param(5);
             }
+            "7032" => {
+                // EVENT_SERVICE_RECOVERY_FAILED inserts differ from 7031.
+                service_name = fields.param(3);
+                name_source = "param3";
+                action_raw = fields.param(1);
+                action_text = fields.param(2);
+                error_raw = fields.param(4);
+                error_scope = "system";
+            }
             "7034" => {
                 service_name = fields.param(1);
                 name_source = "param1";
@@ -706,7 +712,7 @@ pub(super) fn build(ctx: &Ctx, events: &EventLogOverviewCache) -> Result<usize> 
                 Some(count) => format!("종료 횟수 {count}"),
                 None => String::new(),
             },
-            "7031" => action_text.clone(),
+            "7031" | "7032" => action_text.clone(),
             "7042" => stop_reason_code.clone(),
             "7000" | "7023" | "7024" | "7001" | "7016" => fields.param(2),
             "7038" => error_raw.clone(),
@@ -853,10 +859,10 @@ pub(super) fn build(ctx: &Ctx, events: &EventLogOverviewCache) -> Result<usize> 
         record.set("state", text(&state));
         record.set("start_type_before", text(&start_before));
         record.set("start_type_after", text(&start_after));
-        record.set("start_type_before_raw", text(&start_before_raw));
-        record.set("start_type_after_raw", text(&start_after_raw));
+        record.set("start_type_before_raw", text(&start_before));
+        record.set("start_type_after_raw", text(if is_audit { &start_after_raw } else { &start_after }));
         record.set("service_type", text(&service_type));
-        record.set("service_type_raw", text(&service_type_raw));
+        record.set("service_type_raw", text(if is_audit { &service_type_raw } else { &service_type }));
         record.set("control_code", text(&control_code));
         record.set("stop_reason", text(&stop_reason));
         record.set("stop_reason_code", text(&stop_reason_code));
@@ -1732,7 +1738,7 @@ CREATE TABLE "ServiceMetadataReferences" (
   UNIQUE(host_id, dataset_id, metadata_id, reference_kind)
 );
 CREATE TABLE _wina_derived_version (name TEXT NOT NULL PRIMARY KEY, version INTEGER NOT NULL);
-INSERT INTO _wina_derived_version(name,version) VALUES ('overview_contract',1),('service_history',2);
+INSERT INTO _wina_derived_version(name,version) VALUES ('overview_contract',1),('service_history',3);
 "#;
 
 const MAIN: &[&str] = &[
@@ -2191,6 +2197,28 @@ mod tests {
             one::<String>(&db, "SELECT field_value FROM ServiceEventFields f JOIN ServiceHistory s USING(record_id) WHERE s.event_id=7031 AND f.field_name='param3'"),
             "60000"
         );
+    }
+
+    #[test]
+    fn failed_recovery_uses_corrective_action_message_positions() {
+        let case = Case::new("failed-recovery");
+        case.facts("System", 2);
+        let events = EventLogOverviewCache::from_rows_for_tests(vec![
+            scm(1, "7032", "", r#"{"param1":"1","param2":"Restart the service","param3":"DNS Client","param4":"%%1056"}"#),
+            scm(2, "7032", "", r#"{"Strings":["0","No action","LegacySvc","%%5"]}"#),
+        ]);
+        let (_, db) = case.run(&events);
+        let rows: Vec<(String, String, i64, String, i64, Option<i64>)> = db
+            .prepare("SELECT service_name,mapping_state,recovery_action_code,recovery_action_text,error_code_numeric,termination_count FROM ServiceHistory ORDER BY event_record_id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(rows, vec![
+            ("DNS Client".into(), "mapped".into(), 1, "Restart the service".into(), 1056, None),
+            ("LegacySvc".into(), "mapped".into(), 0, "No action".into(), 5, None),
+        ]);
     }
 
     // R01 · A06: the recording actor and the service execution identity stay

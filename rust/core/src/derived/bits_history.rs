@@ -1,17 +1,22 @@
 //! BITS job/file transfer evidence: every Bits-Client record is stored as its
 //! own typed event. Job state, URL transfer and job-file records keep separate
 //! scopes; results come from recorded hr/error codes only, never from a job
-//! start. Direct queue (qmgr) evidence is recorded as a collection state, not
-//! as invented transfers.
+//! start. Direct queue (qmgr) evidence is a snapshot of the service queue and
+//! stays in its own tables: a queue record never becomes an event and is never
+//! merged with an event by job name or URL.
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{anyhow, Result};
 use rusqlite::{params, Connection, OpenFlags};
 
+mod queue;
+
 use super::schema::{ChildSpec, DbSpec};
 use super::{int_opt, Cell, Ctx, DerivedDb, SourceRef};
 use crate::overview::EventLogOverviewCache;
 use crate::sqlite::Row;
+
+pub(super) use queue::prepare_inputs;
 
 // ---------------------------------------------------------------------------
 // Contract
@@ -243,8 +248,153 @@ CREATE TABLE "BitsQueueEvidence" (
   "collection_state" TEXT,
   "parse_support" TEXT,
   "note" TEXT,
+  "format" TEXT,
+  "format_detail" TEXT,
+  "parse_status" TEXT,
+  "declared_job_count" INTEGER,
+  "job_record_count" INTEGER,
+  "file_record_count" INTEGER,
+  "failed_record_count" INTEGER,
+  "job_delimiter" TEXT,
+  "job_delimiter_id" INTEGER,
+  "parse_error" TEXT,
+  "source_dataset_id" TEXT,
+  "source_db" TEXT,
+  "source_table" TEXT,
+  "source_rowid" INTEGER,
   PRIMARY KEY(evidence_id)
 );
+CREATE TABLE "BitsQueueJobs" (
+  "queue_job_id" TEXT NOT NULL,
+  "host_id" TEXT NOT NULL,
+  "dataset_id" TEXT NOT NULL,
+  "evidence_id" TEXT,
+  "input_path" TEXT,
+  "relative_path" TEXT,
+  "container_format" TEXT,
+  "container_table" TEXT,
+  "container_record_index" INTEGER,
+  "record_offset" INTEGER,
+  "record_length" INTEGER,
+  "container_record_id" TEXT,
+  "blob_prefix_hex" TEXT,
+  "job_id" TEXT,
+  "job_id_state" TEXT,
+  "job_type_raw" INTEGER,
+  "job_type" TEXT,
+  "priority_raw" INTEGER,
+  "priority" TEXT,
+  "state_raw" INTEGER,
+  "state" TEXT,
+  "control_reserved_raw" INTEGER,
+  "job_name" TEXT,
+  "job_description" TEXT,
+  "notify_command" TEXT,
+  "notify_command_resolved" TEXT,
+  "notify_arguments" TEXT,
+  "notify_flags_raw" INTEGER,
+  "notify_flags" TEXT,
+  "notify_flags_unmapped" INTEGER,
+  "owner_sid" TEXT,
+  "owner_sid_state" TEXT,
+  "owner_name" TEXT,
+  "owner_name_basis" TEXT,
+  "access_token_offset" INTEGER,
+  "access_token_length" INTEGER,
+  "transfer_section_kind" TEXT,
+  "declared_file_count" INTEGER,
+  "parsed_file_count" INTEGER,
+  "file_count_state" TEXT,
+  "file_reference_guids" TEXT,
+  "error_count" INTEGER,
+  "errors_json" TEXT,
+  "transient_error_count" INTEGER,
+  "retry_delay_raw" INTEGER,
+  "timeout_raw" INTEGER,
+  "created_time" TEXT,
+  "created_time_raw" TEXT,
+  "modified_time" TEXT,
+  "modified_time_raw" TEXT,
+  "other_time0" TEXT,
+  "other_time0_raw" TEXT,
+  "other_time1" TEXT,
+  "other_time1_raw" TEXT,
+  "other_time2" TEXT,
+  "other_time2_raw" TEXT,
+  "metadata_padding_hex" TEXT,
+  "metadata_state" TEXT,
+  "trailing_length" INTEGER,
+  "parse_status" TEXT,
+  "parse_method" TEXT,
+  "parse_error" TEXT,
+  "record_blob" BLOB,
+  "evidence_basis" TEXT,
+  "source_dataset_id" TEXT,
+  "source_db" TEXT,
+  "source_table" TEXT,
+  "source_rowid" INTEGER,
+  "source_file" TEXT,
+  PRIMARY KEY(queue_job_id),
+  FOREIGN KEY(evidence_id) REFERENCES "BitsQueueEvidence"("evidence_id") ON DELETE CASCADE
+);
+CREATE INDEX "idx_BitsQueueJobs_job" ON "BitsQueueJobs"(job_id);
+CREATE INDEX "idx_BitsQueueJobs_state" ON "BitsQueueJobs"(state, queue_job_id);
+CREATE INDEX "idx_BitsQueueJobs_owner" ON "BitsQueueJobs"(owner_sid);
+CREATE TABLE "BitsQueueFiles" (
+  "queue_file_id" TEXT NOT NULL,
+  "host_id" TEXT NOT NULL,
+  "dataset_id" TEXT NOT NULL,
+  "evidence_id" TEXT,
+  "queue_job_id" TEXT,
+  "input_path" TEXT,
+  "relative_path" TEXT,
+  "container_format" TEXT,
+  "container_table" TEXT,
+  "container_record_index" INTEGER,
+  "record_offset" INTEGER,
+  "record_length" INTEGER,
+  "container_record_id" TEXT,
+  "blob_prefix_hex" TEXT,
+  "job_record_index" INTEGER,
+  "job_id" TEXT,
+  "link_basis" TEXT,
+  "file_index_in_job" INTEGER,
+  "source_url" TEXT,
+  "dest_file" TEXT,
+  "dest_file_resolved" TEXT,
+  "dest_path_resolution_state" TEXT,
+  "tmp_file" TEXT,
+  "tmp_file_resolved" TEXT,
+  "drive" TEXT,
+  "volume_guid" TEXT,
+  "download_size" INTEGER,
+  "download_size_raw" TEXT,
+  "download_size_state" TEXT,
+  "transfer_size" INTEGER,
+  "transfer_size_raw" TEXT,
+  "transfer_size_state" TEXT,
+  "reserved_byte" INTEGER,
+  "trailing_filetime" TEXT,
+  "trailing_filetime_raw" TEXT,
+  "trailing_filetime_state" TEXT,
+  "trailing_length" INTEGER,
+  "parse_status" TEXT,
+  "parse_method" TEXT,
+  "parse_error" TEXT,
+  "record_blob" BLOB,
+  "evidence_basis" TEXT,
+  "source_dataset_id" TEXT,
+  "source_db" TEXT,
+  "source_table" TEXT,
+  "source_rowid" INTEGER,
+  "source_file" TEXT,
+  PRIMARY KEY(queue_file_id),
+  FOREIGN KEY(evidence_id) REFERENCES "BitsQueueEvidence"("evidence_id") ON DELETE CASCADE,
+  FOREIGN KEY(queue_job_id) REFERENCES "BitsQueueJobs"("queue_job_id") ON DELETE CASCADE
+);
+CREATE INDEX "idx_BitsQueueFiles_job" ON "BitsQueueFiles"(queue_job_id);
+CREATE INDEX "idx_BitsQueueFiles_url" ON "BitsQueueFiles"(source_url);
+CREATE INDEX "idx_BitsQueueFiles_path" ON "BitsQueueFiles"(dest_file);
 CREATE TABLE "BitsMetadataReferences" (
   "reference_id" TEXT NOT NULL,
   "host_id" TEXT NOT NULL,
@@ -272,7 +422,7 @@ CREATE TABLE "source_records" (
 );
 CREATE INDEX idx_source_lookup ON source_records(source_db, source_table, source_rowid, source_field);
 CREATE TABLE _wina_derived_version (name TEXT NOT NULL PRIMARY KEY, version INTEGER NOT NULL);
-INSERT INTO _wina_derived_version(name,version) VALUES ('overview_contract',1),('bits_history',2);
+INSERT INTO _wina_derived_version(name,version) VALUES ('overview_contract',1),('bits_history',3);
 "#;
 
 const MAIN: &[&str] = &[
@@ -483,6 +633,142 @@ const QUEUE_EVIDENCE: &[&str] = &[
     "collection_state",
     "parse_support",
     "note",
+    "format",
+    "format_detail",
+    "parse_status",
+    "declared_job_count",
+    "job_record_count",
+    "file_record_count",
+    "failed_record_count",
+    "job_delimiter",
+    "job_delimiter_id",
+    "parse_error",
+    "source_dataset_id",
+    "source_db",
+    "source_table",
+    "source_rowid",
+];
+
+const QUEUE_JOBS: &[&str] = &[
+    "queue_job_id",
+    "host_id",
+    "dataset_id",
+    "evidence_id",
+    "input_path",
+    "relative_path",
+    "container_format",
+    "container_table",
+    "container_record_index",
+    "record_offset",
+    "record_length",
+    "container_record_id",
+    "blob_prefix_hex",
+    "job_id",
+    "job_id_state",
+    "job_type_raw",
+    "job_type",
+    "priority_raw",
+    "priority",
+    "state_raw",
+    "state",
+    "control_reserved_raw",
+    "job_name",
+    "job_description",
+    "notify_command",
+    "notify_command_resolved",
+    "notify_arguments",
+    "notify_flags_raw",
+    "notify_flags",
+    "notify_flags_unmapped",
+    "owner_sid",
+    "owner_sid_state",
+    "owner_name",
+    "owner_name_basis",
+    "access_token_offset",
+    "access_token_length",
+    "transfer_section_kind",
+    "declared_file_count",
+    "parsed_file_count",
+    "file_count_state",
+    "file_reference_guids",
+    "error_count",
+    "errors_json",
+    "transient_error_count",
+    "retry_delay_raw",
+    "timeout_raw",
+    "created_time",
+    "created_time_raw",
+    "modified_time",
+    "modified_time_raw",
+    "other_time0",
+    "other_time0_raw",
+    "other_time1",
+    "other_time1_raw",
+    "other_time2",
+    "other_time2_raw",
+    "metadata_padding_hex",
+    "metadata_state",
+    "trailing_length",
+    "parse_status",
+    "parse_method",
+    "parse_error",
+    "record_blob",
+    "evidence_basis",
+    "source_dataset_id",
+    "source_db",
+    "source_table",
+    "source_rowid",
+    "source_file",
+];
+
+const QUEUE_FILES: &[&str] = &[
+    "queue_file_id",
+    "host_id",
+    "dataset_id",
+    "evidence_id",
+    "queue_job_id",
+    "input_path",
+    "relative_path",
+    "container_format",
+    "container_table",
+    "container_record_index",
+    "record_offset",
+    "record_length",
+    "container_record_id",
+    "blob_prefix_hex",
+    "job_record_index",
+    "job_id",
+    "link_basis",
+    "file_index_in_job",
+    "source_url",
+    "dest_file",
+    "dest_file_resolved",
+    "dest_path_resolution_state",
+    "tmp_file",
+    "tmp_file_resolved",
+    "drive",
+    "volume_guid",
+    "download_size",
+    "download_size_raw",
+    "download_size_state",
+    "transfer_size",
+    "transfer_size_raw",
+    "transfer_size_state",
+    "reserved_byte",
+    "trailing_filetime",
+    "trailing_filetime_raw",
+    "trailing_filetime_state",
+    "trailing_length",
+    "parse_status",
+    "parse_method",
+    "parse_error",
+    "record_blob",
+    "evidence_basis",
+    "source_dataset_id",
+    "source_db",
+    "source_table",
+    "source_rowid",
+    "source_file",
 ];
 
 const METADATA_REFERENCES: &[&str] = &[
@@ -518,6 +804,8 @@ pub(super) const SPEC: DbSpec = DbSpec {
         ChildSpec { table: "BitsObservations", columns: OBSERVATIONS },
         ChildSpec { table: "BitsEventCoverage", columns: COVERAGE },
         ChildSpec { table: "BitsQueueEvidence", columns: QUEUE_EVIDENCE },
+        ChildSpec { table: "BitsQueueJobs", columns: QUEUE_JOBS },
+        ChildSpec { table: "BitsQueueFiles", columns: QUEUE_FILES },
         ChildSpec { table: "BitsMetadataReferences", columns: METADATA_REFERENCES },
         ChildSpec { table: "source_records", columns: SOURCE_RECORDS },
     ],
@@ -535,42 +823,6 @@ const CANONICAL_LOG: &str = "Microsoft-Windows-Bits-Client%4Operational";
 /// u64::MAX means "size not known yet" in BITS payloads, not a real size.
 const UNKNOWN_SIZE: &str = "18446744073709551615";
 const KNOWN_EVENT_IDS: &[&str] = &["3", "4", "5", "6", "59", "60", "61", "306", "310", "16403"];
-
-#[derive(Clone, Copy, PartialEq)]
-enum Match {
-    FileName,
-    PathContains,
-}
-
-/// Direct queue (qmgr) inputs reviewed for the A07 contract. No collected
-/// sample exists for this build, so discovery only records where such inputs
-/// would appear and that no parser is supported; nothing is reconstructed.
-const QUEUE_PATTERNS: &[(&str, &str, Match, &str)] = &[
-    (
-        "qmgr_database",
-        "qmgr.db",
-        Match::FileName,
-        "Windows 10 이후 BITS 작업 큐 ESE DB(%ALLUSERSPROFILE%\\Microsoft\\Network\\Downloader)",
-    ),
-    (
-        "qmgr_legacy_queue",
-        "qmgr0.dat",
-        Match::FileName,
-        "구형 BITS 작업 큐 파일",
-    ),
-    (
-        "qmgr_legacy_queue",
-        "qmgr1.dat",
-        Match::FileName,
-        "구형 BITS 작업 큐 파일",
-    ),
-    (
-        "downloader_directory",
-        "microsoft/network/downloader",
-        Match::PathContains,
-        "BITS 작업 큐 디렉터리 수집 여부",
-    ),
-];
 
 fn g<'a>(row: &'a Row, key: &str) -> &'a str {
     row.get(key).map(String::as_str).unwrap_or("")
@@ -996,9 +1248,15 @@ pub(super) fn build(ctx: &Ctx, events: &EventLogOverviewCache) -> Result<usize> 
         };
         let event_id = g(row, "EventID").to_string();
         let time = g(row, "timestamp");
+        // A ProcessingErrorData payload is the event decoder's failure, not
+        // job data: its values are never read as BITS fields and its error
+        // code is never a transfer result. The raw wrapper stays recorded.
         let (map, payload_state) = match g(row, "EventData").trim() {
             "" => (Payload::new(), "unrecorded"),
             raw => match serde_json::from_str::<serde_json::Value>(raw) {
+                Ok(serde_json::Value::Object(map)) if map.contains_key("ProcessingErrorData") => {
+                    (Payload::new(), "processing_error")
+                }
                 Ok(serde_json::Value::Object(map)) => (map, "recorded"),
                 _ => (Payload::new(), "unparsed"),
             },
@@ -1378,7 +1636,7 @@ pub(super) fn build(ctx: &Ctx, events: &EventLogOverviewCache) -> Result<usize> 
     write_jobs(ctx, &mut db, jobs)?;
     write_observations(ctx, &mut db, logs)?;
     write_coverage(ctx, &mut db, coverage)?;
-    write_queue_evidence(ctx, &mut db)?;
+    queue::populate(ctx, &mut db)?;
     write_metadata_references(ctx, &mut db, &account_sids)?;
     db.finish()
 }
@@ -1642,88 +1900,6 @@ fn write_coverage(
     Ok(())
 }
 
-/// A07 contract: record whether the direct queue inputs were collected. No
-/// qmgr format is parsed and no job is reconstructed from them.
-fn write_queue_evidence(ctx: &Ctx, db: &mut DerivedDb) -> Result<()> {
-    let root = ctx.target.to_string_lossy().to_string();
-    let available = ctx.target.is_dir();
-    let (files, errors) = if available {
-        crate::finder::walk_files(ctx.target)
-    } else {
-        (Vec::new(), Vec::new())
-    };
-    let note_errors = errors.first().cloned();
-    for (kind, pattern, mode, note) in QUEUE_PATTERNS {
-        let mut found = Vec::new();
-        if available {
-            for path in &files {
-                let hit = match mode {
-                    Match::FileName => path
-                        .file_name()
-                        .map(|name| name.to_string_lossy().to_lowercase() == *pattern)
-                        .unwrap_or(false),
-                    Match::PathContains => path
-                        .to_string_lossy()
-                        .to_lowercase()
-                        .replace('\\', "/")
-                        .contains(*pattern),
-                };
-                if hit {
-                    found.push(path.clone());
-                }
-            }
-        }
-        if found.is_empty() {
-            db.insert_child(
-                "BitsQueueEvidence",
-                &[
-                    t(&uuid::Uuid::new_v4().to_string()),
-                    t(ctx.host_id),
-                    t(ctx.dataset_id),
-                    t(kind),
-                    t(pattern),
-                    t(&root),
-                    Cell::Null,
-                    Cell::Null,
-                    Cell::Null,
-                    t(if available { "not_collected" } else { "target_unavailable" }),
-                    t("unsupported_no_sample"),
-                    t(&match &note_errors {
-                        Some(error) => format!("{note} / 탐색 경고: {error}"),
-                        None => (*note).to_string(),
-                    }),
-                ],
-            )?;
-            continue;
-        }
-        for path in found {
-            let size = std::fs::metadata(&path).ok().map(|meta| meta.len() as i64);
-            let relative = path
-                .strip_prefix(ctx.target)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .to_string();
-            db.insert_child(
-                "BitsQueueEvidence",
-                &[
-                    t(&uuid::Uuid::new_v4().to_string()),
-                    t(ctx.host_id),
-                    t(ctx.dataset_id),
-                    t(kind),
-                    t(pattern),
-                    t(&root),
-                    t(&relative),
-                    t(&path.to_string_lossy()),
-                    int_opt(size),
-                    t("collected"),
-                    t("unsupported_no_sample"),
-                    t(note),
-                ],
-            )?;
-        }
-    }
-    Ok(())
-}
 
 /// Host and network metadata plus only the account entries this result used.
 fn write_metadata_references(
@@ -1849,7 +2025,10 @@ mod tests {
             .unwrap();
         }
 
+        /// Mirrors the pipeline: queue facts are materialised before the
+        /// overview is derived, and the overview only reads those facts.
         fn run(&self, rows: Vec<Row>) -> (usize, Connection) {
+            prepare_inputs(&self.root, &self.target, "new").unwrap();
             let ctx = Ctx {
                 out_dir: &self.root,
                 target: &self.target,
@@ -2352,36 +2531,356 @@ mod tests {
         );
     }
 
-    /// A07: direct queue evidence is a recorded collection state, never an
-    /// invented transfer; a collected file stays unparsed until a real sample
-    /// establishes the format.
+    /// A ProcessingErrorData payload is the event decoder's failure: its
+    /// values are not job data and its error code is not a transfer result.
     #[test]
-    fn queue_evidence_records_collection_state_only() {
+    fn processing_error_payload_is_not_read_as_job_data() {
+        let fx = Fixture::new(1);
+        let payload =
+            r#"{"ProcessingErrorData":{"ErrorCode":15005,"DataItemName":"hr","EventPayload":"0100"}}"#;
+        let (written, db) = fx.run(vec![event(1, "60", "2026-01-01 00:00:00.000", Some(payload))]);
+        assert_eq!(written, 1);
+        let row: (String, Option<String>, Option<String>, String, Option<i64>, Option<String>) = db
+            .query_row(
+                "SELECT payload_state,event_data_raw,hr_raw,hr_state,error_code_value,url
+                 FROM BitsHistory",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+            )
+            .unwrap();
+        assert_eq!(row.0, "processing_error");
+        assert_eq!(row.1.as_deref(), Some(payload), "the raw wrapper stays verbatim");
+        assert_eq!(row.2, None);
+        assert_eq!(row.3, "unrecorded");
+        assert_eq!(row.4, None, "a decoding error code is not a BITS error code");
+        assert_eq!(row.5, None);
+        assert_eq!(one::<i64>(&db, "SELECT COUNT(*) FROM BitsFiles"), 0);
+        assert_eq!(
+            one::<i64>(
+                &db,
+                "SELECT COUNT(*) FROM source_records WHERE source_field='EventData'"
+            ),
+            0
+        );
+    }
+
+    /// A07: every reviewed queue input keeps its collection state even when
+    /// nothing was collected; nothing is invented from the absence.
+    #[test]
+    fn queue_evidence_records_collection_state_of_every_pattern() {
         let fx = Fixture::new(0);
         let (_, db) = fx.run(Vec::new());
         assert_eq!(
             one::<i64>(&db, "SELECT COUNT(*) FROM BitsQueueEvidence WHERE collection_state='not_collected'"),
-            QUEUE_PATTERNS.len() as i64
+            crate::parsers::bits_queue::INPUT_PATTERNS.len() as i64
         );
+        assert_eq!(
+            one::<i64>(&db, "SELECT COUNT(*) FROM BitsQueueEvidence WHERE parse_support='not_collected'"),
+            crate::parsers::bits_queue::INPUT_PATTERNS.len() as i64
+        );
+        assert_eq!(one::<i64>(&db, "SELECT COUNT(*) FROM BitsQueueJobs"), 0);
+        assert_eq!(one::<i64>(&db, "SELECT COUNT(*) FROM BitsQueueFiles"), 0);
         assert_eq!(one::<i64>(&db, "SELECT COUNT(*) FROM BitsHistory"), 0);
-        drop(db);
+    }
 
-        let queue = fx.target.join("NonVolatile/BITS/Downloader");
-        std::fs::create_dir_all(&queue).unwrap();
-        std::fs::write(queue.join("qmgr.db"), b"ESE-placeholder").unwrap();
-        let (_, db) = fx.run(Vec::new());
-        let found: (String, String, i64, String) = db
+    /// A collected queue is parsed into typed job and file snapshots with
+    /// their facts coordinates. The snapshot never becomes an event row.
+    #[test]
+    fn legacy_queue_input_becomes_typed_job_and_file_snapshots() {
+        use crate::parsers::bits_queue::fixtures::{file_record, legacy_job, legacy_queue, JobSpec};
+        use crate::parsers::bits_queue::{JOB_DELIMITERS, SIZE_UNKNOWN};
+
+        let fx = Fixture::new(0);
+        fx.account("S-1-5-21-1-2-3-1001", "Administrator", "WIN-TEST", "WIN-TEST");
+        let dir = fx
+            .target
+            .join("NonVolatile/BITS/ProgramData/Microsoft/Network/Downloader");
+        std::fs::create_dir_all(&dir).unwrap();
+        let files = vec![
+            file_record(
+                r"C:\Users\a\Downloads\patch.exe",
+                "https://host.test/patch.exe",
+                r"C:\Users\a\AppData\Local\Temp\BIT1.tmp",
+                4096,
+                8192,
+            ),
+            file_record(
+                r"C:\Users\a\Downloads\second.bin",
+                "https://host.test/second.bin",
+                r"C:\Users\a\AppData\Local\Temp\BIT2.tmp",
+                0,
+                SIZE_UNKNOWN,
+            ),
+        ];
+        let job = legacy_job(
+            &JobSpec {
+                name: "WindowsUpdate",
+                description: "job description",
+                command: r"C:\Windows\System32\cmd.exe",
+                arguments: "/c echo done",
+                sid: "S-1-5-21-1-2-3-1001",
+                flags: 0x0003,
+                state: 4,
+                ..JobSpec::default()
+            },
+            &files,
+        );
+        std::fs::write(
+            dir.join("qmgr0.dat"),
+            legacy_queue(&[job], JOB_DELIMITERS[2].1, 1),
+        )
+        .unwrap();
+
+        let (written, db) = fx.run(Vec::new());
+        assert_eq!(written, 0);
+        let evidence: (String, String, String, i64, i64, i64, i64, i64, String) = db
             .query_row(
-                "SELECT collection_state,parse_support,file_size,relative_path FROM BitsQueueEvidence WHERE search_pattern='qmgr.db'",
+                "SELECT collection_state,parse_support,format,declared_job_count,job_record_count,
+                        file_record_count,failed_record_count,job_delimiter_id,source_dataset_id
+                 FROM BitsQueueEvidence WHERE search_pattern='qmgr0.dat'",
+                [],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                        r.get(8)?,
+                    ))
+                },
+            )
+            .unwrap();
+        // Two file records are present, but only the first has a proven
+        // boundary: the job and the input report the unproven candidate.
+        assert_eq!(
+            evidence,
+            (
+                "collected".into(),
+                "parsed_with_errors".into(),
+                "legacy_qmgr_queue".into(),
+                1,
+                1,
+                2,
+                2,
+                3,
+                "new".into()
+            )
+        );
+
+        let job_row: (String, String, String, String, String, String, String, i64, String, String, String, i64, i64, String) = db
+            .query_row(
+                "SELECT job_id,job_type,priority,state,job_name,job_description,notify_command,
+                        notify_flags_unmapped,notify_flags,owner_sid,owner_name,declared_file_count,
+                        parsed_file_count,file_count_state
+                 FROM BitsQueueJobs",
+                [],
+                |r| {
+                    Ok((
+                        r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?,
+                        r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?, r.get(11)?, r.get(12)?, r.get(13)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(job_row.0, "12345678-1234-5678-9abc-def011223344");
+        assert_eq!(job_row.1, "BG_JOB_TYPE_DOWNLOAD");
+        assert_eq!(job_row.2, "BG_JOB_PRIORITY_NORMAL");
+        assert_eq!(job_row.3, "BG_JOB_STATE_ERROR");
+        assert_eq!(job_row.4, "WindowsUpdate");
+        assert_eq!(job_row.5, "job description");
+        assert_eq!(job_row.6, r"C:\Windows\System32\cmd.exe");
+        assert_eq!(job_row.7, 0);
+        assert!(job_row.8.contains("BG_NOTIFY_JOB_TRANSFERRED"));
+        assert!(job_row.8.contains("BG_NOTIFY_JOB_ERROR"));
+        assert_eq!(job_row.9, "S-1-5-21-1-2-3-1001");
+        assert_eq!(job_row.10, "Administrator");
+        assert_eq!((job_row.11, job_row.12), (2, 2));
+        assert_eq!(one::<String>(&db, "SELECT parse_status FROM BitsQueueJobs"), "partial");
+        assert!(one::<String>(&db, "SELECT parse_error FROM BitsQueueJobs").contains("증명되지"));
+        assert_eq!(job_row.13, "matches_with_unproven_boundary");
+
+        let created: String = one(&db, "SELECT created_time FROM BitsQueueJobs");
+        assert_eq!(created, crate::time::fmt_filetime(132_000_000_000_000_000));
+        let created_raw: String = one(&db, "SELECT created_time_raw FROM BitsQueueJobs");
+        assert_eq!(created_raw, "132000000000000000");
+        let errors: String = one(&db, "SELECT errors_json FROM BitsQueueJobs");
+        assert!(errors.contains("0x0000000080070005"));
+        assert_eq!(one::<i64>(&db, "SELECT transient_error_count FROM BitsQueueJobs"), 2);
+        assert_eq!(one::<i64>(&db, "SELECT retry_delay_raw FROM BitsQueueJobs"), 600);
+        assert_eq!(one::<i64>(&db, "SELECT timeout_raw FROM BitsQueueJobs"), 1_209_600);
+        assert_eq!(one::<String>(&db, "SELECT metadata_state FROM BitsQueueJobs"), "parsed");
+        assert!(one::<i64>(&db, "SELECT LENGTH(record_blob) FROM BitsQueueJobs") > 0);
+        assert_eq!(
+            one::<i64>(
+                &db,
+                "SELECT COUNT(*) FROM BitsQueueJobs j JOIN BitsQueueEvidence e ON e.evidence_id=j.evidence_id
+                 WHERE j.source_dataset_id='new' AND j.source_db='SUPPLEMENTAL/Bits_Queue.sqlite'
+                   AND j.source_table='BitsQueue_Jobs' AND j.source_rowid>0"
+            ),
+            1
+        );
+
+        let first: (String, String, String, i64, i64, String, String, String) = db
+            .query_row(
+                "SELECT source_url,dest_file,tmp_file,download_size,transfer_size,download_size_state,
+                        link_basis,dest_path_resolution_state
+                 FROM BitsQueueFiles WHERE file_index_in_job=0",
+                [],
+                |r| {
+                    Ok((
+                        r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?,
+                        r.get(7)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(first.0, "https://host.test/patch.exe");
+        assert_eq!(first.1, r"C:\Users\a\Downloads\patch.exe");
+        assert_eq!(first.2, r"C:\Users\a\AppData\Local\Temp\BIT1.tmp");
+        assert_eq!((first.3, first.4), (4096, 8192));
+        assert_eq!(first.5, "recorded");
+        assert_eq!(first.6, "legacy_job_transfer_section");
+        assert_eq!(first.7, "literal");
+
+        // BG_SIZE_UNKNOWN stays a sentinel, never a size.
+        let second: (Option<i64>, String, String) = db
+            .query_row(
+                "SELECT transfer_size,transfer_size_raw,transfer_size_state FROM BitsQueueFiles
+                 WHERE file_index_in_job=1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(second, (None, "18446744073709551615".into(), "unknown_sentinel".into()));
+        // The second record was recovered past an undocumented trailer: the
+        // row says the boundary is unproven and keeps its bytes.
+        let candidate: (String, String, String, i64) = db
+            .query_row(
+                "SELECT parse_status,parse_method,evidence_basis,LENGTH(record_blob)
+                 FROM BitsQueueFiles WHERE file_index_in_job=1",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .unwrap();
-        assert_eq!(found.0, "collected");
-        assert_eq!(found.1, "unsupported_no_sample");
-        assert_eq!(found.2, 15);
-        assert!(found.3.ends_with("qmgr.db"));
-        assert_eq!(one::<i64>(&db, "SELECT COUNT(*) FROM BitsFiles"), 0);
+        assert_eq!(candidate.0, "heuristic_boundary");
+        assert_eq!(candidate.1, "heuristic_resync");
+        assert!(candidate.2.contains("증명되지"));
+        assert!(candidate.3 > 0);
+        assert_eq!(
+            one::<String>(&db, "SELECT parse_status FROM BitsQueueFiles WHERE file_index_in_job=0"),
+            "parsed"
+        );
+        assert_eq!(
+            one::<i64>(
+                &db,
+                "SELECT COUNT(*) FROM BitsQueueFiles f JOIN BitsQueueJobs j ON j.queue_job_id=f.queue_job_id"
+            ),
+            2
+        );
+        assert_eq!(one::<i64>(&db, "SELECT COUNT(*) FROM BitsQueueFiles WHERE drive='C:'"), 2);
+        // A queue snapshot is not an event and not a transfer result.
         assert_eq!(one::<i64>(&db, "SELECT COUNT(*) FROM BitsHistory"), 0);
+        assert_eq!(one::<i64>(&db, "SELECT COUNT(*) FROM BitsFiles"), 0);
+        let violations: i64 = db
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(violations, 0);
+    }
+
+    /// Unreadable, foreign and truncated inputs keep an explicit failure; an
+    /// empty valid result would hide them.
+    #[test]
+    fn unsupported_and_truncated_queue_inputs_keep_their_errors() {
+        use crate::parsers::bits_queue::fixtures::{legacy_job, legacy_queue, JobSpec};
+        use crate::parsers::bits_queue::JOB_DELIMITERS;
+
+        let fx = Fixture::new(0);
+        let dir = fx.target.join("NonVolatile/BITS/Downloader");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("qmgr.db"), b"SQLite format 3\0 not an ESE database").unwrap();
+        let complete = legacy_queue(&[legacy_job(&JobSpec::default(), &[])], JOB_DELIMITERS[0].1, 1);
+        std::fs::write(dir.join("qmgr0.dat"), &complete[..complete.len() - 40]).unwrap();
+
+        let (_, db) = fx.run(Vec::new());
+        let database: (String, String, String, Option<String>) = db
+            .query_row(
+                "SELECT parse_support,parse_status,format,parse_error FROM BitsQueueEvidence
+                 WHERE search_pattern='qmgr.db'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(database.0, "unsupported_format");
+        assert_eq!(database.1, "unsupported_format");
+        assert_eq!(database.2, "unknown");
+        assert!(database.3.is_some());
+        let legacy: (String, String, Option<String>, Option<String>) = db
+            .query_row(
+                "SELECT parse_support,parse_status,parse_error,format_detail FROM BitsQueueEvidence
+                 WHERE search_pattern='qmgr0.dat'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(legacy.0, "truncated");
+        assert_eq!(legacy.1, "truncated");
+        assert!(legacy.2.is_some());
+        assert!(legacy.3.is_some());
+        assert_eq!(one::<i64>(&db, "SELECT COUNT(*) FROM BitsQueueJobs"), 0);
+        assert_eq!(one::<i64>(&db, "SELECT COUNT(*) FROM BitsQueueFiles"), 0);
+    }
+
+    /// A record that stops short keeps the values it did yield, its raw bytes
+    /// and the reason it is incomplete.
+    #[test]
+    fn partial_queue_record_keeps_values_raw_bytes_and_reason() {
+        use crate::parsers::bits_queue::fixtures::{control, file_record, legacy_queue, JobSpec};
+        use crate::parsers::bits_queue::{JOB_DELIMITERS, XFER_HEADER};
+
+        let fx = Fixture::new(0);
+        let dir = fx.target.join("NonVolatile/BITS/Downloader");
+        std::fs::create_dir_all(&dir).unwrap();
+        let spec = JobSpec { name: "truncated-job", ..JobSpec::default() };
+        let mut job = control(&spec);
+        job.extend_from_slice(&XFER_HEADER);
+        job.extend_from_slice(&1u32.to_le_bytes());
+        job.extend(file_record(r"C:\a\x.bin", "http://host.test/x.bin", r"C:\a\x.tmp", 7, 9));
+        std::fs::write(
+            dir.join("qmgr1.dat"),
+            legacy_queue(&[job.clone()], JOB_DELIMITERS[4].1, 1),
+        )
+        .unwrap();
+
+        let (_, db) = fx.run(Vec::new());
+        let row: (String, String, Option<String>, Option<String>, i64) = db
+            .query_row(
+                "SELECT parse_status,metadata_state,parse_error,created_time,LENGTH(record_blob)
+                 FROM BitsQueueJobs",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(row.0, "partial");
+        assert_eq!(row.1, "absent");
+        assert!(row.2.is_some());
+        assert!(row.3.is_none());
+        assert_eq!(row.4, job.len() as i64);
+        assert_eq!(one::<String>(&db, "SELECT job_name FROM BitsQueueJobs"), "truncated-job");
+        assert_eq!(
+            one::<String>(&db, "SELECT source_url FROM BitsQueueFiles"),
+            "http://host.test/x.bin"
+        );
+        assert_eq!(
+            one::<i64>(&db, "SELECT failed_record_count FROM BitsQueueEvidence WHERE search_pattern='qmgr1.dat'"),
+            1
+        );
+        assert_eq!(
+            one::<String>(&db, "SELECT parse_support FROM BitsQueueEvidence WHERE search_pattern='qmgr1.dat'"),
+            "parsed_with_errors"
+        );
     }
 }

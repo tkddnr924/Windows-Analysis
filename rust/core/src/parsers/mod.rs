@@ -1,4 +1,5 @@
 pub mod amcache;
+pub mod bits_queue;
 pub mod browser_cache;
 pub mod browser_history;
 pub mod eventlog;
@@ -16,4 +17,5 @@ pub mod taskscheduler;
 pub mod timeline;
 pub mod usnjrnl;
 pub mod wer;
+pub mod wer_dump;
 pub mod wmi_repository;

@@ -26,6 +26,7 @@ mod defender_support;
 mod firewall_history;
 mod bits_history;
 mod wer_reports;
+mod wer_dumps;
 mod artifact_paths;
 mod stream;
 mod usn;

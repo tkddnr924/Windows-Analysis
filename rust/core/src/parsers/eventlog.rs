@@ -34,6 +34,10 @@ pub const ALLOWLIST: &[&str] = &[
     "Microsoft-Windows-SmbClient%4Security.evtx",
     "Microsoft-Windows-Bits-Client%4Operational.evtx",
     "Microsoft-Windows-Windows Firewall With Advanced Security%4Firewall.evtx",
+    "Microsoft-Windows-Windows Firewall With Advanced Security%4ConnectionSecurity.evtx",
+    "Microsoft-Windows-Windows Firewall With Advanced Security%4FirewallDiagnostics.evtx",
+    "Microsoft-Windows-WFP%4Operational.evtx",
+    "Microsoft-Windows-IKE%4Operational.evtx",
     // Preserve WMI execution and subscription evidence.
     "Microsoft-Windows-WMI-Activity%4Operational.evtx",
     // WinRM/원격 PowerShell 접속.
@@ -55,12 +59,14 @@ pub const EVENT_COLUMNS: &[&str] = &[
     "timestamp",
     "Channel",
     "EventID",
+    "Version",
     "LevelName",
     "Level",
     // System/Keywords — audit success/failure bits (0x8020…/0x8010…) and the
     // provider's keyword flags. Stored as the raw rendered value, not decoded.
     "Keywords",
     "Provider",
+    "ProviderGuid",
     "Computer",
     "EventRecordID",
     "ProcessID",
@@ -188,9 +194,8 @@ fn fmt_ts(system_time: Option<&Value>, record_ts: DateTime<Utc>) -> String {
     fmt_kst(record_ts)
 }
 
-/// Build one facts row from the evtx crate's JSON record. Every System scalar
-/// is stored exactly as rendered — Keywords in particular carries the audit
-/// success/failure bits, and decoding them belongs to the analysis layer.
+/// Preserve rendered System fields; schema identifiers remain available to
+/// channel-specific analysis instead of inferring an event template by ID alone.
 fn evtx_row(data: &Value, record_ts: DateTime<Utc>) -> Row {
     let sys = get(data, &["Event", "System"]).unwrap_or(&Value::Null);
     let payload =
@@ -211,6 +216,9 @@ fn evtx_row(data: &Value, record_ts: DateTime<Utc>) -> Row {
     if let Some(v) = cell(scalar(sys.get("EventID"))) {
         row.insert("EventID".into(), v);
     }
+    if let Some(v) = cell(scalar(sys.get("Version"))) {
+        row.insert("Version".into(), v);
+    }
     row.insert("LevelName".into(), level_name(level.as_deref()));
     if let Some(v) = level {
         row.insert("Level".into(), v);
@@ -222,6 +230,9 @@ fn evtx_row(data: &Value, record_ts: DateTime<Utc>) -> Row {
     }
     if let Some(v) = cell(get(sys, &["Provider", "#attributes", "Name"])) {
         row.insert("Provider".into(), v);
+    }
+    if let Some(v) = cell(get(sys, &["Provider", "#attributes", "Guid"])) {
+        row.insert("ProviderGuid".into(), v);
     }
     if let Some(v) = cell(sys.get("Computer")) {
         row.insert("Computer".into(), v);
@@ -251,7 +262,9 @@ fn evtx_row(data: &Value, record_ts: DateTime<Utc>) -> Row {
         "EventData".into(),
         match payload {
             Some(p) => py_json(p),
-            None => String::new(),
+            None => get(data, &["Event", "ProcessingErrorData"])
+                .map(|error| format!("{{\"ProcessingErrorData\": {}}}", py_json(error)))
+                .unwrap_or_default(),
         },
     );
     row
@@ -737,6 +750,23 @@ mod evtx_tests {
             row.get("timestamp").map(String::as_str),
             Some("2026-10-07 10:02:03.000")
         );
+    }
+
+    #[test]
+    fn processing_error_retains_opaque_payload_and_decode_failure_context() {
+        let error = json!({
+            "ErrorCode": 13,
+            "DataItemName": "ModifyingUser",
+            "EventPayload": "AAECAw=="
+        });
+        let data = json!({"Event": {
+            "System": {"EventID": 2011},
+            "ProcessingErrorData": error
+        }});
+        let row = evtx_row(&data, record_ts());
+        let payload: Value = serde_json::from_str(&row["EventData"]).unwrap();
+        assert_eq!(payload["ProcessingErrorData"], error);
+        assert!(payload.get("ModifyingUser").is_none());
     }
 
     /// UserData만 있는 공급자(예: 방화벽 일부)도 payload를 잃지 않는다.

@@ -77,6 +77,8 @@ pub fn prepare_ancillary_facts(
     let mut published = if count == 0 { Vec::new() } else { vec![ANCILLARY_DB.to_string()] };
     published.extend(super::defender::prepare_inputs(out_dir, target, dataset_id)?);
     published.extend(super::scheduled_tasks::prepare_inputs(out_dir, target, dataset_id)?);
+    published.extend(super::wer_reports::prepare_inputs(out_dir, target, dataset_id)?);
+    published.extend(super::bits_history::prepare_inputs(out_dir, target, dataset_id)?);
     Ok(published)
 }
 

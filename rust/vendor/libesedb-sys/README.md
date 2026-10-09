@@ -28,6 +28,21 @@ bindgen libesedb-20230824/include/libesedb.h -o src/bindings.rs -- -Ilibesedb-20
 
 <https://github.com/libyal/libesedb/pull/69>
 
+### Bugfix: 64-bit Long-Value Keys
+
+`fix-long_value_64bit_key.patch` backports the 4/8-byte long-value key
+handling from [libyal/libesedb commit 0d42d69](https://github.com/libyal/libesedb/blob/0d42d69cc4fe89eab3bb5e938c956777a026fc60/libesedb/libesedb_record.c).
+The 20230824 reader rejected the 8-byte keys used by Windows 10/11 BITS
+`qmgr.db`. Segment keys now reserve 12 bytes and append the 4-byte offset
+after the actual identifier width; the 4-byte path is retained.
+
+Verified through the native parser against the MIT-licensed
+[Artemis corpus at b234127](https://github.com/puffyCid/artemis/tree/b23412776038a54dbbcbc73560dad8751a388151/forensics/tests/test_data/windows/ese):
+Windows 10 Jobs1/Files1 and Windows 11 Jobs4/Files4. All ten complete blobs
+match an independent `dissect.esedb 3.18` reader byte-for-byte. No recovered
+or tag-deleted records are requested. This patch does not add writes or
+change the public FFI.
+
 ### QoL: Maximum Leaf-Pages
 
 Note: the original value of `16 * 1024` has been increased as far as possible to `(INT_MAX - 1)` in order for large databases to load. In my testing the value makes no meaningful difference beyond limiting the sorts/sizes of files you can open.

@@ -18,14 +18,17 @@ use crate::sqlite::Row;
 
 /// Only this provider's events are Defender evidence; a file name is not.
 const PROVIDER: &str = "Microsoft-Windows-Windows Defender";
+/// Provider GUID from the registered manifest; corroboration for the name.
+const PROVIDER_GUID: &str = "11cd958a-c507-4ef3-b3f2-5fd9dfbd2c78";
 const TIME_KIND_EVENT: &str = "이벤트 기록 시각";
 const TIME_KIND_DETECTION: &str = "탐지 기록 시각";
 const SOURCE_EVENTLOG: &str = "EventLog";
 const SOURCE_MPDETECTION: &str = "MPDetection";
 const SOURCE_LABEL_EVENTLOG: &str = "Defender 이벤트 로그";
 const SOURCE_LABEL_MPDETECTION: &str = "Defender 탐지 로그(MPDetection)";
-/// Documented Defender event meanings come from this channel only.
+/// The two channels the provider manifest declares.
 const OPERATIONAL_CHANNEL: &str = "Microsoft-Windows-Windows Defender/Operational";
+const WHC_CHANNEL: &str = "Microsoft-Windows-Windows Defender/WHC";
 /// Defender event logs this build knows about, so a log that was never
 /// collected is distinguishable from one collected with zero events.
 const EXPECTED_LOGS: &[&str] = &[
@@ -33,10 +36,12 @@ const EXPECTED_LOGS: &[&str] = &[
     "Microsoft-Windows-Windows Defender%4WHC",
 ];
 
-/// Documented event semantics (Microsoft Defender Antivirus event IDs).
-/// `support_state` records whether the mapping comes from the published
-/// schema or only from the observed payload, so an unmapped event stays
-/// visible instead of being guessed.
+/// Documented event semantics. Every mapping is keyed by channel because the
+/// manifest declares each event on one channel only: an id seen on the other
+/// channel is not the same event (뷰어13 A01).
+/// `support_state` says whether the meaning is published, `support_source`
+/// says which authority published it, so an unmapped event stays visible
+/// instead of being guessed.
 struct Kind {
     id: i64,
     section: &'static str,
@@ -44,6 +49,7 @@ struct Kind {
     title: &'static str,
     description: &'static str,
     support_state: &'static str,
+    support_source: &'static str,
 }
 
 const fn kind(
@@ -53,89 +59,215 @@ const fn kind(
     title: &'static str,
     description: &'static str,
     support_state: &'static str,
+    support_source: &'static str,
 ) -> Kind {
-    Kind { id, section, event_type, title, description, support_state }
+    Kind { id, section, event_type, title, description, support_state, support_source }
 }
 
 const DOC: &str = "documented";
 const PAYLOAD_ONLY: &str = "payload_only";
+/// Event id, channel and message template taken from the registered provider
+/// manifest of `MpEvMsg.dll` (Microsoft-Windows-Windows Defender,
+/// {11cd958a-c507-4ef3-b3f2-5fd9dfbd2c78}).
+const SRC_MANIFEST: &str = "provider_manifest";
+/// Microsoft Learn documentation where the manifest dump has no entry.
+const SRC_MSDOCS: &str = "microsoft_docs";
+/// Field names observed in collected payloads with no published template.
+const SRC_PAYLOAD: &str = "observed_payload";
 
-const KINDS: &[Kind] = &[
-    kind(1000, "scan", "scan_started", "검사 시작", "맬웨어 방지 검사를 시작함", DOC),
-    kind(1001, "scan", "scan_completed", "검사 완료", "맬웨어 방지 검사를 완료함", DOC),
-    kind(1002, "scan", "scan_cancelled", "검사 중지", "검사가 완료 전에 중지됨", DOC),
-    kind(1006, "threat", "threat_detected", "위협 탐지", "맬웨어 또는 원치 않는 소프트웨어를 탐지함", DOC),
-    kind(1007, "threat_action", "threat_action_taken", "조치 수행", "탐지 항목에 조치를 수행함", DOC),
-    kind(1008, "threat_action", "threat_action_failed", "조치 실패", "탐지 항목 조치가 실패함", DOC),
-    kind(1009, "threat_action", "quarantine_restored", "격리 복원", "격리에서 항목을 복원함", DOC),
-    kind(1010, "threat_action", "quarantine_restore_failed", "격리 복원 실패", "격리 항목 복원이 실패함", DOC),
-    kind(1011, "threat_action", "quarantine_deleted", "격리 삭제", "격리 항목을 삭제함", DOC),
-    kind(1012, "threat_action", "quarantine_delete_failed", "격리 삭제 실패", "격리 항목 삭제가 실패함", DOC),
-    kind(1013, "history", "history_cleared", "기록 삭제", "맬웨어·검사 기록을 삭제함", DOC),
-    kind(1014, "history", "history_clear_failed", "기록 삭제 실패", "맬웨어·검사 기록 삭제가 실패함", DOC),
-    kind(1015, "threat", "behavior_detected", "동작 탐지", "의심스러운 동작을 탐지함", DOC),
-    kind(1116, "threat", "threat_detected", "위협 탐지", "맬웨어 또는 원치 않는 소프트웨어를 탐지함", DOC),
-    kind(1117, "threat_action", "threat_action_taken", "조치 수행", "탐지 항목에 조치를 수행함", DOC),
-    kind(1118, "threat_action", "threat_action_failed", "조치 실패", "탐지 항목 조치가 실패함(비치명적)", DOC),
-    kind(1119, "threat_action", "threat_action_critically_failed", "조치 치명적 실패", "탐지 항목 조치가 치명적 오류로 실패함", DOC),
-    kind(1120, "threat", "threat_hash_logged", "탐지 해시 기록", "탐지 리소스의 해시를 기록함", DOC),
-    kind(1127, "threat", "controlled_folder_access_blocked", "폴더 액세스 차단", "제어된 폴더 액세스가 신뢰되지 않은 프로세스를 차단함", DOC),
-    kind(1150, "health", "service_healthy", "서비스 정상", "서비스가 정상 상태로 보고됨", DOC),
-    kind(1151, "health", "health_report", "상태 보고", "클라이언트 상태를 보고함", DOC),
-    kind(2000, "signature", "signature_updated", "정의 업데이트", "보안 인텔리전스를 업데이트함", DOC),
-    kind(2001, "signature", "signature_update_failed", "정의 업데이트 실패", "보안 인텔리전스 업데이트가 실패함", DOC),
-    kind(2002, "signature", "engine_updated", "엔진 업데이트", "엔진을 업데이트함", DOC),
-    kind(2003, "signature", "engine_update_failed", "엔진 업데이트 실패", "엔진 업데이트가 실패함", DOC),
-    kind(2004, "signature", "signature_load_failed", "정의 로드 실패", "정의를 로드하지 못해 이전 정의로 되돌림", DOC),
-    kind(2005, "signature", "engine_load_platform_outdated", "플랫폼 버전 부족", "플랫폼 버전이 낮아 엔진을 로드하지 못함", DOC),
-    kind(2006, "signature", "platform_update_failed", "플랫폼 업데이트 실패", "플랫폼 업데이트가 실패함", DOC),
-    kind(2007, "health", "platform_almost_outdated", "플랫폼 만료 예정", "플랫폼이 곧 만료됨", DOC),
-    kind(2010, "signature", "cloud_intelligence_received", "클라우드 인텔리전스 수신", "클라우드 보호로 추가 인텔리전스를 받음", DOC),
-    kind(2011, "signature", "dynamic_signature_deleted", "동적 정의 삭제", "만료된 동적 정의를 삭제함", DOC),
-    kind(2012, "signature", "dynamic_signature_failed", "동적 정의 오류", "동적 정의 사용 중 오류가 발생함", DOC),
-    kind(2013, "signature", "dynamic_signatures_deleted_all", "동적 정의 전체 삭제", "모든 동적 정의를 삭제함", DOC),
-    kind(2020, "signature", "clean_file_downloaded", "정상 파일 수신", "분석용 정상 파일을 내려받음", DOC),
-    kind(2021, "signature", "clean_file_download_failed", "정상 파일 수신 실패", "정상 파일 내려받기가 실패함", DOC),
-    kind(2030, "scan", "offline_scan_installed", "오프라인 검사 구성", "다음 재시작에 오프라인 검사를 실행하도록 구성됨", DOC),
-    kind(2031, "scan", "offline_scan_install_failed", "오프라인 검사 구성 실패", "오프라인 검사 구성이 실패함", DOC),
-    kind(2040, "health", "os_support_expiring", "OS 지원 종료 예정", "이 운영체제 버전의 지원이 곧 종료됨", DOC),
-    kind(2041, "health", "os_support_ended", "OS 지원 종료", "이 운영체제 버전의 지원이 종료됨", DOC),
-    kind(2042, "health", "protection_support_ended", "보호 지원 종료", "엔진이 이 운영체제를 더 이상 보호하지 않음", DOC),
-    kind(2050, "threat", "sample_submitted", "샘플 제출", "분석용 샘플 파일을 제출함", DOC),
-    kind(3002, "failure", "realtime_protection_feature_failure", "실시간 보호 기능 실패", "실시간 보호 기능이 오류로 실패함", DOC),
-    kind(3007, "failure", "realtime_protection_feature_recovered", "실시간 보호 기능 복구", "실시간 보호 기능이 복구됨", DOC),
-    kind(5000, "tampering", "realtime_protection_enabled", "실시간 보호 사용", "실시간 보호가 사용 상태로 기록됨", DOC),
-    kind(5001, "tampering", "realtime_protection_disabled", "실시간 보호 해제", "실시간 보호가 사용 안 함으로 기록됨", DOC),
-    kind(5004, "tampering", "realtime_protection_config_changed", "실시간 보호 구성 변경", "실시간 보호 구성이 변경됨", DOC),
-    kind(5007, "tampering", "configuration_changed", "보호 구성 변경", "보호 구성 값이 변경됨", DOC),
-    kind(5008, "failure", "engine_failure", "엔진 오류", "엔진이 예기치 않은 오류로 종료됨", DOC),
-    kind(5009, "tampering", "malware_scanning_enabled", "맬웨어 검사 사용", "맬웨어·원치 않는 소프트웨어 검사가 사용 상태로 기록됨", DOC),
-    kind(5010, "tampering", "malware_scanning_disabled", "맬웨어 검사 해제", "맬웨어·원치 않는 소프트웨어 검사가 사용 안 함으로 기록됨", DOC),
-    kind(5011, "tampering", "virus_scanning_enabled", "바이러스 검사 사용", "바이러스 검사가 사용 상태로 기록됨", DOC),
-    kind(5012, "tampering", "virus_scanning_disabled", "바이러스 검사 해제", "바이러스 검사가 사용 안 함으로 기록됨", DOC),
-    kind(5013, "tampering", "tamper_protection_blocked_change", "변조 방지 차단", "변조 방지가 설정 변경을 차단함", DOC),
-    kind(5017, "failure", "feature_configuration_failure", "기능 구성 실패", "기능 구성에 실패한 사유가 기록됨", PAYLOAD_ONLY),
-    kind(5100, "health", "platform_expiring", "보호 만료 예정", "보호 플랫폼이 곧 만료됨", DOC),
-    kind(5101, "health", "platform_expired", "보호 만료", "보호 플랫폼이 만료되어 보호가 중지됨", DOC),
+/// Sections of the Operational channel.
+const SECTION_THREAT: &str = "threat";
+const SECTION_THREAT_ACTION: &str = "threat_action";
+const SECTION_SCAN: &str = "scan";
+const SECTION_SIGNATURE: &str = "signature";
+const SECTION_TAMPERING: &str = "tampering";
+const SECTION_HEALTH: &str = "health";
+const SECTION_FAILURE: &str = "failure";
+const SECTION_HISTORY: &str = "history";
+const SECTION_ASR: &str = "asr";
+const SECTION_FOLDER_GUARD: &str = "folder_guard";
+const SECTION_NETWORK: &str = "network_protection";
+const SECTION_DEVICE_CONTROL: &str = "device_control";
+/// WHC channel section; the health state value itself stays raw.
+const SECTION_WHC_STATE: &str = "whc_state";
+
+const OPERATIONAL_KINDS: &[Kind] = &[
+    kind(1000, SECTION_SCAN, "scan_started", "검사 시작", "맬웨어 방지 검사를 시작함", DOC, SRC_MANIFEST),
+    kind(1001, SECTION_SCAN, "scan_completed", "검사 완료", "맬웨어 방지 검사를 완료함", DOC, SRC_MANIFEST),
+    kind(1002, SECTION_SCAN, "scan_cancelled", "검사 중지", "검사가 완료 전에 중지됨", DOC, SRC_MANIFEST),
+    kind(1003, SECTION_SCAN, "scan_paused", "검사 일시 중지", "검사가 일시 중지됨", DOC, SRC_MANIFEST),
+    kind(1004, SECTION_SCAN, "scan_resumed", "검사 재개", "일시 중지된 검사가 재개됨", DOC, SRC_MANIFEST),
+    kind(1005, SECTION_SCAN, "scan_error", "검사 오류 종료", "검사가 오류를 만나 종료됨", DOC, SRC_MANIFEST),
+    kind(1006, SECTION_THREAT, "threat_detected", "위협 탐지", "맬웨어 또는 원치 않는 소프트웨어를 탐지함", DOC, SRC_MANIFEST),
+    kind(1007, SECTION_THREAT_ACTION, "threat_action_taken", "조치 수행", "탐지 항목에 조치를 수행함", DOC, SRC_MANIFEST),
+    kind(1008, SECTION_THREAT_ACTION, "threat_action_failed", "조치 실패", "탐지 항목 조치가 실패함", DOC, SRC_MANIFEST),
+    kind(1009, SECTION_THREAT_ACTION, "quarantine_restored", "격리 복원", "격리에서 항목을 복원함", DOC, SRC_MANIFEST),
+    kind(1010, SECTION_THREAT_ACTION, "quarantine_restore_failed", "격리 복원 실패", "격리 항목 복원이 실패함", DOC, SRC_MANIFEST),
+    kind(1011, SECTION_THREAT_ACTION, "quarantine_deleted", "격리 삭제", "격리 항목을 삭제함", DOC, SRC_MANIFEST),
+    kind(1012, SECTION_THREAT_ACTION, "quarantine_delete_failed", "격리 삭제 실패", "격리 항목 삭제가 실패함", DOC, SRC_MANIFEST),
+    kind(1013, SECTION_HISTORY, "history_cleared", "기록 삭제", "맬웨어·검사 기록을 삭제함", DOC, SRC_MANIFEST),
+    kind(1014, SECTION_HISTORY, "history_clear_failed", "기록 삭제 실패", "맬웨어·검사 기록 삭제가 실패함", DOC, SRC_MANIFEST),
+    kind(1015, SECTION_THREAT, "behavior_detected", "동작 탐지", "의심스러운 동작을 탐지함", DOC, SRC_MANIFEST),
+    kind(1116, SECTION_THREAT, "threat_detected", "위협 탐지", "맬웨어 또는 원치 않는 소프트웨어를 탐지함", DOC, SRC_MANIFEST),
+    kind(1117, SECTION_THREAT_ACTION, "threat_action_taken", "조치 수행", "탐지 항목에 조치를 수행함", DOC, SRC_MANIFEST),
+    kind(1118, SECTION_THREAT_ACTION, "threat_action_failed", "조치 실패", "탐지 항목 조치가 실패함(비치명적)", DOC, SRC_MANIFEST),
+    kind(1119, SECTION_THREAT_ACTION, "threat_action_critically_failed", "조치 치명적 실패", "탐지 항목 조치가 치명적 오류로 실패함", DOC, SRC_MANIFEST),
+    kind(1120, SECTION_THREAT, "threat_hash_logged", "탐지 해시 기록", "탐지 리소스의 해시를 기록함", DOC, SRC_MANIFEST),
+    // ASR·CFA·네트워크 보호는 차단과 감사를 이벤트 자체로 구분한다.
+    kind(1121, SECTION_ASR, "asr_rule_blocked", "ASR 규칙 차단", "공격 표면 축소 규칙이 차단 모드로 작업을 차단함", DOC, SRC_MANIFEST),
+    kind(1122, SECTION_ASR, "asr_rule_audited", "ASR 규칙 감사", "공격 표면 축소 규칙이 감사 모드로 작업을 기록함(차단 아님)", DOC, SRC_MANIFEST),
+    kind(1123, SECTION_FOLDER_GUARD, "cfa_blocked", "폴더 액세스 차단", "제어된 폴더 액세스가 신뢰되지 않은 프로세스의 변경을 차단함", DOC, SRC_MANIFEST),
+    kind(1124, SECTION_FOLDER_GUARD, "cfa_audited", "폴더 액세스 감사", "제어된 폴더 액세스가 감사 모드로 변경 시도를 기록함(차단 아님)", DOC, SRC_MANIFEST),
+    kind(1125, SECTION_NETWORK, "network_connection_audited", "네트워크 연결 감사", "네트워크 보호가 감사 모드로 연결을 기록함(차단 아님)", DOC, SRC_MANIFEST),
+    kind(1126, SECTION_NETWORK, "network_connection_blocked", "네트워크 연결 차단", "네트워크 보호가 위험한 연결을 차단함", DOC, SRC_MANIFEST),
+    kind(1127, SECTION_FOLDER_GUARD, "cfa_sector_write_blocked", "디스크 섹터 쓰기 차단", "제어된 폴더 액세스가 신뢰되지 않은 프로세스의 디스크 섹터·메모리 변경을 차단함", DOC, SRC_MANIFEST),
+    kind(1128, SECTION_FOLDER_GUARD, "cfa_sector_write_audited", "디스크 섹터 쓰기 감사", "제어된 폴더 액세스가 감사 모드로 디스크 섹터·메모리 변경 시도를 기록함(차단 아님)", DOC, SRC_MANIFEST),
+    kind(1129, SECTION_ASR, "asr_rule_warn_overridden", "ASR 경고 재정의", "사용자가 경고 모드의 차단을 재정의함", DOC, SRC_MSDOCS),
+    kind(1133, SECTION_DEVICE_CONTROL, "device_control_blocked", "정책 작업 차단", "정책이 허용하지 않는 작업을 차단함", DOC, SRC_MANIFEST),
+    kind(1134, SECTION_DEVICE_CONTROL, "device_control_audited", "정책 작업 감사", "정책 작업을 감사 기록함(차단 아님)", DOC, SRC_MANIFEST),
+    kind(1150, SECTION_HEALTH, "service_healthy", "서비스 정상", "서비스가 정상 상태로 보고됨", DOC, SRC_MANIFEST),
+    kind(1151, SECTION_HEALTH, "health_report", "상태 보고", "클라이언트 상태를 보고함", DOC, SRC_MANIFEST),
+    kind(1160, SECTION_THREAT, "pua_detected", "PUA 탐지", "원치 않는 응용 프로그램(PUA)을 탐지함", DOC, SRC_MANIFEST),
+    kind(2000, SECTION_SIGNATURE, "signature_updated", "정의 업데이트", "보안 인텔리전스를 업데이트함", DOC, SRC_MANIFEST),
+    kind(2001, SECTION_SIGNATURE, "signature_update_failed", "정의 업데이트 실패", "보안 인텔리전스 업데이트가 실패함", DOC, SRC_MANIFEST),
+    kind(2002, SECTION_SIGNATURE, "engine_updated", "엔진 업데이트", "엔진을 업데이트함", DOC, SRC_MANIFEST),
+    kind(2003, SECTION_SIGNATURE, "engine_update_failed", "엔진 업데이트 실패", "엔진 업데이트가 실패함", DOC, SRC_MANIFEST),
+    kind(2004, SECTION_SIGNATURE, "signature_load_failed", "정의 로드 실패", "정의를 로드하지 못해 이전 정의로 되돌림", DOC, SRC_MANIFEST),
+    kind(2005, SECTION_SIGNATURE, "engine_load_platform_outdated", "플랫폼 버전 부족", "플랫폼 버전이 낮아 엔진을 로드하지 못함", DOC, SRC_MANIFEST),
+    kind(2006, SECTION_SIGNATURE, "platform_update_failed", "플랫폼 업데이트 실패", "플랫폼 업데이트가 실패함", DOC, SRC_MANIFEST),
+    kind(2007, SECTION_HEALTH, "platform_almost_outdated", "플랫폼 만료 예정", "플랫폼이 곧 만료됨", DOC, SRC_MANIFEST),
+    kind(2010, SECTION_SIGNATURE, "cloud_intelligence_received", "클라우드 인텔리전스 수신", "클라우드 보호로 추가 인텔리전스를 받음", DOC, SRC_MANIFEST),
+    kind(2011, SECTION_SIGNATURE, "dynamic_signature_deleted", "동적 정의 삭제", "만료된 동적 정의를 삭제함", DOC, SRC_MANIFEST),
+    kind(2012, SECTION_SIGNATURE, "dynamic_signature_failed", "동적 정의 오류", "동적 정의 사용 중 오류가 발생함", DOC, SRC_MANIFEST),
+    kind(2013, SECTION_SIGNATURE, "dynamic_signatures_deleted_all", "동적 정의 전체 삭제", "모든 동적 정의를 삭제함", DOC, SRC_MANIFEST),
+    kind(2020, SECTION_SIGNATURE, "clean_file_downloaded", "정상 파일 수신", "분석용 정상 파일을 내려받음", DOC, SRC_MANIFEST),
+    kind(2021, SECTION_SIGNATURE, "clean_file_download_failed", "정상 파일 수신 실패", "정상 파일 내려받기가 실패함", DOC, SRC_MANIFEST),
+    kind(2030, SECTION_SCAN, "offline_scan_installed", "오프라인 검사 구성", "다음 재시작에 오프라인 검사를 실행하도록 구성됨", DOC, SRC_MANIFEST),
+    kind(2031, SECTION_SCAN, "offline_scan_install_failed", "오프라인 검사 구성 실패", "오프라인 검사 구성이 실패함", DOC, SRC_MANIFEST),
+    kind(2040, SECTION_HEALTH, "os_support_expiring", "OS 지원 종료 예정", "이 운영체제 버전의 지원이 곧 종료됨", DOC, SRC_MANIFEST),
+    kind(2041, SECTION_HEALTH, "os_support_ended", "OS 지원 종료", "이 운영체제 버전의 지원이 종료됨", DOC, SRC_MANIFEST),
+    kind(2042, SECTION_HEALTH, "protection_support_ended", "보호 지원 종료", "엔진이 이 운영체제를 더 이상 보호하지 않음", DOC, SRC_MANIFEST),
+    kind(2050, SECTION_THREAT, "sample_submitted", "샘플 제출", "분석용 샘플 파일을 제출함", DOC, SRC_MANIFEST),
+    kind(2051, SECTION_THREAT, "sample_submit_failed", "샘플 제출 실패", "분석용 샘플 파일 제출이 실패함", DOC, SRC_MANIFEST),
+    kind(3002, SECTION_FAILURE, "realtime_protection_feature_failure", "실시간 보호 기능 실패", "실시간 보호 기능이 오류로 실패함", DOC, SRC_MANIFEST),
+    kind(3007, SECTION_FAILURE, "realtime_protection_feature_recovered", "실시간 보호 기능 복구", "실시간 보호 기능이 복구됨", DOC, SRC_MANIFEST),
+    kind(5000, SECTION_TAMPERING, "realtime_protection_enabled", "실시간 보호 사용", "실시간 보호가 사용 상태로 기록됨", DOC, SRC_MANIFEST),
+    kind(5001, SECTION_TAMPERING, "realtime_protection_disabled", "실시간 보호 해제", "실시간 보호가 사용 안 함으로 기록됨", DOC, SRC_MANIFEST),
+    kind(5004, SECTION_TAMPERING, "realtime_protection_config_changed", "실시간 보호 구성 변경", "실시간 보호 구성이 변경됨", DOC, SRC_MANIFEST),
+    kind(5007, SECTION_TAMPERING, "configuration_changed", "보호 구성 변경", "보호 구성 값이 변경됨", DOC, SRC_MANIFEST),
+    kind(5008, SECTION_FAILURE, "engine_failure", "엔진 오류", "엔진이 예기치 않은 오류로 종료됨", DOC, SRC_MANIFEST),
+    kind(5009, SECTION_TAMPERING, "malware_scanning_enabled", "맬웨어 검사 사용", "맬웨어·원치 않는 소프트웨어 검사가 사용 상태로 기록됨", DOC, SRC_MANIFEST),
+    kind(5010, SECTION_TAMPERING, "malware_scanning_disabled", "맬웨어 검사 해제", "맬웨어·원치 않는 소프트웨어 검사가 사용 안 함으로 기록됨", DOC, SRC_MANIFEST),
+    kind(5011, SECTION_TAMPERING, "virus_scanning_enabled", "바이러스 검사 사용", "바이러스 검사가 사용 상태로 기록됨", DOC, SRC_MANIFEST),
+    kind(5012, SECTION_TAMPERING, "virus_scanning_disabled", "바이러스 검사 해제", "바이러스 검사가 사용 안 함으로 기록됨", DOC, SRC_MANIFEST),
+    kind(5013, SECTION_TAMPERING, "tamper_protection_blocked_change", "변조 방지 차단", "변조 방지가 설정 변경을 차단함", DOC, SRC_MSDOCS),
+    kind(5017, SECTION_FAILURE, "feature_configuration_failure", "기능 구성 실패", "기능 구성에 실패한 사유가 기록됨", PAYLOAD_ONLY, SRC_PAYLOAD),
+    kind(5100, SECTION_HEALTH, "platform_expiring", "보호 만료 예정", "보호 플랫폼이 곧 만료됨", DOC, SRC_MANIFEST),
+    kind(5101, SECTION_HEALTH, "platform_expired", "보호 만료", "보호 플랫폼이 만료되어 보호가 중지됨", DOC, SRC_MANIFEST),
 ];
 
-fn kind_of(event_id: Option<i64>) -> Option<&'static Kind> {
+/// The manifest declares a single event on the WHC channel. Its state code is
+/// an unlabelled number, so only the fact of a state update is stated and the
+/// code itself stays raw.
+const WHC_KINDS: &[Kind] = &[kind(
+    101,
+    SECTION_WHC_STATE,
+    "whc_state_updated",
+    "Defender 상태 갱신",
+    "Defender 바이러스 백신 상태가 갱신됨(상태 코드 원문 보존, 의미 미확인)",
+    DOC,
+    SRC_MANIFEST,
+)];
+
+/// Channel-keyed lookup: an Operational meaning is never applied to another
+/// channel just because the event number matches.
+fn kind_of(channel: &str, event_id: Option<i64>) -> Option<&'static Kind> {
     let id = event_id?;
-    KINDS.iter().find(|kind| kind.id == id)
+    let table = if channel.eq_ignore_ascii_case(OPERATIONAL_CHANNEL) {
+        OPERATIONAL_KINDS
+    } else if channel.eq_ignore_ascii_case(WHC_CHANNEL) {
+        WHC_KINDS
+    } else {
+        return None;
+    };
+    table.iter().find(|kind| kind.id == id)
 }
 
 fn section_label(section: &str) -> &'static str {
     match section {
-        "threat" => "탐지",
-        "threat_action" => "조치",
-        "scan" => "검사",
-        "signature" => "정의 버전",
-        "tampering" => "보호 설정",
-        "health" => "상태 보고",
-        "failure" => "오류",
-        "history" => "기록 삭제",
+        SECTION_THREAT => "탐지",
+        SECTION_THREAT_ACTION => "조치",
+        SECTION_SCAN => "검사",
+        SECTION_SIGNATURE => "정의 버전",
+        SECTION_TAMPERING => "보호 설정",
+        SECTION_HEALTH => "상태 보고",
+        SECTION_FAILURE => "오류",
+        SECTION_HISTORY => "기록 삭제",
+        SECTION_ASR => "공격 표면 축소",
+        SECTION_FOLDER_GUARD => "폴더 액세스 보호",
+        SECTION_NETWORK => "네트워크 보호",
+        SECTION_DEVICE_CONTROL => "장치·정책 제어",
+        SECTION_WHC_STATE => "상태 갱신(WHC)",
         _ => "기타",
     }
+}
+
+/// Protection feature and enforcement mode, both from the event's own
+/// documented meaning. Audit events never become blocks and block events
+/// never become successful remediations.
+const MODE_BLOCK: &str = "block";
+const MODE_AUDIT: &str = "audit";
+const MODE_WARN_OVERRIDE: &str = "warn_override";
+
+fn protection_of(section: &str, event_type: &str) -> Option<(&'static str, &'static str)> {
+    let feature = match section {
+        SECTION_ASR => "attack_surface_reduction",
+        SECTION_FOLDER_GUARD => "controlled_folder_access",
+        SECTION_NETWORK => "network_protection",
+        SECTION_DEVICE_CONTROL => "device_control",
+        _ => return None,
+    };
+    let mode = match event_type {
+        "asr_rule_blocked" | "cfa_blocked" | "cfa_sector_write_blocked"
+        | "network_connection_blocked" | "device_control_blocked" => MODE_BLOCK,
+        "asr_rule_audited" | "cfa_audited" | "cfa_sector_write_audited"
+        | "network_connection_audited" | "device_control_audited" => MODE_AUDIT,
+        "asr_rule_warn_overridden" => MODE_WARN_OVERRIDE,
+        _ => return None,
+    };
+    Some((feature, mode))
+}
+
+/// Attack surface reduction rule GUIDs and their published names. An unlisted
+/// GUID keeps the raw value with no invented name.
+const ASR_RULES: &[(&str, &str)] = &[
+    ("56a863a9-875e-4185-98a7-b882c64b5ce5", "Block abuse of exploited vulnerable signed drivers"),
+    ("7674ba52-37eb-4a4f-a9a1-f0f9a1619a2c", "Block Adobe Reader from creating child processes"),
+    ("d4f940ab-401b-4efc-aadc-ad5f3c50688a", "Block all Office applications from creating child processes"),
+    ("9e6c4e1f-7d60-472f-ba1a-a39ef669e4b2", "Block credential stealing from the Windows local security authority subsystem"),
+    ("be9ba2d9-53ea-4cdc-84e5-9b1eeee46550", "Block executable content from email client and webmail"),
+    ("01443614-cd74-433a-b99e-2ecdc07bfc25", "Block executable files from running unless they meet a prevalence, age, or trusted list criterion"),
+    ("5beb7efe-fd9a-4556-801d-275e5ffc04cc", "Block execution of potentially obfuscated scripts"),
+    ("d3e037e1-3eb8-44c8-a917-57927947596d", "Block JavaScript or VBScript from launching downloaded executable content"),
+    ("3b576869-a4ec-4529-8536-b80a7769e899", "Block Office applications from creating executable content"),
+    ("75668c1f-73b5-4cf0-bb93-3ecf5cb7cc84", "Block Office applications from injecting code into other processes"),
+    ("26190899-1602-49e8-8b27-eb1d0a1ce869", "Block Office communication application from creating child processes"),
+    ("e6db77e5-3df2-4cf1-b95a-636979351e5b", "Block persistence through WMI event subscription"),
+    ("d1e49aac-8f56-4280-b9ba-993a6d77406c", "Block process creations originating from PSExec and WMI commands"),
+    ("33ddedf1-c6e0-47cb-833e-de6133960387", "Block rebooting machine in Safe Mode"),
+    ("b2b3f03d-6a65-4f7b-a9c7-1c7ef74a9ba4", "Block untrusted and unsigned processes that run from USB"),
+    ("c0033c00-d16d-4114-a5a0-dc9b3a7d2ceb", "Block use of copied or impersonated system tools"),
+    ("a8f5898e-1dc8-49a9-9878-85004b8a61e6", "Block Webshell creation for Servers"),
+    ("92e97fa1-2edf-4476-bdd6-9dd0b4dddc7b", "Block Win32 API calls from Office macros"),
+    ("c1db55ab-c21a-4637-bb3f-a12568109d35", "Use advanced protection against ransomware"),
+];
+
+fn asr_rule_name(raw: &str) -> Option<&'static str> {
+    let trimmed = raw.trim().trim_start_matches('{').trim_end_matches('}');
+    ASR_RULES
+        .iter()
+        .find(|(guid, _)| guid.eq_ignore_ascii_case(trimmed))
+        .map(|(_, name)| *name)
 }
 
 /// Registry value names whose change directly concerns protection features.
@@ -212,7 +344,15 @@ fn payload_of(raw: Option<&str>) -> Payload {
                 _ => None,
             };
             let count = nested.as_ref().map(Map::len).unwrap_or_else(|| map.len());
-            let shape = if nested.is_some() { "nested" } else { "flat" };
+            // A record the parser could only keep as ProcessingErrorData has
+            // no readable field template; it is not an empty normal payload.
+            let shape = if nested.is_some() {
+                "nested"
+            } else if map.contains_key("ProcessingErrorData") {
+                "processing_error"
+            } else {
+                "flat"
+            };
             Payload { map, nested, shape, count }
         }
         _ => Payload { map: Map::new(), nested: None, shape: "invalid", count: 0 },
@@ -386,15 +526,95 @@ fn result_of(event_type: &str, error_code: &str) -> (Option<&'static str>, Optio
         | "offline_scan_install_failed"
         | "history_clear_failed"
         | "engine_failure"
+        | "scan_error"
+        | "sample_submit_failed"
         | "realtime_protection_feature_failure"
         | "feature_configuration_failure" => (Some("failure"), Some("event:reported_failure")),
         "scan_completed" => (Some("success"), Some("event:scan_completed")),
         "scan_cancelled" => (Some("unknown"), Some("event:scan_cancelled")),
-        "threat_detected" | "behavior_detected" => {
+        "scan_paused" | "scan_resumed" => (Some("unknown"), Some("event:scan_state_only")),
+        "threat_detected" | "behavior_detected" | "pua_detected" => {
             (Some("unknown"), Some("event:detection_without_action"))
+        }
+        // Enforcement events state what the engine did, not that a threat was
+        // removed: an audit event is explicitly not a block.
+        "asr_rule_blocked" | "cfa_blocked" | "cfa_sector_write_blocked"
+        | "network_connection_blocked" | "device_control_blocked" => {
+            (Some("blocked"), Some("event:block_mode_enforced"))
+        }
+        "asr_rule_audited" | "cfa_audited" | "cfa_sector_write_audited"
+        | "network_connection_audited" | "device_control_audited" => {
+            (Some("audited"), Some("event:audit_mode_only"))
+        }
+        "asr_rule_warn_overridden" => {
+            (Some("warn_overridden"), Some("event:user_override_in_warn_mode"))
+        }
+        "tamper_protection_blocked_change" => {
+            (Some("blocked"), Some("event:tamper_protection_blocked"))
         }
         _ => (None, None),
     }
+}
+
+/// Network protection writes one endpoint string. Only its syntax is read:
+/// no category, reputation or direction is invented.
+#[derive(Default)]
+struct Destination {
+    kind: &'static str,
+    scheme: String,
+    host: String,
+    ip: String,
+    port: Option<i64>,
+}
+
+fn destination_of(raw: &str) -> Option<Destination> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let (scheme, rest) = match trimmed.split_once("://") {
+        Some((scheme, rest)) if !scheme.is_empty() && !scheme.contains(['/', '.', ' ']) => {
+            (scheme.to_string(), rest)
+        }
+        _ => (String::new(), trimmed),
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    // Userinfo stays out of the host; the raw value keeps it.
+    let authority = authority.rsplit('@').next().unwrap_or(authority);
+    let (host, port) = if let Some(end) = authority.strip_prefix('[').and_then(|_| authority.find(']')) {
+        let host = &authority[1..end];
+        let port = authority[end + 1..].strip_prefix(':').and_then(|port| port.parse::<i64>().ok());
+        (host.to_string(), port)
+    } else if authority.matches(':').count() > 1 {
+        // A bracketless IPv6 literal has no port to split off.
+        (authority.to_string(), None)
+    } else {
+        match authority.rsplit_once(':') {
+            Some((host, port)) if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) => {
+                (host.to_string(), port.parse::<i64>().ok())
+            }
+            _ => (authority.to_string(), None),
+        }
+    };
+    let ip = host.parse::<std::net::IpAddr>().ok().map(|ip| ip.to_string());
+    let kind = if !scheme.is_empty() {
+        "url"
+    } else if ip.is_some() {
+        "ip"
+    } else if !host.is_empty() && host.contains('.') {
+        "hostname"
+    } else if host.is_empty() {
+        "unparsed"
+    } else {
+        "host_label"
+    };
+    Some(Destination {
+        kind,
+        scheme,
+        host,
+        ip: ip.unwrap_or_default(),
+        port,
+    })
 }
 
 fn feature_state(raw: &str) -> &'static str {
@@ -497,14 +717,16 @@ pub(super) fn build(ctx: &Ctx, cache: &EventLogOverviewCache) -> Result<usize> {
             });
         }
         let event_id = g(row, "EventID").trim().parse::<i64>().ok();
-        // The documented meanings belong to the Operational channel; another
-        // Defender channel keeps its payload with unverified semantics.
-        let operational = g(row, "Channel").eq_ignore_ascii_case(OPERATIONAL_CHANNEL);
-        let found = if operational { kind_of(event_id) } else { None };
+        // Each documented meaning belongs to one channel; the same number on
+        // the other channel is a different event and stays raw.
+        let channel = g(row, "Channel");
+        let known_channel = channel.eq_ignore_ascii_case(OPERATIONAL_CHANNEL)
+            || channel.eq_ignore_ascii_case(WHC_CHANNEL);
+        let found = kind_of(channel, event_id);
         if found.is_none() {
             entry.unmapped += 1;
         }
-        let (record, facts) = event_record(ctx, row, event_id, found, operational, &mut observations)?;
+        let (record, facts) = event_record(ctx, row, event_id, found, known_channel, &mut observations)?;
         stored.push(facts);
         db.write(record)?;
     }
@@ -525,13 +747,17 @@ fn event_record(
     row: &Row,
     event_id: Option<i64>,
     found: Option<&'static Kind>,
-    operational: bool,
+    known_channel: bool,
     observations: &mut Vec<Observation>,
 ) -> Result<(Record, Stored)> {
     let payload = payload_of(row.get("EventData").map(String::as_str));
     let mut record = ctx.record(&SPEC);
     let record_id = record.record_id.clone();
     let timestamp = g(row, "timestamp");
+    let channel = g(row, "Channel");
+    let operational = channel.eq_ignore_ascii_case(OPERATIONAL_CHANNEL);
+    let whc = channel.eq_ignore_ascii_case(WHC_CHANNEL);
+    debug_assert_eq!(known_channel, operational || whc);
     let section = found.map(|kind| kind.section).unwrap_or("other");
     let event_type = found
         .map(|kind| kind.event_type.to_string())
@@ -539,8 +765,10 @@ fn event_record(
     let description = found.map(|kind| kind.description.to_string()).unwrap_or_else(|| {
         if operational {
             "지원 매핑이 없는 Defender 이벤트 원문".to_string()
+        } else if whc {
+            "WHC 채널에서 매핑되지 않은 이벤트 원문 — 확인된 의미 없음".to_string()
         } else {
-            "Operational 외 Defender 채널 이벤트 원문 — 확인된 의미 없음".to_string()
+            "매니페스트에 없는 Defender 채널 이벤트 원문 — 확인된 의미 없음".to_string()
         }
     });
 
@@ -562,6 +790,17 @@ fn event_record(
             }
         })),
     );
+    record.set("support_source", opt_value(found.map(|kind| kind.support_source)));
+    record.set(
+        "channel_state",
+        value(if operational {
+            "manifest_operational"
+        } else if whc {
+            "manifest_whc"
+        } else {
+            "unknown_channel"
+        }),
+    );
     record.set("title", opt_value(found.map(|kind| kind.title)));
 
     // Threat and action fields, each from this event only.
@@ -569,8 +808,20 @@ fn event_record(
     let detection_id = payload.first(&["Detection ID"]);
     let path = payload.first(&["Path", "Threat Resource Path", "Resource", "Target File Name", "File Name", "Filename"]);
     let parsed = resources_of(&path);
+    // `ID` is the threat id in antimalware events and the rule GUID in ASR
+    // events, so the family of this event decides who may read it.
+    let generic_id = payload.get("ID");
+    let antimalware = matches!(
+        section,
+        SECTION_THREAT | SECTION_THREAT_ACTION | SECTION_SCAN | SECTION_SIGNATURE | SECTION_HISTORY
+    );
+    let threat_id = match payload.get("Threat ID") {
+        stored if !stored.is_empty() => stored,
+        _ if antimalware => generic_id.clone(),
+        _ => String::new(),
+    };
     record.set("threat_name", value(&threat_name));
-    record.set("threat_id", value(&payload.first(&["Threat ID", "ID"])));
+    record.set("threat_id", value(&threat_id));
     record.set("severity", value(&payload.first(&["Severity Name", "Severity"])));
     record.set("severity_id", int_text(&payload.first(&["Severity ID"])));
     record.set("category", value(&payload.first(&["Category Name", "Category"])));
@@ -617,6 +868,80 @@ fn event_record(
     let (result, result_basis) = result_of(&event_type, &error_code);
     record.set("result", opt_value(result));
     record.set("result_basis", opt_value(result_basis));
+
+    // Attack surface reduction, controlled folder access, network protection
+    // and policy enforcement. The feature and the enforcement mode come from
+    // the event's documented meaning, never from a payload wording.
+    let protection = protection_of(section, &event_type);
+    record.set("protection_feature", opt_value(protection.map(|(feature, _)| feature)));
+    record.set("protection_mode", opt_value(protection.map(|(_, mode)| mode)));
+    let asr_rule_id = if section == SECTION_ASR { generic_id.clone() } else { String::new() };
+    let asr_name = asr_rule_name(&asr_rule_id);
+    record.set("asr_rule_id", value(&asr_rule_id));
+    record.set("asr_rule_name", opt_value(asr_name));
+    record.set(
+        "asr_rule_name_source",
+        if asr_rule_id.is_empty() {
+            Cell::Null
+        } else {
+            value(if asr_name.is_some() { "microsoft_docs" } else { "unknown_guid" })
+        },
+    );
+    // One endpoint string; its syntax is parsed and the raw value is kept.
+    let destination_raw = payload.get("Destination");
+    let destination = destination_of(&destination_raw);
+    record.set("network_destination_raw", value(&destination_raw));
+    record.set("network_destination_kind", opt_value(destination.as_ref().map(|found| found.kind)));
+    record.set(
+        "network_destination_scheme",
+        destination.as_ref().map(|found| value(&found.scheme)).unwrap_or(Cell::Null),
+    );
+    record.set(
+        "network_destination_host",
+        destination.as_ref().map(|found| value(&found.host)).unwrap_or(Cell::Null),
+    );
+    record.set(
+        "network_destination_ip",
+        destination.as_ref().map(|found| value(&found.ip)).unwrap_or(Cell::Null),
+    );
+    record.set(
+        "network_destination_port",
+        destination.as_ref().and_then(|found| found.port).map(Cell::Int).unwrap_or(Cell::Null),
+    );
+    // Enforcement events carry their own detection instant; the source zone
+    // is recorded and an unzoned value follows the documented UTC rule.
+    let detection_time_raw = payload.first(&["Detection Time", "Detection time"]);
+    let detection_time = support::parse_log_time(&detection_time_raw);
+    record.set("detection_time_raw", value(&detection_time_raw));
+    record.set(
+        "detection_time",
+        detection_time.as_ref().map(|parsed| value(&parsed.display)).unwrap_or(Cell::Null),
+    );
+    record.set(
+        "detection_time_state",
+        if detection_time_raw.is_empty() {
+            Cell::Null
+        } else {
+            value(detection_time.as_ref().map(|parsed| parsed.state()).unwrap_or("unparsed"))
+        },
+    );
+    record.set(
+        "detection_time_zone_source",
+        opt_value(detection_time.as_ref().map(|parsed| parsed.zone)),
+    );
+    // Policy enforcement fields with published names only; the remaining
+    // template parameters have no published name and stay in the field child.
+    record.set("policy_version", value(&payload.get("Policy Version")));
+    record.set("policy_rule_id", value(&payload.get("Policy Rule Id")));
+    record.set("policy_enforcement_level", value(&payload.get("Enforcement Level")));
+    record.set("policy_action_type", value(&payload.get("Action Type")));
+    record.set("policy_audit_reason", value(&payload.get("Audit Reason")));
+    record.set("policy_event_timestamp_raw", value(&payload.get("Event Timestamp")));
+    // WHC state update: the numeric state code has no published enumeration,
+    // so it is stored as written and nothing is derived from it.
+    let whc_state = payload.get("hc_stateid");
+    record.set("whc_state_raw", if whc { value(&whc_state) } else { Cell::Null });
+    record.set("whc_state_id", if whc { int_text(&whc_state) } else { Cell::Null });
 
     // Scan evidence.
     let scan_id = payload.first(&["Scan ID"]);
@@ -745,6 +1070,14 @@ fn event_record(
     let domain = payload.get("Domain");
     let user = payload.get("User");
     let sid = payload.get("SID");
+    // ASR/CFA/network events write one combined `User`; the stored domain and
+    // name come from that one value instead of leaving the pair empty.
+    let (domain, user) = match (domain.is_empty(), user.split_once('\\')) {
+        (true, Some((found_domain, found_name))) => {
+            (found_domain.to_string(), found_name.to_string())
+        }
+        _ => (domain, user),
+    };
     let user_raw = match (domain.is_empty(), user.is_empty()) {
         (true, true) => String::new(),
         (true, false) => user.clone(),
@@ -798,7 +1131,22 @@ fn event_record(
     // Event identity and the exact parser payload.
     record.set("event_id", event_id.map(Cell::Int).unwrap_or(Cell::Null));
     record.set("provider", value(g(row, "Provider")));
-    record.set("channel", value(g(row, "Channel")));
+    record.set("channel", value(channel));
+    // Manifest discriminators kept next to the name; NULL in older facts.
+    let provider_guid = g(row, "ProviderGuid");
+    let normalized_guid = provider_guid.trim().trim_start_matches('{').trim_end_matches('}');
+    record.set("provider_guid", value(provider_guid));
+    record.set(
+        "provider_guid_state",
+        value(if provider_guid.trim().is_empty() {
+            "absent"
+        } else if normalized_guid.eq_ignore_ascii_case(PROVIDER_GUID) {
+            "matched_manifest"
+        } else {
+            "other_guid"
+        }),
+    );
+    record.set("schema_version", int_text(g(row, "Version")));
     record.set("computer", value(g(row, "Computer")));
     record.set("event_record_id", value(g(row, "EventRecordID")));
     record.set("level_name", value(g(row, "LevelName")));
@@ -850,6 +1198,10 @@ fn event_record(
             feature_name.as_str(),
             failure_reason.as_str(),
             error_code.as_str(),
+            asr_rule_id.as_str(),
+            asr_name.unwrap_or(""),
+            destination_raw.as_str(),
+            destination.as_ref().map(|found| found.host.as_str()).unwrap_or(""),
             event_type.as_str(),
             section,
         ])),
@@ -1010,11 +1362,14 @@ fn mpdetection_rows(ctx: &Ctx, db: &mut DerivedDb, stored: &mut Vec<Stored>) -> 
         record.set(
             "timestamp_state",
             value(match detection.timestamp_state.as_str() {
-                "parsed_utc_plus9" => "recorded",
+                parsed if parsed.starts_with("parsed_") => "recorded",
                 other => other,
             }),
         );
         record.set("timestamp_raw", opt_value(detection.timestamp_raw.as_deref()));
+        // The zone the stored instant came from, never an assumed shift.
+        record.set("timestamp_zone_source", opt_value(detection.source_timezone.as_deref()));
+        record.set("timestamp_parse_state", value(&detection.timestamp_state));
         record.set("event_type", value("mpdetection_detection"));
         record.set(
             "description",
@@ -1024,11 +1379,12 @@ fn mpdetection_rows(ctx: &Ctx, db: &mut DerivedDb, stored: &mut Vec<Stored>) -> 
                 "MPDetection DETECTION 행을 해석하지 못함(원문 보존)"
             }),
         );
-        record.set("section", value("threat"));
-        record.set("section_label", value(section_label("threat")));
+        record.set("section", value(SECTION_THREAT));
+        record.set("section_label", value(section_label(SECTION_THREAT)));
         record.set("source", value(SOURCE_MPDETECTION));
         record.set("source_label", value(SOURCE_LABEL_MPDETECTION));
         record.set("support_state", value(&detection.parse_state));
+        record.set("support_source", value(SRC_PAYLOAD));
         record.set("title", value("탐지 기록(MPDetection)"));
         record.set("threat_name", opt_value(detection.threat_name.as_deref()));
         record.set("detection_id_state", value("absent"));
@@ -1233,18 +1589,24 @@ fn scans(ctx: &Ctx, db: &mut DerivedDb, stored: &[Stored]) -> Result<()> {
         let start = pick(&members, "scan_started");
         let completion = pick(&members, "scan_completed");
         let cancel = pick(&members, "scan_cancelled");
+        let error = pick(&members, "scan_error");
+        let pauses = members.iter().filter(|row| row.event_type == "scan_paused").count() as i64;
+        let resumes = members.iter().filter(|row| row.event_type == "scan_resumed").count() as i64;
         let facts = start
             .or(completion)
             .or(cancel)
+            .or(error)
             .and_then(|row| row.scan.as_ref());
         let scan_id = facts.map(|facts| facts.scan_id.clone()).unwrap_or_default();
         // Only an observed pair states a pairing; a missing partner is not a stop.
-        let pairing = match (start.is_some(), completion.is_some(), cancel.is_some()) {
-            (true, true, _) => "start_and_completion",
-            (true, false, true) => "start_and_cancel",
-            (true, false, false) => "start_only",
-            (false, true, _) => "completion_only",
-            (false, false, true) => "cancel_only",
+        let pairing = match (start.is_some(), completion.is_some(), cancel.is_some(), error.is_some()) {
+            (true, true, _, _) => "start_and_completion",
+            (true, false, true, _) => "start_and_cancel",
+            (true, false, false, true) => "start_and_error",
+            (true, false, false, false) => "start_only",
+            (false, true, _, _) => "completion_only",
+            (false, false, true, _) => "cancel_only",
+            (false, false, false, true) => "error_only",
             _ => "unknown",
         };
         let elapsed = match (start.and_then(|row| row.timestamp.as_deref()), completion.and_then(|row| row.timestamp.as_deref())) {
@@ -1266,8 +1628,12 @@ fn scans(ctx: &Ctx, db: &mut DerivedDb, stored: &[Stored]) -> Result<()> {
                     "start_event"
                 } else if completion.is_some() {
                     "completion_event"
-                } else {
+                } else if cancel.is_some() {
                     "cancel_event"
+                } else if error.is_some() {
+                    "error_event"
+                } else {
+                    "member_event"
                 }),
                 opt_value(start.map(|row| row.record_id.as_str())),
                 opt_value(start.and_then(|row| row.timestamp.as_deref())),
@@ -1275,6 +1641,10 @@ fn scans(ctx: &Ctx, db: &mut DerivedDb, stored: &[Stored]) -> Result<()> {
                 opt_value(completion.and_then(|row| row.timestamp.as_deref())),
                 opt_value(cancel.map(|row| row.record_id.as_str())),
                 opt_value(cancel.and_then(|row| row.timestamp.as_deref())),
+                opt_value(error.map(|row| row.record_id.as_str())),
+                opt_value(error.and_then(|row| row.timestamp.as_deref())),
+                Cell::Int(pauses),
+                Cell::Int(resumes),
                 opt_value(duration.map(|facts| facts.duration_raw.as_str())),
                 duration.and_then(|facts| facts.duration_seconds).map(Cell::Int).unwrap_or(Cell::Null),
                 elapsed,
@@ -1501,6 +1871,8 @@ fn input_observations(
                     "read_failed"
                 } else if row.decode_state == support::UNSUPPORTED_ENCODING {
                     "unsupported_encoding"
+                } else if row.decode_state == support::UNDETERMINED_ENCODING {
+                    "undetermined_encoding"
                 } else {
                     "collected"
                 }),
@@ -1605,6 +1977,8 @@ CREATE TABLE "Defender" (
   "source" TEXT,
   "source_label" TEXT,
   "support_state" TEXT,
+  "support_source" TEXT,
+  "channel_state" TEXT,
   "title" TEXT,
   "detail" TEXT,
   "severity" TEXT,
@@ -1635,6 +2009,29 @@ CREATE TABLE "Defender" (
   "error_description" TEXT,
   "result" TEXT,
   "result_basis" TEXT,
+  "protection_feature" TEXT,
+  "protection_mode" TEXT,
+  "asr_rule_id" TEXT,
+  "asr_rule_name" TEXT,
+  "asr_rule_name_source" TEXT,
+  "network_destination_raw" TEXT,
+  "network_destination_kind" TEXT,
+  "network_destination_scheme" TEXT,
+  "network_destination_host" TEXT,
+  "network_destination_ip" TEXT,
+  "network_destination_port" INTEGER,
+  "detection_time_raw" TEXT,
+  "detection_time" TEXT,
+  "detection_time_state" TEXT,
+  "detection_time_zone_source" TEXT,
+  "policy_version" TEXT,
+  "policy_rule_id" TEXT,
+  "policy_enforcement_level" TEXT,
+  "policy_action_type" TEXT,
+  "policy_audit_reason" TEXT,
+  "policy_event_timestamp_raw" TEXT,
+  "whc_state_raw" TEXT,
+  "whc_state_id" INTEGER,
   "scan_id" TEXT,
   "scan_type" TEXT,
   "scan_type_index" INTEGER,
@@ -1718,6 +2115,9 @@ CREATE TABLE "Defender" (
   "event_id" INTEGER,
   "provider" TEXT,
   "channel" TEXT,
+  "provider_guid" TEXT,
+  "provider_guid_state" TEXT,
+  "schema_version" INTEGER,
   "computer" TEXT,
   "event_record_id" TEXT,
   "level_name" TEXT,
@@ -1737,6 +2137,8 @@ CREATE TABLE "Defender" (
   "raw_line" TEXT,
   "timestamp_raw" TEXT,
   "timestamp_state" TEXT,
+  "timestamp_zone_source" TEXT,
+  "timestamp_parse_state" TEXT,
   "search_text" TEXT,
   PRIMARY KEY(record_id),
   CHECK(overview_name = 'Defender'),
@@ -1830,6 +2232,10 @@ CREATE TABLE "DefenderScans" (
   "completion_time" TEXT,
   "cancel_record_id" TEXT,
   "cancel_time" TEXT,
+  "error_record_id" TEXT,
+  "error_time" TEXT,
+  "pause_count" INTEGER,
+  "resume_count" INTEGER,
   "reported_duration_raw" TEXT,
   "reported_duration_seconds" INTEGER,
   "elapsed_seconds" INTEGER,
@@ -1841,7 +2247,8 @@ CREATE TABLE "DefenderScans" (
   PRIMARY KEY(scan_entry_id),
   FOREIGN KEY(start_record_id) REFERENCES "Defender"("record_id") ON DELETE CASCADE,
   FOREIGN KEY(completion_record_id) REFERENCES "Defender"("record_id") ON DELETE CASCADE,
-  FOREIGN KEY(cancel_record_id) REFERENCES "Defender"("record_id") ON DELETE CASCADE
+  FOREIGN KEY(cancel_record_id) REFERENCES "Defender"("record_id") ON DELETE CASCADE,
+  FOREIGN KEY(error_record_id) REFERENCES "Defender"("record_id") ON DELETE CASCADE
 );
 CREATE TABLE "DefenderProtectionStates" (
   "state_id" TEXT NOT NULL,
@@ -1995,7 +2402,7 @@ CREATE TABLE "source_records" (
 CREATE INDEX idx_source_lookup ON source_records(source_db, source_table, source_rowid, source_field);
 
 CREATE TABLE _wina_derived_version (name TEXT NOT NULL PRIMARY KEY, version INTEGER NOT NULL);
-INSERT INTO _wina_derived_version(name,version) VALUES ('overview_contract',1),('defender',2);
+INSERT INTO _wina_derived_version(name,version) VALUES ('overview_contract',1),('defender',3);
 "#;
 
 const MAIN: &[&str] = &[
@@ -2014,6 +2421,8 @@ const MAIN: &[&str] = &[
     "source",
     "source_label",
     "support_state",
+    "support_source",
+    "channel_state",
     "title",
     "detail",
     "severity",
@@ -2044,6 +2453,29 @@ const MAIN: &[&str] = &[
     "error_description",
     "result",
     "result_basis",
+    "protection_feature",
+    "protection_mode",
+    "asr_rule_id",
+    "asr_rule_name",
+    "asr_rule_name_source",
+    "network_destination_raw",
+    "network_destination_kind",
+    "network_destination_scheme",
+    "network_destination_host",
+    "network_destination_ip",
+    "network_destination_port",
+    "detection_time_raw",
+    "detection_time",
+    "detection_time_state",
+    "detection_time_zone_source",
+    "policy_version",
+    "policy_rule_id",
+    "policy_enforcement_level",
+    "policy_action_type",
+    "policy_audit_reason",
+    "policy_event_timestamp_raw",
+    "whc_state_raw",
+    "whc_state_id",
     "scan_id",
     "scan_type",
     "scan_type_index",
@@ -2127,6 +2559,9 @@ const MAIN: &[&str] = &[
     "event_id",
     "provider",
     "channel",
+    "provider_guid",
+    "provider_guid_state",
+    "schema_version",
     "computer",
     "event_record_id",
     "level_name",
@@ -2146,6 +2581,8 @@ const MAIN: &[&str] = &[
     "raw_line",
     "timestamp_raw",
     "timestamp_state",
+    "timestamp_zone_source",
+    "timestamp_parse_state",
     "search_text",
 ];
 
@@ -2213,6 +2650,10 @@ const SCANS: &[&str] = &[
     "completion_time",
     "cancel_record_id",
     "cancel_time",
+    "error_record_id",
+    "error_time",
+    "pause_count",
+    "resume_count",
     "reported_duration_raw",
     "reported_duration_seconds",
     "elapsed_seconds",
@@ -2864,12 +3305,19 @@ mod tests {
             ),
         )
         .unwrap();
-        // UTF-16BE is outside the confirmed encodings and must stay a failure.
+        // UTF-16BE carries the same standard signature and now decodes.
         let mut be = vec![0xFE, 0xFF];
-        for unit in "2026-04-01T02:00:00.000 DETECTION Z res".encode_utf16() {
+        for unit in "2026-04-01T02:00:00.000Z DETECTION Z res".encode_utf16() {
             be.extend_from_slice(&unit.to_be_bytes());
         }
         std::fs::write(support.join("MPDetection-20260402-000000.log"), be).unwrap();
+        // A BOM-less UTF-16 stream is byte-wise valid UTF-8; it must not look
+        // like a healthy file with zero detections.
+        let mut headless = Vec::new();
+        for unit in "2026-04-01T03:00:00.000 DETECTION Q res".encode_utf16() {
+            headless.extend_from_slice(&unit.to_le_bytes());
+        }
+        std::fs::write(support.join("MPDetection-20260403-000000.log"), headless).unwrap();
         case.prepare();
 
         let db = case.build(vec![event(
@@ -2879,8 +3327,8 @@ mod tests {
             r#"{"Threat Name":"Trojan:Win32/X","Path":"file:_C:\\tmp\\a.exe"}"#,
         )]);
 
-        // One EVTX row plus both MPDetection lines, including the unparsed time.
-        assert_eq!(one::<i64>(&db, "SELECT COUNT(*) FROM Defender WHERE source='MPDetection'"), 2);
+        // One EVTX row plus the little-endian lines and the big-endian line.
+        assert_eq!(one::<i64>(&db, "SELECT COUNT(*) FROM Defender WHERE source='MPDetection'"), 3);
         let (ts, raw, state, line): (Option<String>, String, String, i64) = db
             .query_row(
                 "SELECT timestamp,timestamp_raw,timestamp_state,line_number FROM Defender \
@@ -2891,42 +3339,66 @@ mod tests {
         assert_eq!(raw, "NOT-A-TIME");
         assert_eq!(state, "unparsed");
         assert_eq!(line, 3);
-        // Confirmed +9h conversion for the parsed line.
-        assert_eq!(
-            one::<String>(&db, "SELECT timestamp FROM Defender WHERE source='MPDetection' AND threat_name='Trojan:Win32/X'"),
-            "2026-04-01 10:00:00.000"
-        );
+        // Documented UTC rule for an unzoned value, kept as evidence.
+        let (time, zone, parse_state): (String, String, String) = db
+            .query_row(
+                "SELECT timestamp,timestamp_zone_source,timestamp_parse_state FROM Defender \
+                 WHERE source='MPDetection' AND threat_name='Trojan:Win32/X'",
+                [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap();
+        assert_eq!(time, "2026-04-01 10:00:00.000");
+        assert_eq!(zone, support::ZONE_UTC_DOCUMENTED);
+        assert_eq!(parse_state, "parsed_utc_documented");
         assert_eq!(
             one::<String>(&db, "SELECT raw_line FROM Defender WHERE source='MPDetection' AND threat_name='Trojan:Win32/X'"),
             "2026-04-01T01:00:00.000 DETECTION Trojan:Win32/X file:_C:\\tmp\\a.exe"
         );
-        // Unsupported encoding is not a healthy zero-detection file.
-        let (decode, detections): (String, Option<i64>) = db
+        // The explicit Z of the big-endian line is recorded as such.
+        let (be_time, be_zone): (String, String) = db
             .query_row(
-                "SELECT decode_state,detection_line_count FROM DefenderInputObservations \
-                 WHERE input_kind='mpdetection' AND source_file LIKE '%20260402%'",
+                "SELECT timestamp,timestamp_zone_source FROM Defender \
+                 WHERE source='MPDetection' AND threat_name='Z'",
                 [], |r| Ok((r.get(0)?, r.get(1)?)))
             .unwrap();
-        assert_eq!(decode, "unsupported_encoding");
-        assert_eq!(detections, None);
+        assert_eq!(be_time, "2026-04-01 11:00:00.000");
+        assert_eq!(be_zone, support::ZONE_UTC_EXPLICIT);
+        let observation = |pattern: &str| -> (String, Option<i64>, Option<i64>) {
+            db.query_row(
+                "SELECT decode_state,detection_line_count,line_count FROM DefenderInputObservations \
+                 WHERE input_kind='mpdetection' AND source_file LIKE ?1",
+                [pattern],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(observation("%20260402%"), ("decoded_utf16be_bom".to_string(), Some(1), Some(1)));
+        // An undetermined encoding is not a healthy zero-detection file.
         assert_eq!(
-            one::<i64>(&db, "SELECT line_count FROM DefenderInputObservations WHERE input_kind='mpdetection' AND source_file LIKE '%20260401%'"),
-            3
+            observation("%20260403%"),
+            ("undetermined_encoding".to_string(), None, None)
         );
+        assert_eq!(
+            one::<String>(
+                &db,
+                "SELECT collection_state FROM DefenderInputObservations WHERE source_file LIKE '%20260403%'"
+            ),
+            "undetermined_encoding"
+        );
+        assert_eq!(observation("%20260401%").2, Some(3));
         // A06: equal threat and time is a candidate, never a merged detection.
         let (basis, relation): (String, String) = db
             .query_row("SELECT match_basis,relation FROM DefenderSourceCandidates", [], |r| Ok((r.get(0)?, r.get(1)?)))
             .unwrap();
         assert_eq!(relation, "candidate");
         assert!(basis.contains("threat_name"));
-        assert_eq!(one::<i64>(&db, "SELECT COUNT(*) FROM DefenderDetections"), 3);
+        assert_eq!(one::<i64>(&db, "SELECT COUNT(*) FROM DefenderDetections"), 4);
         // MPDetection rows point at their own preserved facts rows.
         assert_eq!(
             one::<i64>(
                 &db,
                 "SELECT COUNT(*) FROM source_records WHERE source_artifact='MPDetection' AND source_table='Defender_MPDetection_Records'"
             ),
-            2
+            3
         );
         assert_eq!(one::<i64>(&db, "SELECT COUNT(*) FROM pragma_foreign_key_check"), 0);
     }
@@ -3002,5 +3474,288 @@ mod tests {
         // No events means no invented semantics anywhere.
         assert_eq!(one::<i64>(&db, "SELECT COUNT(*) FROM Defender"), 0);
         assert_eq!(one::<i64>(&db, "SELECT COUNT(*) FROM DefenderProtectionLatest"), 0);
+    }
+
+    /// The same event row seen on another channel of the same provider.
+    fn on_channel(mut row: Row, channel: &str) -> Row {
+        row.insert("Channel".to_string(), channel.to_string());
+        row
+    }
+
+    // A01/R12: the WHC channel has its own single documented event; an
+    // Operational id seen there keeps no Operational meaning.
+    #[test]
+    fn whc_channel_maps_only_its_own_manifest_event() {
+        let case = Case::new(4);
+        let db = case.build(vec![
+            on_channel(
+                event("101", 1, "2026-08-01 00:00:00.000", r#"{"hc_stateid":"4"}"#),
+                WHC_CHANNEL,
+            ),
+            // An ASR block id on the WHC channel is not an ASR block event.
+            on_channel(
+                event("1121", 2, "2026-08-01 00:01:00.000", r#"{"ID":"{c1db55ab-c21a-4637-bb3f-a12568109d35}"}"#),
+                WHC_CHANNEL,
+            ),
+            // The WHC id on the Operational channel is equally unmapped.
+            event("101", 3, "2026-08-01 00:02:00.000", r#"{"hc_stateid":"4"}"#),
+            on_channel(
+                event("1150", 4, "2026-08-01 00:03:00.000", "{}"),
+                "Microsoft-Windows-Windows Defender/Unknown",
+            ),
+        ]);
+
+        let row = |record: i64, column: &str| -> Option<String> {
+            db.query_row(
+                &format!("SELECT {column} FROM Defender WHERE event_record_id=?1"),
+                [record.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(row(1, "event_type").as_deref(), Some("whc_state_updated"));
+        assert_eq!(row(1, "section").as_deref(), Some(SECTION_WHC_STATE));
+        assert_eq!(row(1, "support_state").as_deref(), Some(DOC));
+        assert_eq!(row(1, "support_source").as_deref(), Some(SRC_MANIFEST));
+        assert_eq!(row(1, "channel_state").as_deref(), Some("manifest_whc"));
+        // The state code stays raw and keeps no invented meaning.
+        assert_eq!(row(1, "whc_state_raw").as_deref(), Some("4"));
+        assert_eq!(
+            one::<i64>(&db, "SELECT whc_state_id FROM Defender WHERE event_record_id='1'"),
+            4
+        );
+        assert_eq!(row(2, "support_state").as_deref(), Some("unmapped_channel"));
+        assert_eq!(row(2, "event_type").as_deref(), Some("defender_event_1121"));
+        assert_eq!(row(2, "protection_feature"), None);
+        assert_eq!(row(2, "asr_rule_id"), None);
+        assert_eq!(row(3, "support_state").as_deref(), Some("unmapped"));
+        assert_eq!(row(3, "whc_state_raw"), None);
+        assert_eq!(row(4, "channel_state").as_deref(), Some("unknown_channel"));
+        assert_eq!(row(4, "support_state").as_deref(), Some("unmapped_channel"));
+        // No protection state, scan or detection is created from any of them.
+        assert_eq!(one::<i64>(&db, "SELECT COUNT(*) FROM DefenderProtectionStates"), 0);
+        assert_eq!(one::<i64>(&db, "SELECT COUNT(*) FROM DefenderScans"), 0);
+        assert_eq!(one::<i64>(&db, "SELECT COUNT(*) FROM DefenderDetections"), 0);
+        assert_eq!(one::<i64>(&db, "SELECT COUNT(*) FROM pragma_foreign_key_check"), 0);
+    }
+
+    // A01: block, audit and warn-override stay distinct, the rule GUID is not
+    // a threat id, and the endpoint keeps its raw value next to its parts.
+    #[test]
+    fn asr_network_and_folder_events_keep_mode_rule_and_endpoint() {
+        let case = Case::new(6);
+        let db = case.build(vec![
+            event(
+                "1121",
+                1,
+                "2026-08-02 10:00:00.000",
+                r#"{"ID":"{c1db55ab-c21a-4637-bb3f-a12568109d35}","Detection Time":"2026-08-02T01:00:00.000Z","User":"WIN-HOST\\admin","Path":"C:\\tmp\\a.docx","Process Name":"C:\\Office\\winword.exe","Signature Version":"1.443.1.0","Product Version":"4.18.25110.6"}"#,
+            ),
+            event(
+                "1122",
+                2,
+                "2026-08-02 10:01:00.000",
+                r#"{"ID":"{00000000-0000-0000-0000-000000000001}","Detection Time":"2026-08-02T01:01:00.000Z","User":"WIN-HOST\\admin","Path":"C:\\tmp\\b.docx","Process Name":"C:\\Office\\excel.exe"}"#,
+            ),
+            event(
+                "1129",
+                3,
+                "2026-08-02 10:02:00.000",
+                r#"{"ID":"{c1db55ab-c21a-4637-bb3f-a12568109d35}","User":"WIN-HOST\\admin","Path":"C:\\tmp\\c.docx"}"#,
+            ),
+            event(
+                "1125",
+                4,
+                "2026-08-02 10:03:00.000",
+                r#"{"Detection Time":"2026-08-02T01:03:00Z","User":"WIN-HOST\\admin","Destination":"https://example.test:8443/path?q=1","Process Name":"C:\\Windows\\explorer.exe"}"#,
+            ),
+            event(
+                "1126",
+                5,
+                "2026-08-02 10:04:00.000",
+                r#"{"Detection Time":"NOT-A-TIME","User":"WIN-HOST\\admin","Destination":"203.0.113.5:443","Process Name":"C:\\Windows\\explorer.exe"}"#,
+            ),
+            event(
+                "1127",
+                6,
+                "2026-08-02 10:05:00.000",
+                r#"{"Detection Time":"2026-08-02T01:05:00.000Z","User":"WIN-HOST\\admin","Path":"\\Device\\HarddiskVolume3","Process Name":"C:\\tmp\\x.exe"}"#,
+            ),
+        ]);
+
+        let text = |record: i64, column: &str| -> Option<String> {
+            db.query_row(
+                &format!("SELECT {column} FROM Defender WHERE event_record_id=?1"),
+                [record.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        // Block and audit are different results; neither is a success.
+        assert_eq!(text(1, "result").as_deref(), Some("blocked"));
+        assert_eq!(text(1, "protection_mode").as_deref(), Some(MODE_BLOCK));
+        assert_eq!(text(1, "protection_feature").as_deref(), Some("attack_surface_reduction"));
+        assert_eq!(text(2, "result").as_deref(), Some("audited"));
+        assert_eq!(text(2, "protection_mode").as_deref(), Some(MODE_AUDIT));
+        assert_eq!(text(3, "result").as_deref(), Some("warn_overridden"));
+        assert_eq!(text(3, "protection_mode").as_deref(), Some(MODE_WARN_OVERRIDE));
+        assert_eq!(text(4, "protection_mode").as_deref(), Some(MODE_AUDIT));
+        assert_eq!(text(5, "protection_mode").as_deref(), Some(MODE_BLOCK));
+        assert_eq!(text(6, "protection_feature").as_deref(), Some("controlled_folder_access"));
+        assert_eq!(text(6, "event_type").as_deref(), Some("cfa_sector_write_blocked"));
+        assert_eq!(
+            one::<i64>(&db, "SELECT COUNT(*) FROM Defender WHERE result='success'"),
+            0
+        );
+        // The rule GUID is a rule, never the threat id of a detection.
+        assert_eq!(
+            text(1, "asr_rule_id").as_deref(),
+            Some("{c1db55ab-c21a-4637-bb3f-a12568109d35}")
+        );
+        assert_eq!(text(1, "asr_rule_name").as_deref(), Some("Use advanced protection against ransomware"));
+        assert_eq!(text(1, "asr_rule_name_source").as_deref(), Some("microsoft_docs"));
+        assert_eq!(text(1, "threat_id"), None);
+        assert_eq!(text(2, "asr_rule_name"), None);
+        assert_eq!(text(2, "asr_rule_name_source").as_deref(), Some("unknown_guid"));
+        assert_eq!(text(4, "asr_rule_id"), None);
+        // Path, process and the combined user are typed and still raw.
+        assert_eq!(text(1, "target_path").as_deref(), Some("C:\\tmp\\a.docx"));
+        assert_eq!(text(1, "process").as_deref(), Some("C:\\Office\\winword.exe"));
+        assert_eq!(text(1, "event_user_raw").as_deref(), Some("WIN-HOST\\admin"));
+        assert_eq!(text(1, "event_user_domain").as_deref(), Some("WIN-HOST"));
+        assert_eq!(text(1, "event_user_name").as_deref(), Some("admin"));
+        assert_eq!(text(6, "target_path").as_deref(), Some("\\Device\\HarddiskVolume3"));
+        // Endpoint parts come from the syntax only; the raw stays untouched.
+        assert_eq!(text(4, "network_destination_raw").as_deref(), Some("https://example.test:8443/path?q=1"));
+        assert_eq!(text(4, "network_destination_kind").as_deref(), Some("url"));
+        assert_eq!(text(4, "network_destination_scheme").as_deref(), Some("https"));
+        assert_eq!(text(4, "network_destination_host").as_deref(), Some("example.test"));
+        assert_eq!(text(4, "network_destination_ip"), None);
+        assert_eq!(
+            one::<i64>(&db, "SELECT network_destination_port FROM Defender WHERE event_record_id='4'"),
+            8443
+        );
+        assert_eq!(text(5, "network_destination_kind").as_deref(), Some("ip"));
+        assert_eq!(text(5, "network_destination_ip").as_deref(), Some("203.0.113.5"));
+        assert_eq!(text(1, "network_destination_raw"), None);
+        // The payload detection instant keeps its zone evidence.
+        assert_eq!(text(1, "detection_time").as_deref(), Some("2026-08-02 10:00:00.000"));
+        assert_eq!(text(1, "detection_time_state").as_deref(), Some("parsed_utc_explicit"));
+        assert_eq!(text(1, "detection_time_zone_source").as_deref(), Some(support::ZONE_UTC_EXPLICIT));
+        assert_eq!(text(5, "detection_time"), None);
+        assert_eq!(text(5, "detection_time_raw").as_deref(), Some("NOT-A-TIME"));
+        assert_eq!(text(5, "detection_time_state").as_deref(), Some("unparsed"));
+        assert_eq!(text(3, "detection_time_state"), None);
+        // Enforcement events are not detections and change no feature state.
+        assert_eq!(one::<i64>(&db, "SELECT COUNT(*) FROM DefenderDetections"), 0);
+        assert_eq!(one::<i64>(&db, "SELECT COUNT(*) FROM DefenderProtectionStates"), 0);
+        assert_eq!(one::<i64>(&db, "SELECT COUNT(*) FROM DefenderProtectionLatest"), 0);
+        // Every event keeps one summary row per documented kind.
+        assert_eq!(
+            one::<i64>(&db, "SELECT COUNT(*) FROM DefenderActivitySummaries WHERE section IN ('asr','network_protection','folder_guard')"),
+            6
+        );
+        let search: String = one(&db, "SELECT search_text FROM Defender WHERE event_record_id='4'");
+        assert!(search.contains("example.test"), "{search}");
+        assert_eq!(one::<i64>(&db, "SELECT COUNT(*) FROM pragma_foreign_key_check"), 0);
+    }
+
+    // A01/A02: policy enforcement fields and the full scan lifecycle.
+    #[test]
+    fn policy_events_and_scan_lifecycle_keep_their_own_evidence() {
+        let case = Case::new(6);
+        let db = case.build(vec![
+            event(
+                "1133",
+                1,
+                "2026-08-03 09:00:00.000",
+                r#"{"Policy Version":"1","Policy Rule Id":"{RULE-1}","Enforcement Level":"Deny","Action Type":"Write","Event Timestamp":"2026-08-03T00:00:00Z"}"#,
+            ),
+            event(
+                "1134",
+                2,
+                "2026-08-03 09:01:00.000",
+                r#"{"Policy Version":"1","Policy Rule Id":"{RULE-2}","Enforcement Level":"Audit","Audit Reason":"AllowedByPolicy","Action Type":"Read"}"#,
+            ),
+            event("1000", 3, "2026-08-03 10:00:00.000", r#"{"Scan ID":"{S1}","Scan Type":"빠른 검사"}"#),
+            event("1003", 4, "2026-08-03 10:01:00.000", r#"{"Scan ID":"{S1}"}"#),
+            event("1004", 5, "2026-08-03 10:02:00.000", r#"{"Scan ID":"{S1}"}"#),
+            event(
+                "1005",
+                6,
+                "2026-08-03 10:03:00.000",
+                r#"{"Scan ID":"{S1}","Error Code":"0x80508023","Error Description":"항목을 찾을 수 없습니다"}"#,
+            ),
+        ]);
+
+        let text = |record: i64, column: &str| -> Option<String> {
+            db.query_row(
+                &format!("SELECT {column} FROM Defender WHERE event_record_id=?1"),
+                [record.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(text(1, "protection_feature").as_deref(), Some("device_control"));
+        assert_eq!(text(1, "policy_rule_id").as_deref(), Some("{RULE-1}"));
+        assert_eq!(text(1, "policy_enforcement_level").as_deref(), Some("Deny"));
+        assert_eq!(text(1, "policy_event_timestamp_raw").as_deref(), Some("2026-08-03T00:00:00Z"));
+        assert_eq!(text(1, "result").as_deref(), Some("blocked"));
+        assert_eq!(text(2, "result").as_deref(), Some("audited"));
+        assert_eq!(text(2, "policy_audit_reason").as_deref(), Some("AllowedByPolicy"));
+        assert_eq!(text(1, "policy_audit_reason"), None);
+        // A started scan that errors is never reported as completed.
+        let (pairing, pauses, resumes): (String, i64, i64) = db
+            .query_row(
+                "SELECT pairing_state,pause_count,resume_count FROM DefenderScans",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(pairing, "start_and_error");
+        assert_eq!((pauses, resumes), (1, 1));
+        assert_eq!(
+            one::<String>(&db, "SELECT error_time FROM DefenderScans"),
+            "2026-08-03 10:03:00.000"
+        );
+        assert_eq!(
+            one::<i64>(&db, "SELECT COUNT(*) FROM DefenderScans WHERE completion_record_id IS NOT NULL OR elapsed_seconds IS NOT NULL"),
+            0
+        );
+        assert_eq!(text(6, "result").as_deref(), Some("failure"));
+        assert_eq!(text(4, "result").as_deref(), Some("unknown"));
+        assert_eq!(one::<i64>(&db, "SELECT COUNT(*) FROM pragma_foreign_key_check"), 0);
+    }
+
+    // The manifest discriminators are stored when the facts carry them and
+    // stay NULL for older facts instead of being assumed.
+    #[test]
+    fn provider_guid_and_schema_version_are_stored_or_null() {
+        let case = Case::new(3);
+        let mut matched = event("1150", 1, "2026-08-04 00:00:00.000", "{}");
+        matched.insert("ProviderGuid".to_string(), format!("{{{PROVIDER_GUID}}}"));
+        matched.insert("Version".to_string(), "0".to_string());
+        let mut other = event("1150", 2, "2026-08-04 00:01:00.000", "{}");
+        other.insert(
+            "ProviderGuid".to_string(),
+            "{00000000-0000-0000-0000-000000000000}".to_string(),
+        );
+        other.insert("Version".to_string(), "2".to_string());
+        let legacy = event("1150", 3, "2026-08-04 00:02:00.000", "{}");
+        let db = case.build(vec![matched, other, legacy]);
+
+        let state = |record: i64| -> (String, Option<i64>, Option<String>) {
+            db.query_row(
+                "SELECT provider_guid_state,schema_version,provider_guid FROM Defender WHERE event_record_id=?1",
+                [record.to_string()],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(state(1).0, "matched_manifest");
+        assert_eq!(state(1).1, Some(0));
+        assert_eq!(state(2).0, "other_guid");
+        assert_eq!(state(2).1, Some(2));
+        assert_eq!(state(3), ("absent".to_string(), None, None));
     }
 }
