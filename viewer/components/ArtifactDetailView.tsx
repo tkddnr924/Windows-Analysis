@@ -16,7 +16,7 @@ import { getArtifactView } from "@/lib/artifactViews";
 import type { BrowserVisitGraph, CacheBodyPreview, FetchLinkedRows } from "@/lib/types";
 import AccountTreeOutlinedIcon from "@mui/icons-material/AccountTreeOutlined";
 import VisitFlowGraphModal from "./VisitFlowGraph";
-import { isExactSid, resolveAccountDisplay, type AccountDirectory } from "@/lib/accountIdentity";
+import { resolveAccountDisplay, type AccountDirectory } from "@/lib/accountIdentity";
 import { parsePrivileges, lookupPrivilege } from "@/lib/privileges";
 import TagList from "./TagList";
 import MiniTimeline from "./MiniTimeline";
@@ -270,33 +270,13 @@ function CopyButton({ value }: { value: string }) {
   );
 }
 
-function AccountSidValue({ sid, accountDirectory }: { sid: string; accountDirectory?: AccountDirectory }) {
-  const accountName = resolveAccountDisplay(sid, accountDirectory);
-
-  return (
-    <div>
-      <div style={{ fontFamily: "var(--mono)", fontSize: 12, wordBreak: "break-all" }}>{sid}</div>
-      {accountName !== sid && (
-        <div style={{ marginTop: 6 }}>
-          <span className="dfir-tag dfir-tag--info">
-            <AccountCircleOutlinedIcon sx={{ fontSize: 14 }} aria-hidden />
-            {accountName}
-          </span>
-        </div>
-      )}
-    </div>
-  );
-}
-
 function AccountValue({ account, accountDirectory }: { account: string; accountDirectory?: AccountDirectory }) {
   const display = resolveAccountDisplay(account, accountDirectory);
+  // Label only; the raw value stays in the tooltip and the copy button.
   return (
-    <span>
-      <span className="dfir-tag dfir-tag--info">
-        <AccountCircleOutlinedIcon sx={{ fontSize: 14 }} aria-hidden />
-        {display}
-      </span>
-      {display !== account && isExactSid(account) && <span style={{ display: "block", marginTop: 5, color: "var(--text-faint)", fontFamily: "var(--mono)", fontSize: 11.5 }}>{account}</span>}
+    <span className="dfir-tag dfir-tag--info" title={display !== account ? account : undefined}>
+      <AccountCircleOutlinedIcon sx={{ fontSize: 14 }} aria-hidden />
+      {display}
     </span>
   );
 }
@@ -473,7 +453,7 @@ function FieldRow({ field, row, onFetchLinkedRows, hostDir, accountDirectory, on
       content = <PrivilegeList raw={raw} />;
       break;
     case "accountSid":
-      content = <AccountSidValue sid={raw} accountDirectory={accountDirectory} />;
+      content = <AccountValue account={raw} accountDirectory={accountDirectory} />;
       break;
     case "account":
       content = <AccountValue account={raw} accountDirectory={accountDirectory} />;

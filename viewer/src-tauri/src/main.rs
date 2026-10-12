@@ -412,7 +412,7 @@ fn account_directory_from_rows(
 }
 
 /// SID → display account name. docs-01 runtime lookup: Metadata.sqlite row with
-/// kind='account', scope='machine', key=lower(SID). A NULL value stays
+/// kind='account' or 'virtual_account' (service/DWM/UMFD), scope='machine', key=lower(SID). A NULL value stays
 /// unresolved and the UI shows the SID; no name is invented. The old TargetInfo
 /// composition is gone — metadata is the single source for account names.
 #[tauri::command]
@@ -436,7 +436,7 @@ fn account_directory(host_dir: String) -> Result<Vec<AccountDirectoryEntry>, Str
         &conn,
         &format!(
             "SELECT account_sid, value, COALESCE(name_source, '') AS name_source FROM {} \
-             WHERE kind = 'account' AND scope = 'machine' \
+             WHERE kind IN ('account', 'virtual_account') AND scope = 'machine' \
              AND account_sid IS NOT NULL AND value IS NOT NULL",
             q(&table)
         ),
@@ -2796,139 +2796,10 @@ fn browser_domain_bytes(domains: &[BrowserVisitedDomainStat]) -> usize {
         .sum()
 }
 
-/// One EventLog SQLite table selected by the renderer.  EventLog collection
-/// can produce one result database per original EVTX, so account activity
-/// needs to merge pages across more than one source table.
-#[derive(Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct AccountEventSource {
-    full_path: String,
-    table_name: String,
-    log_name: String,
-}
-
-/// Query contract for the account-detail EventLog list.  The start/end bounds
-/// are already normalised to the parser's sortable timestamp format by the
-/// renderer.
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct AccountEventQuery {
-    sid: String,
-    username: String,
-    search: Option<String>,
-    start: Option<String>,
-    end: Option<String>,
-    offset: i64,
-    limit: i64,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct AccountEventPage {
-    rows: Vec<Map<String, Value>>,
-    row_count: i64,
-    source_count: i64,
-    sources_read: i64,
-    source_failures: Vec<AccountEventSourceFailure>,
-}
-
-/// A per-source read failure.  The reason is intentionally a stable,
-/// user-safe stage description rather than an arbitrary SQLite/OS error.
-#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-struct AccountEventSourceFailure {
-    log_name: String,
-    table_name: String,
-    reason: String,
-}
-
-#[derive(Default)]
-struct AccountRoleValues {
-    sid: Vec<(String, String)>,
-    name: Vec<(String, String)>,
-}
-
-#[derive(Clone)]
-struct AccountEventHit {
-    source_index: usize,
-    rowid: i64,
-    timestamp: String,
-    evidence: String,
-}
-
-/// A cache key contains the source identity and a filesystem fingerprint, so a
-/// re-parse/replacement naturally invalidates the account-event hit index.
-#[derive(Clone, PartialEq, Eq)]
-struct AccountEventSourceFingerprint {
-    full_path: String,
-    table_name: String,
-    log_name: String,
-    size: Option<u64>,
-    modified_ns: Option<u128>,
-}
-
-#[derive(Clone, PartialEq, Eq)]
-struct AccountEventCacheKey {
-    sources: Vec<AccountEventSourceFingerprint>,
-    sid: String,
-    username: String,
-    search: String,
-    start: String,
-    end: String,
-}
-
-#[derive(Clone)]
-struct AccountEventIndex {
-    hits: Vec<AccountEventHit>,
-    source_count: i64,
-    sources_read: i64,
-    source_failures: Vec<AccountEventSourceFailure>,
-}
-
-struct AccountEventCacheEntry {
-    key: AccountEventCacheKey,
-    index: AccountEventIndex,
-    /// 이 엔트리가 붙잡고 있는 대략적인 상주 바이트(hit 문자열 소유분 포함).
-    bytes: usize,
-    inserted_at: Instant,
-}
-
-#[derive(Default)]
-struct AccountEventIndexCache {
-    entries: VecDeque<AccountEventCacheEntry>,
-}
-
-const ACCOUNT_EVENT_CACHE_MAX_ENTRIES: usize = 4;
-const ACCOUNT_EVENT_CACHE_MAX_HITS_PER_ENTRY: usize = 250_000;
-/// hit 수 상한만으로는 상주량이 정해지지 않는다 — hit마다 timestamp/evidence
-/// 문자열을 소유한다. TTL은 get/put 호출 시에만 돌아 계정 뷰를 떠난 뒤에는
-/// 회수되지 않으므로, 유휴 상태의 상한은 이 바이트 예산이 정한다.
-const ACCOUNT_EVENT_CACHE_MAX_BYTES: usize = 48 * 1024 * 1024;
-const ACCOUNT_EVENT_CACHE_TTL: Duration = Duration::from_secs(30);
-static ACCOUNT_EVENT_INDEX_CACHE: LazyLock<Mutex<AccountEventIndexCache>> =
-    LazyLock::new(|| Mutex::new(AccountEventIndexCache::default()));
-
-fn account_event_index_bytes(index: &AccountEventIndex) -> usize {
-    index
-        .hits
-        .iter()
-        .map(|hit| {
-            std::mem::size_of::<AccountEventHit>()
-                + hit.timestamp.capacity()
-                + hit.evidence.capacity()
-        })
-        .sum()
-}
-
-/// 파싱이 결과를 다시 발행하면 두 뷰 캐시의 기존 엔트리는 파일 지문이 달라져
-/// 다시 히트될 수 없다 — 즉 순수한 쓰레기다. TTL은 다음 접근에만 돌기 때문에
+/// 파싱이 결과를 다시 발행하면 브라우저 도메인 캐시의 기존 엔트리는 파일 지문이
+/// 달라져 다시 히트될 수 없다 — 즉 순수한 쓰레기다. TTL은 다음 접근에만 돌기 때문에
 /// 발행 시점에 명시적으로 비운다.
 fn clear_result_view_caches() {
-    ACCOUNT_EVENT_INDEX_CACHE
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .entries
-        .clear();
     BROWSER_DOMAIN_CACHE
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -2936,6 +2807,8 @@ fn clear_result_view_caches() {
         .clear();
 }
 
+/// Test helper: a JSON cell as display text.
+#[cfg(test)]
 fn value_text(value: &Value) -> Option<String> {
     match value {
         Value::Null => None,
@@ -2949,582 +2822,149 @@ fn value_text(value: &Value) -> Option<String> {
                 .collect::<Vec<_>>()
                 .join(", "),
         ),
-        // EventData objects are recursively flattened before matching.  This
-        // fallback is only for broad analyst search over a raw event payload.
+        // Nested objects keep their JSON text.
         Value::Object(_) => Some(value.to_string()),
     }
 }
 
+#[cfg(test)]
 fn map_text(row: &Map<String, Value>, key: &str) -> String {
     row.get(key).and_then(value_text).unwrap_or_default()
 }
 
-fn flatten_event_data(value: &Value, prefix: &str, output: &mut Vec<(String, String, String)>) {
-    let Value::Object(values) = value else {
-        return;
-    };
-    for (key, nested) in values {
-        let path = if prefix.is_empty() {
-            key.clone()
-        } else {
-            format!("{prefix}.{key}")
-        };
-        if nested.is_object() {
-            flatten_event_data(nested, &path, output);
-        } else if let Some(text) = value_text(nested) {
-            output.push((path, key.clone(), text));
-        }
-    }
+/// Account-detail activity: events stored at parse time for one TargetInfo
+/// account parent (docs viewer-03). No raw EventLog scan at view time.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AccountEventQuery {
+    record_id: String,
+    /// Result generation the caller loaded the account from.
+    dataset_id: String,
+    search: Option<String>,
+    start: Option<String>,
+    end: Option<String>,
+    offset: i64,
+    limit: i64,
 }
 
-fn account_sid_role(field: &str) -> Option<&'static str> {
-    match field.to_ascii_lowercase().as_str() {
-        "subjectsid" | "subjectusersid" | "subjectaccountsid" => Some("수행 계정"),
-        "targetsid" | "targetusersid" | "targetaccountsid" => Some("대상 계정"),
-        "membersid" | "membernamesid" => Some("그룹 구성원"),
-        "accountsid" | "accountusersid" | "usersid" | "userusersid" | "callersid"
-        | "callerusersid" | "clientsid" | "clientusersid" => Some("계정"),
-        _ => None,
-    }
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AccountEventPage {
+    rows: Vec<Map<String, Value>>,
+    row_count: i64,
+    /// Stored result predates target_info=2 (no account events): re-parse.
+    stale: bool,
+    /// The account parent/generation the caller holds no longer exists (result
+    /// was re-published): reload, not "no activity".
+    replaced: bool,
 }
 
-fn account_name_role(row: &Map<String, Value>, field: &str) -> Option<&'static str> {
-    match field.to_ascii_lowercase().as_str() {
-        "subjectname" | "subjectusername" | "subjectaccountname" => Some("수행 계정"),
-        "targetname" | "targetusername" | "targetaccountname" => Some("대상 계정"),
-        "membername" => Some("그룹 구성원"),
-        "accountname" | "accountusername" | "username" | "userusername" | "callername"
-        | "callerusername" | "clientname" | "clientusername" => Some("계정"),
-        "param1"
-            if map_text(row, "Provider")
-                == "Microsoft-Windows-TerminalServices-RemoteConnectionManager"
-                && map_text(row, "EventID") == "1149" =>
-        {
-            Some("RDP 세션 사용자")
-        }
-        "user"
-            if map_text(row, "Provider")
-                == "Microsoft-Windows-TerminalServices-LocalSessionManager"
-                && matches!(
-                    map_text(row, "EventID").as_str(),
-                    "21" | "22" | "23" | "24" | "25" | "39" | "40"
-                ) =>
-        {
-            Some("RDP 세션 사용자")
-        }
-        _ => None,
-    }
-}
-
-fn normalise_account_name(value: &str) -> String {
-    let cleaned = value.trim().replace('/', "\\");
-    let without_domain = cleaned
-        .rsplit_once('\\')
-        .map(|(_, name)| name)
-        .unwrap_or(&cleaned);
-    without_domain
-        .split('@')
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .to_lowercase()
-}
-
-/// Exact account correlation equivalent to the renderer's former matcher.
-/// Arbitrary EventData strings are never interpreted as identity evidence.
-fn account_event_evidence(row: &Map<String, Value>, wanted_sid: &str, wanted_name: &str) -> String {
-    let wanted_sid = wanted_sid.trim().to_lowercase();
-    let wanted_name = normalise_account_name(wanted_name);
-    if wanted_sid.is_empty() && wanted_name.is_empty() {
-        return String::new();
-    }
-
-    let mut roles: BTreeMap<String, AccountRoleValues> = BTreeMap::new();
-    let mut add = |role: &str, is_sid: bool, field: String, value: String| {
-        let values = roles.entry(role.to_string()).or_default();
-        if is_sid {
-            values.sid.push((field, value));
-        } else {
-            values.name.push((field, value));
-        }
-    };
-
-    // Event/System Security.UserID is a structured principal, unlike an SID
-    // embedded in a provider payload such as a firewall RuleId.
-    if let Some(user_id) = row
-        .get("UserID")
-        .and_then(value_text)
-        .filter(|value| !value.is_empty())
-    {
-        add("이벤트 보안 주체", true, "UserID".to_string(), user_id);
-    }
-    if let Some(event_data) = row
-        .get("EventData")
-        .and_then(value_text)
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-    {
-        let mut values = Vec::new();
-        flatten_event_data(&event_data, "", &mut values);
-        for (path, field, value) in values {
-            if let Some(role) = account_sid_role(&field) {
-                add(role, true, path, value);
-            } else if let Some(role) = account_name_role(row, &field) {
-                add(role, false, path, value);
-            }
-        }
-    }
-
-    let mut evidence = Vec::new();
-    for (role, values) in roles {
-        let sid_matches: Vec<_> = if wanted_sid.is_empty() {
-            Vec::new()
-        } else {
-            values
-                .sid
-                .iter()
-                .filter(|(_, value)| value.trim().to_lowercase() == wanted_sid)
-                .collect()
-        };
-        if !sid_matches.is_empty() {
-            evidence.extend(
-                sid_matches
-                    .into_iter()
-                    .map(|(field, value)| format!("[SID] {role} · {field} = {value}")),
-            );
-            continue;
-        }
-        // A role carrying any SID is never matched through a same-name
-        // fallback.  This prevents false positives when account names repeat.
-        if !values.sid.is_empty() || wanted_name.is_empty() {
-            continue;
-        }
-        evidence.extend(
-            values
-                .name
-                .iter()
-                .filter(|(_, value)| normalise_account_name(value) == wanted_name)
-                .map(|(field, value)| format!("[이름] {role} · {field} = {value}")),
-        );
-    }
-    evidence.sort();
-    evidence.dedup();
-    evidence.join(" | ")
-}
-
-fn account_event_matches_search(
-    row: &Map<String, Value>,
-    log_name: &str,
-    evidence: &str,
-    search: &str,
-) -> bool {
-    let needle = search.trim().to_lowercase();
-    if needle.is_empty() {
-        return true;
-    }
-    log_name.to_lowercase().contains(&needle)
-        || evidence.to_lowercase().contains(&needle)
-        || row
-            .values()
-            .filter_map(value_text)
-            .any(|value| value.to_lowercase().contains(&needle))
-}
-
-fn account_event_order(left: &AccountEventHit, right: &AccountEventHit) -> std::cmp::Ordering {
-    match (left.timestamp.is_empty(), right.timestamp.is_empty()) {
-        (true, false) => std::cmp::Ordering::Greater,
-        (false, true) => std::cmp::Ordering::Less,
-        _ => left
-            .timestamp
-            .cmp(&right.timestamp)
-            .then(left.source_index.cmp(&right.source_index))
-            .then(left.rowid.cmp(&right.rowid)),
-    }
-}
-
-fn event_row_by_rowid(
-    source: &AccountEventSource,
-    rowid: i64,
-) -> Result<Map<String, Value>, String> {
-    let conn = open_ro(&source.full_path)?;
-    let sql = format!(
-        "SELECT rowid AS __rowid, * FROM {} WHERE rowid = ?",
-        q(&source.table_name)
-    );
-    let mut rows = query_rows(&conn, &sql, &[&rowid])?;
-    rows.pop()
-        .ok_or_else(|| "account event row was not found".to_owned())
-}
-
-fn account_event_source_failure(
-    failures: &mut Vec<AccountEventSourceFailure>,
-    source: &AccountEventSource,
-    reason: &str,
-) {
-    let failure = AccountEventSourceFailure {
-        log_name: source.log_name.clone(),
-        table_name: source.table_name.clone(),
-        reason: reason.to_string(),
-    };
-    if !failures.contains(&failure) {
-        failures.push(failure);
-    }
-}
-
-fn account_event_source_fingerprint(source: &AccountEventSource) -> AccountEventSourceFingerprint {
-    let metadata = std::fs::metadata(&source.full_path).ok();
-    let modified_ns = metadata
-        .as_ref()
-        .and_then(|metadata| metadata.modified().ok())
-        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-        .map(|duration| duration.as_nanos());
-    AccountEventSourceFingerprint {
-        full_path: source.full_path.clone(),
-        table_name: source.table_name.clone(),
-        log_name: source.log_name.clone(),
-        size: metadata.as_ref().map(|metadata| metadata.len()),
-        modified_ns,
-    }
-}
-
-fn account_event_cache_key(
-    sources: &[AccountEventSource],
-    query: &AccountEventQuery,
-) -> AccountEventCacheKey {
-    AccountEventCacheKey {
-        sources: sources
-            .iter()
-            .map(account_event_source_fingerprint)
-            .collect(),
-        // The matcher normalises both identities before comparison, so aliases
-        // such as DOMAIN\\Alice and alice share the same cached index.
-        sid: query.sid.trim().to_lowercase(),
-        username: normalise_account_name(&query.username),
-        search: query
-            .search
-            .as_deref()
-            .unwrap_or_default()
-            .trim()
-            .to_lowercase(),
-        start: query.start.clone().unwrap_or_default(),
-        end: query.end.clone().unwrap_or_default(),
-    }
-}
-
-fn account_event_cache_get(key: &AccountEventCacheKey) -> Option<AccountEventIndex> {
-    let mut cache = ACCOUNT_EVENT_INDEX_CACHE
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let now = Instant::now();
-    cache
-        .entries
-        .retain(|entry| now.duration_since(entry.inserted_at) <= ACCOUNT_EVENT_CACHE_TTL);
-    let index = cache.entries.iter().position(|entry| entry.key == *key)?;
-    let entry = cache.entries.remove(index)?;
-    let result = entry.index.clone();
-    cache.entries.push_back(entry); // LRU refresh without retaining event rows.
-    Some(result)
-}
-
-fn account_event_cache_put(key: AccountEventCacheKey, index: AccountEventIndex) {
-    // The cache is bounded by entry count, hit-reference count, and a byte
-    // budget.  Each hit is metadata only (source/rowid/timestamp/evidence), not
-    // an EventLog row body; unusually broad accounts simply re-scan rather
-    // than retaining an unbounded in-process index.
-    let bytes = account_event_index_bytes(&index);
-    if index.hits.len() > ACCOUNT_EVENT_CACHE_MAX_HITS_PER_ENTRY
-        || bytes > ACCOUNT_EVENT_CACHE_MAX_BYTES
-    {
-        return;
-    }
-    let mut cache = ACCOUNT_EVENT_INDEX_CACHE
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let now = Instant::now();
-    cache.entries.retain(|entry| {
-        now.duration_since(entry.inserted_at) <= ACCOUNT_EVENT_CACHE_TTL && entry.key != key
-    });
-    cache.entries.push_back(AccountEventCacheEntry {
-        key,
-        index,
-        bytes,
-        inserted_at: now,
-    });
-    // 방금 넣은 엔트리는 단독으로 예산 안이므로, 예산 초과는 항상 오래된
-    // 엔트리를 버려서 해소된다(최신 1건은 남긴다).
-    let mut total: usize = cache.entries.iter().map(|entry| entry.bytes).sum();
-    while cache.entries.len() > ACCOUNT_EVENT_CACHE_MAX_ENTRIES
-        || (total > ACCOUNT_EVENT_CACHE_MAX_BYTES && cache.entries.len() > 1)
-    {
-        match cache.entries.pop_front() {
-            Some(dropped) => total = total.saturating_sub(dropped.bytes),
-            None => break,
-        }
-    }
-}
-
-#[cfg(test)]
-static ACCOUNT_EVENT_SOURCE_SCAN_COUNT: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-#[cfg(test)]
-fn clear_account_event_cache_for_test() {
-    ACCOUNT_EVENT_INDEX_CACHE
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .entries
-        .clear();
-    ACCOUNT_EVENT_SOURCE_SCAN_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
-}
-
-/// Merges exact account-correlated EventLog rows across all EventLog files,
-/// while serialising only the requested page into the webview. This is kept
-/// synchronous so the worker can own SQLite connections without crossing an
-/// await point.
-fn build_account_event_index(
-    sources: &[AccountEventSource],
-    query: &AccountEventQuery,
-) -> AccountEventIndex {
-    let has_time_filter = query.start.as_ref().is_some_and(|value| !value.is_empty())
-        || query.end.as_ref().is_some_and(|value| !value.is_empty());
-    let mut hits = Vec::new();
-    let mut source_failures = Vec::new();
-    let mut sources_read = 0_i64;
-
-    for (source_index, source) in sources.iter().enumerate() {
-        #[cfg(test)]
-        ACCOUNT_EVENT_SOURCE_SCAN_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let conn = match open_ro(&source.full_path) {
-            Ok(conn) => conn,
-            Err(_) => {
-                account_event_source_failure(
-                    &mut source_failures,
-                    source,
-                    "원본 SQLite를 열 수 없습니다",
-                );
-                continue;
-            }
-        };
-        if !table_names(&conn)
-            .iter()
-            .any(|name| name == &source.table_name)
-        {
-            account_event_source_failure(
-                &mut source_failures,
-                source,
-                "결과 테이블을 찾을 수 없습니다",
-            );
-            continue;
-        }
-        let columns = table_columns(&conn, &source.table_name);
-        let has_timestamp = columns.iter().any(|column| column == "timestamp");
-        if has_time_filter && !has_timestamp {
-            account_event_source_failure(
-                &mut source_failures,
-                source,
-                "시간 열이 없어 기간 필터를 적용할 수 없습니다",
-            );
-            continue;
-        }
-
-        let mut clauses = Vec::new();
-        let mut params = Vec::new();
-        if has_time_filter {
-            clauses.push("timestamp IS NOT NULL AND timestamp <> ''".to_string());
-            if let Some(start) = query.start.as_ref().filter(|value| !value.is_empty()) {
-                clauses.push("timestamp >= ?".to_string());
-                params.push(start.clone());
-            }
-            if let Some(end) = query.end.as_ref().filter(|value| !value.is_empty()) {
-                clauses.push("timestamp <= ?".to_string());
-                params.push(end.clone());
-            }
-        }
-        let where_clause = if clauses.is_empty() {
-            String::new()
-        } else {
-            format!(" WHERE {}", clauses.join(" AND "))
-        };
-        let sql = format!(
-            "SELECT rowid AS __rowid, * FROM {}{}",
-            q(&source.table_name),
-            where_clause
-        );
-        let refs: Vec<&dyn rusqlite::ToSql> = params
-            .iter()
-            .map(|value| value as &dyn rusqlite::ToSql)
-            .collect();
-        let mut stmt = match conn.prepare(&sql) {
-            Ok(statement) => statement,
-            Err(_) => {
-                account_event_source_failure(
-                    &mut source_failures,
-                    source,
-                    "원본 SQL 조회를 준비할 수 없습니다",
-                );
-                continue;
-            }
-        };
-        let names: Vec<String> = stmt
-            .column_names()
-            .iter()
-            .map(|name| (*name).to_string())
-            .collect();
-        let mut rows = match stmt.query(refs.as_slice()) {
-            Ok(rows) => rows,
-            Err(_) => {
-                account_event_source_failure(
-                    &mut source_failures,
-                    source,
-                    "원본 SQL 행 조회를 시작할 수 없습니다",
-                );
-                continue;
-            }
-        };
-        sources_read = sources_read.saturating_add(1);
-        loop {
-            let row = match rows.next() {
-                Ok(Some(row)) => row,
-                Ok(None) => break,
-                Err(_) => {
-                    account_event_source_failure(
-                        &mut source_failures,
-                        source,
-                        "원본 SQL 행을 읽는 중 오류가 발생했습니다",
-                    );
-                    break;
-                }
-            };
-            let rowid = match row.get::<_, i64>(0) {
-                Ok(rowid) => rowid,
-                Err(_) => {
-                    account_event_source_failure(
-                        &mut source_failures,
-                        source,
-                        "원본 행 식별자를 읽을 수 없습니다",
-                    );
-                    continue;
-                }
-            };
-            let mut record = Map::new();
-            let mut invalid = false;
-            for (index, name) in names.iter().enumerate() {
-                match row.get_ref(index) {
-                    Ok(value) => {
-                        record.insert(name.clone(), cell(value));
-                    }
-                    Err(_) => {
-                        invalid = true;
-                        break;
-                    }
-                }
-            }
-            if invalid {
-                account_event_source_failure(
-                    &mut source_failures,
-                    source,
-                    "원본 행 필드를 읽을 수 없습니다",
-                );
-                continue;
-            }
-            let evidence = account_event_evidence(&record, &query.sid, &query.username);
-            if evidence.is_empty()
-                || !account_event_matches_search(
-                    &record,
-                    &source.log_name,
-                    &evidence,
-                    query.search.as_deref().unwrap_or_default(),
-                )
-            {
-                continue;
-            }
-            hits.push(AccountEventHit {
-                source_index,
-                rowid,
-                timestamp: map_text(&record, "timestamp"),
-                evidence,
-            });
-        }
-    }
-
-    hits.sort_by(account_event_order);
-    AccountEventIndex {
-        hits,
-        source_count: i64::try_from(sources.len()).unwrap_or(i64::MAX),
-        sources_read,
-        source_failures,
-    }
-}
+/// target_info version that first stores TargetAccountEvents/Matches.
+const TARGET_INFO_EVENTS_VERSION: i64 = 2;
 
 fn account_event_page_blocking(
-    sources: Vec<AccountEventSource>,
+    host_dir: String,
     query: AccountEventQuery,
 ) -> Result<AccountEventPage, String> {
-    let key = account_event_cache_key(&sources, &query);
-    let index = match account_event_cache_get(&key) {
-        Some(index) => index,
-        None => {
-            let index = build_account_event_index(&sources, &query);
-            account_event_cache_put(key, index.clone());
-            index
+    let path = Path::new(&host_dir).join("_OVERVIEW").join("TargetInfo.sqlite");
+    let conn = open_ro(&path.to_string_lossy())?;
+    let version: Option<i64> = conn
+        .query_row(
+            "SELECT version FROM _wina_derived_version WHERE name = 'target_info'",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+    if overview_contract_version(&conn) != Some(OVERVIEW_CONTRACT_VERSION)
+        || version.unwrap_or(0) < TARGET_INFO_EVENTS_VERSION
+    {
+        return Ok(AccountEventPage { rows: Vec::new(), row_count: 0, stale: true, replaced: false });
+    }
+    // Only a missing parent/generation means the result was replaced; read
+    // failures surface as errors, never as a reparse hint.
+    match conn.query_row(
+        "SELECT 1 FROM TargetInfo WHERE record_id = ?1 AND dataset_id = ?2",
+        [&query.record_id, &query.dataset_id],
+        |_| Ok(()),
+    ) {
+        Ok(()) => {}
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            return Ok(AccountEventPage { rows: Vec::new(), row_count: 0, stale: false, replaced: true });
         }
-    };
-    let row_count = i64::try_from(index.hits.len()).unwrap_or(i64::MAX);
-    let offset = usize::try_from(query.offset.max(0)).unwrap_or(usize::MAX);
-    let limit = usize::try_from(query.limit.clamp(1, 100)).unwrap_or(100);
-    let mut rows = Vec::with_capacity(limit);
-    let mut source_failures = index.source_failures.clone();
-    for hit in index.hits.iter().skip(offset).take(limit) {
-        let source = &sources[hit.source_index];
-        if let Ok(mut row) = event_row_by_rowid(source, hit.rowid) {
-            row.insert("_log".to_string(), Value::String(source.log_name.clone()));
-            // Account-detail rows are fetched from multiple raw EventLog
-            // SQLite files. Carry the exact source identity so RowDetailPanel
-            // bookmarking never writes an annotation against TargetInfo or an
-            // arbitrary same-rowid EventLog file.
-            row.insert(
-                "_source_full_path".to_string(),
-                Value::String(source.full_path.clone()),
-            );
-            row.insert(
-                "_source_table_name".to_string(),
-                Value::String(source.table_name.clone()),
-            );
-            row.insert(
-                "_account_match".to_string(),
-                Value::String(hit.evidence.clone()),
-            );
-            rows.push(row);
-        } else {
-            account_event_source_failure(
-                &mut source_failures,
-                source,
-                "선택된 원본 행을 다시 읽을 수 없습니다",
-            );
+        Err(e) => return Err(format!("계정 행 조회 실패: {e}")),
+    }
+
+    let mut clauses = vec!["e.record_id = ?".to_string()];
+    let mut params: Vec<String> = vec![query.record_id.clone()];
+    if let Some(start) = query.start.as_deref().filter(|v| !v.is_empty()) {
+        clauses.push("e.timestamp >= ?".into());
+        params.push(start.to_string());
+    }
+    if let Some(end) = query.end.as_deref().filter(|v| !v.is_empty()) {
+        clauses.push("e.timestamp <= ?".into());
+        params.push(end.to_string());
+    }
+    if let Some(needle) = query.search.as_deref().map(|v| v.trim().to_lowercase()).filter(|v| !v.is_empty()) {
+        // Event fields and the stored match evidence (role/field/value).
+        clauses.push(
+            "(instr(lower(coalesce(e.timestamp,'') || ' ' || coalesce(e.channel,'') || ' ' || \
+             coalesce(e.provider,'') || ' ' || coalesce(e.event_id,'') || ' ' || coalesce(e.level_name,'') || ' ' || \
+             coalesce(e.computer,'') || ' ' || coalesce(e.user_id,'') || ' ' || coalesce(e.event_data,'')), ?) > 0 \
+             OR EXISTS (SELECT 1 FROM TargetAccountEventMatches m WHERE m.record_id = e.record_id \
+             AND m.event_ordinal = e.ordinal \
+             AND instr(lower(m.role || ' ' || coalesce(m.field,'') || ' ' || coalesce(m.value,'')), ?) > 0))"
+                .into(),
+        );
+        params.push(needle.clone());
+        params.push(needle);
+    }
+    let filter = clauses.join(" AND ");
+    let bind: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
+    let row_count: i64 = conn
+        .query_row(
+            &format!("SELECT COUNT(*) FROM TargetAccountEvents e WHERE {filter}"),
+            bind.as_slice(),
+            |row| row.get(0),
+        )
+        .map_err(|e| format!("계정 활동 건수 조회 실패: {e}"))?;
+
+    let limit = query.limit.clamp(1, 100);
+    let offset = query.offset.max(0);
+    let mut page_bind = bind.clone();
+    page_bind.push(&limit);
+    page_bind.push(&offset);
+    // EventLog-shaped keys keep the shared EventLog detail definition; the raw
+    // source coordinates (source_records) stay the bookmark key until viewer-20.
+    let sql = format!(
+        "SELECT s.source_rowid AS __rowid, e.timestamp, e.channel AS Channel, e.event_id AS EventID, \
+         e.level_name AS LevelName, e.level AS Level, e.provider AS Provider, e.computer AS Computer, \
+         e.event_record_id AS EventRecordID, e.process_id AS ProcessID, e.thread_id AS ThreadID, \
+         e.user_id AS UserID, e.event_data AS EventData, e.parse_status AS _parse_status, \
+         e.parse_error AS _parse_error, s.source_db AS _source_db, s.source_table AS _source_table_name, \
+         s.source_record_key AS _record_key \
+         FROM TargetAccountEvents e \
+         JOIN source_records s ON s.record_id = e.record_id AND s.ordinal = e.source_ordinal \
+         WHERE {filter} ORDER BY e.timestamp IS NULL, e.timestamp, e.ordinal LIMIT ? OFFSET ?"
+    );
+    let mut rows = query_rows(&conn, &sql, page_bind.as_slice())?;
+    for row in &mut rows {
+        // source_db is host-relative with '/', rebuild with native joins so the
+        // path matches list_result_files (bookmark key).
+        if let Some(Value::String(db)) = row.remove("_source_db") {
+            let mut full = PathBuf::from(&host_dir);
+            full.extend(db.split('/'));
+            row.insert("_source_full_path".into(), Value::String(full.to_string_lossy().to_string()));
         }
     }
-    Ok(AccountEventPage {
-        rows,
-        row_count,
-        source_count: index.source_count,
-        sources_read: index.sources_read,
-        source_failures,
-    })
+    Ok(AccountEventPage { rows, row_count, stale: false, replaced: false })
 }
 
-/// Account EventLog scans parse every candidate EventData JSON to preserve
-/// exact SID/role correlation and an accurate global count.  A synchronous
-/// Tauri command runs this CPU + SQLite I/O on the command handler thread and
-/// can stall the webview while opening an account or moving pages.  Keep the
-/// full scan on Tauri's dedicated blocking executor instead.  The renderer's
-/// existing effect cancellation still discards stale responses; a started
-/// SQLite read is deliberately allowed to finish so no evidence scan is
-/// interrupted midway.
 #[tauri::command]
 async fn account_event_page(
-    sources: Vec<AccountEventSource>,
+    host_dir: String,
     query: AccountEventQuery,
 ) -> Result<AccountEventPage, String> {
-    tauri::async_runtime::spawn_blocking(move || account_event_page_blocking(sources, query))
+    tauri::async_runtime::spawn_blocking(move || account_event_page_blocking(host_dir, query))
         .await
         .map_err(|error| format!("account event worker stopped unexpectedly: {error}"))?
 }
@@ -8128,347 +7568,125 @@ mod bookmark_tests {
 mod account_event_tests {
     use super::*;
 
-    fn cache_test_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-        LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    /// 항목 수 상한(4)에 걸리지 않는 두 건이라도, 합계가 바이트 예산을 넘으면
-    /// 오래된 쪽이 회수되고 최신 항목은 남아야 한다 — TTL이 유휴 상태에서 돌지
-    /// 않으므로 상주량 상한은 이 예산이 정한다.
-    #[test]
-    fn account_event_cache_evicts_older_entries_to_stay_inside_its_byte_budget() {
-        let _lock = cache_test_lock();
-        clear_account_event_cache_for_test();
-        let evidence = "x".repeat(1024);
-        // 엔트리 하나가 예산의 절반을 넘도록 만든다(약 28MB).
-        let index_of = |tag: &str| AccountEventIndex {
-            hits: (0..26_000)
-                .map(|rowid| AccountEventHit {
-                    source_index: 0,
-                    rowid,
-                    timestamp: tag.to_string(),
-                    evidence: evidence.clone(),
-                })
-                .collect(),
-            source_count: 1,
-            sources_read: 1,
-            source_failures: Vec::new(),
-        };
-        let key_of = |sid: &str| AccountEventCacheKey {
-            sources: Vec::new(),
-            sid: sid.to_string(),
-            username: String::new(),
-            search: String::new(),
-            start: String::new(),
-            end: String::new(),
-        };
-        assert!(
-            account_event_index_bytes(&index_of("a")) > ACCOUNT_EVENT_CACHE_MAX_BYTES / 2,
-            "테스트 픽스처가 예산의 절반을 넘지 않으면 축출을 검증하지 못한다"
-        );
-
-        account_event_cache_put(key_of("first"), index_of("first"));
-        assert!(account_event_cache_get(&key_of("first")).is_some());
-
-        account_event_cache_put(key_of("second"), index_of("second"));
-        assert!(
-            account_event_cache_get(&key_of("first")).is_none(),
-            "예산 초과 시 오래된 엔트리가 회수되어야 한다"
-        );
-        assert!(
-            account_event_cache_get(&key_of("second")).is_some(),
-            "방금 넣은 엔트리는 남아야 한다"
-        );
-        clear_account_event_cache_for_test();
-    }
-
-    fn event(event_data: Value) -> Map<String, Value> {
-        let mut row = Map::new();
-        row.insert(
-            "EventData".to_string(),
-            Value::String(event_data.to_string()),
-        );
-        row
-    }
-
-    #[test]
-    fn matches_only_exact_structured_subject_sid() {
-        let sid = "S-1-5-21-100-200-300-1001";
-        let row = event(serde_json::json!({
-            "SubjectUserSid": sid,
-            "RuleId": format!("firewall:{}", sid),
-        }));
-        let evidence = account_event_evidence(&row, sid, "alice");
-        assert!(evidence.contains("[SID] 수행 계정 · SubjectUserSid"));
-        assert!(!evidence.contains("RuleId"));
-    }
-
-    #[test]
-    fn ignores_sid_in_unstructured_provider_payload() {
-        let sid = "S-1-5-21-100-200-300-1001";
-        let row = event(serde_json::json!({ "RuleId": format!("firewall:{}", sid) }));
-        assert!(account_event_evidence(&row, sid, "alice").is_empty());
-    }
-
-    #[test]
-    fn does_not_fall_back_to_name_when_same_role_has_sid() {
-        let row = event(serde_json::json!({
-            "TargetUserSid": "S-1-5-21-100-200-300-9999",
-            "TargetUserName": "alice",
-        }));
-        assert!(account_event_evidence(&row, "S-1-5-21-100-200-300-1001", "alice").is_empty());
-    }
-
-    #[test]
-    fn permits_name_only_provider_role_when_no_sid_exists() {
-        let mut row = event(serde_json::json!({ "TargetUserName": "DOMAIN\\Alice" }));
-        row.insert("Provider".to_string(), Value::String("Example".to_string()));
-        let evidence = account_event_evidence(&row, "", "alice");
-        assert!(evidence.contains("[이름] 대상 계정 · TargetUserName = DOMAIN\\Alice"));
-    }
-
-    #[test]
-    fn pages_globally_sorted_exact_hits_across_eventlog_sources() {
-        let _lock = cache_test_lock();
-        clear_account_event_cache_for_test();
+    fn host(tag: &str, version: i64) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
-            "windows-analysis-account-events-{}-{}",
+            "windows-analysis-account-events-{tag}-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos(),
         ));
-        std::fs::create_dir_all(&root).unwrap();
-        let first = root.join("Security.sqlite");
-        let second = root.join("System.sqlite");
-        let sid = "S-1-5-21-100-200-300-1001";
-        for (path, timestamp, event_id) in [
-            (&first, "2024-02-02 10:00:00.000", "4624"),
-            (&second, "2024-02-01 10:00:00.000", "4625"),
-        ] {
-            let conn = Connection::open(path).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE Events (timestamp TEXT, EventID TEXT, Provider TEXT, EventData TEXT)",
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO Events (timestamp, EventID, Provider, EventData) VALUES (?, ?, ?, ?)",
-                rusqlite::params![
-                    timestamp,
-                    event_id,
-                    "Microsoft-Windows-Security-Auditing",
-                    serde_json::json!({ "SubjectUserSid": sid }).to_string()
-                ],
-            )
-            .unwrap();
-        }
-        // Same SID embedded in unstructured text must not affect the total.
-        Connection::open(&second)
-            .unwrap()
-            .execute(
-                "INSERT INTO Events (timestamp, EventID, Provider, EventData) VALUES (?, ?, ?, ?)",
-                rusqlite::params![
-                    "2024-02-01 11:00:00.000",
-                    "0",
-                    "Example",
-                    serde_json::json!({ "RuleId": sid }).to_string()
-                ],
-            )
-            .unwrap();
-
-        let page = account_event_page_blocking(
-            vec![
-                AccountEventSource {
-                    full_path: first.to_string_lossy().to_string(),
-                    table_name: "Events".to_string(),
-                    log_name: "Security".to_string(),
-                },
-                AccountEventSource {
-                    full_path: second.to_string_lossy().to_string(),
-                    table_name: "Events".to_string(),
-                    log_name: "System".to_string(),
-                },
-                AccountEventSource {
-                    full_path: root.join("missing.sqlite").to_string_lossy().to_string(),
-                    table_name: "Events".to_string(),
-                    log_name: "Missing".to_string(),
-                },
-            ],
-            AccountEventQuery {
-                sid: sid.to_string(),
-                username: "alice".to_string(),
-                search: Some("security".to_string()),
-                start: Some("2024-02-01 00:00:00.000".to_string()),
-                end: Some("2024-02-02 23:59:59.999".to_string()),
-                offset: 0,
-                limit: 1,
-            },
-        )
+        std::fs::create_dir_all(root.join("_OVERVIEW")).unwrap();
+        let conn = Connection::open(root.join("_OVERVIEW").join("TargetInfo.sqlite")).unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TABLE _wina_derived_version (name TEXT PRIMARY KEY, version INTEGER);
+             INSERT INTO _wina_derived_version VALUES ('overview_contract', 1), ('target_info', {version});
+             CREATE TABLE TargetInfo (record_id TEXT, dataset_id TEXT);
+             INSERT INTO TargetInfo VALUES ('acct', 'ds-1'), ('other', 'ds-1'), ('idle', 'ds-1');
+             CREATE TABLE source_records (record_id TEXT, ordinal INTEGER, source_db TEXT, source_table TEXT,
+               source_rowid INTEGER, source_record_key TEXT);
+             CREATE TABLE TargetAccountEvents (record_id TEXT, ordinal INTEGER, source_ordinal INTEGER, timestamp TEXT,
+               channel TEXT, event_id INTEGER, level_name TEXT, level INTEGER, provider TEXT, computer TEXT,
+               event_record_id INTEGER, process_id INTEGER, thread_id INTEGER, user_id TEXT, event_data TEXT,
+               parse_status TEXT, parse_error TEXT);
+             CREATE TABLE TargetAccountEventMatches (record_id TEXT, ordinal INTEGER, event_ordinal INTEGER,
+               role TEXT, match_kind TEXT, field TEXT, value TEXT);
+             INSERT INTO source_records VALUES
+               ('acct', 0, 'EVENTLOG/Security.sqlite', 'Security', 70, 'Security::70'),
+               ('acct', 1, 'EVENTLOG/Security.sqlite', 'Security', 71, 'Security::71'),
+               ('acct', 2, 'EVENTLOG/System.sqlite', 'System', 5, 'System::5'),
+               ('other', 0, 'EVENTLOG/Security.sqlite', 'Security', 99, 'Security::99');
+             INSERT INTO TargetAccountEvents VALUES
+               ('acct', 0, 0, '2024-02-02 10:00:00.000', 'Security', 4624, 'Information', 4,
+                'Microsoft-Windows-Security-Auditing', 'PC', 70, 4, 8, NULL, '{{\"TargetUserSid\":\"S-1-5-21-1\"}}', 'ok', NULL),
+               ('acct', 1, 1, '2024-02-01 10:00:00.000', 'Security', 4672, 'Information', 4,
+                'Microsoft-Windows-Security-Auditing', 'PC', 71, 4, 8, NULL, '{{}}', 'ok', NULL),
+               ('acct', 2, 2, NULL, 'System', 7036, 'Information', 4, 'Service Control Manager', 'PC', 5, 4, 8,
+                'S-1-5-21-1', 'not json', 'error', 'invalid json'),
+               ('other', 0, 0, '2024-02-01 09:00:00.000', 'Security', 4624, 'Information', 4, 'X', 'PC', 99, 4, 8,
+                NULL, '{{}}', 'ok', NULL);
+             INSERT INTO TargetAccountEventMatches VALUES
+               ('acct', 0, 0, '대상 계정', 'sid', 'TargetUserSid', 'S-1-5-21-1'),
+               ('acct', 1, 1, '수행 계정', 'name', 'SubjectUserName', 'alice'),
+               ('acct', 2, 2, '이벤트 보안 주체', 'sid', 'UserID', 'S-1-5-21-1');"
+        ))
         .unwrap();
-        assert_eq!(page.row_count, 2);
-        assert_eq!(page.rows.len(), 1);
-        assert_eq!(
-            map_text(&page.rows[0], "timestamp"),
-            "2024-02-01 10:00:00.000"
-        );
-        assert_eq!(
-            map_text(&page.rows[0], "_source_full_path"),
-            second.to_string_lossy()
-        );
-        assert_eq!(map_text(&page.rows[0], "_source_table_name"), "Events");
-        assert_eq!(page.source_count, 3);
-        assert_eq!(page.sources_read, 2);
-        assert_eq!(
-            page.source_failures,
-            vec![AccountEventSourceFailure {
-                log_name: "Missing".to_string(),
-                table_name: "Events".to_string(),
-                reason: "원본 SQLite를 열 수 없습니다".to_string(),
-            }]
-        );
+        root
+    }
 
+    fn query(search: Option<&str>, start: Option<&str>) -> AccountEventQuery {
+        query_for("acct", "ds-1", search, start)
+    }
+
+    fn query_for(record_id: &str, dataset_id: &str, search: Option<&str>, start: Option<&str>) -> AccountEventQuery {
+        AccountEventQuery {
+            record_id: record_id.into(),
+            dataset_id: dataset_id.into(),
+            search: search.map(str::to_string),
+            start: start.map(str::to_string),
+            end: None,
+            offset: 0,
+            limit: 10,
+        }
+    }
+
+    #[test]
+    fn pages_stored_account_events_oldest_first_with_evidence_and_raw_bookmark_key() {
+        let root = host("page", 2);
+        let host_dir = root.to_string_lossy().to_string();
+        let page = account_event_page_blocking(host_dir.clone(), query(None, None)).unwrap();
+        assert!(!page.stale);
+        assert_eq!(page.row_count, 3, "other account's event is excluded");
+        let times: Vec<String> = page.rows.iter().map(|r| map_text(r, "timestamp")).collect();
+        assert_eq!(times, vec!["2024-02-01 10:00:00.000", "2024-02-02 10:00:00.000", ""]);
+        let first = &page.rows[0];
+        assert_eq!(map_text(first, "EventID"), "4672");
+        assert_eq!(map_text(first, "__rowid"), "71");
+        assert_eq!(map_text(first, "_source_table_name"), "Security");
+        let mut expected = PathBuf::from(&host_dir);
+        expected.extend(["EVENTLOG", "Security.sqlite"]);
+        assert_eq!(map_text(first, "_source_full_path"), expected.to_string_lossy());
+        assert!(first.get("_source_db").is_none());
+
+        // Range excludes undated events; search reaches match evidence.
+        let ranged = account_event_page_blocking(host_dir.clone(), query(None, Some("2024-02-02 00:00:00.000"))).unwrap();
+        assert_eq!(ranged.row_count, 1);
+        let by_evidence = account_event_page_blocking(host_dir.clone(), query(Some("ALICE"), None)).unwrap();
+        assert_eq!(by_evidence.row_count, 1);
+        assert_eq!(map_text(&by_evidence.rows[0], "EventID"), "4672");
+        let by_field = account_event_page_blocking(host_dir, query(Some("service control"), None)).unwrap();
+        assert_eq!(by_field.row_count, 1);
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
-    fn distinguishes_all_source_failures_from_an_empty_match() {
-        let _lock = cache_test_lock();
-        clear_account_event_cache_for_test();
-        let page = account_event_page_blocking(
-            vec![AccountEventSource {
-                full_path: "/definitely/not/an/eventlog.sqlite".to_string(),
-                table_name: "Events".to_string(),
-                log_name: "Unavailable".to_string(),
-            }],
-            AccountEventQuery {
-                sid: "S-1-5-21-1".to_string(),
-                username: "alice".to_string(),
-                search: None,
-                start: None,
-                end: None,
-                offset: 0,
-                limit: 10,
-            },
-        )
-        .unwrap();
+    fn results_before_target_info_2_report_reparse_instead_of_empty_activity() {
+        let root = host("stale", 1);
+        let page = account_event_page_blocking(root.to_string_lossy().to_string(), query(None, None)).unwrap();
+        assert!(page.stale);
         assert_eq!(page.row_count, 0);
-        assert_eq!(page.source_count, 1);
-        assert_eq!(page.sources_read, 0);
-        assert_eq!(page.source_failures.len(), 1);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
-    fn reuses_bounded_hit_index_for_following_page_and_invalidates_on_source_change() {
-        let _lock = cache_test_lock();
-        clear_account_event_cache_for_test();
-        let root = std::env::temp_dir().join(format!(
-            "windows-analysis-account-event-cache-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos(),
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        let first = root.join("Security.sqlite");
-        let second = root.join("System.sqlite");
-        let sid = "S-1-5-21-100-200-300-1001";
-        for (path, parity) in [(&first, 1_u32), (&second, 2_u32)] {
-            let conn = Connection::open(path).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE Events (timestamp TEXT, EventID TEXT, Provider TEXT, EventData TEXT)",
-            )
-            .unwrap();
-            for ordinal in 0..6_u32 {
-                let day = ordinal * 2 + parity;
-                conn.execute(
-                    "INSERT INTO Events (timestamp, EventID, Provider, EventData) VALUES (?, ?, ?, ?)",
-                    rusqlite::params![format!("2024-03-{day:02} 10:00:00.000"), "4624", "Microsoft-Windows-Security-Auditing", serde_json::json!({ "SubjectUserSid": sid }).to_string()],
-                ).unwrap();
-            }
-        }
-        let sources = vec![
-            AccountEventSource {
-                full_path: first.to_string_lossy().to_string(),
-                table_name: "Events".to_string(),
-                log_name: "Security".to_string(),
-            },
-            AccountEventSource {
-                full_path: second.to_string_lossy().to_string(),
-                table_name: "Events".to_string(),
-                log_name: "System".to_string(),
-            },
-            AccountEventSource {
-                full_path: root.join("unreadable.sqlite").to_string_lossy().to_string(),
-                table_name: "Events".to_string(),
-                log_name: "Unreadable".to_string(),
-            },
-        ];
-        let base_query = |offset| AccountEventQuery {
-            sid: sid.to_string(),
-            username: "alice".to_string(),
-            search: None,
-            start: Some("2024-03-01 00:00:00.000".to_string()),
-            end: Some("2024-03-31 23:59:59.999".to_string()),
-            offset,
-            limit: 10,
-        };
+    fn replaced_result_is_distinguished_from_an_account_without_activity() {
+        let root = host("replaced", 2);
+        let host_dir = root.to_string_lossy().to_string();
+        let idle = account_event_page_blocking(host_dir.clone(), query_for("idle", "ds-1", None, None)).unwrap();
+        assert_eq!((idle.row_count, idle.stale, idle.replaced), (0, false, false));
+        let old_generation = account_event_page_blocking(host_dir.clone(), query_for("acct", "ds-0", None, None)).unwrap();
+        assert_eq!((old_generation.row_count, old_generation.replaced), (0, true));
+        let gone = account_event_page_blocking(host_dir, query_for("missing", "ds-1", None, None)).unwrap();
+        assert!(gone.replaced);
+        let _ = std::fs::remove_dir_all(root);
+    }
 
-        let first_page = account_event_page_blocking(sources.clone(), base_query(0)).unwrap();
-        assert_eq!(first_page.row_count, 12);
-        assert_eq!(first_page.rows.len(), 10);
-        assert_eq!(
-            map_text(&first_page.rows[0], "timestamp"),
-            "2024-03-01 10:00:00.000"
-        );
-        assert_eq!(first_page.source_failures.len(), 1);
-        let scans_after_first_page =
-            ACCOUNT_EVENT_SOURCE_SCAN_COUNT.load(std::sync::atomic::Ordering::SeqCst);
-        assert_eq!(scans_after_first_page, 3);
-
-        let second_page = account_event_page_blocking(sources.clone(), base_query(10)).unwrap();
-        assert_eq!(second_page.row_count, 12);
-        assert_eq!(second_page.rows.len(), 2);
-        assert_eq!(
-            map_text(&second_page.rows[0], "timestamp"),
-            "2024-03-11 10:00:00.000"
-        );
-        assert_eq!(second_page.source_failures, first_page.source_failures);
-        assert_eq!(
-            ACCOUNT_EVENT_SOURCE_SCAN_COUNT.load(std::sync::atomic::Ordering::SeqCst),
-            scans_after_first_page
-        );
-
-        // Source fingerprint includes file size + mtime, so a re-parse/update
-        // invalidates the old index even with the same source path and query.
-        Connection::open(&first)
+    #[test]
+    fn unreadable_current_result_is_an_error_not_a_replacement() {
+        let root = host("broken", 2);
+        Connection::open(root.join("_OVERVIEW").join("TargetInfo.sqlite"))
             .unwrap()
-            .execute(
-                "INSERT INTO Events (timestamp, EventID, Provider, EventData) VALUES (?, ?, ?, ?)",
-                rusqlite::params![
-                    "2024-03-13 10:00:00.000",
-                    "4624",
-                    "Microsoft-Windows-Security-Auditing",
-                    serde_json::json!({ "SubjectUserSid": sid }).to_string()
-                ],
-            )
+            .execute_batch("DROP TABLE TargetInfo;")
             .unwrap();
-        let refreshed = account_event_page_blocking(sources, base_query(10)).unwrap();
-        assert_eq!(refreshed.row_count, 13);
-        assert_eq!(refreshed.rows.len(), 3);
-        assert_eq!(
-            map_text(&refreshed.rows[2], "timestamp"),
-            "2024-03-13 10:00:00.000"
-        );
-        assert_eq!(
-            ACCOUNT_EVENT_SOURCE_SCAN_COUNT.load(std::sync::atomic::Ordering::SeqCst),
-            scans_after_first_page + 3
-        );
-
+        assert!(account_event_page_blocking(root.to_string_lossy().to_string(), query(None, None)).is_err());
         let _ = std::fs::remove_dir_all(root);
     }
 }

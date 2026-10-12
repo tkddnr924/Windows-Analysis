@@ -35,7 +35,7 @@ import { EMPTY_TIME_RANGE, type TimeRange } from "@/lib/timeRange";
 import { bookmarkRefKeys, isRecordBookmarked, parseSourceRefs, type SourceRef } from "@/lib/sourceRefs";
 import { accountDirectoryFromEntries, type AccountDirectory } from "@/lib/accountIdentity";
 import { RecordScopeContext } from "@/lib/recordScope";
-import type { AccountEventPage, AccountEventQuery, AccountEventSource, Bookmark, Case, Host, CategoryEntry, CsvData, RecordSource, ResultFileEntry, TimelineEntry, SearchHit } from "@/lib/types";
+import type { AccountEventPage, AccountEventQuery, Bookmark, Case, Host, CategoryEntry, CsvData, RecordSource, ResultFileEntry, TimelineEntry, SearchHit } from "@/lib/types";
 
 interface TabState {
   file: ResultFileEntry;
@@ -419,22 +419,15 @@ export default function Home() {
     [categories]
   );
 
-  // The Tauri command performs structured account-role matching and returns a
-  // bounded globally ordered page.  Keeping the scan out of the webview avoids
-  // loading whole EventLog tables just to render this account-detail list.
+  // Account activity comes from TargetAccountEvents stored at parse time
+  // (docs viewer-03); the server pages it, the webview never scans EventLog.
+  const hostDir = selectedHost?.dir;
   const loadAccountEvents = useCallback(
-    async (sid: string, username: string, query: Omit<AccountEventQuery, "sid" | "username">): Promise<AccountEventPage> => {
-      const sources: AccountEventSource[] = [];
-      for (const cat of categories) {
-        if (cat.name.toUpperCase() !== "EVENTLOG") continue;
-        const files = await window.api.listResultFiles(cat.fullPath);
-        for (const f of files) {
-          sources.push({ fullPath: f.fullPath, tableName: f.tableName, logName: f.name });
-        }
-      }
-      return window.api.accountEventPage(sources, { sid, username, ...query });
+    async (query: AccountEventQuery): Promise<AccountEventPage> => {
+      if (!hostDir) throw new Error("선택된 호스트가 없습니다");
+      return window.api.accountEventPage(hostDir, query);
     },
-    [categories]
+    [hostDir]
   );
 
   // Return the host's master timeline, preferring the on-disk cache written by

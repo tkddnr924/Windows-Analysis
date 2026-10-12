@@ -1,6 +1,6 @@
 //! Stored Windows metadata derived from raw registry facts.
 //! Conflicts retain candidates; resolution never uses the analyst's environment.
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -24,6 +24,8 @@ const RANK_SECONDARY: u8 = 1;
 /// Actual registry row coordinates; never synthetic rowids.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SourceRef {
+    /// source_records.source_artifact (Registry, SRUM).
+    artifact: &'static str,
     db: String,
     table: String,
     rowid: i64,
@@ -223,6 +225,7 @@ impl Hive {
 
     fn source_ref(&self, row: &RegRow, field: &str) -> SourceRef {
         SourceRef {
+            artifact: "Registry",
             db: self.db_rel.clone(),
             table: REG_TABLE.to_string(),
             rowid: row.rowid,
@@ -580,6 +583,70 @@ fn well_known_account(sid: &str) -> Option<&'static str> {
     }
 }
 
+/// Virtual service (S-1-5-80) and IIS app pool (S-1-5-82) SIDs are the SHA-1 of
+/// the uppercase service / lowercase pool name (UTF-16LE) as five LE u32s.
+fn virtual_sid(prefix: &str, name: &str) -> String {
+    use sha1::{Digest, Sha1};
+    let bytes: Vec<u8> = name.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let digest = Sha1::digest(&bytes);
+    let mut sid = prefix.to_string();
+    for chunk in digest.chunks_exact(4) {
+        sid.push_str(&format!("-{}", u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])));
+    }
+    sid
+}
+
+fn service_sid(name: &str) -> String {
+    virtual_sid("S-1-5-80", &name.to_uppercase())
+}
+
+/// (domain, name, name_source) only when `candidate` hashes to `sid`.
+fn hashed_virtual_account(sid: &str, candidate: &str) -> Option<(&'static str, String, &'static str)> {
+    let upper = sid.to_uppercase();
+    let (expected, domain, source) = if upper.starts_with("S-1-5-80-") {
+        (service_sid(candidate), "NT SERVICE", "service_sid_hash")
+    } else if upper.starts_with("S-1-5-82-") {
+        (virtual_sid("S-1-5-82", &candidate.to_lowercase()), "IIS APPPOOL", "apppool_sid_hash")
+    } else {
+        return None;
+    };
+    (expected == upper).then(|| (domain, candidate.to_string(), source))
+}
+
+/// Fixed Microsoft patterns: S-1-5-90-0-N = Window Manager\DWM-N,
+/// S-1-5-96-0-N = Font Driver Host\UMFD-N (session N). Returns (domain, name).
+fn fixed_virtual_account(sid: &str) -> Option<(&'static str, String)> {
+    let upper = sid.to_uppercase();
+    let (domain, prefix, session) = if let Some(n) = upper.strip_prefix("S-1-5-90-0-") {
+        ("Window Manager", "DWM", n)
+    } else if let Some(n) = upper.strip_prefix("S-1-5-96-0-") {
+        ("Font Driver Host", "UMFD", n)
+    } else {
+        return None;
+    };
+    session.parse::<u32>().ok().map(|n| (domain, format!("{prefix}-{n}")))
+}
+
+fn profile_folder_of(raw_path: &str) -> Option<&str> {
+    raw_path.trim().trim_end_matches('\\').rsplit('\\').next().filter(|f| !f.is_empty())
+}
+
+/// One stored virtual account (kind='virtual_account'): name proven by SID
+/// structure, kept out of the host account list.
+fn virtual_account_row(sid: &str, domain: &str, name: &str, source: &str, reason: &str, src: SourceRef) -> MetaRow {
+    let mut row = MetaRow::new("virtual_account", "machine", &sid.to_lowercase());
+    row.value = Some(format!("{domain}\\{name}"));
+    row.account_name = row.value.clone();
+    row.account_sid = Some(sid.to_string());
+    row.domain = Some(domain.to_string());
+    row.account_kind = Some("well_known".into());
+    row.name_source = Some(source.to_string());
+    row.status = "resolved";
+    row.selection_reason = Some(reason.to_string());
+    row.refs.push(src);
+    row
+}
+
 const ACB_FLAGS: &[(u16, &str)] = &[
     (0x0001, "Disabled"),
     (0x0002, "HomeDirRequired"),
@@ -809,7 +876,7 @@ impl<'a> Writer<'a> {
                     metadata_id,
                     ordinal as i64,
                     source_dataset,
-                    "Registry",
+                    src.artifact,
                     src.db,
                     src.table,
                     src.rowid,
@@ -1106,6 +1173,8 @@ struct AccountFacts {
     sam_users: Vec<SamUser>,
     hidden: HashMap<String, (String, SourceRef)>,
     groups: HashMap<String, Vec<(Option<String>, Option<String>)>>,
+    /// Active ControlSet service names: candidates for S-1-5-80 virtual accounts.
+    services: Vec<(String, SourceRef)>,
 }
 
 // Machine SID is the validated 24-byte SAM V tail, not a profile-name guess.
@@ -1223,6 +1292,29 @@ fn collect_accounts(facts: &Facts) -> AccountFacts {
                         hive.source_ref(row, "value_name"),
                     ),
                 );
+            }
+        }
+    }
+
+    // <ControlSetNNN>\Services\<name> only; deeper "Services" keys are not services.
+    let mut services: Vec<(String, SourceRef)> = Vec::new();
+    let mut seen_services: HashSet<String> = HashSet::new();
+    for hive in facts.of(HiveKind::System) {
+        for row in &hive.rows {
+            if !row.key_low.contains("\\services\\") || !hive.in_active_set(row) {
+                continue;
+            }
+            let parts: Vec<&str> = row.key_path.split('\\').collect();
+            let Some(i) = parts.windows(2).position(|w| {
+                w[0].to_ascii_lowercase().starts_with("controlset") && w[1].eq_ignore_ascii_case("services")
+            }) else {
+                continue;
+            };
+            let Some(name) = parts.get(i + 2).filter(|n| !n.is_empty()) else {
+                continue;
+            };
+            if seen_services.insert(name.to_lowercase()) {
+                services.push((name.to_string(), hive.source_ref(row, "key_path")));
             }
         }
     }
@@ -1401,6 +1493,7 @@ fn collect_accounts(facts: &Facts) -> AccountFacts {
         sam_users,
         hidden,
         groups,
+        services,
     }
 }
 
@@ -2194,7 +2287,8 @@ pub fn build_metadata(
     let tx = conn.unchecked_transaction()?;
     let mut writer = Writer::new(&conn, host_id, dataset_id, &facts);
     build_host(&facts, &mut writer)?;
-    write_accounts(&accounts, &env.model, &mut writer)?;
+    let observed_fixed = observed_fixed_sids(out_dir, &facts, &mut writer)?;
+    write_accounts(&accounts, &env.model, &observed_fixed, &mut writer)?;
     build_networks(&facts, &mut writer)?;
     write_env(&env, &mut writer)?;
     let count = writer.count;
@@ -2202,11 +2296,88 @@ pub fn build_metadata(
     Ok(count)
 }
 
+/// First registry/SRUM observation of each DWM/UMFD SID. SRUM facts
+/// generations are registered on `writer` so their refs can be stored.
+fn observed_fixed_sids(out_dir: &Path, facts: &Facts, writer: &mut Writer<'_>) -> Result<Vec<(String, SourceRef)>> {
+    let mut found: BTreeMap<String, SourceRef> = BTreeMap::new();
+    for hive in &facts.hives {
+        for row in &hive.rows {
+            if !(row.key_low.contains("\\s-1-5-90-0-") || row.key_low.contains("\\s-1-5-96-0-")) {
+                continue;
+            }
+            for part in row.key_path.split('\\') {
+                if fixed_virtual_account(part).is_some() {
+                    found.entry(part.to_uppercase()).or_insert_with(|| hive.source_ref(row, "key_path"));
+                }
+            }
+        }
+    }
+    let dir = out_dir.join("SRUM");
+    let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .map(|rd| rd.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.extension().is_some_and(|x| x == "sqlite")).collect())
+        .unwrap_or_default();
+    files.sort();
+    for path in files {
+        let Ok(conn) = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY) else {
+            continue;
+        };
+        let tables: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE '\\_%' ESCAPE '\\'")?
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        let stem = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+        let db_rel = format!("SRUM/{}", path.file_name().map(|s| s.to_string_lossy()).unwrap_or_default());
+        let mut used = false;
+        for table in tables {
+            let has_user = conn
+                .prepare(&format!("PRAGMA table_info(\"{table}\")"))?
+                .query_map([], |r| r.get::<_, String>(1))?
+                .filter_map(|c| c.ok())
+                .any(|c| c == "user");
+            if !has_user {
+                continue;
+            }
+            let mut stmt = conn.prepare(&format!(
+                "SELECT user, MIN(rowid) FROM \"{table}\" \
+                 WHERE user LIKE 'S-1-5-90-0-%' OR user LIKE 'S-1-5-96-0-%' GROUP BY user"
+            ))?;
+            let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+            for (sid, rowid) in rows.filter_map(|r| r.ok()) {
+                if fixed_virtual_account(&sid).is_none() || found.contains_key(&sid.to_uppercase()) {
+                    continue;
+                }
+                used = true;
+                found.insert(sid.to_uppercase(), SourceRef {
+                    artifact: "SRUM",
+                    db: db_rel.clone(),
+                    table: table.clone(),
+                    rowid,
+                    field: Some("user".into()),
+                    record_key: Some(format!("{stem}::{table}::{rowid}")),
+                    file: None,
+                    label: Some(sid),
+                });
+            }
+        }
+        if used {
+            // Unstamped facts cannot be cited; reparse is required (same as registry).
+            writer.source_dataset.insert(db_rel, crate::derived::facts_dataset_id(&path)?);
+        }
+    }
+    Ok(found.into_iter().collect())
+}
+
 fn write_accounts(
     accounts: &AccountFacts,
     env: &EnvModel,
+    observed_fixed: &[(String, SourceRef)],
     writer: &mut Writer<'_>,
 ) -> Result<()> {
+    let service_by_sid: BTreeMap<String, (&str, &SourceRef)> = accounts
+        .services
+        .iter()
+        .map(|(name, src)| (service_sid(name), (name.as_str(), src)))
+        .collect();
     let machine_sid = accounts.machine_sid.clone();
     let mut by_sid: BTreeMap<String, MetaRow> = BTreeMap::new();
     let mut order: Vec<String> = Vec::new();
@@ -2340,6 +2511,21 @@ fn write_accounts(
                 row.name_source = Some("well_known_sid".into());
                 row.status = "resolved";
                 row.selection_reason = Some("잘 알려진 SID".into());
+            } else if let Some((domain, name, source)) = profile_folder_of(&profile.raw_path)
+                .and_then(|folder| hashed_virtual_account(&profile.sid, folder))
+                .or_else(|| {
+                    let (name, src) = service_by_sid.get(&profile.sid.to_uppercase())?;
+                    row.add_ref((*src).clone());
+                    Some(("NT SERVICE", (*name).to_string(), "service_sid_hash"))
+                })
+            {
+                // Folder or service name is only a candidate; the SID hash proves it.
+                row.value = Some(format!("{domain}\\{name}"));
+                row.account_name = row.value.clone();
+                row.domain = Some(domain.into());
+                row.name_source = Some(source.into());
+                row.status = "resolved";
+                row.selection_reason = Some("SID = SHA-1(이름) 일치".into());
             }
         }
     }
@@ -2358,6 +2544,16 @@ fn write_accounts(
             row.status = "missing";
         }
         writer.write(row)?;
+    }
+
+    // Every active service has a deterministic NT SERVICE SID.
+    for (sid, (name, src)) in &service_by_sid {
+        writer.write(virtual_account_row(sid, "NT SERVICE", name, "service_sid_hash", "활성 서비스명 SHA-1", (*src).clone()))?;
+    }
+    for (sid, src) in observed_fixed {
+        if let Some((domain, name)) = fixed_virtual_account(sid) {
+            writer.write(virtual_account_row(sid, domain, &name, "fixed_virtual_sid", "고정 가상 계정 SID 규칙", src.clone()))?;
+        }
     }
     Ok(())
 }
@@ -2444,10 +2640,17 @@ pub fn account_names_from_facts(out_dir: &Path) -> Result<HashMap<String, String
         }
     }
     for profile in &accounts.profiles {
-        if let Some(name) = well_known_account(&profile.sid) {
-            out.entry(profile.sid.to_uppercase())
-                .or_insert_with(|| name.to_string());
+        let name = well_known_account(&profile.sid).map(str::to_string).or_else(|| {
+            profile_folder_of(&profile.raw_path)
+                .and_then(|folder| hashed_virtual_account(&profile.sid, folder))
+                .map(|(domain, name, _)| format!("{domain}\\{name}"))
+        });
+        if let Some(name) = name {
+            out.entry(profile.sid.to_uppercase()).or_insert(name);
         }
+    }
+    for (name, _) in &accounts.services {
+        out.entry(service_sid(name)).or_insert_with(|| format!("NT SERVICE\\{name}"));
     }
     Ok(out)
 }
@@ -2492,6 +2695,8 @@ pub struct MetadataLookup {
     machine_env: BTreeMap<String, String>,
     user_env: BTreeMap<String, BTreeMap<String, String>>,
     profiles: Vec<(String, String)>,
+    /// kind='virtual_account' names (service / DWM / UMFD); not host accounts.
+    virtual_accounts: HashMap<String, String>,
 }
 
 impl MetadataLookup {
@@ -2512,6 +2717,7 @@ impl MetadataLookup {
         let mut machine_env = BTreeMap::new();
         let mut user_env: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
         let mut profiles = Vec::new();
+        let mut virtual_accounts = HashMap::new();
         let mut rows = stmt.query([])?;
         while let Some(r) = rows.next()? {
             let metadata_id: String = r.get(0)?;
@@ -2566,6 +2772,11 @@ impl MetadataLookup {
                     }
                     accounts.insert(key.to_lowercase(), entry);
                 }
+                "virtual_account" => {
+                    if let Some(v) = value.clone() {
+                        virtual_accounts.insert(key.to_lowercase(), v);
+                    }
+                }
                 _ => {}
             }
             index.insert(
@@ -2590,14 +2801,17 @@ impl MetadataLookup {
             machine_env,
             user_env,
             profiles,
+            virtual_accounts,
         })
     }
 
     /// Resolve confirmed names; callers retain SID when unavailable.
     pub fn account(&self, sid: &str) -> Option<&str> {
+        let key = sid.to_lowercase();
         self.accounts
-            .get(&sid.to_lowercase())
+            .get(&key)
             .and_then(|a| a.name.as_deref())
+            .or_else(|| self.virtual_accounts.get(&key).map(String::as_str))
     }
 
     pub fn account_entry(&self, sid: &str) -> Option<&AccountEntry> {
@@ -2970,6 +3184,92 @@ mod tests {
             .unwrap();
         assert_eq!(group_sid.as_deref(), Some("S-1-5-32-544"));
         assert_eq!(group_name.as_deref(), Some("Administrators"));
+    }
+
+    #[test]
+    fn virtual_accounts_resolve_only_when_sid_hash_matches() {
+        // SIDs copied from the IDC_20261012_112701 ProfileList / SRUM.
+        const TELEMETRY: &str = "S-1-5-80-2652535364-2169709536-2857650723-2622804123-1107741775";
+        const FD_LAUNCHER: &str = "S-1-5-80-3263513310-3392720605-1798839546-683002060-3227631582";
+        const AGENT: &str = "S-1-5-80-344959196-2060754871-2302487193-2804545603-1466107430";
+        const SQLSERVER: &str = "S-1-5-80-3880718306-3832830129-1677859214-2598158968-1052248003";
+        const POOL: &str = "S-1-5-82-271721585-897601226-2024613209-625570482-296978595";
+        let fx = Fixture::new("virtual-accounts");
+        let profiles = [
+            (TELEMETRY, "C:\\WINDOWS\\ServiceProfiles\\SQLTELEMETRY"),
+            // Renamed folder: only the SYSTEM service list can prove this name.
+            (FD_LAUNCHER, "C:\\WINDOWS\\ServiceProfiles\\Renamed"),
+            (POOL, "C:\\Users\\.NET v4.5"),
+            // Neither the folder nor any active service hashes to this SID.
+            (SQLSERVER, "C:\\WINDOWS\\ServiceProfiles\\Other"),
+        ]
+        .map(|(sid, path)| (format!("\\ROOT\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList\\{sid}"), path));
+        let base = base_software("D:\\Users\\analyst");
+        let mut software: Vec<(&str, &str, &str, &str)> =
+            base.iter().map(|(a, b, c, d)| (*a, *b, *c, d.as_str())).collect();
+        for (key, path) in &profiles {
+            software.push((key.as_str(), "ProfileImagePath", "REG_SZ", path));
+        }
+        fx.hive("SOFTWARE", &software);
+        fx.hive(
+            "SYSTEM",
+            &[
+                ("\\ROOT\\Select", "Current", "REG_DWORD", "1"),
+                ("\\ROOT\\ControlSet001\\Services\\MSSQLFDLauncher", "ImagePath", "REG_EXPAND_SZ", "fd.exe"),
+                ("\\ROOT\\ControlSet001\\Services\\SQLSERVERAGENT", "Start", "REG_DWORD", "2"),
+                // Inactive ControlSet: not a candidate.
+                ("\\ROOT\\ControlSet002\\Services\\MSSQLSERVER", "Start", "REG_DWORD", "2"),
+            ],
+        );
+        let srum = fx.root.join("SRUM").join("SRUM_AppResourceUsage.sqlite");
+        std::fs::create_dir_all(srum.parent().unwrap()).unwrap();
+        let conn = Connection::open(&srum).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE SRUM_AppResourceUsage (timestamp TEXT, app TEXT, user TEXT);
+             INSERT INTO SRUM_AppResourceUsage VALUES ('t','a','S-1-5-90-0-3'),('t','a','S-1-5-96-0-0'),('t','a','S-1-5-18');",
+        )
+        .unwrap();
+        drop(conn);
+        crate::derived::stamp_facts_generation(&srum, FACTS_DATASET).unwrap();
+        assert!(fx.build() > 0);
+
+        let conn = fx.db();
+        let row = |kind: &str, sid: &str| -> Option<(Option<String>, Option<String>, Option<String>)> {
+            conn.query_row(
+                "SELECT value, domain, name_source FROM metadata WHERE kind=?1 AND key=?2",
+                [kind, &sid.to_lowercase()],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .ok()
+        };
+        let named = |name: &str, domain: &str, source: &str| Some((Some(name.to_string()), Some(domain.to_string()), Some(source.to_string())));
+        assert_eq!(row("account", TELEMETRY), named("NT SERVICE\\SQLTELEMETRY", "NT SERVICE", "service_sid_hash"));
+        assert_eq!(row("account", FD_LAUNCHER), named("NT SERVICE\\MSSQLFDLauncher", "NT SERVICE", "service_sid_hash"));
+        assert_eq!(row("account", POOL), named("IIS APPPOOL\\.NET v4.5", "IIS APPPOOL", "apppool_sid_hash"));
+        assert_eq!(row("account", SQLSERVER), Some((None, None, None)));
+
+        // Active services without a profile are stored apart from account rows.
+        assert_eq!(row("virtual_account", AGENT), named("NT SERVICE\\SQLSERVERAGENT", "NT SERVICE", "service_sid_hash"));
+        assert_eq!(row("virtual_account", SQLSERVER), None);
+        assert_eq!(row("virtual_account", "S-1-5-90-0-3"), named("Window Manager\\DWM-3", "Window Manager", "fixed_virtual_sid"));
+        assert_eq!(row("virtual_account", "S-1-5-96-0-0"), named("Font Driver Host\\UMFD-0", "Font Driver Host", "fixed_virtual_sid"));
+        let (artifact, table, field): (String, String, String) = conn
+            .query_row(
+                "SELECT s.source_artifact, s.source_table, s.source_field FROM source_records s \
+                 JOIN metadata m ON m.metadata_id = s.record_id WHERE m.key = 's-1-5-90-0-3'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((artifact.as_str(), table.as_str(), field.as_str()), ("SRUM", "SRUM_AppResourceUsage", "user"));
+
+        let lookup = fx.lookup();
+        assert_eq!(lookup.account(AGENT), Some("NT SERVICE\\SQLSERVERAGENT"));
+        assert_eq!(lookup.account("S-1-5-90-0-3"), Some("Window Manager\\DWM-3"));
+        assert_eq!(lookup.account("S-1-5-90-0-9"), None);
+        assert_eq!(lookup.account(SQLSERVER), None);
+        // Host account list stays limited to profile/SAM accounts.
+        assert!(lookup.accounts().all(|a| !a.sid.eq_ignore_ascii_case(AGENT)));
     }
 
     #[test]

@@ -20,6 +20,7 @@ import SettingsOutlinedIcon from "@mui/icons-material/SettingsOutlined";
 import WarningAmberOutlinedIcon from "@mui/icons-material/WarningAmberOutlined";
 import WifiOutlinedIcon from "@mui/icons-material/WifiOutlined";
 import InfoOutlinedIcon from "@mui/icons-material/InfoOutlined";
+import { acbFlagNames, yesNo } from "@/lib/accountFields";
 import type { AccountEventPage, AccountEventQuery, CsvData, Bookmark, DBRow, HostMetadata } from "@/lib/types";
 import type { FetchLinkedRows } from "@/lib/types";
 import { RecordScopeContext } from "@/lib/recordScope";
@@ -34,9 +35,9 @@ import { expandAccountPath } from "@/lib/accountPath";
 
 interface TargetInfoViewProps {
   data: CsvData;
-  /** Fetch EventLog rows involving an account (by SID or username) — account
-   * management (creation/group/pw) + logons. Enables the account detail page. */
-  loadAccountEvents?: (sid: string, username: string, query: Omit<AccountEventQuery, "sid" | "username">) => Promise<AccountEventPage>;
+  /** Page this account's stored activity (TargetAccountEvents, matched at
+   * parse time by role SID/name). Enables the account detail page. */
+  loadAccountEvents?: (query: AccountEventQuery) => Promise<AccountEventPage>;
   /** Global incident period selected in the sidebar. */
   timeRange: TimeRange;
   /** Threaded so the account-event detail uses the same shared EventLog detail
@@ -152,10 +153,12 @@ function buildAccount(r: Row, meta?: DBRow, groups?: string): Account {
     lastFailedLogin: meta?.last_failed_login || "",
     loginCount: meta?.login_count || "",
     failedLoginCount: meta?.failed_login_count || "",
-    disabled: meta?.disabled || "",
-    specialAccount: meta?.special_account || "",
+    // metadata stores disabled/special_account as 0/1 (NULL = unknown).
+    disabled: yesNo(meta?.disabled),
+    specialAccount: yesNo(meta?.special_account),
     groups: groups || "",
-    accountFlags: meta?.account_flags || "",
+    // account_flags is the raw ACB hex; flag names live in details_json.acb_flags.
+    accountFlags: acbFlagNames(meta?.details_json) || meta?.account_flags || "",
     sourceArtifact: meta?.name_source || "",
   };
 }
@@ -345,8 +348,13 @@ export default function TargetInfoView({ data, loadAccountEvents, timeRange, onN
       account.homeDir = expandAccountPath(account.homeDir, systemRoot);
     }
 
-    const users = accounts.filter((a) => a.isUser).sort((a, b) => a.username.localeCompare(b.username));
-    const services = accounts.filter((a) => !a.isUser).sort((a, b) => a.username.localeCompare(b.username));
+    // Users first, then system accounts; each by creation time (oldest first),
+    // accounts without one after them by name.
+    const byCreated = (a: Account, b: Account) =>
+      a.created && b.created ? a.created.localeCompare(b.created) || a.username.localeCompare(b.username)
+        : a.created ? -1 : b.created ? 1 : a.username.localeCompare(b.username);
+    const users = accounts.filter((a) => a.isUser).sort(byCreated);
+    const services = accounts.filter((a) => !a.isUser).sort(byCreated);
     const networks = [...netMap.values()]
       .sort((a, b) => (b.timestamp || "").localeCompare(a.timestamp || ""));
     const interfaces = [...ifaceMap.values()].sort((a, b) => a.ip.localeCompare(b.ip));
@@ -687,7 +695,9 @@ function eventSummary(row: Row): string {
   const target = val(/target.*user|membername/i);
   const group = val(/group.*name/i);
   const actor = val(/subject.*user/i);
-  const logon = val(/logontype/i);
+  // LogonType is a Windows logon type only in Security auditing events
+  // (Shell-Core etc. reuse the name for unrelated flags).
+  const logon = row.Provider === "Microsoft-Windows-Security-Auditing" ? val(/logontype/i) : "";
   const ip = val(/ipaddress|clientaddress|\baddress\b/i);
   if (target) parts.push(`대상: ${target}`);
   if (group) parts.push(`그룹: ${group}`);
@@ -703,7 +713,7 @@ function eventSummary(row: Row): string {
   return parts.join(" · ");
 }
 
-function AccountDetailPage({ account, onBack, loadEvents, timeRange, onNavigate, onFetchLinkedRows, isRowBookmarked, onToggleBookmark, eventBookmarks, onToggleEventBookmark, accountDirectory }: { account: Account; onBack: () => void; loadEvents?: (sid: string, username: string, query: Omit<AccountEventQuery, "sid" | "username">) => Promise<AccountEventPage>; timeRange: TimeRange; onNavigate?: (targetFile: string, targetColumn: string, value: string) => void; onFetchLinkedRows?: FetchLinkedRows; isRowBookmarked?: (row: Row, field?: string) => boolean; onToggleBookmark?: (rowid: number, field: string) => void; eventBookmarks?: Bookmark[]; onToggleEventBookmark?: (fullPath: string, tableName: string, rowid: number) => void; accountDirectory?: AccountDirectory }) {
+function AccountDetailPage({ account, onBack, loadEvents, timeRange, onNavigate, onFetchLinkedRows, isRowBookmarked, onToggleBookmark, eventBookmarks, onToggleEventBookmark, accountDirectory }: { account: Account; onBack: () => void; loadEvents?: (query: AccountEventQuery) => Promise<AccountEventPage>; timeRange: TimeRange; onNavigate?: (targetFile: string, targetColumn: string, value: string) => void; onFetchLinkedRows?: FetchLinkedRows; isRowBookmarked?: (row: Row, field?: string) => boolean; onToggleBookmark?: (rowid: number, field: string) => void; eventBookmarks?: Bookmark[]; onToggleEventBookmark?: (fullPath: string, tableName: string, rowid: number) => void; accountDirectory?: AccountDirectory }) {
   const [events, setEvents] = useState<AccountEventPage | null>(null);
   const [eventsAccountKey, setEventsAccountKey] = useState("");
   const [loading, setLoading] = useState(false);
@@ -772,7 +782,9 @@ function AccountDetailPage({ account, onBack, loadEvents, timeRange, onNavigate,
     const sequence = ++requestSequence.current;
     setLoading(true);
     setEventsError(null);
-    loadEvents(account.sid, account.username, {
+    loadEvents({
+      recordId: account.row.record_id || "",
+      datasetId: account.row.dataset_id || "",
       search: eventSearch,
       start: toBound(timeRange.start, "start") || undefined,
       end: toBound(timeRange.end, "end") || undefined,
@@ -793,7 +805,7 @@ function AccountDetailPage({ account, onBack, loadEvents, timeRange, onNavigate,
       })
       .finally(() => { if (!cancelled && sequence === requestSequence.current) setLoading(false); });
     return () => { cancelled = true; };
-  }, [account.sid, account.username, accountKey, eventSearch, loadEvents, requestedPage, timeRange.end, timeRange.start]);
+  }, [account.row.record_id, account.row.dataset_id, accountKey, eventSearch, loadEvents, requestedPage, timeRange.end, timeRange.start]);
 
   const hijack = account.rid && account.ridSam && account.rid !== account.ridSam;
   const visibleEvents = eventsAccountKey === accountKey ? events : null;
@@ -806,12 +818,10 @@ function AccountDetailPage({ account, onBack, loadEvents, timeRange, onNavigate,
   const eventRangeStart = evCount === 0 ? 0 : renderedSafePage * EV_PAGE_SIZE + 1;
   const eventRangeEnd = Math.min((renderedSafePage + 1) * EV_PAGE_SIZE, evCount);
   const showingPriorQuery = Boolean(visibleEvents && (renderedFilterKey !== filterKey || renderedSafePage !== requestedPage));
-  const sourceFailures = visibleEvents?.sourceFailures ?? [];
-  const failedSourceText = sourceFailures.slice(0, 2)
-    .map((failure) => `${failure.logName} / ${failure.tableName} (${failure.reason})`)
-    .join(" · ");
-  const failedSourceMore = sourceFailures.length > 2 ? ` 외 ${sourceFailures.length - 2}개` : "";
-  const allSourcesUnreadable = Boolean(visibleEvents && visibleEvents.sourceCount > 0 && visibleEvents.sourcesRead === 0);
+  // Stored result predates account-event storage: re-parse, not "no activity".
+  const stale = Boolean(visibleEvents?.stale);
+  // The account row came from a result generation that was since replaced.
+  const replaced = Boolean(visibleEvents?.replaced);
   const identityRows = [
     ["계정명", account.username || "(이름 없음)", false],
     ["계정 SID", account.sid, true],
@@ -887,9 +897,10 @@ function AccountDetailPage({ account, onBack, loadEvents, timeRange, onNavigate,
           />}
           {loadEvents && initialLoading && <div style={{ display: "flex", alignItems: "center", gap: 8, minHeight: 48, color: "var(--text-dim)", fontSize: 12.5 }}><CircularProgress size={16} thickness={4} /> 이 계정의 EventLog 활동을 불러오는 중…</div>}
           {loadEvents && refreshing && <div style={{ display: "flex", alignItems: "center", gap: 6, minHeight: 24, marginBottom: 6, color: "var(--text-dim)", fontSize: 11.5 }}><CircularProgress size={14} thickness={4} /> 결과 갱신 중… {showingPriorQuery ? "이전 결과 표시 중" : "현재 결과 확인 중"}</div>}
-          {loadEvents && sourceFailures.length > 0 && <div title={`일부 EventLog 원본을 열 수 없어 결과가 불완전할 수 있습니다 · 읽기 실패: ${sourceFailures.map((failure) => `${failure.logName} / ${failure.tableName} (${failure.reason})`).join(" · ")}`} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", marginBottom: 8, padding: "6px 8px", borderLeft: "2px solid var(--warning)", background: "var(--warning-subtle)", color: "var(--warning)", fontSize: 11.5, lineHeight: 1.35 }}>일부 EventLog 원본을 열 수 없어 결과가 불완전할 수 있습니다 · 읽기 실패: {failedSourceText}{failedSourceMore}</div>}
+          {loadEvents && stale && <div style={{ marginBottom: 8, padding: "6px 8px", borderLeft: "2px solid var(--warning)", background: "var(--warning-subtle)", color: "var(--warning)", fontSize: 11.5, lineHeight: 1.35 }}>이전 파싱 결과라 계정 활동이 저장되어 있지 않습니다. 호스트를 다시 파싱하세요.</div>}
+          {loadEvents && replaced && <div style={{ marginBottom: 8, padding: "6px 8px", borderLeft: "2px solid var(--warning)", background: "var(--warning-subtle)", color: "var(--warning)", fontSize: 11.5, lineHeight: 1.35 }}>파싱 결과가 교체되었습니다. 호스트 정보를 다시 열어 주세요.</div>}
           {loadEvents && eventsError && <div title={eventsError} style={{ paddingBottom: 8, color: "var(--danger)", fontSize: 12.5 }}>{visibleEvents ? "새 EventLog 결과를 불러오지 못했습니다. 이전 결과 표시 중." : `EventLog 활동을 불러오지 못했습니다: ${eventsError}`}</div>}
-          {loadEvents && !initialLoading && visibleEvents && evCount === 0 && <div style={{ fontSize: 12.5, color: allSourcesUnreadable ? "var(--warning)" : "var(--text-faint)" }}>{allSourcesUnreadable ? "읽을 수 있는 EventLog 원본이 없습니다. 원본 읽기 실패를 확인하세요." : eventSearch.trim() ? "검색 조건과 기간 필터에 일치하는 EventLog가 없습니다." : "선택한 기간에 이 계정과 관련된 EventLog가 없습니다."}</div>}
+          {loadEvents && !initialLoading && visibleEvents && !stale && !replaced && evCount === 0 && <div style={{ fontSize: 12.5, color: "var(--text-faint)" }}>{eventSearch.trim() ? "검색 조건과 기간 필터에 일치하는 EventLog가 없습니다." : "선택한 기간에 이 계정과 관련된 EventLog가 없습니다."}</div>}
           {loadEvents && visibleEvents && evCount > 0 && <div style={{ minWidth: 0, pointerEvents: refreshing ? "none" : "auto", opacity: refreshing ? 0.65 : 1 }}>
           {pagedEvents.map((r, i) => {
             const eid = r.EventID || "";

@@ -341,29 +341,6 @@ function tagsForMissingAmcachePublisher(publisher: string | undefined): Tag[] {
   }];
 }
 
-// A SID with a human label where one is knowable from the SID alone (built-in /
-// service accounts, and the built-in Administrator RID 500). Mapping an
-// arbitrary S-1-5-21-…-<RID≥1000> user SID to its account name needs the
-// registry profile list, which isn't available to this row-only formatter.
-const WELL_KNOWN_SID: Record<string, string> = {
-  "S-1-5-18": "LocalSystem",
-  "S-1-5-19": "LocalService",
-  "S-1-5-20": "NetworkService",
-  "S-1-1-0": "Everyone",
-  "S-1-5-7": "Anonymous",
-  "S-1-5-11": "Authenticated Users",
-  "S-1-5-32-544": "Administrators",
-  "S-1-5-32-545": "Users",
-};
-function sidLabel(sid: string | undefined): string {
-  if (!sid) return "";
-  const wk = WELL_KNOWN_SID[sid];
-  if (wk) return `${sid} (${wk})`;
-  const rid = sid.match(/-(\d+)$/)?.[1];
-  if (/^S-1-5-21-/.test(sid) && rid === "500") return `${sid} (Administrator)`;
-  return sid;
-}
-
 // Windows Error Reporting (Application / Event 1001): the crash is described by
 // EventName + the P1..P10 bucket parameters, whose meaning depends on EventName
 // (APPCRASH: P1=app, P2=version, P4=faulting module, …). These helpers pull the
@@ -877,13 +854,13 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
         { key: "account_sid", label: "계정 SID", kind: "accountSid", compute: (r) => r.account_role ? r.account_sid : "" },
       ]},
       { heading: "생성 요청자 (Subject)", fields: [
-        { key: "subject_user_name", label: "계정 이름 (SubjectUserName)" },
+        { key: "subject_user_name", label: "계정 이름 (SubjectUserName)", kind: "account" },
         { key: "subject_domain_name", label: "도메인 (SubjectDomainName)" },
         { key: "subject_user_sid", label: "SID (SubjectUserSid)", kind: "accountSid" },
         { key: "subject_logon_id", label: "로그온 ID (SubjectLogonId)" },
       ]},
       { heading: "대상 계정 (Target)", fields: [
-        { key: "target_user_name", label: "계정 이름 (TargetUserName)" },
+        { key: "target_user_name", label: "계정 이름 (TargetUserName)", kind: "account" },
         { key: "target_domain_name", label: "도메인 (TargetDomainName)" },
         { key: "target_user_sid", label: "SID (TargetUserSid)", kind: "accountSid" },
         { key: "target_logon_id", label: "로그온 ID (TargetLogonId)" },
@@ -1223,7 +1200,7 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
       { key: "additional_actions", label: "추가 조치" },
       { key: "process", label: "프로세스" },
       { key: "account", label: "사용자", kind: "account" },
-      { key: "detection_user", label: "탐지 당시 사용자 원문" },
+      { key: "detection_user", label: "탐지 당시 사용자 원문", kind: "account" },
       { key: "origin", label: "유입 경로" },
       { key: "source", label: "탐지원" },
       { key: "detail", label: "경로/내용" },
@@ -1533,7 +1510,7 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
         { key: "Source" },
       ]},
       { heading: "누가/어디서", fields: [
-        { key: "UserSid", label: "설치한 계정(SID)" },
+        { key: "UserSid", label: "설치한 계정(SID)", kind: "account" },
         { key: "RootDirPath", kind: "path" },
         { key: "UninstallString", kind: "code" },
         { key: "RegistryKeyPath", kind: "path" },
@@ -1704,18 +1681,17 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
             return lt ? formatLogonType(lt) : undefined;
           },
         },
-        // Writer SID → account: labels built-in/service SIDs (LocalSystem, …)
-        // and the built-in Administrator; a plain user SID shows as-is.
-        { key: "UserID", label: "UserID (계정)", compute: (r) => sidLabel(r.UserID) },
+        // Writer SID as an account label (name from the host account directory).
+        { key: "UserID", label: "계정", kind: "account" },
       ]},
       // Every field below renders only when the event actually carries it, so a
       // single section adapts per Event ID: BITS shows its URL/파일, a logon
       // shows accounts/IP, a service-install shows the image path, and so on.
       { heading: "이벤트 데이터", fields: [
         // Accounts / logon / remote access / SMB / persistence
-        edField("TargetUserName", "대상 계정"),
+        edField("TargetUserName", "대상 계정", { kind: "account" }),
         edField("TargetDomainName", "대상 도메인"),
-        edField("SubjectUserName", "수행 계정"),
+        edField("SubjectUserName", "수행 계정", { kind: "account" }),
         edField("WorkstationName", "워크스테이션"),
         edField("IpAddress", "원격 IP"),
         edField("IpPort", "원격 포트"),
@@ -1755,7 +1731,7 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
         { key: "_ps_host_application", label: "HostApplication", kind: "code", compute: (r) => extractPsClassicField(r, "HostApplication") },
         { key: "_ps_script_name", label: "ScriptName", kind: "path", compute: (r) => extractPsClassicField(r, "ScriptName") },
         { key: "_ps_command_line", label: "CommandLine", kind: "code", compute: (r) => extractPsClassicField(r, "CommandLine") },
-        { key: "_ps_user_id", label: "UserId (계정)", compute: (r) => extractPsClassicField(r, "UserId") },
+        { key: "_ps_user_id", label: "UserId (계정)", kind: "account", compute: (r) => extractPsClassicField(r, "UserId") },
         { key: "_ps_host_name", label: "HostName", compute: (r) => extractPsClassicField(r, "HostName") },
         { key: "_ps_host_version", label: "HostVersion", compute: (r) => extractPsClassicField(r, "HostVersion") },
         { key: "_ps_engine_version", label: "EngineVersion", compute: (r) => extractPsClassicField(r, "EngineVersion") },
@@ -1887,7 +1863,7 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     sections: [
       { heading: "실행 동작", fields: [{ key: "actions", kind: "code" }] },
       { heading: "실행 주체", fields: [
-        { key: "run_as", label: "실행 계정" },
+        { key: "run_as", label: "실행 계정", kind: "account" },
         { key: "run_level", label: "권한 수준" },
         { key: "logon_type", label: "로그온 유형" },
       ]},

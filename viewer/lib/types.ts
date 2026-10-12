@@ -521,17 +521,12 @@ export interface AiConversationPage {
   derivedMissing: boolean;
 }
 
-/** One EventLog result table used by the account-detail activity query. */
-export interface AccountEventSource {
-  fullPath: string;
-  tableName: string;
-  logName: string;
-}
-
-/** Server-side filters for exact account-correlated EventLog activity. */
+/** Server-side filters for one TargetInfo account's stored activity
+ * (TargetAccountEvents). `recordId` is the account parent record_id. */
 export interface AccountEventQuery {
-  sid: string;
-  username: string;
+  recordId: string;
+  /** Result generation the account row was loaded from. */
+  datasetId: string;
   search?: string;
   start?: string;
   end?: string;
@@ -539,23 +534,15 @@ export interface AccountEventQuery {
   limit: number;
 }
 
-/** One bounded, globally ordered account-activity page. */
+/** One bounded, ordered page of stored account activity. Rows use EventLog
+ * keys plus the raw source coordinates used as the bookmark key. */
 export interface AccountEventPage {
   rows: Record<string, string>[];
   rowCount: number;
-  /** Number of EventLog tables submitted to the server for this query. */
-  sourceCount: number;
-  /** Sources whose query could start; zero distinguishes total read failure from no matches. */
-  sourcesRead: number;
-  /** EventLog evidence sources that could not be read; successful sources remain usable. */
-  sourceFailures: AccountEventSourceFailure[];
-}
-
-/** A safely described EventLog source read failure for analyst follow-up. */
-export interface AccountEventSourceFailure {
-  logName: string;
-  tableName: string;
-  reason: string;
+  /** Result predates target_info=2: re-parse needed, not "no activity". */
+  stale: boolean;
+  /** The account row's result generation was replaced: reload the host view. */
+  replaced: boolean;
 }
 
 /** A display-only exact SID-to-account mapping, read from the host's
@@ -684,7 +671,7 @@ export interface ElectronApi {
   browserActivityInsights(fullPath: string, tableName: string, account: string | undefined, start: string | undefined, end: string | undefined): Promise<BrowserActivityInsights>;
   browserActivityDomains(fullPath: string, tableName: string, account: string | undefined, start: string | undefined, end: string | undefined, offset: number, limit: number, ascending?: boolean): Promise<BrowserDomainStatsPage>;
   browserActivityPage(fullPath: string, tableName: string, query: BrowserActivityQuery): Promise<CsvData>;
-  accountEventPage(sources: AccountEventSource[], query: AccountEventQuery): Promise<AccountEventPage>;
+  accountEventPage(hostDir: string, query: AccountEventQuery): Promise<AccountEventPage>;
   aiReferrals(fullPath: string, tableName: string, start: string | undefined, end: string | undefined, offset: number, limit: number): Promise<CsvData>;
   /** parentEntry가 null이면 부모 미확인(parent_entry IS NULL) 묶음을 받는다. */
   mftChildren(fullPath: string, parentEntry: number | null, offset?: number, limit?: number, volumeId?: string): Promise<MftChildrenPage>;

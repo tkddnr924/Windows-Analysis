@@ -97,9 +97,9 @@ CREATE TABLE "metadata" (
   "selection_reason" TEXT,
   PRIMARY KEY(metadata_id),
   UNIQUE(kind, scope, key),
-  CHECK(kind IN ('host','account','network','env')),
+  CHECK(kind IN ('host','account','virtual_account','network','env')),
   CHECK(resolution_status IN ('resolved','missing','conflict','unresolved')),
-  CHECK(kind <> 'account' OR (account_sid IS NOT NULL AND key = lower(account_sid)))
+  CHECK(kind NOT IN ('account','virtual_account') OR (account_sid IS NOT NULL AND key = lower(account_sid)))
 );
 CREATE INDEX idx_metadata_account ON metadata(account_sid) WHERE kind = 'account';
 CREATE TABLE "source_records" (
