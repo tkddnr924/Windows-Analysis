@@ -410,8 +410,9 @@ function CacheDataValue({ row, hostDir }: { row: Record<string, string>; hostDir
 }
 
 function FieldRow({ field, row, onFetchLinkedRows, hostDir, accountDirectory, onToggleFieldBookmark, isFieldBookmarked }: { field: FieldSpec; row: Record<string, string>; onFetchLinkedRows?: FetchLinkedRows; hostDir?: string; accountDirectory?: AccountDirectory; onToggleFieldBookmark?: (field: string) => void; isFieldBookmarked?: (field: string) => boolean }) {
-  const raw = field.compute ? field.compute(row) ?? "" : row[field.key];
-  if ((raw === undefined || raw === null || raw === "") && !field.showWhenEmpty) return null;
+  // resultRow returns SQL NULL as null; treat it as an empty value.
+  const raw: string = (field.compute ? field.compute(row) : row[field.key]) ?? "";
+  if (raw === "" && !field.showWhenEmpty) return null;
 
   const kind: FieldKind = field.kind ?? "text";
   const label = field.label ?? field.key;

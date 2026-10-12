@@ -548,7 +548,7 @@ CREATE TABLE "PowerShellConsoleLines" (
 
 CREATE TABLE _wina_derived_version (name TEXT NOT NULL PRIMARY KEY, version INTEGER NOT NULL);
 INSERT INTO _wina_derived_version(name,version) VALUES ('overview_contract',1);
-INSERT INTO _wina_derived_version(name,version) VALUES ('powershell_history',3);
+INSERT INTO _wina_derived_version(name,version) VALUES ('powershell_history',4);
 "#;
 
 const POWER_SHELL_HISTORY_COLUMNS: &[&str] = &[

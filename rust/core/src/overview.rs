@@ -306,9 +306,9 @@ fn basename_win(path: &str) -> String {
         .to_string()
 }
 
-fn user_map(out_dir: &Path) -> std::collections::HashMap<String, String> {
+fn user_map(registry: &[Row]) -> std::collections::HashMap<String, String> {
     let mut umap = std::collections::HashMap::new();
-    for r in read_registry_all(out_dir) {
+    for r in registry {
         let kp = r.get("key_path").cloned().unwrap_or_default();
         if kp.to_lowercase().contains("\\profilelist\\s-")
             && r.get("value_name")
@@ -323,6 +323,62 @@ fn user_map(out_dir: &Path) -> std::collections::HashMap<String, String> {
         }
     }
     umap
+}
+
+/// Local accounts for resolving classic PowerShell `UserId=HOST\user`.
+struct LocalAccounts {
+    computer: String,
+    /// lower(name) -> (SAM name, RID)
+    sam: std::collections::HashMap<String, (String, String)>,
+    /// Machine domain SID from SAM `Domains\Account` V; "" when absent.
+    machine_sid: String,
+}
+
+impl LocalAccounts {
+    fn load(registry: &[Row]) -> Self {
+        let computer = reg_pick_row(registry, "\\control\\computername\\computername", "ComputerName")
+            .and_then(|r| r.get("value_data").cloned())
+            .unwrap_or_default();
+        let mut sam = std::collections::HashMap::new();
+        let mut machine_sid = String::new();
+        let names = "\\sam\\domains\\account\\users\\names\\";
+        for r in registry {
+            let kp = r.get("key_path").cloned().unwrap_or_default();
+            let low = kp.to_lowercase();
+            if let Some(i) = low.find(names) {
+                // SAM stores the RID as the Names\<user> default value's type.
+                let name = &kp[i + names.len()..];
+                let rid = r.get("value_type").cloned().unwrap_or_default();
+                if !name.is_empty() && !name.contains('\\') && rid.chars().all(|c| c.is_ascii_digit()) && !rid.is_empty() {
+                    sam.insert(name.to_lowercase(), (name.to_string(), rid));
+                }
+            } else if low.ends_with("\\sam\\domains\\account")
+                && r.get("value_name").map(|v| v == "V").unwrap_or(false)
+            {
+                // The V value ends with the domain's three sub-authorities.
+                let v = unhex(&r.get("value_data").cloned().unwrap_or_default());
+                if v.len() >= 12 {
+                    let tail = &v[v.len() - 12..];
+                    let part = |i: usize| u32::from_le_bytes([tail[i], tail[i + 1], tail[i + 2], tail[i + 3]]);
+                    machine_sid = format!("S-1-5-21-{}-{}-{}", part(0), part(4), part(8));
+                }
+            }
+        }
+        Self { computer, sam, machine_sid }
+    }
+
+    /// `HOST\user` names this machine's local `user` only when HOST equals the
+    /// stored ComputerName and SAM has the user. The SID is the SAM machine
+    /// SID + RID; without the machine SID it stays "".
+    fn resolve(&self, user_id: &str) -> Option<(String, String)> {
+        let (host, user) = user_id.split_once('\\')?;
+        if self.computer.is_empty() || !host.eq_ignore_ascii_case(&self.computer) {
+            return None;
+        }
+        let (name, rid) = self.sam.get(&user.to_lowercase())?;
+        let sid = if self.machine_sid.is_empty() { String::new() } else { format!("{}-{rid}", self.machine_sid) };
+        Some((name.clone(), sid))
+    }
 }
 
 fn all_strings(v: &serde_json::Value, out: &mut Vec<String>) {
@@ -627,7 +683,10 @@ pub fn build_powershell_history_with_events(
     out_dir: &Path,
     events: &EventLogOverviewCache,
 ) -> Vec<Row> {
-    let umap = user_map(out_dir);
+    let registry = read_registry_all(out_dir);
+    let umap = user_map(&registry);
+    let locals = LocalAccounts::load(&registry);
+    drop(registry);
     let account_for = |sid: &str| -> String {
         match umap.get(sid) {
             Some(n) if !n.is_empty() => n.clone(),
@@ -895,10 +954,15 @@ pub fn build_powershell_history_with_events(
             // Classic Windows PowerShell events frequently leave the outer
             // UserID empty while carrying the actual user in EventData.
             let event_user = classic_get(&fields, "UserId");
-            let account = if event_user.is_empty() {
-                account_for(&sid)
+            // `THISHOST\user` is the SAM local account: store its name and,
+            // when uniquely known, its SID. Other domains stay verbatim.
+            let (account, account_sid) = if event_user.is_empty() {
+                (account_for(&sid), sid.clone())
+            } else if let Some((name, local_sid)) = locals.resolve(&event_user) {
+                let resolved = if local_sid.is_empty() { sid.clone() } else { local_sid };
+                (name, resolved)
             } else {
-                event_user
+                (event_user, sid.clone())
             };
             // Event 800 can have no CommandLine while still carrying the
             // launching HostApplication. Preserve that evidence rather than
@@ -931,7 +995,7 @@ pub fn build_powershell_history_with_events(
             classic_session(&mut row, &fields);
             stamp_event(
                 &mut row,
-                &sid,
+                &account_sid,
                 &channel,
                 &record_id,
                 &level,
@@ -5780,6 +5844,54 @@ mod tests {
         assert_eq!(row.get("event_data").map(String::as_str), Some(data.as_str()));
         assert_eq!(row.get("event_level").map(String::as_str), Some("4"));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn ps800_with_user(tag: &str, user: &str, registry: &[(&str, &str, &str, &str, &str)]) -> Row {
+        let root = ps_tmp(tag);
+        let conn = ps_event_facts(&root);
+        let detail = format!("\tUserId={user}\r\n\tHostApplication=powershell.exe -c x\r\n\tCommandLine=Get-Date\r\n");
+        let data = serde_json::json!({ "Data": {"#text": ["Get-Date", detail, ""]} }).to_string();
+        ps_insert_classic(&conn, "800", "281", &data);
+        drop(conn);
+        let registry_dir = root.join("REGISTRY");
+        std::fs::create_dir_all(&registry_dir).unwrap();
+        for (hive, key, name, value_type, value) in registry {
+            let reg = Connection::open(registry_dir.join(format!("{hive}.sqlite"))).unwrap();
+            reg.execute("CREATE TABLE IF NOT EXISTS Registry (key_path TEXT, value_name TEXT, value_type TEXT, value_data TEXT, last_write TEXT, _recovery TEXT, _source_file TEXT)", []).unwrap();
+            reg.execute("INSERT INTO Registry VALUES (?1, ?2, ?3, ?4, '2026-01-01 00:00:00.000', 'live', ?5)", rusqlite::params![key, name, value_type, value, hive]).unwrap();
+        }
+        let rows = build_powershell_history(&root);
+        let _ = std::fs::remove_dir_all(root);
+        rows.into_iter().next().unwrap()
+    }
+
+    const COMPUTER: (&str, &str, &str, &str, &str) = ("SYSTEM", "\\ROOT\\ControlSet001\\Control\\ComputerName\\ComputerName", "ComputerName", "REG_SZ", "WIN-HOST");
+    const SAM_ADMIN: (&str, &str, &str, &str, &str) = ("SAM", "\\ROOT\\SAM\\Domains\\Account\\Users\\Names\\Administrator", "(default)", "500", "");
+    // Account V tail = sub-authorities 1, 2, 3 (little-endian u32).
+    const SAM_DOMAIN: (&str, &str, &str, &str, &str) = ("SAM", "\\ROOT\\SAM\\Domains\\Account", "V", "REG_BINARY", "00000000010000000200000003000000");
+    const CORP_PROFILE_500: (&str, &str, &str, &str, &str) = ("SOFTWARE", "\\ROOT\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList\\S-1-5-21-9-9-9-500", "ProfileImagePath", "REG_EXPAND_SZ", "C:\\Users\\Administrator");
+
+    #[test]
+    fn classic_800_this_host_user_resolves_to_the_local_account_and_sid() {
+        let row = ps800_with_user("ps800-local", "win-host\\administrator", &[COMPUTER, SAM_ADMIN, SAM_DOMAIN, CORP_PROFILE_500]);
+        assert_eq!(row.get("account").map(String::as_str), Some("Administrator"));
+        assert_eq!(row.get("account_sid").map(String::as_str), Some("S-1-5-21-1-2-3-500"));
+    }
+
+    #[test]
+    fn classic_800_other_domain_or_unknown_machine_sid_is_not_guessed() {
+        // Different domain: verbatim, no SID.
+        let row = ps800_with_user("ps800-domain", "CORP\\Administrator", &[COMPUTER, SAM_ADMIN, SAM_DOMAIN]);
+        assert_eq!(row.get("account").map(String::as_str), Some("CORP\\Administrator"));
+        assert!(row.get("account_sid").map(String::is_empty).unwrap_or(true));
+        // Only a domain profile shares RID 500 and SAM has no machine SID:
+        // the local name is confirmed, the SID stays unknown.
+        let row = ps800_with_user("ps800-domain-profile", "WIN-HOST\\Administrator", &[COMPUTER, SAM_ADMIN, CORP_PROFILE_500]);
+        assert_eq!(row.get("account").map(String::as_str), Some("Administrator"));
+        assert!(row.get("account_sid").map(String::is_empty).unwrap_or(true));
+        // Not in SAM: verbatim.
+        let row = ps800_with_user("ps800-nosam", "WIN-HOST\\ghost", &[COMPUTER, SAM_ADMIN, SAM_DOMAIN]);
+        assert_eq!(row.get("account").map(String::as_str), Some("WIN-HOST\\ghost"));
     }
 
     #[test]

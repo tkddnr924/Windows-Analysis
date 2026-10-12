@@ -1440,10 +1440,9 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
   },
   PowerShellHistory: {
     customView: "powershellFlow",
-    // ScriptBlock and HostApplication can be arbitrarily long. Keep the
-    // shared drawer's evidence title stable; both values are first-class
-    // fields in the execution section below.
-    title: (r) => r.command || r.event_type || "(명령 없음)",
+    // Title names the record type (like every other view); the command,
+    // script and host command line are the content sections below.
+    title: (r) => r.event_type || "파워셸 기록",
     subtitle: (r) => [r.account, r.process].filter(Boolean).join(" · "),
     badges: [
       { key: "event_type", kind: "badge" },
@@ -1456,8 +1455,8 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     priorityColumns: ["timestamp", "event_type", "account", "process", "command"],
     sections: [
       { heading: "실행 정보", fields: [
-        { key: "account", label: "수행 계정", kind: "account" },
-        { key: "account_sid", label: "수행 계정 SID", kind: "accountSid" },
+        // One account label: confirmed name, else the event SID.
+        { key: "account", label: "수행 계정", kind: "account", compute: (r) => r.account || r.account_sid },
         { key: "process", label: "수행 프로세스" },
         { key: "process_id", label: "프로세스 ID" },
         { key: "host_application", label: "호스트 애플리케이션", kind: "code", showWhenEmpty: true, emptyLabel: "기록되지 않음" },
@@ -1472,13 +1471,51 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
         { key: "description", label: "재조합 상태" },
         { key: "script_block", kind: "code" },
         { key: "script_block_id", label: "ScriptBlock ID" },
+        { key: "script_block_expected_parts", label: "기대 조각 수" },
+        { key: "script_block_observed_parts", label: "관측 조각 수" },
+        { key: "script_block_missing", label: "누락 조각 구간", kind: "json" },
+        { key: "script_block_conflicts", label: "충돌 조각 번호", kind: "json" },
+        { key: "script_block_anomalies", label: "재조합 이상", kind: "json" },
       ] },
+      // 4100: an error/warning record, never a successful execution.
+      { heading: "오류·경고", fields: [
+        { key: "error_message", label: "오류 메시지", kind: "code" },
+        { key: "context_info", label: "실행 문맥 (ContextInfo)", kind: "code" },
+      ]},
+      { heading: "콘솔 기록", fields: [
+        { key: "console_history_status", label: "연결 상태", valueLabels: { incomplete_continuation: "연결 미완료", missing_line: "줄 누락" } },
+      ]},
       { heading: "이벤트", fields: [
         { key: "event_id", label: "이벤트 ID" },
+        { key: "event_level", label: "수준", valueLabels: { "1": "위험", "2": "오류", "3": "경고", "4": "정보", "5": "자세한 정보" } },
         { key: "provider", label: "공급자" },
-        { key: "session_id", label: "세션 ID" },
+        { key: "event_channel", label: "채널" },
+        { key: "event_record_id", label: "EventRecordID" },
+        { key: "session_id", label: "Host ID (세션)" },
         { key: "runspace_id", label: "Runspace ID" },
       ]},
+      { heading: "이벤트 원문", collapsible: { defaultExpanded: false, summary: () => "EventData" }, fields: [
+        { key: "event_data", label: "EventData", kind: "json" },
+      ]},
+    ],
+    childTables: [
+      {
+        table: "PowerShellEncodedCommands",
+        heading: "인코딩 명령 해독",
+        fields: [
+          { key: "source_field", label: "출처 필드" },
+          { key: "decode_status", label: "해독 상태", valueLabels: { success: "성공", missing_payload: "인코딩 값 없음", invalid_base64: "Base64 오류", invalid_utf16: "UTF-16 오류", ambiguous_command_line: "명령줄 모호" } },
+          { key: "decode_method", label: "방식" },
+          { key: "decoded_command", label: "해독 명령" },
+          { key: "encoded_command", label: "인코딩 원문" },
+          { key: "decode_error", label: "오류" },
+        ],
+      },
+      {
+        table: "PowerShellConsoleLines",
+        heading: "콘솔 원본 줄",
+        summary: (r) => `${r.line_number ?? "?"}: ${r.command ?? ""}`,
+      },
     ],
   },
 

@@ -3545,28 +3545,49 @@ async fn powershell_search_rowids(
     full_path: String,
     query: String,
 ) -> Result<Vec<i64>, String> {
-    tauri::async_runtime::spawn_blocking(move || -> Result<Vec<i64>, String> {
-        let needle = query.trim().to_lowercase();
-        if needle.is_empty() {
-            return Ok(Vec::new());
-        }
-        let conn = open_ro(&full_path)?;
-        let like = format!(
-            "%{}%",
-            needle
-                .replace('\\', "\\\\")
-                .replace('%', "\\%")
-                .replace('_', "\\_")
+    tauri::async_runtime::spawn_blocking(move || powershell_search_rowids_blocking(&full_path, &query))
+        .await
+        .map_err(|error| format!("파워셸 검색 작업이 중단되었습니다: {error}"))?
+}
+
+fn powershell_search_rowids_blocking(full_path: &str, query: &str) -> Result<Vec<i64>, String> {
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() {
+        return Ok(Vec::new());
+    }
+    let conn = open_ro(full_path)?;
+    let like = format!(
+        "%{}%",
+        needle
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_")
+    );
+    // Full stored text (docs viewer-02): command, script, host command line,
+    // script path, 4100 error/context and decoded EncodedCommand. Columns
+    // and the decode child exist only from powershell_history=3.
+    let columns = table_columns(&conn, "PowerShellHistory");
+    let mut clauses: Vec<String> = ["command", "script_block", "host_application", "script_path", "error_message", "context_info"]
+        .iter()
+        .filter(|column| columns.iter().any(|c| c == *column))
+        .map(|column| format!("lower(COALESCE(p.{column},'')) LIKE ?1 ESCAPE '\\'"))
+        .collect();
+    if table_names(&conn).iter().any(|name| name == "PowerShellEncodedCommands") {
+        clauses.push(
+            "EXISTS (SELECT 1 FROM \"PowerShellEncodedCommands\" e WHERE e.record_id = p.record_id \
+             AND lower(COALESCE(e.decoded_command,'')) LIKE ?1 ESCAPE '\\')"
+                .to_string(),
         );
-        let sql = "SELECT rowid FROM \"PowerShellHistory\" WHERE lower(COALESCE(command,'')) LIKE ?1 ESCAPE '\\' OR lower(COALESCE(script_block,'')) LIKE ?1 ESCAPE '\\' OR lower(COALESCE(host_application,'')) LIKE ?1 ESCAPE '\\'";
-        let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map([&like], |r| r.get::<_, i64>(0))
-            .map_err(|e| e.to_string())?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
-    })
-    .await
-    .map_err(|error| format!("파워셸 검색 작업이 중단되었습니다: {error}"))?
+    }
+    if clauses.is_empty() {
+        return Ok(Vec::new());
+    }
+    let sql = format!("SELECT p.rowid FROM \"PowerShellHistory\" p WHERE {}", clauses.join(" OR "));
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([&like], |r| r.get::<_, i64>(0))
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -7561,6 +7582,47 @@ mod bookmark_tests {
         assert!(result.is_err());
 
         let _ = std::fs::remove_dir_all(case_dir);
+    }
+}
+
+#[cfg(test)]
+mod powershell_search_tests {
+    use super::*;
+
+    fn db(tag: &str, ddl: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "windows-analysis-ps-search-{tag}-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos(),
+        ));
+        Connection::open(&path).unwrap().execute_batch(ddl).unwrap();
+        path
+    }
+
+    #[test]
+    fn searches_decoded_commands_and_4100_text_beyond_the_list_preview() {
+        let path = db("v3", "CREATE TABLE PowerShellHistory (record_id TEXT, command TEXT, script_block TEXT,
+               host_application TEXT, script_path TEXT, error_message TEXT, context_info TEXT);
+             CREATE TABLE PowerShellEncodedCommands (record_id TEXT, decoded_command TEXT);
+             INSERT INTO PowerShellHistory VALUES
+               ('a', NULL, NULL, 'powershell -enc VwBy', NULL, NULL, NULL),
+               ('b', NULL, NULL, NULL, NULL, 'System error.', NULL),
+               ('c', 'Get-Date', NULL, NULL, NULL, NULL, NULL);
+             INSERT INTO PowerShellEncodedCommands VALUES ('a', 'Write-Output secret_100%');");
+        let full = path.to_string_lossy().to_string();
+        assert_eq!(powershell_search_rowids_blocking(&full, "SECRET_100%").unwrap(), vec![1]);
+        assert_eq!(powershell_search_rowids_blocking(&full, "system error").unwrap(), vec![2]);
+        // LIKE wildcards in the needle are literal.
+        assert!(powershell_search_rowids_blocking(&full, "get_date").unwrap().is_empty());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn older_results_without_new_columns_still_search() {
+        let path = db("v2", "CREATE TABLE PowerShellHistory (record_id TEXT, command TEXT, script_block TEXT, host_application TEXT);
+             INSERT INTO PowerShellHistory VALUES ('a', 'Invoke-Thing', NULL, NULL);");
+        assert_eq!(powershell_search_rowids_blocking(&path.to_string_lossy(), "invoke").unwrap(), vec![1]);
+        let _ = std::fs::remove_file(path);
     }
 }
 

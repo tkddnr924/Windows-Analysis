@@ -1,9 +1,10 @@
 "use client";
 
-import { useId, useState } from "react";
+import { useId, useRef, useState } from "react";
 import CheckIcon from "@mui/icons-material/Check";
 import ContentCopyOutlinedIcon from "@mui/icons-material/ContentCopyOutlined";
 import { useModalDialog } from "@/lib/useModalDialog";
+import SelectionDecoder from "./SelectionDecoder";
 
 // A full-screen overlay that shows one code/text blob on its own — for when a
 // ScriptBlock (or any long code field) is too big to read inside the detail
@@ -22,6 +23,7 @@ export default function CodeModal({
   const [wrap, setWrap] = useState(true);
   const titleId = useId();
   const dialogRef = useModalDialog(onClose);
+  const preRef = useRef<HTMLPreElement>(null);
 
   async function copyCode() {
     try {
@@ -114,6 +116,7 @@ export default function CodeModal({
         </div>
         {copyError && <div role="status" style={{ padding: "6px 14px", color: "var(--danger)", borderBottom: "1px solid var(--border-subtle)", fontSize: 11.5 }}>클립보드에 복사하지 못했습니다. 권한을 확인한 뒤 다시 시도하세요.</div>}
         <pre
+          ref={preRef}
           style={{
             margin: 0,
             flex: 1,
@@ -129,6 +132,7 @@ export default function CodeModal({
         >
           {code}
         </pre>
+        <SelectionDecoder containerRef={preRef} />
       </div>
     </div>
   );
