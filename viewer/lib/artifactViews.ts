@@ -3,6 +3,7 @@ import { resolveKnownFolderPath } from "@/lib/knownFolders";
 import { MACHINE_SCOPE_LABEL, MACHINE_SCOPE_USER } from "@/lib/accountIdentity";
 import { displayRegistryKeyPath } from "@/lib/registryPath";
 import { executableNote } from "./executableCatalog";
+import { ACCOUNT_ROLE_LABELS } from "./executionHistory";
 import { lookupEventCatalog, parseEventData, extractEventField, extractPsClassicField, tagsForSecurityEvent, EVENT_QUICK_FIELDS, LOGON_TYPE_LABELS } from "./eventCatalog";
 
 export type FieldKind = "text" | "path" | "code" | "hash" | "bytes" | "json" | "badge" | "privileges" | "accountSid" | "account" | "byteSize" | "durationMs" | "cacheData";
@@ -296,7 +297,7 @@ function accountFromJumpListSource(path: string | undefined): string {
   return "";
 }
 
-type ExecutionEvidence = "amcache" | "userAssist" | "srum" | "bam" | "prefetch" | "other";
+type ExecutionEvidence = "amcache" | "userAssist" | "srum" | "bam" | "prefetch" | "processCreation" | "shellCore" | "other";
 
 // 실행 이력 파생 행의 증거 종류는 event_type에 들어 있다(저장 계약 docs-01:
 // 기존 source_artifact 값을 그대로 쓴다). 원본 연결은 source_records에 있고,
@@ -308,6 +309,8 @@ function executionEvidence(row: Record<string, string>): ExecutionEvidence {
   if (source === "srum") return "srum";
   if (source === "bam") return "bam";
   if (source === "prefetch") return "prefetch";
+  if (source === "security 4688") return "processCreation";
+  if (source.startsWith("shell-core ")) return "shellCore";
   return "other";
 }
 
@@ -318,6 +321,9 @@ function executionSourceLabel(row: Record<string, string>): string {
     case "srum": return "SRUM";
     case "bam": return "BAM";
     case "prefetch": return "Prefetch";
+    // All EventLog channels share one label; event_type stays in 기록 정보.
+    case "processCreation":
+    case "shellCore": return "EventLog";
     default: return row.event_type || "ExecutionHistory";
   }
 }
@@ -806,7 +812,8 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     // RegistryFindings with that caveat.
     timelineField: "timestamp",
     title: (r) => `ExecutionHistory:${executionSourceLabel(r)}`,
-    timelineTitle: (r) => r.program_name || basename(r.program_path) || "(이름 없음)",
+    // Shell-Core keeps only the raw command (no program name/path is inferred).
+    timelineTitle: (r) => r.program_name || basename(r.program_path) || r.command_line || "(이름 없음)",
     // The timeline keeps the evidence source and path visible while the detail
     // drawer has one concise timestamp in its evidence overview.
     timelineSubtitle: (r) => [executionSourceLabel(r), r.program_path].filter(Boolean).join(" · "),
@@ -851,11 +858,51 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
         { key: "program_name", label: "실행 파일", compute: (r) => executionValue("prefetch", "program_name", r) },
         { key: "run_count", label: "실행 횟수", compute: (r) => executionValue("prefetch", "run_count", r) },
       ]},
+      { heading: "프로세스 생성 정보", fields: [
+        { key: "program_name", label: "새 프로세스 이름", compute: (r) => executionValue("processCreation", "program_name", r) },
+        { key: "program_path", label: "새 프로세스 경로 (NewProcessName)", kind: "path", compute: (r) => executionValue("processCreation", "program_path", r) },
+        { key: "command_line", label: "명령줄 (CommandLine)", kind: "code", compute: (r) => executionValue("processCreation", "command_line", r) },
+        { key: "process_id", label: "새 프로세스 ID (NewProcessId)", compute: (r) => executionValue("processCreation", "process_id", r) },
+        { key: "parent_process_path", label: "생성 요청 프로세스 (ParentProcessName)", kind: "path" },
+        { key: "parent_process_id", label: "생성 요청 프로세스 ID (ProcessId)" },
+      ]},
+      { heading: "시작 명령 정보", fields: [
+        { key: "command_line", label: "Run 키 명령 (Command)", kind: "code", compute: (r) => executionValue("shellCore", "command_line", r) },
+        { key: "process_id", label: "프로세스 ID (PID)", compute: (r) => executionValue("shellCore", "process_id", r) },
+      ]},
+      // account/account_sid are the common account; account_role says whose it is.
+      { heading: "이벤트 계정", fields: [
+        { key: "account_role", label: "계정 역할", valueLabels: ACCOUNT_ROLE_LABELS },
+        { key: "account", label: "계정", kind: "account", compute: (r) => r.account_role ? r.account : "" },
+        { key: "account_sid", label: "계정 SID", kind: "accountSid", compute: (r) => r.account_role ? r.account_sid : "" },
+      ]},
+      { heading: "생성 요청자 (Subject)", fields: [
+        { key: "subject_user_name", label: "계정 이름 (SubjectUserName)" },
+        { key: "subject_domain_name", label: "도메인 (SubjectDomainName)" },
+        { key: "subject_user_sid", label: "SID (SubjectUserSid)", kind: "accountSid" },
+        { key: "subject_logon_id", label: "로그온 ID (SubjectLogonId)" },
+      ]},
+      { heading: "대상 계정 (Target)", fields: [
+        { key: "target_user_name", label: "계정 이름 (TargetUserName)" },
+        { key: "target_domain_name", label: "도메인 (TargetDomainName)" },
+        { key: "target_user_sid", label: "SID (TargetUserSid)", kind: "accountSid" },
+        { key: "target_logon_id", label: "로그온 ID (TargetLogonId)" },
+      ]},
       { heading: "실행 정보", fields: [
         { key: "program_name", label: "항목 이름", compute: (r) => executionEvidence(r) === "other" ? r.program_name : "" },
         { key: "program_path", label: "항목 경로", kind: "path", compute: (r) => executionEvidence(r) === "other" ? r.program_path : "" },
         { key: "program_path_resolved", label: "항목 경로 (환경변수 해석)", kind: "path" },
-        { key: "event_type", label: "원본 아티팩트" },
+      ]},
+      { heading: "이벤트 정보", collapsible: { defaultExpanded: false, summary: (r) => `EventID ${r.event_id} · RecordID ${r.event_record_id || "-"}` }, fields: [
+        { key: "event_id", label: "Event ID" },
+        { key: "event_provider", label: "제공자 (Provider)" },
+        { key: "event_channel", label: "채널 (Channel)" },
+        { key: "event_record_id", label: "EventRecordID" },
+        { key: "event_process_id", label: "기록 프로세스 ID (System.ProcessID)" },
+        { key: "event_thread_id", label: "기록 스레드 ID (System.ThreadID)" },
+        { key: "event_user_sid", label: "System.UserID", kind: "accountSid" },
+        { key: "event_computer", label: "Computer" },
+        { key: "event_data", label: "EventData 원문", kind: "json" },
       ]},
     ],
     // 대표 시각 외의 실행 시각과 볼륨 정보는 자식 표에 있다 — 한 행에 8개

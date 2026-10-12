@@ -67,6 +67,10 @@ const ARTIFACT_CHIP_TONES: Record<string, ArtifactChipTone> = {
   REGISTRYFINDINGS: { border: "#cfb8f7", background: "rgba(150, 113, 201, 0.14)", color: "#cfb8f7" },
   SMBHISTORY: { border: "#88dce2", background: "rgba(37, 143, 154, 0.14)", color: "#88dce2" },
   DEFENDER: { border: "#f0ada0", background: "rgba(181, 100, 86, 0.14)", color: "#f0ada0" },
+  // Execution-history sources shown as separate badges (registry-derived ones too).
+  USERASSIST: { border: "#d8e27a", background: "rgba(150, 160, 50, 0.14)", color: "#d8e27a" },
+  BAM: { border: "#f5c6a0", background: "rgba(190, 130, 80, 0.14)", color: "#f5c6a0" },
+  TIMELINE: { border: "#a8e6a1", background: "rgba(84, 160, 76, 0.14)", color: "#a8e6a1" },
 };
 
 const DEFAULT_ARTIFACT_CHIP_TONE: ArtifactChipTone = {

@@ -322,8 +322,6 @@ fn execution_events(ctx: &Ctx, events: &EventLogOverviewCache, db: &mut DerivedD
                 ("Security 4688", "프로세스 생성 시각", "새 프로세스 생성"),
             ("Microsoft-Windows-Shell-Core", "Microsoft-Windows-Shell-Core/Operational", "9707") =>
                 ("Shell-Core 9707", "시작 명령 처리 시작 시각", "Run 키 명령 처리 시작"),
-            ("Microsoft-Windows-Shell-Core", "Microsoft-Windows-Shell-Core/Operational", "9708") =>
-                ("Shell-Core 9708", "시작 명령 처리 종료 시각", "Run 키 명령 처리 종료 — 프로그램 종료·성공 판정 아님"),
             _ => continue,
         };
         let data = overview::parse_eventdata(g(row, "EventData"));
@@ -370,10 +368,7 @@ fn execution_events(ctx: &Ctx, events: &EventLogOverviewCache, db: &mut DerivedD
             }
         } else {
             rec.set("command_line", text_raw(&ed_field(&data, "Command")));
-            // System.ProcessID identifies the logger, not the launched process.
-            if g(row, "EventID") == "9708" {
-                rec.set("process_id", text_raw(&ed_field(&data, "PID")));
-            }
+            // 9708 (processing stop) is not stored (user decision 2026-10-12).
             rec.set("account_role", text("event_subject"));
             if let Some(sid) = sid_of(g(row, "UserID")) {
                 rec.account(sid, &ctx.meta);

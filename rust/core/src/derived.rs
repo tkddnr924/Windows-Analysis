@@ -2220,7 +2220,7 @@ mod tests {
     }
 
     #[test]
-    fn execution_history_keeps_shell_commands_without_inventing_processes() {
+    fn execution_history_keeps_shell_start_commands_and_excludes_9708() {
         let (out_dir, target) = fixture("execution-shell");
         let path = facts_db(&out_dir, "EVENTLOG/Shell.sqlite",
             "CREATE TABLE Shell(timestamp TEXT, Channel TEXT, Provider TEXT, EventID TEXT,
@@ -2246,10 +2246,9 @@ mod tests {
                 ORDER BY s.source_rowid").unwrap().query_map([], |r| {
                     Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))
                 }).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        // 9708 (command processing stop) is not stored in _OVERVIEW (user decision 2026-10-12).
         assert_eq!(rows, vec![
             (Some(command.into()), None, None, "999".into(), "event_subject".into(), None),
-            (Some(command.into()), Some("0".into()), None, "999".into(), "event_subject".into(), None),
-            (None, None, None, "999".into(), "event_subject".into(), None),
         ]);
         drop(conn);
         std::fs::remove_dir_all(out_dir.parent().unwrap()).unwrap();
