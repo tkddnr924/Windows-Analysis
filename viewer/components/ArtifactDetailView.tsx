@@ -495,6 +495,44 @@ function BrowserRecordExtras({ recordId, eventType, hostDir }: { recordId: strin
   );
 }
 
+// Same-generation metadata interfaces shown as a separate reference; never
+// copied into the event's local_address (docs-08 R15).
+function LocalNetworkReference({ hostDir, datasetId }: { hostDir: string; datasetId?: string }) {
+  const [interfaces, setInterfaces] = useState<{ id: string; name: string; addresses: string; gateways: string; dns: string }[] | null>(null);
+  useEffect(() => {
+    let alive = true;
+    window.api.hostMetadata(hostDir, { kind: "network" }).then((meta) => {
+      if (!alive) return;
+      const join = (rows: Record<string, unknown>[], id: string) => rows.filter((entry) => entry.metadata_id === id).map((entry) => String(entry.address ?? "")).filter(Boolean).join(", ");
+      const list = (meta.rows as Record<string, unknown>[])
+        .filter((entry) => !datasetId || entry.dataset_id === datasetId)
+        .map((entry) => {
+          const id = String(entry.metadata_id ?? "");
+          const addresses = join(meta.addresses as Record<string, unknown>[], id);
+          const gateways = join(meta.gateways as Record<string, unknown>[], id);
+          const dns = join(meta.dnsServers as Record<string, unknown>[], id);
+          return { id, name: String(entry.interface_name || entry.value || entry.key || ""), addresses, gateways, dns };
+        })
+        .filter((entry) => entry.addresses || entry.gateways || entry.dns);
+      setInterfaces(list);
+    }).catch(() => { if (alive) setInterfaces([]); });
+    return () => { alive = false; };
+  }, [hostDir, datasetId]);
+  if (!interfaces?.length) return null;
+  return (
+    <ExtraSection heading="로컬 네트워크 참조 (수집 시점)">
+      <div style={{ display: "grid", gap: 8 }}>
+        {interfaces.map((entry) => (
+          <div key={entry.id} style={{ padding: "8px 10px", background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: "var(--radius)", display: "grid", gap: 4 }}>
+            <span style={{ fontSize: 12, fontWeight: 650 }}>{entry.name}</span>
+            <ExtraRows rows={[["주소", entry.addresses, true], ["게이트웨이", entry.gateways, true], ["DNS", entry.dns, true]]} />
+          </div>
+        ))}
+      </div>
+    </ExtraSection>
+  );
+}
+
 function FieldRow({ field, row, onFetchLinkedRows, hostDir, accountDirectory, onToggleFieldBookmark, isFieldBookmarked }: { field: FieldSpec; row: Record<string, string>; onFetchLinkedRows?: FetchLinkedRows; hostDir?: string; accountDirectory?: AccountDirectory; onToggleFieldBookmark?: (field: string) => void; isFieldBookmarked?: (field: string) => boolean }) {
   // resultRow returns SQL NULL as null; treat it as an empty value.
   const raw: string = (field.compute ? field.compute(row) : row[field.key]) ?? "";
@@ -925,6 +963,9 @@ export default function ArtifactDetailView({ spec, row, evidenceTime, onNavigate
 
       {hostDir && row.overview_name === "BrowserActivity" && row.record_id && (
         <BrowserRecordExtras recordId={row.record_id} eventType={row.event_type} hostDir={hostDir} />
+      )}
+      {hostDir && row.overview_name === "RemoteDesktopHistory" && (
+        <LocalNetworkReference hostDir={hostDir} datasetId={row.dataset_id} />
       )}
     </div>
   );

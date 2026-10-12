@@ -10,7 +10,7 @@ import MasterTimeline from "@/components/MasterTimeline";
 import BookmarksView from "@/components/BookmarksView";
 import CaseSearchView from "@/components/CaseSearchView";
 import HostConnectionView, { type HostGraph, type ConnRecord } from "@/components/HostConnectionView";
-import SessionFlowView from "@/components/SessionFlowView";
+import RemoteAccessView from "@/components/RemoteAccessView";
 import SmbHistoryView from "@/components/SmbHistoryView";
 import BitsView from "@/components/BitsView";
 import ServiceView from "@/components/ServiceView";
@@ -35,6 +35,7 @@ import { EMPTY_TIME_RANGE, type TimeRange } from "@/lib/timeRange";
 import { bookmarkRefKeys, isRecordBookmarked, parseSourceRefs, type SourceRef } from "@/lib/sourceRefs";
 import { accountDirectoryFromEntries, type AccountDirectory } from "@/lib/accountIdentity";
 import { RecordScopeContext } from "@/lib/recordScope";
+import { isLoopbackAddress } from "@/lib/remoteAccess";
 import type { AccountEventPage, AccountEventQuery, Bookmark, Case, Host, CategoryEntry, CsvData, RecordSource, ResultFileEntry, TimelineEntry, SearchHit } from "@/lib/types";
 
 interface TabState {
@@ -110,7 +111,7 @@ export default function Home() {
   // All IPs of every host in the case (a host can have several NICs). Shared by
   // every 케이스 분석 view so a remote IP that is really another host is
   // recognised as that host, whichever of its addresses appears. Cached per case.
-  const [caseNetwork, setCaseNetwork] = useState<{ caseId: string; sig: string; nonce: number; ipToHost: Record<string, { id: string; name: string }>; hostIps: Record<string, string[]> } | null>(null);
+  const [caseNetwork, setCaseNetwork] = useState<{ caseId: string; sig: string; nonce: number; ipToHost: Record<string, { id: string; name: string }>; ipHosts: Record<string, { id: string; name: string }[]>; hostIps: Record<string, string[]> } | null>(null);
   // Bumped when a parse finishes so the network map reloads even if the host
   // SET is unchanged (re-parsing an existing host adds/updates its TargetInfo).
   const [netNonce, setNetNonce] = useState(0);
@@ -480,22 +481,13 @@ export default function Home() {
     setActiveVirtualTab("bookmarks");
   }
 
-  function isLoopbackAddress(value: string): boolean {
-    const raw = value.trim().toLocaleLowerCase();
-    if (!raw) return false;
-    const hostName = /^[a-z][a-z0-9.-]*:\d+$/.test(raw) ? raw.replace(/:\d+$/, "") : raw;
-    if (hostName === "localhost" || hostName === "localhost.localdomain") return true;
-    const bracketed = raw.match(/^\[([^\]]+)](?::\d+)?$/)?.[1] ?? raw;
-    const withoutZone = bracketed.replace(/%[\w.-]+$/, "");
-    const address = /^\d{1,3}(?:\.\d{1,3}){3}:\d+$/.test(withoutZone) ? withoutZone.replace(/:\d+$/, "") : withoutZone;
-    return /^127(?:\.\d{1,3}){3}$/.test(address) || address === "::1" || address === "0:0:0:0:0:0:0:1" || /^::ffff:127(?:\.\d{1,3}){3}$/.test(address);
-  }
-
   // Read every host's network IPs (all NICs) from its TargetInfo overview and
   // build ip -> host and host -> ips maps. One place, so every case-analysis
-  // view agrees on which IP belongs to which host.
-  async function loadCaseNetwork(): Promise<{ ipToHost: Record<string, { id: string; name: string }>; hostIps: Record<string, string[]> }> {
+  // view agrees on which IP belongs to which host. `ipHosts` keeps every host
+  // on an IP (docs-08 R14); `ipToHost` is the single-host map older views use.
+  async function loadCaseNetwork(): Promise<{ ipToHost: Record<string, { id: string; name: string }>; ipHosts: Record<string, { id: string; name: string }[]>; hostIps: Record<string, string[]> }> {
     const ipToHost: Record<string, { id: string; name: string }> = {};
+    const ipHosts: Record<string, { id: string; name: string }[]> = {};
     const hostIps: Record<string, string[]> = {};
     for (const h of selectedCase?.hosts ?? []) {
       let ips: string[] = [];
@@ -516,9 +508,13 @@ export default function Home() {
       hostIps[h.id] = ips;
       // Loopback identifies the current machine, not a host-to-host relation.
       // Keep it in the raw interface list but never resolve a remote peer to it.
-      for (const ip of ips) if (!isLoopbackAddress(ip)) ipToHost[ip] = { id: h.id, name: h.name };
+      for (const ip of ips) {
+        if (isLoopbackAddress(ip)) continue;
+        ipToHost[ip] = { id: h.id, name: h.name };
+        ipHosts[ip] = [...(ipHosts[ip] ?? []), { id: h.id, name: h.name }];
+      }
     }
-    return { ipToHost, hostIps };
+    return { ipToHost, ipHosts, hostIps };
   }
 
   // Auto-(re)load the case network map whenever the case or its host set
@@ -1261,12 +1257,14 @@ export default function Home() {
                   timeRange={timeRange}
                   accountDirectory={currentAccountDirectory}
                 />
-              ) : getArtifactView(activeTab.file.name)?.flowView ? (
-                <SessionFlowView
-                  key={activeTab.file.name}
+              ) : getArtifactView(activeTab.file.name)?.customView === "remoteAccess" ? (
+                <RemoteAccessView
+                  key={activeTab.file.fullPath}
                   fileName={activeTab.file.name}
+                  dbPath={activeTab.file.fullPath}
                   data={activeTab.data}
-                  hostIpMap={caseNetwork?.caseId === selectedCase?.id ? caseNetwork.ipToHost : {}}
+                  hostDir={selectedHost?.dir ?? ""}
+                  ipHosts={caseNetwork?.caseId === selectedCase?.id ? caseNetwork.ipHosts : {}}
                   onNavigate={handleNavigate}
                   onFetchLinkedRows={fetchLinkedRows}
                   bookmarkedRowids={activeBookmarkedRowids}

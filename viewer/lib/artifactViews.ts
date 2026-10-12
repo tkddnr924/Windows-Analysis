@@ -6,6 +6,7 @@ import { executableNote } from "./executableCatalog";
 import { ACCOUNT_ROLE_LABELS } from "./executionHistory";
 import { lookupEventCatalog, parseEventData, extractEventField, extractPsClassicField, tagsForSecurityEvent, EVENT_QUICK_FIELDS, LOGON_TYPE_LABELS } from "./eventCatalog";
 import { downloadStateLabel, transitionLabel } from "./browserView";
+import { STAGE_LABELS } from "./remoteAccess";
 
 export type FieldKind = "text" | "path" | "code" | "hash" | "bytes" | "json" | "badge" | "privileges" | "accountSid" | "account" | "byteSize" | "durationMs" | "mftData";
 
@@ -144,19 +145,12 @@ export interface ArtifactViewSpec {
    */
   filterTabs?: { column: string; tabs: { label: string; value?: string }[] };
   /**
-   * Render this table as a session-grouped FLOW view (SessionFlowView)
-   * instead of a flat data table — rows are clustered into sessions by
-   * peer + account + time proximity so the connect→logon→disconnect
-   * sequence reads as a flow. Used for RemoteDesktopHistory.
-   */
-  flowView?: boolean;
-  /**
    * Render this overview table with a bespoke, non-tabular component instead
    * of a DataTable — the string names which one (see CUSTOM_VIEWS in page.tsx).
    * Overview correlations (TargetInfo, ...) read as summaries/dashboards, not
    * spreadsheets, so each gets a purpose-built view.
    */
-  customView?: "targetInfo" | "executionHistory" | "powershellFlow" | "defender" | "registryExplorer" | "rdpCache" | "browserHistory" | "smb" | "bits" | "service" | "firewall" | "scheduledTasks" | "wer" | "mft" | "usnJrnl";
+  customView?: "targetInfo" | "executionHistory" | "powershellFlow" | "defender" | "registryExplorer" | "rdpCache" | "browserHistory" | "smb" | "bits" | "service" | "firewall" | "scheduledTasks" | "wer" | "mft" | "usnJrnl" | "remoteAccess";
   /**
    * In the sidebar, present this table split by this column: instead of one
    * row for the whole table, the category lists one entry per distinct value
@@ -1360,10 +1354,8 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
       { key: "direction", kind: "badge", badgeColors: DIRECTION_COLORS },
       { key: "result", label: "결과", kind: "badge", badgeColors: RDP_RESULT_COLORS },
     ],
-    // Shown as a session-grouped flow instead of a flat table.
-    flowView: true,
-    // (kept for when the raw table is viewed directly) Only these five are
-    // worth scanning; provider/event_id/result stay in the data.
+    customView: "remoteAccess",
+    // (kept for when the raw table is viewed directly)
     visibleColumns: ["timestamp", "direction", "remote_address", "account", "description"],
     filterTabs: {
       column: "result",
@@ -1374,23 +1366,84 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
       ],
     },
     priorityColumns: ["timestamp", "direction", "remote_address", "account", "description"],
-    sections: [{ heading: "상세", fields: [
-      { key: "account", label: "계정", kind: "account" },
-      { key: "account_sid", label: "계정 SID", kind: "accountSid" },
-      { key: "remote_computer", label: "원격 컴퓨터" },
-      { key: "remote_port", label: "원격 포트" },
-      { key: "local_address", label: "로컬 주소" },
-      { key: "logon_type", label: "로그온 유형" },
-      { key: "logon_id", label: "로그온 ID" },
-      { key: "session_id", label: "세션 ID" },
-      { key: "start_time", label: "시작 시각" },
-      { key: "end_time", label: "종료 시각" },
-      { key: "event_type", label: "기록 종류" },
-      { key: "description", label: "설명" },
-      { key: "result", label: "결과" },
-      { key: "event_id", label: "이벤트 ID" },
-      { key: "provider", label: "공급자" },
-    ]}],
+    // docs-08: stored values only; unknown direction stays neutral (R13).
+    sections: [
+      { heading: "접속", fields: [
+        { key: "timestamp_kind", label: "대표 시각 의미" },
+        { key: "direction", label: "방향", valueLabels: { inbound: "인바운드", outbound: "아웃바운드", unknown: "방향 미확인" } },
+        { key: "access_scope", label: "접근 범위", valueLabels: { remote: "원격", local: "로컬", unknown: "미확인" } },
+        { key: "stage", label: "단계", valueLabels: STAGE_LABELS },
+        { key: "result", label: "결과" },
+        { key: "description", label: "설명" },
+        { key: "remote_address", label: "상대 주소" },
+        { key: "remote_address_raw", label: "상대 주소 원문", compute: (r) => (r.remote_address_raw && r.remote_address_raw !== r.remote_address ? r.remote_address_raw : "") },
+        { key: "remote_computer", label: "상대 컴퓨터" },
+        { key: "remote_port", label: "상대 포트" },
+        { key: "local_address", label: "이벤트 기록 로컬 주소" },
+        { key: "logon_type", label: "로그온 유형" },
+        { key: "session_id", label: "세션 ID" },
+        { key: "logon_id", label: "로그온 ID" },
+        { key: "connection_id", label: "연결 ID" },
+      ]},
+      { heading: "계정", fields: [
+        { key: "account", label: "계정", kind: "account" },
+        { key: "account_raw", label: "계정 원문", compute: (r) => (r.account_raw && r.account_raw !== r.account ? r.account_raw : "") },
+        { key: "account_domain", label: "도메인" },
+        { key: "account_upn", label: "UPN" },
+        { key: "account_sid", label: "SID", kind: "accountSid" },
+        { key: "target_user_sid", label: "대상 사용자 SID", compute: (r) => (r.target_user_sid && r.target_user_sid !== r.account_sid ? r.target_user_sid : "") },
+        { key: "system_user_sid", label: "서비스 주체 SID" },
+      ]},
+      { heading: "실패 · 사유", fields: [
+        { key: "status", label: "Status" },
+        { key: "sub_status", label: "SubStatus" },
+        { key: "failure_reason", label: "FailureReason" },
+        { key: "reason", label: "사유" },
+        { key: "authentication_package", label: "인증 패키지" },
+        { key: "logon_process", label: "로그온 프로세스" },
+      ]},
+      { heading: "원본 이벤트", fields: [
+        { key: "event_id", label: "이벤트 ID" },
+        { key: "provider", label: "공급자" },
+        { key: "channel", label: "채널" },
+        { key: "computer", label: "컴퓨터" },
+        { key: "event_record_id", label: "EventRecordID" },
+        { key: "process_id", label: "ProcessID" },
+        { key: "thread_id", label: "ThreadID" },
+        { key: "activity_id", label: "ActivityID" },
+        { key: "related_activity_id", label: "RelatedActivityID" },
+      ]},
+    ],
+    childTables: [
+      {
+        table: "RemoteAccessRelations",
+        heading: "값 승계 · 관계",
+        summary: (r) => [({ carry_forward: "승계", local_scope_direction: "로컬 방향", logon_instance_end: "로그온 종료" } as Record<string, string>)[r.relation_kind] ?? r.relation_kind, r.field, r.value].filter(Boolean).join(" · "),
+      },
+      {
+        table: "RemoteAccessDetails",
+        heading: "원문 세부",
+        fields: [
+          { key: "subject_user_sid", label: "Subject SID" },
+          { key: "subject_user_name", label: "Subject 이름" },
+          { key: "subject_domain", label: "Subject 도메인" },
+          { key: "subject_logon_id", label: "Subject LogonId" },
+          { key: "workstation_name", label: "워크스테이션" },
+          { key: "session_name", label: "세션 이름" },
+          { key: "source_session", label: "원본 세션" },
+          { key: "conn_type", label: "연결 유형" },
+          { key: "tunnel_id", label: "터널 ID" },
+          { key: "transport_type", label: "전송 유형" },
+          { key: "previous_state_name", label: "이전 상태" },
+          { key: "new_state_name", label: "새 상태" },
+          { key: "transition_event_name", label: "전이 이벤트" },
+          { key: "error_code", label: "오류 코드" },
+          { key: "facts_status", label: "facts 상태" },
+          { key: "facts_error", label: "facts 오류" },
+          { key: "event_data", label: "EventData", kind: "code" },
+        ],
+      },
+    ],
   },
 
   // SMB / network-logon activity, both directions: inbound (SMBServer/Security
