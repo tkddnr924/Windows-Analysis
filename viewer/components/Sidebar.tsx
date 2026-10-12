@@ -382,9 +382,6 @@ function CategoryNode({ category, selectedFile, onSelectFile, displayName, pinne
     const map = new Map<string, ResultFileEntry[]>();
     for (const file of files) {
       if (hideFileName && file.name === hideFileName) continue;
-      // 뷰 백데이터 테이블(파일 시스템 교차 참조, AI 대화 파생 등)은 독립
-      // 화면이 없다 — 내비게이션에 노출하지 않는다.
-      if (file.fileName === "PathReferences" || file.fileName === "AiConversations") continue;
       if (!map.has(file.fileName)) map.set(file.fileName, []);
       map.get(file.fileName)!.push(file);
     }
@@ -557,35 +554,22 @@ export default function Sidebar({
   }, [overviewFiles, overviewCategory?.fullPath]);
   const effectiveOverviewFiles = overviewFiles ?? fetchedOverviewFiles;
   const targetInfoEntry = effectiveOverviewFiles?.find((file) => file.name === "TargetInfo") ?? null;
-  // 소그룹 렌더용 — 종합 분석 테이블을 파일 단위로 묶는다 (CategoryNode와
-  // 같은 규칙: TargetInfo는 승격돼 제외, PathReferences·AiConversations는
-  // 독립 화면이 없는 백데이터라 제외).
+  // 분석 메뉴는 ANALYSIS_GROUPS에 정한 뷰만 보여 준다(사용자 확정). _OVERVIEW에
+  // 있는 다른 DB(백데이터·원본 facts·화면 없는 파생)는 자동으로 노출하지 않는다.
   const overviewByFile = useMemo(() => {
     const map = new Map<string, ResultFileEntry[]>();
     for (const file of browsableResultFiles(effectiveOverviewFiles ?? [])) {
-      // 승격 항목(@WER·@USN)이 여는 파생 테이블, 전용 뷰를 삭제한
-      // WmiSubscriptions, 화면이 없는 백데이터(경로 참조·AI 대화·공통 참조
-      // 정보 Metadata)는 일반 목록에서 제외한다.
-      if (file.name === "TargetInfo"
-        || file.fileName === "PathReferences"
-        || file.fileName === "AiConversations"
-        || file.fileName === "Metadata"
-        || file.fileName === "WerReports"
-        || file.fileName === "UsnJournal"
-        || file.fileName === "WmiSubscriptions") continue;
       if (!map.has(file.fileName)) map.set(file.fileName, []);
       map.get(file.fileName)!.push(file);
     }
     return map;
   }, [effectiveOverviewFiles]);
-  const groupedNames = useMemo(() => new Set(ANALYSIS_GROUPS.flatMap((group) => group.items)), []);
-  const leftoverOverview = [...overviewByFile.keys()].filter((name) => !groupedNames.has(name)).sort((a, b) => a.localeCompare(b));
   // 소그룹 접힘 상태 — 시작 시 전부 접힘 (2026-08-31 사용자 확정).
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(
     () => new Set(ANALYSIS_GROUPS.map((group) => group.title)),
   );
-  // WER(오류 보고)은 전용 뷰가 있는 분석 항목이라 호스트 분석 목록으로 승격 —
-  // 원본 데이터 목록에서는 빼서 중복 표시를 피한다.
+  // WER(오류 보고)은 전용 뷰가 있는 분석 항목(@WER)이고, WER 원본 산출물은
+  // 다른 아티팩트처럼 원본 데이터 목록에도 남는다.
   const werCategory = categories.find((c) => c.name === "WER");
   const [werEntry, setWerEntry] = useState<ResultFileEntry | null>(null);
   useEffect(() => {
@@ -613,11 +597,9 @@ export default function Sidebar({
   // (FILESYSTEM/UsnJrnl_Records)는 원본 데이터 목록에 그대로 남는다.
   const usnEntry = effectiveOverviewFiles?.find((file) => file.fileName === "UsnJournal") ?? null;
   // WMI 전용 뷰 삭제(2026-10-07 사용자 확정) 이후 _OVERVIEW/WmiSubscriptions를
-  // 여는 승격 항목은 없다. 수집·파싱·저장과 검색·북마크 경로는 그대로다.
-  // 원본 WMI facts(WMI/WMI_Persistence)는 다른 아티팩트와 같이 "원본 데이터"
-  // 목록에 남는다. FILESYSTEM(원본 USN facts)도 승격 항목이 파생 테이블을
-  // 열므로 원본은 그 목록에서만 접근한다.
-  const rawCategories = categories.filter((c) => c.name !== "_OVERVIEW" && c.name !== "WER");
+  // 여는 승격 항목은 없다. 원본 데이터 목록은 파싱한 아티팩트 산출물을 모두
+  // 보여 준다(_OVERVIEW 파생은 위 분석 메뉴의 정해진 뷰로만 연다).
+  const rawCategories = categories.filter((c) => c.name !== "_OVERVIEW");
 
   // Every artifact that ran, mapped to its category, in run order — so the
   // "원본 데이터" list is 1:1 with the run list. Categories with real output
@@ -629,12 +611,20 @@ export default function Sidebar({
   const seenNames = new Set<string>();
   for (const artifact of activeHost.artifactsRun ?? []) {
     const cat = categoryForArtifact(artifact);
-    if (cat === "_OVERVIEW" || cat === "WER" || seenNames.has(cat)) continue;
+    if (cat === "_OVERVIEW" || seenNames.has(cat)) continue;
     seenNames.add(cat);
     orderedNames.push(cat);
   }
   const leftoverCategories = rawCategories.filter((c) => !seenNames.has(c.name));
-  const hasRawSection = orderedNames.length > 0 || leftoverCategories.length > 0;
+  // Raw parser facts written under _OVERVIEW (e.g. $MFT → MFT_Records) are raw
+  // data too; the derived flag comes from the DB itself, not a name list.
+  const overviewRawByFile = new Map<string, ResultFileEntry[]>();
+  for (const file of effectiveOverviewFiles ?? []) {
+    if (file.derived !== false) continue;
+    if (!overviewRawByFile.has(file.fileName)) overviewRawByFile.set(file.fileName, []);
+    overviewRawByFile.get(file.fileName)!.push(file);
+  }
+  const hasRawSection = orderedNames.length > 0 || leftoverCategories.length > 0 || overviewRawByFile.size > 0;
 
   return (
     <div
@@ -788,12 +778,6 @@ export default function Sidebar({
                 </div>
               );
             })}
-            {leftoverOverview.map((name) => {
-              const tables = overviewByFile.get(name);
-              return tables?.length ? (
-                <FileNode key={name} fileName={name} label={OVERVIEW_TABLE_NAMES[name] ?? name} tables={tables} selectedFile={selectedFile} indent={12} leading={<OverviewTableIcon name={name} />} prominent onSelectFile={onSelectFile} />
-              ) : null;
-            })}
             <div style={{ height: 4 }} />
           </div>
         </>
@@ -817,6 +801,9 @@ export default function Sidebar({
         })}
         {rawDataExpanded && leftoverCategories.map((category) => (
           <CategoryNode key={category.fullPath} category={category} selectedFile={selectedFile} onSelectFile={onSelectFile} onNavigate={onNavigate} />
+        ))}
+        {rawDataExpanded && [...overviewRawByFile.entries()].map(([name, tables]) => (
+          <FileNode key={`raw-${name}`} fileName={name} label={OVERVIEW_TABLE_NAMES[name] ?? name} tables={tables} selectedFile={selectedFile} indent={12} leading={<OverviewTableIcon name={name} />} onSelectFile={onSelectFile} />
         ))}
       </div>
     </div>

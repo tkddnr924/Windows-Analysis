@@ -2276,6 +2276,8 @@ struct ResultFileEntry {
     relative_path: String,
     full_path: String,
     row_count: i64,
+    /// True for _OVERVIEW contract DBs; false for raw parser facts.
+    derived: bool,
 }
 
 fn find_result_files(dir: &Path, base: &Path, out: &mut Vec<ResultFileEntry>) {
@@ -2317,6 +2319,9 @@ fn find_result_files(dir: &Path, base: &Path, out: &mut Vec<ResultFileEntry>) {
             .unwrap_or(&p)
             .to_string_lossy()
             .to_string();
+        // Derived (_OVERVIEW contract) DBs carry `_wina_derived_version`; raw
+        // parser facts do not, even when stored under _OVERVIEW (MFT_Records).
+        let derived = overview_contract_version(&conn).is_some();
         // A contract DB contributes one sidebar entry: source_records and child
         // tables are detail-only, not separate result files.
         for t in visible_table_names(&conn, &p) {
@@ -2330,6 +2335,7 @@ fn find_result_files(dir: &Path, base: &Path, out: &mut Vec<ResultFileEntry>) {
                 relative_path: rel.clone(),
                 full_path: p.to_string_lossy().to_string(),
                 row_count: count,
+                derived,
             });
         }
     }
@@ -3931,20 +3937,21 @@ fn list_column_values_blocking(
     }
 }
 
-/// Display-facing derived table (docs-01 §18); the MFT screens read this.
+/// Display-facing derived table (docs-01 §18). The file-system screens read
+/// only this; raw MFT_Records is never a display fallback (docs-24 §0).
 const FILE_SYSTEM_TABLE: &str = "FileSystemEntries";
-/// Raw facts (docs-21), used only when a facts file is opened directly.
-const MFT_FACTS_TABLE: &str = "MFT_Records";
 
 fn file_system_table(conn: &Connection) -> Result<String, String> {
-    let names = table_names(conn);
-    for candidate in [FILE_SYSTEM_TABLE, MFT_FACTS_TABLE] {
-        if names.iter().any(|name| name == candidate) {
-            return Ok(candidate.to_string());
-        }
+    if table_names(conn).iter().any(|name| name == FILE_SYSTEM_TABLE) {
+        Ok(FILE_SYSTEM_TABLE.to_string())
+    } else {
+        Err("파일 시스템 레코드 테이블(FileSystemEntries)을 찾을 수 없습니다. 호스트를 다시 파싱하세요.".to_string())
     }
-    Err("파일 시스템 레코드 테이블을 찾을 수 없습니다".to_string())
 }
+
+/// Records whose stored parent link is not verified (docs-04 §0): never
+/// attached under a folder, listed in the separate "unlinked" bucket.
+const UNLINKED_PARENT: &str = "(parent_status IS NULL OR parent_status NOT IN ('verified', 'root'))";
 
 /// Volume scope for a query. `entry`/`parent_entry` are meaningful only inside
 /// one volume_id (docs-01 §18), so the chosen volume is applied as a condition.
@@ -3960,37 +3967,11 @@ fn volume_scope(columns: &[String], volume_id: Option<String>) -> Option<String>
         .then_some(volume)
 }
 
-/// Seq of the parent record. The tree link is narrowed only when the child's
-/// `parent_seq` and the parent's `seq` are both known; a NULL on either side
-/// leaves the link ambiguous and unfiltered (docs-04 §4).
-fn parent_entry_seq(
-    conn: &Connection,
-    table: &str,
-    columns: &[String],
-    parent: i64,
-    volume: Option<&str>,
-) -> Option<i64> {
-    if !columns.iter().any(|column| column == "seq")
-        || !columns.iter().any(|column| column == "parent_seq")
-    {
-        return None;
-    }
-    let mut sql = format!("SELECT seq FROM {} WHERE entry = ?1", q(table));
-    if volume.is_some() {
-        sql.push_str(" AND volume_id = ?2");
-    }
-    sql.push_str(" LIMIT 1");
-    let seq: rusqlite::Result<Option<i64>> = match volume {
-        Some(volume) => conn.query_row(&sql, rusqlite::params![parent, volume], |row| row.get(0)),
-        None => conn.query_row(&sql, rusqlite::params![parent], |row| row.get(0)),
-    };
-    seq.ok().flatten()
-}
-
 #[tauri::command]
 async fn mft_children(
     full_path: String,
     parent_entry: Option<i64>,
+    parent_seq: Option<i64>,
     volume_id: Option<String>,
     offset: Option<i64>,
     limit: Option<i64>,
@@ -4001,6 +3982,7 @@ async fn mft_children(
         mft_children_blocking(
             full_path,
             parent_entry,
+            parent_seq,
             volume_id,
             offset.unwrap_or(0),
             limit.unwrap_or(100),
@@ -4010,17 +3992,21 @@ async fn mft_children(
     .map_err(|error| format!("MFT 자식 조회 작업이 중단되었습니다: {error}"))?
 }
 
-/// 읽기·쿼리 실패는 빈 폴더가 아니라 오류로 전파한다 — MFT 탐색은 증거
-/// 누락·손상 판단 기능이라, 실패를 "비어 있음"으로 표시하면 잘못된 증거
-/// 해석으로 이어진다. UI는 기존 failedEntries/rootError 경로로 재시도를
-/// 안내한다.
+/// One folder page of the explorer tree, from the stored link verification
+/// (docs-04 §0/§4): a child belongs to a folder only when `parent_status` is
+/// `verified` and its `parent_seq` equals the folder's `seq`. The tree never
+/// re-derives or loosens that link (no NULL-tolerant match).
 ///
-/// `parent_entry` None returns records with an unverified parent
-/// (parent_entry IS NULL). The old -1 convention is gone, and NULL (distinct
-/// from 0) can never be found by equality (docs-01 §18).
+/// `parent_seq` None with a parent means the volume root: its seq is read
+/// from the record stored as `parent_status = 'root'`. `parent_entry` None
+/// lists the unlinked bucket (sequence mismatch / unknown parent).
+///
+/// 읽기·쿼리 실패는 빈 폴더가 아니라 오류로 전파한다 — 실패를 "비어 있음"으로
+/// 표시하면 잘못된 증거 해석으로 이어진다.
 fn mft_children_blocking(
     full_path: String,
     parent_entry: Option<i64>,
+    parent_seq: Option<i64>,
     volume_id: Option<String>,
     offset: i64,
     limit: i64,
@@ -4032,59 +4018,85 @@ fn mft_children_blocking(
     let Some(projection) = payload_projection(&columns) else {
         return Err("파일 시스템 레코드 컬럼을 읽지 못했습니다".to_string());
     };
-    // NTFS에는 자식 수만~수십만 개짜리 디렉터리가 실존한다 — 폴더 하나
-    // 펼치기가 무제한 IPC가 되지 않게 서버에서 상한을 강제하고, UI가
-    // "더 불러오기"로 이어 받는다. rowid 2차 정렬로 페이지 순서를 고정하며,
-    // (volume_id, parent_entry, is_directory, file_name) 인덱스를 그대로 탄다.
+    if !columns.iter().any(|column| column == "parent_status") {
+        return Err("부모 연결 상태가 없는 이전 결과입니다. 호스트를 다시 파싱하세요.".to_string());
+    }
     let limit = limit.clamp(1, 500);
     let offset = offset.max(0);
     let volume = volume_scope(&columns, volume_id);
-    let parent_seq = parent_entry
-        .and_then(|parent| parent_entry_seq(&conn, &table, &columns, parent, volume.as_deref()));
 
     let mut conditions: Vec<String> = Vec::new();
-    let mut binds: Vec<&dyn rusqlite::ToSql> = Vec::new();
-    if let Some(parent) = parent_entry.as_ref() {
-        binds.push(parent);
-        let n = binds.len();
-        conditions.push(format!("parent_entry = ?{n} AND entry <> ?{n}"));
-    } else {
-        conditions.push("parent_entry IS NULL".to_string());
-    }
+    let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
     if let Some(volume) = volume.as_ref() {
-        binds.push(volume);
+        binds.push(Box::new(volume.clone()));
         conditions.push(format!("volume_id = ?{}", binds.len()));
     }
-    if let Some(seq) = parent_seq.as_ref() {
-        binds.push(seq);
-        conditions.push(format!("(parent_seq IS NULL OR parent_seq = ?{})", binds.len()));
+    match parent_entry {
+        Some(parent) => {
+            let seq = match parent_seq {
+                Some(seq) => Some(seq),
+                None => {
+                    // Root folder: the record the parser stored as the root.
+                    let mut sql = format!(
+                        "SELECT seq FROM {} WHERE entry = ?1 AND parent_status = 'root'",
+                        q(&table)
+                    );
+                    if volume.is_some() {
+                        sql.push_str(" AND volume_id = ?2");
+                    }
+                    let found: rusqlite::Result<Option<i64>> = match volume.as_ref() {
+                        Some(volume) => conn.query_row(&sql, rusqlite::params![parent, volume], |row| row.get(0)),
+                        None => conn.query_row(&sql, rusqlite::params![parent], |row| row.get(0)),
+                    };
+                    match found {
+                        Ok(seq) => seq,
+                        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                        Err(error) => return Err(format!("루트 레코드를 읽지 못했습니다: {error}")),
+                    }
+                }
+            };
+            // Without the folder's seq no child can be verified as its own.
+            let Some(seq) = seq else {
+                return Ok(MftChildrenPage { rows: Vec::new(), total: 0 });
+            };
+            binds.push(Box::new(parent));
+            let n = binds.len();
+            binds.push(Box::new(seq));
+            conditions.push(format!(
+                "parent_entry = ?{n} AND entry <> ?{n} AND parent_seq = ?{} AND parent_status = 'verified'",
+                binds.len()
+            ));
+        }
+        None => conditions.push(UNLINKED_PARENT.to_string()),
     }
     let where_clause = conditions.join(" AND ");
+    let refs: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|value| value.as_ref()).collect();
 
-    // 전체 건수는 첫 페이지에서만 계산한다 — "더 불러오기"마다 COUNT를
-    // 반복하지 않도록 후속 페이지는 -1을 반환하고 UI가 보관한 값을 쓴다.
+    // 전체 건수는 첫 페이지에서만 계산한다 — 후속 페이지는 -1.
     let total: i64 = if offset == 0 {
         conn.query_row(
             &format!("SELECT COUNT(*) FROM {} WHERE {where_clause}", q(&table)),
-            binds.as_slice(),
+            refs.as_slice(),
             |row| row.get(0),
         )
         .map_err(|error| format!("MFT 자식 수 조회 실패: {error}"))?
     } else {
         -1
     };
-    binds.push(&limit);
-    let limit_index = binds.len();
-    binds.push(&offset);
-    let offset_index = binds.len();
-    // is_directory is 0/1/NULL: DESC puts directories first, unknown last.
+    let mut page_refs = refs.clone();
+    page_refs.push(&limit);
+    let limit_index = page_refs.len();
+    page_refs.push(&offset);
+    let offset_index = page_refs.len();
+    // is_directory is 0/1/NULL: DESC puts directories first, unknown last;
+    // record_id fixes the order of equal names (docs-24 §2).
     let sql = format!(
         "SELECT rowid AS __rowid, {projection} FROM {} WHERE {where_clause} \
-         ORDER BY is_directory DESC, file_name COLLATE NOCASE, rowid \
+         ORDER BY is_directory DESC, file_name IS NULL, file_name COLLATE NOCASE, record_id \
          LIMIT ?{limit_index} OFFSET ?{offset_index}",
         q(&table)
     );
-    let mut rows = query_rows(&conn, &sql, binds.as_slice())?;
+    let mut rows = query_rows(&conn, &sql, page_refs.as_slice())?;
     decorate_source_refs(&conn, Path::new(&full_path), &mut rows)?;
     Ok(MftChildrenPage { rows, total })
 }
@@ -4121,10 +4133,10 @@ fn mft_search_blocking(
     };
     // 호출자 값에 의존하지 않는 서버 측 상한.
     let limit = limit.clamp(1, 500);
-    let like = format!("%{}%", query);
+    let like = like_contains(&query);
     let volume = volume_scope(&columns, volume_id);
     let mut binds: Vec<&dyn rusqlite::ToSql> = vec![&like];
-    let mut conditions = vec!["(file_name LIKE ?1 OR path LIKE ?1)".to_string()];
+    let mut conditions = vec![fs_text_match(1)];
     if let Some(volume) = volume.as_ref() {
         binds.push(volume);
         conditions.push(format!("volume_id = ?{}", binds.len()));
@@ -4132,7 +4144,7 @@ fn mft_search_blocking(
     binds.push(&limit);
     let sql = format!(
         "SELECT rowid AS __rowid, {projection} FROM {} WHERE {} \
-         ORDER BY is_directory DESC, path COLLATE NOCASE LIMIT ?{}",
+         ORDER BY is_directory DESC, path IS NULL, path COLLATE NOCASE, record_id LIMIT ?{}",
         q(&table),
         conditions.join(" AND "),
         binds.len()
@@ -4140,6 +4152,20 @@ fn mft_search_blocking(
     let mut rows = query_rows(&conn, &sql, binds.as_slice())?;
     decorate_source_refs(&conn, Path::new(&full_path), &mut rows)?;
     Ok(rows)
+}
+
+/// `%needle%` with LIKE metacharacters escaped (use with `ESCAPE '\'`).
+fn like_contains(needle: &str) -> String {
+    let escaped = needle.trim().replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+    format!("%{escaped}%")
+}
+
+/// docs-04 §3 search fields: name, path, extension and account name/SID.
+fn fs_text_match(n: usize) -> String {
+    format!(
+        "(file_name LIKE ?{n} ESCAPE '\\' OR path LIKE ?{n} ESCAPE '\\' OR extension LIKE ?{n} ESCAPE '\\' \
+         OR account LIKE ?{n} ESCAPE '\\' OR account_sid LIKE ?{n} ESCAPE '\\')"
+    )
 }
 
 /// Volume selector list: the internal key that separates volumes inside one
@@ -4161,19 +4187,23 @@ fn mft_volumes_blocking(db_path: String) -> Result<Vec<Map<String, Value>>, Stri
         // No volume column: nothing to build a selector from.
         return Ok(Vec::new());
     }
-    let label = if columns.iter().any(|column| column == "volume_label") {
-        "MAX(volume_label)"
-    } else {
-        "NULL"
-    };
-    let drive = if columns.iter().any(|column| column == "drive_letter") {
-        "MAX(drive_letter)"
-    } else {
-        "NULL"
+    // Display identity of each input (docs-04 §0): confirmed drive/label when
+    // stored, plus input name and collection-relative path so inputs stay
+    // distinguishable even when those are NULL. Nothing is guessed.
+    let pick = |column: &str| {
+        if columns.iter().any(|c| c == column) {
+            format!("MAX({column}) AS {column}")
+        } else {
+            format!("NULL AS {column}")
+        }
     };
     let sql = format!(
-        "SELECT volume_id, {label} AS volume_label, {drive} AS drive_letter, \
-         COUNT(*) AS record_count FROM {} GROUP BY volume_id ORDER BY volume_id",
+        "SELECT volume_id, {}, {}, {}, {}, COUNT(*) AS record_count FROM {} \
+         GROUP BY volume_id ORDER BY volume_id",
+        pick("volume_label"),
+        pick("drive_letter"),
+        pick("input_name"),
+        pick("source_relative"),
         q(&table)
     );
     query_rows(&conn, &sql, &[])
@@ -4405,48 +4435,94 @@ fn usnjrnl_page_blocking(
     })
 }
 
+/// Recursive list filters (docs-04 §3). All optional; unknown keys fall back
+/// to the default whitelist entry.
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+struct MftListOptions {
+    volume_id: Option<String>,
+    sort_key: Option<String>,
+    sort_desc: Option<bool>,
+    /// "file" | "dir"; anything else lists both.
+    kind: Option<String>,
+    /// 1 in use, 0 not in use; None both. NULL never matches either.
+    in_use: Option<i64>,
+    /// Extensions, case-insensitive, without dots; comma/space separated.
+    extension: Option<String>,
+    name_pattern: Option<String>,
+    /// Folder scope: the folder itself and its descendants (drive prefix ignored).
+    path_prefix: Option<String>,
+    /// Folders left out (same matching as `path_prefix`).
+    exclude_paths: Option<Vec<String>>,
+    /// Byte size range (INTEGER file_size; NULL never matches a bound).
+    size_min: Option<i64>,
+    size_max: Option<i64>,
+    /// Stored-state flags (docs-04 §0): path not complete / resident body.
+    path_incomplete: Option<bool>,
+    resident_only: Option<bool>,
+    /// SI created earlier than FN created (both stored) — a value comparison.
+    si_before_fn: Option<bool>,
+    /// Time fields of the period filter (OR: any of them in range), chosen
+    /// independently of the sort. Unknown keys are ignored.
+    time_keys: Option<Vec<String>>,
+    time_start: Option<String>,
+    time_end: Option<String>,
+}
+
+/// Typed folder → (exact path, `folder\%` LIKE pattern). Stored paths are
+/// volume-relative (`\Users\...`): a drive letter is dropped, `/` becomes `\`,
+/// trailing `\` trimmed, LIKE metacharacters stay literal. Root → None.
+fn folder_match(typed: &str) -> Option<(String, String)> {
+    let mut folder = typed.trim().replace('/', "\\");
+    if folder.len() >= 2 && folder.as_bytes()[1] == b':' && folder.as_bytes()[0].is_ascii_alphabetic() {
+        folder = folder[2..].to_string();
+    }
+    let folder = format!("\\{}", folder.trim_matches('\\'));
+    if folder == "\\" {
+        return None;
+    }
+    let escaped = folder.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+    Some((folder, format!("{escaped}\\\\%")))
+}
+
+/// SI/FN time keys → columns (docs-04 §4: eight times kept separately).
+fn mft_time_column(key: &str) -> Option<&'static str> {
+    Some(match key {
+        "created" => "si_created",
+        "modified" => "si_modified",
+        "accessed" => "si_accessed",
+        "mft_modified" => "si_mft_modified",
+        // $FILE_NAME(0x30) — timestomping usually touches only $SI.
+        "fn_created" => "fn_created",
+        "fn_modified" => "fn_modified",
+        "fn_accessed" => "fn_accessed",
+        "fn_mft_modified" => "fn_mft_modified",
+        _ => return None,
+    })
+}
+
 #[tauri::command]
-#[allow(clippy::too_many_arguments)] // 재귀 목록 전용 필터 인자들 — tauri command 시그니처
 async fn mft_records_page(
     full_path: String,
     query: String,
-    volume_id: Option<String>,
     offset: i64,
     limit: i64,
-    sort_key: Option<String>,
-    sort_desc: Option<bool>,
-    files_only: Option<bool>,
-    name_pattern: Option<String>,
-    time_key: Option<String>,
-    time_start: Option<String>,
-    time_end: Option<String>,
+    options: Option<MftListOptions>,
 ) -> Result<MftRecordsPage, String> {
-    // 수백만 행 MFT의 비인덱스 정렬·필터 페이지 조회 — 메인 스레드 밖에서
-    // 수행한다.
+    // 수백만 행 MFT의 비인덱스 정렬·필터 페이지 조회 — 메인 스레드 밖에서 수행한다.
     tauri::async_runtime::spawn_blocking(move || {
-        mft_records_page_blocking(
-            full_path, query, volume_id, offset, limit, sort_key, sort_desc, files_only,
-            name_pattern, time_key, time_start, time_end,
-        )
+        mft_records_page_blocking(full_path, query, offset, limit, options.unwrap_or_default())
     })
     .await
     .map_err(|error| format!("MFT 목록 조회 작업이 중단되었습니다: {error}"))?
 }
 
-#[allow(clippy::too_many_arguments)]
 fn mft_records_page_blocking(
     full_path: String,
     query: String,
-    volume_id: Option<String>,
     offset: i64,
     limit: i64,
-    sort_key: Option<String>,
-    sort_desc: Option<bool>,
-    files_only: Option<bool>,
-    name_pattern: Option<String>,
-    time_key: Option<String>,
-    time_start: Option<String>,
-    time_end: Option<String>,
+    options: MftListOptions,
 ) -> Result<MftRecordsPage, String> {
     let conn = open_ro(&full_path)?;
     let table = file_system_table(&conn)?;
@@ -4459,23 +4535,75 @@ fn mft_records_page_blocking(
     let offset = offset.max(0);
     let query = query.trim();
 
-    // 재귀 목록 전용 필터: 파일만 보기 / 파일명 글롭(*·?) / 정렬 기준.
     let mut clauses: Vec<String> = Vec::new();
-    let mut params: Vec<String> = Vec::new();
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
     if !query.is_empty() {
-        params.push(format!("%{query}%"));
-        let n = params.len();
-        clauses.push(format!("(file_name LIKE ?{n} OR path LIKE ?{n})"));
+        params.push(Box::new(like_contains(query)));
+        clauses.push(fs_text_match(params.len()));
     }
-    if let Some(volume) = volume_scope(&columns, volume_id) {
-        params.push(volume);
+    if let Some(volume) = volume_scope(&columns, options.volume_id) {
+        params.push(Box::new(volume));
         clauses.push(format!("volume_id = ?{}", params.len()));
     }
-    if files_only.unwrap_or(false) {
-        // Of 0/1/NULL only 0 is a file; unknown is not claimed to be one.
-        clauses.push("is_directory = 0".to_string());
+    // Of 0/1/NULL only the stated flag matches; unknown is never claimed.
+    match options.kind.as_deref() {
+        Some("file") => clauses.push("is_directory = 0".to_string()),
+        Some("dir") => clauses.push("is_directory = 1".to_string()),
+        _ => {}
     }
-    if let Some(pattern) = name_pattern.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+    if let Some(flag @ (0 | 1)) = options.in_use {
+        params.push(Box::new(flag));
+        clauses.push(format!("in_use = ?{}", params.len()));
+    }
+    let extensions: Vec<String> = options
+        .extension
+        .as_deref()
+        .unwrap_or("")
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .map(|value| value.trim().trim_start_matches('.').to_lowercase())
+        .filter(|value| !value.is_empty())
+        .collect();
+    if !extensions.is_empty() {
+        let first = params.len() + 1;
+        let placeholders = (0..extensions.len()).map(|i| format!("?{}", first + i)).collect::<Vec<_>>().join(", ");
+        for extension in extensions {
+            params.push(Box::new(extension));
+        }
+        clauses.push(format!("lower(extension) IN ({placeholders})"));
+    }
+    // The folder itself or `folder\...`, so `\Users\Admin` never pulls in
+    // `\Users\Admin.old`. Root covers the whole volume: no clause.
+    if let Some((exact, like)) = options.path_prefix.as_deref().and_then(folder_match) {
+        params.push(Box::new(exact));
+        let exact = params.len();
+        params.push(Box::new(like));
+        clauses.push(format!("(path = ?{exact} COLLATE NOCASE OR path LIKE ?{} ESCAPE '\\')", params.len()));
+    }
+    for (exact, like) in options.exclude_paths.iter().flatten().filter_map(|folder| folder_match(folder)) {
+        params.push(Box::new(exact));
+        let exact = params.len();
+        params.push(Box::new(like));
+        // NULL path is not inside the folder: keep it.
+        clauses.push(format!("NOT COALESCE(path = ?{exact} COLLATE NOCASE OR path LIKE ?{} ESCAPE '\\', 0)", params.len()));
+    }
+    if let Some(min) = options.size_min {
+        params.push(Box::new(min));
+        clauses.push(format!("file_size >= ?{}", params.len()));
+    }
+    if let Some(max) = options.size_max {
+        params.push(Box::new(max));
+        clauses.push(format!("file_size <= ?{}", params.len()));
+    }
+    if options.path_incomplete.unwrap_or(false) {
+        clauses.push("path_status IS NOT NULL AND path_status <> 'complete'".to_string());
+    }
+    if options.resident_only.unwrap_or(false) {
+        clauses.push("data_status = 'resident'".to_string());
+    }
+    if options.si_before_fn.unwrap_or(false) {
+        clauses.push("si_created IS NOT NULL AND fn_created IS NOT NULL AND si_created < fn_created".to_string());
+    }
+    if let Some(pattern) = options.name_pattern.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
         // 간단 글롭 → SQL LIKE: LIKE 메타문자를 이스케이프한 뒤 * → %, ? → _.
         let mut like = String::with_capacity(pattern.len() + 4);
         for ch in pattern.chars() {
@@ -4489,31 +4617,33 @@ fn mft_records_page_blocking(
                 other => like.push(other),
             }
         }
-        params.push(like);
-        let n = params.len();
-        clauses.push(format!("file_name LIKE ?{n} ESCAPE '\\'"));
+        params.push(Box::new(like));
+        clauses.push(format!("file_name LIKE ?{} ESCAPE '\\'", params.len()));
     }
-    // Time range filter on the selected time column. Records without that time
-    // (NULL) drop out of a range query and stay visible in the full range.
-    let time_column = match time_key.as_deref().unwrap_or("created") {
-        "modified" => "si_modified",
-        "accessed" => "si_accessed",
-        "mft_modified" => "si_mft_modified",
-        // $FILE_NAME(0x30) 기준 — timestomping은 주로 $SI만 조작되므로
-        // 조작 전 시각으로 표를 정렬·필터하는 수단(T7).
-        "fn_created" => "fn_created",
-        "fn_modified" => "fn_modified",
-        "fn_accessed" => "fn_accessed",
-        "fn_mft_modified" => "fn_mft_modified",
-        _ => "si_created",
-    };
-    if let Some(start) = time_start.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
-        params.push(start.to_string());
-        clauses.push(format!("{time_column} >= ?{}", params.len()));
-    }
-    if let Some(end) = time_end.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
-        params.push(end.to_string());
-        clauses.push(format!("{time_column} <= ?{}", params.len()));
+    // Period filter: a record matches when ANY chosen time field is in the
+    // range. A NULL time never falls in a range; the full range keeps all.
+    let start = options.time_start.as_deref().map(str::trim).filter(|v| !v.is_empty());
+    let end = options.time_end.as_deref().map(str::trim).filter(|v| !v.is_empty());
+    if start.is_some() || end.is_some() {
+        let mut time_columns: Vec<&'static str> = options.time_keys.iter().flatten().filter_map(|key| mft_time_column(key)).collect();
+        time_columns.sort_unstable();
+        time_columns.dedup();
+        if time_columns.is_empty() {
+            time_columns.push("si_created");
+        }
+        let start_index = start.map(|value| { params.push(Box::new(value.to_string())); params.len() });
+        let end_index = end.map(|value| { params.push(Box::new(value.to_string())); params.len() });
+        let any = time_columns
+            .iter()
+            .map(|column| {
+                let mut parts = Vec::new();
+                if let Some(index) = start_index { parts.push(format!("{column} >= ?{index}")); }
+                if let Some(index) = end_index { parts.push(format!("{column} <= ?{index}")); }
+                format!("({})", parts.join(" AND "))
+            })
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        clauses.push(format!("({any})"));
     }
     let where_clause = if clauses.is_empty() {
         String::new()
@@ -4521,48 +4651,34 @@ fn mft_records_page_blocking(
         format!(" WHERE {}", clauses.join(" AND "))
     };
 
-    let count_sql = format!("SELECT COUNT(*) FROM {}{}", q(&table), where_clause);
-    let count_refs: Vec<&dyn rusqlite::ToSql> =
-        params.iter().map(|value| value as &dyn rusqlite::ToSql).collect();
+    let count_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|value| value.as_ref()).collect();
     let total = conn
-        .query_row(&count_sql, count_refs.as_slice(), |row| row.get(0))
+        .query_row(&format!("SELECT COUNT(*) FROM {}{}", q(&table), where_clause), count_refs.as_slice(), |row| row.get(0))
         .map_err(|error| format!("MFT 레코드 수를 읽지 못했습니다: {error}"))?;
 
-    // Sort whitelist; records without a value (NULL) sort last in both directions.
-    let order_by = match sort_key.as_deref().unwrap_or("path") {
-        "name" => "file_name COLLATE NOCASE".to_string(),
-        key @ ("created" | "modified" | "accessed" | "mft_modified" | "fn_created"
-        | "fn_modified" | "fn_accessed" | "fn_mft_modified") => {
-            let column = match key {
-                "created" => "si_created",
-                "modified" => "si_modified",
-                "accessed" => "si_accessed",
-                "mft_modified" => "si_mft_modified",
-                // fn_* 키는 컬럼명과 동일 ($FILE_NAME 타임스탬프).
-                other => other,
-            };
-            format!("{column} IS NULL, {column}")
-        }
+    // Sort whitelist; NULL values sort last in both directions, record_id
+    // fixes equal values (docs-24 §2).
+    let sort_key = options.sort_key.as_deref().unwrap_or("path");
+    let order_by = match sort_key {
+        "name" => "file_name IS NULL, file_name COLLATE NOCASE".to_string(),
         // file_size is INTEGER bytes: no CAST or lexical ordering needed.
         "size" => "file_size IS NULL, file_size".to_string(),
-        _ => "path COLLATE NOCASE".to_string(),
+        key => match mft_time_column(key) {
+            Some(column) => format!("{column} IS NULL, {column}"),
+            None => "path IS NULL, path COLLATE NOCASE".to_string(),
+        },
     };
-    let direction = if sort_desc.unwrap_or(false) { "DESC" } else { "ASC" };
+    let direction = if options.sort_desc.unwrap_or(false) { "DESC" } else { "ASC" };
 
     let page_sql = format!(
-        "SELECT rowid AS __rowid, {} FROM {}{} ORDER BY {} {}, rowid LIMIT ?{} OFFSET ?{}",
-        projection,
+        "SELECT rowid AS __rowid, {projection} FROM {}{where_clause} ORDER BY {order_by} {direction}, record_id {direction} LIMIT ?{} OFFSET ?{}",
         q(&table),
-        where_clause,
-        order_by,
-        direction,
         params.len() + 1,
         params.len() + 2,
     );
-    params.push(limit.to_string());
-    params.push(offset.to_string());
-    let page_refs: Vec<&dyn rusqlite::ToSql> =
-        params.iter().map(|value| value as &dyn rusqlite::ToSql).collect();
+    let mut page_refs = count_refs;
+    page_refs.push(&limit);
+    page_refs.push(&offset);
     let mut rows = query_rows(&conn, &page_sql, page_refs.as_slice())
         .map_err(|error| format!("MFT 레코드 페이지를 읽지 못했습니다: {error}"))?;
     decorate_source_refs(&conn, Path::new(&full_path), &mut rows)?;
@@ -4604,7 +4720,9 @@ fn mft_row(
 ///
 /// `dataPresent` is true or null: null means non-resident or not captured,
 /// while a zero-length BLOB is a valid empty body (`dataPresent=true,
-/// dataLen=0`). The two are never shown as the same thing.
+/// dataLen=0`). The two are never shown as the same thing. `dataStatus` is
+/// the parser's stored state (resident / resident_empty / nonresident /
+/// unavailable / not_applicable); the viewer shows it instead of guessing.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct MftRecordBody {
@@ -4612,6 +4730,7 @@ struct MftRecordBody {
     data_len: Option<i64>,
     truncated: bool,
     body_b64: Option<String>,
+    data_status: Option<String>,
 }
 
 /// Cap for one body transfer. Beyond it only the prefix is sent with
@@ -4649,14 +4768,15 @@ fn mft_record_body_blocking(
         binds.push(volume);
         conditions.push(format!("volume_id = ?{}", binds.len()));
     }
+    let status_column = if columns.iter().any(|column| column == "data_status") { "data_status" } else { "NULL" };
     let sql = format!(
-        "SELECT data FROM {} WHERE {}",
+        "SELECT data, {status_column} FROM {} WHERE {}",
         q(&table),
         conditions.join(" AND ")
     );
-    let body: Option<Vec<u8>> = conn
+    let (body, data_status): (Option<Vec<u8>>, Option<String>) = conn
         .query_row(&sql, binds.as_slice(), |row| {
-            row.get::<_, Option<Vec<u8>>>(0)
+            Ok((row.get::<_, Option<Vec<u8>>>(0)?, row.get::<_, Option<String>>(1)?))
         })
         .map_err(|error| match error {
             rusqlite::Error::QueryReturnedNoRows => "레코드를 찾을 수 없습니다".to_string(),
@@ -4668,6 +4788,7 @@ fn mft_record_body_blocking(
             data_len: None,
             truncated: false,
             body_b64: None,
+            data_status,
         });
     };
     use base64::Engine as _;
@@ -4679,6 +4800,7 @@ fn mft_record_body_blocking(
         data_len: Some(data_len),
         truncated,
         body_b64: Some(base64::engine::general_purpose::STANDARD.encode(slice)),
+        data_status,
     })
 }
 
@@ -6682,171 +6804,109 @@ async fn ai_conversations(
 
 // --- commands: cross-artifact path references ------------------------------
 
-/// One other-artifact sighting of a filesystem path — currently JumpList
-/// entries; `kind` is open so Shellbag/LNK/Prefetch can be added without a
-/// frontend change. `path` is lowercased for matching against $MFT paths.
+/// One other-artifact reference that the parser matched to a file record as a
+/// candidate (`PathReferenceCandidates`, docs-04 §0). A candidate is path
+/// evidence, never "the same file". `row` is the stored PathReferences row
+/// (typed, all columns); `full_path`/`table_name`/`rowid` are the first raw
+/// origin, used only as the existing bookmark key (rowid -1: none).
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct PathReference {
-    path: String,
-    kind: String,
-    account: String,
-    label: String,
-    fields: Map<String, Value>,
-    /// Source sqlite + row so the viewer can bookmark this reference's
-    /// timestamps. Empty full_path / rowid < 0 means "not bookmarkable"
-    /// (e.g. a Shellbag reconstructed from the registry, which has no row).
+struct FileReference {
+    file_record_id: String,
+    match_basis: String,
+    row: Map<String, Value>,
     full_path: String,
     table_name: String,
     rowid: i64,
 }
 
-/// Normalize a path to the volume-relative, lowercased form $MFT uses:
-/// drop a leading drive letter (`C:\Windows` -> `\windows`) and lowercase.
-/// UNC paths (`\\host\share`) and already-relative paths pass through lowered.
-fn to_volume_relative(p: &str) -> String {
-    let low = p.to_lowercase().replace('/', "\\");
-    let b = low.as_bytes();
-    if b.len() >= 2 && b[1] == b':' && b[0].is_ascii_alphabetic() {
-        let rest = &low[2..];
-        if rest.is_empty() {
-            "\\".to_string()
-        } else if rest.starts_with('\\') {
-            rest.to_string()
-        } else {
-            format!("\\{}", rest)
-        }
-    } else {
-        low
-    }
-}
-
-
-/// MFT 탐색기 교차 참조 — 파싱 단계에서 만들어 둔 `_OVERVIEW/PathReferences`
-/// 파생 테이블을 **표시 중인 경로 배치**로만 조회한다. 화면 진입마다 JumpList
-/// 전수 스캔·Shellbag 재구성을 하던 즉석 가공은 파서로 이전됐다(협약).
-/// 파생 테이블이 없는 이전 파싱 호스트는 빈 결과를 돌려준다(재파싱 필요).
+/// References for the file records currently on screen, via the stored
+/// candidates of the same result generation and volume. No path string is
+/// re-normalized or matched here (docs-24: no derivation at read time).
 #[tauri::command]
-async fn path_references(
+async fn file_references(
     host_dir: String,
-    paths: Vec<String>,
-) -> Result<Vec<PathReference>, String> {
-    tauri::async_runtime::spawn_blocking(move || path_references_blocking(host_dir, paths))
-        .await
-        .map_err(|error| format!("교차 참조 조회 작업이 중단되었습니다: {error}"))?
+    dataset_id: String,
+    volume_id: Option<String>,
+    file_record_ids: Vec<String>,
+) -> Result<Vec<FileReference>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        file_references_blocking(&host_dir, &dataset_id, volume_id.as_deref(), &file_record_ids)
+    })
+    .await
+    .map_err(|error| format!("교차 참조 조회 작업이 중단되었습니다: {error}"))?
 }
 
-fn path_references_blocking(
-    host_dir: String,
-    paths: Vec<String>,
-) -> Result<Vec<PathReference>, String> {
-    let db = PathBuf::from(&host_dir)
-        .join("_OVERVIEW")
-        .join("PathReferences.sqlite");
-    if !db.exists() {
-        return Ok(vec![]);
+fn file_references_blocking(
+    host_dir: &str,
+    dataset_id: &str,
+    volume_id: Option<&str>,
+    file_record_ids: &[String],
+) -> Result<Vec<FileReference>, String> {
+    let db = PathBuf::from(host_dir).join("_OVERVIEW").join("PathReferences.sqlite");
+    if !db.exists() || file_record_ids.is_empty() {
+        return Ok(Vec::new());
     }
     let conn = open_ro(&db.to_string_lossy())?;
-    // 요청 경로를 파생 테이블의 키와 같은 형식(볼륨 상대·소문자)으로 정규화.
-    let mut keys: Vec<String> = paths.iter().map(|p| to_volume_relative(p)).collect();
-    keys.sort();
-    keys.dedup();
-    let host_root = normalize_bookmark_path(Path::new(&host_dir));
+    let tables = table_names(&conn);
+    if !tables.iter().any(|name| name == "PathReferenceCandidates") {
+        return Err("교차 참조 후보 테이블이 없는 이전 결과입니다. 호스트를 다시 파싱하세요.".to_string());
+    }
+    let has_sources = tables.iter().any(|name| name == "source_records");
+    let host_root = normalize_bookmark_path(Path::new(host_dir));
+    let volume = volume_id.map(str::trim).filter(|value| !value.is_empty());
     let mut out = Vec::new();
-    // SQLite 바인딩 수 제한을 고려해 청크로 조회한다.
-    for chunk in keys.chunks(400) {
-        let placeholders = vec!["?"; chunk.len()].join(", ");
+    // SQLite bind limit: chunk the requested ids.
+    for chunk in file_record_ids.chunks(400) {
+        let mut params: Vec<&dyn rusqlite::ToSql> = vec![&dataset_id];
+        let mut volume_clause = String::new();
+        if let Some(volume) = volume.as_ref() {
+            params.push(volume);
+            volume_clause = format!(" AND c.volume_id = ?{}", params.len());
+        }
+        let first = params.len() + 1;
+        let placeholders = (0..chunk.len()).map(|i| format!("?{}", first + i)).collect::<Vec<_>>().join(", ");
+        params.extend(chunk.iter().map(|id| id as &dyn rusqlite::ToSql));
         let sql = format!(
-            "SELECT rowid AS __rowid, * FROM PathReferences WHERE path IN ({placeholders})"
+            "SELECT c.file_record_id AS __file_record_id, c.match_basis AS __match_basis, p.rowid AS __rowid, p.* \
+             FROM PathReferenceCandidates c JOIN PathReferences p ON p.record_id = c.record_id \
+             WHERE p.dataset_id = ?1{volume_clause} AND c.file_record_id IN ({placeholders}) \
+             ORDER BY c.file_record_id, p.timestamp IS NULL, p.timestamp, p.record_id"
         );
-        let params: Vec<&dyn rusqlite::ToSql> =
-            chunk.iter().map(|k| k as &dyn rusqlite::ToSql).collect();
         let rows = query_rows(&conn, &sql, &params)?;
-        // Raw rows live in source_records: read the record_ids of this page in
-        // one batch instead of reopening the DB per row. With several origins
-        // the first one (ordinal 0) is the open target; the rest are chosen from
-        // the detail evidence list (docs-24 §4).
+        // First raw origin per reference, only as the existing bookmark key.
+        let mut first_source: BTreeMap<String, (String, String, i64)> = BTreeMap::new();
         let record_ids: Vec<String> = rows
             .iter()
-            .filter_map(|row| {
-                row.get("record_id")
-                    .and_then(Value::as_str)
-                    .filter(|id| !id.is_empty())
-                    .map(str::to_string)
-            })
+            .filter_map(|row| row.get("record_id").and_then(Value::as_str).map(str::to_string))
             .collect();
-        let mut first_source: BTreeMap<String, (String, String, i64)> = BTreeMap::new();
-        if !record_ids.is_empty() && table_names(&conn).iter().any(|n| n == "source_records") {
+        if has_sources && !record_ids.is_empty() {
             let source_placeholders = vec!["?"; record_ids.len()].join(", ");
             let source_sql = format!(
                 "SELECT record_id, source_db, source_table, source_rowid FROM \"source_records\" \
                  WHERE record_id IN ({source_placeholders}) ORDER BY record_id, ordinal DESC"
             );
-            let source_params: Vec<&dyn rusqlite::ToSql> = record_ids
-                .iter()
-                .map(|id| id as &dyn rusqlite::ToSql)
-                .collect();
+            let source_params: Vec<&dyn rusqlite::ToSql> = record_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
             for source in query_rows(&conn, &source_sql, &source_params)? {
-                let text = |key: &str| {
-                    source
-                        .get(key)
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string()
-                };
-                let record_id = text("record_id");
-                if record_id.is_empty() {
-                    continue;
-                }
-                let resolved = resolve_source_db(&host_root, &text("source_db"));
-                let rowid = source
-                    .get("source_rowid")
-                    .and_then(Value::as_i64)
-                    .unwrap_or(-1);
+                let text = |key: &str| source.get(key).and_then(Value::as_str).unwrap_or("").to_string();
+                let rowid = source.get("source_rowid").and_then(Value::as_i64).unwrap_or(-1);
                 // Ordinal is descending, so the value kept last is ordinal 0.
-                first_source.insert(record_id, (resolved, text("source_table"), rowid));
+                first_source.insert(text("record_id"), (resolve_source_db(&host_root, &text("source_db")), text("source_table"), rowid));
             }
         }
-        for r in rows {
-            let get = |k: &str| r.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let mut fields = Map::new();
-            for k in [
-                "target_path",
-                "target_path_resolved",
-                "app_id",
-                "jumplist_type",
-                "arguments",
-                "working_directory",
-                "machine_id",
-                "timestamp",
-                "timestamp_kind",
-                "created_time",
-                "modified_time",
-                "description",
-                "path",
-                "account",
-                "account_sid",
-            ] {
-                let v = get(k);
-                if !v.is_empty() {
-                    fields.insert(k.to_string(), Value::from(v));
-                }
-            }
+        for mut row in rows {
+            let mut take = |key: &str| match row.remove(key) {
+                Some(Value::String(value)) => value,
+                _ => String::new(),
+            };
+            let file_record_id = take("__file_record_id");
+            let match_basis = take("__match_basis");
+            let record_id = row.get("record_id").and_then(Value::as_str).unwrap_or("").to_string();
             let (full_path, table_name, rowid) = first_source
-                .get(&get("record_id"))
+                .get(&record_id)
                 .cloned()
                 .unwrap_or_else(|| (String::new(), String::new(), -1));
-            out.push(PathReference {
-                path: get("path"),
-                // The record kind is the common column event_type.
-                kind: get("event_type"),
-                account: get("account"),
-                label: get("label"),
-                fields,
-                full_path,
-                table_name,
-                rowid,
-            });
+            out.push(FileReference { file_record_id, match_basis, row, full_path, table_name, rowid });
         }
     }
     Ok(out)
@@ -9717,36 +9777,38 @@ mod overview_contract_tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    /// One docs-01 §18 FileSystemEntries set: typed flags and byte sizes, NULL
-    /// semantics (unverified parent, unknown time), a resident body, two volumes.
+    /// One docs-01 §18 FileSystemEntries set: typed flags and byte sizes, stored
+    /// link/path/data status, unknown time, a resident body, two volumes.
     fn write_file_system_entries(overview: &Path) -> PathBuf {
         let path = overview.join("FileSystemEntries.sqlite");
         let conn = Connection::open(&path).unwrap();
         conn.execute_batch(
-            "CREATE TABLE FileSystemEntries (record_id TEXT NOT NULL, host_id TEXT NOT NULL, dataset_id TEXT NOT NULL, timestamp TEXT, overview_name TEXT NOT NULL, account TEXT, account_sid TEXT, timestamp_kind TEXT, event_type TEXT, description TEXT, path TEXT, file_name TEXT, extension TEXT, is_directory INTEGER, in_use INTEGER, file_size INTEGER, data BLOB, volume_id TEXT, volume_label TEXT, volume_serial TEXT, drive_letter TEXT, ntfs_major_version INTEGER, ntfs_minor_version INTEGER, volume_flags TEXT, entry INTEGER, seq INTEGER, parent_entry INTEGER, parent_seq INTEGER, si_created TEXT, si_modified TEXT, si_mft_modified TEXT, si_accessed TEXT, owner_id INTEGER, security_id INTEGER, fn_created TEXT, fn_modified TEXT, fn_mft_modified TEXT, fn_accessed TEXT);
+            "CREATE TABLE FileSystemEntries (record_id TEXT NOT NULL, host_id TEXT NOT NULL, dataset_id TEXT NOT NULL, timestamp TEXT, overview_name TEXT NOT NULL, account TEXT, account_sid TEXT, timestamp_kind TEXT, event_type TEXT, description TEXT, path TEXT, file_name TEXT, extension TEXT, is_directory INTEGER, in_use INTEGER, file_size INTEGER, data BLOB, volume_id TEXT, volume_label TEXT, volume_serial TEXT, drive_letter TEXT, ntfs_major_version INTEGER, ntfs_minor_version INTEGER, volume_flags TEXT, entry INTEGER, seq INTEGER, parent_entry INTEGER, parent_seq INTEGER, si_created TEXT, si_modified TEXT, si_mft_modified TEXT, si_accessed TEXT, owner_id INTEGER, security_id INTEGER, fn_created TEXT, fn_modified TEXT, fn_mft_modified TEXT, fn_accessed TEXT, parent_status TEXT, path_status TEXT, data_status TEXT, source_file TEXT, source_relative TEXT, input_name TEXT, path_key TEXT);
              CREATE TABLE source_records (record_id TEXT NOT NULL, ordinal INTEGER NOT NULL, source_dataset_id TEXT NOT NULL, source_artifact TEXT NOT NULL, source_db TEXT NOT NULL, source_table TEXT NOT NULL, source_rowid INTEGER NOT NULL, source_field TEXT, source_record_key TEXT, source_file TEXT, source_label TEXT);
              CREATE TABLE _wina_derived_version (name TEXT NOT NULL PRIMARY KEY, version INTEGER NOT NULL);
              INSERT INTO _wina_derived_version(name,version) VALUES ('overview_contract',1);",
         )
         .unwrap();
-        let insert = "INSERT INTO FileSystemEntries (record_id, host_id, dataset_id, timestamp, overview_name, timestamp_kind, path, file_name, is_directory, in_use, file_size, data, volume_id, volume_label, entry, seq, parent_entry, si_modified) \
-             VALUES (?1, 'h', 'd', ?2, 'FileSystemEntries', ?3, ?4, ?5, ?6, 1, ?7, ?8, ?9, ?10, ?11, 1, ?12, ?2)";
-        // Root (unverified parent), file with a resident body, directory, file on
-        // another volume, file with an unverified parent, zero-length body file.
-        let rows: Vec<(&str, Option<&str>, Option<&str>, &str, &str, Option<i64>, Option<i64>, Option<Vec<u8>>, &str, Option<&str>, i64, Option<i64>)> = vec![
-            ("r1", None, None, "\\", ".", Some(1), Some(0), None, "v1", Some("SYSTEM"), 5, None),
-            ("r2", Some("2026-01-02 00:00:00.000"), Some("si_modified"), "\\a.txt", "a.txt", Some(0), Some(3), Some(b"abc".to_vec()), "v1", Some("SYSTEM"), 10, Some(5)),
-            ("r3", Some("2026-01-01 00:00:00.000"), Some("si_modified"), "\\dir", "dir", Some(1), Some(0), None, "v1", Some("SYSTEM"), 11, Some(5)),
-            ("r4", None, None, "\\other.txt", "other.txt", Some(0), Some(7), None, "v2", None, 10, Some(5)),
-            ("r5", None, None, "\\orphan.bin", "orphan.bin", Some(0), None, None, "v1", Some("SYSTEM"), 12, None),
-            ("r6", Some("2026-01-03 00:00:00.000"), Some("si_modified"), "\\empty.txt", "empty.txt", Some(0), Some(0), Some(Vec::new()), "v1", Some("SYSTEM"), 13, Some(5)),
+        let insert = "INSERT INTO FileSystemEntries (record_id, host_id, dataset_id, timestamp, overview_name, timestamp_kind, path, file_name, extension, is_directory, in_use, file_size, data, volume_id, volume_label, entry, seq, parent_entry, parent_seq, parent_status, path_status, data_status, account, account_sid, input_name, source_relative, si_modified) \
+             VALUES (?1, 'h', 'd', ?2, 'FileSystemEntries', CASE WHEN ?2 IS NULL THEN NULL ELSE 'SI 수정 시각' END, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, CASE WHEN ?10 = 'v1' THEN 'SYSTEM' END, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, '$MFT', 'C/' || ?10 || '/$MFT', ?2)";
+        type Fixture<'a> = (&'a str, Option<&'a str>, &'a str, &'a str, Option<&'a str>, i64, i64, Option<i64>, Option<Vec<u8>>, &'a str, i64, i64, i64, i64, &'a str, &'a str, &'a str, Option<&'a str>, Option<&'a str>);
+        // Root, resident file, directory, file on another volume, unknown
+        // parent, empty resident file, reused parent (sequence mismatch).
+        let rows: Vec<Fixture> = vec![
+            ("r1", None, "\\", ".", None, 1, 1, Some(0), None, "v1", 5, 5, 5, 5, "root", "complete", "not_applicable", None, None),
+            ("r2", Some("2026-01-02 00:00:00.000"), "\\a.txt", "a.txt", Some("txt"), 0, 1, Some(3), Some(b"abc".to_vec()), "v1", 10, 1, 5, 5, "verified", "complete", "resident", None, None),
+            ("r3", Some("2026-01-01 00:00:00.000"), "\\dir", "dir", None, 1, 1, Some(0), None, "v1", 11, 1, 5, 5, "verified", "complete", "not_applicable", None, None),
+            ("r4", None, "\\other.txt", "other.txt", Some("TXT"), 0, 1, Some(7), None, "v2", 10, 1, 5, 5, "verified", "complete", "nonresident", None, None),
+            ("r5", None, "orphan.bin", "orphan.bin", Some("bin"), 0, 0, None, None, "v1", 12, 1, 99, 1, "unknown", "unknown", "unavailable", None, None),
+            ("r6", Some("2026-01-03 00:00:00.000"), "\\empty.txt", "empty.txt", Some("txt"), 0, 1, Some(0), Some(Vec::new()), "v1", 13, 1, 5, 5, "verified", "complete", "resident_empty", None, None),
+            ("r7", None, "\\stale.log", "stale.log", Some("log"), 0, 0, Some(9), None, "v1", 14, 2, 5, 4, "sequence_mismatch", "sequence_mismatch", "nonresident", Some("alice"), Some("S-1-5-21-1-2-3-1001")),
         ];
-        for (record_id, timestamp, kind, path_value, name, is_dir, size, data, volume, label, entry, parent) in rows {
+        for (record_id, timestamp, path_value, name, extension, is_dir, in_use, size, data, volume, entry, seq, parent, parent_seq, parent_status, path_status, data_status, account, sid) in rows {
             conn.execute(
                 insert,
                 rusqlite::params![
-                    record_id, timestamp, kind, path_value, name, is_dir, size, data, volume,
-                    label, entry, parent
+                    record_id, timestamp, path_value, name, extension, is_dir, in_use, size, data, volume,
+                    entry, seq, parent, parent_seq, parent_status, path_status, data_status, account, sid
                 ],
             )
             .unwrap();
@@ -9800,6 +9862,19 @@ mod overview_contract_tests {
                 .collect::<Vec<_>>(),
             vec!["FileSystemEntries"]
         );
+        assert!(listed[0].derived);
+        // Raw facts stored under _OVERVIEW (no derived version) are listed as raw.
+        Connection::open(overview.join("MFT_Records.sqlite"))
+            .unwrap()
+            .execute_batch(&format!(
+                "CREATE TABLE MFT_Records (volume_id TEXT, path TEXT); CREATE TABLE _wina_facts_generation (id TEXT); {}",
+                (0..400).map(|i| format!("INSERT INTO MFT_Records VALUES ('v1', '\\\\file{i}.txt');")).collect::<String>()
+            ))
+            .unwrap();
+        let mut listed = Vec::new();
+        find_result_files(&overview, &overview, &mut listed);
+        let facts = listed.iter().find(|entry| entry.table_name == "MFT_Records").expect("raw facts listed");
+        assert!(!facts.derived);
 
         // A generic page response carries no body BLOB.
         let page = read_result_file_page_blocking(
@@ -9818,97 +9893,130 @@ mod overview_contract_tests {
     }
 
     #[test]
-    fn mft_queries_are_typed_volume_scoped_and_body_free() {
+    fn mft_queries_follow_stored_links_filters_and_volume_scope() {
         let root = temp_root("mft");
         let overview = root.join("_OVERVIEW");
         std::fs::create_dir_all(&overview).unwrap();
         let db = write_file_system_entries(&overview);
         let full = db.to_string_lossy().to_string();
+        let page = |query: &str, options: MftListOptions| mft_records_page_blocking(full.clone(), query.to_string(), 0, 100, options).unwrap();
+        let v1 = |options: MftListOptions| MftListOptions { volume_id: Some("v1".into()), ..options };
 
-        // Choosing a volume never mixes the same parent number from another one.
-        let children =
-            mft_children_blocking(full.clone(), Some(5), Some("v1".into()), 0, 100).unwrap();
+        // Root folder: seq read from the stored root record; only verified
+        // children with the same parent seq. The reused-parent record (same
+        // parent number, other seq) is never attached under the folder.
+        let children = mft_children_blocking(full.clone(), Some(5), None, Some("v1".into()), 0, 100).unwrap();
         assert_eq!(children.total, 3);
-        // is_directory is 0/1 INTEGER; directories come first.
         assert_eq!(row_names(&children.rows), vec!["dir", "a.txt", "empty.txt"]);
         assert!(children.rows.iter().all(|row| !row.contains_key("data")));
-        assert_eq!(
-            children.rows[0].get("is_directory").and_then(Value::as_i64),
-            Some(1)
-        );
+        assert_eq!(children.rows[0].get("is_directory").and_then(Value::as_i64), Some(1));
+        // A folder seq that does not match links nothing.
+        assert_eq!(mft_children_blocking(full.clone(), Some(5), Some(4), Some("v1".into()), 0, 100).unwrap().total, 0);
 
-        // An unverified parent (NULL) is unreachable by equality: separate mode.
-        let orphans = mft_children_blocking(full.clone(), None, Some("v1".into()), 0, 100).unwrap();
-        assert_eq!(orphans.total, 2);
-        assert_eq!(row_names(&orphans.rows), vec![".", "orphan.bin"]);
+        // Unlinked bucket: sequence mismatch and unknown parent, never the root.
+        let unlinked = mft_children_blocking(full.clone(), None, None, Some("v1".into()), 0, 100).unwrap();
+        assert_eq!(row_names(&unlinked.rows), vec!["orphan.bin", "stale.log"]);
 
-        // Files-only keeps is_directory = 0 (unknown is not treated as a file).
-        let files = mft_records_page_blocking(
-            full.clone(),
-            String::new(),
-            Some("v1".into()),
-            0,
-            100,
-            Some("modified".into()),
-            Some(false),
-            Some(true),
-            None,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        assert_eq!(files.total, 3);
-        // Records with a NULL time sort last even ascending.
-        assert_eq!(row_names(&files.rows), vec!["a.txt", "empty.txt", "orphan.bin"]);
+        // Kind / in-use / extension filters; NULL time sorts last both ways.
+        let files = page("", v1(MftListOptions { sort_key: Some("modified".into()), kind: Some("file".into()), in_use: Some(1), ..Default::default() }));
+        assert_eq!(row_names(&files.rows), vec!["a.txt", "empty.txt"]);
+        let unused = page("", v1(MftListOptions { in_use: Some(0), ..Default::default() }));
+        assert_eq!(row_names(&unused.rows), vec!["stale.log", "orphan.bin"], "NULL-free paths first, by path");
+        let dirs = page("", v1(MftListOptions { kind: Some("dir".into()), ..Default::default() }));
+        assert_eq!(row_names(&dirs.rows), vec![".", "dir"]);
+        let txt = page("", MftListOptions { extension: Some(".TXT".into()), ..Default::default() });
+        assert_eq!(txt.total, 3, "extension match is case-insensitive across volumes");
+        let descending = page("", v1(MftListOptions { sort_key: Some("modified".into()), sort_desc: Some(true), kind: Some("file".into()), ..Default::default() }));
+        assert_eq!(row_names(&descending.rows), vec!["empty.txt", "a.txt", "stale.log", "orphan.bin"], "NULL times last; record_id follows the direction");
 
-        let descending = mft_records_page_blocking(
-            full.clone(),
-            String::new(),
-            Some("v1".into()),
-            0,
-            100,
-            Some("modified".into()),
-            Some(true),
-            Some(true),
-            None,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        assert_eq!(
-            row_names(&descending.rows),
-            vec!["empty.txt", "a.txt", "orphan.bin"],
-            "NULL 시각은 방향과 무관하게 뒤로 간다"
-        );
+        // Period filter uses the chosen time field even when sorting by path.
+        let ranged = page("", v1(MftListOptions { time_keys: Some(vec!["modified".into()]), time_start: Some("2026-01-02 00:00:00.000".into()), ..Default::default() }));
+        assert_eq!(row_names(&ranged.rows), vec!["a.txt", "empty.txt"]);
 
+        // Analysis filters: several extensions, folder scope (typed drive
+        // letter ignored), size range, stored-state flags, SI<FN created.
+        let names = |options: MftListOptions| row_names(&page("", v1(options)).rows);
+        assert_eq!(names(MftListOptions { extension: Some("TXT, .bin".into()), ..Default::default() }), vec!["a.txt", "empty.txt", "orphan.bin"]);
+        assert_eq!(names(MftListOptions { path_prefix: Some("C:\\dir".into()), ..Default::default() }), vec!["dir"]);
+        assert!(names(MftListOptions { path_prefix: Some("\\a_txt".into()), ..Default::default() }).is_empty(), "LIKE metacharacters stay literal");
+        assert_eq!(names(MftListOptions { size_min: Some(3), size_max: Some(9), ..Default::default() }), vec!["a.txt", "stale.log"]);
+        assert_eq!(names(MftListOptions { path_incomplete: Some(true), ..Default::default() }), vec!["stale.log", "orphan.bin"]);
+        assert_eq!(names(MftListOptions { resident_only: Some(true), ..Default::default() }), vec!["a.txt"]);
+        Connection::open(&db).unwrap().execute_batch(
+            "UPDATE FileSystemEntries SET si_created='2020-01-01 00:00:00.000', fn_created='2021-01-01 00:00:00.000' WHERE record_id='r2';
+             UPDATE FileSystemEntries SET si_created='2022-01-01 00:00:00.000', fn_created='2021-01-01 00:00:00.000' WHERE record_id='r6';",
+        ).unwrap();
+        assert_eq!(names(MftListOptions { si_before_fn: Some(true), ..Default::default() }), vec!["a.txt"]);
+        // Several time fields: a record matches when ANY of them is in range.
+        let window = |keys: &[&str]| names(MftListOptions { time_keys: Some(keys.iter().map(|k| k.to_string()).collect()), time_start: Some("2020-06-01 00:00:00.000".into()), time_end: Some("2021-06-01 00:00:00.000".into()), ..Default::default() });
+        assert!(window(&["created"]).is_empty());
+        assert_eq!(window(&["created", "fn_created"]), vec!["a.txt", "empty.txt"]);
+        assert_eq!(window(&["bogus", "fn_created"]), vec!["a.txt", "empty.txt"], "unknown keys are ignored");
+        // Folder scope is the folder itself and its `\` descendants: a
+        // same-prefix sibling (`\dir.old`) must not leak in; root is no filter.
+        Connection::open(&db).unwrap().execute_batch(
+            "CREATE TEMP TABLE extra AS SELECT * FROM FileSystemEntries WHERE record_id = 'r2';
+             INSERT INTO extra SELECT * FROM extra;
+             UPDATE extra SET record_id = 't1', path = '\\dir\\in.txt', file_name = 'in.txt' WHERE rowid = 1;
+             UPDATE extra SET record_id = 't2', path = '\\dir.old\\x.txt', file_name = 'x.txt' WHERE rowid = 2;
+             INSERT INTO FileSystemEntries SELECT * FROM extra;",
+        ).unwrap();
+        assert_eq!(names(MftListOptions { path_prefix: Some("c:/DIR/".into()), ..Default::default() }), vec!["dir", "in.txt"]);
+        assert_eq!(names(MftListOptions { path_prefix: Some("\\".into()), ..Default::default() }).len(), names(MftListOptions::default()).len());
+        // Excluded folders drop the folder and its descendants, not siblings.
+        let excluded = names(MftListOptions { exclude_paths: Some(vec!["C:\\DIR\\".into()]), ..Default::default() });
+        assert!(excluded.contains(&"x.txt".to_string()) && !excluded.contains(&"in.txt".to_string()) && !excluded.contains(&"dir".to_string()));
+        assert_eq!(excluded.len(), names(MftListOptions::default()).len() - 2);
+        Connection::open(&db).unwrap().execute_batch("DELETE FROM FileSystemEntries WHERE record_id IN ('t1', 't2');").unwrap();
+
+        // Search covers extension and account/SID; LIKE metacharacters are literal.
+        assert_eq!(row_names(&page("S-1-5-21-1-2-3-1001", MftListOptions::default()).rows), vec!["stale.log"]);
+        assert_eq!(row_names(&mft_search_blocking(full.clone(), "alice".into(), None, 50).unwrap()), vec!["stale.log"]);
+        assert!(page("a_txt", MftListOptions::default()).rows.is_empty());
         let searched = mft_search_blocking(full.clone(), "txt".into(), Some("v1".into()), 50).unwrap();
         assert_eq!(row_names(&searched), vec!["a.txt", "empty.txt"]);
         assert!(searched.iter().all(|row| !row.contains_key("data")));
 
+        // Volume list keeps input identity; unknown drive stays NULL.
         let volumes = mft_volumes_blocking(full.clone()).unwrap();
         assert_eq!(volumes.len(), 2);
-        assert_eq!(
-            volumes[0].get("volume_id").and_then(Value::as_str),
-            Some("v1")
-        );
-        assert_eq!(
-            volumes[0].get("record_count").and_then(Value::as_i64),
-            Some(5)
-        );
-        // Drive letter stays NULL without evidence; never an empty string.
+        assert_eq!(volumes[0].get("record_count").and_then(Value::as_i64), Some(6));
         assert_eq!(volumes[0].get("drive_letter"), Some(&Value::Null));
+        assert_eq!(volumes[1].get("source_relative").and_then(Value::as_str), Some("C/v2/$MFT"));
+        assert_eq!(volumes[1].get("input_name").and_then(Value::as_str), Some("$MFT"));
 
         // A rowid from another volume context opens nothing.
-        let other_volume_rowid = mft_children_blocking(full.clone(), Some(5), Some("v2".into()), 0, 10)
-            .unwrap()
-            .rows[0]
+        let other_volume_rowid = mft_search_blocking(full.clone(), "other".into(), Some("v2".into()), 10).unwrap()[0]
             .get("__rowid")
             .and_then(Value::as_i64)
             .unwrap();
         assert!(mft_row(full.clone(), other_volume_rowid, Some("v1".into())).is_none());
         assert!(mft_row(full, other_volume_rowid, Some("v2".into())).is_some());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn file_references_come_from_stored_candidates_of_the_same_generation() {
+        let root = temp_root("fileref");
+        let overview = root.join("_OVERVIEW");
+        std::fs::create_dir_all(&overview).unwrap();
+        Connection::open(overview.join("PathReferences.sqlite")).unwrap().execute_batch(
+            "CREATE TABLE PathReferences (record_id TEXT PRIMARY KEY, host_id TEXT, dataset_id TEXT, timestamp TEXT, event_type TEXT, account TEXT, path TEXT, access_count INTEGER);
+             CREATE TABLE PathReferenceCandidates (record_id TEXT, ordinal INTEGER, file_record_id TEXT, volume_id TEXT, match_basis TEXT);
+             INSERT INTO PathReferences VALUES ('p1','h','d','2026-01-02 00:00:00.000','Jumplist','alice','\\a.txt',8),
+                                               ('p2','h','old','2026-01-01 00:00:00.000','Jumplist','bob','\\a.txt',1),
+                                               ('p3','h','d',NULL,'Shellbag',NULL,'\\a.txt',NULL);
+             INSERT INTO PathReferenceCandidates VALUES ('p1',0,'r2','v1','path_and_drive'), ('p2',0,'r2','v1','path'), ('p3',0,'r2','v2','path');",
+        ).unwrap();
+        let host = root.to_string_lossy().to_string();
+        let refs = file_references_blocking(&host, "d", Some("v1"), &["r2".to_string()]).unwrap();
+        // Other generation (p2) and other volume (p3) are not linked.
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].file_record_id, "r2");
+        assert_eq!(refs[0].match_basis, "path_and_drive");
+        assert_eq!(refs[0].row.get("access_count").and_then(Value::as_i64), Some(8), "INTEGER stays typed");
+        assert_eq!(refs[0].rowid, -1, "no raw origin, no bookmark key");
+        assert_eq!(file_references_blocking(&host, "d", None, &["r2".to_string()]).unwrap().len(), 2);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -9941,6 +10049,7 @@ mod overview_contract_tests {
         assert_eq!(absent.data_present, None, "비상주·미확보는 NULL이다");
         assert_eq!(absent.data_len, None);
         assert!(absent.body_b64.is_none());
+        assert_eq!(absent.data_status.as_deref(), Some("unavailable"), "stored state, not guessed");
 
         // All evidence links are returned in ordinal order, and a source_db
         // outside the host root never resolves to an openable path.
@@ -10197,7 +10306,7 @@ fn main() {
             toggle_bookmark,
             update_bookmark_note,
             pick_folder,
-            path_references,
+            file_references,
             path_reference_accounts,
             browser_activity_summary,
             browser_activity_insights,

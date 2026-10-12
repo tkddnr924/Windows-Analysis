@@ -171,12 +171,14 @@ fn namespace_priority(namespace: &FileNamespace) -> i32 {
 /// Header identity is retained even without a readable FILE_NAME.
 struct IndexEntry {
     name: String,
+    /// Namespace priority of `name`; -1 when the record had none.
+    priority: i32,
     parent: Option<(u64, u16)>,
     sequence: u16,
     is_directory: bool,
 }
 
-/// Decode only FILE_NAME; pass 1 never reads resident bodies.
+/// Decode only FILE_NAME; pass 1 never reads resident bodies of base records.
 fn index_entry(entry: &mft::MftEntry) -> IndexEntry {
     let mut best: Option<(i32, String, u64, u16)> = None;
     for attr in entry
@@ -190,15 +192,49 @@ fn index_entry(entry: &mft::MftEntry) -> IndexEntry {
             }
         }
     }
-    let (name, parent) = best.map_or_else(
-        || (String::new(), None),
-        |(_, name, entry, sequence)| (name, Some((entry, sequence))),
+    let (priority, name, parent) = best.map_or_else(
+        || (-1, String::new(), None),
+        |(priority, name, entry, sequence)| (priority, name, Some((entry, sequence))),
     );
     IndexEntry {
         name,
+        priority,
         parent,
         sequence: entry.header.sequence,
         is_directory: entry.header.flags.bits() & FLAG_DIRECTORY != 0,
+    }
+}
+
+/// Extension record (attributes moved out via $ATTRIBUTE_LIST): its record
+/// number, the base sequence its header points at, and its attributes.
+struct Extension {
+    record: u64,
+    base_sequence: u16,
+    facts: RecordFacts,
+}
+
+/// Fold an extension record's attributes into its base record's facts.
+/// The base keeps what it already carries; $FILE_NAME follows namespace
+/// priority; $DATA size/body come from whichever record holds them.
+fn absorb(facts: &mut RecordFacts, ext: RecordFacts) {
+    if let Some(name) = ext.name {
+        let better = facts
+            .name
+            .as_ref()
+            .map_or(true, |cur| namespace_priority(&name.namespace) > namespace_priority(&cur.namespace));
+        if better {
+            facts.name = Some(name);
+        }
+    }
+    if facts.standard_info.is_none() {
+        facts.standard_info = ext.standard_info;
+    }
+    if facts.data_size.is_none() {
+        facts.data_size = ext.data_size;
+    }
+    if facts.data_shape == DataShape::Absent {
+        facts.data_shape = ext.data_shape;
+        facts.data = ext.data;
     }
 }
 
@@ -220,7 +256,9 @@ fn extract(entry: &mft::MftEntry) -> RecordFacts {
         if attr.header.type_code == MftAttributeType::DATA && attr.header.name.is_empty() {
             match &attr.header.residential_header {
                 ResidentialHeader::NonResident(nr) => {
-                    if facts.data_size.is_none() {
+                    // Only the segment starting at VCN 0 carries the sizes;
+                    // later run segments (often in extension records) hold 0.
+                    if facts.data_size.is_none() && nr.vnc_first == 0 {
                         facts.data_size = Some(nr.file_size);
                     }
                     if facts.data_shape == DataShape::Absent {
@@ -655,9 +693,11 @@ fn stream_source(
         MftParser::from_path(source).map_err(|e| SourceFailure::Input(e.to_string()))?;
 
     // pass 1: entry -> name, raw parent reference and own identity, for path
-    // resolution and parent validation, plus $Volume.
+    // resolution and parent validation, plus $Volume. Extension records are
+    // collected whole: their attributes belong to the base record.
     let mut index: HashMap<u64, IndexEntry> = HashMap::new();
     let mut volume = VolumeFacts::default();
+    let mut extensions: HashMap<u64, Vec<Extension>> = HashMap::new();
     for entry in parser.iter_entries() {
         if crate::pipeline::cancelled() {
             break;
@@ -672,9 +712,52 @@ fn stream_source(
             }
         }
         if entry.header.signature == *b"FILE" {
+            let base = &entry.header.base_reference;
+            // Only an all-zero reference marks a base record ($MFT's own
+            // extensions point at entry 0 with a nonzero sequence).
+            if base.entry != 0 || base.sequence != 0 {
+                extensions.entry(base.entry).or_default().push(Extension {
+                    record: entry.header.record_number,
+                    base_sequence: base.sequence,
+                    facts: extract(&entry),
+                });
+            }
             index.insert(entry.header.record_number, index_entry(&entry));
         }
     }
+
+    // An extension belongs to its base only when the base slot still holds
+    // the same sequence and is not itself an extension; anything else is a
+    // leftover of an earlier occupant and stays a row of its own.
+    let extension_records: HashSet<u64> = extensions.values().flatten().map(|e| e.record).collect();
+    let mut merged: HashSet<u64> = HashSet::new();
+    for (base, list) in extensions.iter_mut() {
+        let Some(base_sequence) = index.get(base).map(|b| b.sequence) else {
+            list.clear();
+            continue;
+        };
+        if extension_records.contains(base) {
+            list.clear();
+            continue;
+        }
+        list.retain(|e| e.base_sequence == base_sequence);
+        list.sort_by_key(|e| e.record);
+        for ext in list.iter() {
+            merged.insert(ext.record);
+            // A directory's name may live only in an extension: children
+            // resolve their paths through it.
+            if let Some(f) = &ext.facts.name {
+                let priority = namespace_priority(&f.namespace);
+                let entry = index.get_mut(base).expect("base checked above");
+                if priority > entry.priority {
+                    entry.priority = priority;
+                    entry.name = f.name.clone();
+                    entry.parent = Some((f.parent.entry, f.parent.sequence));
+                }
+            }
+        }
+    }
+    extensions.retain(|_, list| !list.is_empty());
 
     let mut resolver = PathResolver::new();
     let source_text = source.to_string_lossy().to_string();
@@ -696,9 +779,16 @@ fn stream_source(
             Err(_) => continue,
         };
         let header = &entry.header;
+        let record = header.record_number;
+        if merged.contains(&record) {
+            continue;
+        }
         let in_use = i64::from(header.flags.bits() & FLAG_IN_USE != 0);
         let is_directory = header.flags.bits() & FLAG_DIRECTORY != 0;
-        let facts = extract(&entry);
+        let mut facts = extract(&entry);
+        for ext in extensions.remove(&record).unwrap_or_default() {
+            absorb(&mut facts, ext.facts);
+        }
         if facts.name.is_none() && facts.standard_info.is_none() {
             continue;
         }
@@ -732,7 +822,6 @@ fn stream_source(
             ),
         };
 
-        let record = header.record_number;
         // Only directory record 5 is the root; a "." name is insufficient.
         let (parent_status, path_status, path): (ParentStatus, PathStatus, String) =
             if record == ROOT_ENTRY && is_directory {
@@ -1003,6 +1092,22 @@ mod tests {
         put(&mut attr, 48, &file_size.to_le_bytes()); // file size
         put(&mut attr, 56, &file_size.to_le_bytes()); // valid data
         attr
+    }
+
+    /// A later run segment of a non-resident unnamed $DATA: NTFS only fills
+    /// the size fields in the segment starting at VCN 0.
+    fn data_segment(first_vcn: u64, file_size: u64) -> Vec<u8> {
+        let mut attr = nonresident_data_attr(file_size);
+        put(&mut attr, 16, &first_vcn.to_le_bytes());
+        put(&mut attr, 24, &(first_vcn + 1).to_le_bytes());
+        attr
+    }
+
+    /// Extension record: its header points back at the base record.
+    fn extension_record(sequence: u16, base: u64, attrs: &[Vec<u8>]) -> Vec<u8> {
+        let mut record = mft_record(sequence, 0x01, attrs);
+        put(&mut record, 32, &base.to_le_bytes());
+        record
     }
 
     fn standard_info_body(owner_id: u32, security_id: u32) -> Vec<u8> {
@@ -1287,6 +1392,57 @@ mod tests {
         // The $FILE_NAME physical size (7) must not win over the real $DATA size.
         assert_eq!(size, 1_048_576);
         assert_eq!(data_type, "null");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn attribute_list_extension_records_belong_to_their_base_record() {
+        let dir = temp_dir("attr-list");
+        let records = with_root(vec![
+            // 6: base file whose $FILE_NAME/$DATA moved to extension 7.
+            mft_record(2, 0x01, &[si()]),
+            extension_record(1, mft_ref(6, 2), &[file_name_attr(mft_ref(5, ROOT_SEQ), "big.dll", 0), nonresident_data_attr(4096)]),
+            // 8: extension written for an earlier occupant of slot 6 (seq 1).
+            extension_record(1, mft_ref(6, 1), &[file_name_attr(mft_ref(5, ROOT_SEQ), "old.txt", 0)]),
+            // 9: directory whose name lives in extension 10; 11 is its child.
+            mft_record(1, 0x03, &[si()]),
+            extension_record(1, mft_ref(9, 1), &[file_name_attr(mft_ref(5, ROOT_SEQ), "Dir", 0)]),
+            mft_record(1, 0x01, &[si(), file_name_attr(mft_ref(9, 1), "c.txt", 0)]),
+            // 12: fragmented $DATA — the VCN>0 segment comes first (13) and
+            // carries no size; the VCN 0 segment (14) holds the real one.
+            mft_record(1, 0x01, &[si(), file_name_attr(mft_ref(5, ROOT_SEQ), "frag.bin", 0)]),
+            extension_record(1, mft_ref(12, 1), &[data_segment(5, 0)]),
+            extension_record(1, mft_ref(12, 1), &[data_segment(0, 9999)]),
+            // 15: extension of record 0 ($MFT, seq 1) — entry 0 with a
+            // nonzero sequence is still an extension, never a row.
+            extension_record(1, mft_ref(0, 1), &[file_name_attr(mft_ref(5, ROOT_SEQ), "$MFT", 0)]),
+        ]);
+        let src = write_mft(&dir, "$MFT", &records);
+        let out = dir.join("MFT_Records.sqlite");
+        parse_mft_stream(&src, &out).unwrap();
+
+        let conn = Connection::open(&out).unwrap();
+        let base: (Option<String>, String, Option<i64>, String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT file_name, path, file_size, data_status, si_created, fn_created FROM MFT_Records WHERE entry = 6",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+            )
+            .unwrap();
+        assert_eq!((base.0.as_deref(), base.1.as_str(), base.2, base.3.as_str()), (Some("big.dll"), "\\big.dll", Some(4096), "nonresident"));
+        assert!(base.4.is_some() && base.5.is_some(), "SI from the base, FN from the extension");
+        // Merged extensions are not files of their own; a stale one stays as evidence.
+        let entries: Vec<i64> = conn
+            .prepare("SELECT entry FROM MFT_Records WHERE entry >= 6 ORDER BY entry")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(entries, vec![6, 8, 9, 11, 12]);
+        assert_eq!(row_state(&out, "entry = 11").3, "\\Dir\\c.txt");
+        assert_eq!(row_state(&out, "entry = 11").4, "complete");
+        assert_eq!(query_one::<i64>(&out, "SELECT file_size FROM MFT_Records WHERE entry = 12"), 9999);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

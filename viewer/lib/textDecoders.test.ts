@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 // @ts-expect-error -- TypeScript uses bundler resolution while this test uses Node directly.
-import { decodeBase64, decodeHex, decodeUrl } from "./textDecoders.ts";
+import { decodeBase64, decodeBytes, decodeHex, decodeUrl, hexDump } from "./textDecoders.ts";
 
 const utf16le = (text: string) => Buffer.from(text, "utf16le").toString("base64");
 
@@ -32,4 +32,16 @@ test("URL decoding handles %XX, UTF-8 sequences and plus signs", () => {
 test("hex decoding accepts spaced or 0x-prefixed bytes", () => {
   assert.deepEqual(decodeHex("0x48 0x69"), { ok: true, text: "Hi", encoding: "UTF-8" });
   assert.equal(decodeHex("4G").ok, false);
+});
+
+test("hex dump shows offset, bytes and printable ASCII per 16 bytes", () => {
+  const dump = hexDump(new Uint8Array([0x68, 0x69, 0x0a, ...Array(15).fill(0x41)]));
+  assert.equal(dump.split("\n")[0], "00000000  68 69 0a 41 41 41 41 41 41 41 41 41 41 41 41 41  |hi.AAAAAAAAAAAAA|");
+  assert.equal(dump.split("\n")[1], `00000010  41 41${" ".repeat(42)}  |AA|`);
+  assert.equal(hexDump(new Uint8Array()), "");
+});
+
+test("resident bytes decode as text or are reported binary", () => {
+  assert.deepEqual(decodeBytes(new TextEncoder().encode("qc 1.0\r\n")), { ok: true, text: "qc 1.0\r\n", encoding: "UTF-8" });
+  assert.equal(decodeBytes(new Uint8Array([0x4d, 0x5a, 0x90, 0x00, 0x03])).ok, false);
 });

@@ -8,7 +8,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type {
   AccountDirectoryEntry, Bookmark, BookmarkInput, Case, CategoryEntry, CsvData, DBRow, ElectronApi, Host, HostMetadata, LinkedRowsPage, MftChildrenPage,
-  ListCasesResult, CacheMeta, CacheBodyPreview, BrowserVisitGraph, PathReference, PipelineLogEntry, PipelineResult, ResultFileEntry, ResultProvenance, ArtifactInputFile, ParseReport, ParseEligibility, RunHostOptions, SearchCasePage, AiConversation, AiConversationPage, AiConversationDetail, BrowserActivityQuery, BrowserActivitySummary, BrowserActivityInsights, BrowserDomainStatsPage, AccountEventPage, AccountEventQuery, MftRecordBody, MftVolume, OverviewContractStatus, RecordSource, ResultRow, MftRecordsPage, ParseLogPreview, TimelineMeta, TimelineFacets, TimelinePage, TimelineSourcePage, TimelineQuery,
+  ListCasesResult, CacheMeta, CacheBodyPreview, BrowserVisitGraph, FileReference, PipelineLogEntry, PipelineResult, ResultFileEntry, ResultProvenance, ArtifactInputFile, ParseReport, ParseEligibility, RunHostOptions, SearchCasePage, AiConversation, AiConversationPage, AiConversationDetail, BrowserActivityQuery, BrowserActivitySummary, BrowserActivityInsights, BrowserDomainStatsPage, AccountEventPage, AccountEventQuery, MftRecordBody, MftVolume, OverviewContractStatus, RecordSource, ResultRow, MftRecordsPage, ParseLogPreview, TimelineMeta, TimelineFacets, TimelinePage, TimelineSourcePage, TimelineQuery,
 } from "./types";
 
 // 저장 계약(docs-01)의 결과 DB는 INTEGER·REAL 컬럼을 쓴다. 화면 코드는 셀을
@@ -81,13 +81,13 @@ function makeApi(): ElectronApi {
     accountEventPage: (hostDir, query) => invoke<AccountEventPage>("account_event_page", { hostDir, query }).then(table),
     aiReferrals: (fullPath, tableName, start, end, offset, limit) => invoke<CsvData>("ai_referrals", { fullPath, tableName, start, end, offset, limit }).then(table),
     // 볼륨 문맥은 호출자가 고른 값만 넘긴다 — 미지정은 볼륨 구분 없는 조회다.
-    mftChildren: (fullPath, parentEntry, offset, limit, volumeId) => invoke<MftChildrenPage>("mft_children", { fullPath, parentEntry: parentEntry ?? null, offset, limit, volumeId: volumeId ?? null }).then(table),
+    mftChildren: (fullPath, parentEntry, parentSeq, offset, limit, volumeId) => invoke<MftChildrenPage>("mft_children", { fullPath, parentEntry: parentEntry ?? null, parentSeq: parentSeq ?? null, offset, limit, volumeId: volumeId ?? null }).then(table),
     mftSearch: (fullPath, query, limit, volumeId) => invoke<DBRow[]>("mft_search", { fullPath, query, limit, volumeId: volumeId ?? null }).then(rows),
     mftRow: (fullPath, rowid, volumeId) => invoke<DBRow | null>("mft_row", { fullPath, rowid, volumeId: volumeId ?? null }).then((row) => (row ? cells(row) : row)),
     mftRecordBody: (fullPath, rowid, volumeId) => invoke<MftRecordBody>("mft_record_body", { fullPath, rowid, volumeId: volumeId ?? null }),
     mftVolumes: (dbPath) => invoke<MftVolume[]>("mft_volumes", { dbPath }).then(rows),
     usnJrnlPage: (fullPath, query) => invoke<CsvData>("usnjrnl_page", { fullPath, search: query.search ?? "", reason: query.reason ?? "", start: query.start ?? "", end: query.end ?? "", ascending: query.ascending ?? false, offset: query.offset, limit: query.limit }).then(table),
-    mftRecordsPage: (fullPath, query, offset, limit, options) => invoke<MftRecordsPage>("mft_records_page", { fullPath, query, offset, limit, sortKey: options?.sortKey ?? null, sortDesc: options?.sortDesc ?? null, filesOnly: options?.filesOnly ?? null, namePattern: options?.namePattern ?? null, timeKey: options?.timeKey ?? null, timeStart: options?.timeStart ?? null, timeEnd: options?.timeEnd ?? null, volumeId: options?.volumeId ?? null }).then(table),
+    mftRecordsPage: (fullPath, query, offset, limit, options) => invoke<MftRecordsPage>("mft_records_page", { fullPath, query, offset, limit, options: options ?? null }).then(table),
     listColumnValues: (fullPath, column, tableName) =>
       invoke<{ value: string; count: number }[]>("list_column_values", { fullPath, column, tableName: tableName ?? null })
         .then((values) => values.map((entry) => ({ ...entry, value: entry.value === null ? entry.value : String(entry.value) }))),
@@ -108,8 +108,8 @@ function makeApi(): ElectronApi {
     masterTimelineFacets: (hostDir) => invoke<TimelineFacets>("master_timeline_facets", { hostDir }),
     masterTimelinePage: (hostDir, query) => invoke<TimelinePage>("master_timeline_page", { hostDir, query })
       .then((page) => { for (const row of page.rows) cells(row.row); return page; }),
-    pathReferences: (hostDir, paths) => invoke<PathReference[]>("path_references", { hostDir, paths })
-      .then((references) => { for (const reference of references) cells(reference.fields); return references; }),
+    fileReferences: (hostDir, datasetId, volumeId, fileRecordIds) => invoke<FileReference[]>("file_references", { hostDir, datasetId, volumeId: volumeId ?? null, fileRecordIds })
+      .then((references) => { for (const reference of references) cells(reference.row); return references; }),
     pathReferenceAccounts: (hostDir) => invoke<string[]>("path_reference_accounts", { hostDir }),
     cacheEntryBody: (hostDir, account, url, cacheKey) => invoke<CacheBodyPreview>("cache_entry_body", { hostDir, account, url, cacheKey }),
     browserVisitGraph: (hostDir, account, url, cacheKey, sourceFile) => invoke<BrowserVisitGraph>("browser_visit_graph", { hostDir, account, url, cacheKey: cacheKey ?? null, sourceFile: sourceFile ?? null }),

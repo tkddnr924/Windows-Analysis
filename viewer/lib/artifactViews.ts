@@ -6,7 +6,7 @@ import { executableNote } from "./executableCatalog";
 import { ACCOUNT_ROLE_LABELS } from "./executionHistory";
 import { lookupEventCatalog, parseEventData, extractEventField, extractPsClassicField, tagsForSecurityEvent, EVENT_QUICK_FIELDS, LOGON_TYPE_LABELS } from "./eventCatalog";
 
-export type FieldKind = "text" | "path" | "code" | "hash" | "bytes" | "json" | "badge" | "privileges" | "accountSid" | "account" | "byteSize" | "durationMs" | "cacheData";
+export type FieldKind = "text" | "path" | "code" | "hash" | "bytes" | "json" | "badge" | "privileges" | "accountSid" | "account" | "byteSize" | "durationMs" | "cacheData" | "mftData";
 
 export interface FieldSpec {
   key: string;
@@ -66,6 +66,8 @@ export interface DetailSectionSpec {
     defaultExpanded?: boolean;
     summary?: (row: Record<string, string>, fieldCount: number) => string;
   };
+  /** Placement marker for content supplied by the opening panel (fields ignored). */
+  slot?: "relatedEvidence";
 }
 
 /**
@@ -397,7 +399,13 @@ function userAssistProgram(r: Record<string, string>): string {
 // 저장 계약(docs-01)의 플래그는 0/1이고 미확인은 NULL이다. 화면은 모르는 값을
 // 한쪽으로 단정하지 않고 "확인 불가"로 남긴다.
 const MFT_DIRECTORY_LABELS: Record<string, string> = { "1": "디렉터리", "0": "파일" };
-const MFT_IN_USE_LABELS: Record<string, string> = { "1": "사용 중 (할당됨)", "0": "미사용 (삭제됨)" };
+// in_use=0 is a released record, not proof of deletion time or recoverability (docs-04).
+const MFT_IN_USE_LABELS: Record<string, string> = { "1": "사용 중 (할당됨)", "0": "비사용 (할당 해제)" };
+// Stored link/path/body states (docs-04 §0, FileSystemEntries).
+export const MFT_PARENT_STATUS_LABELS: Record<string, string> = { verified: "확인됨", root: "루트", sequence_mismatch: "부모 순번 불일치", unknown: "부모 미확인" };
+export const MFT_PATH_STATUS_LABELS: Record<string, string> = { complete: "완전한 경로", sequence_mismatch: "불완전 (부모 순번 불일치)", unknown: "불완전 (부모 미확인)" };
+export const MFT_DATA_STATUS_LABELS: Record<string, string> = { resident: "Resident 본문", resident_empty: "빈 Resident 본문", nonresident: "Non-resident (본문 미저장)", unavailable: "본문 미확보", not_applicable: "폴더 (본문 없음)" };
+const PATH_MATCH_BASIS_LABELS: Record<string, string> = { path: "경로 일치 (드라이브 미확인)", path_and_drive: "경로·드라이브 일치" };
 const RECYCLE_R_EXISTS_LABELS: Record<string, string> = { "1": "수집본에 $R 있음", "0": "수집본에 $R 없음" };
 
 // 볼륨 값은 파일마다 따로 있는 값이 아니라 $Volume 레코드의 값을 그 볼륨의
@@ -648,12 +656,9 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
       // 0/1/NULL — 미확인을 "파일"로 단정하지 않는다(docs-01).
       { key: "is_directory", label: "디렉터리", valueLabels: MFT_DIRECTORY_LABELS, showWhenEmpty: true, emptyLabel: "확인 불가" },
       { key: "in_use", label: "할당 상태", valueLabels: MFT_IN_USE_LABELS, showWhenEmpty: true, emptyLabel: "확인 불가" },
-      { key: "entry", label: "엔트리" }, { key: "seq", label: "시퀀스" },
-      { key: "parent_entry", label: "부모 엔트리", showWhenEmpty: true, emptyLabel: "부모 미확인" },
-      { key: "parent_seq", label: "부모 시퀀스", showWhenEmpty: true, emptyLabel: "원본 정보 없음" },
+      { key: "account", label: "계정", kind: "account", compute: (r) => r.account || r.account_sid },
       { key: "event_type", label: "항목 종류" },
-    ]}, { heading: "볼륨", fields: MFT_VOLUME_FIELDS },
-    { heading: "$STANDARD_INFORMATION (0x10)", fields: [
+    ]}, { heading: "$STANDARD_INFORMATION (0x10)", fields: [
       { key: "si_created", label: "생성", showWhenEmpty: true, bookmarkable: true }, { key: "si_modified", label: "수정", showWhenEmpty: true, bookmarkable: true },
       { key: "si_mft_modified", label: "MFT 수정", showWhenEmpty: true, bookmarkable: true }, { key: "si_accessed", label: "접근", showWhenEmpty: true, bookmarkable: true },
       { key: "owner_id", label: "할당량 소유자 ID", showWhenEmpty: true, emptyLabel: "원본 정보 없음" },
@@ -661,6 +666,23 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     ]}, { heading: "$FILE_NAME (0x30)", fields: [
       { key: "fn_created", label: "생성", showWhenEmpty: true, bookmarkable: true }, { key: "fn_modified", label: "수정", showWhenEmpty: true, bookmarkable: true },
       { key: "fn_mft_modified", label: "MFT 수정", showWhenEmpty: true, bookmarkable: true }, { key: "fn_accessed", label: "접근", showWhenEmpty: true, bookmarkable: true },
+    ]}, { heading: "경로 참조 흔적", fields: [], slot: "relatedEvidence" },
+    { heading: "$DATA 본문", fields: [
+      // Resident body stored in FileSystemEntries.data; other states show data_status.
+      { key: "data_status", label: "본문", kind: "mftData", showWhenEmpty: true },
+    ]}, { heading: "연결·본문 상태", fields: [
+      // Parser-verified states; the viewer never re-derives them.
+      { key: "parent_status", label: "부모 연결", valueLabels: MFT_PARENT_STATUS_LABELS, showWhenEmpty: true, emptyLabel: "저장되지 않음" },
+      { key: "path_status", label: "경로 복원", valueLabels: MFT_PATH_STATUS_LABELS, showWhenEmpty: true, emptyLabel: "저장되지 않음" },
+      { key: "data_status", label: "본문", valueLabels: MFT_DATA_STATUS_LABELS, showWhenEmpty: true, emptyLabel: "저장되지 않음" },
+      { key: "entry", label: "엔트리" }, { key: "seq", label: "시퀀스" },
+      { key: "parent_entry", label: "부모 엔트리", showWhenEmpty: true, emptyLabel: "부모 미확인" },
+      { key: "parent_seq", label: "부모 시퀀스", showWhenEmpty: true, emptyLabel: "원본 정보 없음" },
+    ]}, { heading: "입력·볼륨", fields: [
+      { key: "input_name", label: "입력 이름" },
+      { key: "source_relative", label: "수집 상대 경로", kind: "path" },
+      { key: "source_file", label: "원본 입력 경로", kind: "path" },
+      ...MFT_VOLUME_FIELDS,
     ]}],
   },
 
@@ -709,6 +731,37 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     ]}, { heading: "파싱", fields: [
       { key: "status", label: "상태" },
       { key: "error", label: "실패 사유" },
+    ]}],
+  },
+
+  // 경로 참조 파생(_OVERVIEW/PathReferences) — 파일 시스템 화면의 교차 참조
+  // 상세. 후보 연결은 경로 근거일 뿐 같은 파일이라는 확정이 아니다(docs-04).
+  PathReferences: {
+    title: (r) => r.label || r.target_path || r.path || "(경로 참조)",
+    subtitle: (r) => [r.event_type, r.account].filter(Boolean).join(" · "),
+    badges: [{ key: "event_type", kind: "badge" }],
+    sections: [{ heading: "참조", fields: [
+      { key: "__match_basis", label: "후보 근거", valueLabels: PATH_MATCH_BASIS_LABELS },
+      { key: "account", label: "계정", kind: "account", compute: (r) => r.account || r.account_sid },
+      { key: "label", label: "표시 이름" },
+      { key: "target_path", label: "대상 경로 (원문)", kind: "path" },
+      { key: "target_path_resolved", label: "대상 경로 (해석)", kind: "path" },
+      { key: "path_kind", label: "경로 종류" },
+      { key: "target_drive_letter", label: "드라이브 문자" },
+      { key: "arguments", label: "인수", kind: "code" },
+      { key: "working_directory", label: "작업 디렉터리", kind: "path" },
+    ]}, { heading: "JumpList", fields: [
+      { key: "app_id", label: "앱 ID" },
+      { key: "jumplist_type", label: "JumpList 유형" },
+      // NULL (unknown) is distinct from a real 0.
+      { key: "access_count", label: "사용 횟수 (DestList)" },
+      { key: "destlist_accessed", label: "DestList 마지막 사용 시각" },
+      { key: "lnk_accessed", label: "LNK 대상 접근 시각" },
+      { key: "timestamp_source", label: "대표 시각 출처", valueLabels: { destlist_accessed: "DestList 마지막 사용", lnk_accessed: "LNK 대상 접근", origin_record: "원 기록 시각" } },
+      { key: "created_time", label: "LNK 생성 시각" },
+      { key: "modified_time", label: "LNK 수정 시각" },
+      { key: "hostname", label: "DestList 호스트명" },
+      { key: "machine_id", label: "장비 식별자" },
     ]}],
   },
 

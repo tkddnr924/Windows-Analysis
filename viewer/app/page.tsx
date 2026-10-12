@@ -304,9 +304,10 @@ export default function Home() {
     rawLoadFailed.current.delete(key);
 
     try {
-      if (file.tableName === "FileSystemEntries" || file.tableName === "MFT_Records") {
+      if (file.tableName === "FileSystemEntries") {
         // 파일 시스템 표는 수십만~백만 행이다. 탐색기(MftView)는 dbPath로
-        // SQLite를 지연 조회하므로 전체 행을 탭에 싣지 않는다.
+        // SQLite를 지연 조회하므로 전체 행을 탭에 싣지 않는다. 원본
+        // MFT_Records는 아래 원본 표 청크 경로로 연다.
         setTabs((prev) => prev.map((t) => (keyOf(t.file) === key ? { ...t, data: { columns: [], rows: [], rowCount: 0 }, loading: false } : t)));
         return;
       }

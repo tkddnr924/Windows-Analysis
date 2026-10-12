@@ -1,7 +1,7 @@
 "use client";
 import PaginationControls from "@/components/PaginationControls";
 
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import AccountCircleOutlinedIcon from "@mui/icons-material/AccountCircleOutlined";
 import BookmarkBorderOutlinedIcon from "@mui/icons-material/BookmarkBorderOutlined";
 import BookmarkOutlinedIcon from "@mui/icons-material/BookmarkOutlined";
@@ -21,6 +21,7 @@ import { parsePrivileges, lookupPrivilege } from "@/lib/privileges";
 import TagList from "./TagList";
 import MiniTimeline from "./MiniTimeline";
 import CodeModal from "./CodeModal";
+import MftResidentData from "./MftResidentData";
 
 // Renders a raw Windows PrivilegeList (event 4672/4673) as a simple readable
 // list: each Se*Privilege with a plain "what it is" description. No risk
@@ -422,7 +423,7 @@ function FieldRow({ field, row, onFetchLinkedRows, hostDir, accountDirectory, on
   // two identical actions for the same evidence value.
   // Plain fields that happen to contain JSON also render CodeOrJsonBlock, so
   // they must use its single copy control instead of adding FieldRow's copy.
-  const hasInlineCodeControls = kind === "code" || kind === "json" || kind === "cacheData" || prettyJsonOrNull(raw) !== null;
+  const hasInlineCodeControls = kind === "code" || kind === "json" || kind === "cacheData" || kind === "mftData" || prettyJsonOrNull(raw) !== null;
 
   let content: React.ReactNode;
   switch (kind) {
@@ -467,6 +468,9 @@ function FieldRow({ field, row, onFetchLinkedRows, hostDir, accountDirectory, on
       break;
     case "cacheData":
       content = <CacheDataValue row={row} hostDir={hostDir} />;
+      break;
+    case "mftData":
+      content = <MftResidentData row={row} />;
       break;
     default:
       // A plain text/path field can still hold a JSON blob (e.g. a registry
@@ -742,6 +746,8 @@ interface ArtifactDetailViewProps {
   accountDirectory?: AccountDirectory;
   onToggleFieldBookmark?: (field: string) => void;
   isFieldBookmarked?: (field: string) => boolean;
+  /** Panel content placed at spec sections marked with `slot`. */
+  slots?: Partial<Record<"relatedEvidence", React.ReactNode>>;
 }
 
 // "이 페이지를 둘러싼 이동" — reconstructs the browser visit navigation graph
@@ -780,7 +786,7 @@ function VisitFlowLauncher({ row, hostDir }: { row: Record<string, string>; host
   );
 }
 
-export default function ArtifactDetailView({ spec, row, evidenceTime, onNavigate, onFetchLinkedRows, hostDir, accountDirectory, onToggleFieldBookmark, isFieldBookmarked }: ArtifactDetailViewProps) {
+export default function ArtifactDetailView({ spec, row, evidenceTime, onNavigate, onFetchLinkedRows, hostDir, accountDirectory, onToggleFieldBookmark, isFieldBookmarked, slots }: ArtifactDetailViewProps) {
   const title = spec.title(row);
   const subtitle = spec.subtitle?.(row);
   const tags = spec.tags?.(row) ?? [];
@@ -851,7 +857,10 @@ export default function ArtifactDetailView({ spec, row, evidenceTime, onNavigate
         </div>
       )}
 
-      {spec.sections.map((section, index) => (
+      {spec.sections.map((section, index) => section.slot ? (
+        // Content supplied by the opening panel, placed where the spec puts it.
+        <Fragment key={`slot-${section.slot}-${index}`}>{slots?.[section.slot] ?? null}</Fragment>
+      ) : (
         <DetailSection key={`${typeof section.heading === "string" ? section.heading : "computed"}-${index}`} section={section} row={row} onFetchLinkedRows={onFetchLinkedRows} hostDir={hostDir} accountDirectory={accountDirectory} onToggleFieldBookmark={onToggleFieldBookmark} isFieldBookmarked={isFieldBookmarked} />
       ))}
 

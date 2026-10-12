@@ -397,10 +397,14 @@ export default function RowDetailPanel({ row, columns, focusedColumn, evidenceTi
         <div data-detail-scroll-container style={{ overflowY: "auto", flex: 1 }}>
           {spec && !showRaw ? (
             <>
-              <ArtifactDetailView spec={spec} row={row} evidenceTime={evidenceTime} onNavigate={onNavigate} onFetchLinkedRows={onFetchLinkedRows} hostDir={hostDir} accountDirectory={accountDirectory} onToggleFieldBookmark={onToggleFieldBookmark} isFieldBookmarked={isFieldBookmarked} />
-              {relatedEvidence.length > 0 && (
+              {(() => {
+                // A spec can place this block via a `slot` section (with its heading);
+                // otherwise it follows the spec sections as before.
+                const slotSection = spec.sections.find((section) => section.slot === "relatedEvidence");
+                const heading = typeof slotSection?.heading === "string" ? slotSection.heading : "교차 참조 증거";
+                const evidenceNode = relatedEvidence.length > 0 ? (
                 <section style={{ padding: "14px 16px 18px", borderBottom: "1px solid var(--border-subtle)" }}>
-                  <div className="dfir-section-label" style={{ marginBottom: 7 }}>교차 참조 증거</div>
+                  <div className="dfir-section-label" style={{ marginBottom: 7 }}>{heading}</div>
                   {relatedEvidence.map((evidence) => {
                     // "Jumplist · Administrator" → 아티팩트 배지 + 계정으로 분해해 표시.
                     const [kind, ...accountParts] = evidence.label.split(" · ");
@@ -425,7 +429,12 @@ export default function RowDetailPanel({ row, columns, focusedColumn, evidenceTi
                     );
                   })}
                 </section>
-              )}
+                ) : null;
+                return <>
+                  <ArtifactDetailView spec={spec} row={row} evidenceTime={evidenceTime} onNavigate={onNavigate} onFetchLinkedRows={onFetchLinkedRows} hostDir={hostDir} accountDirectory={accountDirectory} onToggleFieldBookmark={onToggleFieldBookmark} isFieldBookmarked={isFieldBookmarked} slots={slotSection ? { relatedEvidence: evidenceNode } : undefined} />
+                  {!slotSection && evidenceNode}
+                </>;
+              })()}
               {childSections}
             </>
           ) : (

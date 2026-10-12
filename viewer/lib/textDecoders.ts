@@ -11,7 +11,8 @@ function printable(text: string): boolean {
   return !/[\u0000-\u0008\u000b\u000c\u000e-\u001f\ufffd]/.test(text);
 }
 
-function decodeBytes(bytes: Uint8Array): DecodeResult {
+/** Bytes as display text (UTF-16LE when it looks like it, else UTF-8); binary is reported. */
+export function decodeBytes(bytes: Uint8Array): DecodeResult {
   // UTF-16LE (PowerShell -EncodedCommand): ASCII-range text has zero high bytes.
   if (bytes.length >= 2 && bytes.length % 2 === 0) {
     let zeros = 0;
@@ -28,6 +29,18 @@ function decodeBytes(bytes: Uint8Array): DecodeResult {
     if (printable(text)) return { ok: true, text, encoding: "UTF-8" };
   } catch { /* fall through */ }
   return { ok: false, error: "텍스트가 아닌 바이너리 값입니다." };
+}
+
+/** Classic 16-byte hex dump: offset, hex bytes, printable ASCII. */
+export function hexDump(bytes: Uint8Array): string {
+  const lines: string[] = [];
+  for (let offset = 0; offset < bytes.length; offset += 16) {
+    const chunk = bytes.subarray(offset, offset + 16);
+    const hex = Array.from(chunk, (byte) => byte.toString(16).padStart(2, "0")).join(" ").padEnd(47, " ");
+    const ascii = Array.from(chunk, (byte) => (byte >= 0x20 && byte < 0x7f ? String.fromCharCode(byte) : ".")).join("");
+    lines.push(`${offset.toString(16).padStart(8, "0")}  ${hex}  |${ascii}|`);
+  }
+  return lines.join("\n");
 }
 
 export function decodeBase64(input: string): DecodeResult {

@@ -158,6 +158,8 @@ export interface ResultFileEntry {
   relativePath: string;
   fullPath: string;
   rowCount: number;
+  /** True for _OVERVIEW contract (derived) DBs; false for raw parser facts. */
+  derived?: boolean;
 }
 
 /** Parser-provided source and recovery summary for one result table. */
@@ -458,20 +460,42 @@ export interface PipelineResult {
   exitCode: number | null;
 }
 
-/** A sighting of a filesystem path in another artifact (JumpList today;
- * Shellbag/LNK later) — used to tag rows in the $MFT explorer. */
-export interface PathReference {
-  /** lowercased target path, for matching against $MFT paths */
-  path: string;
-  kind: string;
-  account: string;
-  label: string;
-  fields: Record<string, string>;
-  /** Source sqlite + row, so the viewer can bookmark this reference's
-   * timestamps. Empty fullPath / rowid < 0 = not bookmarkable (e.g. Shellbag). */
+/** A PathReferences row the parser linked to a file record as a candidate
+ * (PathReferenceCandidates) — path evidence, never "the same file". */
+export interface FileReference {
+  fileRecordId: string;
+  /** "path" | "path_and_drive" */
+  matchBasis: string;
+  /** Stored PathReferences row (all columns). */
+  row: Record<string, string>;
+  /** First raw origin — only the existing bookmark key; rowid < 0 = none. */
   fullPath: string;
   tableName: string;
   rowid: number;
+}
+
+/** Recursive file list filters (docs-04 §3). */
+export interface MftListOptions {
+  sortKey?: string;
+  sortDesc?: boolean;
+  /** "file" | "dir" | undefined (both) */
+  kind?: string;
+  /** 1 in use, 0 not in use, undefined both */
+  inUse?: number;
+  extension?: string;
+  namePattern?: string;
+  pathPrefix?: string;
+  excludePaths?: string[];
+  sizeMin?: number;
+  sizeMax?: number;
+  pathIncomplete?: boolean;
+  residentOnly?: boolean;
+  siBeforeFn?: boolean;
+  /** Period filter fields; a record matches when any of them is in range. */
+  timeKeys?: string[];
+  timeStart?: string;
+  timeEnd?: string;
+  volumeId?: string;
 }
 
 /** Metadata-only cache entry (no body). Use cacheEntryBody() to fetch body on demand. */
@@ -577,22 +601,26 @@ export interface RecordSource {
   source_full_path: string;
 }
 
-/** FileSystemEntries/MFT_Records가 담은 볼륨 문맥. 같은 값이라고 해서 실제로
+/** FileSystemEntries가 담은 입력(볼륨) 문맥. 같은 값이라고 해서 실제로
  * 같은 볼륨이라는 증거는 아니다(docs-01). */
 export interface MftVolume {
   volume_id: string;
   volume_label: string | null;
   drive_letter: string | null;
+  input_name: string | null;
+  source_relative: string | null;
   record_count: string;
 }
 
 /** 상주 $DATA 본문 — 상세에서 명시적으로 요청할 때만 받는다. dataPresent가
- * null이면 비상주·미확보이고, 길이 0 BLOB(dataLen 0)과 다르다. */
+ * null이면 비상주·미확보이고, 길이 0 BLOB(dataLen 0)과 다르다. dataStatus는
+ * 파서가 저장한 상태(resident/resident_empty/nonresident/unavailable/not_applicable). */
 export interface MftRecordBody {
   dataPresent: true | null;
   dataLen: number | null;
   truncated: boolean;
   bodyB64: string | null;
+  dataStatus: string | null;
 }
 
 /** Metadata.sqlite 조회 결과 — 부모 metadata 행과 그 자식 테이블들. */
@@ -673,23 +701,23 @@ export interface ElectronApi {
   browserActivityPage(fullPath: string, tableName: string, query: BrowserActivityQuery): Promise<CsvData>;
   accountEventPage(hostDir: string, query: AccountEventQuery): Promise<AccountEventPage>;
   aiReferrals(fullPath: string, tableName: string, start: string | undefined, end: string | undefined, offset: number, limit: number): Promise<CsvData>;
-  /** parentEntry가 null이면 부모 미확인(parent_entry IS NULL) 묶음을 받는다. */
-  mftChildren(fullPath: string, parentEntry: number | null, offset?: number, limit?: number, volumeId?: string): Promise<MftChildrenPage>;
+  /** parentEntry null = 부모 연결 미확인 묶음. parentSeq null + parentEntry = 볼륨 루트. */
+  mftChildren(fullPath: string, parentEntry: number | null, parentSeq: number | null, offset?: number, limit?: number, volumeId?: string): Promise<MftChildrenPage>;
   mftSearch(fullPath: string, query: string, limit: number, volumeId?: string): Promise<DBRow[]>;
   mftRow(fullPath: string, rowid: number, volumeId?: string): Promise<DBRow | null>;
   /** 상주 $DATA 본문 — 상세에서 분석가가 요청할 때만 호출한다. */
   mftRecordBody(fullPath: string, rowid: number, volumeId?: string): Promise<MftRecordBody>;
   /** 결과가 담은 볼륨 문맥 목록. 선택한 볼륨 안에서만 경로·부모를 해석한다. */
   mftVolumes(dbPath: string): Promise<MftVolume[]>;
-  mftRecordsPage(fullPath: string, query: string, offset: number, limit: number, options?: { sortKey?: string; sortDesc?: boolean; filesOnly?: boolean; namePattern?: string; timeKey?: string; timeStart?: string; timeEnd?: string; volumeId?: string }): Promise<MftRecordsPage>;
+  mftRecordsPage(fullPath: string, query: string, offset: number, limit: number, options?: MftListOptions): Promise<MftRecordsPage>;
   usnJrnlPage(fullPath: string, query: { search?: string; reason?: string; start?: string; end?: string; ascending?: boolean; offset: number; limit: number }): Promise<CsvData>;
   listColumnValues(fullPath: string, column: string, tableName?: string): Promise<{ value: string; count: number }[]>;
   searchCase(query: string, hosts: { id: string; name: string; dir: string }[], offset: number, limit: number, range?: { start?: string; end?: string }, categories?: string[]): Promise<SearchCasePage>;
   listBookmarks(hostDir: string): Promise<Bookmark[]>;
   toggleBookmark(hostDir: string, entry: BookmarkInput): Promise<Bookmark[]>;
   updateBookmarkNote(hostDir: string, id: string, note: string): Promise<Bookmark[]>;
-  /** Cross-artifact references to filesystem paths for a host. */
-  pathReferences(hostDir: string, paths: string[]): Promise<PathReference[]>;
+  /** Stored candidate references for the file records on screen. */
+  fileReferences(hostDir: string, datasetId: string, volumeId: string | undefined, fileRecordIds: string[]): Promise<FileReference[]>;
   pathReferenceAccounts(hostDir: string): Promise<string[]>;
   /** Fetch an IPC-bounded preview for one exact cache record. An empty bodyB64
    * means the parser did not retain a recoverable response body. */
