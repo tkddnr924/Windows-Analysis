@@ -386,6 +386,92 @@ export interface UsnGroupsPage {
   total: number;
 }
 
+/** One stored registry hive input (docs-06), loaded or not. */
+export interface RegistryHive {
+  hiveId: string;
+  ordinal: number;
+  hiveName: string;
+  sourceFile: string | null;
+  inventorySource: string;
+  inputStatus: string | null;
+  loadStatus: string;
+  loadError: string | null;
+  inputError: string | null;
+  isRegback: boolean;
+  keyCount: number;
+  valueCount: number;
+  rootCount: number;
+  logsDiscovered: number | null;
+  logsApplied: number | null;
+  logError: string | null;
+  unresolvedCount: number;
+}
+
+/** One page of keys or values with the full count. */
+export interface RegistryRowsPage {
+  rows: Record<string, string>[];
+  total: number;
+}
+
+/** A slice of a value's stored hex (byte-aligned) or text. */
+export interface RegistryValueChunk {
+  data: string;
+  offset: number;
+  total: number;
+}
+
+export interface RegistryAncestor {
+  recordId: string;
+  keyName: string | null;
+  parentStatus: string | null;
+  /** Position among siblings in tree order. */
+  position: number;
+}
+
+export interface RegistryEntry {
+  entry: Record<string, string>;
+  key: Record<string, string>;
+  ancestors: RegistryAncestor[];
+}
+
+export interface RegistrySearchOptions {
+  query: string;
+  hiveId?: string;
+  keyRecordId?: string;
+  keys?: boolean;
+  valueNames?: boolean;
+  valueData?: boolean;
+}
+
+export interface RegistrySearchHit {
+  recordId: string;
+  rowid: number;
+  entryKind: "key" | "value";
+  hiveId: string;
+  keyRecordId: string;
+  keyPath: string | null;
+  valueName: string | null;
+  valueDisplayName: string | null;
+  valueTypeName: string | null;
+  /** "key" | "value_name" | "value_data" | "value_hex" */
+  fields: string[];
+  snippet: string | null;
+}
+
+export interface RegistrySearchPage {
+  hits: RegistrySearchHit[];
+  /** Resume after this rowid; null = scanned to the end of the scope. */
+  nextCursor: number | null;
+  scannedTo: number;
+  rangeStart: number;
+  rangeEnd: number;
+}
+
+export interface RegistryQuickAccess {
+  available: boolean;
+  items: { finding: Record<string, string>; targets: Record<string, string>[] }[];
+}
+
 export interface TimelineEntry {
   /** Already formatted YYYY-MM-DD hh:mm:ss.fff (KST) by the parser — empty when the row has no value in its artifact's timelineField. */
   timestamp: string;
@@ -766,6 +852,15 @@ export interface ElectronApi {
   usnOverview(fullPath: string, inputId?: string): Promise<UsnOverview>;
   /** Stored change groups with every member and rename event. */
   usnGroupsPage(fullPath: string, options: UsnGroupOptions, offset: number, limit: number): Promise<UsnGroupsPage>;
+  registryHives(fullPath: string): Promise<RegistryHive[]>;
+  /** parentRecordId null: hive roots (or the unresolved bucket). */
+  registryKeys(fullPath: string, hiveId: string, parentRecordId: string | null, unresolved: boolean, offset: number, limit: number): Promise<RegistryRowsPage>;
+  registryValues(fullPath: string, keyRecordId: string, offset: number, limit: number): Promise<RegistryRowsPage>;
+  registryEntry(fullPath: string, recordId: string): Promise<RegistryEntry>;
+  /** Data past the detail cap: `offset`/`length` in hex digits or characters. */
+  registryValueChunk(fullPath: string, recordId: string, field: "hex" | "text", offset: number, length: number): Promise<RegistryValueChunk>;
+  registrySearch(fullPath: string, options: RegistrySearchOptions, cursor: number | null, limit: number): Promise<RegistrySearchPage>;
+  registryQuickAccess(fullPath: string): Promise<RegistryQuickAccess>;
   listColumnValues(fullPath: string, column: string, tableName?: string): Promise<{ value: string; count: number }[]>;
   searchCase(query: string, hosts: { id: string; name: string; dir: string }[], offset: number, limit: number, range?: { start?: string; end?: string }, categories?: string[]): Promise<SearchCasePage>;
   listBookmarks(hostDir: string): Promise<Bookmark[]>;

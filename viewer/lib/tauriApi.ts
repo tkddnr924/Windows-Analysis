@@ -9,6 +9,7 @@ import { listen } from "@tauri-apps/api/event";
 import type {
   AccountDirectoryEntry, Bookmark, BookmarkInput, Case, CategoryEntry, CsvData, DBRow, ElectronApi, Host, HostMetadata, LinkedRowsPage, MftChildrenPage,
   ListCasesResult, CacheMeta, CacheBodyPreview, BrowserVisitGraph, FileReference, PipelineLogEntry, PipelineResult, ResultFileEntry, ResultProvenance, ArtifactInputFile, ParseReport, ParseEligibility, RunHostOptions, SearchCasePage, AiConversation, AiConversationPage, AiConversationDetail, BrowserActivityQuery, BrowserActivitySummary, BrowserActivityInsights, BrowserDomainStatsPage, AccountEventPage, AccountEventQuery, MftRecordBody, MftVolume, OverviewContractStatus, RecordSource, ResultRow, MftRecordsPage, ParseLogPreview, TimelineMeta, TimelineFacets, TimelinePage, TimelineSourcePage, TimelineQuery, UsnGroupsPage, UsnOverview,
+  RegistryEntry, RegistryHive, RegistryRowsPage, RegistryQuickAccess, RegistrySearchPage, RegistryValueChunk,
 } from "./types";
 
 // 저장 계약(docs-01)의 결과 DB는 INTEGER·REAL 컬럼을 쓴다. 화면 코드는 셀을
@@ -98,6 +99,26 @@ function makeApi(): ElectronApi {
           }
         }
         return page;
+      }),
+    registryHives: (fullPath) => invoke<RegistryHive[]>("registry_hives", { fullPath }),
+    registryKeys: (fullPath, hiveId, parentRecordId, unresolved, offset, limit) =>
+      invoke<RegistryRowsPage>("registry_keys", { fullPath, hiveId, parentRecordId, unresolved, offset, limit }).then(table),
+    registryValues: (fullPath, keyRecordId, offset, limit) => invoke<RegistryRowsPage>("registry_values", { fullPath, keyRecordId, offset, limit }).then(table),
+    registryValueChunk: (fullPath, recordId, field, offset, length) => invoke<RegistryValueChunk>("registry_value_chunk", { fullPath, recordId, field, offset, length }),
+    registryEntry: (fullPath, recordId) =>
+      invoke<RegistryEntry>("registry_entry", { fullPath, recordId }).then((result) => {
+        cells(result.entry);
+        cells(result.key);
+        return result;
+      }),
+    registrySearch: (fullPath, options, cursor, limit) => invoke<RegistrySearchPage>("registry_search", { fullPath, options, cursor, limit }),
+    registryQuickAccess: (fullPath) =>
+      invoke<RegistryQuickAccess>("registry_quick_access", { fullPath }).then((result) => {
+        for (const item of result.items) {
+          cells(item.finding);
+          rows(item.targets);
+        }
+        return result;
       }),
     mftRecordsPage: (fullPath, query, offset, limit, options) => invoke<MftRecordsPage>("mft_records_page", { fullPath, query, offset, limit, options: options ?? null }).then(table),
     listColumnValues: (fullPath, column, tableName) =>

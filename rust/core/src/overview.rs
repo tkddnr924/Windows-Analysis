@@ -4497,6 +4497,31 @@ fn rf_execution_traces(hives: &[RegistryOverviewHive]) -> Vec<Row> {
                     ),
                     ("record_key", reg_record_key(r)),
                 ]));
+            } else if low.ends_with("\\software\\bandizip")
+                && name
+                    .strip_prefix("RecentArchive")
+                    .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+            {
+                // Bandizip recent archive list; empty slots are unused.
+                if data.is_empty() {
+                    continue;
+                }
+                rows.push(rf_row(&[
+                    ("category", "기타 레지스트리".into()),
+                    ("subtype", "BandizipRecentArchive".into()),
+                    ("name", "반디집 최근 압축 파일".into()),
+                    ("value", data),
+                    ("status", "정보".into()),
+                    ("detail", name),
+                    ("user", user.clone()),
+                    ("key_path", r.get("key_path").cloned().unwrap_or_default()),
+                    ("source", hive.name.clone()),
+                    (
+                        "timestamp",
+                        r.get("last_write").cloned().unwrap_or_default(),
+                    ),
+                    ("record_key", reg_record_key(r)),
+                ]));
             } else if low.ends_with("\\explorer\\wordwheelquery") {
                 // REG_BINARY UTF-16LE — 탐색기 검색창에 입력한 검색어.
                 let term = utf16le_until_nul(&unhex(&data));
@@ -5379,6 +5404,59 @@ mod tests {
         assert_eq!(
             pending[0].get("record_key").map(String::as_str),
             Some("SYSTEM::Registry::2")
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn bandizip_recent_archives_keep_every_stored_path() {
+        let root = std::env::temp_dir().join(format!(
+            "wina-bandizip-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        ));
+        let registry_dir = root.join("REGISTRY");
+        std::fs::create_dir_all(&registry_dir).unwrap();
+        let conn = Connection::open(registry_dir.join("analyst_NTUSER.DAT.sqlite")).unwrap();
+        conn.execute("CREATE TABLE Registry (key_path TEXT, value_name TEXT, value_data TEXT, last_write TEXT, _recovery TEXT, _source_file TEXT)", []).unwrap();
+        for row in [
+            ("\\ROOT\\SOFTWARE\\Bandizip", "RecentArchive0", "C:\\Users\\a\\Desktop\\out.zip"),
+            ("\\ROOT\\SOFTWARE\\Bandizip", "RecentArchive1", "D:\\x.7z"),
+            ("\\ROOT\\SOFTWARE\\Bandizip", "RecentArchive2", ""),
+            ("\\ROOT\\SOFTWARE\\Bandizip", "RecentFolder0", "C:\\dest\\"),
+            ("\\ROOT\\SOFTWARE\\Bandizip\\Other", "RecentArchive0", "C:\\nested.zip"),
+        ] {
+            conn.execute(
+                "INSERT INTO Registry VALUES (?1, ?2, ?3, '2026-01-01 00:00:00.000', 'live', 'evidence/analyst_NTUSER.DAT')",
+                rusqlite::params![row.0, row.1, row.2],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let registry = RegistryOverviewCache::load(&root);
+        let findings = build_registry_findings_with_registry(&registry);
+        let archives: Vec<_> = findings
+            .iter()
+            .filter(|row| row.get("subtype").map(String::as_str) == Some("BandizipRecentArchive"))
+            .map(|row| {
+                (
+                    row.get("value").cloned().unwrap_or_default(),
+                    row.get("detail").cloned().unwrap_or_default(),
+                    row.get("record_key").cloned().unwrap_or_default(),
+                )
+            })
+            .collect();
+        // Empty slots, other values and other keys stay out; the slot name is kept.
+        assert_eq!(
+            archives,
+            vec![
+                ("C:\\Users\\a\\Desktop\\out.zip".to_string(), "RecentArchive0".to_string(), "analyst_NTUSER.DAT::Registry::1".to_string()),
+                ("D:\\x.7z".to_string(), "RecentArchive1".to_string(), "analyst_NTUSER.DAT::Registry::2".to_string()),
+            ]
         );
         let _ = std::fs::remove_dir_all(root);
     }

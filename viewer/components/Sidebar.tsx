@@ -14,7 +14,7 @@ import FolderOpenOutlinedIcon from "@mui/icons-material/FolderOpenOutlined";
 import DesktopWindowsOutlinedIcon from "@mui/icons-material/DesktopWindowsOutlined";
 import HomeOutlinedIcon from "@mui/icons-material/HomeOutlined";
 import BoltOutlinedIcon from "@mui/icons-material/BoltOutlined";
-import ManageSearchOutlinedIcon from "@mui/icons-material/ManageSearchOutlined";
+import AccountTreeOutlinedIcon from "@mui/icons-material/AccountTreeOutlined";
 import TerminalOutlinedIcon from "@mui/icons-material/TerminalOutlined";
 import DnsOutlinedIcon from "@mui/icons-material/DnsOutlined";
 import CloudDownloadOutlinedIcon from "@mui/icons-material/CloudDownloadOutlined";
@@ -138,7 +138,7 @@ const OVERVIEW_ORDER: string[] = [
   "RemoteDesktopHistory",
   "ExecutionHistory",
   "Defender",
-  "RegistryFindings",
+  "RegistryExplorer",
   "PowerShellHistory",
   "SmbHistory",
   "BitsHistory",
@@ -153,6 +153,7 @@ const OVERVIEW_TABLE_NAMES: Record<string, string> = {
   TargetInfo: "호스트 정보",
   ExecutionHistory: "실행 이력",
   Defender: "Microsoft Defender 활동",
+  RegistryExplorer: "레지스트리",
   RegistryFindings: "레지스트리 특이사항",
   BrowserActivity: "브라우저 활동",
   RemoteDesktopHistory: "원격 접근 이력 (RDP)",
@@ -176,7 +177,7 @@ const ANALYSIS_GROUPS: { title: string; items: string[] }[] = [
   { title: "파일 시스템", items: ["FileSystemEntries", "@USN", "RecycleBin"] },
   { title: "실행 흔적", items: ["ExecutionHistory", "PowerShellHistory", "ServiceHistory", "ScheduledTasks"] },
   { title: "네트워크 · 원격", items: ["RemoteDesktopHistory", "SmbHistory", "BitsHistory", "FirewallHistory", "BrowserActivity", "RdpCache"] },
-  { title: "시스템 · 보안", items: ["RegistryFindings", "Defender", "@WER"] },
+  { title: "시스템 · 보안", items: ["RegistryExplorer", "Defender", "@WER"] },
 ];
 
 function OverviewTableIcon({ name }: { name: string }) {
@@ -192,7 +193,8 @@ function OverviewTableIcon({ name }: { name: string }) {
     case "ExecutionHistory": return <BoltOutlinedIcon {...props} />;
     // Defender 뷰 헤더와 동일한 방패 아이콘.
     case "Defender": return <ShieldOutlinedIcon {...props} />;
-    case "RegistryFindings": return <ManageSearchOutlinedIcon {...props} />;
+    // 레지스트리 뷰 헤더와 같은 글리프.
+    case "RegistryExplorer": return <AccountTreeOutlinedIcon {...props} />;
     case "PowerShellHistory": return <TerminalOutlinedIcon {...props} />;
     case "SmbHistory": return <DnsOutlinedIcon {...props} />;
     case "BitsHistory": return <CloudDownloadOutlinedIcon {...props} />;

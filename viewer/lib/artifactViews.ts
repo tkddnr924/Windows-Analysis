@@ -155,7 +155,7 @@ export interface ArtifactViewSpec {
    * Overview correlations (TargetInfo, ...) read as summaries/dashboards, not
    * spreadsheets, so each gets a purpose-built view.
    */
-  customView?: "targetInfo" | "executionHistory" | "powershellFlow" | "defender" | "registryFindings" | "rdpCache" | "browserHistory" | "smb" | "bits" | "service" | "firewall" | "scheduledTasks" | "wer" | "mft" | "usnJrnl";
+  customView?: "targetInfo" | "executionHistory" | "powershellFlow" | "defender" | "registryExplorer" | "rdpCache" | "browserHistory" | "smb" | "bits" | "service" | "firewall" | "scheduledTasks" | "wer" | "mft" | "usnJrnl";
   /**
    * In the sidebar, present this table split by this column: instead of one
    * row for the whole table, the category lists one entry per distinct value
@@ -1207,8 +1207,19 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     ],
   },
 
+  // 레지스트리 Explorer(_OVERVIEW/RegistryExplorer) — RegistryView가 하이브·키·
+  // 값을 직접 조회한다. 타임라인에는 넣지 않는다(키 마지막 기록 시각은
+  // 사건 시각이 아니다).
+  RegistryExplorer: {
+    customView: "registryExplorer",
+    title: (r) => r.value_display_name || r.key_name || "(레지스트리)",
+    subtitle: (r) => r.key_path || "",
+    sections: [],
+  },
+
+  // 레지스트리 판정 결과 — 전용 뷰는 2026-10-12 삭제(레지스트리 뷰의 퀵 접근으로
+  // 이관). 북마크·검색 상세용 표시 규칙으로 남는다.
   RegistryFindings: {
-    customView: "registryFindings",
     title: (r) => r.name || "(no name)",
     // The overview is intentionally terse: the registry path and status are
     // evidence fields below, while attention-only status appears once at the

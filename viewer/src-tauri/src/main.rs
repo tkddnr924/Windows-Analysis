@@ -4537,6 +4537,626 @@ fn usn_groups_page_blocking(full_path: String, options: UsnGroupOptions, offset:
     Ok(UsnGroupsPage { groups, total })
 }
 
+// ---------------------------------------------------------------------------
+// Registry explorer (docs-06): every stored hive, key and value from
+// _OVERVIEW/RegistryExplorer.sqlite; quick access joins RegistryFindings.
+// ---------------------------------------------------------------------------
+
+const REGISTRY_TABLES: [&str; 3] = ["RegistryHives", "RegistryExplorer", "RegistryQuickTargets"];
+
+fn open_registry_explorer(full_path: &str) -> Result<Connection, String> {
+    let conn = open_ro(full_path)?;
+    let names = table_names(&conn);
+    if let Some(missing) = REGISTRY_TABLES.iter().find(|table| !names.iter().any(|name| name == *table)) {
+        return Err(format!("레지스트리 저장본에 {missing} 테이블이 없습니다. 재파싱이 필요합니다."));
+    }
+    Ok(conn)
+}
+
+fn registry_error(context: &str) -> impl Fn(rusqlite::Error) -> String + '_ {
+    move |error| format!("{context}: {error}")
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RegistryHive {
+    hive_id: String,
+    ordinal: i64,
+    hive_name: String,
+    source_file: Option<String>,
+    inventory_source: String,
+    input_status: Option<String>,
+    load_status: String,
+    load_error: Option<String>,
+    input_error: Option<String>,
+    is_regback: bool,
+    key_count: i64,
+    value_count: i64,
+    root_count: i64,
+    logs_discovered: Option<i64>,
+    logs_applied: Option<i64>,
+    log_error: Option<String>,
+    /// Keys whose parent could not be linked (shown as their own bucket).
+    unresolved_count: i64,
+}
+
+#[tauri::command]
+async fn registry_hives(full_path: String) -> Result<Vec<RegistryHive>, String> {
+    tauri::async_runtime::spawn_blocking(move || registry_hives_blocking(full_path))
+        .await
+        .map_err(|error| format!("레지스트리 조회 작업이 중단되었습니다: {error}"))?
+}
+
+fn registry_hives_blocking(full_path: String) -> Result<Vec<RegistryHive>, String> {
+    let conn = open_registry_explorer(&full_path)?;
+    let read = registry_error("레지스트리 하이브를 읽지 못했습니다");
+    let mut unresolved: HashMap<String, i64> = HashMap::new();
+    {
+        let mut stmt = conn
+            .prepare("SELECT hive_id, COUNT(*) FROM RegistryExplorer WHERE entry_kind = 'key' AND parent_record_id IS NULL AND parent_status = 'unresolved' GROUP BY hive_id")
+            .map_err(&read)?;
+        let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))).map_err(&read)?;
+        for row in rows {
+            let (hive, count) = row.map_err(&read)?;
+            unresolved.insert(hive, count);
+        }
+    }
+    let mut stmt = conn
+        .prepare(
+            "SELECT hive_id, ordinal, hive_name, source_file, inventory_source, input_status, load_status, load_error, input_error,
+                    is_regback, key_count, value_count, root_count, logs_discovered, logs_applied, log_error
+             FROM RegistryHives ORDER BY ordinal",
+        )
+        .map_err(&read)?;
+    let rows = stmt
+        .query_map([], |row| {
+            let hive_id: String = row.get(0)?;
+            Ok(RegistryHive {
+                unresolved_count: unresolved.get(&hive_id).copied().unwrap_or(0),
+                hive_id,
+                ordinal: row.get(1)?,
+                hive_name: row.get(2)?,
+                source_file: row.get(3)?,
+                inventory_source: row.get(4)?,
+                input_status: row.get(5)?,
+                load_status: row.get(6)?,
+                load_error: row.get(7)?,
+                input_error: row.get(8)?,
+                is_regback: row.get::<_, i64>(9)? == 1,
+                key_count: row.get(10)?,
+                value_count: row.get(11)?,
+                root_count: row.get(12)?,
+                logs_discovered: row.get(13)?,
+                logs_applied: row.get(14)?,
+                log_error: row.get(15)?,
+            })
+        })
+        .map_err(&read)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(read)
+}
+
+const REGISTRY_KEY_COLUMNS: &str = "rowid AS __rowid, record_id, hive_id, entry_kind, parent_record_id, parent_status, key_name, key_path, key_depth, key_last_write, key_subkey_count, key_value_count, stored_subkey_count, stored_value_count, key_read_status, key_read_error, key_offset, recovery, source_rowid";
+
+#[derive(Serialize)]
+struct RegistryRowsPage {
+    rows: Vec<Map<String, Value>>,
+    total: i64,
+}
+
+#[tauri::command]
+async fn registry_keys(full_path: String, hive_id: String, parent_record_id: Option<String>, unresolved: bool, offset: i64, limit: i64) -> Result<RegistryRowsPage, String> {
+    tauri::async_runtime::spawn_blocking(move || registry_keys_blocking(full_path, hive_id, parent_record_id, unresolved, offset, limit))
+        .await
+        .map_err(|error| format!("레지스트리 조회 작업이 중단되었습니다: {error}"))?
+}
+
+/// Child keys of one key, the hive roots (no parent) or the keys whose stored
+/// parent link is unresolved — name order (`key_path_lower` under one parent).
+fn registry_keys_blocking(full_path: String, hive_id: String, parent_record_id: Option<String>, unresolved: bool, offset: i64, limit: i64) -> Result<RegistryRowsPage, String> {
+    let conn = open_registry_explorer(&full_path)?;
+    // Large limits serve "reveal": a deep child must be in the loaded window.
+    let limit = limit.clamp(1, 50_000);
+    let offset = offset.max(0);
+    // `+hive_id` keeps the planner on the (parent_record_id, key_path_lower)
+    // index; on hive_id it scans every key of the hive (measured 1.5–3.3 s).
+    let (filter, params): (&str, Vec<&dyn rusqlite::ToSql>) = match (&parent_record_id, unresolved) {
+        (Some(parent), _) => ("entry_kind = 'key' AND parent_record_id = ?1 AND +hive_id = ?2", vec![parent, &hive_id]),
+        (None, true) => ("entry_kind = 'key' AND parent_record_id IS NULL AND parent_status = 'unresolved' AND +hive_id = ?1", vec![&hive_id]),
+        (None, false) => ("entry_kind = 'key' AND parent_record_id IS NULL AND parent_status = 'root' AND +hive_id = ?1", vec![&hive_id]),
+    };
+    let total: i64 = conn
+        .query_row(&format!("SELECT COUNT(*) FROM RegistryExplorer WHERE {filter}"), params.as_slice(), |row| row.get(0))
+        .map_err(registry_error("레지스트리 키 수를 읽지 못했습니다"))?;
+    let mut rows = query_rows(
+        &conn,
+        &format!("SELECT {REGISTRY_KEY_COLUMNS} FROM RegistryExplorer WHERE {filter} ORDER BY key_path_lower, record_id LIMIT {limit} OFFSET {offset}"),
+        params.as_slice(),
+    )?;
+    decorate_source_refs(&conn, Path::new(&full_path), &mut rows)?;
+    Ok(RegistryRowsPage { rows, total })
+}
+
+#[tauri::command]
+async fn registry_values(full_path: String, key_record_id: String, offset: i64, limit: i64) -> Result<RegistryRowsPage, String> {
+    tauri::async_runtime::spawn_blocking(move || registry_values_blocking(full_path, key_record_id, offset, limit))
+        .await
+        .map_err(|error| format!("레지스트리 조회 작업이 중단되었습니다: {error}"))?
+}
+
+/// One page of a key's values with previews. Default value first, then by
+/// name; `total` lets the view page to the last value. Full data comes from
+/// `registry_entry` / `registry_value_chunk`.
+fn registry_values_blocking(full_path: String, key_record_id: String, offset: i64, limit: i64) -> Result<RegistryRowsPage, String> {
+    let conn = open_registry_explorer(&full_path)?;
+    let limit = limit.clamp(1, 5_000);
+    let offset = offset.max(0);
+    let total: i64 = conn
+        .query_row("SELECT COUNT(*) FROM RegistryExplorer WHERE entry_kind = 'value' AND key_record_id = ?1", [&key_record_id], |row| row.get(0))
+        .map_err(registry_error("레지스트리 값 수를 읽지 못했습니다"))?;
+    let mut rows = query_rows(
+        &conn,
+        &format!(
+            "SELECT rowid AS __rowid, record_id, hive_id, entry_kind, key_record_id, value_name, value_is_default, value_display_name,
+                    value_type_code, value_type_code_raw, value_type_name, value_data_length,
+                    substr(value_data_text, 1, 512) AS value_preview, length(value_data_text) AS value_text_length,
+                    substr(value_data_hex, 1, 96) AS value_hex_preview, value_read_status, value_read_error, recovery, source_rowid
+             FROM RegistryExplorer WHERE entry_kind = 'value' AND key_record_id = ?1
+             ORDER BY value_is_default DESC, value_name_lower, source_rowid, record_id LIMIT {limit} OFFSET {offset}"
+        ),
+        &[&key_record_id],
+    )?;
+    decorate_source_refs(&conn, Path::new(&full_path), &mut rows)?;
+    Ok(RegistryRowsPage { rows, total })
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RegistryAncestor {
+    record_id: String,
+    key_name: Option<String>,
+    parent_status: Option<String>,
+    /// Index among the siblings in tree order (children page offset).
+    position: i64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RegistryEntry {
+    entry: Map<String, Value>,
+    key: Map<String, Value>,
+    /// Root → key (inclusive), for revealing the entry in the tree.
+    ancestors: Vec<RegistryAncestor>,
+}
+
+#[tauri::command]
+async fn registry_entry(full_path: String, record_id: String) -> Result<RegistryEntry, String> {
+    tauri::async_runtime::spawn_blocking(move || registry_entry_blocking(full_path, record_id, REGISTRY_ENTRY_TEXT_CAP))
+        .await
+        .map_err(|error| format!("레지스트리 조회 작업이 중단되었습니다: {error}"))?
+}
+
+/// First part of a value's text/hex sent with the detail (largest stored
+/// value: 284,222 bytes); the rest comes through `registry_value_chunk`.
+const REGISTRY_ENTRY_TEXT_CAP: i64 = 4 * 1024 * 1024;
+
+fn registry_entry_blocking(full_path: String, record_id: String, cap: i64) -> Result<RegistryEntry, String> {
+    let conn = open_registry_explorer(&full_path)?;
+    let entry_columns = "rowid AS __rowid, record_id, hive_id, entry_kind, key_record_id, parent_record_id, parent_status, key_offset, parent_key_offset, key_name, key_path, key_depth, key_last_write, key_subkey_count, key_value_count, stored_subkey_count, stored_value_count, key_read_status, key_read_error, value_offset, value_name, value_is_default, value_display_name, value_type_code, value_type_code_raw, value_type_name, value_data_length, value_read_status, value_read_error, recovery, source_rowid";
+    // Hex is cut on a byte boundary; lengths tell how much remains.
+    let hex_cap = (cap - cap % 2).max(2);
+    let fetch = |id: &str| -> Result<Option<Map<String, Value>>, String> {
+        let mut rows = query_rows(
+            &conn,
+            &format!(
+                "SELECT {entry_columns},
+                        substr(value_data_hex, 1, {hex_cap}) AS value_data_hex, length(value_data_hex) AS value_hex_length, length(value_data_hex) > {hex_cap} AS value_hex_truncated,
+                        substr(value_data_text, 1, {cap}) AS value_data_text, length(value_data_text) AS value_text_length, length(value_data_text) > {cap} AS value_text_truncated
+                 FROM RegistryExplorer WHERE record_id = ?1"
+            ),
+            &[&id],
+        )?;
+        Ok(rows.pop())
+    };
+    let mut entry = fetch(&record_id)?.ok_or_else(|| "레지스트리 레코드를 찾지 못했습니다".to_string())?;
+    let mut key = match entry.get("key_record_id").and_then(Value::as_str) {
+        Some(key_id) => fetch(key_id)?.ok_or_else(|| "값이 속한 키를 찾지 못했습니다".to_string())?,
+        None => entry.clone(),
+    };
+    let mut pair = vec![entry.clone(), key.clone()];
+    decorate_source_refs(&conn, Path::new(&full_path), &mut pair)?;
+    key = pair.pop().unwrap_or(key);
+    entry = pair.pop().unwrap_or(entry);
+
+    // Walk parent links up; each step records its position among siblings.
+    let mut ancestors = Vec::new();
+    let mut current = key.get("record_id").and_then(Value::as_str).map(str::to_string);
+    let mut guard = 0;
+    while let Some(id) = current.take() {
+        guard += 1;
+        if guard > 512 {
+            break;
+        }
+        let row = conn
+            .query_row(
+                "SELECT record_id, key_name, parent_record_id, parent_status, hive_id, key_path_lower FROM RegistryExplorer WHERE record_id = ?1 AND entry_kind = 'key'",
+                [&id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, Option<String>>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)?)),
+            )
+            .map_err(registry_error("레지스트리 상위 키를 읽지 못했습니다"))?;
+        let (record, name, parent, status, hive, lower) = row;
+        let position: i64 = match &parent {
+            Some(parent) => conn.query_row(
+                "SELECT COUNT(*) FROM RegistryExplorer WHERE entry_kind = 'key' AND parent_record_id = ?1 AND (key_path_lower < ?2 OR (key_path_lower = ?2 AND record_id < ?3))",
+                rusqlite::params![parent, lower, record],
+                |row| row.get(0),
+            ),
+            None => conn.query_row(
+                "SELECT COUNT(*) FROM RegistryExplorer WHERE entry_kind = 'key' AND parent_record_id IS NULL AND +hive_id = ?1 AND parent_status = ?4 AND (key_path_lower < ?2 OR (key_path_lower = ?2 AND record_id < ?3))",
+                rusqlite::params![hive, lower, record, status.as_deref().unwrap_or("root")],
+                |row| row.get(0),
+            ),
+        }
+        .map_err(registry_error("레지스트리 키 위치를 읽지 못했습니다"))?;
+        ancestors.push(RegistryAncestor { record_id: record, key_name: name, parent_status: status, position });
+        current = parent;
+    }
+    ancestors.reverse();
+    Ok(RegistryEntry { entry, key, ancestors })
+}
+
+#[derive(Serialize)]
+struct RegistryValueChunk {
+    /// Hex digits or text characters from `offset`.
+    data: String,
+    offset: i64,
+    /// Full length of the field (hex digits or characters).
+    total: i64,
+}
+
+#[tauri::command]
+async fn registry_value_chunk(full_path: String, record_id: String, field: String, offset: i64, length: i64) -> Result<RegistryValueChunk, String> {
+    tauri::async_runtime::spawn_blocking(move || registry_value_chunk_blocking(full_path, record_id, field, offset, length))
+        .await
+        .map_err(|error| format!("레지스트리 조회 작업이 중단되었습니다: {error}"))?
+}
+
+/// A slice of a value's stored hex (byte-aligned) or text, so data past the
+/// detail cap is reachable to the last byte / character.
+fn registry_value_chunk_blocking(full_path: String, record_id: String, field: String, offset: i64, length: i64) -> Result<RegistryValueChunk, String> {
+    let conn = open_registry_explorer(&full_path)?;
+    let (column, offset, length) = match field.as_str() {
+        "hex" => ("value_data_hex", offset.max(0) - offset.max(0) % 2, (length.clamp(2, REGISTRY_ENTRY_TEXT_CAP) + 1) / 2 * 2),
+        "text" => ("value_data_text", offset.max(0), length.clamp(1, REGISTRY_ENTRY_TEXT_CAP)),
+        _ => return Err(format!("알 수 없는 값 필드: {field}")),
+    };
+    let (data, total): (Option<String>, Option<i64>) = conn
+        .query_row(
+            &format!("SELECT substr({column}, ?2 + 1, ?3), length({column}) FROM RegistryExplorer WHERE record_id = ?1 AND entry_kind = 'value'"),
+            rusqlite::params![record_id, offset, length],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(registry_error("레지스트리 값 데이터를 읽지 못했습니다"))?;
+    Ok(RegistryValueChunk { data: data.unwrap_or_default(), offset, total: total.unwrap_or(0) })
+}
+
+#[derive(Deserialize, Default, Clone)]
+#[serde(rename_all = "camelCase", default)]
+struct RegistrySearchOptions {
+    query: String,
+    /// Limit to one hive.
+    hive_id: Option<String>,
+    /// Limit to this key and its descendants (its hive implied).
+    key_record_id: Option<String>,
+    /// Fields; each defaults to on.
+    keys: Option<bool>,
+    value_names: Option<bool>,
+    value_data: Option<bool>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RegistrySearchHit {
+    record_id: String,
+    rowid: i64,
+    entry_kind: String,
+    hive_id: String,
+    /// The key itself, or the key holding the value.
+    key_record_id: String,
+    key_path: Option<String>,
+    value_name: Option<String>,
+    value_display_name: Option<String>,
+    value_type_name: Option<String>,
+    /// "key" | "value_name" | "value_data" | "value_hex".
+    fields: Vec<String>,
+    snippet: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RegistrySearchPage {
+    hits: Vec<RegistrySearchHit>,
+    /// Resume after this rowid; None = the scope was scanned to the end.
+    next_cursor: Option<i64>,
+    scanned_to: i64,
+    range_start: i64,
+    range_end: i64,
+}
+
+#[tauri::command]
+async fn registry_search(full_path: String, options: RegistrySearchOptions, cursor: Option<i64>, limit: i64) -> Result<RegistrySearchPage, String> {
+    // ~150k rows per call: progress every second or so on 2.6M rows.
+    tauri::async_runtime::spawn_blocking(move || registry_search_blocking(full_path, options, cursor, limit, 150_000))
+        .await
+        .map_err(|error| format!("레지스트리 검색 작업이 중단되었습니다: {error}"))?
+}
+
+/// Hex digits of a query that reads as bytes ("4D 5A 90"), lowercase.
+fn registry_hex_query(query: &str) -> Option<String> {
+    let compact: String = query.chars().filter(|c| !c.is_whitespace()).collect();
+    (compact.len() >= 4 && compact.len() % 2 == 0 && compact.chars().all(|c| c.is_ascii_hexdigit())).then(|| compact.to_ascii_lowercase())
+}
+
+/// First occurrence of `needle` at a byte (even nibble) boundary.
+fn aligned_hex_find(hex: &str, needle: &str) -> Option<usize> {
+    let mut from = 0;
+    while let Some(found) = hex[from..].find(needle) {
+        let at = from + found;
+        if at % 2 == 0 {
+            return Some(at);
+        }
+        from = at + 1;
+    }
+    None
+}
+
+/// Text around a char range, cut on char boundaries.
+fn registry_snippet(text: &str, start: usize, len: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let begin = start.saturating_sub(40);
+    let end = (start + len + 40).min(chars.len());
+    let mut out = String::new();
+    if begin > 0 {
+        out.push('…');
+    }
+    out.extend(&chars[begin..end]);
+    if end < chars.len() {
+        out.push('…');
+    }
+    out
+}
+
+/// Search the whole store (or one hive / key subtree) in rowid order. Each call
+/// scans at most `budget` rows and stops at `limit` hits, so a rare term over
+/// 2.6M rows streams in steps instead of blocking; `next_cursor` resumes.
+fn registry_search_blocking(full_path: String, options: RegistrySearchOptions, cursor: Option<i64>, limit: i64, budget: i64) -> Result<RegistrySearchPage, String> {
+    let conn = open_registry_explorer(&full_path)?;
+    let read = registry_error("레지스트리를 검색하지 못했습니다");
+    let query = options.query.trim().to_string();
+    let limit = limit.clamp(1, 500) as usize;
+    let empty = |start: i64, end: i64| RegistrySearchPage { hits: Vec::new(), next_cursor: None, scanned_to: end, range_start: start, range_end: end };
+    if query.is_empty() {
+        return Ok(empty(0, 0));
+    }
+    let lower = query.to_lowercase();
+    let hex = registry_hex_query(&query);
+    let (want_keys, want_names, want_data) = (options.keys.unwrap_or(true), options.value_names.unwrap_or(true), options.value_data.unwrap_or(true));
+
+    // Scope: a key subtree implies its hive.
+    let subtree: Option<(String, String)> = match options.key_record_id.as_deref().filter(|id| !id.is_empty()) {
+        Some(id) => Some(
+            conn.query_row("SELECT hive_id, key_path_lower FROM RegistryExplorer WHERE record_id = ?1 AND entry_kind = 'key'", [id], |row| Ok((row.get(0)?, row.get(1)?)))
+                .map_err(registry_error("검색 범위 키를 찾지 못했습니다"))?,
+        ),
+        None => None,
+    };
+    let hive = subtree.as_ref().map(|(hive, _)| hive.clone()).or(options.hive_id.clone().filter(|id| !id.is_empty()));
+    // Rows of one hive are contiguous in rowid; bound the scan to them.
+    let (range_start, range_end): (i64, i64) = match &hive {
+        Some(hive) => {
+            let bound = |sql: &str| -> Result<(Option<i64>, Option<i64>), String> { conn.query_row(sql, [hive], |row| Ok((row.get(0)?, row.get(1)?))).map_err(&read) };
+            let (key_min, key_max) = bound("SELECT min(rowid), max(rowid) FROM RegistryExplorer WHERE entry_kind = 'key' AND hive_id = ?1")?;
+            let (value_min, value_max) = bound("SELECT min(rowid), max(rowid) FROM RegistryExplorer WHERE entry_kind = 'value' AND hive_id = ?1")?;
+            match (key_min.into_iter().chain(value_min).min(), key_max.into_iter().chain(value_max).max()) {
+                (Some(start), Some(end)) => (start, end),
+                _ => return Ok(empty(0, 0)),
+            }
+        }
+        None => {
+            let (start, end): (Option<i64>, Option<i64>) = conn.query_row("SELECT min(rowid), max(rowid) FROM RegistryExplorer", [], |row| Ok((row.get(0)?, row.get(1)?))).map_err(&read)?;
+            match (start, end) {
+                (Some(start), Some(end)) => (start, end),
+                _ => return Ok(empty(0, 0)),
+            }
+        }
+    };
+
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(0i64), Box::new(0i64)];
+    let mut ors = Vec::new();
+    params.push(Box::new(like_contains(&lower)));
+    let lower_index = params.len();
+    if want_keys {
+        ors.push(format!("(r.entry_kind = 'key' AND r.key_path_lower LIKE ?{lower_index} ESCAPE '\\')"));
+    }
+    if want_names {
+        ors.push(format!("(r.entry_kind = 'value' AND r.value_name_lower LIKE ?{lower_index} ESCAPE '\\')"));
+    }
+    if want_data {
+        params.push(Box::new(like_contains(&query)));
+        let mut data = format!("r.value_data_text LIKE ?{} ESCAPE '\\'", params.len());
+        if let Some(hex) = &hex {
+            params.push(Box::new(like_contains(hex)));
+            data.push_str(&format!(" OR r.value_data_hex LIKE ?{} ESCAPE '\\'", params.len()));
+        }
+        ors.push(format!("(r.entry_kind = 'value' AND ({data}))"));
+    }
+    if ors.is_empty() {
+        return Ok(empty(range_start, range_end));
+    }
+    let mut clauses = vec![format!("({})", ors.join(" OR "))];
+    if let Some(hive) = &hive {
+        params.push(Box::new(hive.clone()));
+        clauses.push(format!("r.hive_id = ?{}", params.len()));
+    }
+    if let Some((_, prefix)) = &subtree {
+        let escaped = prefix.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+        params.push(Box::new(prefix.clone()));
+        let exact = params.len();
+        params.push(Box::new(format!("{escaped}\\\\%")));
+        let below = params.len();
+        let path = "(CASE WHEN r.entry_kind = 'key' THEN r.key_path_lower ELSE (SELECT k.key_path_lower FROM RegistryExplorer k WHERE k.record_id = r.key_record_id) END)";
+        clauses.push(format!("({path} = ?{exact} OR {path} LIKE ?{below} ESCAPE '\\')"));
+    }
+    let hex_column = if hex.is_some() { "r.value_data_hex" } else { "NULL" };
+    let sql = format!(
+        "SELECT r.rowid, r.record_id, r.entry_kind, r.hive_id, r.key_record_id, r.key_path, r.key_path_lower, r.value_name, r.value_name_lower,
+                r.value_display_name, r.value_type_name, r.value_data_text, {hex_column}
+         FROM RegistryExplorer r WHERE r.rowid > ?1 AND r.rowid <= ?2 AND {} ORDER BY r.rowid LIMIT {{limit}}",
+        clauses.join(" AND ")
+    );
+
+    const CHUNK: i64 = 50_000;
+    let mut cursor = cursor.unwrap_or(range_start - 1).max(range_start - 1);
+    let start_cursor = cursor;
+    let mut hits: Vec<RegistrySearchHit> = Vec::new();
+    while cursor < range_end && hits.len() < limit && cursor - start_cursor < budget {
+        let chunk_end = (cursor + CHUNK).min(range_end);
+        let remaining = limit - hits.len();
+        params[0] = Box::new(cursor);
+        params[1] = Box::new(chunk_end);
+        let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|value| value.as_ref()).collect();
+        let mut stmt = conn.prepare(&sql.replace("{limit}", &remaining.to_string())).map_err(&read)?;
+        let rows = stmt
+            .query_map(refs.as_slice(), |row| {
+                Ok((
+                    row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?, row.get::<_, Option<String>>(6)?, row.get::<_, Option<String>>(7)?, row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<String>>(9)?, row.get::<_, Option<String>>(10)?, row.get::<_, Option<String>>(11)?, row.get::<_, Option<String>>(12)?,
+                ))
+            })
+            .map_err(&read)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(&read)?;
+        let returned = rows.len();
+        let last_rowid = rows.last().map(|row| row.0);
+        for (rowid, record_id, kind, hive_id, key_record_id, key_path, key_lower, value_name, name_lower, display, type_name, text, hex_value) in rows {
+            let mut fields = Vec::new();
+            let mut snippet = None;
+            if want_keys && kind == "key" && key_lower.as_deref().is_some_and(|path| path.contains(&lower)) {
+                fields.push("key".to_string());
+            }
+            if want_names && kind == "value" && name_lower.as_deref().is_some_and(|name| name.contains(&lower)) {
+                fields.push("value_name".to_string());
+            }
+            if want_data && kind == "value" {
+                if let Some(text) = text.as_deref() {
+                    let folded = text.to_lowercase();
+                    if let Some(at) = folded.find(&lower) {
+                        fields.push("value_data".to_string());
+                        let char_at = folded[..at].chars().count();
+                        snippet = Some(registry_snippet(text, char_at, lower.chars().count()));
+                    }
+                }
+                if let (Some(needle), Some(hex_value)) = (&hex, hex_value.as_deref()) {
+                    if let Some(at) = aligned_hex_find(hex_value, needle) {
+                        fields.push("value_hex".to_string());
+                        if snippet.is_none() {
+                            let begin = at.saturating_sub(32);
+                            let end = (at + needle.len() + 32).min(hex_value.len());
+                            snippet = Some(format!("{}{}{}", if begin > 0 { "…" } else { "" }, &hex_value[begin - begin % 2..end], if end < hex_value.len() { "…" } else { "" }));
+                        }
+                    }
+                }
+            }
+            if fields.is_empty() {
+                continue; // e.g. a hex hit off the byte boundary
+            }
+            hits.push(RegistrySearchHit {
+                key_record_id: if kind == "key" { record_id.clone() } else { key_record_id.unwrap_or_default() },
+                record_id,
+                rowid,
+                entry_kind: kind,
+                hive_id,
+                key_path,
+                value_name,
+                value_display_name: display,
+                value_type_name: type_name,
+                fields,
+                snippet,
+            });
+        }
+        cursor = if returned == remaining { last_rowid.unwrap_or(chunk_end) } else { chunk_end };
+    }
+
+    // Key paths of value hits, in one lookup.
+    let missing: Vec<String> = hits.iter().filter(|hit| hit.key_path.is_none()).map(|hit| hit.key_record_id.clone()).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+    if !missing.is_empty() {
+        let list = (1..=missing.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(", ");
+        let refs: Vec<&dyn rusqlite::ToSql> = missing.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+        let mut stmt = conn.prepare(&format!("SELECT record_id, key_path FROM RegistryExplorer WHERE record_id IN ({list})")).map_err(&read)?;
+        let paths: HashMap<String, Option<String>> = stmt
+            .query_map(refs.as_slice(), |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)))
+            .map_err(&read)?
+            .collect::<Result<_, _>>()
+            .map_err(&read)?;
+        for hit in hits.iter_mut().filter(|hit| hit.key_path.is_none()) {
+            hit.key_path = paths.get(&hit.key_record_id).cloned().flatten();
+        }
+    }
+    Ok(RegistrySearchPage { hits, next_cursor: (cursor < range_end).then_some(cursor), scanned_to: cursor, range_start, range_end })
+}
+
+#[derive(Serialize)]
+struct RegistryQuickItem {
+    finding: Map<String, Value>,
+    targets: Vec<Map<String, Value>>,
+}
+
+#[derive(Serialize)]
+struct RegistryQuickAccess {
+    /// False when RegistryFindings.sqlite is not in the same _OVERVIEW.
+    available: bool,
+    items: Vec<RegistryQuickItem>,
+}
+
+#[tauri::command]
+async fn registry_quick_access(full_path: String) -> Result<RegistryQuickAccess, String> {
+    tauri::async_runtime::spawn_blocking(move || registry_quick_access_blocking(full_path))
+        .await
+        .map_err(|error| format!("레지스트리 조회 작업이 중단되었습니다: {error}"))?
+}
+
+/// Stored findings (RegistryFindings) with their stored explorer targets
+/// (RegistryQuickTargets). Independent of evidence bookmarks; parser notes
+/// (`detail`, `properties`) are not sent.
+fn registry_quick_access_blocking(full_path: String) -> Result<RegistryQuickAccess, String> {
+    let conn = open_registry_explorer(&full_path)?;
+    let findings_path = Path::new(&full_path).with_file_name("RegistryFindings.sqlite");
+    if !findings_path.is_file() {
+        return Ok(RegistryQuickAccess { available: false, items: Vec::new() });
+    }
+    let findings = open_ro(&findings_path.to_string_lossy())?;
+    let rows = query_rows(
+        &findings,
+        "SELECT record_id, category, subtype, name, substr(value, 1, 400) AS value, value_type, status, key_path, source, account, account_sid, timestamp, timestamp_kind
+         FROM RegistryFindings ORDER BY rowid",
+        &[],
+    )?;
+    let mut targets: HashMap<String, Vec<Map<String, Value>>> = HashMap::new();
+    for target in query_rows(&conn, "SELECT * FROM RegistryQuickTargets ORDER BY finding_record_id, ordinal", &[])? {
+        if let Some(id) = target.get("finding_record_id").and_then(Value::as_str).map(str::to_string) {
+            targets.entry(id).or_default().push(target);
+        }
+    }
+    let items = rows
+        .into_iter()
+        .map(|finding| {
+            let id = finding.get("record_id").and_then(Value::as_str).unwrap_or_default().to_string();
+            RegistryQuickItem { targets: targets.remove(&id).unwrap_or_default(), finding }
+        })
+        .collect();
+    Ok(RegistryQuickAccess { available: true, items })
+}
+
 /// Recursive list filters (docs-04 §3). All optional; unknown keys fall back
 /// to the default whitelist entry.
 #[derive(Deserialize, Default)]
@@ -4974,6 +5594,10 @@ fn contract_row_record_id(row: &Map<String, Value>) -> Option<String> {
             .map(str::to_string)
     };
     if row.contains_key("overview_name") {
+        return text("record_id");
+    }
+    // RegistryExplorer keys/values carry no overview_name column.
+    if row.contains_key("entry_kind") && row.contains_key("hive_id") {
         return text("record_id");
     }
     if row.contains_key("host_id") && row.contains_key("dataset_id") {
@@ -10268,6 +10892,217 @@ mod overview_contract_tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// docs-06 RegistryExplorer: SOFTWARE and its RegBack copy (same paths),
+    /// a hive that was not parsed, a sibling key sharing a name prefix, an
+    /// empty key, an unresolved-parent key and values of several kinds.
+    fn write_registry_explorer(overview: &Path) -> PathBuf {
+        let path = overview.join("RegistryExplorer.sqlite");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE RegistryHives (hive_id TEXT PRIMARY KEY, ordinal INTEGER, host_id TEXT, dataset_id TEXT, hive_name TEXT, source_file TEXT, facts_db TEXT, facts_dataset_id TEXT, inventory_source TEXT, input_status TEXT, load_status TEXT, load_error TEXT, input_error TEXT, facts_row_count INTEGER, logs_discovered INTEGER, logs_applied INTEGER, log_error TEXT, is_regback INTEGER, key_count INTEGER, value_count INTEGER, root_count INTEGER);
+             CREATE TABLE RegistryExplorer (record_id TEXT PRIMARY KEY, host_id TEXT, dataset_id TEXT, hive_id TEXT, entry_kind TEXT, key_record_id TEXT, parent_record_id TEXT, parent_status TEXT, key_offset TEXT, parent_key_offset TEXT, key_name TEXT, key_path TEXT, key_path_lower TEXT, key_depth INTEGER, key_last_write TEXT, key_subkey_count INTEGER, key_value_count INTEGER, stored_subkey_count INTEGER, stored_value_count INTEGER, key_read_status TEXT, key_read_error TEXT, value_offset TEXT, value_name TEXT, value_name_lower TEXT, value_is_default INTEGER, value_display_name TEXT, value_type_code INTEGER, value_type_code_raw TEXT, value_type_name TEXT, value_data BLOB, value_data_hex TEXT, value_data_length INTEGER, value_data_text TEXT, value_read_status TEXT, value_read_error TEXT, recovery TEXT, source_rowid INTEGER);
+             CREATE TABLE RegistryQuickTargets (finding_record_id TEXT, ordinal INTEGER, resolution TEXT, basis TEXT, target_record_id TEXT, target_kind TEXT, target_key_path TEXT, hive_id TEXT, finding_source_db TEXT, finding_source_rowid INTEGER, finding_hive_name TEXT, finding_key_path TEXT, candidate_count INTEGER);
+             CREATE TABLE source_records (record_id TEXT NOT NULL, ordinal INTEGER NOT NULL, source_dataset_id TEXT NOT NULL, source_artifact TEXT NOT NULL, source_db TEXT NOT NULL, source_table TEXT NOT NULL, source_rowid INTEGER NOT NULL, source_field TEXT, source_record_key TEXT, source_file TEXT, source_label TEXT);
+             INSERT INTO RegistryHives VALUES
+               ('h0', 0, 'h', 'd', 'SOFTWARE', 'C/config/SOFTWARE', 'REGISTRY/SOFTWARE.sqlite', 'f', 'manifest', 'completed', 'loaded', NULL, NULL, 10, 2, 2, NULL, 0, 6, 6, 1),
+               ('h1', 1, 'h', 'd', 'SOFTWARE', 'C/config/RegBack/SOFTWARE', 'REGISTRY/SOFTWARE_RegBack.sqlite', 'f', 'manifest', 'completed', 'loaded', NULL, NULL, 4, 0, 0, NULL, 1, 3, 1, 1),
+               ('h2', 2, 'h', 'd', 'NTUSER.DAT', 'C/Users/x/NTUSER.DAT', NULL, NULL, 'manifest', 'failed', 'not_parsed', NULL, 'bad header', NULL, NULL, NULL, NULL, 0, 0, 0, 0);",
+        )
+        .unwrap();
+        let key = |id: &str, hive: &str, parent: Option<&str>, status: &str, name: &str, path_value: &str, depth: i64, subkeys: i64, values: i64| {
+            conn.execute(
+                "INSERT INTO RegistryExplorer (record_id, host_id, dataset_id, hive_id, entry_kind, parent_record_id, parent_status, key_offset, key_name, key_path, key_path_lower, key_depth, key_last_write, key_subkey_count, key_value_count, stored_subkey_count, stored_value_count, key_read_status, recovery, source_rowid)
+                 VALUES (?1, 'h', 'd', ?2, 'key', ?3, ?4, '4096', ?5, ?6, lower(?6), ?7, '2026-04-27 13:10:15.030', ?8, ?9, ?8, ?9, 'ok', 'live', 1)",
+                rusqlite::params![id, hive, parent, status, name, path_value, depth, subkeys, values],
+            )
+            .unwrap();
+        };
+        let value = |id: &str, hive: &str, key_id: &str, name: &str, type_name: &str, hex: &str, text: Option<&str>, status: &str, source: i64| {
+            conn.execute(
+                "INSERT INTO RegistryExplorer (record_id, host_id, dataset_id, hive_id, entry_kind, key_record_id, value_name, value_name_lower, value_is_default, value_display_name, value_type_name, value_data_hex, value_data_length, value_data_text, value_read_status, recovery, source_rowid)
+                 VALUES (?1, 'h', 'd', ?2, 'value', ?3, ?4, lower(?4), ?4 = '', CASE WHEN ?4 = '' THEN '(default)' ELSE ?4 END, ?5, ?6, length(?6) / 2, ?7, ?8, 'live', ?9)",
+                rusqlite::params![id, hive, key_id, name, type_name, hex, text, status, source],
+            )
+            .unwrap();
+        };
+        key("h0:k:1", "h0", None, "root", "ROOT", "\\ROOT", 0, 2, 0);
+        key("h0:k:2", "h0", Some("h0:k:1"), "linked", "Microsoft", "\\ROOT\\Microsoft", 1, 2, 0);
+        key("h0:k:3", "h0", Some("h0:k:2"), "linked", "Run", "\\ROOT\\Microsoft\\Run", 2, 0, 5);
+        key("h0:k:4", "h0", Some("h0:k:2"), "linked", "Run_old", "\\ROOT\\Microsoft\\Run_old", 2, 0, 1);
+        key("h0:k:5", "h0", Some("h0:k:1"), "linked", "Empty", "\\ROOT\\Empty", 1, 0, 0);
+        key("h0:k:6", "h0", None, "unresolved", "Lost", "\\ROOT\\Lost", 1, 0, 0);
+        value("h0:v:1", "h0", "h0:k:3", "", "REG_SZ", "43003a005c006500760069006c002e00650078006500", Some("C:\\evil.exe"), "ok", 1);
+        value("h0:v:2", "h0", "h0:k:3", "Updater", "REG_SZ", "43003a00", Some("C:\\tools\\updater.exe -s"), "ok", 2);
+        value("h0:v:3", "h0", "h0:k:4", "Legacy", "REG_SZ", "43003a00", Some("C:\\evil.exe"), "ok", 3);
+        value("h0:v:4", "h0", "h0:k:3", "Blob", "REG_BINARY", "4d5a9000", None, "ok", 4);
+        value("h0:v:5", "h0", "h0:k:3", "Odd", "REG_BINARY", "04d5a900", None, "ok", 5);
+        value("h0:v:6", "h0", "h0:k:3", "Nothing", "REG_NONE", "", None, "empty", 6);
+        key("h1:k:1", "h1", None, "root", "ROOT", "\\ROOT", 0, 1, 0);
+        key("h1:k:2", "h1", Some("h1:k:1"), "linked", "Microsoft", "\\ROOT\\Microsoft", 1, 1, 0);
+        key("h1:k:3", "h1", Some("h1:k:2"), "linked", "Run", "\\ROOT\\Microsoft\\Run", 2, 0, 1);
+        value("h1:v:1", "h1", "h1:k:3", "Updater", "REG_SZ", "43003a00", Some("C:\\tools\\updater.exe -s"), "ok", 1);
+        conn.execute_batch(
+            "INSERT INTO RegistryQuickTargets VALUES
+               ('f1', 0, 'exact_value', 'source_records', 'h0:v:2', 'value', NULL, 'h0', 'REGISTRY/SOFTWARE.sqlite', 2, 'SOFTWARE', '\\ROOT\\Microsoft\\Run', 1),
+               ('f2', 0, 'parent_key', 'key_path', 'h0:k:3', 'key', '\\ROOT\\Microsoft\\Run', 'h0', NULL, NULL, 'SOFTWARE', '\\ROOT\\Microsoft\\Run', 1),
+               ('f3', 0, 'missing_hive', 'key_path', NULL, NULL, NULL, NULL, NULL, NULL, 'NTUSER.DAT', '\\ROOT\\Software\\RunMRU', 0);
+             INSERT INTO source_records VALUES ('h0:v:2', 0, 'f', 'Registry', 'REGISTRY/SOFTWARE.sqlite', 'Registry', 2, 'value', NULL, NULL, NULL);",
+        )
+        .unwrap();
+        let findings = Connection::open(overview.join("RegistryFindings.sqlite")).unwrap();
+        findings
+            .execute_batch(
+                "CREATE TABLE RegistryFindings (record_id TEXT PRIMARY KEY, host_id TEXT, dataset_id TEXT, timestamp TEXT, overview_name TEXT, account TEXT, account_sid TEXT, timestamp_kind TEXT, event_type TEXT, description TEXT, category TEXT, name TEXT, value TEXT, value_type TEXT, status TEXT, detail TEXT, key_path TEXT, source TEXT, command TEXT, command_resolved TEXT, subtype TEXT, properties TEXT);
+                 INSERT INTO RegistryFindings (record_id, host_id, dataset_id, timestamp, overview_name, timestamp_kind, category, name, value, status, detail, key_path, source, subtype) VALUES
+                   ('f1', 'h', 'd', '2026-04-27 13:10:15.030', 'RegistryFindings', '키 기록 시각', '자동 실행', 'Updater', 'C:\\tools\\updater.exe -s', '주의', 'parser note', '\\ROOT\\Microsoft\\Run', 'SOFTWARE', NULL),
+                   ('f2', 'h', 'd', NULL, 'RegistryFindings', NULL, '자격 증명 보호', 'UseLogonCredential', '미설정', '정보', 'parser note', '\\ROOT\\Microsoft\\Run', 'SOFTWARE', NULL),
+                   ('f3', 'h', 'd', NULL, 'RegistryFindings', NULL, '기타 레지스트리', 'a', 'cmd.exe', '정보', 'parser note', '\\ROOT\\Software\\RunMRU', 'NTUSER.DAT', 'RunMRU');",
+            )
+            .unwrap();
+        path
+    }
+
+    #[test]
+    fn registry_explorer_reads_every_hive_key_and_value_from_overview() {
+        let root = temp_root("registry");
+        let overview = root.join("_OVERVIEW");
+        std::fs::create_dir_all(&overview).unwrap();
+        let full = write_registry_explorer(&overview).to_string_lossy().to_string();
+        let text = |row: &Map<String, Value>, key: &str| row.get(key).and_then(Value::as_str).unwrap_or_default().to_string();
+
+        // Every stored hive in order, RegBack and unparsed inputs included.
+        let hives = registry_hives_blocking(full.clone()).unwrap();
+        assert_eq!(hives.iter().map(|h| (h.hive_id.as_str(), h.is_regback, h.load_status.as_str())).collect::<Vec<_>>(), vec![("h0", false, "loaded"), ("h1", true, "loaded"), ("h2", false, "not_parsed")]);
+        assert_eq!(hives[0].unresolved_count, 1);
+
+        // Roots, ordered children with paging, empty keys, unresolved bucket.
+        let names = |page: &RegistryRowsPage| page.rows.iter().map(|r| text(r, "key_name")).collect::<Vec<_>>();
+        let roots = registry_keys_blocking(full.clone(), "h0".into(), None, false, 0, 100).unwrap();
+        assert_eq!((names(&roots), roots.total), (vec!["ROOT".to_string()], 1));
+        let children = registry_keys_blocking(full.clone(), "h0".into(), Some("h0:k:1".into()), false, 0, 100).unwrap();
+        assert_eq!(names(&children), vec!["Empty", "Microsoft"]);
+        let second = registry_keys_blocking(full.clone(), "h0".into(), Some("h0:k:1".into()), false, 1, 1).unwrap();
+        assert_eq!((names(&second), second.total), (vec!["Microsoft".to_string()], 2));
+        assert!(children.rows[0].get("__rowid").is_some());
+        let lost = registry_keys_blocking(full.clone(), "h0".into(), None, true, 0, 100).unwrap();
+        assert_eq!(names(&lost), vec!["Lost"]);
+
+        // Values: default first, then by name; empty data stays distinct.
+        let values = registry_values_blocking(full.clone(), "h0:k:3".into(), 0, 100).unwrap();
+        assert_eq!(values.total, 5);
+        assert_eq!(values.rows.iter().map(|v| text(v, "value_name")).collect::<Vec<_>>(), vec!["", "Blob", "Nothing", "Odd", "Updater"]);
+        assert_eq!(text(&values.rows[2], "value_read_status"), "empty");
+        assert_eq!(text(&values.rows[0], "value_preview"), "C:\\evil.exe");
+
+        // A value's detail carries its key and the ancestor chain with the
+        // position of each step among its siblings (to reveal it in the tree).
+        let entry = registry_entry_blocking(full.clone(), "h0:v:2".into(), REGISTRY_ENTRY_TEXT_CAP).unwrap();
+        assert_eq!(text(&entry.key, "record_id"), "h0:k:3");
+        assert_eq!(entry.ancestors.iter().map(|a| (a.key_name.as_deref().unwrap_or(""), a.position)).collect::<Vec<_>>(), vec![("ROOT", 0), ("Microsoft", 1), ("Run", 0)]);
+        assert_eq!(text(&entry.entry, "value_data_text"), "C:\\tools\\updater.exe -s");
+
+        // Search: whole store by rowid cursor; hives stay apart.
+        let search = |query: &str, options: RegistrySearchOptions| {
+            let mut hits = Vec::new();
+            let mut cursor = None;
+            loop {
+                let page = registry_search_blocking(full.clone(), RegistrySearchOptions { query: query.into(), ..options.clone() }, cursor, 1, 1_000_000).unwrap();
+                hits.extend(page.hits.into_iter().map(|h| (h.record_id, h.fields.join(","))));
+                match page.next_cursor { Some(next) => cursor = Some(next), None => break }
+            }
+            hits
+        };
+        let all = RegistrySearchOptions::default();
+        assert_eq!(search("EVIL.exe", all.clone()), vec![("h0:v:1".to_string(), "value_data".to_string()), ("h0:v:3".into(), "value_data".into())]);
+        assert_eq!(search("updater", all.clone()).iter().map(|h| h.0.as_str()).collect::<Vec<_>>(), vec!["h0:v:2", "h1:v:1"]);
+        assert_eq!(search("updater", RegistrySearchOptions { hive_id: Some("h1".into()), ..all.clone() }).iter().map(|h| h.0.as_str()).collect::<Vec<_>>(), vec!["h1:v:1"]);
+        // Subtree of Run: its own value only, never the Run_old sibling.
+        assert_eq!(search("evil", RegistrySearchOptions { hive_id: Some("h0".into()), key_record_id: Some("h0:k:3".into()), ..all.clone() }).iter().map(|h| h.0.as_str()).collect::<Vec<_>>(), vec!["h0:v:1"]);
+        // Field selection: key paths only.
+        let keys_only = RegistrySearchOptions { hive_id: Some("h0".into()), value_names: Some(false), value_data: Some(false), ..all.clone() };
+        assert_eq!(search("run", keys_only), vec![("h0:k:3".to_string(), "key".to_string()), ("h0:k:4".into(), "key".into())]);
+        // Hex matches on byte boundaries only (Odd holds 4d5a90 at nibble 1).
+        assert_eq!(search("4D 5A 90", all.clone()), vec![("h0:v:4".to_string(), "value_hex".to_string())]);
+        assert!(search("evil_exe", all.clone()).is_empty(), "LIKE metacharacters are literal");
+        // A hit reports where it lives.
+        let first = registry_search_blocking(full.clone(), RegistrySearchOptions { query: "evil".into(), ..all.clone() }, None, 10, 1_000_000).unwrap();
+        assert_eq!((first.hits[0].key_path.as_deref(), first.next_cursor), (Some("\\ROOT\\Microsoft\\Run"), None));
+        assert!(first.hits[0].snippet.as_deref().unwrap_or("").contains("evil.exe"));
+
+        // Quick access: stored findings with their stored targets; a missing
+        // hive keeps no target. Parser notes are not sent.
+        let quick = registry_quick_access_blocking(full.clone()).unwrap();
+        assert!(quick.available);
+        assert_eq!(quick.items.iter().map(|i| text(&i.finding, "record_id")).collect::<Vec<_>>(), vec!["f1", "f2", "f3"]);
+        assert_eq!(text(&quick.items[0].targets[0], "target_record_id"), "h0:v:2");
+        assert_eq!(text(&quick.items[2].targets[0], "resolution"), "missing_hive");
+        assert!(quick.items[0].finding.get("detail").is_none());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn registry_values_and_value_data_reach_the_last_item_past_every_limit() {
+        let root = temp_root("registry-limits");
+        let overview = root.join("_OVERVIEW");
+        std::fs::create_dir_all(&overview).unwrap();
+        let full = write_registry_explorer(&overview).to_string_lossy().to_string();
+        {
+            let mut conn = Connection::open(&full).unwrap();
+            let tx = conn.transaction().unwrap();
+            {
+                let mut insert = tx
+                    .prepare("INSERT INTO RegistryExplorer (record_id, host_id, dataset_id, hive_id, entry_kind, key_record_id, value_name, value_name_lower, value_is_default, value_display_name, value_type_name, value_data_hex, value_data_length, value_data_text, value_read_status, recovery, source_rowid) VALUES (?1, 'h', 'd', 'h0', 'value', 'h0:k:5', ?2, ?2, 0, ?2, 'REG_SZ', '00', 1, 'x', 'ok', 'live', ?3)")
+                    .unwrap();
+                for index in 0..20_001 {
+                    insert.execute(rusqlite::params![format!("h0:v:many{index}"), format!("v{index:05}"), 100 + index]).unwrap();
+                }
+            }
+            tx.execute(
+                "INSERT INTO RegistryExplorer (record_id, host_id, dataset_id, hive_id, entry_kind, key_record_id, value_name, value_name_lower, value_is_default, value_display_name, value_type_name, value_data_hex, value_data_length, value_data_text, value_read_status, recovery, source_rowid)
+                 VALUES ('h0:v:long', 'h', 'd', 'h0', 'value', 'h0:k:4', 'Long', 'long', 0, 'Long', 'REG_SZ', '00112233445566778899', 10, 'abcdefghijklmnop', 'ok', 'live', 99)",
+                [],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+
+        // Every value of a key with more than one page, to the last one.
+        let mut names = Vec::new();
+        let total = loop {
+            let page = registry_values_blocking(full.clone(), "h0:k:5".into(), names.len() as i64, 5_000).unwrap();
+            if page.rows.is_empty() {
+                break page.total;
+            }
+            names.extend(page.rows.iter().map(|row| row.get("value_name").and_then(Value::as_str).unwrap_or_default().to_string()));
+        };
+        assert_eq!((total, names.len()), (20_001, 20_001));
+        assert_eq!(names.last().map(String::as_str), Some("v20000"));
+
+        // A value past the detail cap: the first part is marked, and the rest
+        // comes in chunks up to the last byte / character.
+        let entry = registry_entry_blocking(full.clone(), "h0:v:long".into(), 8).unwrap();
+        let get = |key: &str| entry.entry.get(key).cloned().unwrap_or(Value::Null);
+        assert_eq!((get("value_data_hex"), get("value_hex_truncated"), get("value_hex_length")), (Value::from("00112233"), Value::from(1), Value::from(20)));
+        assert_eq!((get("value_data_text"), get("value_text_length")), (Value::from("abcdefgh"), Value::from(16)));
+        let gather = |field: &str, start: i64, total: i64, step: i64| {
+            let mut out = String::new();
+            let mut offset = start;
+            while offset < total {
+                let chunk = registry_value_chunk_blocking(full.clone(), "h0:v:long".into(), field.into(), offset, step).unwrap();
+                assert_eq!(chunk.total, total);
+                offset += chunk.data.chars().count() as i64;
+                out.push_str(&chunk.data);
+            }
+            out
+        };
+        assert_eq!(format!("00112233{}", gather("hex", 8, 20, 6)), "00112233445566778899");
+        assert_eq!(format!("abcdefgh{}", gather("text", 8, 16, 5)), "abcdefghijklmnop");
+        // Hex chunks start and end on byte boundaries.
+        assert_eq!(registry_value_chunk_blocking(full.clone(), "h0:v:long".into(), "hex".into(), 9, 3).unwrap().data, "4455");
+        assert!(registry_value_chunk_blocking(full.clone(), "h0:v:long".into(), "blob".into(), 0, 4).is_err());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn file_references_come_from_stored_candidates_of_the_same_generation() {
         let root = temp_root("fileref");
@@ -10569,6 +11404,13 @@ fn main() {
             mft_search,
             usn_overview,
             usn_groups_page,
+            registry_hives,
+            registry_keys,
+            registry_values,
+            registry_entry,
+            registry_value_chunk,
+            registry_search,
+            registry_quick_access,
             mft_records_page,
             mft_row,
             mft_record_body,
