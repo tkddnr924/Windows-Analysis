@@ -8,7 +8,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type {
   AccountDirectoryEntry, Bookmark, BookmarkInput, Case, CategoryEntry, CsvData, DBRow, ElectronApi, Host, HostMetadata, LinkedRowsPage, MftChildrenPage,
-  ListCasesResult, CacheMeta, CacheBodyPreview, BrowserVisitGraph, FileReference, PipelineLogEntry, PipelineResult, ResultFileEntry, ResultProvenance, ArtifactInputFile, ParseReport, ParseEligibility, RunHostOptions, SearchCasePage, AiConversation, AiConversationPage, AiConversationDetail, BrowserActivityQuery, BrowserActivitySummary, BrowserActivityInsights, BrowserDomainStatsPage, AccountEventPage, AccountEventQuery, MftRecordBody, MftVolume, OverviewContractStatus, RecordSource, ResultRow, MftRecordsPage, ParseLogPreview, TimelineMeta, TimelineFacets, TimelinePage, TimelineSourcePage, TimelineQuery,
+  ListCasesResult, CacheMeta, CacheBodyPreview, BrowserVisitGraph, FileReference, PipelineLogEntry, PipelineResult, ResultFileEntry, ResultProvenance, ArtifactInputFile, ParseReport, ParseEligibility, RunHostOptions, SearchCasePage, AiConversation, AiConversationPage, AiConversationDetail, BrowserActivityQuery, BrowserActivitySummary, BrowserActivityInsights, BrowserDomainStatsPage, AccountEventPage, AccountEventQuery, MftRecordBody, MftVolume, OverviewContractStatus, RecordSource, ResultRow, MftRecordsPage, ParseLogPreview, TimelineMeta, TimelineFacets, TimelinePage, TimelineSourcePage, TimelineQuery, UsnGroupsPage, UsnOverview,
 } from "./types";
 
 // 저장 계약(docs-01)의 결과 DB는 INTEGER·REAL 컬럼을 쓴다. 화면 코드는 셀을
@@ -86,7 +86,19 @@ function makeApi(): ElectronApi {
     mftRow: (fullPath, rowid, volumeId) => invoke<DBRow | null>("mft_row", { fullPath, rowid, volumeId: volumeId ?? null }).then((row) => (row ? cells(row) : row)),
     mftRecordBody: (fullPath, rowid, volumeId) => invoke<MftRecordBody>("mft_record_body", { fullPath, rowid, volumeId: volumeId ?? null }),
     mftVolumes: (dbPath) => invoke<MftVolume[]>("mft_volumes", { dbPath }).then(rows),
-    usnJrnlPage: (fullPath, query) => invoke<CsvData>("usnjrnl_page", { fullPath, search: query.search ?? "", reason: query.reason ?? "", start: query.start ?? "", end: query.end ?? "", ascending: query.ascending ?? false, offset: query.offset, limit: query.limit }).then(table),
+    usnOverview: (fullPath, inputId) => invoke<UsnOverview>("usn_overview", { fullPath, inputId: inputId ?? null }),
+    usnGroupsPage: (fullPath, options, offset, limit) =>
+      invoke<UsnGroupsPage>("usn_groups_page", { fullPath, options, offset, limit }).then((page) => {
+        for (const entry of page.groups) {
+          cells(entry.group);
+          rows(entry.members);
+          for (const rename of entry.renames) {
+            cells(rename.event);
+            rows(rename.candidates);
+          }
+        }
+        return page;
+      }),
     mftRecordsPage: (fullPath, query, offset, limit, options) => invoke<MftRecordsPage>("mft_records_page", { fullPath, query, offset, limit, options: options ?? null }).then(table),
     listColumnValues: (fullPath, column, tableName) =>
       invoke<{ value: string; count: number }[]>("list_column_values", { fullPath, column, tableName: tableName ?? null })

@@ -520,8 +520,8 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
       ]},
     ],
   },
-  // NTFS 변경 저널 파생(_OVERVIEW/UsnJournal) — 수십만 행 규모라 UsnJrnlView가
-  // 서버 페이지네이션(usnjrnl_page)으로 직접 조회한다. path·volume_id·
+  // NTFS 변경 저널 파생(_OVERVIEW/UsnJournal) — UsnJrnlView가 저장된 묶음
+  // (usn_groups_page)으로 조회한다. 상세는 구성원 한 건이다. path·volume_id·
   // journal_id·계정은 $J 본문에 없는 값이라 근거가 없으면 NULL로 둔다.
   UsnJournal: {
     customView: "usnJrnl",
@@ -532,14 +532,13 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     timelineSubtitle: (r) => r.event_type || r.reason || "",
     priorityColumns: ["timestamp", "event_type", "file_name", "reason", "file_attributes", "usn"],
     sections: [
-      { heading: "변경 이벤트", fields: [
+      { heading: "변경 기록", fields: [
         { key: "file_name", label: "파일명", kind: "path" },
         { key: "path", label: "전체 경로", kind: "path", showWhenEmpty: true, emptyLabel: "$J에 없는 값 — 외부 근거 없음" },
-        { key: "event_type", label: "변경 종류" },
-        { key: "reason", label: "변경 사유", kind: "code" },
-        { key: "reason_mask", label: "변경 사유 원문 비트마스크" },
-        { key: "renamed_from", label: "이전 이름", kind: "path" },
-        { key: "group_count", label: "묶인 기록 수" },
+        { key: "event_type", label: "기록 종류" },
+        { key: "reason", label: "변경 이유 (이 기록)", kind: "code" },
+        { key: "reason_mask", label: "변경 이유 원문 비트마스크" },
+        { key: "rename_role", label: "이름 변경 역할", valueLabels: { old: "이전 이름 (OLD)", new: "새 이름 (NEW)", both: "이전·새 이름" } },
         { key: "file_attributes", label: "파일 속성" },
         { key: "source_info", label: "소스 정보" },
       ]},
@@ -551,6 +550,13 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
         { key: "security_id", label: "보안 ID (SID 아님)" },
         { key: "volume_id", label: "볼륨 문맥", showWhenEmpty: true, emptyLabel: "확인된 볼륨 문맥 없음" },
         { key: "journal_id", label: "저널 식별자", showWhenEmpty: true, emptyLabel: "$Max 등 별도 근거 없음" },
+      ]},
+      { heading: "묶음·입력", fields: [
+        { key: "group_ordinal", label: "묶음 안 순서 (0부터)" },
+        { key: "input_name", label: "입력 이름" },
+        { key: "source_relative", label: "수집 상대 경로", kind: "path" },
+        { key: "record_offset", label: "원본 바이트 오프셋" },
+        { key: "input_sequence", label: "입력 내 순번" },
       ]},
     ],
   },

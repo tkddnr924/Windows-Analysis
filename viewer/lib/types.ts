@@ -334,6 +334,58 @@ export interface MftRecordsPage {
   total: number;
 }
 
+/** One collected `$J` input (internal key — not a volume or journal ID). */
+export interface UsnInput {
+  input_id: string;
+  input_name: string | null;
+  source_relative: string | null;
+  record_count: number;
+  group_count: number;
+}
+
+export interface UsnFilterOption {
+  value: string;
+  count: number;
+}
+
+export interface UsnOverview {
+  inputs: UsnInput[];
+  eventTypes: UsnFilterOption[];
+  reasonFlags: UsnFilterOption[];
+}
+
+/** A group is listed when one member meets every member condition. */
+export interface UsnGroupOptions {
+  inputId?: string;
+  /** File name or stored reason text of a member. */
+  search?: string;
+  /** Representative type of the stored group. */
+  eventType?: string;
+  /** Full reasons: any of these flags on a member. */
+  reasonFlags?: string[];
+  timeStart?: string;
+  timeEnd?: string;
+  descending?: boolean;
+}
+
+/** Stored group, every member (stored order, `__matched` = "true" for hits) and rename events. */
+export interface UsnGroupEntry {
+  group: Record<string, string>;
+  members: Record<string, string>[];
+  renames: UsnRenameEntry[];
+}
+
+/** Stored rename event and every OLD/NEW candidate (parent reference from its journal record). */
+export interface UsnRenameEntry {
+  event: Record<string, string>;
+  candidates: Record<string, string>[];
+}
+
+export interface UsnGroupsPage {
+  groups: UsnGroupEntry[];
+  total: number;
+}
+
 export interface TimelineEntry {
   /** Already formatted YYYY-MM-DD hh:mm:ss.fff (KST) by the parser — empty when the row has no value in its artifact's timelineField. */
   timestamp: string;
@@ -710,7 +762,10 @@ export interface ElectronApi {
   /** 결과가 담은 볼륨 문맥 목록. 선택한 볼륨 안에서만 경로·부모를 해석한다. */
   mftVolumes(dbPath: string): Promise<MftVolume[]>;
   mftRecordsPage(fullPath: string, query: string, offset: number, limit: number, options?: MftListOptions): Promise<MftRecordsPage>;
-  usnJrnlPage(fullPath: string, query: { search?: string; reason?: string; start?: string; end?: string; ascending?: boolean; offset: number; limit: number }): Promise<CsvData>;
+  /** docs-05 inputs + stored representative types / reason flags of one input. */
+  usnOverview(fullPath: string, inputId?: string): Promise<UsnOverview>;
+  /** Stored change groups with every member and rename event. */
+  usnGroupsPage(fullPath: string, options: UsnGroupOptions, offset: number, limit: number): Promise<UsnGroupsPage>;
   listColumnValues(fullPath: string, column: string, tableName?: string): Promise<{ value: string; count: number }[]>;
   searchCase(query: string, hosts: { id: string; name: string; dir: string }[], offset: number, limit: number, range?: { start?: string; end?: string }, categories?: string[]): Promise<SearchCasePage>;
   listBookmarks(hostDir: string): Promise<Bookmark[]>;

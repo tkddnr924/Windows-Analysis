@@ -4229,210 +4229,312 @@ struct MftChildrenPage {
     total: i64,
 }
 
-#[tauri::command]
-#[allow(clippy::too_many_arguments)] // 검색·필터·기간·페이징 인자 — tauri command 시그니처
-async fn usnjrnl_page(
-    full_path: String,
-    search: String,
-    reason: String,
-    start: String,
-    end: String,
-    ascending: bool,
-    offset: i64,
-    limit: i64,
-) -> Result<CsvData, String> {
-    // 20만+ 행 테이블을 세 번 훑는 조회라, 메인 스레드에서 돌리면 탭 진입·
-    // 검색·페이지 이동마다 창이 멈춘다 — blocking executor로 분리한다
-    // (MFT 탐색·Browser Activity와 같은 규칙).
-    tauri::async_runtime::spawn_blocking(move || {
-        usnjrnl_page_blocking(full_path, search, reason, start, end, ascending, offset, limit)
-    })
-    .await
-    .map_err(|error| format!("USN 저널 조회 작업이 중단되었습니다: {error}"))?
+/// docs-05: one collected `$J` input (internal key, not a volume/journal ID).
+#[derive(Serialize)]
+struct UsnInput {
+    input_id: String,
+    input_name: Option<String>,
+    source_relative: Option<String>,
+    record_count: i64,
+    group_count: i64,
 }
 
-#[allow(clippy::too_many_arguments)]
-fn usnjrnl_page_blocking(
-    full_path: String,
-    search: String,
-    reason: String,
-    start: String,
-    end: String,
-    ascending: bool,
-    offset: i64,
-    limit: i64,
-) -> Result<CsvData, String> {
-    let conn = open_ro(&full_path)?;
-    // Display-facing derived table (docs-01 §19). Raw `UsnJrnl_Records` stays in
-    // the raw table view; this screen reads file_name and the full references.
-    let table = "UsnJournal";
-    if !table_names(&conn).iter().any(|name| name == table) {
-        return Err("USN 저널 테이블을 찾을 수 없습니다".to_string());
+#[derive(Serialize)]
+struct UsnFilterOption {
+    value: String,
+    count: i64,
+}
+
+/// Inputs plus the stored representative types (per group) and reason flags
+/// (per record) of one input, for the filter controls.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UsnOverview {
+    inputs: Vec<UsnInput>,
+    event_types: Vec<UsnFilterOption>,
+    reason_flags: Vec<UsnFilterOption>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+struct UsnGroupOptions {
+    input_id: Option<String>,
+    /// File name, stored reason text or path of a member (LIKE, literal).
+    search: Option<String>,
+    /// Representative type of the stored group (`UsnChangeGroups.event_type`).
+    event_type: Option<String>,
+    /// Full reasons: a member holding any of these flags (`UsnReasonFlags`).
+    reason_flags: Option<Vec<String>>,
+    /// Period on member timestamps.
+    time_start: Option<String>,
+    time_end: Option<String>,
+    descending: Option<bool>,
+}
+
+/// One stored group with every member (stored order) and its rename events.
+#[derive(Serialize)]
+struct UsnGroupEntry {
+    group: Map<String, Value>,
+    members: Vec<Map<String, Value>>,
+    renames: Vec<UsnRenameEntry>,
+}
+
+/// A stored rename event with every OLD/NEW candidate (docs-05 §0/§1). The
+/// parent reference comes from the candidate's linked journal record.
+#[derive(Serialize, Clone)]
+struct UsnRenameEntry {
+    event: Map<String, Value>,
+    candidates: Vec<Map<String, Value>>,
+}
+
+#[derive(Serialize)]
+struct UsnGroupsPage {
+    groups: Vec<UsnGroupEntry>,
+    total: i64,
+}
+
+const USN_TABLES: [&str; 6] = ["UsnJournal", "UsnChangeGroups", "UsnGroupMembers", "UsnReasonFlags", "UsnRenameEvents", "UsnRenameCandidates"];
+
+fn open_usn_journal(full_path: &str) -> Result<Connection, String> {
+    let conn = open_ro(full_path)?;
+    let names = table_names(&conn);
+    if let Some(missing) = USN_TABLES.iter().find(|table| !names.iter().any(|name| name == *table)) {
+        return Err(format!("USN 저널 저장본에 {missing} 테이블이 없습니다. 재파싱이 필요합니다."));
     }
-    let mut columns = payload_columns(&conn, table);
-    let Some(projection) = payload_projection(&columns) else {
-        return Err("USN 저널 컬럼을 읽지 못했습니다".to_string());
+    Ok(conn)
+}
+
+#[tauri::command]
+async fn usn_overview(full_path: String, input_id: Option<String>) -> Result<UsnOverview, String> {
+    tauri::async_runtime::spawn_blocking(move || usn_overview_blocking(full_path, input_id))
+        .await
+        .map_err(|error| format!("USN 저널 조회 작업이 중단되었습니다: {error}"))?
+}
+
+fn usn_overview_blocking(full_path: String, input_id: Option<String>) -> Result<UsnOverview, String> {
+    let conn = open_usn_journal(&full_path)?;
+    let read_error = |error: rusqlite::Error| format!("USN 저널 입력을 읽지 못했습니다: {error}");
+    let mut inputs = Vec::new();
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT g.input_id, MAX(g.input_name), MAX(g.source_relative), SUM(g.member_count), COUNT(*)
+                 FROM UsnChangeGroups g GROUP BY g.input_id ORDER BY g.input_id",
+            )
+            .map_err(read_error)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(UsnInput {
+                    input_id: row.get(0)?,
+                    input_name: row.get(1)?,
+                    source_relative: row.get(2)?,
+                    record_count: row.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                    group_count: row.get(4)?,
+                })
+            })
+            .map_err(read_error)?;
+        for row in rows {
+            inputs.push(row.map_err(read_error)?);
+        }
+    }
+    let options = |sql: &str| -> Result<Vec<UsnFilterOption>, String> {
+        let mut stmt = conn.prepare(sql).map_err(read_error)?;
+        let rows = stmt
+            .query_map(rusqlite::params![input_id], |row| Ok(UsnFilterOption { value: row.get(0)?, count: row.get(1)? }))
+            .map_err(read_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(read_error)
     };
-    columns.push("renamed_from".to_string());
-    columns.push("group_count".to_string());
-    let limit = limit.clamp(1, 500);
+    // NULL input = every input; empty representative types are not offered.
+    let event_types = options(
+        "SELECT event_type, COUNT(*) FROM UsnChangeGroups
+         WHERE (?1 IS NULL OR input_id = ?1) AND event_type IS NOT NULL AND event_type <> ''
+         GROUP BY event_type ORDER BY COUNT(*) DESC, event_type",
+    )?;
+    // A single input needs no join (654k flags): count straight from the index.
+    let scoped = if inputs.len() > 1 { input_id.as_deref() } else { None };
+    let reason_flags = if scoped.is_some() {
+        options(
+            "SELECT f.reason_flag, COUNT(*) FROM UsnReasonFlags f
+             WHERE f.group_id IN (SELECT group_id FROM UsnChangeGroups WHERE input_id = ?1)
+             GROUP BY f.reason_flag ORDER BY COUNT(*) DESC, f.reason_flag",
+        )?
+    } else {
+        let mut stmt = conn
+            .prepare("SELECT reason_flag, COUNT(*) FROM UsnReasonFlags GROUP BY reason_flag ORDER BY COUNT(*) DESC, reason_flag")
+            .map_err(read_error)?;
+        let rows = stmt.query_map([], |row| Ok(UsnFilterOption { value: row.get(0)?, count: row.get(1)? })).map_err(read_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(read_error)?
+    };
+    Ok(UsnOverview { inputs, event_types, reason_flags })
+}
+
+#[tauri::command]
+async fn usn_groups_page(full_path: String, options: Option<UsnGroupOptions>, offset: i64, limit: i64) -> Result<UsnGroupsPage, String> {
+    // 15만 묶음·33만 기록 조회 — 메인 스레드 밖에서 수행한다.
+    tauri::async_runtime::spawn_blocking(move || usn_groups_page_blocking(full_path, options.unwrap_or_default(), offset, limit))
+        .await
+        .map_err(|error| format!("USN 저널 조회 작업이 중단되었습니다: {error}"))?
+}
+
+/// Stored groups (docs-05 §5). A group is listed when ONE member satisfies
+/// every member condition (search, reason flags, period); its members are all
+/// returned and the satisfying ones carry `__matched`. Groups are never
+/// rebuilt here and the representative row never stands for the group.
+fn usn_groups_page_blocking(full_path: String, options: UsnGroupOptions, offset: i64, limit: i64) -> Result<UsnGroupsPage, String> {
+    let conn = open_usn_journal(&full_path)?;
+    let limit = limit.clamp(1, 200);
     let offset = offset.max(0);
 
-    let mut clauses: Vec<String> = Vec::new();
-    let mut params: Vec<String> = Vec::new();
-    if !search.trim().is_empty() {
-        params.push(format!("%{}%", search.trim()));
-        clauses.push(format!("file_name LIKE ?{}", params.len()));
+    // Member conditions, written for alias `j` over columns UsnJournal and
+    // the narrow UsnGroupMembers share (file_name, reason, timestamp,
+    // record_id). The group filter runs them on UsnGroupMembers; the member
+    // rows reuse them for `__matched`. `path` is not searched: the builder
+    // never stores it for $J (core derived/usn.rs).
+    let mut member_clauses: Vec<String> = Vec::new();
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    if let Some(search) = options.search.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+        params.push(Box::new(like_contains(search)));
+        let index = params.len();
+        member_clauses.push(format!("(j.file_name LIKE ?{index} ESCAPE '\\' OR j.reason LIKE ?{index} ESCAPE '\\')"));
     }
-    // 상태(대표 유형) 필터 — 뷰의 배지 판정과 같은 우선순위(삭제 > 생성 >
-    // 이름 변경 > 데이터 > 정보 > 보안)로 걸어 배지와 필터 결과가 일치한다.
-    match reason.as_str() {
-        "delete" => clauses.push("reason LIKE '%FILE_DELETE%'".into()),
-        "create" => clauses.push(
-            "reason LIKE '%FILE_CREATE%' AND reason NOT LIKE '%FILE_DELETE%'".into(),
-        ),
-        "rename" => clauses.push(
-            "reason LIKE '%RENAME\\_%' ESCAPE '\\' AND reason NOT LIKE '%FILE_DELETE%' AND reason NOT LIKE '%FILE_CREATE%'".into(),
-        ),
-        "data" => clauses.push(
-            "reason LIKE '%DATA\\_%' ESCAPE '\\' AND reason NOT LIKE '%FILE_DELETE%' AND reason NOT LIKE '%FILE_CREATE%' AND reason NOT LIKE '%RENAME\\_%' ESCAPE '\\'".into(),
-        ),
-        "info" => clauses.push(
-            "reason LIKE '%BASIC\\_INFO\\_CHANGE%' ESCAPE '\\' AND reason NOT LIKE '%FILE_DELETE%' AND reason NOT LIKE '%FILE_CREATE%' AND reason NOT LIKE '%RENAME\\_%' ESCAPE '\\' AND reason NOT LIKE '%DATA\\_%' ESCAPE '\\'".into(),
-        ),
-        "security" => clauses.push(
-            "reason LIKE '%SECURITY\\_CHANGE%' ESCAPE '\\' AND reason NOT LIKE '%FILE_DELETE%' AND reason NOT LIKE '%FILE_CREATE%' AND reason NOT LIKE '%RENAME\\_%' ESCAPE '\\' AND reason NOT LIKE '%DATA\\_%' ESCAPE '\\' AND reason NOT LIKE '%BASIC\\_INFO\\_CHANGE%' ESCAPE '\\'".into(),
-        ),
-        _ => {}
+    let flags: Vec<String> = options.reason_flags.unwrap_or_default().into_iter().map(|flag| flag.trim().to_string()).filter(|flag| !flag.is_empty()).collect();
+    if !flags.is_empty() {
+        let first = params.len() + 1;
+        let placeholders = (0..flags.len()).map(|i| format!("?{}", first + i)).collect::<Vec<_>>().join(", ");
+        for flag in flags {
+            params.push(Box::new(flag));
+        }
+        // Non-correlated IN: a correlated EXISTS lets the planner pick the
+        // flag index and loop per member (measured > 100 s on 329k records).
+        member_clauses.push(format!("j.record_id IN (SELECT f.record_id FROM UsnReasonFlags f WHERE f.reason_flag IN ({placeholders}))"));
     }
-    if !start.trim().is_empty() {
-        params.push(start.trim().to_string());
-        clauses.push(format!("timestamp >= ?{}", params.len()));
+    if let Some(start) = options.time_start.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+        params.push(Box::new(start.to_string()));
+        member_clauses.push(format!("j.timestamp >= ?{}", params.len()));
     }
-    if !end.trim().is_empty() {
-        params.push(end.trim().to_string());
-        clauses.push(format!("timestamp <= ?{}", params.len()));
+    if let Some(end) = options.time_end.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+        params.push(Box::new(end.to_string()));
+        member_clauses.push(format!("j.timestamp <= ?{}", params.len()));
     }
-    let where_clause = if clauses.is_empty() {
-        String::new()
-    } else {
-        format!(" WHERE {}", clauses.join(" AND "))
+    let member_match = if member_clauses.is_empty() { "1".to_string() } else { member_clauses.join(" AND ") };
+
+    let mut group_clauses: Vec<String> = Vec::new();
+    if let Some(input) = options.input_id.filter(|value| !value.is_empty()) {
+        params.push(Box::new(input));
+        group_clauses.push(format!("g.input_id = ?{}", params.len()));
+    }
+    if let Some(event_type) = options.event_type.filter(|value| !value.is_empty()) {
+        params.push(Box::new(event_type));
+        group_clauses.push(format!("g.event_type = ?{}", params.len()));
+    }
+    if !member_clauses.is_empty() {
+        group_clauses.push(format!("g.group_id IN (SELECT j.group_id FROM UsnGroupMembers j WHERE {member_match})"));
+    }
+    let where_clause = if group_clauses.is_empty() { String::new() } else { format!(" WHERE {}", group_clauses.join(" AND ")) };
+    let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|value| value.as_ref()).collect();
+
+    // Stored order keys only: time (NULL last), length-prefixed USN text, id.
+    let direction = if options.descending.unwrap_or(false) { "DESC" } else { "ASC" };
+    let order = format!("ORDER BY g.first_timestamp IS NULL, g.first_timestamp {direction}, g.first_usn_sort {direction}, g.group_id {direction}");
+    let read_ids = |sql: &str| -> Result<Vec<String>, String> {
+        let mut stmt = conn.prepare(sql).map_err(|error| format!("USN 저널 묶음을 읽지 못했습니다: {error}"))?;
+        let rows = stmt.query_map(refs.as_slice(), |row| row.get::<_, String>(0)).map_err(|error| format!("USN 저널 묶음을 읽지 못했습니다: {error}"))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|error| format!("USN 저널 묶음을 읽지 못했습니다: {error}"))
     };
-
-    // USN 레코드는 파일 핸들이 닫힐 때까지 사유가 누적되며 여러 행으로
-    // 남는다. 같은 파일(참조 번호)·같은 시각의 기록을 한 행동으로 묶는다 —
-    // 누적 체인과 이름 변경(OLD/NEW 쌍)이 모두 하나로 합쳐진다.
-    let base = format!(
-        "SELECT rowid AS __rowid, {projection} FROM {}{}",
-        q(table),
-        where_clause
-    );
-    let refs: Vec<&dyn rusqlite::ToSql> =
-        params.iter().map(|value| value as &dyn rusqlite::ToSql).collect();
-
-    let count_sql = format!(
-        "SELECT COUNT(*) FROM (SELECT 1 FROM ({base}) GROUP BY file_reference, timestamp)"
-    );
-    let row_count: i64 = conn
-        .query_row(&count_sql, refs.as_slice(), |row| row.get(0))
-        .map_err(|error| format!("USN 저널 행 수를 읽지 못했습니다: {error}"))?;
-
-    let direction = if ascending { "ASC" } else { "DESC" };
-    let keys_sql = format!(
-        "SELECT file_reference, timestamp FROM ({base}) GROUP BY file_reference, timestamp ORDER BY timestamp {direction}, MAX(CAST(usn AS INTEGER)) {direction} LIMIT {limit} OFFSET {offset}"
-    );
-    let keys = query_rows(&conn, &keys_sql, refs.as_slice())?;
-    if keys.is_empty() {
-        return Ok(CsvData {
-            columns,
-            rows: Vec::new(),
-            row_count,
-        });
+    let (total, ids) = if member_clauses.is_empty() {
+        // Index order + LIMIT; the count is a cheap index count.
+        let total: i64 = conn
+            .query_row(&format!("SELECT COUNT(*) FROM UsnChangeGroups g{where_clause}"), refs.as_slice(), |row| row.get(0))
+            .map_err(|error| format!("USN 저널 묶음 수를 읽지 못했습니다: {error}"))?;
+        (total, read_ids(&format!("SELECT g.group_id FROM UsnChangeGroups g{where_clause} {order} LIMIT {limit} OFFSET {offset}"))?)
+    } else {
+        // Member conditions scan members once: total and page from one result.
+        let all = read_ids(&format!("SELECT g.group_id FROM UsnChangeGroups g{where_clause} {order}"))?;
+        let total = all.len() as i64;
+        (total, all.into_iter().skip(offset as usize).take(limit as usize).collect())
+    };
+    if ids.is_empty() {
+        return Ok(UsnGroupsPage { groups: Vec::new(), total });
     }
+    let id_refs: Vec<&dyn rusqlite::ToSql> = ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+    let id_only = (1..=ids.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(", ");
+    let mut group_rows = query_rows(&conn, &format!("SELECT * FROM UsnChangeGroups WHERE group_id IN ({id_only})"), id_refs.as_slice())?;
+    let rank: HashMap<String, usize> = ids.iter().enumerate().map(|(index, id)| (id.clone(), index)).collect();
+    group_rows.sort_by_key(|row| row.get("group_id").and_then(Value::as_str).and_then(|id| rank.get(id)).copied().unwrap_or(usize::MAX));
 
-    // 이번 페이지 묶음의 구성 기록만 다시 읽는다 (USN 오름차순 = 기록 순서).
-    let mut member_params = params.clone();
-    let mut tuples = Vec::new();
-    for key in &keys {
-        let fr = key.get("file_reference").and_then(Value::as_str).unwrap_or("");
-        let ts = key.get("timestamp").and_then(Value::as_str).unwrap_or("");
-        member_params.push(fr.to_string());
-        let a = member_params.len();
-        member_params.push(ts.to_string());
-        let b = member_params.len();
-        tuples.push(format!("(?{a}, ?{b})"));
+    // Members and renames of this page only, in one query each.
+    let id_start = params.len() + 1;
+    let id_list = (0..ids.len()).map(|i| format!("?{}", id_start + i)).collect::<Vec<_>>().join(", ");
+    let mut member_params: Vec<&dyn rusqlite::ToSql> = refs.clone();
+    for id in &ids {
+        member_params.push(id);
     }
-    let members_sql = format!(
-        "SELECT * FROM ({base}) WHERE (file_reference, timestamp) IN (VALUES {}) ORDER BY CAST(usn AS INTEGER) ASC",
-        tuples.join(", ")
-    );
-    let member_refs: Vec<&dyn rusqlite::ToSql> = member_params
-        .iter()
-        .map(|value| value as &dyn rusqlite::ToSql)
-        .collect();
-    let members = query_rows(&conn, &members_sql, member_refs.as_slice())?;
-
-    // 페이지 순서를 유지하며 묶음별로 병합한다.
-    let mut grouped: std::collections::HashMap<(String, String), Vec<Map<String, Value>>> =
-        std::collections::HashMap::new();
-    for member in members {
-        let fr = member
-            .get("file_reference")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let ts = member
-            .get("timestamp")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        grouped.entry((fr, ts)).or_default().push(member);
+    let columns = payload_columns(&conn, "UsnJournal");
+    let projection = columns.iter().map(|column| format!("j.{}", q(column))).collect::<Vec<_>>().join(", ");
+    let mut members = query_rows(
+        &conn,
+        &format!(
+            "SELECT j.rowid AS __rowid, {projection}, ({member_match}) AS __matched
+             FROM UsnJournal j WHERE j.group_id IN ({id_list})
+             ORDER BY j.group_id, j.group_ordinal, j.usn_sort, j.record_id"
+        ),
+        member_params.as_slice(),
+    )?;
+    for member in members.iter_mut() {
+        // No member condition = nothing to single out.
+        let matched = !member_clauses.is_empty() && member.get("__matched").and_then(Value::as_i64) == Some(1);
+        member.insert("__matched".into(), Value::Bool(matched));
     }
-    let mut rows = Vec::new();
-    for key in &keys {
-        let fr = key.get("file_reference").and_then(Value::as_str).unwrap_or("");
-        let ts = key.get("timestamp").and_then(Value::as_str).unwrap_or("");
-        let Some(group) = grouped.remove(&(fr.to_string(), ts.to_string())) else {
-            continue;
-        };
-        let Some(representative) = group.last().cloned() else {
-            continue;
-        };
-        // 사유 플래그 합집합 — 기록 순서대로 처음 등장한 순서를 보존한다.
-        let mut flags: Vec<String> = Vec::new();
-        let mut renamed_from = String::new();
-        let rep_name = representative
-            .get("file_name")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        for member in &group {
-            let member_reason = member.get("reason").and_then(Value::as_str).unwrap_or("");
-            for flag in member_reason.split('|') {
-                if !flag.is_empty() && !flags.iter().any(|f| f == flag) {
-                    flags.push(flag.to_string());
-                }
-            }
-            if member_reason.contains("RENAME_OLD_NAME") {
-                let old = member.get("file_name").and_then(Value::as_str).unwrap_or("");
-                if !old.is_empty() && old != rep_name {
-                    renamed_from = old.to_string();
-                }
+    decorate_source_refs(&conn, Path::new(&full_path), &mut members)?;
+    let renames = query_rows(
+        &conn,
+        &format!(
+            "SELECT * FROM UsnRenameEvents WHERE old_group_id IN ({id_only}) OR new_group_id IN ({id_only})
+             ORDER BY COALESCE(old_usn_sort, new_usn_sort), rename_id"
+        ),
+        id_refs.as_slice(),
+    )?;
+    let mut candidates_by_rename: HashMap<String, Vec<Map<String, Value>>> = HashMap::new();
+    if !renames.is_empty() {
+        let rename_ids: Vec<String> = renames.iter().filter_map(|rename| rename.get("rename_id").and_then(Value::as_str).map(str::to_string)).collect();
+        let rename_refs: Vec<&dyn rusqlite::ToSql> = rename_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+        let rename_list = (1..=rename_ids.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(", ");
+        let candidates = query_rows(
+            &conn,
+            &format!(
+                "SELECT c.*, j.rowid AS __rowid, j.parent_reference
+                 FROM UsnRenameCandidates c LEFT JOIN UsnJournal j ON j.record_id = c.record_id
+                 WHERE c.rename_id IN ({rename_list}) ORDER BY c.rename_id, c.ordinal"
+            ),
+            rename_refs.as_slice(),
+        )?;
+        for candidate in candidates {
+            if let Some(id) = candidate.get("rename_id").and_then(Value::as_str).map(str::to_string) {
+                candidates_by_rename.entry(id).or_default().push(candidate);
             }
         }
-        let mut row = representative;
-        row.insert("reason".into(), Value::String(flags.join("|")));
-        row.insert("renamed_from".into(), Value::String(renamed_from));
-        row.insert(
-            "group_count".into(),
-            Value::String(group.len().to_string()),
-        );
-        rows.push(row);
     }
-    Ok(CsvData {
-        columns,
-        rows,
-        row_count,
-    })
+
+    let mut groups: Vec<UsnGroupEntry> = group_rows.into_iter().map(|group| UsnGroupEntry { group, members: Vec::new(), renames: Vec::new() }).collect();
+    let position = &rank;
+    for member in members {
+        if let Some(&index) = member.get("group_id").and_then(Value::as_str).and_then(|id| position.get(id)) {
+            groups[index].members.push(member);
+        }
+    }
+    for event in renames {
+        let old = event.get("old_group_id").and_then(Value::as_str).and_then(|id| position.get(id)).copied();
+        let new = event.get("new_group_id").and_then(Value::as_str).and_then(|id| position.get(id)).copied();
+        let candidates = event.get("rename_id").and_then(Value::as_str).and_then(|id| candidates_by_rename.remove(id)).unwrap_or_default();
+        let entry = UsnRenameEntry { event, candidates };
+        if let Some(index) = old {
+            groups[index].renames.push(entry.clone());
+        }
+        if let Some(index) = new.filter(|index| Some(*index) != old) {
+            groups[index].renames.push(entry);
+        }
+    }
+    Ok(UsnGroupsPage { groups, total })
 }
 
 /// Recursive list filters (docs-04 §3). All optional; unknown keys fall back
@@ -9995,6 +10097,177 @@ mod overview_contract_tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// docs-05 stored groups: two inputs; a create group, a rename group
+    /// (paired OLD/NEW + CLOSE), a delete group sharing the rename's first
+    /// time, and a same-name record in another input.
+    fn write_usn_journal(overview: &Path) -> PathBuf {
+        let path = overview.join("UsnJournal.sqlite");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE UsnJournal (record_id TEXT PRIMARY KEY, host_id TEXT, dataset_id TEXT, timestamp TEXT, overview_name TEXT, account TEXT, account_sid TEXT, timestamp_kind TEXT, event_type TEXT, description TEXT, file_name TEXT, path TEXT, volume_id TEXT, journal_id TEXT, usn TEXT, record_version INTEGER, file_reference TEXT, parent_reference TEXT, reason_mask TEXT, reason TEXT, source_info TEXT, security_id INTEGER, file_attributes TEXT, input_id TEXT, input_name TEXT, source_file TEXT, source_relative TEXT, record_offset TEXT, input_sequence INTEGER, usn_sort TEXT, file_reference_sort TEXT, parent_reference_sort TEXT, group_id TEXT, group_ordinal INTEGER, rename_role TEXT);
+             CREATE TABLE UsnChangeGroups (group_id TEXT PRIMARY KEY, host_id TEXT, dataset_id TEXT, input_id TEXT, input_name TEXT, source_file TEXT, source_relative TEXT, record_version INTEGER, file_reference TEXT, file_reference_sort TEXT, first_parent_reference TEXT, last_parent_reference TEXT, first_file_name TEXT, last_file_name TEXT, distinct_file_name_count INTEGER, first_timestamp TEXT, last_timestamp TEXT, first_usn TEXT, first_usn_sort TEXT, last_usn TEXT, last_usn_sort TEXT, first_input_sequence INTEGER, last_input_sequence INTEGER, member_count INTEGER, event_type TEXT, reason_union_mask TEXT, reason_union TEXT, unknown_reason_mask TEXT, has_unknown_reason INTEGER, group_scope TEXT, grouping_basis TEXT, boundary_reason TEXT, close_observed INTEGER, is_display_summary INTEGER, operation_confirmed INTEGER);
+             CREATE TABLE UsnReasonFlags (record_id TEXT, ordinal INTEGER, group_id TEXT, reason_flag TEXT, flag_bit TEXT, is_unknown INTEGER);
+             CREATE TABLE UsnGroupMembers (group_id TEXT, ordinal INTEGER, record_id TEXT, input_id TEXT, input_sequence INTEGER, record_offset TEXT, timestamp TEXT, file_name TEXT, event_type TEXT, reason TEXT, reason_mask TEXT, usn TEXT, usn_sort TEXT);
+             CREATE TABLE UsnRenameEvents (rename_id TEXT PRIMARY KEY, host_id TEXT, dataset_id TEXT, input_id TEXT, input_name TEXT, record_version INTEGER, file_reference TEXT, file_reference_sort TEXT, status TEXT, ambiguity_reason TEXT, matching_basis TEXT, old_record_id TEXT, new_record_id TEXT, old_group_id TEXT, new_group_id TEXT, old_file_name TEXT, new_file_name TEXT, old_usn TEXT, old_usn_sort TEXT, new_usn TEXT, new_usn_sort TEXT, old_timestamp TEXT, new_timestamp TEXT, old_candidate_count INTEGER, new_candidate_count INTEGER);
+             CREATE TABLE UsnRenameCandidates (rename_id TEXT, ordinal INTEGER, record_id TEXT, group_id TEXT, role TEXT, file_name TEXT, usn TEXT, usn_sort TEXT, timestamp TEXT, record_offset TEXT, input_sequence INTEGER, reason_mask TEXT);
+             CREATE TABLE source_records (record_id TEXT NOT NULL, ordinal INTEGER NOT NULL, source_dataset_id TEXT NOT NULL, source_artifact TEXT NOT NULL, source_db TEXT NOT NULL, source_table TEXT NOT NULL, source_rowid INTEGER NOT NULL, source_field TEXT, source_record_key TEXT, source_file TEXT, source_label TEXT);",
+        )
+        .unwrap();
+        // (group, input, first/last time, first usn_sort, event type, members)
+        // member: (record, time, name, reasons, rename role)
+        type Member<'a> = (&'a str, &'a str, &'a str, &'a [&'a str], Option<&'a str>);
+        let groups: Vec<(&str, &str, &str, &str, &str, &str, Vec<Member>)> = vec![
+            ("g1", "usn-1", "2026-01-01 10:00:00.000", "2026-01-01 10:01:00.000", "10100", "생성", vec![
+                ("m1", "2026-01-01 10:00:00.000", "a.txt", &["FILE_CREATE"], None),
+                ("m2", "2026-01-01 10:01:00.000", "a.txt", &["DATA_EXTEND", "CLOSE"], None),
+            ]),
+            ("g2", "usn-1", "2026-01-01 10:05:00.000", "2026-01-01 10:05:01.000", "10200", "이름 변경(이전 이름)", vec![
+                ("m3", "2026-01-01 10:05:00.000", "old.doc", &["RENAME_OLD_NAME"], Some("old")),
+                ("m4", "2026-01-01 10:05:00.500", "new.doc", &["RENAME_NEW_NAME"], Some("new")),
+                ("m5", "2026-01-01 10:05:01.000", "new.doc", &["RENAME_NEW_NAME", "CLOSE"], None),
+            ]),
+            ("g3", "usn-1", "2026-01-01 10:05:00.000", "2026-01-01 10:05:00.000", "10300", "삭제", vec![
+                ("m6", "2026-01-01 10:05:00.000", "x.log", &["FILE_DELETE", "CLOSE"], None),
+            ]),
+            ("g4", "usn-2", "2026-01-01 10:00:00.000", "2026-01-01 10:00:00.000", "10100", "생성", vec![
+                ("m7", "2026-01-01 10:00:00.000", "a.txt", &["FILE_CREATE", "CLOSE"], None),
+            ]),
+            // usn-3: an ambiguous rename (two OLD names under different
+            // parents) and an OLD name whose NEW was never seen.
+            ("g5", "usn-3", "2026-01-02 09:00:00.000", "2026-01-02 09:00:02.000", "10500", "이름 변경(이전 이름)", vec![
+                ("m8", "2026-01-02 09:00:00.000", "a1.txt", &["RENAME_OLD_NAME"], Some("old")),
+                ("m9", "2026-01-02 09:00:01.000", "a2.txt", &["RENAME_OLD_NAME"], Some("old")),
+                ("m10", "2026-01-02 09:00:02.000", "b.txt", &["RENAME_NEW_NAME", "CLOSE"], Some("new")),
+            ]),
+            ("g6", "usn-3", "2026-01-02 09:10:00.000", "2026-01-02 09:10:00.000", "10600", "이름 변경(이전 이름)", vec![
+                ("m11", "2026-01-02 09:10:00.000", "gone.tmp", &["RENAME_OLD_NAME"], Some("old")),
+            ]),
+        ];
+        for (group, input, first, last, usn_sort, event_type, members) in &groups {
+            let reason_union = members.iter().flat_map(|m| m.3.iter().copied()).collect::<Vec<_>>().join("|");
+            conn.execute(
+                "INSERT INTO UsnChangeGroups (group_id, host_id, dataset_id, input_id, input_name, source_relative, first_file_name, last_file_name, first_timestamp, last_timestamp, first_usn_sort, member_count, event_type, reason_union, grouping_basis, boundary_reason, close_observed, is_display_summary, operation_confirmed)
+                 VALUES (?1, 'h', 'd', ?2, '$J', 'C/' || ?2 || '/$J', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'close_delimited_observations', 'close_flag', 1, 1, 0)",
+                rusqlite::params![group, input, members[0].2, members[members.len() - 1].2, first, last, usn_sort, members.len() as i64, event_type, reason_union],
+            )
+            .unwrap();
+            for (ordinal, (record, time, name, reasons, role)) in members.iter().enumerate() {
+                conn.execute(
+                    "INSERT INTO UsnJournal (record_id, host_id, dataset_id, timestamp, overview_name, timestamp_kind, file_name, usn, usn_sort, reason, input_id, input_name, group_id, group_ordinal, rename_role, file_reference)
+                     VALUES (?1, 'h', 'd', ?2, 'UsnJournal', '변경 기록 시각', ?3, '1844674407370955161' || ?7, '20' || ?4 || ?7, ?5, ?6, '$J', ?8, ?7, ?9, '281474976710656')",
+                    rusqlite::params![record, time, name, usn_sort, reasons.join("|"), input, ordinal as i64, group, role],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO UsnGroupMembers (group_id, ordinal, record_id, input_id, timestamp, file_name, reason) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    rusqlite::params![group, ordinal as i64, record, input, time, name, reasons.join("|")],
+                )
+                .unwrap();
+                for (flag_ordinal, flag) in reasons.iter().enumerate() {
+                    conn.execute(
+                        "INSERT INTO UsnReasonFlags VALUES (?1, ?2, ?3, ?4, '0x1', 0)",
+                        rusqlite::params![record, flag_ordinal as i64, group, flag],
+                    )
+                    .unwrap();
+                }
+            }
+        }
+        conn.execute_batch(
+            "INSERT INTO UsnRenameEvents (rename_id, host_id, dataset_id, input_id, status, ambiguity_reason, matching_basis, old_record_id, new_record_id, old_group_id, new_group_id, old_file_name, new_file_name, old_candidate_count, new_candidate_count) VALUES
+               ('rn1', 'h', 'd', 'usn-1', 'paired', NULL, 'same_group_usn_order', 'm3', 'm4', 'g2', 'g2', 'old.doc', 'new.doc', 1, 2),
+               ('rn2', 'h', 'd', 'usn-3', 'ambiguous', 'multiple_old_names|multiple_old_parents', 'same_group_usn_order', NULL, 'm10', 'g5', 'g5', NULL, 'b.txt', 2, 1),
+               ('rn3', 'h', 'd', 'usn-3', 'missing_new', NULL, 'same_group_usn_order', 'm11', NULL, 'g6', NULL, 'gone.tmp', NULL, 1, 0);
+             INSERT INTO UsnRenameCandidates (rename_id, ordinal, record_id, group_id, role, file_name, usn, timestamp, record_offset) VALUES
+               ('rn1', 0, 'm3', 'g2', 'old', 'old.doc', '1', '2026-01-01 10:05:00.000', '100'),
+               ('rn1', 1, 'm4', 'g2', 'new', 'new.doc', '2', '2026-01-01 10:05:00.500', '200'),
+               ('rn1', 2, 'm5', 'g2', 'new', 'new.doc', '3', '2026-01-01 10:05:01.000', '300'),
+               ('rn2', 0, 'm8', 'g5', 'old', 'a1.txt', '8', '2026-01-02 09:00:00.000', '800'),
+               ('rn2', 1, 'm9', 'g5', 'old', 'a2.txt', '9', '2026-01-02 09:00:01.000', '900'),
+               ('rn2', 2, 'm10', 'g5', 'new', 'b.txt', '10', '2026-01-02 09:00:02.000', '1000'),
+               ('rn3', 0, 'm11', 'g6', 'old', 'gone.tmp', '11', '2026-01-02 09:10:00.000', '1100');
+             UPDATE UsnJournal SET parent_reference = CASE record_id WHEN 'm8' THEN '1407374883553285' WHEN 'm9' THEN '1688849860263941' ELSE '1407374883553285' END;
+             INSERT INTO source_records VALUES ('m6', 0, 'd0', 'UsnJrnl', 'FILESYSTEM/UsnJrnl_Records.sqlite', 'UsnJrnl_Records', 6, NULL, NULL, NULL, NULL);",
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn usn_groups_come_from_stored_groups_with_every_member() {
+        let root = temp_root("usn");
+        let overview = root.join("_OVERVIEW");
+        std::fs::create_dir_all(&overview).unwrap();
+        let full = write_usn_journal(&overview).to_string_lossy().to_string();
+        let page = |options: UsnGroupOptions, offset: i64, limit: i64| usn_groups_page_blocking(full.clone(), options, offset, limit).unwrap();
+        let one = |options: UsnGroupOptions| UsnGroupOptions { input_id: Some("usn-1".into()), ..options };
+        let ids = |result: &UsnGroupsPage| result.groups.iter().map(|g| g.group.get("group_id").and_then(Value::as_str).unwrap_or_default().to_string()).collect::<Vec<_>>();
+        let members_of = |entry: &UsnGroupEntry| entry.members.iter().map(|m| (m.get("record_id").and_then(Value::as_str).unwrap_or_default().to_string(), m.get("__matched").and_then(Value::as_bool).unwrap_or(false))).collect::<Vec<_>>();
+
+        // Inputs stay apart; options are counted per input.
+        let overview_all = usn_overview_blocking(full.clone(), Some("usn-1".into())).unwrap();
+        assert_eq!(overview_all.inputs.iter().map(|i| (i.input_id.clone(), i.record_count, i.group_count)).collect::<Vec<_>>(), vec![("usn-1".to_string(), 6, 3), ("usn-2".to_string(), 1, 1), ("usn-3".to_string(), 4, 2)]);
+        assert_eq!(overview_all.event_types.iter().find(|o| o.value == "생성").map(|o| o.count), Some(1));
+        assert_eq!(overview_all.reason_flags.iter().find(|o| o.value == "CLOSE").map(|o| o.count), Some(3));
+
+        // Time order, then first USN; the other input never leaks in.
+        let all = page(one(UsnGroupOptions::default()), 0, 10);
+        assert_eq!((ids(&all), all.total), (vec!["g1".to_string(), "g2".into(), "g3".into()], 3));
+        let desc = page(one(UsnGroupOptions { descending: Some(true), ..Default::default() }), 0, 10);
+        assert_eq!(ids(&desc), vec!["g3", "g2", "g1"]);
+        let second = page(one(UsnGroupOptions::default()), 1, 1);
+        assert_eq!((ids(&second), second.total), (vec!["g2".to_string()], 3));
+
+        // Every member in stored order, rename linked from the stored event.
+        let g2 = &all.groups[1];
+        assert_eq!(members_of(g2).iter().map(|m| m.0.as_str()).collect::<Vec<_>>(), vec!["m3", "m4", "m5"]);
+        assert_eq!(g2.renames.len(), 1);
+        assert_eq!(g2.renames[0].event.get("old_file_name").and_then(Value::as_str), Some("old.doc"));
+        assert_eq!(g2.renames[0].event.get("status").and_then(Value::as_str), Some("paired"));
+        // Every stored candidate, CLOSE's accumulated NEW included.
+        let names = |rename: &UsnRenameEntry| rename.candidates.iter().map(|c| format!("{}:{}", c.get("role").and_then(Value::as_str).unwrap_or(""), c.get("file_name").and_then(Value::as_str).unwrap_or(""))).collect::<Vec<_>>();
+        assert_eq!(names(&g2.renames[0]), vec!["old:old.doc", "new:new.doc", "new:new.doc"]);
+        assert!(g2.members[0].get("__rowid").is_some(), "members carry their row for detail/bookmark");
+        // USN text keeps full precision (no numeric conversion).
+        assert_eq!(g2.members[0].get("usn").and_then(Value::as_str), Some("18446744073709551610"));
+
+        // A search on the new name keeps the whole group and marks matches.
+        let renamed = page(one(UsnGroupOptions { search: Some("NEW.doc".into()), ..Default::default() }), 0, 10);
+        assert_eq!(ids(&renamed), vec!["g2"]);
+        assert_eq!(members_of(&renamed.groups[0]), vec![("m3".to_string(), false), ("m4".to_string(), true), ("m5".to_string(), true)]);
+        // Search covers stored reasons; LIKE metacharacters are literal.
+        assert_eq!(ids(&page(one(UsnGroupOptions { search: Some("file_delete".into()), ..Default::default() }), 0, 10)), vec!["g3"]);
+        assert!(page(one(UsnGroupOptions { search: Some("a_txt".into()), ..Default::default() }), 0, 10).groups.is_empty());
+
+        // Reason flags (any of them) differ from the representative type: g1 is
+        // "생성" yet holds DATA_EXTEND.
+        assert_eq!(ids(&page(one(UsnGroupOptions { reason_flags: Some(vec!["DATA_EXTEND".into(), "FILE_DELETE".into()]), ..Default::default() }), 0, 10)), vec!["g1", "g3"]);
+        assert_eq!(ids(&page(one(UsnGroupOptions { event_type: Some("생성".into()), ..Default::default() }), 0, 10)), vec!["g1"]);
+        assert!(page(one(UsnGroupOptions { event_type: Some("내용 변경".into()), reason_flags: Some(vec!["DATA_EXTEND".into()]), ..Default::default() }), 0, 10).groups.is_empty());
+
+        // Period is checked on members: g1 spans 10:00–10:01 but none of its
+        // members lies in 10:00:30–10:04.
+        let window = page(one(UsnGroupOptions { time_start: Some("2026-01-01 10:00:30.000".into()), time_end: Some("2026-01-01 10:04:00.000".into()), ..Default::default() }), 0, 10);
+        assert_eq!(ids(&window), vec!["g1"]);
+        assert_eq!(members_of(&window.groups[0]), vec![("m1".to_string(), false), ("m2".to_string(), true)]);
+        // One member must satisfy all member conditions together.
+        assert!(page(one(UsnGroupOptions { search: Some("old.doc".into()), reason_flags: Some(vec!["CLOSE".into()]), ..Default::default() }), 0, 10).groups.is_empty());
+
+        // Ambiguous and missing renames carry every candidate with the
+        // parent reference read from the linked journal record.
+        let three = page(UsnGroupOptions { input_id: Some("usn-3".into()), ..Default::default() }, 0, 10);
+        assert_eq!(ids(&three), vec!["g5", "g6"]);
+        let ambiguous = &three.groups[0].renames[0];
+        assert_eq!(ambiguous.event.get("status").and_then(Value::as_str), Some("ambiguous"));
+        assert_eq!(names(ambiguous), vec!["old:a1.txt", "old:a2.txt", "new:b.txt"]);
+        let parents = ambiguous.candidates.iter().map(|c| c.get("parent_reference").and_then(Value::as_str).unwrap_or("").to_string()).collect::<Vec<_>>();
+        assert_eq!(parents, vec!["1407374883553285", "1688849860263941", "1407374883553285"]);
+        assert!(ambiguous.candidates.iter().all(|c| c.get("__rowid").is_some()), "candidates open their journal record");
+        let missing = &three.groups[1].renames[0];
+        assert_eq!(missing.event.get("status").and_then(Value::as_str), Some("missing_new"));
+        assert_eq!(names(missing), vec!["old:gone.tmp"]);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn file_references_come_from_stored_candidates_of_the_same_generation() {
         let root = temp_root("fileref");
@@ -10294,7 +10567,8 @@ fn main() {
             list_column_values,
             mft_children,
             mft_search,
-            usnjrnl_page,
+            usn_overview,
+            usn_groups_page,
             mft_records_page,
             mft_row,
             mft_record_body,
