@@ -13,9 +13,11 @@ import ContentCopyOutlinedIcon from "@mui/icons-material/ContentCopyOutlined";
 import CheckIcon from "@mui/icons-material/Check";
 import type { ArtifactViewSpec, DetailSectionSpec, FieldKind, FieldSpec, LinkSpec } from "@/lib/artifactViews";
 import { getArtifactView } from "@/lib/artifactViews";
-import type { BrowserVisitGraph, CacheBodyPreview, FetchLinkedRows } from "@/lib/types";
+import type { BrowserRecord, BrowserVisitFlow, FetchLinkedRows } from "@/lib/types";
 import AccountTreeOutlinedIcon from "@mui/icons-material/AccountTreeOutlined";
 import VisitFlowGraphModal from "./VisitFlowGraph";
+import { HexViewer } from "./HexViewer";
+import { bodyKind } from "@/lib/browserView";
 import { resolveAccountDisplay, type AccountDirectory } from "@/lib/accountIdentity";
 import { parsePrivileges, lookupPrivilege } from "@/lib/privileges";
 import TagList from "./TagList";
@@ -312,102 +314,185 @@ function ByteSizeValue({ value }: { value: string }) {
   );
 }
 
-function decodeBase64Text(value: string): string {
-  try {
-    const binary = atob(value);
-    const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
-    return new TextDecoder("utf-8").decode(bytes);
-  } catch {
-    return "";
-  }
+const CACHE_BODY_CHUNK = 1024 * 1024;
+
+function base64Bytes(value: string): Uint8Array {
+  const binary = atob(value);
+  return Uint8Array.from(binary, (char) => char.charCodeAt(0));
 }
 
-const CACHE_TEXT_PREVIEW_B64_CAP = 192 * 1024;
-
-function cacheContentType(row: Record<string, string>): string {
-  if (row.mime) return row.mime;
-  const path = (row.url || "").split(/[?#]/)[0].toLowerCase();
-  if (path.endsWith(".js")) return "application/javascript";
-  if (path.endsWith(".css")) return "text/css";
-  if (path.endsWith(".json")) return "application/json";
-  if (path.endsWith(".html") || path.endsWith(".htm")) return "text/html";
-  if (path.endsWith(".svg")) return "image/svg+xml";
-  return "";
-}
-
-function CacheDataValue({ row, hostDir }: { row: Record<string, string>; hostDir?: string }) {
-  const [state, setState] = useState<"idle" | "loading" | "ready" | "unavailable">("idle");
-  const [body, setBody] = useState<CacheBodyPreview | null>(null);
-  const loadTokenRef = useRef(0);
-  const contentType = cacheContentType(row);
-  const cacheIdentity = `${hostDir ?? ""}\u0000${row.account ?? ""}\u0000${row.url ?? ""}\u0000${row.cache_key ?? ""}`;
-  const recoveryStateKnown = row.cache_body_recovered !== undefined;
-  const hasRecoveredBody = row.cache_body_recovered === "1";
-
-  // Decoding or JSON formatting a multi-megabyte body in the WebView used to
-  // monopolize the event loop after the IPC result arrived. The Rust command
-  // already returns a bounded base64 response; keep the visible text prefix
-  // smaller still, so opening it never has to paint an unbounded <pre>.
-  const textPreview = useMemo(() => {
-    if (!body || !(/^text\//i.test(contentType) || /json|javascript|xml|svg/i.test(contentType))) return "";
-    return decodeBase64Text(body.bodyB64.slice(0, CACHE_TEXT_PREVIEW_B64_CAP));
-  }, [body, contentType]);
-  const textPreviewTruncated = Boolean(body && (body.truncated || body.bodyB64.length > CACHE_TEXT_PREVIEW_B64_CAP));
-
-  useEffect(() => {
-    // Cache detail opens must not start disk I/O on their own. In addition to
-    // avoiding unnecessary work for normal cache metadata, this keeps a
-    // legacy overview (which has no recovery marker) responsive until the
-    // analyst deliberately requests its body.
-    loadTokenRef.current += 1;
-    setState("idle");
-    setBody(null);
-    return () => { loadTokenRef.current += 1; };
-  }, [cacheIdentity]);
-
-  function loadRecoveredBody() {
-    if (!hostDir || !row.account || !row.url) {
-      setState("unavailable");
-      return;
-    }
-    const loadToken = loadTokenRef.current + 1;
-    loadTokenRef.current = loadToken;
-    setState("loading");
-    setBody(null);
-    // `cache_entry_body` performs filesystem/SQLite work on a Rust blocking
-    // worker. The local guard keeps a later selection from receiving this
-    // response, while the drawer and the rest of the app stay interactive.
-    window.api.cacheEntryBody(hostDir, row.account, row.url, row.cache_key || "")
-      .then((response) => {
-        if (loadToken !== loadTokenRef.current) return;
-        if (!response.bodyB64) { setState("unavailable"); return; }
-        setBody(response);
-        setState("ready");
+// Stored cache body (BrowserCacheDetails.body), read only on request and in
+// chunks; nothing is reread from collected cache files (docs-07 R01, R03).
+function CacheBodyView({ hostDir, recordId, contentType, total }: { hostDir: string; recordId: string; contentType: string; total: number }) {
+  const [bytes, setBytes] = useState<Uint8Array | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(false);
+  const identity = `${hostDir}\u0000${recordId}`;
+  const tokenRef = useRef(0);
+  useEffect(() => { tokenRef.current += 1; setBytes(null); setLoading(false); setError(false); }, [identity]);
+  const load = () => {
+    const token = ++tokenRef.current;
+    const offset = bytes?.length ?? 0;
+    setLoading(true);
+    setError(false);
+    window.api.browserCacheBody(hostDir, recordId, offset, CACHE_BODY_CHUNK)
+      .then((chunk) => {
+        if (token !== tokenRef.current) return;
+        const next = base64Bytes(chunk.dataB64);
+        setBytes((previous) => {
+          if (!previous) return next;
+          const merged = new Uint8Array(previous.length + next.length);
+          merged.set(previous);
+          merged.set(next, previous.length);
+          return merged;
+        });
       })
-      .catch(() => {
-        if (loadToken === loadTokenRef.current) setState("unavailable");
-      });
-  }
-
-  if (state === "loading") return <span style={{ display: "inline-flex", alignItems: "center", gap: 7, color: "var(--text-dim)", fontSize: 12 }}><CircularProgress size={14} thickness={4} sx={{ color: "var(--accent)" }} />복구 데이터 불러오는 중</span>;
-  if (state === "unavailable") return <span style={{ color: "var(--warning)", fontSize: 12.5, fontWeight: 650 }}>복구 데이터 확인 불가 · 원본 캐시를 다시 확인하세요</span>;
-  if (state === "idle") {
-    if (!hasRecoveredBody) {
-      if (recoveryStateKnown) return <span style={{ color: "var(--danger)", fontSize: 12.5, fontWeight: 650 }}>파싱 실패</span>;
-      return <span style={{ color: "var(--text-faint)", fontSize: 12 }}>이전 분석 데이터 · 재파싱 필요</span>;
-    }
-    if (!(row.cache_key || "").trim()) return <span style={{ color: "var(--text-faint)", fontSize: 12 }}>캐시 식별자 없음 · 재파싱 필요</span>;
-    return (
+      .catch(() => { if (token === tokenRef.current) setError(true); })
+      .finally(() => { if (token === tokenRef.current) setLoading(false); });
+  };
+  const kind = bytes ? bodyKind(bytes, contentType) : null;
+  const complete = Boolean(bytes && bytes.length >= total);
+  const text = useMemo(() => (bytes && kind === "text" ? new TextDecoder("utf-8").decode(bytes) : ""), [bytes, kind]);
+  const imageUrl = useMemo(() => {
+    if (!bytes || kind !== "image" || !complete) return "";
+    let binary = "";
+    for (let index = 0; index < bytes.length; index += 0x8000) binary += String.fromCharCode(...bytes.subarray(index, index + 0x8000));
+    return `data:${contentType.split(";")[0]};base64,${btoa(binary)}`;
+  }, [bytes, kind, complete, contentType]);
+  const button: React.CSSProperties = { padding: "4px 9px", borderRadius: "var(--radius)", border: "1px solid var(--border)", background: "var(--bg-elevated)", color: "var(--accent)", cursor: "pointer", fontSize: 11.5, fontWeight: 650 };
+  return (
+    <div style={{ display: "grid", gap: 8 }}>
+      {bytes && (kind === "image" && imageUrl
+        ? <img src={imageUrl} alt="캐시 본문" style={{ display: "block", maxWidth: "100%", maxHeight: 360, border: "1px solid var(--border)", borderRadius: "var(--radius)", background: "var(--bg-input)" }} />
+        : kind === "text" ? <CodeOrJsonBlock raw={text} expandTitle="캐시 본문" />
+        : <HexViewer bytes={bytes} maxHeight={320} />)}
       <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-        <button type="button" onClick={loadRecoveredBody} style={{ padding: "4px 8px", borderRadius: "var(--radius)", border: "1px solid var(--border)", background: "var(--bg-elevated)", color: "var(--accent)", cursor: "pointer", fontSize: 11.5, fontWeight: 650 }}>복구 데이터 열기</button>
+        {!complete && (
+          <button type="button" disabled={loading} onClick={load} style={button}>
+            {loading ? "불러오는 중…" : bytes ? `나머지 불러오기 · ${bytes.length.toLocaleString()} / ${total.toLocaleString()} bytes` : `본문 열기 · ${total.toLocaleString()} bytes`}
+          </button>
+        )}
+        {error && <span role="alert" style={{ color: "var(--danger)", fontSize: 11.5 }}>본문을 불러오지 못했습니다</span>}
       </div>
-    );
-  }
-  if (!body) return null;
-  if (/^image\//i.test(contentType) && !body.truncated) return <img src={`data:${contentType.split(";")[0]};base64,${body.bodyB64}`} alt="복구된 캐시 데이터" style={{ display: "block", maxWidth: "100%", maxHeight: 360, border: "1px solid var(--border)", borderRadius: "var(--radius)", background: "var(--bg-input)" }} />;
-  if (/^text\//i.test(contentType) || /json|javascript|xml|svg/i.test(contentType)) return <div><CodeOrJsonBlock raw={textPreview} expandTitle="캐시 데이터" />{textPreviewTruncated && <div style={{ marginTop: 6, color: "var(--text-faint)", fontSize: 11.5 }}>복구된 본문 {body.decodedSize.toLocaleString()} Bytes 중 성능 보호용 미리보기만 표시합니다.</div>}</div>;
-  const byteLength = parseByteSize(row.size_bytes || row.size || "");
-  return <span style={{ color: "var(--text-dim)", fontSize: 12.5 }}>바이너리 데이터 복구됨{byteLength !== null ? ` · ${byteLength.toLocaleString()} Bytes` : body.decodedSize ? ` · ${body.decodedSize.toLocaleString()} Bytes` : ""}{body.truncated ? " (미리보기 제한)" : ""}</span>;
+    </div>
+  );
+}
+
+function ExtraRows({ rows }: { rows: [string, string | null | undefined, boolean?][] }) {
+  const shown = rows.filter(([, value]) => value !== null && value !== undefined && value !== "");
+  if (!shown.length) return null;
+  return (
+    <div style={{ display: "grid", gridTemplateColumns: "minmax(96px, 30%) minmax(0, 1fr)", gap: "3px 8px" }}>
+      {shown.map(([label, value, mono]) => (
+        <Fragment key={label}>
+          <span style={{ fontSize: 11.5, color: "var(--text-faint)" }}>{label}</span>
+          <span style={{ fontSize: 12, color: "var(--text)", fontFamily: mono ? "var(--mono)" : undefined, wordBreak: "break-all" }}>{value}</span>
+        </Fragment>
+      ))}
+    </div>
+  );
+}
+
+function ExtraSection({ heading, children }: { heading: string; children: React.ReactNode }) {
+  return (
+    <div style={{ padding: "14px 16px", borderBottom: "1px solid var(--border-subtle)" }}>
+      <div className="dfir-section-label" style={{ marginBottom: 7 }}>{heading}</div>
+      {children}
+    </div>
+  );
+}
+
+// Stored relations of one BrowserActivity record: URL summary, search terms,
+// download URL chain, cache response and the collected input (docs-07).
+function BrowserRecordExtras({ recordId, eventType, hostDir }: { recordId: string; eventType: string; hostDir: string }) {
+  const [record, setRecord] = useState<BrowserRecord | null>(null);
+  const [failed, setFailed] = useState(false);
+  const [flowState, setFlowState] = useState<"idle" | "loading" | "ready" | "error">("idle");
+  const [flow, setFlow] = useState<BrowserVisitFlow | null>(null);
+  const [flowOpen, setFlowOpen] = useState(false);
+  useEffect(() => {
+    let alive = true;
+    setRecord(null);
+    setFailed(false);
+    setFlowOpen(false);
+    window.api.browserRecord(hostDir, recordId).then((result) => { if (alive) setRecord(result); }).catch(() => { if (alive) setFailed(true); });
+    return () => { alive = false; };
+  }, [hostDir, recordId]);
+  const loadFlow = () => {
+    setFlowOpen(true);
+    setFlowState("loading");
+    window.api.browserVisitFlow(hostDir, recordId).then((result) => { setFlow(result); setFlowState("ready"); }).catch(() => setFlowState("error"));
+  };
+  if (failed) return <ExtraSection heading="연결 기록"><span role="alert" style={{ color: "var(--danger)", fontSize: 12 }}>불러오지 못했습니다</span></ExtraSection>;
+  if (!record) return null;
+  const summary = record.urlSummary;
+  const cache = record.cache;
+  const bodyLength = Number(cache?.body_length);
+  return (
+    <>
+      {summary && (
+        <ExtraSection heading="URL 요약">
+          {eventType === "url_summary"
+            ? <ExtraRows rows={[["urls.id", summary.url_id, true], ["숨김", summary.hidden], ["마지막 방문 원문", summary.last_visit_raw, true], ["원본", [summary.source_table, summary.source_rowid].filter(Boolean).join(" #"), true]]} />
+            : <ExtraRows rows={[["누적 방문 횟수", summary.visit_count], ["주소창 직접 입력 횟수", summary.typed_count], ["마지막 방문", summary.timestamp, true]]} />}
+        </ExtraSection>
+      )}
+      {record.searchTerms.length > 0 && (
+        <ExtraSection heading={`검색어 (${record.searchTerms.length})`}>
+          <div style={{ display: "grid", gap: 4 }}>
+            {record.searchTerms.map((term) => (
+              <div key={term.search_id} style={{ display: "flex", gap: 8, alignItems: "baseline", fontSize: 12.5 }}>
+                <span style={{ fontWeight: 650 }}>{term.term}</span>
+                {term.normalized_term && term.normalized_term !== term.term && <span style={{ color: "var(--text-faint)", fontSize: 11.5 }}>{term.normalized_term}</span>}
+              </div>
+            ))}
+          </div>
+        </ExtraSection>
+      )}
+      {record.downloadChain.length > 0 && (
+        <ExtraSection heading={`다운로드 URL 체인 (${record.downloadChain.length})`}>
+          <ol style={{ margin: 0, padding: 0, listStyle: "none", display: "grid", gap: 4 }}>
+            {record.downloadChain.map((link) => (
+              <li key={link.ordinal} style={{ display: "grid", gridTemplateColumns: "24px minmax(0, 1fr)", gap: 6, fontFamily: "var(--mono)", fontSize: 11.5 }}>
+                <span style={{ color: "var(--text-faint)", textAlign: "right" }}>{link.chain_index ?? link.ordinal}</span>
+                <span style={{ wordBreak: "break-all" }}>{link.url}{link.url_decoded && link.url_decoded !== link.url && <span style={{ display: "block", color: "var(--text-dim)" }}>{link.url_decoded}</span>}</span>
+              </li>
+            ))}
+          </ol>
+        </ExtraSection>
+      )}
+      {cache && (
+        <ExtraSection heading="캐시 응답">
+          <div style={{ display: "grid", gap: 10 }}>
+            <ExtraRows rows={[
+              ["상태 줄", cache.status_line, true], ["Content-Type", cache.content_type, true], ["Content-Encoding", cache.content_encoding, true],
+              ["Content-Length", cache.content_length], ["저장 본문 크기", cache.body_size], ["본문 파일", cache.body_file, true],
+              ["본문 크기", cache.body_bytes],
+              ["Server", cache.server, true], ["Date", cache.date, true], ["Last-Modified", cache.last_modified, true], ["ETag", cache.etag, true],
+              ["Cache-Control", cache.cache_control, true], ["Location", cache.location, true],
+            ]} />
+            {cache.all_headers && <CodeOrJsonBlock raw={cache.all_headers} expandTitle="응답 헤더" />}
+            {Number.isFinite(bodyLength) && cache.body_length !== null && cache.body_length !== undefined && (
+              <CacheBodyView hostDir={hostDir} recordId={recordId} contentType={cache.content_type || ""} total={bodyLength} />
+            )}
+          </div>
+        </ExtraSection>
+      )}
+      {record.input && (
+        <ExtraSection heading="수집 입력">
+          <ExtraRows rows={[["원본 파일", record.input.source_file, true], ["facts DB", record.input.facts_db, true]]} />
+        </ExtraSection>
+      )}
+      {eventType === "visit" && (
+        <div style={{ padding: "14px 16px 18px" }}>
+          <button type="button" onClick={loadFlow} style={{ display: "inline-flex", alignItems: "center", gap: 7, padding: "8px 13px", borderRadius: "var(--radius)", border: "1px solid var(--accent)", background: "var(--accent-subtle)", color: "var(--accent)", cursor: "pointer", fontSize: 12.5, fontWeight: 650 }}>
+            <AccountTreeOutlinedIcon sx={{ fontSize: 16 }} />이동 흐름 보기
+          </button>
+          {flowOpen && <VisitFlowGraphModal state={flowState} graph={flow} onRetry={loadFlow} onClose={() => setFlowOpen(false)} />}
+        </div>
+      )}
+    </>
+  );
 }
 
 function FieldRow({ field, row, onFetchLinkedRows, hostDir, accountDirectory, onToggleFieldBookmark, isFieldBookmarked }: { field: FieldSpec; row: Record<string, string>; onFetchLinkedRows?: FetchLinkedRows; hostDir?: string; accountDirectory?: AccountDirectory; onToggleFieldBookmark?: (field: string) => void; isFieldBookmarked?: (field: string) => boolean }) {
@@ -423,7 +508,7 @@ function FieldRow({ field, row, onFetchLinkedRows, hostDir, accountDirectory, on
   // two identical actions for the same evidence value.
   // Plain fields that happen to contain JSON also render CodeOrJsonBlock, so
   // they must use its single copy control instead of adding FieldRow's copy.
-  const hasInlineCodeControls = kind === "code" || kind === "json" || kind === "cacheData" || kind === "mftData" || prettyJsonOrNull(raw) !== null;
+  const hasInlineCodeControls = kind === "code" || kind === "json" || kind === "mftData" || prettyJsonOrNull(raw) !== null;
 
   let content: React.ReactNode;
   switch (kind) {
@@ -465,9 +550,6 @@ function FieldRow({ field, row, onFetchLinkedRows, hostDir, accountDirectory, on
       break;
     case "durationMs":
       content = <span>{formatDurationMs(raw)}</span>;
-      break;
-    case "cacheData":
-      content = <CacheDataValue row={row} hostDir={hostDir} />;
       break;
     case "mftData":
       content = <MftResidentData row={row} />;
@@ -750,42 +832,6 @@ interface ArtifactDetailViewProps {
   slots?: Partial<Record<"relatedEvidence", React.ReactNode>>;
 }
 
-// "이 페이지를 둘러싼 이동" — reconstructs the browser visit navigation graph
-// (referrer + new-tab opener links, both directions) on demand from the raw
-// History DB and shows it as a 2D graph modal. Only meaningful for browser
-// visit/cache records.
-function VisitFlowLauncher({ row, hostDir }: { row: Record<string, string>; hostDir?: string }) {
-  const [state, setState] = useState<"idle" | "loading" | "ready" | "error">("idle");
-  const [graph, setGraph] = useState<BrowserVisitGraph | null>(null);
-  const [open, setOpen] = useState(false);
-  const isCache = row.event_type === "cache";
-
-  function load() {
-    if (!hostDir || !row.account) return;
-    setState("loading");
-    setOpen(true);
-    const url = isCache ? row.url || "" : row.url_raw || row.url || "";
-    const cacheKey = isCache ? row.cache_key || "" : undefined;
-    // 출처 고정 — 같은 브라우저의 History만 조회한다 (없으면 서버가 안내 반환).
-    window.api.browserVisitGraph(hostDir, row.account, url, cacheKey, row._source_file || undefined)
-      .then((result) => { setGraph(result); setState("ready"); })
-      .catch(() => setState("error"));
-  }
-
-  return (
-    <div>
-      <button
-        type="button"
-        onClick={load}
-        style={{ display: "inline-flex", alignItems: "center", gap: 7, padding: "8px 13px", borderRadius: "var(--radius)", border: "1px solid var(--accent)", background: "var(--accent-subtle)", color: "var(--accent)", cursor: "pointer", fontSize: 12.5, fontWeight: 650 }}
-      >
-        <AccountTreeOutlinedIcon sx={{ fontSize: 16 }} />유입 흐름 보기
-      </button>
-      {open && <VisitFlowGraphModal state={state} graph={graph} isCache={isCache} onRetry={load} onClose={() => setOpen(false)} />}
-    </div>
-  );
-}
-
 export default function ArtifactDetailView({ spec, row, evidenceTime, onNavigate, onFetchLinkedRows, hostDir, accountDirectory, onToggleFieldBookmark, isFieldBookmarked, slots }: ArtifactDetailViewProps) {
   const title = spec.title(row);
   const subtitle = spec.subtitle?.(row);
@@ -877,10 +923,8 @@ export default function ArtifactDetailView({ spec, row, evidenceTime, onNavigate
         </div>
       )}
 
-      {hostDir && row.account && (row.event_type === "visit" || row.event_type === "cache") && (
-        <div style={{ padding: "14px 16px 18px" }}>
-          <VisitFlowLauncher row={row} hostDir={hostDir} />
-        </div>
+      {hostDir && row.overview_name === "BrowserActivity" && row.record_id && (
+        <BrowserRecordExtras recordId={row.record_id} eventType={row.event_type} hostDir={hostDir} />
       )}
     </div>
   );

@@ -4,16 +4,13 @@ import { useModalDialog } from "@/lib/useModalDialog";
 import AccountTreeOutlinedIcon from "@mui/icons-material/AccountTreeOutlined";
 import CloseIcon from "@mui/icons-material/Close";
 import CircularProgress from "@mui/material/CircularProgress";
-import ReplayOutlinedIcon from "@mui/icons-material/ReplayOutlined";
 import OpenInNewOutlinedIcon from "@mui/icons-material/OpenInNewOutlined";
-import type { BrowserVisitGraph, VisitGraphEdge, VisitGraphNode } from "@/lib/types";
+import type { BrowserVisitFlow, VisitFlowEdge, VisitFlowNode } from "@/lib/types";
+import { transitionLabel } from "@/lib/browserView";
 
-// 유입 흐름 모달 — 원본 History의 방문 연결(from_visit·opener_visit)을 2D
-// 그래프로 그린다. 선택한 항목의 방문(대상)이 끝점이 아니라, 조상(유입)·후행
-// 이동·형제 분기까지 백엔드가 추적한 이웃 전체가 가로(시간 진행 방향)로
-// 퍼져나가는 트리 형태로 배치된다. 노드 하나 = visits 행 하나(같은 URL
-// 재이동은 entry에 접힘)이고, 간선은 자식 행의 링크 컬럼 그대로다.
-
+// Visit flow modal: stored from/opener relations of one input (docs-07 R08),
+// laid out as a left-to-right forest. Node identity is the record id; the
+// visits.id is shown as stored.
 const NODE_W = 224;
 const NODE_H = 78;
 const COL_W = 296;
@@ -27,16 +24,16 @@ const FIT_READABLE = 0.5;
 const FOCUS_ZOOM = 0.9;
 
 interface LaidNode {
-  node: VisitGraphNode;
+  node: VisitFlowNode;
   x: number;
   y: number;
 }
 
 interface Layout {
   nodes: LaidNode[];
-  edges: VisitGraphEdge[];
+  edges: VisitFlowEdge[];
   /** 자식 → 그 노드로 들어오는 간선(부모 연결). 노드당 최대 1개. */
-  parentOf: Map<string, VisitGraphEdge>;
+  parentOf: Map<string, VisitFlowEdge>;
   width: number;
   height: number;
 }
@@ -51,10 +48,10 @@ function visitDomain(url: string): string {
 
 // 각 노드는 부모가 최대 1개(백엔드의 접힌 그래프 계약)라 숲(forest)이다 —
 // 깊이(루트로부터의 거리)를 열로, 리프 순서 기반 tidy 배치를 행으로 쓴다.
-function layoutGraph(graph: BrowserVisitGraph): Layout {
-  const byId = new Map(graph.nodes.map((n) => [n.visitId, n]));
+function layoutGraph(graph: BrowserVisitFlow): Layout {
+  const byId = new Map(graph.nodes.map((n) => [n.recordId, n]));
   const children = new Map<string, string[]>();
-  const parentOf = new Map<string, VisitGraphEdge>();
+  const parentOf = new Map<string, VisitFlowEdge>();
   for (const edge of graph.edges) {
     if (!byId.has(edge.from) || !byId.has(edge.to) || parentOf.has(edge.to)) continue;
     parentOf.set(edge.to, edge);
@@ -64,7 +61,7 @@ function layoutGraph(graph: BrowserVisitGraph): Layout {
   }
   const timeOf = (id: string) => byId.get(id)?.time || "";
   const idNum = (id: string) => {
-    const n = Number(id);
+    const n = Number(byId.get(id)?.visitId);
     return Number.isFinite(n) ? n : Number.MAX_SAFE_INTEGER;
   };
   const byVisitOrder = (a: string, b: string) =>
@@ -88,8 +85,8 @@ function layoutGraph(graph: BrowserVisitGraph): Layout {
     return y;
   };
   const roots = graph.nodes
-    .filter((n) => !parentOf.has(n.visitId))
-    .map((n) => n.visitId)
+    .filter((n) => !parentOf.has(n.recordId))
+    .map((n) => n.recordId)
     .sort(byVisitOrder);
   for (const root of roots) {
     if (!visited.has(root)) {
@@ -99,8 +96,8 @@ function layoutGraph(graph: BrowserVisitGraph): Layout {
   }
   // 순환 데이터 방어 — 어느 루트에서도 닿지 못한 노드도 반드시 배치한다.
   for (const n of graph.nodes) {
-    if (!visited.has(n.visitId)) {
-      place(n.visitId, 0);
+    if (!visited.has(n.recordId)) {
+      place(n.recordId, 0);
       row += 0.35;
     }
   }
@@ -108,14 +105,15 @@ function layoutGraph(graph: BrowserVisitGraph): Layout {
   let maxCol = 0;
   let maxRow = 0;
   const laid: LaidNode[] = graph.nodes.map((n) => {
-    const p = pos.get(n.visitId) ?? { col: 0, row: 0 };
+    const p = pos.get(n.recordId) ?? { col: 0, row: 0 };
     maxCol = Math.max(maxCol, p.col);
     maxRow = Math.max(maxRow, p.row);
     return { node: n, x: PAD + p.col * COL_W, y: PAD + p.row * ROW_H };
   });
   return {
     nodes: laid,
-    edges: graph.edges.filter((e) => parentOf.get(e.to) === e),
+    // Positioning uses the first parent; every stored relation is drawn.
+    edges: graph.edges.filter((e) => byId.has(e.from) && byId.has(e.to)),
     parentOf,
     width: PAD * 2 + maxCol * COL_W + NODE_W,
     height: PAD * 2 + maxRow * ROW_H + NODE_H,
@@ -165,13 +163,8 @@ function GraphNodeCard({ laid, selected, onSelect }: { laid: LaidNode; selected:
           {n.visitId || "?"}
         </span>
         <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontFamily: "var(--mono)", fontSize: 10, color: "var(--text-time)" }}>{n.time || "시간 미상"}</span>
-        {n.reloads > 0 && (
-          <span title={`같은 URL로 ${n.reloads}회 재이동(리다이렉트·리로드)이 이 방문에 접혀 있습니다`} style={{ flexShrink: 0, marginLeft: "auto", display: "inline-flex", alignItems: "center", gap: 2, fontSize: 9.5, fontFamily: "var(--mono)", fontWeight: 700, color: "var(--text-faint)", padding: "0 4px", borderRadius: "var(--radius)", border: "1px solid var(--border-subtle)", background: "var(--bg-input)" }}>
-            <ReplayOutlinedIcon sx={{ fontSize: 10 }} />{n.reloads}
-          </span>
-        )}
         {n.isTarget && (
-          <span style={{ flexShrink: 0, marginLeft: n.reloads > 0 ? 0 : "auto", fontSize: 9, fontWeight: 800, letterSpacing: 0.3, color: "var(--danger)", padding: "0 5px", borderRadius: "var(--radius)", background: "color-mix(in srgb, var(--danger) 14%, transparent)" }}>이 항목</span>
+          <span style={{ flexShrink: 0, marginLeft: "auto", fontSize: 9, fontWeight: 800, letterSpacing: 0.3, color: "var(--danger)", padding: "0 5px", borderRadius: "var(--radius)", background: "color-mix(in srgb, var(--danger) 14%, transparent)" }}>이 항목</span>
         )}
       </span>
       <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 11.5, fontWeight: n.isTarget ? 700 : 600 }}>
@@ -184,7 +177,7 @@ function GraphNodeCard({ laid, selected, onSelect }: { laid: LaidNode; selected:
 
 // 하단 상세 패널 — 노드 카드에 다 못 싣는 원시 근거(전체 URL·transition·부모
 // 링크 컬럼 값)를 선택한 노드에 대해 그대로 보여준다.
-function NodeDetail({ node, parentEdge }: { node: VisitGraphNode; parentEdge?: VisitGraphEdge }) {
+function NodeDetail({ node, parentEdge }: { node: VisitFlowNode; parentEdge?: VisitFlowEdge }) {
   const newTab = parentEdge?.kind === "opener_visit";
   const rows: Array<[string, React.ReactNode]> = [
     ["시간", node.time || "시간 미상"],
@@ -193,16 +186,15 @@ function NodeDetail({ node, parentEdge }: { node: VisitGraphNode; parentEdge?: V
       "부모 연결",
       parentEdge ? (
         <span style={{ color: newTab ? "var(--warning)" : "var(--accent)" }}>
-          {parentEdge.kind}={parentEdge.from}
-          <span style={{ color: "var(--text-faint)" }}> · {newTab ? "새 탭에서 열림" : "같은 탭 이동"}</span>
+          {parentEdge.kind}
+          <span style={{ color: "var(--text-faint)" }}> · {newTab ? "새 탭" : "같은 탭"}</span>
         </span>
       ) : (
-        "없음 · 유입 시작점 (from_visit·opener 없음)"
+        "없음"
       ),
     ],
-    ["transition", `${node.transitionRaw} · ${node.transition}`],
+    ["transition", [transitionLabel(node.transition, node.qualifiers), [node.transition, node.qualifiers].filter(Boolean).join(" ")].filter(Boolean).join(" · ") || "—"],
   ];
-  if (node.reloads > 0) rows.push(["재이동", `같은 URL로 ${node.reloads}회 (리다이렉트·리로드, 이 방문에 접힘)`]);
   if (node.externalReferrer) rows.push(["외부 referrer", node.externalReferrer]);
   return (
     <div style={{ flexShrink: 0, maxHeight: 168, overflowY: "auto", borderTop: "1px solid var(--border)", padding: "10px 16px 12px", background: "var(--bg-panel)" }}>
@@ -225,7 +217,7 @@ function NodeDetail({ node, parentEdge }: { node: VisitGraphNode; parentEdge?: V
   );
 }
 
-function GraphCanvas({ graph }: { graph: BrowserVisitGraph }) {
+function GraphCanvas({ graph }: { graph: BrowserVisitFlow }) {
   const layout = useMemo(() => layoutGraph(graph), [graph]);
   const viewportRef = useRef<HTMLDivElement>(null);
   const [view, setView] = useState({ x: 0, y: 0, k: 1 });
@@ -238,8 +230,8 @@ function GraphCanvas({ graph }: { graph: BrowserVisitGraph }) {
   const [selectedId, setSelectedId] = useState<string | null>(() => {
     // 기본 선택: 대상(이 항목) 방문 중 가장 최근 것.
     const targets = graph.nodes.filter((n) => n.isTarget);
-    const latest = targets.reduce<VisitGraphNode | null>((best, n) => (!best || n.time > best.time ? n : best), null);
-    return latest?.visitId ?? graph.nodes[graph.nodes.length - 1]?.visitId ?? null;
+    const latest = targets.reduce<VisitFlowNode | null>((best, n) => (!best || n.time > best.time ? n : best), null);
+    return latest?.recordId ?? graph.nodes[graph.nodes.length - 1]?.recordId ?? null;
   });
 
   const fit = () => {
@@ -265,7 +257,7 @@ function GraphCanvas({ graph }: { graph: BrowserVisitGraph }) {
   const centerOn = (id: string | null, zoom?: number) => {
     const el = viewportRef.current;
     if (!el) return;
-    const laid = (id && layout.nodes.find((l) => l.node.visitId === id)) || layout.nodes[layout.nodes.length - 1];
+    const laid = (id && layout.nodes.find((l) => l.node.recordId === id)) || layout.nodes[layout.nodes.length - 1];
     if (!laid) return;
     const k = zoom ?? Math.max(viewRef.current.k, FOCUS_ZOOM);
     setView({ x: el.clientWidth / 2 - (laid.x + NODE_W / 2) * k, y: el.clientHeight / 2 - (laid.y + NODE_H / 2) * k, k });
@@ -301,14 +293,8 @@ function GraphCanvas({ graph }: { graph: BrowserVisitGraph }) {
     return () => el.removeEventListener("wheel", onWheel);
   }, []);
 
-  const selected = selectedId ? layout.nodes.find((l) => l.node.visitId === selectedId)?.node ?? null : null;
+  const selected = selectedId ? layout.nodes.find((l) => l.node.recordId === selectedId)?.node ?? null : null;
   const targetCount = graph.nodes.filter((n) => n.isTarget).length;
-  // 현재 배율에서 그래프가 뷰포트를 벗어나는지 — 벗어나면 이동 안내를 띄운다.
-  const viewportEl = viewportRef.current;
-  const overflowing =
-    !!viewportEl &&
-    (layout.width * view.k > viewportEl.clientWidth + 8 || layout.height * view.k > viewportEl.clientHeight + 8);
-
   return (
     <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
       <div
@@ -371,8 +357,8 @@ function GraphCanvas({ graph }: { graph: BrowserVisitGraph }) {
               </marker>
             </defs>
             {layout.edges.map((edge) => {
-              const from = layout.nodes.find((l) => l.node.visitId === edge.from);
-              const to = layout.nodes.find((l) => l.node.visitId === edge.to);
+              const from = layout.nodes.find((l) => l.node.recordId === edge.from);
+              const to = layout.nodes.find((l) => l.node.recordId === edge.to);
               if (!from || !to) return null;
               const x1 = from.x + NODE_W;
               const y1 = from.y + NODE_H / 2;
@@ -396,14 +382,9 @@ function GraphCanvas({ graph }: { graph: BrowserVisitGraph }) {
             })}
           </svg>
           {layout.nodes.map((laid) => (
-            <GraphNodeCard key={laid.node.visitId} laid={laid} selected={laid.node.visitId === selectedId} onSelect={() => setSelectedId(laid.node.visitId)} />
+            <GraphNodeCard key={laid.node.recordId} laid={laid} selected={laid.node.recordId === selectedId} onSelect={() => setSelectedId(laid.node.recordId)} />
           ))}
         </div>
-        {overflowing && (
-          <div style={{ position: "absolute", top: 10, left: 10, padding: "4px 9px", borderRadius: "var(--radius)", border: "1px solid var(--border-subtle)", background: "color-mix(in srgb, var(--bg-panel) 88%, transparent)", color: "var(--text-faint)", fontSize: 10.5, pointerEvents: "none" }}>
-            화면 밖에 더 있습니다 — 드래그·휠로 이동 · ⤢ 전체 보기
-          </div>
-        )}
         {/* 확대·축소 컨트롤 */}
         <div style={{ position: "absolute", top: 10, right: 10, display: "flex", gap: 5 }}>
           {([
@@ -431,49 +412,34 @@ function GraphCanvas({ graph }: { graph: BrowserVisitGraph }) {
           <span style={{ fontFamily: "var(--mono)" }}>노드 {graph.nodes.length} · 이동 {graph.edges.length}</span>
         </div>
       </div>
-      {selected && <NodeDetail node={selected} parentEdge={layout.parentOf.get(selected.visitId)} />}
+      {selected && <NodeDetail node={selected} parentEdge={layout.parentOf.get(selected.recordId)} />}
     </div>
   );
 }
 
-export default function VisitFlowGraphModal({ state, graph, isCache, onRetry, onClose }: { state: "idle" | "loading" | "ready" | "error"; graph: BrowserVisitGraph | null; isCache: boolean; onRetry: () => void; onClose: () => void }) {
+export default function VisitFlowGraphModal({ state, graph, onRetry, onClose }: { state: "idle" | "loading" | "ready" | "error"; graph: BrowserVisitFlow | null; onRetry: () => void; onClose: () => void }) {
   const dialogRef = useModalDialog(onClose);
   const hasGraph = state === "ready" && graph && graph.nodes.length > 0;
   return (
     <div onClick={onClose} style={{ position: "fixed", inset: 0, zIndex: 1100, display: "flex", alignItems: "center", justifyContent: "center", padding: 20, background: "rgba(1,4,9,0.6)" }}>
-      <div ref={dialogRef} role="dialog" aria-modal="true" aria-label="브라우저 유입 흐름 그래프" onClick={(event) => event.stopPropagation()} style={{ display: "flex", flexDirection: "column", width: "min(1240px, 96vw)", height: hasGraph ? "86vh" : undefined, maxHeight: "86vh", minHeight: 0, overflow: "hidden", background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "var(--radius)", boxShadow: "var(--shadow-panel)" }}>
+      <div ref={dialogRef} role="dialog" aria-modal="true" aria-label="방문 이동 흐름" onClick={(event) => event.stopPropagation()} style={{ display: "flex", flexDirection: "column", width: "min(1240px, 96vw)", height: hasGraph ? "86vh" : undefined, maxHeight: "86vh", minHeight: 0, overflow: "hidden", background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "var(--radius)", boxShadow: "var(--shadow-panel)" }}>
         <header style={{ display: "flex", flexShrink: 0, alignItems: "center", gap: 10, padding: "12px 16px", borderBottom: "1px solid var(--border)" }}>
           <AccountTreeOutlinedIcon sx={{ fontSize: 18, color: "var(--accent)" }} />
-          <span style={{ fontSize: 14, fontWeight: 700 }}>유입 흐름 · 페이지 이동 그래프</span>
-          {graph?.sourceFile && <span style={{ fontSize: 11, color: "var(--text-faint)", fontFamily: "var(--mono)" }}>{graph.sourceFile}</span>}
+          <span style={{ fontSize: 14, fontWeight: 700 }}>방문 이동 흐름</span>
+          {graph?.truncated && <span role="status" style={{ fontSize: 11.5, color: "var(--warning)" }}>일부만 표시</span>}
           <button data-dialog-autofocus type="button" onClick={onClose} aria-label="닫기" style={{ marginLeft: "auto", display: "inline-flex", padding: 4, border: "none", background: "transparent", color: "var(--text-faint)", cursor: "pointer" }}>
             <CloseIcon sx={{ fontSize: 18 }} />
           </button>
         </header>
-        {state === "loading" && <div style={{ display: "flex", alignItems: "center", gap: 8, color: "var(--text-dim)", fontSize: 12.5, padding: 24 }}><CircularProgress size={16} thickness={4} sx={{ color: "var(--accent)" }} />원본 방문 기록에서 이동 그래프 복원 중…</div>}
+        {state === "loading" && <div style={{ display: "flex", alignItems: "center", gap: 8, color: "var(--text-dim)", fontSize: 12.5, padding: 24 }}><CircularProgress size={16} thickness={4} sx={{ color: "var(--accent)" }} />불러오는 중</div>}
         {state === "error" && (
           <div role="alert" style={{ display: "flex", flexDirection: "column", gap: 10, padding: 24, color: "var(--text-dim)", fontSize: 12.5 }}>
-            유입 흐름을 불러오지 못했습니다.
+            이동 흐름을 불러오지 못했습니다.
             <button type="button" onClick={onRetry} style={{ alignSelf: "flex-start", padding: "5px 10px", borderRadius: "var(--radius)", border: "1px solid var(--border)", background: "var(--bg-elevated)", color: "var(--text)", cursor: "pointer", fontSize: 12 }}>다시 시도</button>
           </div>
         )}
-        {state === "ready" && !hasGraph && <div role="status" style={{ padding: 24, color: "var(--text-faint)", fontSize: 12.5, lineHeight: 1.6 }}>{graph?.note || "이 항목에 대한 방문 유입 흐름을 찾지 못했습니다."}</div>}
-        {hasGraph && (
-          <>
-            {(isCache && graph!.matchedPage) || graph!.truncated ? (
-              <div style={{ flexShrink: 0, display: "flex", flexDirection: "column", gap: 6, padding: "9px 16px", borderBottom: "1px solid var(--border-subtle)" }}>
-                {isCache && graph!.matchedPage && (
-                  <div style={{ color: "var(--text-dim)", fontSize: 11.5, lineHeight: 1.5 }}>
-                    {graph!.note}
-                    <span style={{ marginLeft: 6, fontFamily: "var(--mono)", fontSize: 11, color: "var(--text-faint)", wordBreak: "break-all" }}>기준 페이지: {graph!.matchedPage}</span>
-                  </div>
-                )}
-                {graph!.truncated && <div role="status" style={{ color: "var(--warning)", fontSize: 11.5 }}>방문·연결이 많아 가까운 일부만 표시했습니다 — 더 많은 이동이 있을 수 있습니다.</div>}
-              </div>
-            ) : null}
-            <GraphCanvas graph={graph!} />
-          </>
-        )}
+        {state === "ready" && !hasGraph && <div role="status" style={{ padding: 24, color: "var(--text-faint)", fontSize: 12.5 }}>연결된 방문 없음</div>}
+        {hasGraph && <GraphCanvas graph={graph!} />}
       </div>
     </div>
   );

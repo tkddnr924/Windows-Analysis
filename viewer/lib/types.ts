@@ -21,95 +21,135 @@ export interface LinkedRowsPage {
   rowCount: number;
 }
 
-export interface BrowserActivityQuery {
-  account?: string;
-  kinds: string[];
+/** Browser record filter (docs-07). Empty lists mean all. */
+export interface BrowserFilter {
+  inputIds?: string[];
+  /** visit, url_summary, download, cache */
+  kinds?: string[];
   day?: string;
-  search?: string;
+  /** Records without a representative time; time filters do not apply. */
+  untimed?: boolean;
   start?: string;
   end?: string;
-  offset: number;
-  limit: number;
-  /** Only summary ledgers request newest-first ordering; the daily evidence ledger remains chronological. */
-  descending?: boolean;
+  search?: string;
+  /** Only stored AI referral markers. */
+  referral?: boolean;
 }
 
-export interface BrowserVisitedDomainStat {
-  rowId: number;
+/** One collected browser input; label, confirmed account and SID stay apart. */
+export interface BrowserInputInfo {
+  inputId: string;
+  inputKind: string;
+  browser: string | null;
+  profile: string | null;
+  accountLabel: string | null;
+  account: string | null;
+  accountSid: string | null;
+  sourceFile: string | null;
+  recordCount: number;
+}
+
+export interface BrowserDomainStat {
   domain: string;
+  /** Individual visit events on the host. */
   visitCount: number;
-  /** Exact count of distinct stored URLs represented by the hostname. */
   urlCount: number;
 }
 
-export interface BrowserActivityInsights {
+export interface BrowserSummary {
+  /** Event days (visit/download/cache); URL summaries excluded. */
+  days: { value: string; count: number }[];
+  untimed: number;
+  kinds: { value: string; count: number }[];
   visitTotal: number;
-  topVisitedDomains: BrowserVisitedDomainStat[];
+  topDomains: BrowserDomainStat[];
+  domainTotal: number;
   downloadTotal: number;
   downloads: Record<string, string>[];
 }
 
-/** A bounded, exact-cache-record preview. `truncated` means the recovered
- * response is larger than the IPC-safe prefix returned in `bodyB64`. */
-export interface CacheBodyPreview {
-  bodyB64: string;
-  decodedSize: number;
-  truncated: boolean;
+export interface BrowserDomainPage {
+  domains: BrowserDomainStat[];
+  total: number;
 }
 
-/** One visit node of the reconstructed navigation graph. */
-export interface VisitGraphNode {
-  /** visits.id — the entry visit when same-URL re-navigations were collapsed. */
+export interface BrowserPage {
+  rows: Record<string, string>[];
+  rowCount: number;
+}
+
+/** One stored browser record with its relations; the cache body is separate. */
+export interface BrowserRecord {
+  row: Record<string, string>;
+  input: Record<string, string> | null;
+  urlSummary: Record<string, string> | null;
+  searchTerms: Record<string, string>[];
+  downloadChain: Record<string, string>[];
+  cache: Record<string, string> | null;
+  sources: Record<string, string>[];
+}
+
+export interface BrowserCacheBody {
+  dataB64: string;
+  offset: number;
+  total: number;
+}
+
+export interface VisitFlowNode {
+  recordId: string;
   visitId: string;
   url: string;
   title: string;
   time: string;
-  /** Decoded page-transition label (e.g. "링크 클릭 · 서버 리다이렉트"). */
   transition: string;
-  /** Raw visits.transition integer (decoded form is in `transition`). */
-  transitionRaw: string;
-  /** A visit of the looked-up page itself (or its cache document origin). */
-  isTarget: boolean;
-  /** Same-URL 재이동(리다이렉트·리로드)으로 이 노드에 접힌 방문 수. */
-  reloads: number;
-  /** Cross-site referrer recorded on this visit (may not be a page in the
-   *  visits table, e.g. https://chatgpt.com/). */
+  qualifiers: string;
   externalReferrer: string;
+  isTarget: boolean;
 }
 
-/** One navigation edge, provable against the DB via the child's link column. */
-export interface VisitGraphEdge {
-  /** Parent (navigation source) node's visits.id. */
+export interface VisitFlowEdge {
   from: string;
-  /** Child (navigation destination) node's visits.id. */
   to: string;
   /** "from_visit" (same tab) | "opener_visit" (new tab). */
   kind: string;
 }
 
-/** The navigation neighbourhood of a browser visit/cache record: ancestors
- *  (where it came from), descendants (where the user went next) and sibling
- *  branches off shared ancestors, as one graph. */
-export interface BrowserVisitGraph {
-  nodes: VisitGraphNode[];
-  edges: VisitGraphEdge[];
-  sourceFile: string;
-  /** For a cache resource: the navigated page it was attributed to. */
-  matchedPage: string;
-  note: string;
-  /** 방문·노드 상한에 걸려 일부 연결만 표시한 경우. */
+export interface BrowserVisitFlow {
+  nodes: VisitFlowNode[];
+  edges: VisitFlowEdge[];
   truncated: boolean;
 }
 
-/** A server-paginated page of host-normalised browser visit domains. */
-export interface BrowserDomainStatsPage {
-  domains: BrowserVisitedDomainStat[];
-  total: number;
+export interface AiQuery {
+  /** conversation | list_entry */
+  kind?: string;
+  untimed?: boolean;
+  start?: string;
+  end?: string;
+  search?: string;
+  offset: number;
+  limit: number;
+  ascending?: boolean;
 }
 
-export interface BrowserActivitySummary {
-  accounts: string[];
-  days: { value: string; count: number }[];
+export interface AiPage {
+  rows: Record<string, string>[];
+  rowCount: number;
+  kinds: { value: string; count: number }[];
+}
+
+export interface AiRecord {
+  row: Record<string, string>;
+  messages: Record<string, string>[];
+  attachments: Record<string, string>[];
+  interpretation: string | null;
+  sources: Record<string, string>[];
+  snapshots: Record<string, string>[];
+}
+
+export interface AiResponseChunk {
+  data: string;
+  offset: number;
   total: number;
 }
 
@@ -636,52 +676,6 @@ export interface MftListOptions {
   volumeId?: string;
 }
 
-/** Metadata-only cache entry (no body). Use cacheEntryBody() to fetch body on demand. */
-export interface CacheMeta {
-  account: string;
-  url: string;
-  contentType: string;
-  status: string;
-  responseTime: string;
-  bodySize: string;
-  cacheKey: string;
-}
-
-/** AI conversation extracted from the browser cache. */
-export interface AiConversation {
-  provider: string;
-  account: string;
-  title: string;
-  /** 대표 시각(UTC+9). 전역 기간 필터가 쓰는 값이다. */
-  timestamp: string;
-  /** Provider payload time values, retained independently from cache observation time. */
-  createdAt: string;
-  updatedAt: string;
-  url: string;
-  /** 파생 테이블 rowid — 원문 단건 조회 키. */
-  rowId: number;
-  /** 파생 레코드 ID(record_id). 원본 캐시 행은 source_records로 조회한다. */
-  recordId: string;
-  /** 파생 시점에 센 메시지 수. 목록은 원문을 받지 않는다. */
-  messageCount: number;
-}
-
-/** 대화 원문 — 목록이 아니라 대화를 열 때만 조회한다. */
-export interface AiConversationDetail {
-  rawJson: string;
-  recordId: string;
-}
-
-export interface AiConversationPage {
-  conversations: AiConversation[];
-  total: number;
-  sourceCount: number;
-  sourcesRead: number;
-  /** Cache files that could not be read; other files may still have results. */
-  sourceFailures: string[];
-  /** 파생 테이블 자체가 없는 이전 파싱본 — "기간 내 데이터 없음"과 구별한다. */
-  derivedMissing: boolean;
-}
 
 /** Server-side filters for one TargetInfo account's stored activity
  * (TargetAccountEvents). `recordId` is the account parent record_id. */
@@ -833,12 +827,18 @@ export interface ElectronApi {
   timelineSourcePage(fullPath: string, tableName: string | undefined, offset: number, limit: number): Promise<TimelineSourcePage>;
   linkedResultRows(fullPath: string, tableName: string, matchColumn: string, matchValue: string, search: string, offset: number, limit: number): Promise<LinkedRowsPage>;
   resultRow(fullPath: string, tableName: string, rowid: number): Promise<ResultRow>;
-  browserActivitySummary(fullPath: string, tableName: string, query: BrowserActivityQuery): Promise<BrowserActivitySummary>;
-  browserActivityInsights(fullPath: string, tableName: string, account: string | undefined, start: string | undefined, end: string | undefined): Promise<BrowserActivityInsights>;
-  browserActivityDomains(fullPath: string, tableName: string, account: string | undefined, start: string | undefined, end: string | undefined, offset: number, limit: number, ascending?: boolean): Promise<BrowserDomainStatsPage>;
-  browserActivityPage(fullPath: string, tableName: string, query: BrowserActivityQuery): Promise<CsvData>;
+  browserScope(fullPath: string): Promise<BrowserInputInfo[]>;
+  browserSummary(fullPath: string, filter: BrowserFilter): Promise<BrowserSummary>;
+  browserDomains(fullPath: string, filter: BrowserFilter, offset: number, limit: number, ascending: boolean): Promise<BrowserDomainPage>;
+  browserPage(fullPath: string, filter: BrowserFilter, offset: number, limit: number, descending: boolean): Promise<BrowserPage>;
+  /** Record-level reads resolve `_OVERVIEW/BrowserActivity.sqlite` under the host. */
+  browserRecord(hostDir: string, recordId: string): Promise<BrowserRecord>;
+  browserCacheBody(hostDir: string, recordId: string, offset: number, length: number): Promise<BrowserCacheBody>;
+  browserVisitFlow(hostDir: string, recordId: string): Promise<BrowserVisitFlow>;
   accountEventPage(hostDir: string, query: AccountEventQuery): Promise<AccountEventPage>;
-  aiReferrals(fullPath: string, tableName: string, start: string | undefined, end: string | undefined, offset: number, limit: number): Promise<CsvData>;
+  aiPage(fullPath: string, query: AiQuery): Promise<AiPage>;
+  aiRecord(fullPath: string, recordId: string): Promise<AiRecord>;
+  aiResponseBody(fullPath: string, sourceDb: string, sourceTable: string, sourceRowid: number, offset: number, length: number): Promise<AiResponseChunk>;
   /** parentEntry null = 부모 연결 미확인 묶음. parentSeq null + parentEntry = 볼륨 루트. */
   mftChildren(fullPath: string, parentEntry: number | null, parentSeq: number | null, offset?: number, limit?: number, volumeId?: string): Promise<MftChildrenPage>;
   mftSearch(fullPath: string, query: string, limit: number, volumeId?: string): Promise<DBRow[]>;
@@ -869,18 +869,6 @@ export interface ElectronApi {
   /** Stored candidate references for the file records on screen. */
   fileReferences(hostDir: string, datasetId: string, volumeId: string | undefined, fileRecordIds: string[]): Promise<FileReference[]>;
   pathReferenceAccounts(hostDir: string): Promise<string[]>;
-  /** Fetch an IPC-bounded preview for one exact cache record. An empty bodyB64
-   * means the parser did not retain a recoverable response body. */
-  cacheEntryBody(hostDir: string, account: string, url: string, cacheKey: string): Promise<CacheBodyPreview>;
-  /** Reconstruct the visit navigation graph (ancestors + descendants +
-   *  sibling branches) for a browser visit (pass its URL) or a cache record
-   *  (also pass its cacheKey) from the raw History DB on demand. */
-  /** sourceFile: 행의 `_source_file` — 같은 브라우저의 History만 조회하는 출처
-   *  고정에 쓰인다. 없으면(구 파싱본) 계정 후보 전체에서 조회한다. */
-  browserVisitGraph(hostDir: string, account: string, url: string, cacheKey?: string, sourceFile?: string): Promise<BrowserVisitGraph>;
-  /** AI conversations extracted from browser cache, filtered and paged by cache timestamp. */
-  aiConversations(hostDir: string, query: { start?: string; end?: string; offset: number; limit: number }): Promise<AiConversationPage>;
-  aiConversationDetail(hostDir: string, rowId: number): Promise<AiConversationDetail>;
   /** PowerShellHistory 원문(절단 없는 컬럼) 검색 — 일치 rowid 집합 반환. */
   powershellSearchRowids(fullPath: string, query: string): Promise<number[]>;
 }

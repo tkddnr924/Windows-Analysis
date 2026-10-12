@@ -8,7 +8,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type {
   AccountDirectoryEntry, Bookmark, BookmarkInput, Case, CategoryEntry, CsvData, DBRow, ElectronApi, Host, HostMetadata, LinkedRowsPage, MftChildrenPage,
-  ListCasesResult, CacheMeta, CacheBodyPreview, BrowserVisitGraph, FileReference, PipelineLogEntry, PipelineResult, ResultFileEntry, ResultProvenance, ArtifactInputFile, ParseReport, ParseEligibility, RunHostOptions, SearchCasePage, AiConversation, AiConversationPage, AiConversationDetail, BrowserActivityQuery, BrowserActivitySummary, BrowserActivityInsights, BrowserDomainStatsPage, AccountEventPage, AccountEventQuery, MftRecordBody, MftVolume, OverviewContractStatus, RecordSource, ResultRow, MftRecordsPage, ParseLogPreview, TimelineMeta, TimelineFacets, TimelinePage, TimelineSourcePage, TimelineQuery, UsnGroupsPage, UsnOverview,
+  ListCasesResult, FileReference, PipelineLogEntry, PipelineResult, ResultFileEntry, ResultProvenance, ArtifactInputFile, ParseReport, ParseEligibility, RunHostOptions, SearchCasePage, AccountEventPage, AccountEventQuery, MftRecordBody, MftVolume, OverviewContractStatus, RecordSource, ResultRow, MftRecordsPage, ParseLogPreview, TimelineMeta, TimelineFacets, TimelinePage, TimelineSourcePage, TimelineQuery, UsnGroupsPage, UsnOverview,
+  AiPage, AiRecord, AiResponseChunk, BrowserCacheBody, BrowserDomainPage, BrowserInputInfo, BrowserPage, BrowserRecord, BrowserSummary, BrowserVisitFlow,
   RegistryEntry, RegistryHive, RegistryRowsPage, RegistryQuickAccess, RegistrySearchPage, RegistryValueChunk,
 } from "./types";
 
@@ -74,13 +75,25 @@ function makeApi(): ElectronApi {
     timelineSourcePage: (fullPath, tableName, offset, limit) => invoke<TimelineSourcePage>("timeline_source_page", { fullPath, tableName: tableName ?? null, offset, limit }).then(table),
     linkedResultRows: (fullPath, tableName, matchColumn, matchValue, search, offset, limit) => invoke<LinkedRowsPage>("linked_result_rows", { fullPath, tableName, matchColumn, matchValue, search, offset, limit }).then(table),
     resultRow: (fullPath, tableName, rowid) => invoke<ResultRow>("result_row", { fullPath, tableName, rowid }).then((result) => { if (result.row) cells(result.row); return result; }),
-    browserActivitySummary: (fullPath, tableName, query) => invoke<BrowserActivitySummary>("browser_activity_summary", { fullPath, tableName, query }),
-    browserActivityInsights: (fullPath, tableName, account, start, end) => invoke<BrowserActivityInsights>("browser_activity_insights", { fullPath, tableName, account, start, end })
-      .then((insights) => { rows(insights.downloads); return insights; }),
-    browserActivityDomains: (fullPath, tableName, account, start, end, offset, limit, ascending) => invoke<BrowserDomainStatsPage>("browser_activity_domains", { fullPath, tableName, account, start, end, offset, limit, ascending: ascending ?? null }),
-    browserActivityPage: (fullPath, tableName, query) => invoke<CsvData>("browser_activity_page", { fullPath, tableName, query }).then(table),
+    browserScope: (fullPath) => invoke<BrowserInputInfo[]>("browser_scope", { fullPath }),
+    browserSummary: (fullPath, filter) => invoke<BrowserSummary>("browser_summary", { fullPath, filter }).then((summary) => { rows(summary.downloads); return summary; }),
+    browserDomains: (fullPath, filter, offset, limit, ascending) => invoke<BrowserDomainPage>("browser_domains", { fullPath, filter, offset, limit, ascending }),
+    browserPage: (fullPath, filter, offset, limit, descending) => invoke<BrowserPage>("browser_page", { fullPath, filter, offset, limit, descending }).then(table),
+    browserRecord: (hostDir, recordId) => invoke<BrowserRecord>("browser_record", { hostDir, recordId }).then((record) => {
+      cells(record.row);
+      for (const single of [record.input, record.urlSummary, record.cache]) if (single) cells(single);
+      rows(record.searchTerms); rows(record.downloadChain); rows(record.sources);
+      return record;
+    }),
+    browserCacheBody: (hostDir, recordId, offset, length) => invoke<BrowserCacheBody>("browser_cache_body", { hostDir, recordId, offset, length }),
+    browserVisitFlow: (hostDir, recordId) => invoke<BrowserVisitFlow>("browser_visit_flow", { hostDir, recordId }),
     accountEventPage: (hostDir, query) => invoke<AccountEventPage>("account_event_page", { hostDir, query }).then(table),
-    aiReferrals: (fullPath, tableName, start, end, offset, limit) => invoke<CsvData>("ai_referrals", { fullPath, tableName, start, end, offset, limit }).then(table),
+    aiPage: (fullPath, query) => invoke<AiPage>("ai_page", { fullPath, query }).then(table),
+    aiRecord: (fullPath, recordId) => invoke<AiRecord>("ai_record", { fullPath, recordId }).then((record) => {
+      cells(record.row); rows(record.messages); rows(record.attachments); rows(record.sources); rows(record.snapshots);
+      return record;
+    }),
+    aiResponseBody: (fullPath, sourceDb, sourceTable, sourceRowid, offset, length) => invoke<AiResponseChunk>("ai_response_body", { fullPath, sourceDb, sourceTable, sourceRowid, offset, length }),
     // 볼륨 문맥은 호출자가 고른 값만 넘긴다 — 미지정은 볼륨 구분 없는 조회다.
     mftChildren: (fullPath, parentEntry, parentSeq, offset, limit, volumeId) => invoke<MftChildrenPage>("mft_children", { fullPath, parentEntry: parentEntry ?? null, parentSeq: parentSeq ?? null, offset, limit, volumeId: volumeId ?? null }).then(table),
     mftSearch: (fullPath, query, limit, volumeId) => invoke<DBRow[]>("mft_search", { fullPath, query, limit, volumeId: volumeId ?? null }).then(rows),
@@ -144,10 +157,6 @@ function makeApi(): ElectronApi {
     fileReferences: (hostDir, datasetId, volumeId, fileRecordIds) => invoke<FileReference[]>("file_references", { hostDir, datasetId, volumeId: volumeId ?? null, fileRecordIds })
       .then((references) => { for (const reference of references) cells(reference.row); return references; }),
     pathReferenceAccounts: (hostDir) => invoke<string[]>("path_reference_accounts", { hostDir }),
-    cacheEntryBody: (hostDir, account, url, cacheKey) => invoke<CacheBodyPreview>("cache_entry_body", { hostDir, account, url, cacheKey }),
-    browserVisitGraph: (hostDir, account, url, cacheKey, sourceFile) => invoke<BrowserVisitGraph>("browser_visit_graph", { hostDir, account, url, cacheKey: cacheKey ?? null, sourceFile: sourceFile ?? null }),
-    aiConversations: (hostDir, query) => invoke<AiConversationPage>("ai_conversations", { hostDir, query }),
-    aiConversationDetail: (hostDir, rowId) => invoke<AiConversationDetail>("ai_conversation_detail", { hostDir, rowId }),
     powershellSearchRowids: (fullPath, query) => invoke<number[]>("powershell_search_rowids", { fullPath, query }),
   };
 }

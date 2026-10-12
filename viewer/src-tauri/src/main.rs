@@ -18,7 +18,9 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{LazyLock, Mutex};
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::{Duration, Instant};
+#[cfg(test)]
+use std::time::UNIX_EPOCH;
 
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OpenFlags};
@@ -1222,10 +1224,6 @@ async fn run_host(
                         format!("[LIFECYCLE] 재파싱으로 이 호스트의 이전 북마크 {removed}건 삭제"),
                     );
                 }
-                // 발행으로 원본 파일 지문이 바뀌었으므로 뷰 캐시(계정 이벤트
-                // 인덱스·브라우저 도메인 집계)의 기존 엔트리는 다시 히트될 수
-                // 없다. TTL은 다음 접근에만 돌기 때문에 여기서 비운다.
-                clear_result_view_caches();
             }
             emit_pipeline_event(
                 &app,
@@ -2707,112 +2705,6 @@ struct LinkedRowsPage {
     row_count: i64,
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct BrowserActivityQuery {
-    account: Option<String>,
-    kinds: Vec<String>,
-    day: Option<String>,
-    search: Option<String>,
-    start: Option<String>,
-    end: Option<String>,
-    offset: i64,
-    limit: i64,
-    descending: Option<bool>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct BrowserActivitySummary {
-    accounts: Vec<String>,
-    days: Vec<ColumnValue>,
-    total: i64,
-}
-
-/// Compact domain aggregate for the Browser activity summary. Keeping this
-/// result bounded prevents a large history database from being copied into the
-/// webview merely to render its top domains.
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct BrowserVisitedDomainStat {
-    row_id: i64,
-    domain: String,
-    visit_count: i64,
-    /// Exact count of distinct stored URLs represented by this hostname.
-    url_count: i64,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct BrowserActivityInsights {
-    visit_total: i64,
-    top_visited_domains: Vec<BrowserVisitedDomainStat>,
-    download_total: i64,
-    downloads: Vec<Map<String, Value>>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct BrowserDomainStatsPage {
-    domains: Vec<BrowserVisitedDomainStat>,
-    total: i64,
-}
-
-/// Bounded LRU cache for the server-side hostname aggregation used by the
-/// domain modal. The filesystem fingerprint prevents a re-parse/replaced
-/// BrowserActivity SQLite from serving stale pages.
-#[derive(Clone, PartialEq, Eq)]
-struct BrowserDomainCacheKey {
-    full_path: String,
-    table_name: String,
-    account: String,
-    start: String,
-    end: String,
-    size: Option<u64>,
-    modified_ns: Option<u128>,
-}
-
-struct BrowserDomainCacheEntry {
-    key: BrowserDomainCacheKey,
-    domains: Vec<BrowserVisitedDomainStat>,
-    /// 이 엔트리가 붙잡고 있는 대략적인 상주 바이트(문자열 소유분 포함).
-    bytes: usize,
-    inserted_at: Instant,
-}
-
-#[derive(Default)]
-struct BrowserDomainCache {
-    entries: VecDeque<BrowserDomainCacheEntry>,
-}
-
-const BROWSER_DOMAIN_CACHE_MAX_ENTRIES: usize = 4;
-const BROWSER_DOMAIN_CACHE_MAX_DOMAINS_PER_ENTRY: usize = 50_000;
-/// 항목 수만으로는 실제 상주량이 정해지지 않는다(도메인 문자열 길이가 제각각).
-/// TTL은 get/put이 다시 호출될 때만 돌기 때문에, 뷰를 떠난 뒤의 상주량 상한은
-/// 이 바이트 예산이 정한다.
-const BROWSER_DOMAIN_CACHE_MAX_BYTES: usize = 8 * 1024 * 1024;
-const BROWSER_DOMAIN_CACHE_TTL: Duration = Duration::from_secs(30);
-static BROWSER_DOMAIN_CACHE: LazyLock<Mutex<BrowserDomainCache>> =
-    LazyLock::new(|| Mutex::new(BrowserDomainCache::default()));
-
-fn browser_domain_bytes(domains: &[BrowserVisitedDomainStat]) -> usize {
-    domains
-        .iter()
-        .map(|stat| std::mem::size_of::<BrowserVisitedDomainStat>() + stat.domain.capacity())
-        .sum()
-}
-
-/// 파싱이 결과를 다시 발행하면 브라우저 도메인 캐시의 기존 엔트리는 파일 지문이
-/// 달라져 다시 히트될 수 없다 — 즉 순수한 쓰레기다. TTL은 다음 접근에만 돌기 때문에
-/// 발행 시점에 명시적으로 비운다.
-fn clear_result_view_caches() {
-    BROWSER_DOMAIN_CACHE
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .entries
-        .clear();
-}
-
 /// Test helper: a JSON cell as display text.
 #[cfg(test)]
 fn value_text(value: &Value) -> Option<String> {
@@ -2975,572 +2867,795 @@ async fn account_event_page(
         .map_err(|error| format!("account event worker stopped unexpectedly: {error}"))?
 }
 
-fn browser_activity_where(query: &BrowserActivityQuery) -> (String, Vec<String>) {
-    let mut clauses = Vec::new();
-    let mut params = Vec::new();
-    if let Some(account) = query
-        .account
-        .as_ref()
-        .filter(|v| !v.is_empty() && *v != "(전체)")
-    {
-        clauses.push("account = ?".to_string());
-        params.push(account.clone());
-    }
-    if !query.kinds.is_empty() {
-        clauses.push(format!(
-            // 활동 종류는 공통 컬럼 event_type이다(docs-01 "기존 컬럼의 이동").
-            "event_type IN ({})",
-            (0..query.kinds.len())
-                .map(|_| "?")
-                .collect::<Vec<_>>()
-                .join(",")
-        ));
-        params.extend(query.kinds.iter().cloned());
-    }
-    if let Some(day) = query.day.as_ref().filter(|v| !v.is_empty()) {
-        clauses.push("substr(timestamp, 1, 10) = ?".to_string());
-        params.push(day.clone());
-    }
-    if let Some(start) = query.start.as_ref().filter(|v| !v.is_empty()) {
-        clauses.push("timestamp >= ?".to_string());
-        params.push(start.clone());
-    }
-    if let Some(end) = query.end.as_ref().filter(|v| !v.is_empty()) {
-        clauses.push("timestamp <= ?".to_string());
-        params.push(end.clone());
-    }
-    if let Some(search) = query.search.as_ref().filter(|v| !v.trim().is_empty()) {
-        clauses.push("(url LIKE ? OR title LIKE ? OR url_raw LIKE ?)".to_string());
-        let like = format!("%{}%", search.trim());
-        params.extend([like.clone(), like.clone(), like]);
-    }
-    (
-        if clauses.is_empty() {
-            String::new()
-        } else {
-            format!(" WHERE {}", clauses.join(" AND "))
-        },
-        params,
-    )
+// --- commands: browser activity and AI conversations (docs-07) -------------
+// Only _OVERVIEW BrowserActivity/AiConversations and their child tables are
+// read; facts and collected browser files are never reopened.
+
+const BROWSER_DB: &str = "BrowserActivity.sqlite";
+/// Kinds that are events; `url_summary` is an aggregate (R04).
+const BROWSER_EVENT_KINDS: &str = "('visit','download','cache')";
+/// Columns sent for list rows; detail reads the full record (R17).
+const BROWSER_LIST_COLUMNS: &str = "b.rowid AS __rowid, b.record_id, b.host_id, b.dataset_id, \
+     b.overview_name, b.timestamp, b.timestamp_kind, b.event_type, b.input_id, b.browser, b.profile, \
+     b.account, b.account_sid, b.account_label, b.input_kind, b.title, b.url, b.url_raw, b.detail, \
+     b.source_url, b.visit_count, b.typed_count, b.transition_core, b.size, b.size_bytes, b.mime, \
+     b.danger, b.download_state, b.download_opened, b.http_status, b.cache_body_recovered, \
+     b.body_bytes, b.ai_service_provider, b.ai_referral_provider, b.ai_referral_param";
+/// Parent columns matched by the browser search (R12).
+const BROWSER_SEARCH_COLUMNS: &[&str] = &[
+    "title", "url", "url_raw", "detail", "source_url", "external_referrer_url", "mime",
+    "download_path", "download_path_resolved", "download_current_path",
+    "download_current_path_resolved", "download_referrer", "download_tab_url",
+    "download_tab_referrer_url", "download_site_url", "download_url_first", "download_url_final",
+    "request_url", "cache_key", "account", "account_sid", "account_label", "browser", "profile",
+];
+const BROWSER_FLOW_MAX_NODES: usize = 200;
+const BROWSER_CACHE_CHUNK_MAX: i64 = 4 * 1024 * 1024;
+
+#[derive(Deserialize, Default, Clone)]
+#[serde(rename_all = "camelCase", default)]
+struct BrowserFilter {
+    /// Selected inputs (empty: all).
+    input_ids: Vec<String>,
+    /// visit, url_summary, download, cache (empty: all).
+    kinds: Vec<String>,
+    day: Option<String>,
+    /// Records without a representative time (time filters do not apply).
+    untimed: bool,
+    start: Option<String>,
+    end: Option<String>,
+    search: Option<String>,
+    /// Only stored AI referral markers (R15).
+    referral: bool,
 }
 
-fn browser_activity_summary_blocking(
-    full_path: String,
-    table_name: String,
-    query: BrowserActivityQuery,
-) -> Result<BrowserActivitySummary, String> {
-    let conn = open_ro(&full_path)?;
-    let (where_, params) = browser_activity_where(&query);
-    let refs: Vec<&dyn rusqlite::ToSql> =
-        params.iter().map(|v| v as &dyn rusqlite::ToSql).collect();
-    let total = conn
-        .query_row(
-            &format!("SELECT COUNT(*) FROM {}{}", q(&table_name), where_),
-            refs.as_slice(),
-            |r| r.get(0),
-        )
-        .map_err(|e| e.to_string())?;
-    let accounts = {
-        let mut stmt = conn
-            .prepare(&format!(
-                "SELECT DISTINCT account FROM {}{} ORDER BY account",
-                q(&table_name),
-                where_
-            ))
-            .map_err(|e| e.to_string())?;
-        let accounts = stmt
-            .query_map(refs.as_slice(), |r| r.get::<_, String>(0))
-            .map_err(|e| e.to_string())?
-            .filter_map(|r| r.ok())
-            .collect();
-        accounts
+/// Which filter parts a query applies.
+#[derive(Clone, Copy)]
+struct BrowserFilterParts {
+    kinds: bool,
+    day: bool,
+    search: bool,
+}
+
+/// WHERE clauses over alias `b` with numbered text parameters.
+fn browser_where(filter: &BrowserFilter, parts: BrowserFilterParts) -> (Vec<String>, Vec<String>) {
+    let mut clauses = Vec::new();
+    let mut params: Vec<String> = Vec::new();
+    let bind = |params: &mut Vec<String>, value: String| {
+        params.push(value);
+        format!("?{}", params.len())
     };
-    let mut stmt = conn.prepare(&format!("SELECT substr(timestamp, 1, 10), COUNT(*) FROM {}{} GROUP BY substr(timestamp, 1, 10) ORDER BY 1", q(&table_name), where_)).map_err(|e| e.to_string())?;
-    let days = stmt
-        .query_map(refs.as_slice(), |r| {
-            Ok(ColumnValue {
-                value: r.get(0)?,
-                count: r.get(1)?,
+    if !filter.input_ids.is_empty() {
+        let marks: Vec<String> = filter.input_ids.iter().map(|id| bind(&mut params, id.clone())).collect();
+        clauses.push(format!("b.input_id IN ({})", marks.join(",")));
+    }
+    if parts.kinds && !filter.kinds.is_empty() {
+        let marks: Vec<String> = filter.kinds.iter().map(|kind| bind(&mut params, kind.clone())).collect();
+        clauses.push(format!("b.event_type IN ({})", marks.join(",")));
+    }
+    if filter.untimed {
+        clauses.push("b.timestamp IS NULL".into());
+    } else {
+        if parts.day {
+            if let Some(day) = filter.day.as_ref().filter(|day| !day.is_empty()) {
+                let from = bind(&mut params, day.clone());
+                let to = bind(&mut params, format!("{day}~"));
+                clauses.push(format!("b.timestamp >= {from} AND b.timestamp < {to}"));
+            }
+        }
+        if let Some(start) = filter.start.as_ref().filter(|value| !value.is_empty()) {
+            clauses.push(format!("b.timestamp >= {}", bind(&mut params, start.clone())));
+        }
+        if let Some(end) = filter.end.as_ref().filter(|value| !value.is_empty()) {
+            clauses.push(format!("b.timestamp <= {}", bind(&mut params, end.clone())));
+        }
+    }
+    if filter.referral {
+        clauses.push("b.ai_referral_provider IS NOT NULL".into());
+    }
+    if parts.search {
+        if let Some(needle) = filter.search.as_ref().filter(|value| !value.trim().is_empty()) {
+            let n = bind(&mut params, like_contains(needle));
+            let mut ors: Vec<String> = BROWSER_SEARCH_COLUMNS
+                .iter()
+                .map(|column| format!("b.{column} LIKE {n} ESCAPE '\\'"))
+                .collect();
+            // Child matches reduce to their parent row (EXISTS).
+            ors.push(format!(
+                "EXISTS (SELECT 1 FROM \"BrowserSearchTerms\" t WHERE t.summary_id IN (b.record_id, b.url_summary_id) \
+                 AND (t.term LIKE {n} ESCAPE '\\' OR t.normalized_term LIKE {n} ESCAPE '\\'))"
+            ));
+            ors.push(format!(
+                "EXISTS (SELECT 1 FROM \"BrowserDownloadChain\" c WHERE c.record_id = b.record_id \
+                 AND (c.url LIKE {n} ESCAPE '\\' OR c.url_decoded LIKE {n} ESCAPE '\\'))"
+            ));
+            ors.push(format!(
+                "EXISTS (SELECT 1 FROM \"BrowserCacheDetails\" d WHERE d.record_id = b.record_id \
+                 AND (d.all_headers LIKE {n} ESCAPE '\\' OR d.status_line LIKE {n} ESCAPE '\\'))"
+            ));
+            clauses.push(format!("({})", ors.join(" OR ")));
+        }
+    }
+    (clauses, params)
+}
+
+fn where_sql(clauses: &[String]) -> String {
+    if clauses.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", clauses.join(" AND "))
+    }
+}
+
+fn text_refs(params: &[String]) -> Vec<&dyn rusqlite::ToSql> {
+    params.iter().map(|value| value as &dyn rusqlite::ToSql).collect()
+}
+
+fn count_where(conn: &Connection, from: &str, clauses: &[String], params: &[String]) -> Result<i64, String> {
+    conn.query_row(&format!("SELECT COUNT(*) FROM {from}{}", where_sql(clauses)), text_refs(params).as_slice(), |row| row.get(0))
+        .map_err(|error| error.to_string())
+}
+
+fn browser_db_of(host_dir: &str) -> String {
+    Path::new(host_dir).join("_OVERVIEW").join(BROWSER_DB).to_string_lossy().to_string()
+}
+
+/// One collected browser input (R10: label, confirmed account and SID apart).
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserInputInfo {
+    input_id: String,
+    input_kind: String,
+    browser: Option<String>,
+    profile: Option<String>,
+    account_label: Option<String>,
+    account: Option<String>,
+    account_sid: Option<String>,
+    source_file: Option<String>,
+    record_count: i64,
+}
+
+fn browser_scope_blocking(full_path: String) -> Result<Vec<BrowserInputInfo>, String> {
+    let conn = open_ro(&full_path)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT i.input_id, i.input_kind, i.browser, i.profile, i.account_label, i.account, i.account_sid, \
+             i.source_file, (SELECT COUNT(*) FROM \"BrowserActivity\" b WHERE b.input_id = i.input_id) \
+             FROM \"BrowserInputs\" i ORDER BY i.ordinal",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(BrowserInputInfo {
+                input_id: row.get(0)?,
+                input_kind: row.get(1)?,
+                browser: row.get(2)?,
+                profile: row.get(3)?,
+                account_label: row.get(4)?,
+                account: row.get(5)?,
+                account_sid: row.get(6)?,
+                source_file: row.get(7)?,
+                record_count: row.get(8)?,
             })
         })
-        .map_err(|e| e.to_string())?
-        .filter_map(|r| r.ok())
-        .collect();
-    Ok(BrowserActivitySummary {
-        accounts,
-        days,
-        total,
-    })
+        .map_err(|error| error.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|error| error.to_string())
 }
 
-/// Browser summaries can group large activity tables. Keep SQLite work off
-/// the command path so changing the date/account filter does not stall other
-/// controls in the WebView.
 #[tauri::command]
-async fn browser_activity_summary(
-    full_path: String,
-    table_name: String,
-    query: BrowserActivityQuery,
-) -> Result<BrowserActivitySummary, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        browser_activity_summary_blocking(full_path, table_name, query)
-    })
-    .await
-    .map_err(|error| format!("브라우저 요약 작업이 중단되었습니다: {error}"))?
+async fn browser_scope(full_path: String) -> Result<Vec<BrowserInputInfo>, String> {
+    tauri::async_runtime::spawn_blocking(move || browser_scope_blocking(full_path))
+        .await
+        .map_err(|error| format!("브라우저 입력 조회가 중단되었습니다: {error}"))?
 }
 
-/// Extract a hostname only when the stored browser URL is a valid absolute URL
-/// with a host. `Url` normalises authority syntax; lower-casing and trimming a
-/// terminal DNS dot yields a stable display/grouping value while the original
-/// URL evidence remains unchanged in SQLite.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserDomainStat {
+    domain: String,
+    /// Individual visit events on this host.
+    visit_count: i64,
+    /// Distinct stored URLs on this host.
+    url_count: i64,
+}
+
+/// Hostname of a stored absolute URL (display/grouping only).
 fn browser_url_domain(value: &str) -> Option<String> {
     let parsed = Url::parse(value.trim()).ok()?;
     let host = parsed.host_str()?.trim_end_matches('.');
     (!host.is_empty()).then(|| host.to_ascii_lowercase())
 }
 
-fn browser_domain_cache_key(
-    full_path: &str,
-    table_name: &str,
-    account: Option<&str>,
-    start: Option<&str>,
-    end: Option<&str>,
-) -> BrowserDomainCacheKey {
-    let metadata = std::fs::metadata(full_path).ok();
-    let modified_ns = metadata
-        .as_ref()
-        .and_then(|metadata| metadata.modified().ok())
-        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-        .map(|duration| duration.as_nanos());
-    BrowserDomainCacheKey {
-        full_path: full_path.to_string(),
-        table_name: table_name.to_string(),
-        account: account.unwrap_or_default().to_string(),
-        start: start.unwrap_or_default().to_string(),
-        end: end.unwrap_or_default().to_string(),
-        size: metadata.as_ref().map(|metadata| metadata.len()),
-        modified_ns,
+/// Visit events per host in scope (inputs + period); url_summary rows are not
+/// visits and hostless URLs cannot form a domain.
+fn browser_visit_domains(conn: &Connection, filter: &BrowserFilter) -> Result<Vec<BrowserDomainStat>, String> {
+    let scope = BrowserFilter { kinds: Vec::new(), untimed: false, search: None, day: None, referral: false, ..filter.clone() };
+    let (mut clauses, params) = browser_where(&scope, BrowserFilterParts { kinds: false, day: false, search: false });
+    clauses.push("b.event_type = 'visit'".into());
+    clauses.push("COALESCE(b.url, '') <> ''".into());
+    let mut stmt = conn
+        .prepare(&format!("SELECT b.url, COUNT(*) FROM \"BrowserActivity\" b{} GROUP BY b.url", where_sql(&clauses)))
+        .map_err(|error| error.to_string())?;
+    let mut totals: BTreeMap<String, (i64, i64)> = BTreeMap::new();
+    let mut rows = stmt.query(text_refs(&params).as_slice()).map_err(|error| error.to_string())?;
+    while let Some(row) = rows.next().map_err(|error| error.to_string())? {
+        let url: String = row.get(0).map_err(|error| error.to_string())?;
+        let visits: i64 = row.get(1).map_err(|error| error.to_string())?;
+        let Some(domain) = browser_url_domain(&url) else { continue };
+        let entry = totals.entry(domain).or_insert((0, 0));
+        entry.0 += visits;
+        entry.1 += 1;
     }
+    let mut domains: Vec<BrowserDomainStat> = totals
+        .into_iter()
+        .map(|(domain, (visit_count, url_count))| BrowserDomainStat { domain, visit_count, url_count })
+        .collect();
+    domains.sort_by(|left, right| right.visit_count.cmp(&left.visit_count).then_with(|| left.domain.cmp(&right.domain)));
+    Ok(domains)
 }
 
-fn browser_domain_cache_get(key: &BrowserDomainCacheKey) -> Option<Vec<BrowserVisitedDomainStat>> {
-    let mut cache = BROWSER_DOMAIN_CACHE
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let now = Instant::now();
-    cache
-        .entries
-        .retain(|entry| now.duration_since(entry.inserted_at) <= BROWSER_DOMAIN_CACHE_TTL);
-    let index = cache.entries.iter().position(|entry| entry.key == *key)?;
-    let entry = cache.entries.remove(index)?;
-    let domains = entry.domains.clone();
-    cache.entries.push_back(entry);
-    Some(domains)
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserSummary {
+    /// Event days (visit/download/cache), url_summary excluded.
+    days: Vec<ColumnValue>,
+    /// Records without a representative time in the selected kinds.
+    untimed: i64,
+    /// Records per kind in scope (inputs + period).
+    kinds: Vec<ColumnValue>,
+    visit_total: i64,
+    top_domains: Vec<BrowserDomainStat>,
+    domain_total: i64,
+    download_total: i64,
+    downloads: Vec<Map<String, Value>>,
 }
 
-fn browser_domain_cache_put(key: BrowserDomainCacheKey, domains: Vec<BrowserVisitedDomainStat>) {
-    // The cache is capped by entry count, domain count, and a byte budget. Very
-    // broad scopes still return a server page, but are deliberately not
-    // retained in memory.
-    let bytes = browser_domain_bytes(&domains);
-    if domains.len() > BROWSER_DOMAIN_CACHE_MAX_DOMAINS_PER_ENTRY
-        || bytes > BROWSER_DOMAIN_CACHE_MAX_BYTES
-    {
-        return;
-    }
-    let mut cache = BROWSER_DOMAIN_CACHE
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let now = Instant::now();
-    cache.entries.retain(|entry| {
-        now.duration_since(entry.inserted_at) <= BROWSER_DOMAIN_CACHE_TTL && entry.key != key
-    });
-    cache.entries.push_back(BrowserDomainCacheEntry {
-        key,
-        domains,
-        bytes,
-        inserted_at: now,
-    });
-    let mut total: usize = cache.entries.iter().map(|entry| entry.bytes).sum();
-    while cache.entries.len() > BROWSER_DOMAIN_CACHE_MAX_ENTRIES
-        || (total > BROWSER_DOMAIN_CACHE_MAX_BYTES && cache.entries.len() > 1)
-    {
-        match cache.entries.pop_front() {
-            Some(dropped) => total = total.saturating_sub(dropped.bytes),
-            None => break,
-        }
-    }
-}
+fn browser_summary_blocking(full_path: String, filter: BrowserFilter) -> Result<BrowserSummary, String> {
+    let conn = open_ro(&full_path)?;
+    let scope = BrowserFilter { untimed: false, day: None, search: None, referral: false, ..filter.clone() };
+    let no_search = BrowserFilterParts { kinds: true, day: false, search: false };
 
-#[cfg(test)]
-static BROWSER_DOMAIN_AGGREGATION_BUILD_COUNT: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-#[cfg(test)]
-fn clear_browser_domain_cache_for_test() {
-    BROWSER_DOMAIN_CACHE
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .entries
-        .clear();
-    BROWSER_DOMAIN_AGGREGATION_BUILD_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
-}
-
-/// Produces the complete, server-side domain ordering for one account and
-/// incident period. Callers page the returned aggregate before serialisation;
-/// individual browser activity records never leave the backend for this view.
-fn browser_visit_domains(
-    conn: &Connection,
-    table_name: &str,
-    visit_where: &str,
-    refs: &[&dyn rusqlite::ToSql],
-) -> Result<Vec<BrowserVisitedDomainStat>, String> {
-    #[cfg(test)]
-    BROWSER_DOMAIN_AGGREGATION_BUILD_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    // Aggregate one exact stored URL before grouping by normalised hostname.
-    // This retains the former URL grouping semantics for `url_count`.
-    let mut url_stmt = conn
+    let (mut day_clauses, day_params) = browser_where(&scope, no_search);
+    day_clauses.push(format!("b.event_type IN {BROWSER_EVENT_KINDS}"));
+    day_clauses.push("b.timestamp IS NOT NULL".into());
+    let mut stmt = conn
         .prepare(&format!(
-            "SELECT MIN(rowid), url, COALESCE(SUM(CAST(visit_count AS INTEGER)), 0) \
-         FROM {}{visit_where} AND COALESCE(url, '') <> '' \
-         GROUP BY url",
-            q(table_name),
+            "SELECT substr(b.timestamp, 1, 10), COUNT(*) FROM \"BrowserActivity\" b{} GROUP BY 1 ORDER BY 1",
+            where_sql(&day_clauses)
         ))
         .map_err(|error| error.to_string())?;
-    let mut domain_totals: BTreeMap<String, (i64, i64, i64)> = BTreeMap::new();
-    let mut url_rows = url_stmt.query(refs).map_err(|error| error.to_string())?;
-    while let Some(row) = url_rows.next().map_err(|error| error.to_string())? {
-        let row_id: i64 = row.get(0).map_err(|error| error.to_string())?;
-        let url: String = row.get(1).map_err(|error| error.to_string())?;
-        let visit_count: i64 = row.get(2).map_err(|error| error.to_string())?;
-        let Some(domain) = browser_url_domain(&url) else {
-            continue;
-        };
-        let entry = domain_totals.entry(domain).or_insert((row_id, 0, 0));
-        entry.0 = entry.0.min(row_id);
-        entry.1 += visit_count;
-        entry.2 += 1;
-    }
-    let mut domains = domain_totals
-        .into_iter()
-        .map(
-            |(domain, (row_id, visit_count, url_count))| BrowserVisitedDomainStat {
-                row_id,
-                domain,
-                visit_count,
-                url_count,
-            },
-        )
-        .collect::<Vec<_>>();
-    domains.sort_by(|left, right| {
-        right
-            .visit_count
-            .cmp(&left.visit_count)
-            .then_with(|| left.domain.cmp(&right.domain))
-    });
-    Ok(domains)
-}
-
-fn browser_visit_domains_cached(
-    full_path: &str,
-    table_name: &str,
-    account: Option<&str>,
-    start: Option<&str>,
-    end: Option<&str>,
-) -> Result<Vec<BrowserVisitedDomainStat>, String> {
-    let key = browser_domain_cache_key(full_path, table_name, account, start, end);
-    if let Some(domains) = browser_domain_cache_get(&key) {
-        return Ok(domains);
-    }
-    let conn = open_ro(full_path)?;
-    let query = BrowserActivityQuery {
-        account: account.map(str::to_owned),
-        kinds: Vec::new(),
-        day: None,
-        search: None,
-        start: start.map(str::to_owned),
-        end: end.map(str::to_owned),
-        offset: 0,
-        limit: 1,
-        descending: None,
-    };
-    let (where_, params) = browser_activity_where(&query);
-    let refs: Vec<&dyn rusqlite::ToSql> = params
-        .iter()
-        .map(|value| value as &dyn rusqlite::ToSql)
-        .collect();
-    let visit_where = if where_.is_empty() {
-        " WHERE event_type = 'visit'".to_owned()
-    } else {
-        format!("{where_} AND event_type = 'visit'")
-    };
-    let domains = browser_visit_domains(&conn, table_name, &visit_where, refs.as_slice())?;
-    browser_domain_cache_put(key, domains.clone());
-    Ok(domains)
-}
-
-/// Returns the bounded analysis strip above the date ledger. Unlike the
-/// selected-day evidence table, these aggregates deliberately cover the active
-/// account and global incident period so the displayed scope stays stable while
-/// an analyst moves through individual dates.
-fn browser_activity_insights_blocking(
-    full_path: String,
-    table_name: String,
-    account: Option<String>,
-    start: Option<String>,
-    end: Option<String>,
-) -> Result<BrowserActivityInsights, String> {
-    let mut top_visited_domains = browser_visit_domains_cached(
-        &full_path,
-        &table_name,
-        account.as_deref(),
-        start.as_deref(),
-        end.as_deref(),
-    )?;
-    let conn = open_ro(&full_path)?;
-    let query = BrowserActivityQuery {
-        account,
-        kinds: Vec::new(),
-        day: None,
-        search: None,
-        start,
-        end,
-        offset: 0,
-        limit: 8,
-        descending: None,
-    };
-    let (where_, params) = browser_activity_where(&query);
-    let refs: Vec<&dyn rusqlite::ToSql> = params
-        .iter()
-        .map(|value| value as &dyn rusqlite::ToSql)
-        .collect();
-    // The header total must match the domain list exactly: malformed/hostless
-    // URLs cannot be represented as a domain and are therefore excluded from
-    // this specific analytical scope.
-    let visit_total = top_visited_domains
-        .iter()
-        .map(|domain| domain.visit_count)
-        .sum();
-    top_visited_domains.truncate(8);
-    let download_where = if where_.is_empty() {
-        " WHERE event_type = 'download'".to_owned()
-    } else {
-        format!("{where_} AND event_type = 'download'")
-    };
-    let download_total = conn
-        .query_row(
-            &format!("SELECT COUNT(*) FROM {}{download_where}", q(&table_name)),
-            refs.as_slice(),
-            |row| row.get(0),
-        )
+    let days = stmt
+        .query_map(text_refs(&day_params).as_slice(), |row| Ok(ColumnValue { value: row.get(0)?, count: row.get(1)? }))
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())?;
-    let downloads = query_rows(
+
+    let untimed_filter = BrowserFilter { untimed: true, start: None, end: None, ..scope.clone() };
+    let (untimed_clauses, untimed_params) = browser_where(&untimed_filter, no_search);
+    let untimed = count_where(&conn, "\"BrowserActivity\" b", &untimed_clauses, &untimed_params)?;
+
+    let all_kinds = BrowserFilter { kinds: Vec::new(), ..scope.clone() };
+    let (kind_clauses, kind_params) = browser_where(&all_kinds, no_search);
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT COALESCE(b.event_type, ''), COUNT(*) FROM \"BrowserActivity\" b{} GROUP BY 1 ORDER BY 1",
+            where_sql(&kind_clauses)
+        ))
+        .map_err(|error| error.to_string())?;
+    let kinds = stmt
+        .query_map(text_refs(&kind_params).as_slice(), |row| Ok(ColumnValue { value: row.get(0)?, count: row.get(1)? }))
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+
+    let domains = browser_visit_domains(&conn, &scope)?;
+    let visit_total = domains.iter().map(|domain| domain.visit_count).sum();
+    let domain_total = i64::try_from(domains.len()).unwrap_or(i64::MAX);
+    let top_domains = domains.into_iter().take(8).collect();
+
+    let (mut download_clauses, download_params) = browser_where(&all_kinds, no_search);
+    download_clauses.push("b.event_type = 'download'".into());
+    let download_total = count_where(&conn, "\"BrowserActivity\" b", &download_clauses, &download_params)?;
+    let mut downloads = query_rows(
         &conn,
         &format!(
-            "SELECT rowid AS __rowid, * FROM {}{download_where} ORDER BY timestamp DESC LIMIT 8",
-            q(&table_name)
+            "SELECT {BROWSER_LIST_COLUMNS} FROM \"BrowserActivity\" b{} \
+             ORDER BY b.timestamp IS NULL, b.timestamp DESC, b.record_id DESC LIMIT 8",
+            where_sql(&download_clauses)
         ),
-        &refs,
+        text_refs(&download_params).as_slice(),
     )?;
-    Ok(BrowserActivityInsights {
-        visit_total,
-        top_visited_domains,
-        download_total,
-        downloads,
-    })
+    decorate_source_refs(&conn, Path::new(&full_path), &mut downloads)?;
+    Ok(BrowserSummary { days, untimed, kinds, visit_total, top_domains, domain_total, download_total, downloads })
 }
 
 #[tauri::command]
-async fn browser_activity_insights(
-    full_path: String,
-    table_name: String,
-    account: Option<String>,
-    start: Option<String>,
-    end: Option<String>,
-) -> Result<BrowserActivityInsights, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        browser_activity_insights_blocking(full_path, table_name, account, start, end)
-    })
-    .await
-    .map_err(|error| format!("브라우저 통계 작업이 중단되었습니다: {error}"))?
+async fn browser_summary(full_path: String, filter: BrowserFilter) -> Result<BrowserSummary, String> {
+    tauri::async_runtime::spawn_blocking(move || browser_summary_blocking(full_path, filter))
+        .await
+        .map_err(|error| format!("브라우저 요약 작업이 중단되었습니다: {error}"))?
 }
 
-/// Server-paginated continuation of the compact domain analysis strip. The
-/// same account and global incident-period where clause as insights is used;
-/// a selected day or activity-kind toggle deliberately never narrows it.
-#[allow(clippy::too_many_arguments)] // 정렬 옵션 포함 command 시그니처
-fn browser_activity_domains_blocking(
-    full_path: String,
-    table_name: String,
-    account: Option<String>,
-    start: Option<String>,
-    end: Option<String>,
-    offset: i64,
-    limit: i64,
-    ascending: Option<bool>,
-) -> Result<BrowserDomainStatsPage, String> {
-    let mut domains = browser_visit_domains_cached(
-        &full_path,
-        &table_name,
-        account.as_deref(),
-        start.as_deref(),
-        end.as_deref(),
-    )?;
-    // 기본은 방문 많은 순 — 요청 시 적은 순으로 뒤집는다.
-    if ascending.unwrap_or(false) {
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserDomainPage {
+    domains: Vec<BrowserDomainStat>,
+    total: i64,
+}
+
+fn browser_domains_blocking(full_path: String, filter: BrowserFilter, offset: i64, limit: i64, ascending: bool) -> Result<BrowserDomainPage, String> {
+    let conn = open_ro(&full_path)?;
+    let mut domains = browser_visit_domains(&conn, &filter)?;
+    if ascending {
         domains.reverse();
     }
     let total = i64::try_from(domains.len()).unwrap_or(i64::MAX);
-    let page_offset = usize::try_from(offset.max(0)).unwrap_or(usize::MAX);
-    let page_limit = usize::try_from(limit.clamp(1, 100)).unwrap_or(100);
     let domains = domains
         .into_iter()
-        .skip(page_offset)
-        .take(page_limit)
+        .skip(usize::try_from(offset.max(0)).unwrap_or(usize::MAX))
+        .take(usize::try_from(limit.clamp(1, 100)).unwrap_or(100))
         .collect();
-    Ok(BrowserDomainStatsPage { domains, total })
+    Ok(BrowserDomainPage { domains, total })
 }
 
 #[tauri::command]
-#[allow(clippy::too_many_arguments)] // 정렬 옵션 포함 command 시그니처
-async fn browser_activity_domains(
-    full_path: String,
-    table_name: String,
-    account: Option<String>,
-    start: Option<String>,
-    end: Option<String>,
-    offset: i64,
-    limit: i64,
-    ascending: Option<bool>,
-) -> Result<BrowserDomainStatsPage, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        browser_activity_domains_blocking(full_path, table_name, account, start, end, offset, limit, ascending)
-    })
-    .await
-    .map_err(|error| format!("도메인 통계 작업이 중단되었습니다: {error}"))?
+async fn browser_domains(full_path: String, filter: BrowserFilter, offset: i64, limit: i64, ascending: bool) -> Result<BrowserDomainPage, String> {
+    tauri::async_runtime::spawn_blocking(move || browser_domains_blocking(full_path, filter, offset, limit, ascending))
+        .await
+        .map_err(|error| format!("도메인 통계 작업이 중단되었습니다: {error}"))?
 }
 
-fn browser_activity_page_blocking(
-    full_path: String,
-    table_name: String,
-    query: BrowserActivityQuery,
-) -> Result<CsvData, String> {
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserPage {
+    rows: Vec<Map<String, Value>>,
+    row_count: i64,
+}
+
+/// Time order with NULL times last and record_id as the tie-breaker (A04).
+fn browser_page_blocking(full_path: String, filter: BrowserFilter, offset: i64, limit: i64, descending: bool) -> Result<BrowserPage, String> {
     let conn = open_ro(&full_path)?;
-    let columns = table_columns(&conn, &table_name);
-    let (where_, mut params) = browser_activity_where(&query);
-    let count_refs: Vec<&dyn rusqlite::ToSql> =
-        params.iter().map(|v| v as &dyn rusqlite::ToSql).collect();
-    let row_count = conn
-        .query_row(
-            &format!("SELECT COUNT(*) FROM {}{}", q(&table_name), where_),
-            count_refs.as_slice(),
-            |r| r.get(0),
-        )
-        .map_err(|e| e.to_string())?;
-    params.push(query.limit.clamp(1, 200).to_string());
-    params.push(query.offset.max(0).to_string());
-    let refs: Vec<&dyn rusqlite::ToSql> =
-        params.iter().map(|v| v as &dyn rusqlite::ToSql).collect();
-    let order = if query.descending.unwrap_or(false) {
-        "DESC"
-    } else {
-        "ASC"
-    };
-    let sql = format!(
-        "SELECT rowid AS __rowid, * FROM {}{} ORDER BY timestamp {order} LIMIT ? OFFSET ?",
-        q(&table_name),
-        where_
-    );
-    let mut rows = query_rows(&conn, &sql, &refs)?;
-    decorate_source_refs(&conn, Path::new(&full_path), &mut rows)?;
-    Ok(CsvData {
-        columns,
-        rows,
-        row_count,
-    })
-}
-
-#[tauri::command]
-async fn browser_activity_page(
-    full_path: String,
-    table_name: String,
-    query: BrowserActivityQuery,
-) -> Result<CsvData, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        browser_activity_page_blocking(full_path, table_name, query)
-    })
-    .await
-    .map_err(|error| format!("브라우저 기록 작업이 중단되었습니다: {error}"))?
-}
-
-fn ai_referrals_blocking(
-    full_path: String,
-    table_name: String,
-    start: Option<String>,
-    end: Option<String>,
-    offset: i64,
-    limit: i64,
-) -> Result<CsvData, String> {
-    let conn = open_ro(&full_path)?;
-    let mut clauses = vec!["(url LIKE '%utm_source=chatgpt.com%' OR url LIKE '%utm_source=gemini%' OR url LIKE '%utm_source=claude%')".to_string()];
-    let mut params = Vec::new();
-    if let Some(v) = start.filter(|v| !v.is_empty()) {
-        clauses.push("timestamp >= ?".into());
-        params.push(v);
-    }
-    if let Some(v) = end.filter(|v| !v.is_empty()) {
-        clauses.push("timestamp <= ?".into());
-        params.push(v);
-    }
-    let where_ = clauses.join(" AND ");
-    let count_refs: Vec<&dyn rusqlite::ToSql> =
-        params.iter().map(|v| v as &dyn rusqlite::ToSql).collect();
-    let row_count = conn
-        .query_row(
-            &format!("SELECT COUNT(*) FROM {} WHERE {}", q(&table_name), where_),
-            count_refs.as_slice(),
-            |r| r.get(0),
-        )
-        .map_err(|e| e.to_string())?;
-    params.push(limit.clamp(1, 100).to_string());
+    let (clauses, mut params) = browser_where(&filter, BrowserFilterParts { kinds: true, day: true, search: true });
+    let row_count = count_where(&conn, "\"BrowserActivity\" b", &clauses, &params)?;
+    let direction = if descending { "DESC" } else { "ASC" };
+    params.push(limit.clamp(1, 200).to_string());
+    let limit_mark = params.len();
     params.push(offset.max(0).to_string());
-    let refs: Vec<&dyn rusqlite::ToSql> =
-        params.iter().map(|v| v as &dyn rusqlite::ToSql).collect();
+    let offset_mark = params.len();
     let mut rows = query_rows(
         &conn,
         &format!(
-            "SELECT rowid AS __rowid, {} FROM {} WHERE {} ORDER BY timestamp ASC LIMIT ? OFFSET ?",
-            payload_projection(&payload_columns(&conn, &table_name))
-                .unwrap_or_else(|| "*".to_string()),
-            q(&table_name),
-            where_
+            "SELECT {BROWSER_LIST_COLUMNS} FROM \"BrowserActivity\" b{} \
+             ORDER BY b.timestamp IS NULL, b.timestamp {direction}, b.record_id {direction} LIMIT ?{limit_mark} OFFSET ?{offset_mark}",
+            where_sql(&clauses)
         ),
-        &refs,
+        text_refs(&params).as_slice(),
     )?;
     decorate_source_refs(&conn, Path::new(&full_path), &mut rows)?;
-    Ok(CsvData {
-        columns: payload_columns(&conn, &table_name),
-        rows,
-        row_count,
+    Ok(BrowserPage { rows, row_count })
+}
+
+#[tauri::command]
+async fn browser_page(full_path: String, filter: BrowserFilter, offset: i64, limit: i64, descending: bool) -> Result<BrowserPage, String> {
+    tauri::async_runtime::spawn_blocking(move || browser_page_blocking(full_path, filter, offset, limit, descending))
+        .await
+        .map_err(|error| format!("브라우저 기록 작업이 중단되었습니다: {error}"))?
+}
+
+/// One record with its stored relations; the cache body itself is fetched
+/// separately in chunks (R01, R17).
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserRecord {
+    row: Map<String, Value>,
+    input: Option<Map<String, Value>>,
+    /// url_summary: its BrowserUrlSummaries row; visit: the summary record.
+    url_summary: Option<Map<String, Value>>,
+    search_terms: Vec<Map<String, Value>>,
+    download_chain: Vec<Map<String, Value>>,
+    /// BrowserCacheDetails without `body`, plus body_length/body_type.
+    cache: Option<Map<String, Value>>,
+    sources: Vec<Map<String, Value>>,
+}
+
+fn map_str(row: &Map<String, Value>, key: &str) -> Option<String> {
+    row.get(key).and_then(Value::as_str).filter(|value| !value.is_empty()).map(str::to_string)
+}
+
+fn browser_record_blocking(host_dir: String, record_id: String) -> Result<BrowserRecord, String> {
+    let full_path = browser_db_of(&host_dir);
+    let conn = open_ro(&full_path)?;
+    let mut rows = query_rows(&conn, "SELECT rowid AS __rowid, * FROM \"BrowserActivity\" WHERE record_id = ?1", &[&record_id])?;
+    decorate_source_refs(&conn, Path::new(&full_path), &mut rows)?;
+    let row = rows.pop().ok_or_else(|| "브라우저 기록을 찾을 수 없습니다".to_string())?;
+    let input_id = map_str(&row, "input_id").unwrap_or_default();
+    let input = query_rows(&conn, "SELECT * FROM \"BrowserInputs\" WHERE input_id = ?1", &[&input_id])?.pop();
+    let summary_id = map_str(&row, "url_summary_id");
+    let url_summary = if map_str(&row, "event_type").as_deref() == Some("url_summary") {
+        query_rows(&conn, "SELECT * FROM \"BrowserUrlSummaries\" WHERE summary_id = ?1", &[&record_id])?.pop()
+    } else if let Some(summary_id) = &summary_id {
+        query_rows(
+            &conn,
+            "SELECT rowid AS __rowid, record_id, timestamp, timestamp_kind, url, title, visit_count, typed_count \
+             FROM \"BrowserActivity\" WHERE record_id = ?1 AND input_id = ?2",
+            &[summary_id, &input_id],
+        )?
+        .pop()
+    } else {
+        None
+    };
+    let summary_key = summary_id.unwrap_or_default();
+    let search_terms = query_rows(
+        &conn,
+        "SELECT * FROM \"BrowserSearchTerms\" WHERE summary_id IN (?1, ?2) ORDER BY term, search_id",
+        &[&record_id, &summary_key],
+    )?;
+    let download_chain = query_rows(&conn, "SELECT * FROM \"BrowserDownloadChain\" WHERE record_id = ?1 ORDER BY ordinal", &[&record_id])?;
+    let cache = query_rows(
+        &conn,
+        "SELECT record_id, cache_key, request_url, status_line, http_status, http_reason, content_type, \
+         content_encoding, content_length, body_size, body_file, body_recovered, body_bytes, all_headers, server, \
+         date, last_modified, etag, cache_control, location, length(CAST(body AS BLOB)) AS body_length, \
+         typeof(body) AS body_type FROM \"BrowserCacheDetails\" WHERE record_id = ?1",
+        &[&record_id],
+    )?
+    .pop();
+    let sources = query_rows(&conn, "SELECT * FROM \"source_records\" WHERE record_id = ?1 ORDER BY ordinal", &[&record_id])?;
+    Ok(BrowserRecord { row, input, url_summary, search_terms, download_chain, cache, sources })
+}
+
+#[tauri::command]
+async fn browser_record(host_dir: String, record_id: String) -> Result<BrowserRecord, String> {
+    tauri::async_runtime::spawn_blocking(move || browser_record_blocking(host_dir, record_id))
+        .await
+        .map_err(|error| format!("브라우저 기록 상세 조회가 중단되었습니다: {error}"))?
+}
+
+/// A byte range of one stored cache body (TEXT or BLOB), base64 encoded.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserCacheBody {
+    data_b64: String,
+    offset: i64,
+    total: i64,
+}
+
+fn browser_cache_body_blocking(host_dir: String, record_id: String, offset: i64, length: i64) -> Result<BrowserCacheBody, String> {
+    use base64::Engine as _;
+    let conn = open_ro(&browser_db_of(&host_dir))?;
+    let offset = offset.max(0);
+    let length = length.clamp(1, BROWSER_CACHE_CHUNK_MAX);
+    let (bytes, total): (Option<Vec<u8>>, Option<i64>) = conn
+        .query_row(
+            "SELECT substr(CAST(body AS BLOB), ?2 + 1, ?3), length(CAST(body AS BLOB)) FROM \"BrowserCacheDetails\" WHERE record_id = ?1",
+            rusqlite::params![record_id, offset, length],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|error| format!("캐시 본문을 찾을 수 없습니다: {error}"))?;
+    let total = total.ok_or_else(|| "저장된 캐시 본문이 없습니다".to_string())?;
+    Ok(BrowserCacheBody {
+        data_b64: base64::engine::general_purpose::STANDARD.encode(bytes.unwrap_or_default()),
+        offset,
+        total,
     })
 }
 
 #[tauri::command]
-async fn ai_referrals(
-    full_path: String,
-    table_name: String,
-    start: Option<String>,
-    end: Option<String>,
-    offset: i64,
-    limit: i64,
-) -> Result<CsvData, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        ai_referrals_blocking(full_path, table_name, start, end, offset, limit)
-    })
-    .await
-    .map_err(|error| format!("AI 공유 링크 작업이 중단되었습니다: {error}"))?
+async fn browser_cache_body(host_dir: String, record_id: String, offset: i64, length: i64) -> Result<BrowserCacheBody, String> {
+    tauri::async_runtime::spawn_blocking(move || browser_cache_body_blocking(host_dir, record_id, offset, length))
+        .await
+        .map_err(|error| format!("캐시 본문 조회가 중단되었습니다: {error}"))?
 }
 
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct VisitFlowNode {
+    record_id: String,
+    visit_id: String,
+    url: String,
+    title: String,
+    time: String,
+    transition: String,
+    qualifiers: String,
+    external_referrer: String,
+    is_target: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VisitFlowEdge {
+    from: String,
+    to: String,
+    /// "from_visit" (same tab) or "opener_visit" (new tab).
+    kind: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserVisitFlow {
+    nodes: Vec<VisitFlowNode>,
+    edges: Vec<VisitFlowEdge>,
+    truncated: bool,
+}
+
+/// Navigation around one visit from stored relations, both directions, inside
+/// the visit's own input only (R08).
+fn browser_visit_flow_blocking(host_dir: String, record_id: String) -> Result<BrowserVisitFlow, String> {
+    let conn = open_ro(&browser_db_of(&host_dir))?;
+    let input_id: String = conn
+        .query_row("SELECT input_id FROM \"BrowserActivity\" WHERE record_id = ?1 AND event_type = 'visit'", [&record_id], |row| row.get(0))
+        .map_err(|_| "방문 기록이 아닙니다".to_string())?;
+    let fetch = |sql: &str, key: &str| -> Result<Vec<Map<String, Value>>, String> {
+        query_rows(&conn, sql, &[&key, &input_id])
+    };
+    const NODE: &str = "SELECT record_id, visit_id, url, title, timestamp, transition_core, transition_qualifiers, \
+         external_referrer_url, from_record_id, opener_record_id FROM \"BrowserActivity\" ";
+    let mut nodes: BTreeMap<String, Map<String, Value>> = BTreeMap::new();
+    let mut edges: Vec<(String, String, String)> = Vec::new();
+    let mut queue: VecDeque<String> = VecDeque::from([record_id.clone()]);
+    let mut truncated = false;
+    if let Some(start) = fetch(&format!("{NODE}WHERE record_id = ?1 AND input_id = ?2"), &record_id)?.pop() {
+        nodes.insert(record_id.clone(), start);
+    }
+    while let Some(id) = queue.pop_front() {
+        let Some(node) = nodes.get(&id).cloned() else { continue };
+        let mut neighbors: Vec<Map<String, Value>> = Vec::new();
+        for (column, kind) in [("from_record_id", "from_visit"), ("opener_record_id", "opener_visit")] {
+            if let Some(parent) = map_str(&node, column) {
+                edges.push((parent.clone(), id.clone(), kind.to_string()));
+                neighbors.extend(fetch(&format!("{NODE}WHERE record_id = ?1 AND input_id = ?2 AND event_type = 'visit'"), &parent)?);
+            }
+            for child in fetch(&format!("{NODE}WHERE {column} = ?1 AND input_id = ?2 AND event_type = 'visit'"), &id)? {
+                if let Some(child_id) = map_str(&child, "record_id") {
+                    edges.push((id.clone(), child_id, kind.to_string()));
+                }
+                neighbors.push(child);
+            }
+        }
+        for neighbor in neighbors {
+            let Some(neighbor_id) = map_str(&neighbor, "record_id") else { continue };
+            if nodes.contains_key(&neighbor_id) {
+                continue;
+            }
+            if nodes.len() >= BROWSER_FLOW_MAX_NODES {
+                truncated = true;
+                continue;
+            }
+            nodes.insert(neighbor_id.clone(), neighbor);
+            queue.push_back(neighbor_id);
+        }
+    }
+    let text = |row: &Map<String, Value>, key: &str| map_str(row, key).unwrap_or_default();
+    let mut flow_nodes: Vec<VisitFlowNode> = nodes
+        .iter()
+        .map(|(id, row)| VisitFlowNode {
+            record_id: id.clone(),
+            visit_id: text(row, "visit_id"),
+            url: text(row, "url"),
+            title: text(row, "title"),
+            time: text(row, "timestamp"),
+            transition: text(row, "transition_core"),
+            qualifiers: text(row, "transition_qualifiers"),
+            external_referrer: text(row, "external_referrer_url"),
+            is_target: *id == record_id,
+        })
+        .collect();
+    flow_nodes.sort_by(|left, right| left.time.cmp(&right.time).then_with(|| left.record_id.cmp(&right.record_id)));
+    let mut seen = HashSet::new();
+    let flow_edges = edges
+        .into_iter()
+        .filter(|(from, to, _)| nodes.contains_key(from) && nodes.contains_key(to))
+        .filter(|edge| seen.insert(edge.clone()))
+        .map(|(from, to, kind)| VisitFlowEdge { from, to, kind })
+        .collect();
+    Ok(BrowserVisitFlow { nodes: flow_nodes, edges: flow_edges, truncated })
+}
+
+#[tauri::command]
+async fn browser_visit_flow(host_dir: String, record_id: String) -> Result<BrowserVisitFlow, String> {
+    tauri::async_runtime::spawn_blocking(move || browser_visit_flow_blocking(host_dir, record_id))
+        .await
+        .map_err(|error| format!("이동 흐름 조회가 중단되었습니다: {error}"))?
+}
+
+const AI_LIST_COLUMNS: &str = "a.rowid AS __rowid, a.record_id, a.host_id, a.dataset_id, a.overview_name, \
+     a.timestamp, a.timestamp_kind, a.event_type, a.description, a.record_kind, a.provider, a.conversation_id, \
+     a.service_account, a.title, a.created_at, a.updated_at, a.url, a.browser, a.profile, a.input_label, \
+     a.account, a.account_sid, a.input_kind, a.body_recovered, a.message_count, a.current_branch_message_count, \
+     a.structural_node_count, a.attachment_count, a.list_ordinal, a.list_item_count, a.list_declared_total";
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+struct AiQuery {
+    /// conversation | list_entry (empty: both).
+    kind: Option<String>,
+    untimed: bool,
+    start: Option<String>,
+    end: Option<String>,
+    search: Option<String>,
+    offset: i64,
+    limit: i64,
+    ascending: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AiPage {
+    rows: Vec<Map<String, Value>>,
+    row_count: i64,
+    /// Records per kind under the same filter without the kind choice.
+    kinds: Vec<ColumnValue>,
+}
+
+fn ai_where(query: &AiQuery, with_kind: bool) -> (Vec<String>, Vec<String>) {
+    let mut clauses = Vec::new();
+    let mut params: Vec<String> = Vec::new();
+    if with_kind {
+        if let Some(kind) = query.kind.as_ref().filter(|kind| !kind.is_empty()) {
+            params.push(kind.clone());
+            clauses.push(format!("a.record_kind = ?{}", params.len()));
+        }
+    }
+    if query.untimed {
+        clauses.push("a.timestamp IS NULL".into());
+    } else {
+        if let Some(start) = query.start.as_ref().filter(|value| !value.is_empty()) {
+            params.push(start.clone());
+            clauses.push(format!("a.timestamp >= ?{}", params.len()));
+        }
+        if let Some(end) = query.end.as_ref().filter(|value| !value.is_empty()) {
+            params.push(end.clone());
+            clauses.push(format!("a.timestamp <= ?{}", params.len()));
+        }
+    }
+    if let Some(needle) = query.search.as_ref().filter(|value| !value.trim().is_empty()) {
+        params.push(like_contains(needle));
+        let n = params.len();
+        let mut ors: Vec<String> = ["title", "conversation_id", "service_account", "url", "provider", "account", "account_sid", "input_label"]
+            .iter()
+            .map(|column| format!("a.{column} LIKE ?{n} ESCAPE '\\'"))
+            .collect();
+        ors.push(format!(
+            "EXISTS (SELECT 1 FROM \"AiConversationTexts\" t WHERE t.record_id = a.record_id \
+             AND t.text_kind = 'search_text' AND t.text_value LIKE ?{n} ESCAPE '\\')"
+        ));
+        clauses.push(format!("({})", ors.join(" OR ")));
+    }
+    (clauses, params)
+}
+
+fn ai_page_blocking(full_path: String, query: AiQuery) -> Result<AiPage, String> {
+    let conn = open_ro(&full_path)?;
+    let (clauses, mut params) = ai_where(&query, true);
+    let row_count = count_where(&conn, "\"AiConversations\" a", &clauses, &params)?;
+    let (kind_clauses, kind_params) = ai_where(&query, false);
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT a.record_kind, COUNT(*) FROM \"AiConversations\" a{} GROUP BY 1 ORDER BY 1",
+            where_sql(&kind_clauses)
+        ))
+        .map_err(|error| error.to_string())?;
+    let kinds = stmt
+        .query_map(text_refs(&kind_params).as_slice(), |row| Ok(ColumnValue { value: row.get(0)?, count: row.get(1)? }))
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    let direction = if query.ascending { "ASC" } else { "DESC" };
+    params.push(query.limit.clamp(1, 100).to_string());
+    let limit_mark = params.len();
+    params.push(query.offset.max(0).to_string());
+    let offset_mark = params.len();
+    let mut rows = query_rows(
+        &conn,
+        &format!(
+            "SELECT {AI_LIST_COLUMNS} FROM \"AiConversations\" a{} \
+             ORDER BY a.timestamp IS NULL, a.timestamp {direction}, a.record_id {direction} LIMIT ?{limit_mark} OFFSET ?{offset_mark}",
+            where_sql(&clauses)
+        ),
+        text_refs(&params).as_slice(),
+    )?;
+    decorate_source_refs(&conn, Path::new(&full_path), &mut rows)?;
+    Ok(AiPage { rows, row_count, kinds })
+}
+
+#[tauri::command]
+async fn ai_page(full_path: String, query: AiQuery) -> Result<AiPage, String> {
+    tauri::async_runtime::spawn_blocking(move || ai_page_blocking(full_path, query))
+        .await
+        .map_err(|error| format!("AI 대화 조회가 중단되었습니다: {error}"))?
+}
+
+/// One AI record: stored messages, attachments, interpretation JSON, evidence
+/// sources (with collected response sizes) and other snapshots of the same
+/// conversation (A03, R13, R14, R18).
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AiRecord {
+    row: Map<String, Value>,
+    messages: Vec<Map<String, Value>>,
+    attachments: Vec<Map<String, Value>>,
+    interpretation: Option<String>,
+    sources: Vec<Map<String, Value>>,
+    snapshots: Vec<Map<String, Value>>,
+}
+
+fn ai_record_blocking(full_path: String, record_id: String) -> Result<AiRecord, String> {
+    let conn = open_ro(&full_path)?;
+    let mut rows = query_rows(&conn, &format!("SELECT {AI_LIST_COLUMNS} FROM \"AiConversations\" a WHERE a.record_id = ?1"), &[&record_id])?;
+    decorate_source_refs(&conn, Path::new(&full_path), &mut rows)?;
+    let row = rows.pop().ok_or_else(|| "AI 대화 기록을 찾을 수 없습니다".to_string())?;
+    let messages = query_rows(&conn, "SELECT * FROM \"AiMessages\" WHERE record_id = ?1 ORDER BY ordinal", &[&record_id])?;
+    let attachments = query_rows(&conn, "SELECT * FROM \"AiAttachments\" WHERE record_id = ?1 ORDER BY ordinal", &[&record_id])?;
+    let interpretation = conn
+        .query_row(
+            "SELECT text_value FROM \"AiConversationTexts\" WHERE record_id = ?1 AND text_kind = 'interpretation_json' ORDER BY ordinal LIMIT 1",
+            [&record_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten();
+    let sources = query_rows(
+        &conn,
+        "SELECT s.*, r.byte_length AS response_length FROM \"source_records\" s \
+         LEFT JOIN \"AiResponseBodies\" r ON r.source_db = s.source_db AND r.source_table = s.source_table \
+         AND r.source_rowid = s.source_rowid WHERE s.record_id = ?1 ORDER BY s.ordinal",
+        &[&record_id],
+    )?;
+    let provider = map_str(&row, "provider").unwrap_or_default();
+    let snapshots = match map_str(&row, "conversation_id") {
+        Some(conversation_id) => {
+            let mut snapshots = query_rows(
+                &conn,
+                &format!(
+                    "SELECT {AI_LIST_COLUMNS} FROM \"AiConversations\" a WHERE a.conversation_id = ?1 \
+                     AND COALESCE(a.provider, '') = ?2 AND a.record_id <> ?3 \
+                     ORDER BY a.timestamp IS NULL, a.timestamp DESC, a.record_id DESC LIMIT 200"
+                ),
+                &[&conversation_id, &provider, &record_id],
+            )?;
+            decorate_source_refs(&conn, Path::new(&full_path), &mut snapshots)?;
+            snapshots
+        }
+        None => Vec::new(),
+    };
+    Ok(AiRecord { row, messages, attachments, interpretation, sources, snapshots })
+}
+
+#[tauri::command]
+async fn ai_record(full_path: String, record_id: String) -> Result<AiRecord, String> {
+    tauri::async_runtime::spawn_blocking(move || ai_record_blocking(full_path, record_id))
+        .await
+        .map_err(|error| format!("AI 대화 상세 조회가 중단되었습니다: {error}"))?
+}
+
+/// A character range of one collected response body.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AiResponseChunk {
+    data: String,
+    offset: i64,
+    total: i64,
+}
+
+fn ai_response_body_blocking(full_path: String, source_db: String, source_table: String, source_rowid: i64, offset: i64, length: i64) -> Result<AiResponseChunk, String> {
+    let conn = open_ro(&full_path)?;
+    let offset = offset.max(0);
+    let length = length.clamp(1, 4 * 1024 * 1024);
+    conn.query_row(
+        "SELECT substr(response_body, ?4 + 1, ?5), length(response_body) FROM \"AiResponseBodies\" \
+         WHERE source_db = ?1 AND source_table = ?2 AND source_rowid = ?3",
+        rusqlite::params![source_db, source_table, source_rowid, offset, length],
+        |row| Ok(AiResponseChunk { data: row.get(0)?, offset, total: row.get(1)? }),
+    )
+    .map_err(|error| format!("수집 응답 원문을 찾을 수 없습니다: {error}"))
+}
+
+#[tauri::command]
+async fn ai_response_body(full_path: String, source_db: String, source_table: String, source_rowid: i64, offset: i64, length: i64) -> Result<AiResponseChunk, String> {
+    tauri::async_runtime::spawn_blocking(move || ai_response_body_blocking(full_path, source_db, source_table, source_rowid, offset, length))
+        .await
+        .map_err(|error| format!("수집 응답 원문 조회가 중단되었습니다: {error}"))?
+}
 
 /// PowerShellHistory 원문 검색 — 목록 IPC는 script_block/host_application을
 /// 미리보기(1,000자)로만 싣기 때문에, 그 뒤의 IOC·명령 문자열은 서버에서
@@ -6237,1297 +6352,6 @@ async fn search_case(
     .map_err(|_| "케이스 검색 작업을 완료하지 못했습니다.".to_string())
 }
 
-// --- commands: browser cache bodies ----------------------------------------
-
-/// Metadata-only cache entry (no body_b64) — safe to load for all rows.
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CacheMeta {
-    account: String,
-    url: String,
-    content_type: String,
-    status: String,
-    response_time: String,
-    body_size: String,
-    cache_key: String,
-}
-
-/// Returns metadata (no body) for all cache entries that have a stored body.
-/// Callers fetch the body on-demand via `cache_entry_body`.
-/// Capped at 20 000 rows to keep IPC snappy even for large caches.
-#[tauri::command]
-async fn cache_entries(host_dir: String) -> Vec<CacheMeta> {
-    // 캐시 sqlite 여러 개를 훑는 메타 수집 — 메인 스레드 밖에서 수행한다.
-    tauri::async_runtime::spawn_blocking(move || cache_entries_blocking(host_dir))
-        .await
-        .unwrap_or_default()
-}
-
-fn cache_entries_blocking(host_dir: String) -> Vec<CacheMeta> {
-    let dir = PathBuf::from(&host_dir).join("BROWSER");
-    let mut out = Vec::new();
-    let files = match std::fs::read_dir(&dir) {
-        Ok(rd) => rd
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| {
-                p.file_name()
-                    .map(|n| n.to_string_lossy().ends_with("_Cache.sqlite"))
-                    .unwrap_or(false)
-            })
-            .collect::<Vec<_>>(),
-        Err(_) => return out,
-    };
-    const ROW_CAP: usize = 20_000;
-    for f in files {
-        if out.len() >= ROW_CAP {
-            break;
-        }
-        let conn = match open_ro(&f.to_string_lossy()) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-        let limit = (ROW_CAP - out.len()) as i64;
-        let sql = "SELECT account, url, content_type, status, response_time, body_size, cache_key \
-                   FROM CacheEntries WHERE body_b64 IS NOT NULL AND body_b64 != '' LIMIT ?1";
-        let mut stmt = match conn.prepare(sql) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        if let Ok(it) = stmt.query_map([limit], |r| {
-            Ok(CacheMeta {
-                account: r.get(0).unwrap_or_default(),
-                url: r.get(1).unwrap_or_default(),
-                content_type: r.get(2).unwrap_or_default(),
-                status: r.get(3).unwrap_or_default(),
-                response_time: r.get(4).unwrap_or_default(),
-                body_size: r.get(5).unwrap_or_default(),
-                cache_key: r.get(6).unwrap_or_default(),
-            })
-        }) {
-            for row in it.filter_map(|r| r.ok()) {
-                out.push(row);
-            }
-        };
-    }
-    out
-}
-
-/// The cache-body response is intentionally a preview transport, not a raw
-/// CacheEntries row.  Cache bodies may be several MiB and sending an entire
-/// base64 value over the webview IPC queue makes the renderer stop responding.
-/// `decoded_size` still describes the complete recovered response and
-/// `truncated` tells the detail panel that the visible bytes are a prefix.
-#[derive(Default, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CacheBodyPreview {
-    body_b64: String,
-    decoded_size: usize,
-    truncated: bool,
-}
-
-// A multiple of four keeps the base64 prefix decodable.  This holds common
-// HTML/JS responses (including the observed 417 KiB response) while putting a
-// hard upper bound on both SQLite-to-IPC and WebView work for large objects.
-const CACHE_BODY_PREVIEW_B64_CAP: usize = 768 * 1024;
-
-fn base64_decoded_size(encoded_len: usize, tail: &str) -> usize {
-    let padding = tail
-        .as_bytes()
-        .iter()
-        .rev()
-        .take_while(|&&byte| byte == b'=')
-        .count();
-    encoded_len
-        .saturating_div(4)
-        .saturating_mul(3)
-        .saturating_sub(padding)
-}
-
-/// Reads the bounded preview of one *exact* cache record.  Kept synchronous so
-/// the command wrapper can move all SQLite and filesystem work to Tauri's
-/// blocking worker pool.
-fn cache_entry_body_blocking(
-    host_dir: String,
-    account: String,
-    url: String,
-    cache_key: String,
-) -> CacheBodyPreview {
-    // URL alone is not an evidence identifier: the same URL can appear in
-    // multiple cache entries with different responses. Old BrowserActivity
-    // overviews did not retain `cache_key`; make those records reparse-only
-    // instead of silently returning an arbitrary duplicate body.
-    if cache_key.trim().is_empty() {
-        return CacheBodyPreview::default();
-    }
-    let dir = PathBuf::from(&host_dir).join("BROWSER");
-    let mut files = match std::fs::read_dir(&dir) {
-        Ok(rd) => rd
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| {
-                p.file_name()
-                    .map(|n| n.to_string_lossy().ends_with("_Cache.sqlite"))
-                    .unwrap_or(false)
-            })
-            .collect::<Vec<_>>(),
-        Err(_) => return CacheBodyPreview::default(),
-    };
-    // A BrowserActivity account is derived from this source filename's prefix
-    // (`<account>_<browser>_Cache.sqlite`). Check the account's own databases
-    // first rather than scanning every account for every drawer open. The
-    // browser is not part of the evidence identity, so match on the account
-    // prefix (Chrome/Edge/Whale/Unknown all qualify). Remaining databases stay
-    // as a correctness fallback for older data whose recorded account and
-    // filename do not agree.
-    let expected_prefix = format!("{}_", account);
-    files.sort_by(|left, right| {
-        let left_owned = left
-            .file_name()
-            .is_some_and(|name| name.to_string_lossy().starts_with(&expected_prefix));
-        let right_owned = right
-            .file_name()
-            .is_some_and(|name| name.to_string_lossy().starts_with(&expected_prefix));
-        right_owned.cmp(&left_owned).then_with(|| left.cmp(right))
-    });
-    for f in files {
-        let conn = match open_ro(&f.to_string_lossy()) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-        let sql = "SELECT substr(body_b64, 1, ?4), length(body_b64), substr(body_b64, -2) FROM CacheEntries WHERE account = ?1 AND url = ?2 AND cache_key = ?3 AND body_b64 IS NOT NULL AND body_b64 != '' LIMIT 1";
-        if let Ok(mut stmt) = conn.prepare(sql) {
-            let query = stmt.query(rusqlite::params![
-                account,
-                url,
-                cache_key,
-                CACHE_BODY_PREVIEW_B64_CAP as i64
-            ]);
-            if let Ok(mut rows) = query {
-                if let Ok(Some(row)) = rows.next() {
-                    let body_b64 = row.get::<_, String>(0).unwrap_or_default();
-                    let encoded_size = row.get::<_, i64>(1).unwrap_or_default().max(0) as usize;
-                    let tail = row.get::<_, String>(2).unwrap_or_default();
-                    return CacheBodyPreview {
-                        truncated: encoded_size > body_b64.len(),
-                        decoded_size: base64_decoded_size(encoded_size, &tail),
-                        body_b64,
-                    };
-                }
-            }
-        };
-    }
-    CacheBodyPreview::default()
-}
-
-/// Fetch a bounded body preview on Tauri's blocking pool.  A synchronous
-/// command ran this disk/SQLite query on the invoke path, so opening a large
-/// recovered cache record could freeze all click handling in the WebView.
-#[tauri::command]
-async fn cache_entry_body(
-    host_dir: String,
-    account: String,
-    url: String,
-    cache_key: String,
-) -> CacheBodyPreview {
-    tauri::async_runtime::spawn_blocking(move || {
-        cache_entry_body_blocking(host_dir, account, url, cache_key)
-    })
-    .await
-    .unwrap_or_default()
-}
-
-// --- Browser visit inflow chain (referrer / opener reconstruction) ----------
-//
-// The BrowserActivity overview intentionally keeps only per-URL metadata (it
-// reads `urls`, never `visits`), so "어디서 이 페이지로 왔나" is not in it. This
-// command reconstructs the inflow chain on demand from the *raw* browser
-// History database that is already collected under BROWSER/, so it works on
-// existing cases with no re-parse. Read-only, bounded, and blocking work runs
-// on Tauri's worker pool.
-
-#[derive(Serialize, Clone, Default)]
-#[serde(rename_all = "camelCase")]
-struct VisitGraphNode {
-    /// `visits.id` of this node — the *entry* visit when same-URL re-navigations
-    /// were collapsed into it (see `reloads`).
-    visit_id: String,
-    url: String,
-    title: String,
-    time: String,
-    transition: String,
-    /// Raw `visits.transition` integer (decoded form is in `transition`).
-    transition_raw: String,
-    /// A visit of the looked-up page itself — the record the analyst opened
-    /// (or, for a cache record, a page under the cache key's document origin).
-    is_target: bool,
-    /// Same-URL re-navigations (client/server redirect·reload) collapsed into
-    /// this node — the page re-navigating to itself is one visit story, not
-    /// separate nodes.
-    reloads: usize,
-    /// Raw cross-site referrer recorded on this visit (may be a site the
-    /// visits table has no row for, e.g. `https://chatgpt.com/`).
-    external_referrer: String,
-}
-
-#[derive(Serialize, Clone, Default)]
-#[serde(rename_all = "camelCase")]
-struct VisitGraphEdge {
-    /// Parent (navigation source) node's `visits.id`.
-    from: String,
-    /// Child (navigation destination) node's `visits.id`.
-    to: String,
-    /// Column on the child's row that names the parent — the raw join the edge
-    /// is built on: "from_visit" (same tab) or "opener_visit" (new tab).
-    kind: String,
-}
-
-/// The navigation neighbourhood of the looked-up page: every visit reachable
-/// from its visits through referrer/opener links in *both* directions —
-/// ancestors (where the analyst came from), descendants (where they went next)
-/// and sibling branches off shared ancestors.
-#[derive(Serialize, Default)]
-#[serde(rename_all = "camelCase")]
-struct BrowserVisitGraph {
-    nodes: Vec<VisitGraphNode>,
-    edges: Vec<VisitGraphEdge>,
-    source_file: String,
-    /// For a cache resource: the navigated page we attributed it to.
-    matched_page: String,
-    note: String,
-    /// 방문·노드 상한에 걸려 일부 연결만 표시한 경우.
-    truncated: bool,
-}
-
-/// Decode a Chromium page-transition integer into a short Korean label.
-fn decode_transition(raw: i64) -> String {
-    let v = raw as u32;
-    let core = match v & 0xff {
-        0 => "링크 클릭",
-        1 => "주소창 직접 입력",
-        2 => "북마크",
-        3 => "자동 하위프레임",
-        4 => "수동 하위프레임",
-        5 => "주소창 추천 이동",
-        6 => "시작 페이지",
-        7 => "폼 제출",
-        8 => "새로고침",
-        9 => "키워드 검색",
-        10 => "키워드 생성",
-        _ => "기타",
-    };
-    let mut quals: Vec<&str> = Vec::new();
-    if v & 0x0100_0000 != 0 {
-        quals.push("앞/뒤 이동");
-    }
-    if v & 0x0200_0000 != 0 {
-        quals.push("주소창");
-    }
-    if v & 0x0800_0000 != 0 {
-        quals.push("API");
-    }
-    if v & 0x4000_0000 != 0 {
-        quals.push("클라이언트 리다이렉트");
-    }
-    if v & 0x8000_0000 != 0 {
-        quals.push("서버 리다이렉트");
-    }
-    if quals.is_empty() {
-        core.to_string()
-    } else {
-        format!("{} · {}", core, quals.join(", "))
-    }
-}
-
-/// `scheme://host` of a URL, or None when it is not http(s).
-fn url_origin(u: &str) -> Option<String> {
-    let u = u.trim();
-    let (scheme, rest) = u
-        .strip_prefix("https://")
-        .map(|r| ("https://", r))
-        .or_else(|| u.strip_prefix("http://").map(|r| ("http://", r)))?;
-    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
-    if host.is_empty() {
-        None
-    } else {
-        Some(format!("{scheme}{host}"))
-    }
-}
-
-/// The top-frame document origin encoded in a Chromium cache key (the first
-/// http(s) token, i.e. the `_dk_<site>` entry), used to attribute a cached
-/// subresource back to the page that loaded it.
-fn cache_key_document_origin(cache_key: &str) -> Option<String> {
-    cache_key
-        .split_whitespace()
-        .find(|tok| tok.starts_with("http://") || tok.starts_with("https://"))
-        .and_then(url_origin)
-}
-
-/// 경로 비교용 정규화 — 소문자화 + 구분자 통일.
-fn normalize_fs_path(p: &str) -> String {
-    p.trim().to_lowercase().replace('\\', "/")
-}
-
-/// 캐시 index 수집 경로의 브라우저 프로필 루트 —
-/// `.../<프로필>/Cache[/Cache_Data]/index` → `.../<프로필>`.
-fn cache_profile_root(index_path: &str) -> Option<String> {
-    let norm = normalize_fs_path(index_path);
-    let mut parts: Vec<&str> = norm.split('/').filter(|s| !s.is_empty()).collect();
-    parts.pop()?; // index 파일명
-    if parts.last().copied() == Some("cache_data") {
-        parts.pop();
-    }
-    if parts.last().copied() == Some("cache") {
-        parts.pop();
-    }
-    if parts.is_empty() {
-        None
-    } else {
-        Some(parts.join("/"))
-    }
-}
-
-/// History 결과 DB에 파이프라인이 남긴 수집 원본 경로(_wina_source)의
-/// 프로필 루트(부모 폴더). 매핑이 없는 구 파싱본은 None.
-fn history_profile_root(db: &Path) -> Option<String> {
-    let conn = open_ro(&db.to_string_lossy()).ok()?;
-    let source: String = conn
-        .query_row("SELECT source_path FROM \"_wina_source\" LIMIT 1", [], |r| {
-            r.get(0)
-        })
-        .ok()?;
-    let norm = normalize_fs_path(&source);
-    let mut parts: Vec<&str> = norm.split('/').filter(|s| !s.is_empty()).collect();
-    parts.pop()?; // History 파일명
-    if parts.is_empty() {
-        None
-    } else {
-        Some(parts.join("/"))
-    }
-}
-
-/// 대상 방문에서 양방향(선행·후행)으로 따라가는 최대 홉 수.
-const VISIT_GRAPH_DEPTH_CAP: usize = 30;
-/// 그래프에 담는 최대 노드 수 — 넘으면 truncated로 표시. BFS라 대상에서
-/// 가까운(홉 수가 작은) 연결부터 채워진다.
-const VISIT_GRAPH_MAX_NODES: usize = 200;
-/// 그래프 출발점으로 삼는 대상 URL 방문(리다이렉트 접기 후) 상한 — 자주
-/// 방문한 페이지에서 대상 방문만으로 노드 상한을 다 쓰면 맥락(조상·후행)
-/// 노드가 전혀 못 들어가므로 훨씬 작게 잡는다.
-const VISIT_GRAPH_MAX_TARGETS: usize = 40;
-/// URL 하나에서 검사하는 최근 방문 수의 상한 — 최신 몇 건이 같은 유입의
-/// 리다이렉트로 채워져도 그 뒤의 다른 유입 경로가 조사되도록 충분히 넓게
-/// 잡는다. 이 상한에 걸리면 결과에 truncated로 표시한다.
-const VISIT_FLOW_SCAN_VISITS: usize = 400;
-
-/// Resolve one visit id into its stored fields, or None when absent. The
-/// collected browser History copy stores every column as TEXT (ids and the
-/// integer-typed `from_visit`/`opener_visit`/`transition`/`visit_time` all come
-/// back as strings), so ids are threaded as strings and the numeric fields are
-/// parsed explicitly.
-struct VisitRow {
-    transition: i64,
-    external_referrer: String,
-    time: String,
-    url: String,
-    title: String,
-}
-
-/// A visit id that references an actual row — a blank or "0" link is a chain
-/// terminator, not a real ancestor.
-fn nonzero_visit_id(id: &str) -> Option<String> {
-    let trimmed = id.trim();
-    if trimmed.is_empty() || trimmed == "0" {
-        None
-    } else {
-        Some(trimmed.to_string())
-    }
-}
-
-fn read_visit(conn: &Connection, visit_id: &str) -> Option<VisitRow> {
-    let sql = "SELECT COALESCE(v.transition, '0'), \
-               COALESCE(v.external_referrer_url, ''), \
-               CASE WHEN CAST(v.visit_time AS INTEGER) > 0 THEN datetime(CAST(v.visit_time AS INTEGER)/1000000 - 11644473600, 'unixepoch', 'localtime') ELSE '' END, \
-               u.url, COALESCE(u.title, '') \
-               FROM visits v JOIN urls u ON u.id = v.url WHERE v.id = ?1";
-    conn.query_row(sql, [visit_id], |r| {
-        let transition: String = r.get(0).unwrap_or_default();
-        Ok(VisitRow {
-            transition: transition.trim().parse::<i64>().unwrap_or(0),
-            external_referrer: r.get(1).unwrap_or_default(),
-            time: r.get(2).unwrap_or_default(),
-            url: r.get(3).unwrap_or_default(),
-            title: r.get(4).unwrap_or_default(),
-        })
-    })
-    .ok()
-}
-
-/// 한 `visits` 행의 연결 정보 — url id와, 이동해 온 부모(`from_visit`가
-/// `opener_visit`보다 우선, 기존 선형 체인과 같은 규칙)와 그 연결 컬럼명.
-#[derive(Clone)]
-struct VisitLinkRow {
-    url_id: String,
-    /// (parent `visits.id`, linking column: "from_visit" | "opener_visit").
-    parent: Option<(String, String)>,
-}
-
-/// 방문 연결 정보의 요구식(bounded) 저장소 — visits 테이블 전체를 적재하는
-/// 대신 시드와 그 이웃만 단건/배치 SQL로 읽고 캐시한다. 읽은 행 수는 전역
-/// 예산(VISIT_GRAPH_ROW_BUDGET)으로 상한되어, 메모리·I/O가 테이블 크기가
-/// 아니라 탐색 상한에 비례한다 (표시 상한 200노드는 결과 상한이지 입력
-/// 상한이 아니라는 리뷰 지적의 반영). 예산 소진은 truncated로 표면화된다.
-struct VisitStore<'c> {
-    conn: &'c Connection,
-    rows: std::collections::HashMap<String, Option<VisitLinkRow>>,
-    children: std::collections::HashMap<String, Vec<String>>,
-    children_fetched: std::collections::HashSet<String>,
-    rep_memo: std::collections::HashMap<String, String>,
-    fetched_rows: usize,
-}
-
-/// 그래프 조회 한 번이 원본 History에서 읽을 수 있는 방문 행 수의 상한.
-const VISIT_GRAPH_ROW_BUDGET: usize = 5_000;
-
-impl<'c> VisitStore<'c> {
-    fn new(conn: &'c Connection) -> Self {
-        Self {
-            conn,
-            rows: std::collections::HashMap::new(),
-            children: std::collections::HashMap::new(),
-            children_fetched: std::collections::HashSet::new(),
-            rep_memo: std::collections::HashMap::new(),
-            fetched_rows: 0,
-        }
-    }
-
-    fn budget_exhausted(&self) -> bool {
-        self.fetched_rows >= VISIT_GRAPH_ROW_BUDGET
-    }
-
-    fn link_of(url_id: String, from: String, opener: String) -> VisitLinkRow {
-        let parent = nonzero_visit_id(&from)
-            .map(|f| (f, "from_visit".to_string()))
-            .or_else(|| nonzero_visit_id(&opener).map(|o| (o, "opener_visit".to_string())));
-        VisitLinkRow { url_id, parent }
-    }
-
-    /// 방문 하나의 연결 행 — 캐시 미스면 단건 조회(예산 소진 시 None).
-    fn get_row(&mut self, id: &str) -> Option<VisitLinkRow> {
-        if let Some(cached) = self.rows.get(id) {
-            return cached.clone();
-        }
-        if self.budget_exhausted() {
-            return None;
-        }
-        let fetched = self
-            .conn
-            .query_row(
-                "SELECT COALESCE(url, ''), COALESCE(from_visit, ''), COALESCE(opener_visit, '') FROM visits WHERE id = ?1",
-                [id],
-                |r| {
-                    Ok(Self::link_of(
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, String>(2)?,
-                    ))
-                },
-            )
-            .ok();
-        self.fetched_rows += 1;
-        self.rows.insert(id.to_string(), fetched.clone());
-        fetched
-    }
-
-    /// `parents`의 (유효 부모 기준) 자식들을 배치 조회해 캐시에 채운다.
-    fn fetch_children(&mut self, parents: &[String]) {
-        let missing: Vec<String> = parents
-            .iter()
-            .filter(|p| !self.children_fetched.contains(*p))
-            .cloned()
-            .collect();
-        if missing.is_empty() || self.budget_exhausted() {
-            return;
-        }
-        for chunk in missing.chunks(100) {
-            if self.budget_exhausted() {
-                break;
-            }
-            let placeholders = std::iter::repeat_n("?", chunk.len())
-                .collect::<Vec<_>>()
-                .join(",");
-            let sql = format!(
-                "SELECT id, COALESCE(url, ''), COALESCE(from_visit, ''), COALESCE(opener_visit, '') FROM visits WHERE from_visit IN ({placeholders}) OR opener_visit IN ({placeholders})"
-            );
-            let params: Vec<&dyn rusqlite::ToSql> = chunk
-                .iter()
-                .chain(chunk.iter())
-                .map(|p| p as &dyn rusqlite::ToSql)
-                .collect();
-            let chunk_set: std::collections::HashSet<&str> =
-                chunk.iter().map(String::as_str).collect();
-            let Ok(mut stmt) = self.conn.prepare(&sql) else {
-                continue;
-            };
-            let Ok(mut rows) = stmt.query(params.as_slice()) else {
-                continue;
-            };
-            while let Ok(Some(r)) = rows.next() {
-                if self.budget_exhausted() {
-                    break;
-                }
-                let (Ok(id), Ok(url_id), Ok(from), Ok(opener)) = (
-                    r.get::<_, String>(0),
-                    r.get::<_, String>(1),
-                    r.get::<_, String>(2),
-                    r.get::<_, String>(3),
-                ) else {
-                    continue;
-                };
-                let link = Self::link_of(url_id, from, opener);
-                // 유효 부모(from 우선)가 이 배치의 부모일 때만 자식으로 연결 —
-                // 전량 스캔 버전과 같은 간선 의미를 유지한다.
-                if let Some((parent, _)) = &link.parent {
-                    if chunk_set.contains(parent.as_str()) {
-                        self.children
-                            .entry(parent.clone())
-                            .or_default()
-                            .push(id.clone());
-                    }
-                }
-                if !self.rows.contains_key(&id) {
-                    self.fetched_rows += 1;
-                    self.rows.insert(id, Some(link));
-                }
-            }
-            for parent in chunk {
-                self.children_fetched.insert(parent.clone());
-            }
-        }
-    }
-
-    /// 같은-URL 재이동 사슬의 entry 방문 — 부모가 같은 url인 동안 위로 걷는다
-    /// (전량 스캔 버전의 collapse_rep과 동일 의미, 메모·순환 안전).
-    fn rep_of(&mut self, id: &str) -> String {
-        if let Some(rep) = self.rep_memo.get(id) {
-            return rep.clone();
-        }
-        let mut path: Vec<String> = Vec::new();
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut cursor = id.to_string();
-        let rep = loop {
-            if let Some(rep) = self.rep_memo.get(&cursor) {
-                break rep.clone();
-            }
-            if !seen.insert(cursor.clone()) || path.len() >= VISIT_FLOW_SCAN_VISITS {
-                break cursor;
-            }
-            let Some(row) = self.get_row(&cursor) else {
-                break cursor;
-            };
-            let same_url_parent = match &row.parent {
-                Some((p, _)) => self
-                    .get_row(p)
-                    .is_some_and(|pr| pr.url_id == row.url_id)
-                    .then(|| p.clone()),
-                None => None,
-            };
-            match same_url_parent {
-                Some(p) => {
-                    path.push(cursor.clone());
-                    cursor = p;
-                }
-                None => break cursor,
-            }
-        };
-        for member in path {
-            self.rep_memo.insert(member, rep.clone());
-        }
-        self.rep_memo.insert(id.to_string(), rep.clone());
-        rep
-    }
-
-    /// entry(rep)의 같은-URL 재이동 사슬 구성원(rep 포함)을 아래로 확장한다.
-    /// 반환: (구성원 목록, 상한 도달 여부). 구성원 수·예산으로 상한된다.
-    fn members_of(&mut self, rep: &str) -> (Vec<String>, bool) {
-        let mut members = vec![rep.to_string()];
-        let Some(rep_row) = self.get_row(rep) else {
-            return (members, false);
-        };
-        let rep_url = rep_row.url_id;
-        let mut frontier = vec![rep.to_string()];
-        let mut capped = false;
-        while !frontier.is_empty() {
-            if members.len() >= VISIT_FLOW_SCAN_VISITS || self.budget_exhausted() {
-                capped = true;
-                break;
-            }
-            self.fetch_children(&frontier);
-            let mut next: Vec<String> = Vec::new();
-            for parent in frontier {
-                let kids = self.children.get(&parent).cloned().unwrap_or_default();
-                for kid in kids {
-                    let same = self
-                        .rows
-                        .get(&kid)
-                        .and_then(|r| r.as_ref())
-                        .is_some_and(|r| r.url_id == rep_url);
-                    if same {
-                        members.push(kid.clone());
-                        next.push(kid);
-                    }
-                }
-            }
-            frontier = next;
-        }
-        (members, capped)
-    }
-
-    /// 사슬 구성원들에 붙은 교차-URL 자식(각자 자기 사슬의 entry)과, 그 자식이
-    /// 부모를 가리키는 연결 컬럼명을 돌려준다.
-    fn cross_children_of(&mut self, members: &[String], rep_url: &str) -> Vec<(String, String)> {
-        self.fetch_children(members);
-        let mut out: Vec<(String, String)> = Vec::new();
-        for member in members {
-            let kids = self.children.get(member).cloned().unwrap_or_default();
-            for kid in kids {
-                let Some(Some(row)) = self.rows.get(&kid).cloned() else {
-                    continue;
-                };
-                if row.url_id != rep_url {
-                    let kind = row
-                        .parent
-                        .as_ref()
-                        .map(|(_, k)| k.clone())
-                        .unwrap_or_else(|| "from_visit".to_string());
-                    out.push((kid, kind));
-                }
-            }
-        }
-        out
-    }
-}
-
-/// The `_Cache`/`_IE_WebCache` outputs have no `visits` table; every other
-/// `*.sqlite` under BROWSER is a candidate History database.
-///
-/// 후보는 **같은 계정의 산출물로 한정**한다(스템이 `계정` 또는 `계정_` 접두) —
-/// 계정은 출처 컬럼이 없는 구 파싱본에도 남아 있는 최소 귀속 근거라, 다른
-/// 계정의 History가 이동 그래프의 근거로 연결되면 안 된다.
-fn browser_history_dbs(host_dir: &str, account: &str) -> Vec<PathBuf> {
-    let dir = PathBuf::from(host_dir).join("BROWSER");
-    let prefix = format!("{account}_");
-    let mut files: Vec<PathBuf> = match std::fs::read_dir(&dir) {
-        Ok(rd) => rd
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| {
-                let name = p.file_name().map(|n| n.to_string_lossy().to_string());
-                let stem = p
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                match name {
-                    Some(n) => {
-                        n.ends_with(".sqlite")
-                            && !n.ends_with("_Cache.sqlite")
-                            && !n.ends_with("_IE_WebCache.sqlite")
-                            && (stem == account || stem.starts_with(&prefix))
-                    }
-                    None => false,
-                }
-            })
-            .collect(),
-        Err(_) => return Vec::new(),
-    };
-    files.sort();
-    files
-}
-
-fn browser_visit_graph_blocking(
-    host_dir: String,
-    account: String,
-    url: String,
-    cache_key: Option<String>,
-    source_file: Option<String>,
-) -> BrowserVisitGraph {
-    let is_cache = cache_key.as_deref().is_some_and(|k| !k.trim().is_empty());
-    // 행이 가리키는 원본과 같은 브라우저의 History만 조회한다 — 같은 계정에
-    // 여러 브라우저 프로필이 있을 때 먼저 일치한 다른 브라우저의 체인을
-    // 증거처럼 연결하지 않기 위한 출처 고정이다.
-    //  - `BROWSER/<계정_브라우저>.sqlite` (BrowserActivity 방문 행) → 그 DB 하나만.
-    //  - 수집 원본 경로(캐시 index 등) → 경로에서 브라우저를 판별해 같은
-    //    계정·같은 브라우저의 History만 후보.
-    //  - 출처가 없으면(구 파싱본, `_source_file` 컬럼 도입 전) 고정을 포기하고
-    //    이전 동작대로 계정의 History 후보 전체를 조회한다 — 재파싱 전
-    //    케이스에서 기능을 끄지 않기 위한 완화이며, 체인을 낸 DB 파일명이
-    //    결과(source_file)에 남아 어느 원본인지는 확인 가능하다.
-    let source = source_file
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let candidates: Vec<PathBuf> = match source {
-        None => browser_history_dbs(&host_dir, &account),
-        Some(value) => {
-            let name = Path::new(value)
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
-            if name.ends_with(".sqlite") {
-                vec![PathBuf::from(&host_dir).join("BROWSER").join(name)]
-            } else {
-                match wina_core::parsers::browser_cache::browser_of(Path::new(value)) {
-                    Some(browser) => {
-                        let account_prefix = format!("{account}_");
-                        let browser_token = format!("_{browser}");
-                        let filtered: Vec<PathBuf> = browser_history_dbs(&host_dir, &account)
-                            .into_iter()
-                            .filter(|path| {
-                                path.file_name().is_some_and(|n| {
-                                    let n = n.to_string_lossy();
-                                    n.starts_with(&account_prefix) && n.contains(&browser_token)
-                                })
-                            })
-                            .collect();
-                        // 같은 브라우저 다중 프로필 구분: History 산출물의 수집
-                        // 원본(_wina_source) 프로필 루트와 캐시 index의 프로필
-                        // 루트가 일치하는 DB만 채택한다. 매핑이 없고(구 파싱본)
-                        // 후보가 여럿이면 임의 선택 대신 비활성 — Default 캐시에
-                        // Profile 1 체인이 붙는 오귀속을 차단한다.
-                        let cache_root = cache_profile_root(value);
-                        let matched: Vec<PathBuf> = match cache_root.as_deref() {
-                            Some(root) => filtered
-                                .iter()
-                                .filter(|db| history_profile_root(db).as_deref() == Some(root))
-                                .cloned()
-                                .collect(),
-                            None => Vec::new(),
-                        };
-                        if matched.len() == 1 {
-                            matched
-                        } else if filtered.len() <= 1 {
-                            // 후보가 하나뿐이면 프로필 모호성이 없고, 0개면
-                            // 아래 공통 빈 후보 안내로 떨어진다.
-                            filtered
-                        } else {
-                            return BrowserVisitGraph {
-                                note: "같은 브라우저 프로필이 여러 개라 이 캐시의 원본 프로필을 특정할 수 없습니다 — 재파싱하면 사용할 수 있습니다.".to_string(),
-                                ..Default::default()
-                            };
-                        }
-                    }
-                    None => {
-                        return BrowserVisitGraph {
-                            note: "크로미움 계열(Chrome·Edge·Whale) 방문 기록이 아닌 원본이라 유입 흐름을 복원할 수 없습니다.".to_string(),
-                            ..Default::default()
-                        };
-                    }
-                }
-            }
-        }
-    };
-    if candidates.is_empty() {
-        return BrowserVisitGraph {
-            note: "같은 브라우저의 방문 기록 결과가 없어 유입 흐름을 연결하지 않습니다.".to_string(),
-            ..Default::default()
-        };
-    }
-    // 원본 접근·스키마 실패는 "직접 확인 결과 유입 없음"과 구분해 남긴다 —
-    // 손상·잠금이 빈 흐름으로 위장하면 분석가가 증거 부재로 오판한다.
-    let mut source_failures: Vec<String> = Vec::new();
-    let mut truncated = false;
-    for db in candidates {
-        let db_name = db
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
-        let conn = match open_ro(&db.to_string_lossy()) {
-            Ok(c) => c,
-            Err(error) => {
-                source_failures.push(format!("{db_name}: 열기 실패 ({error})"));
-                continue;
-            }
-        };
-        // Require both tables — a truncated copy is skipped, not reported empty.
-        let has_tables = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('urls','visits')",
-                [],
-                |r| r.get::<_, i64>(0),
-            )
-            .unwrap_or(0)
-            == 2;
-        if !has_tables {
-            source_failures.push(format!("{db_name}: urls/visits 테이블 없음"));
-            continue;
-        }
-        let source_file = db
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
-
-        // Resolve the navigated page URL id(s) whose chain we reconstruct.
-        // ids are TEXT in the collected copy, so they are kept as strings.
-        let mut matched_page = String::new();
-        let mut url_ids: Vec<String> = Vec::new();
-        if is_cache {
-            // A cached subresource is not itself a navigated page; attribute it
-            // to pages under the cache key's top-frame document origin.
-            let origin = cache_key
-                .as_deref()
-                .and_then(cache_key_document_origin)
-                .or_else(|| url_origin(&url));
-            if let Some(origin) = origin {
-                matched_page = origin.clone();
-                // 접두어 LIKE만으로는 `https://example.com.evil/…`·다른 포트가
-                // 후보 상한(60)을 점유해 실제 origin 페이지가 밀릴 수 있다 —
-                // SQL 단계에서 origin 경계(정확 일치 / '/', '?', '#' 뒤따름)로
-                // 후보를 제한하고, Rust에서 origin 완전 일치를 재검증한다.
-                let escaped = origin
-                    .replace('\\', "\\\\")
-                    .replace('%', "\\%")
-                    .replace('_', "\\_");
-                if let Ok(mut stmt) = conn.prepare(
-                    "SELECT id, url FROM urls WHERE (url = ?1 OR url LIKE ?2 ESCAPE '\\' OR url LIKE ?3 ESCAPE '\\' OR url LIKE ?4 ESCAPE '\\') ORDER BY CAST(visit_count AS INTEGER) DESC LIMIT 60",
-                ) {
-                    if let Ok(mut rows) = stmt.query(rusqlite::params![
-                        origin,
-                        format!("{escaped}/%"),
-                        format!("{escaped}?%"),
-                        format!("{escaped}#%"),
-                    ]) {
-                        while let Ok(Some(r)) = rows.next() {
-                            if url_ids.len() >= 6 {
-                                break;
-                            }
-                            let (Ok(id), Ok(candidate)) =
-                                (r.get::<_, String>(0), r.get::<_, String>(1))
-                            else {
-                                continue;
-                            };
-                            if url_origin(&candidate).as_deref() == Some(origin.as_str()) {
-                                url_ids.push(id);
-                            }
-                        }
-                    }
-                }
-            }
-        } else if let Ok(mut stmt) = conn.prepare("SELECT id FROM urls WHERE url = ?1 LIMIT 4") {
-            if let Ok(mut rows) = stmt.query([&url]) {
-                while let Ok(Some(r)) = rows.next() {
-                    if let Ok(id) = r.get::<_, String>(0) {
-                        url_ids.push(id);
-                    }
-                }
-            }
-        }
-        if url_ids.is_empty() {
-            continue;
-        }
-
-        // ---- 요구식(bounded) 방문 연결 저장소 -------------------------------
-        // visits 전체를 적재하지 않고 시드·이웃만 배치 조회한다 — 읽기·메모리가
-        // 테이블 크기가 아니라 탐색 상한(노드·깊이·행 예산)에 비례한다.
-        let mut store = VisitStore::new(&conn);
-
-        // ---- 대상 방문(시드) 수집 ------------------------------------------
-        let target_url_ids: std::collections::HashSet<String> = url_ids.iter().cloned().collect();
-        let mut seeds: Vec<String> = Vec::new();
-        let mut seed_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        'urls: for url_id in &url_ids {
-            let mut visit_ids: Vec<String> = Vec::new();
-            if let Ok(mut stmt) = conn.prepare(
-                "SELECT id FROM visits WHERE url = ?1 ORDER BY CAST(visit_time AS INTEGER) DESC LIMIT ?2",
-            ) {
-                if let Ok(mut rows) =
-                    stmt.query(rusqlite::params![url_id, VISIT_FLOW_SCAN_VISITS as i64])
-                {
-                    while let Ok(Some(r)) = rows.next() {
-                        if let Ok(id) = r.get::<_, String>(0) {
-                            visit_ids.push(id);
-                        }
-                    }
-                }
-            }
-            if visit_ids.len() >= VISIT_FLOW_SCAN_VISITS {
-                truncated = true;
-            }
-            for vid in visit_ids {
-                let rep = store.rep_of(&vid);
-                if !seed_seen.insert(rep.clone()) {
-                    continue;
-                }
-                if seeds.len() >= VISIT_GRAPH_MAX_TARGETS {
-                    truncated = true;
-                    break 'urls;
-                }
-                seeds.push(rep);
-            }
-        }
-        if seeds.is_empty() {
-            continue;
-        }
-
-        // ---- 시드에서 양방향 BFS(접힌 노드 단위) ---------------------------
-        // 노드는 같은-URL 재이동 사슬의 entry(rep), 간선은 서로 다른 URL 사이
-        // 이동만. reload 수는 사슬 구성원 수 — 전량 스캔 버전과 같은 의미이되
-        // 확장은 in-graph 노드 주변으로만 일어난다.
-        let mut in_graph: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut order: Vec<String> = Vec::new();
-        let mut reloads_of: std::collections::HashMap<String, usize> =
-            std::collections::HashMap::new();
-        let mut parent_edge: std::collections::HashMap<String, (String, String)> =
-            std::collections::HashMap::new();
-        let mut queue: std::collections::VecDeque<(String, usize)> =
-            std::collections::VecDeque::new();
-        for seed in &seeds {
-            if in_graph.insert(seed.clone()) {
-                order.push(seed.clone());
-                queue.push_back((seed.clone(), 0));
-            }
-        }
-        while let Some((id, hop)) = queue.pop_front() {
-            let Some(row) = store.get_row(&id) else {
-                continue;
-            };
-            let (members, member_capped) = store.members_of(&id);
-            if member_capped {
-                truncated = true;
-            }
-            reloads_of.insert(id.clone(), members.len().saturating_sub(1));
-            let mut neighbors: Vec<String> = Vec::new();
-            // 조상: 이 entry의 교차-URL 부모 → 그 부모 사슬의 entry.
-            if let Some((p, kind)) = &row.parent {
-                let parent_is_cross = store
-                    .get_row(p)
-                    .is_some_and(|pr| pr.url_id != row.url_id);
-                if parent_is_cross {
-                    let prep = store.rep_of(p);
-                    parent_edge.insert(id.clone(), (prep.clone(), kind.clone()));
-                    neighbors.push(prep);
-                }
-            }
-            // 후행·형제: 사슬 구성원에 붙은 교차-URL 자식(각자 자기 사슬 entry).
-            for (child, kind) in store.cross_children_of(&members, &row.url_id) {
-                parent_edge
-                    .entry(child.clone())
-                    .or_insert((id.clone(), kind));
-                neighbors.push(child);
-            }
-            for n in neighbors {
-                if in_graph.contains(&n) {
-                    continue;
-                }
-                if hop >= VISIT_GRAPH_DEPTH_CAP
-                    || in_graph.len() >= VISIT_GRAPH_MAX_NODES
-                    || store.budget_exhausted()
-                {
-                    truncated = true;
-                    continue;
-                }
-                in_graph.insert(n.clone());
-                order.push(n.clone());
-                queue.push_back((n, hop + 1));
-            }
-        }
-        if store.budget_exhausted() {
-            truncated = true;
-        }
-
-        // ---- 노드·간선 구체화 ----------------------------------------------
-        let visit_id_num = |s: &str| s.trim().parse::<i64>().unwrap_or(i64::MAX);
-        let mut nodes: Vec<VisitGraphNode> = Vec::new();
-        for id in &order {
-            let Some(v) = read_visit(&conn, id) else {
-                continue;
-            };
-            nodes.push(VisitGraphNode {
-                visit_id: id.clone(),
-                url: v.url,
-                title: v.title,
-                time: v.time,
-                transition: decode_transition(v.transition),
-                transition_raw: v.transition.to_string(),
-                is_target: store
-                    .get_row(id)
-                    .is_some_and(|r| target_url_ids.contains(&r.url_id)),
-                reloads: reloads_of.get(id).copied().unwrap_or(0),
-                external_referrer: v.external_referrer,
-            });
-        }
-        nodes.sort_by(|a, b| {
-            a.time
-                .cmp(&b.time)
-                .then_with(|| visit_id_num(&a.visit_id).cmp(&visit_id_num(&b.visit_id)))
-        });
-        let mut edges: Vec<VisitGraphEdge> = Vec::new();
-        for id in &order {
-            if let Some((p, kind)) = parent_edge.get(id) {
-                if in_graph.contains(p) {
-                    edges.push(VisitGraphEdge {
-                        from: p.clone(),
-                        to: id.clone(),
-                        kind: kind.clone(),
-                    });
-                }
-            }
-        }
-        edges.sort_by_key(|e| visit_id_num(&e.to));
-        // 연결도 재이동도 외부 referrer도 없는 외톨이 대상뿐이면 이 DB에는
-        // 이동 이야기가 없다 — 기존 체인 뷰의 "유입 없음" 판정과 동일.
-        let has_story = !edges.is_empty()
-            || nodes
-                .iter()
-                .any(|n| !n.external_referrer.is_empty() || n.reloads > 0);
-        if !has_story {
-            continue;
-        }
-        let note = if is_cache {
-            "이 캐시 리소스를 로드한 것으로 추정되는 페이지(캐시 키의 최상위 문서 출처)를 기준으로 한 방문 이동 그래프입니다.".to_string()
-        } else {
-            String::new()
-        };
-        return BrowserVisitGraph {
-            nodes,
-            edges,
-            source_file,
-            matched_page,
-            note,
-            truncated,
-        };
-    }
-    // 모든 후보에서 체인을 만들지 못함 — 실패가 있으면 오류로 구분해 안내.
-    if !source_failures.is_empty() {
-        return BrowserVisitGraph {
-            note: format!(
-                "원본 방문 기록을 읽지 못해 유입 흐름을 확인할 수 없습니다 — {}",
-                source_failures.join("; ")
-            ),
-            ..Default::default()
-        };
-    }
-    BrowserVisitGraph {
-        note: "이 항목에 대한 방문 유입 흐름을 원본 History에서 찾지 못했습니다 (새 탭·리다이렉트 없이 직접 접근했거나, 원본 방문 기록이 남아있지 않을 수 있습니다).".to_string(),
-        ..Default::default()
-    }
-}
-
-#[tauri::command]
-async fn browser_visit_graph(
-    host_dir: String,
-    account: String,
-    url: String,
-    cache_key: Option<String>,
-    source_file: Option<String>,
-) -> BrowserVisitGraph {
-    tauri::async_runtime::spawn_blocking(move || {
-        browser_visit_graph_blocking(host_dir, account, url, cache_key, source_file)
-    })
-    .await
-    .unwrap_or_else(|error| BrowserVisitGraph {
-        note: format!("유입 흐름 작업이 중단되었습니다: {error}"),
-        ..Default::default()
-    })
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct AiConversation {
-    provider: String,
-    account: String,
-    title: String,
-    /// 대표 시각(공통 컬럼). 기간 필터가 쓰는 증거 시각이다.
-    timestamp: String,
-    /// Conversation-authored timestamps are preserved separately from the cache time.
-    created_at: String,
-    updated_at: String,
-    url: String,
-    /// 파생 테이블 rowid — 상세(원문) 단건 조회 키.
-    row_id: i64,
-    /// 결과 세대 내 레코드 ID. 원본 증거는 이 ID로 source_records를 조회해
-    /// 연다 — 화면 조회 키일 뿐 원본 북마크 키를 대신하지 않는다.
-    record_id: String,
-    /// 목록 표시용 메시지 수(파생 시점 계산). 원문은 상세에서만 읽는다.
-    message_count: i64,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct AiConversationQuery {
-    start: Option<String>,
-    end: Option<String>,
-    offset: usize,
-    limit: usize,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct AiConversationPage {
-    conversations: Vec<AiConversation>,
-    total: usize,
-    source_count: usize,
-    sources_read: usize,
-    /// One source failure must not hide conversations recovered from other
-    /// browser profiles. The UI presents this as a degraded-data warning,
-    /// never as an empty result set.
-    source_failures: Vec<String>,
-    /// 파생 테이블 자체가 없는 이전 파싱본 — "기간 내 데이터 없음"과
-    /// 구별해야 한다. 증거 부재와 미파싱을 혼동시키면 안 된다.
-    derived_missing: bool,
-}
-
-
-/// 파싱 단계 파생(_OVERVIEW/AiConversations)을 기간·페이지 조건으로
-/// 조회한다. 원본 캐시 재해석·행 상한(500/2,000)은 파생 이전으로 제거됐다 —
-/// total은 기간 내 전체 건수이고 정렬(관찰 시각 내림차순 + URL)은 파생
-/// 테이블 순서와 동일해 페이지가 재현된다. 파생 테이블이 없는 이전 파싱본은
-/// 빈 결과를 돌려준다(재파싱하면 생성 — PathReferences와 같은 계약).
-fn ai_conversations_blocking(
-    host_dir: String,
-    query: AiConversationQuery,
-) -> Result<AiConversationPage, String> {
-    let db = PathBuf::from(&host_dir)
-        .join("_OVERVIEW")
-        .join("AiConversations.sqlite");
-    if !db.is_file() {
-        return Ok(AiConversationPage {
-            conversations: Vec::new(),
-            total: 0,
-            source_count: 0,
-            sources_read: 0,
-            source_failures: Vec::new(),
-            derived_missing: true,
-        });
-    }
-    let conn = open_ro(&db.to_string_lossy())
-        .map_err(|error| format!("AI 대화 파생 테이블을 열 수 없습니다: {error}"))?;
-    let mut clauses: Vec<&str> = Vec::new();
-    let mut params: Vec<String> = Vec::new();
-    if let Some(start) = query.start.as_ref().filter(|s| !s.is_empty()) {
-        clauses.push("timestamp >= ?");
-        params.push(start.clone());
-    }
-    if let Some(end) = query.end.as_ref().filter(|s| !s.is_empty()) {
-        clauses.push("timestamp <= ?");
-        params.push(end.clone());
-    }
-    let where_sql = if clauses.is_empty() {
-        String::new()
-    } else {
-        format!(" WHERE {}", clauses.join(" AND "))
-    };
-    let bind: Vec<&dyn rusqlite::ToSql> =
-        params.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
-    let total: usize = conn
-        .query_row(
-            &format!("SELECT COUNT(*) FROM \"AiConversations\"{where_sql}"),
-            bind.as_slice(),
-            |r| r.get::<_, i64>(0),
-        )
-        .map_err(|error| format!("AI 대화 건수를 읽을 수 없습니다: {error}"))? as usize;
-    let limit = query.limit.clamp(1, 100);
-    // 원문(raw_json)은 목록에 싣지 않는다 — 대화 한 건의 크기에 상한이 없어
-    // 페이지 행 수만으로는 전송 바이트·파싱 비용이 제한되지 않는다. 원문은
-    // 분석가가 대화를 열 때 rowid로 단건 조회한다.
-    //
-    // The representative time is the common `timestamp`; the conversation's own
-    // created_at/updated_at are preserved (docs-01 column moves). Evidence links
-    // live in source_records, so only record_id is carried here.
-    let sql = format!(
-        "SELECT rowid, timestamp, provider, account, title, created_at, updated_at, url, \
-         COALESCE(record_id,''), COALESCE(message_count, 0) FROM \"AiConversations\"{where_sql} \
-         ORDER BY timestamp IS NULL, timestamp DESC, url ASC LIMIT ? OFFSET ?"
-    );
-    let mut stmt = conn
-        .prepare(&sql)
-        .map_err(|error| format!("AI 대화 조회를 준비할 수 없습니다: {error}"))?;
-    let mut bind_page = bind;
-    let limit_v = limit as i64;
-    let offset_v = query.offset as i64;
-    bind_page.push(&limit_v);
-    bind_page.push(&offset_v);
-    let conversations = stmt
-        .query_map(bind_page.as_slice(), |r| {
-            Ok(AiConversation {
-                row_id: r.get::<_, i64>(0)?,
-                timestamp: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                provider: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                account: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
-                title: r.get::<_, Option<String>>(4)?.unwrap_or_default(),
-                created_at: r.get::<_, Option<String>>(5)?.unwrap_or_default(),
-                updated_at: r.get::<_, Option<String>>(6)?.unwrap_or_default(),
-                url: r.get::<_, Option<String>>(7)?.unwrap_or_default(),
-                record_id: r.get::<_, Option<String>>(8)?.unwrap_or_default(),
-                message_count: r.get::<_, i64>(9)?,
-            })
-        })
-        .map_err(|error| format!("AI 대화를 읽을 수 없습니다: {error}"))?
-        .filter_map(|row| row.ok())
-        .collect();
-    Ok(AiConversationPage {
-        conversations,
-        total,
-        source_count: 1,
-        sources_read: 1,
-        source_failures: Vec::new(),
-        derived_missing: false,
-    })
-}
-
-/// 대화 한 건의 원문 — 목록이 아니라 분석가가 대화를 열 때만 조회한다.
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct AiConversationDetail {
-    raw_json: String,
-    record_id: String,
-}
-
-fn ai_conversation_detail_blocking(
-    host_dir: String,
-    row_id: i64,
-) -> Result<AiConversationDetail, String> {
-    let db = PathBuf::from(&host_dir)
-        .join("_OVERVIEW")
-        .join("AiConversations.sqlite");
-    if !db.is_file() {
-        return Err("AI 대화 파생 데이터가 없습니다".to_string());
-    }
-    let conn = open_ro(&db.to_string_lossy())
-        .map_err(|error| format!("AI 대화 파생 테이블을 열 수 없습니다: {error}"))?;
-    conn.query_row(
-        "SELECT COALESCE(raw_json,''), COALESCE(record_id,'') FROM \"AiConversations\" WHERE rowid = ?1",
-        rusqlite::params![row_id],
-        |row| {
-            Ok(AiConversationDetail {
-                raw_json: row.get(0)?,
-                record_id: row.get(1)?,
-            })
-        },
-    )
-    .map_err(|error| format!("AI 대화 원문을 읽을 수 없습니다: {error}"))
-}
-
-#[tauri::command]
-async fn ai_conversation_detail(
-    host_dir: String,
-    row_id: i64,
-) -> Result<AiConversationDetail, String> {
-    tauri::async_runtime::spawn_blocking(move || ai_conversation_detail_blocking(host_dir, row_id))
-        .await
-        .map_err(|error| format!("AI 대화 원문 조회가 중단되었습니다: {error}"))?
-}
-
-/// Conversation discovery decodes and validates cached JSON. It is bounded,
-/// but can still be CPU and disk intensive across several browser profiles,
-/// so it must never run on the command path that serves the interactive view.
-#[tauri::command]
-async fn ai_conversations(
-    host_dir: String,
-    query: AiConversationQuery,
-) -> Result<AiConversationPage, String> {
-    tauri::async_runtime::spawn_blocking(move || ai_conversations_blocking(host_dir, query))
-        .await
-        .map_err(|error| format!("AI 대화 작업이 중단되었습니다: {error}"))?
-}
-
 // --- commands: cross-artifact path references ------------------------------
 
 /// One other-artifact reference that the parser matched to a file record as a
@@ -8975,1174 +7799,6 @@ mod timeline_source_page_tests {
 }
 
 #[cfg(test)]
-mod browser_activity_tests {
-    use super::*;
-
-    /// 계정 경계 회귀: 출처 없는(구 파싱본) A 계정 행의 그래프가 같은 URL을
-    /// 가진 B 계정 History를 절대 후보로 삼지 않는다 — 계정은 남아 있는
-    /// 최소 귀속 근거다.
-    #[test]
-    fn sourceless_graph_never_crosses_account_boundary() {
-        let root = std::env::temp_dir().join(format!(
-            "windows-analysis-graph-acct-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos(),
-        ));
-        let dir = root.join("BROWSER");
-        std::fs::create_dir_all(&dir).unwrap();
-        // B 계정 History에만 대상 URL의 이동 이력이 있다.
-        let conn = Connection::open(dir.join("bob_Chrome.sqlite")).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE urls (id TEXT, url TEXT, title TEXT, visit_count TEXT);\
-             CREATE TABLE visits (id TEXT, url TEXT, from_visit TEXT, opener_visit TEXT, transition TEXT, external_referrer_url TEXT, visit_time TEXT);",
-        )
-        .unwrap();
-        conn.execute("INSERT INTO urls VALUES ('1','https://from-bob.test/','','1')", []).unwrap();
-        conn.execute("INSERT INTO urls VALUES ('2','https://t.test/p','','1')", []).unwrap();
-        conn.execute(
-            "INSERT INTO visits (id,url,from_visit,opener_visit,transition,external_referrer_url,visit_time) VALUES ('10','1','0','0','1','','13427941143000000')",
-            [],
-        ).unwrap();
-        conn.execute(
-            "INSERT INTO visits (id,url,from_visit,opener_visit,transition,external_referrer_url,visit_time) VALUES ('11','2','10','0','0','','13427941143100000')",
-            [],
-        ).unwrap();
-        drop(conn);
-
-        // alice 계정 행(출처 없음) → bob DB가 후보에 들어가면 안 된다.
-        let graph = browser_visit_graph_blocking(
-            root.to_string_lossy().to_string(),
-            "alice".to_string(),
-            "https://t.test/p".to_string(),
-            None,
-            None,
-        );
-        assert!(graph.nodes.is_empty(), "다른 계정 DB의 그래프가 연결되면 안 된다: {:?}",
-            graph.nodes.iter().map(|n| n.url.clone()).collect::<Vec<_>>());
-        assert!(!graph.note.is_empty());
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    /// 입력 상한 회귀: 대상과 무관한 대량 방문이 있어도 그래프 결과·truncated에
-    /// 영향이 없다 — 전량 적재가 아니라 시드 주변만 읽는다는 계약의 관측 지점.
-    #[test]
-    fn unrelated_visit_mass_does_not_affect_graph_or_budget() {
-        let root = std::env::temp_dir().join(format!(
-            "windows-analysis-graph-budget-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos(),
-        ));
-        let dir = root.join("BROWSER");
-        std::fs::create_dir_all(&dir).unwrap();
-        let conn = Connection::open(dir.join("user_Chrome.sqlite")).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE urls (id TEXT, url TEXT, title TEXT, visit_count TEXT);\
-             CREATE TABLE visits (id TEXT, url TEXT, from_visit TEXT, opener_visit TEXT, transition TEXT, external_referrer_url TEXT, visit_time TEXT);",
-        )
-        .unwrap();
-        conn.execute("INSERT INTO urls VALUES ('1','https://x.test/','','1')", []).unwrap();
-        conn.execute("INSERT INTO urls VALUES ('2','https://t.test/p','','1')", []).unwrap();
-        conn.execute("INSERT INTO urls VALUES ('3','https://noise.test/','','1')", []).unwrap();
-        conn.execute(
-            "INSERT INTO visits (id,url,from_visit,opener_visit,transition,external_referrer_url,visit_time) VALUES ('10','1','0','0','1','','13427941143000000')",
-            [],
-        ).unwrap();
-        conn.execute(
-            "INSERT INTO visits (id,url,from_visit,opener_visit,transition,external_referrer_url,visit_time) VALUES ('11','2','10','0','0','','13427941143100000')",
-            [],
-        ).unwrap();
-        // 행 예산(5,000)을 넘는 무관 방문 — 연결이 없어 그래프가 읽을 이유가 없다.
-        {
-            let tx = conn.unchecked_transaction().unwrap();
-            for i in 0..6_000i64 {
-                tx.execute(
-                    "INSERT INTO visits (id,url,from_visit,opener_visit,transition,external_referrer_url,visit_time) VALUES (?1,'3','0','0','0','', '13427941200000000')",
-                    [format!("{}", 1_000 + i)],
-                ).unwrap();
-            }
-            tx.commit().unwrap();
-        }
-        drop(conn);
-
-        let graph = browser_visit_graph_blocking(
-            root.to_string_lossy().to_string(),
-            "user".to_string(),
-            "https://t.test/p".to_string(),
-            None,
-            Some("BROWSER/user_Chrome.sqlite".to_string()),
-        );
-        let urls: Vec<&str> = graph.nodes.iter().map(|n| n.url.as_str()).collect();
-        assert!(urls.contains(&"https://x.test/"));
-        assert!(urls.contains(&"https://t.test/p"));
-        assert_eq!(graph.nodes.len(), 2, "무관 방문이 그래프에 끼면 안 된다: {urls:?}");
-        assert!(!graph.truncated, "무관 방문 대량이 예산을 소모하면 안 된다");
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    // Build a minimal browser History copy the way the collector writes it:
-    // one `urls`/`visits` pair with *every* column typed TEXT (ids and the
-    // integer-like link/time fields included).
-    fn write_history_fixture(dir: &Path) {
-        std::fs::create_dir_all(dir).unwrap();
-        let conn = Connection::open(dir.join("user_Chrome.sqlite")).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE urls (id TEXT, url TEXT, title TEXT, visit_count TEXT);\
-             CREATE TABLE visits (id TEXT, url TEXT, from_visit TEXT, opener_visit TEXT, transition TEXT, external_referrer_url TEXT, visit_time TEXT);",
-        )
-        .unwrap();
-        // A (typed) → B (link, same tab) → C (opened in a new tab from B),
-        // then onward: C → D (a later move off the reload), and A → E (a
-        // sibling branch off the shared ancestor).
-        for (id, url, title) in [
-            ("1", "https://a.test/", "A"),
-            ("2", "https://b.test/", "B"),
-            ("3", "https://c.test/page", "C"),
-            ("4", "https://d.test/next", "D"),
-            ("5", "https://e.test/side", "E"),
-        ] {
-            conn.execute(
-                "INSERT INTO urls VALUES (?1, ?2, ?3, '1')",
-                rusqlite::params![id, url, title],
-            )
-            .unwrap();
-        }
-        // transitions: TYPED (1) for A, LINK (0) for B, LINK (0x30000000) for C.
-        // Visit 13 is C re-navigating to *itself* (client redirect, 0x60000000,
-        // from_visit=12) — a reload of the same page, not a new inflow. Visit 14
-        // leaves C *from that reload* (from_visit=13), and visit 15 branches off
-        // A (from_visit=10) — a sibling path next to the target's ancestry.
-        // visit_time: microseconds since 1601 (arbitrary increasing values).
-        let rows = [
-            ("10", "1", "0", "0", "1", "", "13427941143000000"),
-            ("11", "2", "10", "0", "0", "", "13427941143100000"),
-            ("12", "3", "0", "11", "805306368", "https://ext.test/", "13427941143200000"),
-            ("13", "3", "12", "0", "1610612736", "", "13427941143300000"),
-            ("14", "4", "13", "0", "0", "", "13427941143400000"),
-            ("15", "5", "10", "0", "0", "", "13427941143500000"),
-        ];
-        for (id, url, from_visit, opener, transition, ext, time) in rows {
-            conn.execute(
-                "INSERT INTO visits (id, url, from_visit, opener_visit, transition, external_referrer_url, visit_time) VALUES (?1,?2,?3,?4,?5,?6,?7)",
-                rusqlite::params![id, url, from_visit, opener, transition, ext, time],
-            )
-            .unwrap();
-        }
-    }
-
-    #[test]
-    fn visit_graph_covers_ancestors_descendants_and_siblings() {
-        let root = std::env::temp_dir().join(format!(
-            "windows-analysis-visitflow-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos(),
-        ));
-        write_history_fixture(&root.join("BROWSER"));
-
-        // 대상 C에서 조상(A→B→C), 후행(C→D), 형제 분기(A→E)까지 한 그래프로.
-        let flow = browser_visit_graph_blocking(
-            root.to_string_lossy().to_string(),
-            "user".to_string(),
-            "https://c.test/page".to_string(),
-            None,
-            Some("BROWSER/user_Chrome.sqlite".to_string()),
-        );
-        assert_eq!(flow.source_file, "user_Chrome.sqlite");
-        let by_id: std::collections::HashMap<&str, &VisitGraphNode> =
-            flow.nodes.iter().map(|n| (n.visit_id.as_str(), n)).collect();
-        // reload 방문(13)은 entry(12)에 접혀 노드가 아니다.
-        assert_eq!(flow.nodes.len(), 5, "nodes: {:?}", flow.nodes.iter().map(|n| &n.visit_id).collect::<Vec<_>>());
-        for id in ["10", "11", "12", "14", "15"] {
-            assert!(by_id.contains_key(id), "missing node {id}");
-        }
-        let target = by_id["12"];
-        assert!(target.is_target);
-        assert_eq!(target.reloads, 1, "self-redirect 13 collapses into 12");
-        assert_eq!(target.external_referrer, "https://ext.test/");
-        assert_eq!(by_id["10"].transition, "주소창 직접 입력");
-        assert!(!by_id["14"].is_target && !by_id["10"].is_target);
-        // 간선: 조상 연결 그대로, 후행 이동은 reload가 아니라 entry에 붙는다.
-        let edge = |from: &str, to: &str| flow.edges.iter().find(|e| e.from == from && e.to == to);
-        assert_eq!(flow.edges.len(), 4);
-        assert_eq!(edge("10", "11").unwrap().kind, "from_visit");
-        assert_eq!(edge("11", "12").unwrap().kind, "opener_visit");
-        assert!(edge("12", "14").is_some(), "C→D는 reload(13)를 접은 entry(12)에 연결");
-        assert!(edge("10", "15").is_some(), "형제 분기 A→E 포함");
-
-        // A cached subresource is attributed to its document origin's page.
-        let cache_flow = browser_visit_graph_blocking(
-            root.to_string_lossy().to_string(),
-            "user".to_string(),
-            "https://c.test/asset/app.js".to_string(),
-            Some("1/0/_dk_https://c.test https://c.test https://c.test/asset/app.js".to_string()),
-            Some("/case/BROWSER/user/Chrome/Cache/Cache_Data/index".to_string()),
-        );
-        assert_eq!(cache_flow.matched_page, "https://c.test");
-        assert!(cache_flow
-            .nodes
-            .iter()
-            .any(|n| n.is_target && n.url == "https://c.test/page"));
-
-        // An unknown URL yields no graph but a non-empty explanatory note.
-        let none = browser_visit_graph_blocking(
-            root.to_string_lossy().to_string(),
-            "user".to_string(),
-            "https://nowhere.test/x".to_string(),
-            None,
-            Some("BROWSER/user_Chrome.sqlite".to_string()),
-        );
-        assert!(none.nodes.is_empty());
-        assert!(!none.note.is_empty());
-
-        // 출처가 없는 행(구 파싱본)은 고정을 포기하고 계정 후보 전체를
-        // 조회한다 — 그래프를 낸 원본은 source_file로 남는다.
-        let unsourced = browser_visit_graph_blocking(
-            root.to_string_lossy().to_string(),
-            "user".to_string(),
-            "https://c.test/page".to_string(),
-            None,
-            None,
-        );
-        assert!(!unsourced.nodes.is_empty());
-        assert_eq!(unsourced.source_file, "user_Chrome.sqlite");
-
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn visit_graph_keeps_every_entry_and_distinct_origins() {
-        let root = std::env::temp_dir().join(format!(
-            "windows-analysis-visitflow-distinct-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos(),
-        ));
-        let dir = root.join("BROWSER");
-        std::fs::create_dir_all(&dir).unwrap();
-        let conn = Connection::open(dir.join("user_Chrome.sqlite")).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE urls (id TEXT, url TEXT, title TEXT, visit_count TEXT);\
-             CREATE TABLE visits (id TEXT, url TEXT, from_visit TEXT, opener_visit TEXT, transition TEXT, external_referrer_url TEXT, visit_time TEXT);",
-        )
-        .unwrap();
-        // urls: 1 = source X, 2 = source Y, 3 = the target T.
-        for (id, url) in [("1", "https://x.test/"), ("2", "https://y.test/"), ("3", "https://t.test/p")] {
-            conn.execute("INSERT INTO urls VALUES (?1,?2,'',' 1')", rusqlite::params![id, url]).unwrap();
-        }
-        // Three genuine entries of T: two via X (both real visits — the graph
-        // keeps each), one via Y (a different origin, in the same picture).
-        let rows = [
-            ("100", "1", "0", "0", "1", "", "13427941143000000"),
-            ("101", "3", "100", "0", "0", "", "13427941143100000"),
-            ("200", "2", "0", "0", "1", "", "13427941143200000"),
-            ("201", "3", "200", "0", "0", "", "13427941143300000"),
-            ("102", "3", "100", "0", "0", "", "13427941143400000"),
-        ];
-        for (id, url, fv, op, tr, ext, t) in rows {
-            conn.execute(
-                "INSERT INTO visits (id,url,from_visit,opener_visit,transition,external_referrer_url,visit_time) VALUES (?1,?2,?3,?4,?5,?6,?7)",
-                rusqlite::params![id, url, fv, op, tr, ext, t],
-            ).unwrap();
-        }
-        drop(conn);
-
-        let flow = browser_visit_graph_blocking(
-            root.to_string_lossy().to_string(),
-            "user".to_string(),
-            "https://t.test/p".to_string(),
-            None,
-            Some("BROWSER/user_Chrome.sqlite".to_string()),
-        );
-        // 그래프는 T의 진짜 entry 방문을 전부 노드로 남긴다(101·102·201) —
-        // 서로 다른 출발지 X·Y가 한 그림에서 같이 보인다.
-        assert_eq!(flow.nodes.len(), 5);
-        assert_eq!(flow.edges.len(), 3);
-        assert_eq!(flow.nodes.iter().filter(|n| n.is_target).count(), 3);
-        let origins: std::collections::HashSet<&str> = flow
-            .nodes
-            .iter()
-            .filter(|n| !n.is_target)
-            .map(|n| n.url.as_str())
-            .collect();
-        assert!(origins.contains("https://x.test/"));
-        assert!(origins.contains("https://y.test/"));
-        let edge = |from: &str, to: &str| flow.edges.iter().any(|e| e.from == from && e.to == to);
-        assert!(edge("100", "101") && edge("100", "102") && edge("200", "201"));
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    /// 캐시 출처 origin은 접두어가 아니라 완전 일치 — `example.com.evil`·다른
-    /// 포트의 방문이 기준 페이지로 오인되면 안 된다.
-    #[test]
-    fn cache_origin_match_rejects_lookalike_hosts_and_other_ports() {
-        let root = std::env::temp_dir().join(format!(
-            "windows-analysis-visitflow-origin-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos(),
-        ));
-        let dir = root.join("BROWSER");
-        std::fs::create_dir_all(&dir).unwrap();
-        let conn = Connection::open(dir.join("user_Chrome.sqlite")).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE urls (id TEXT, url TEXT, title TEXT, visit_count TEXT);\
-             CREATE TABLE visits (id TEXT, url TEXT, from_visit TEXT, opener_visit TEXT, transition TEXT, external_referrer_url TEXT, visit_time TEXT);",
-        )
-        .unwrap();
-        // 미끼 호스트·다른 포트만 방문 기록에 있다 — 방문 횟수도 더 높다.
-        for (id, url, count) in [
-            ("1", "https://c.test.evil/lure", "9"),
-            ("2", "https://c.test:8443/admin", "8"),
-            ("3", "https://c.test/page", "1"),
-            ("4", "https://o.test/", "1"),
-        ] {
-            conn.execute("INSERT INTO urls VALUES (?1,?2,'',?3)", rusqlite::params![id, url, count]).unwrap();
-        }
-        let rows = [
-            ("10", "1", "0", "0", "1", "", "13427941143000000"),
-            ("11", "1", "10", "0", "0", "", "13427941143100000"),
-            ("20", "2", "0", "0", "1", "", "13427941143200000"),
-            ("21", "2", "20", "0", "0", "", "13427941143300000"),
-            ("30", "4", "0", "0", "1", "", "13427941143400000"),
-            ("31", "3", "30", "0", "0", "", "13427941143500000"),
-        ];
-        for (id, url, fv, op, tr, ext, t) in rows {
-            conn.execute(
-                "INSERT INTO visits (id,url,from_visit,opener_visit,transition,external_referrer_url,visit_time) VALUES (?1,?2,?3,?4,?5,?6,?7)",
-                rusqlite::params![id, url, fv, op, tr, ext, t],
-            ).unwrap();
-        }
-        drop(conn);
-
-        let flow = browser_visit_graph_blocking(
-            root.to_string_lossy().to_string(),
-            "user".to_string(),
-            "https://c.test/asset/app.js".to_string(),
-            Some("1/0/_dk_https://c.test https://c.test https://c.test/asset/app.js".to_string()),
-            Some("/case/BROWSER/user/Chrome/Cache/Cache_Data/index".to_string()),
-        );
-        assert_eq!(flow.matched_page, "https://c.test");
-        // 미끼·타 포트 페이지가 아니라 정확한 origin의 페이지만 대상이 된다.
-        let targets: Vec<&VisitGraphNode> = flow.nodes.iter().filter(|n| n.is_target).collect();
-        assert!(!targets.is_empty());
-        for node in &targets {
-            assert!(node.url.starts_with("https://c.test/"), "wrong page attributed: {}", node.url);
-        }
-        // 미끼 호스트·타 포트의 컴포넌트는 그래프에 연결되지 않는다.
-        assert!(flow
-            .nodes
-            .iter()
-            .all(|n| !n.url.contains(".evil") && !n.url.contains(":8443")));
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    /// 출처 고정: 같은 계정에 같은 URL을 가진 두 브라우저 DB가 있어도, 행의
-    /// 원본 DB(Edge)만 조회한다 — 먼저 정렬된 Chrome 체인이 새면 안 된다.
-    #[test]
-    fn visit_flow_reads_only_the_source_browser_db() {
-        let root = std::env::temp_dir().join(format!(
-            "windows-analysis-visitflow-src-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos(),
-        ));
-        let dir = root.join("BROWSER");
-        std::fs::create_dir_all(&dir).unwrap();
-        // 같은 URL이 두 브라우저 모두에 있고, 유입 출발지만 다르다.
-        for (file, origin) in [
-            ("user_Chrome.sqlite", "https://from-chrome.test/"),
-            ("user_Edge.sqlite", "https://from-edge.test/"),
-        ] {
-            let conn = Connection::open(dir.join(file)).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE urls (id TEXT, url TEXT, title TEXT, visit_count TEXT);\
-                 CREATE TABLE visits (id TEXT, url TEXT, from_visit TEXT, opener_visit TEXT, transition TEXT, external_referrer_url TEXT, visit_time TEXT);",
-            )
-            .unwrap();
-            conn.execute("INSERT INTO urls VALUES ('1', ?1, '', '1')", [origin]).unwrap();
-            conn.execute("INSERT INTO urls VALUES ('2', 'https://t.test/p', '', '1')", []).unwrap();
-            conn.execute(
-                "INSERT INTO visits (id,url,from_visit,opener_visit,transition,external_referrer_url,visit_time) VALUES ('10','1','0','0','1','','13427941143000000')",
-                [],
-            ).unwrap();
-            conn.execute(
-                "INSERT INTO visits (id,url,from_visit,opener_visit,transition,external_referrer_url,visit_time) VALUES ('11','2','10','0','0','','13427941143100000')",
-                [],
-            ).unwrap();
-        }
-
-        let flow = browser_visit_graph_blocking(
-            root.to_string_lossy().to_string(),
-            "user".to_string(),
-            "https://t.test/p".to_string(),
-            None,
-            Some("BROWSER/user_Edge.sqlite".to_string()),
-        );
-        assert_eq!(flow.source_file, "user_Edge.sqlite");
-        assert!(flow.nodes.iter().any(|n| n.url == "https://from-edge.test/"));
-        assert!(flow.nodes.iter().all(|n| n.url != "https://from-chrome.test/"));
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    /// reload 귀속: 독립 유입 두 개 중 리다이렉트가 이어진 entry에만 세고,
-    /// 다른 유입 체인에는 0으로 남는다.
-    #[test]
-    fn reloads_are_attributed_per_entry_chain() {
-        let root = std::env::temp_dir().join(format!(
-            "windows-analysis-visitflow-reload-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos(),
-        ));
-        let dir = root.join("BROWSER");
-        std::fs::create_dir_all(&dir).unwrap();
-        let conn = Connection::open(dir.join("user_Chrome.sqlite")).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE urls (id TEXT, url TEXT, title TEXT, visit_count TEXT);\
-             CREATE TABLE visits (id TEXT, url TEXT, from_visit TEXT, opener_visit TEXT, transition TEXT, external_referrer_url TEXT, visit_time TEXT);",
-        )
-        .unwrap();
-        for (id, url) in [("1", "https://x.test/"), ("2", "https://y.test/"), ("3", "https://t.test/p")] {
-            conn.execute("INSERT INTO urls VALUES (?1,?2,'','1')", rusqlite::params![id, url]).unwrap();
-        }
-        // X→T(101) 뒤에 self-redirect 2회(102→103), Y→T(201)는 리다이렉트 없음.
-        let rows = [
-            ("100", "1", "0", "0", "1", "", "13427941143000000"),
-            ("101", "3", "100", "0", "0", "", "13427941143100000"),
-            ("102", "3", "101", "0", "1610612736", "", "13427941143200000"),
-            ("103", "3", "102", "0", "1610612736", "", "13427941143300000"),
-            ("200", "2", "0", "0", "1", "", "13427941143400000"),
-            ("201", "3", "200", "0", "0", "", "13427941143500000"),
-        ];
-        for (id, url, fv, op, tr, ext, t) in rows {
-            conn.execute(
-                "INSERT INTO visits (id,url,from_visit,opener_visit,transition,external_referrer_url,visit_time) VALUES (?1,?2,?3,?4,?5,?6,?7)",
-                rusqlite::params![id, url, fv, op, tr, ext, t],
-            ).unwrap();
-        }
-        drop(conn);
-
-        let flow = browser_visit_graph_blocking(
-            root.to_string_lossy().to_string(),
-            "user".to_string(),
-            "https://t.test/p".to_string(),
-            None,
-            Some("BROWSER/user_Chrome.sqlite".to_string()),
-        );
-        // reload 방문(102·103)은 노드가 아니라 자기 entry(101)의 접힌 수다.
-        let by_id: std::collections::HashMap<&str, &VisitGraphNode> =
-            flow.nodes.iter().map(|n| (n.visit_id.as_str(), n)).collect();
-        assert_eq!(flow.nodes.len(), 4);
-        assert!(!by_id.contains_key("102") && !by_id.contains_key("103"));
-        assert_eq!(by_id["101"].reloads, 2, "X 유입 entry에만 재이동 2회 귀속");
-        assert_eq!(by_id["201"].reloads, 0, "Y 유입 entry는 재이동 0회");
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    /// 같은 계정·같은 브라우저의 다중 프로필: 캐시 행은 _wina_source의 프로필
-    /// 루트가 일치하는 History만 연결되고, 매핑이 없는 산출물이 여럿이면
-    /// 임의 선택 대신 비활성 안내가 반환된다.
-    #[test]
-    fn cache_flow_matches_only_the_same_browser_profile() {
-        let root = std::env::temp_dir().join(format!(
-            "windows-analysis-visitflow-profile-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos(),
-        ));
-        let dir = root.join("BROWSER");
-        std::fs::create_dir_all(&dir).unwrap();
-        // Default / Profile 1 — 같은 URL, 유입 출발지만 다르다.
-        for (file, origin, source) in [
-            (
-                "user_Chrome.sqlite",
-                "https://from-default.test/",
-                "/img/Users/user/AppData/Local/Google/Chrome/User Data/Default/History",
-            ),
-            (
-                "user_Chrome_2.sqlite",
-                "https://from-profile1.test/",
-                "/img/Users/user/AppData/Local/Google/Chrome/User Data/Profile 1/History",
-            ),
-        ] {
-            let conn = Connection::open(dir.join(file)).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE urls (id TEXT, url TEXT, title TEXT, visit_count TEXT);\
-                 CREATE TABLE visits (id TEXT, url TEXT, from_visit TEXT, opener_visit TEXT, transition TEXT, external_referrer_url TEXT, visit_time TEXT);\
-                 CREATE TABLE \"_wina_source\" (source_path TEXT);",
-            )
-            .unwrap();
-            conn.execute("INSERT INTO \"_wina_source\" VALUES (?1)", [source]).unwrap();
-            conn.execute("INSERT INTO urls VALUES ('1', ?1, '', '1')", [origin]).unwrap();
-            conn.execute("INSERT INTO urls VALUES ('2', 'https://t.test/p', '', '1')", []).unwrap();
-            conn.execute(
-                "INSERT INTO visits (id,url,from_visit,opener_visit,transition,external_referrer_url,visit_time) VALUES ('10','1','0','0','1','','13427941143000000')",
-                [],
-            ).unwrap();
-            conn.execute(
-                "INSERT INTO visits (id,url,from_visit,opener_visit,transition,external_referrer_url,visit_time) VALUES ('11','2','10','0','0','','13427941143100000')",
-                [],
-            ).unwrap();
-        }
-
-        // Profile 1의 캐시 index → Profile 1 History 그래프만 연결된다.
-        let flow = browser_visit_graph_blocking(
-            root.to_string_lossy().to_string(),
-            "user".to_string(),
-            "https://t.test/asset/app.js".to_string(),
-            Some("1/0/_dk_https://t.test https://t.test https://t.test/asset/app.js".to_string()),
-            Some("/img/Users/user/AppData/Local/Google/Chrome/User Data/Profile 1/Cache/Cache_Data/index".to_string()),
-        );
-        assert_eq!(flow.source_file, "user_Chrome_2.sqlite");
-        assert!(flow.nodes.iter().any(|n| n.url == "https://from-profile1.test/"));
-        assert!(flow.nodes.iter().all(|n| n.url != "https://from-default.test/"));
-
-        // 프로필 매핑이 없는 산출물(구 파싱본)에서 후보가 여럿이면 비활성.
-        for file in ["user_Chrome.sqlite", "user_Chrome_2.sqlite"] {
-            let conn = Connection::open(dir.join(file)).unwrap();
-            conn.execute_batch("DROP TABLE \"_wina_source\";").unwrap();
-        }
-        let ambiguous = browser_visit_graph_blocking(
-            root.to_string_lossy().to_string(),
-            "user".to_string(),
-            "https://t.test/asset/app.js".to_string(),
-            Some("1/0/_dk_https://t.test https://t.test https://t.test/asset/app.js".to_string()),
-            Some("/img/Users/user/AppData/Local/Google/Chrome/User Data/Profile 1/Cache/Cache_Data/index".to_string()),
-        );
-        assert!(ambiguous.nodes.is_empty());
-        assert!(ambiguous.note.contains("프로필"), "note: {}", ambiguous.note);
-
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    fn browser_domain_cache_test_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-        LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    #[test]
-    fn cache_body_preview_is_bounded_and_exactly_keyed() {
-        let root = std::env::temp_dir().join(format!(
-            "windows-analysis-cache-preview-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos(),
-        ));
-        let browser_dir = root.join("BROWSER");
-        std::fs::create_dir_all(&browser_dir).unwrap();
-        let path = browser_dir.join("alice_Chrome_Cache.sqlite");
-        let conn = Connection::open(&path).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE CacheEntries (account TEXT, url TEXT, cache_key TEXT, body_b64 TEXT)",
-        )
-        .unwrap();
-        let long_body = "QUJD".repeat(CACHE_BODY_PREVIEW_B64_CAP / 4 + 2);
-        conn.execute(
-            "INSERT INTO CacheEntries (account, url, cache_key, body_b64) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![
-                "alice",
-                "https://example.test/recovered.js",
-                "exact-key",
-                long_body
-            ],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO CacheEntries (account, url, cache_key, body_b64) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![
-                "alice",
-                "https://example.test/recovered.js",
-                "other-key",
-                "eA=="
-            ],
-        )
-        .unwrap();
-        drop(conn);
-
-        let preview = cache_entry_body_blocking(
-            root.to_string_lossy().to_string(),
-            "alice".to_string(),
-            "https://example.test/recovered.js".to_string(),
-            "exact-key".to_string(),
-        );
-        assert_eq!(preview.body_b64.len(), CACHE_BODY_PREVIEW_B64_CAP);
-        assert!(preview.truncated);
-        assert_eq!(
-            preview.decoded_size,
-            (CACHE_BODY_PREVIEW_B64_CAP / 4 + 2) * 3
-        );
-
-        let missing = cache_entry_body_blocking(
-            root.to_string_lossy().to_string(),
-            "alice".to_string(),
-            "https://example.test/recovered.js".to_string(),
-            "unknown-key".to_string(),
-        );
-        assert!(missing.body_b64.is_empty());
-        assert_eq!(missing.decoded_size, 0);
-        assert!(!missing.truncated);
-
-        let no_key = cache_entry_body_blocking(
-            root.to_string_lossy().to_string(),
-            "alice".to_string(),
-            "https://example.test/recovered.js".to_string(),
-            String::new(),
-        );
-        assert!(no_key.body_b64.is_empty());
-
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn cache_body_preview_recovers_non_chrome_browsers() {
-        // The BrowserActivity overview ingests Chrome/Edge/Whale/Unknown caches
-        // and marks any entry with a stored body as recoverable. The body fetch
-        // must open those same databases — a body living in `*_Edge_Cache.sqlite`
-        // used to be unreachable because the lookup only scanned Chrome files,
-        // so the "복구 데이터 열기" button opened onto "복구 데이터 확인 불가".
-        let root = std::env::temp_dir().join(format!(
-            "windows-analysis-cache-edge-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos(),
-        ));
-        let browser_dir = root.join("BROWSER");
-        std::fs::create_dir_all(&browser_dir).unwrap();
-        let path = browser_dir.join("profile1_Edge_Cache.sqlite");
-        let conn = Connection::open(&path).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE CacheEntries (account TEXT, url TEXT, cache_key TEXT, body_b64 TEXT)",
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO CacheEntries (account, url, cache_key, body_b64) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![
-                "profile1",
-                "https://example.test/js/app.min.js",
-                "edge-entry-key",
-                "SGVsbG8="
-            ],
-        )
-        .unwrap();
-        drop(conn);
-
-        let preview = cache_entry_body_blocking(
-            root.to_string_lossy().to_string(),
-            "profile1".to_string(),
-            "https://example.test/js/app.min.js".to_string(),
-            "edge-entry-key".to_string(),
-        );
-        assert_eq!(preview.body_b64, "SGVsbG8=");
-        assert_eq!(preview.decoded_size, 5);
-        assert!(!preview.truncated);
-
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn ai_conversation_detection_excludes_chatgpt_non_conversation_json() {
-        let payload = serde_json::json!({ "mapping": { "node": {} } });
-        let object = payload.as_object().unwrap();
-        assert!(wina_core::ai_activity::is_ai_conversation_payload(
-            "ChatGPT",
-            "https://chatgpt.com/backend-api/conversation/123e4567-e89b-12d3-a456-426614174000",
-            object,
-        ));
-        assert!(!wina_core::ai_activity::is_ai_conversation_payload(
-            "ChatGPT",
-            "https://chatgpt.com/backend-api/conversation/123e4567-e89b-12d3-a456-426614174000/stream_status",
-            object,
-        ));
-        assert!(!wina_core::ai_activity::is_ai_conversation_payload(
-            "ChatGPT",
-            "https://chatgpt.com/backend-api/settings/voices",
-            object,
-        ));
-    }
-
-    #[test]
-    fn ai_conversation_time_fields_preserve_numeric_and_text_values() {
-        let payload = serde_json::json!({ "create_time": 1_784_525_759.692_772, "updated_at": "2026-07-21T16:00:00Z" });
-        let object = payload.as_object().unwrap();
-        assert_eq!(
-            wina_core::ai_activity::json_time_field(object, &["create_time", "created_at"]),
-            "1784525759.692772"
-        );
-        assert_eq!(
-            wina_core::ai_activity::json_time_field(object, &["update_time", "updated_at"]),
-            "2026-07-21T16:00:00Z"
-        );
-    }
-
-    #[test]
-    fn ai_conversations_page_filters_range_and_reports_exact_total() {
-        let root = std::env::temp_dir().join(format!(
-            "windows-analysis-ai-derived-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos(),
-        ));
-        let ov = root.join("_OVERVIEW");
-        std::fs::create_dir_all(&ov).unwrap();
-        let conn = Connection::open(ov.join("AiConversations.sqlite")).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE AiConversations (record_id TEXT, host_id TEXT, dataset_id TEXT, timestamp TEXT, overview_name TEXT, account TEXT, account_sid TEXT, timestamp_kind TEXT, event_type TEXT, description TEXT, provider TEXT, title TEXT, created_at TEXT, updated_at TEXT, url TEXT, raw_json TEXT, message_count INTEGER);
-             CREATE TABLE source_records (record_id TEXT NOT NULL, ordinal INTEGER NOT NULL, source_dataset_id TEXT NOT NULL, source_artifact TEXT NOT NULL, source_db TEXT NOT NULL, source_table TEXT NOT NULL, source_rowid INTEGER NOT NULL, source_field TEXT, source_record_key TEXT, source_file TEXT, source_label TEXT);
-             CREATE TABLE _wina_derived_version (name TEXT NOT NULL PRIMARY KEY, version INTEGER NOT NULL);
-             INSERT INTO _wina_derived_version(name,version) VALUES ('overview_contract',1)",
-        )
-        .unwrap();
-        // 원문은 목록 응답에 실리면 안 되므로 크게 만들어 둔다.
-        let big_raw = format!("{{\"pad\":\"{}\"}}", "x".repeat(200_000));
-        for (record_id, timestamp, url) in [
-            ("rec-a", "2026-07-01 10:00:00.000", "https://chatgpt.com/backend-api/conversation/a"),
-            ("rec-b", "2026-07-02 10:00:00.000", "https://chatgpt.com/backend-api/conversation/b"),
-            ("rec-c", "2026-07-03 10:00:00.000", "https://chatgpt.com/backend-api/conversation/c"),
-        ] {
-            conn.execute(
-                "INSERT INTO AiConversations VALUES (?1, 'h', 'd', ?2, 'AiConversations', 'alice', NULL, 'cache_observed', 'conversation', NULL, 'ChatGPT', 't', NULL, NULL, ?3, ?4, 4)",
-                rusqlite::params![record_id, timestamp, url, big_raw],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO source_records VALUES (?1, 0, 'd0', 'Browser', 'BROWSER/u_Chrome_Cache.sqlite', 'CacheEntries', 7, NULL, 'u_Chrome_Cache::CacheEntries::7', NULL, NULL)",
-                rusqlite::params![record_id],
-            )
-            .unwrap();
-        }
-        drop(conn);
-
-        // 기간 필터: 2건만, total도 기간 내 전체(절단이 아님).
-        let page = ai_conversations_blocking(
-            root.to_string_lossy().to_string(),
-            AiConversationQuery {
-                start: Some("2026-07-02 00:00:00.000".into()),
-                end: None,
-                offset: 0,
-                limit: 1,
-            },
-        )
-        .unwrap();
-        assert_eq!(page.total, 2);
-        assert_eq!(page.conversations.len(), 1);
-        // 관찰 시각 내림차순 — 첫 페이지는 최신.
-        assert_eq!(page.conversations[0].timestamp, "2026-07-03 10:00:00.000");
-        let second = ai_conversations_blocking(
-            root.to_string_lossy().to_string(),
-            AiConversationQuery {
-                start: Some("2026-07-02 00:00:00.000".into()),
-                end: None,
-                offset: 1,
-                limit: 1,
-            },
-        )
-        .unwrap();
-        assert_eq!(second.conversations[0].timestamp, "2026-07-02 10:00:00.000");
-
-        // The list carries no raw JSON, only the record id and the message count;
-        // raw evidence is opened through record_id and source_records.
-        let listed = &page.conversations[0];
-        assert_eq!(listed.record_id, "rec-c");
-        assert_eq!(listed.message_count, 4);
-        assert!(listed.row_id > 0);
-        let serialized = serde_json::to_string(&page).unwrap();
-        assert!(
-            !serialized.contains("pad"),
-            "목록 응답에 원문이 포함되면 안 된다"
-        );
-        assert!(serialized.len() < 10_000, "목록 응답 크기 = {}", serialized.len());
-        assert!(!page.derived_missing);
-
-        // 원문은 대화를 열 때 rowid로 단건 조회한다.
-        let detail =
-            ai_conversation_detail_blocking(root.to_string_lossy().to_string(), listed.row_id)
-                .unwrap();
-        assert!(detail.raw_json.contains("pad"));
-        assert_eq!(detail.record_id, "rec-c");
-
-        // Evidence links come from source_records; nothing outside the host root
-        // is resolved.
-        let sources = read_record_sources_blocking(
-            ov.join("AiConversations.sqlite").to_string_lossy().to_string(),
-            "AiConversations".to_string(),
-            listed.row_id,
-        )
-        .unwrap();
-        assert_eq!(sources.len(), 1);
-        assert_eq!(
-            sources[0].get("source_record_key").and_then(Value::as_str),
-            Some("u_Chrome_Cache::CacheEntries::7")
-        );
-        assert_eq!(
-            sources[0].get("source_rowid").and_then(Value::as_i64),
-            Some(7)
-        );
-        // The collection file does not exist here, so no openable path.
-        assert_eq!(
-            sources[0].get("source_full_path").and_then(Value::as_str),
-            Some("")
-        );
-
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn ai_conversations_missing_derived_table_returns_empty_page() {
-        let root = std::env::temp_dir().join(format!(
-            "windows-analysis-ai-derived-missing-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos(),
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        // 이전 파싱본(파생 없음) — 오류가 아니라 빈 결과 (재파싱하면 생성).
-        let page = ai_conversations_blocking(
-            root.to_string_lossy().to_string(),
-            AiConversationQuery {
-                start: None,
-                end: None,
-                offset: 0,
-                limit: 10,
-            },
-        )
-        .unwrap();
-        assert!(page.conversations.is_empty());
-        assert_eq!(page.total, 0);
-        assert_eq!(page.source_count, 0);
-        // 미파싱(파생 부재)과 "기간 내 데이터 없음"은 구별돼야 한다 —
-        // 증거 부재로 오인하면 분석 결론이 달라진다.
-        assert!(page.derived_missing);
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn browser_summary_uses_sql_aggregates_for_the_active_filter_scope() {
-        let root = std::env::temp_dir().join(format!(
-            "windows-analysis-browser-summary-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos(),
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        let path = root.join("Browser.sqlite");
-        let conn = Connection::open(&path).unwrap();
-        conn.execute_batch("CREATE TABLE BrowserActivity (account TEXT, event_type TEXT, timestamp TEXT, title TEXT, url TEXT, url_raw TEXT)").unwrap();
-        for (account, kind, timestamp) in [
-            ("alice", "visit", "2024-06-01 10:00:00.000"),
-            ("alice", "download", "2024-06-01 11:00:00.000"),
-            ("bob", "cache", "2024-06-02 09:00:00.000"),
-        ] {
-            conn.execute(
-                "INSERT INTO BrowserActivity (account, event_type, timestamp, title, url, url_raw) VALUES (?, ?, ?, '', '', '')",
-                rusqlite::params![account, kind, timestamp],
-            ).unwrap();
-        }
-        drop(conn);
-
-        let summary = browser_activity_summary_blocking(
-            path.to_string_lossy().to_string(),
-            "BrowserActivity".to_string(),
-            BrowserActivityQuery {
-                account: Some("alice".to_string()),
-                kinds: vec!["visit".to_string(), "download".to_string()],
-                day: None,
-                search: None,
-                start: Some("2024-06-01 00:00:00.000".to_string()),
-                end: Some("2024-06-01 23:59:59.999".to_string()),
-                offset: 0,
-                limit: 10,
-                descending: None,
-            },
-        )
-        .unwrap();
-        assert_eq!(summary.total, 2);
-        assert_eq!(summary.accounts, vec!["alice"]);
-        assert_eq!(summary.days.len(), 1);
-        assert_eq!(summary.days[0].value, "2024-06-01");
-        assert_eq!(summary.days[0].count, 2);
-
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn browser_insights_are_bounded_and_use_the_active_account_and_period() {
-        let _lock = browser_domain_cache_test_lock();
-        clear_browser_domain_cache_for_test();
-        let root = std::env::temp_dir().join(format!(
-            "windows-analysis-browser-insights-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos(),
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        let path = root.join("Browser.sqlite");
-        let conn = Connection::open(&path).unwrap();
-        conn.execute_batch("CREATE TABLE BrowserActivity (account TEXT, event_type TEXT, timestamp TEXT, title TEXT, url TEXT, url_raw TEXT, visit_count INTEGER)").unwrap();
-        for (account, kind, timestamp, title, url, visits) in [
-            (
-                "alice",
-                "visit",
-                "2024-07-01 10:00:00.000",
-                "Alpha",
-                "https://alpha.example/a",
-                "4",
-            ),
-            (
-                "alice",
-                "visit",
-                "2024-07-01 11:00:00.000",
-                "Alpha",
-                "https://alpha.example/a",
-                "3",
-            ),
-            (
-                "alice",
-                "download",
-                "2024-07-02 09:00:00.000",
-                "a.exe",
-                "https://alpha.example/a.exe",
-                "",
-            ),
-            (
-                "bob",
-                "visit",
-                "2024-07-01 12:00:00.000",
-                "Bob",
-                "https://bob.example/",
-                "99",
-            ),
-            (
-                "alice",
-                "visit",
-                "2024-08-01 12:00:00.000",
-                "Later",
-                "https://later.example/",
-                "50",
-            ),
-        ] {
-            conn.execute(
-                "INSERT INTO BrowserActivity (account, event_type, timestamp, title, url, url_raw, visit_count) VALUES (?, ?, ?, ?, ?, '', ?)",
-                rusqlite::params![account, kind, timestamp, title, url, visits],
-            ).unwrap();
-        }
-        drop(conn);
-
-        let insights = browser_activity_insights_blocking(
-            path.to_string_lossy().to_string(),
-            "BrowserActivity".to_string(),
-            Some("alice".to_string()),
-            Some("2024-07-01 00:00:00.000".to_string()),
-            Some("2024-07-31 23:59:59.999".to_string()),
-        )
-        .unwrap();
-        assert_eq!(insights.visit_total, 7);
-        assert_eq!(insights.top_visited_domains.len(), 1);
-        assert_eq!(insights.top_visited_domains[0].domain, "alpha.example");
-        assert_eq!(insights.top_visited_domains[0].visit_count, 7);
-        assert_eq!(insights.top_visited_domains[0].url_count, 1);
-        assert_eq!(insights.download_total, 1);
-        assert_eq!(insights.downloads.len(), 1);
-        assert_eq!(map_text(&insights.downloads[0], "title"), "a.exe");
-
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn browser_domain_stats_normalize_hosts_and_exclude_out_of_scope_or_hostless_urls() {
-        let _lock = browser_domain_cache_test_lock();
-        clear_browser_domain_cache_for_test();
-        let root = std::env::temp_dir().join(format!(
-            "windows-analysis-browser-domains-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos(),
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        let path = root.join("Browser.sqlite");
-        let conn = Connection::open(&path).unwrap();
-        conn.execute_batch("CREATE TABLE BrowserActivity (account TEXT, event_type TEXT, timestamp TEXT, title TEXT, url TEXT, url_raw TEXT, visit_count INTEGER)").unwrap();
-        for (account, timestamp, url, visits) in [
-            (
-                "alice",
-                "2024-07-01 10:00:00.000",
-                "https://User:pass@Alpha.Example:8443/a?q=1#top",
-                "4",
-            ),
-            (
-                "alice",
-                "2024-07-01 11:00:00.000",
-                "http://alpha.example./b",
-                "3",
-            ),
-            (
-                "alice",
-                "2024-07-01 12:00:00.000",
-                "https://beta.example/path",
-                "2",
-            ),
-            (
-                "alice",
-                "2024-07-01 13:00:00.000",
-                "file:///tmp/evidence",
-                "40",
-            ),
-            (
-                "bob",
-                "2024-07-01 14:00:00.000",
-                "https://bob.example/",
-                "99",
-            ),
-            (
-                "alice",
-                "2024-08-01 14:00:00.000",
-                "https://later.example/",
-                "50",
-            ),
-        ] {
-            conn.execute(
-                "INSERT INTO BrowserActivity (account, event_type, timestamp, title, url, url_raw, visit_count) VALUES (?, 'visit', ?, '', ?, '', ?)",
-                rusqlite::params![account, timestamp, url, visits],
-            ).unwrap();
-        }
-        drop(conn);
-
-        let insights = browser_activity_insights_blocking(
-            path.to_string_lossy().to_string(),
-            "BrowserActivity".to_string(),
-            Some("alice".to_string()),
-            Some("2024-07-01 00:00:00.000".to_string()),
-            Some("2024-07-31 23:59:59.999".to_string()),
-        )
-        .unwrap();
-        assert_eq!(insights.visit_total, 9);
-        assert_eq!(insights.top_visited_domains.len(), 2);
-        assert_eq!(insights.top_visited_domains[0].domain, "alpha.example");
-        assert_eq!(insights.top_visited_domains[0].visit_count, 7);
-        assert_eq!(insights.top_visited_domains[0].url_count, 2);
-        assert_eq!(insights.top_visited_domains[1].domain, "beta.example");
-        assert_eq!(insights.top_visited_domains[1].visit_count, 2);
-
-        let first_page = browser_activity_domains_blocking(
-            path.to_string_lossy().to_string(),
-            "BrowserActivity".to_string(),
-            Some("alice".to_string()),
-            Some("2024-07-01 00:00:00.000".to_string()),
-            Some("2024-07-31 23:59:59.999".to_string()),
-            0,
-            1,
-            None,
-        )
-        .unwrap();
-        assert_eq!(first_page.total, 2);
-        assert_eq!(first_page.domains.len(), 1);
-        assert_eq!(first_page.domains[0].domain, "alpha.example");
-        assert_eq!(
-            BROWSER_DOMAIN_AGGREGATION_BUILD_COUNT.load(std::sync::atomic::Ordering::SeqCst),
-            1
-        );
-        let second_page = browser_activity_domains_blocking(
-            path.to_string_lossy().to_string(),
-            "BrowserActivity".to_string(),
-            Some("alice".to_string()),
-            Some("2024-07-01 00:00:00.000".to_string()),
-            Some("2024-07-31 23:59:59.999".to_string()),
-            1,
-            1,
-            None,
-        )
-        .unwrap();
-        assert_eq!(second_page.total, 2);
-        assert_eq!(second_page.domains.len(), 1);
-        assert_eq!(second_page.domains[0].domain, "beta.example");
-        assert_eq!(
-            BROWSER_DOMAIN_AGGREGATION_BUILD_COUNT.load(std::sync::atomic::Ordering::SeqCst),
-            1
-        );
-
-        // A different account is a different scope and must not reuse Alice's
-        // aggregate. The source database has no in-range Bob visit domain.
-        let bob_page = browser_activity_domains_blocking(
-            path.to_string_lossy().to_string(),
-            "BrowserActivity".to_string(),
-            Some("bob".to_string()),
-            Some("2024-07-01 00:00:00.000".to_string()),
-            Some("2024-07-31 23:59:59.999".to_string()),
-            0,
-            1,
-            None,
-        )
-        .unwrap();
-        assert_eq!(bob_page.total, 1);
-        assert_eq!(bob_page.domains[0].domain, "bob.example");
-        assert_eq!(
-            BROWSER_DOMAIN_AGGREGATION_BUILD_COUNT.load(std::sync::atomic::Ordering::SeqCst),
-            2
-        );
-
-        // Changing the SQLite file invalidates the old Alice key even though
-        // account and period are unchanged.
-        let conn = Connection::open(&path).unwrap();
-        conn.execute(
-            "INSERT INTO BrowserActivity (account, event_type, timestamp, title, url, url_raw, visit_count) VALUES ('alice', 'visit', '2024-07-02 00:00:00.000', '', 'https://new.example/', '', '1')",
-            [],
-        ).unwrap();
-        drop(conn);
-        let refreshed_page = browser_activity_domains_blocking(
-            path.to_string_lossy().to_string(),
-            "BrowserActivity".to_string(),
-            Some("alice".to_string()),
-            Some("2024-07-01 00:00:00.000".to_string()),
-            Some("2024-07-31 23:59:59.999".to_string()),
-            0,
-            10,
-            None,
-        )
-        .unwrap();
-        assert_eq!(refreshed_page.total, 3);
-        assert_eq!(
-            BROWSER_DOMAIN_AGGREGATION_BUILD_COUNT.load(std::sync::atomic::Ordering::SeqCst),
-            3
-        );
-
-        let _ = std::fs::remove_dir_all(root);
-    }
-}
-
-#[cfg(test)]
 mod pipeline_log_supervision_tests {
     use super::*;
 
@@ -11356,6 +9012,289 @@ mod overview_contract_tests {
         );
         let _ = std::fs::remove_dir_all(root);
     }
+
+    /// Inserts one row; `cells` are (column, value) pairs.
+    fn insert_row(conn: &Connection, table: &str, cells: &[(&str, rusqlite::types::Value)]) {
+        let columns: Vec<String> = cells.iter().map(|(column, _)| q(column)).collect();
+        let marks: Vec<String> = (1..=cells.len()).map(|index| format!("?{index}")).collect();
+        let values: Vec<&dyn rusqlite::ToSql> = cells.iter().map(|(_, value)| value as &dyn rusqlite::ToSql).collect();
+        conn.execute(&format!("INSERT INTO {} ({}) VALUES ({})", q(table), columns.join(","), marks.join(",")), values.as_slice())
+            .unwrap_or_else(|error| panic!("{table}: {error}"));
+    }
+
+    fn t(value: &str) -> rusqlite::types::Value {
+        rusqlite::types::Value::Text(value.to_string())
+    }
+
+    fn n(value: i64) -> rusqlite::types::Value {
+        rusqlite::types::Value::Integer(value)
+    }
+
+    /// Three inputs (two Chrome profiles + an Edge cache) with visits, URL
+    /// summaries, a download with a URL chain, cache rows (text/blob/untimed)
+    /// and one AI referral marker.
+    fn write_browser_overview(root: &Path) -> PathBuf {
+        let conn = wina_core::derived::create_database(&root.join("_OVERVIEW"), "BrowserActivity").unwrap();
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        for (ordinal, (id, kind, browser, profile, label)) in [
+            ("in1", "history", "Chrome", "Default", "alice"),
+            ("in2", "cache", "Edge", "Default", "alice"),
+            ("in3", "history", "Chrome", "Profile 1", "bob"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            insert_row(&conn, "BrowserInputs", &[
+                ("input_id", t(id)), ("host_id", t("h")), ("dataset_id", t("g")), ("ordinal", n(ordinal as i64)),
+                ("input_kind", t(kind)), ("browser", t(browser)), ("profile", t(profile)), ("account_label", t(label)),
+                ("account", t(label)), ("account_sid", t(if label == "alice" { "S-1-5-21-1" } else { "S-1-5-21-2" })),
+                ("source_file", t(&format!("/evidence/{label}/{browser}/{profile}"))), ("facts_db", t("BROWSER/x.sqlite")),
+                ("facts_dataset_id", t("f")),
+            ]);
+        }
+        let record = |id: &str, kind: &str, input: &str, time: Option<&str>, extra: &[(&str, rusqlite::types::Value)]| {
+            let mut cells = vec![
+                ("record_id", t(id)), ("host_id", t("h")), ("dataset_id", t("g")), ("overview_name", t("BrowserActivity")),
+                ("event_type", t(kind)), ("input_id", t(input)), ("account", t(if input == "in3" { "bob" } else { "alice" })),
+                ("account_sid", t(if input == "in3" { "S-1-5-21-2" } else { "S-1-5-21-1" })),
+            ];
+            if let Some(time) = time {
+                cells.push(("timestamp", t(time)));
+                cells.push(("timestamp_kind", t("시각")));
+            }
+            cells.extend(extra.iter().cloned());
+            insert_row(&conn, "BrowserActivity", &cells);
+            insert_row(&conn, "source_records", &[
+                ("record_id", t(id)), ("ordinal", n(0)), ("source_dataset_id", t("f")), ("source_artifact", t("Browser")),
+                ("source_db", t("BROWSER/x.sqlite")), ("source_table", t("BrowserHistory")), ("source_rowid", n(1)),
+            ]);
+        };
+        record("v1", "visit", "in1", Some("2026-01-01 10:00:00.000"), &[("url", t("https://a.example/x")), ("title", t("A")), ("url_summary_id", t("s1")), ("visit_id", t("1"))]);
+        record("v2", "visit", "in1", Some("2026-01-01 11:00:00.000"), &[("url", t("https://a.example/y")), ("from_record_id", t("v1")), ("visit_id", t("2"))]);
+        // Two parents: same-tab source v1 and opener v2.
+        record("v3", "visit", "in1", Some("2026-01-02 09:00:00.000"), &[("url", t("https://b.example/")), ("from_record_id", t("v1")), ("opener_record_id", t("v2")), ("visit_id", t("3"))]);
+        // A link across inputs must never be followed.
+        record("v4", "visit", "in3", Some("2026-01-01 10:30:00.000"), &[("url", t("https://a.example/z")), ("from_record_id", t("v2")), ("visit_id", t("2"))]);
+        record("s1", "url_summary", "in1", Some("2026-01-01 11:00:00.000"), &[("url", t("https://a.example/x")), ("visit_count", n(2)), ("typed_count", n(0))]);
+        record("s2", "url_summary", "in1", None, &[("url", t("https://c.example/"))]);
+        record("d1", "download", "in1", Some("2026-01-02 10:00:00.000"), &[
+            ("title", t("tool.exe")), ("url", t("https://dl.example/tool.exe")),
+            ("download_path", t("C:\\Users\\alice\\Down%20loads\\tool.exe")), ("download_referrer", t("https://a.example/y")),
+            ("received_bytes", n(10)), ("total_bytes", n(20)), ("download_state", n(2)), ("download_opened", n(0)),
+        ]);
+        record("c1", "cache", "in2", Some("2026-01-01 12:00:00.000"), &[("url", t("https://a.example/app.js")), ("request_url", t("https://a.example/app.js"))]);
+        record("c2", "cache", "in2", None, &[("url", t("https://a.example/bin"))]);
+        record("r1", "visit", "in1", Some("2026-01-03 08:00:00.000"), &[("url", t("https://x.example/?utm_source=chatgpt.com")), ("ai_referral_provider", t("ChatGPT"))]);
+        for (id, ordinal) in [("s1", 0), ("s2", 1)] {
+            insert_row(&conn, "BrowserUrlSummaries", &[
+                ("summary_id", t(id)), ("host_id", t("h")), ("dataset_id", t("g")), ("input_id", t("in1")), ("url_id", n(ordinal)),
+                ("source_dataset_id", t("f")), ("source_db", t("BROWSER/x.sqlite")), ("source_table", t("urls")), ("source_rowid", n(ordinal)),
+            ]);
+        }
+        insert_row(&conn, "BrowserSearchTerms", &[
+            ("search_id", t("k1")), ("host_id", t("h")), ("dataset_id", t("g")), ("input_id", t("in1")), ("summary_id", t("s1")),
+            ("term", t("Secret Plan")), ("normalized_term", t("secret plan")), ("source_dataset_id", t("f")),
+            ("source_db", t("BROWSER/x.sqlite")), ("source_table", t("keyword_search_terms")), ("source_rowid", n(1)),
+        ]);
+        for (ordinal, url) in [(0, "https://cdn.example/redirect"), (1, "https://dl.example/tool.exe")] {
+            insert_row(&conn, "BrowserDownloadChain", &[("record_id", t("d1")), ("ordinal", n(ordinal)), ("chain_index", n(ordinal)), ("url", t(url))]);
+        }
+        insert_row(&conn, "BrowserCacheDetails", &[
+            ("record_id", t("c1")), ("status_line", t("HTTP/1.1 200 OK")), ("http_status", n(200)), ("body_recovered", n(1)),
+            ("body", t("hello cache")), ("all_headers", t("HTTP/1.1 200 OK\nX-Trace: needle-header")),
+        ]);
+        insert_row(&conn, "BrowserCacheDetails", &[
+            ("record_id", t("c2")), ("body_recovered", n(1)), ("body", rusqlite::types::Value::Blob(vec![0, 1, 2, 255])),
+        ]);
+        root.join("_OVERVIEW").join("BrowserActivity.sqlite")
+    }
+
+    fn ids(rows: &[Map<String, Value>]) -> Vec<String> {
+        rows.iter().map(|row| map_text(row, "record_id")).collect()
+    }
+
+    fn filter(kinds: &[&str]) -> BrowserFilter {
+        BrowserFilter { kinds: kinds.iter().map(|kind| kind.to_string()).collect(), ..Default::default() }
+    }
+
+    #[test]
+    fn browser_view_reads_only_the_overview_contract() {
+        let root = temp_root("browser-overview");
+        let db = write_browser_overview(&root).to_string_lossy().to_string();
+        let host = root.to_string_lossy().to_string();
+
+        let scope = browser_scope_blocking(db.clone()).unwrap();
+        assert_eq!(
+            scope.iter().map(|input| (input.input_id.as_str(), input.record_count)).collect::<Vec<_>>(),
+            vec![("in1", 7), ("in2", 2), ("in3", 1)]
+        );
+
+        // Event days exclude URL summaries; untimed rows stay reachable.
+        let summary = browser_summary_blocking(db.clone(), BrowserFilter::default()).unwrap();
+        let days: Vec<(String, i64)> = summary.days.iter().map(|day| (day.value.clone(), day.count)).collect();
+        assert_eq!(days, vec![("2026-01-01".into(), 4), ("2026-01-02".into(), 2), ("2026-01-03".into(), 1)]);
+        assert_eq!(summary.untimed, 2);
+        let domains: Vec<(String, i64, i64)> = summary.top_domains.iter().map(|d| (d.domain.clone(), d.visit_count, d.url_count)).collect();
+        assert_eq!(domains[0], ("a.example".into(), 3, 3));
+        assert_eq!(summary.visit_total, 5);
+        assert_eq!((summary.download_total, ids(&summary.downloads)), (1, vec!["d1".to_string()]));
+
+        let scoped = browser_summary_blocking(db.clone(), BrowserFilter { input_ids: vec!["in1".into()], ..filter(&["visit"]) }).unwrap();
+        assert_eq!(scoped.days.iter().map(|day| day.count).collect::<Vec<_>>(), vec![2, 1, 1]);
+        assert_eq!(scoped.visit_total, 4);
+
+        // Day page: time order, record_id tie-break; descending mirrors it.
+        let day = BrowserFilter { day: Some("2026-01-01".into()), ..filter(&["visit", "download", "cache"]) };
+        assert_eq!(ids(&browser_page_blocking(db.clone(), day.clone(), 0, 50, false).unwrap().rows), ["v1", "v4", "v2", "c1"]);
+        assert_eq!(ids(&browser_page_blocking(db.clone(), day, 0, 50, true).unwrap().rows), ["c1", "v2", "v4", "v1"]);
+        let untimed = browser_page_blocking(db.clone(), BrowserFilter { untimed: true, ..Default::default() }, 0, 50, false).unwrap();
+        assert_eq!(ids(&untimed.rows), ["c2", "s2"]);
+        let all = browser_page_blocking(db.clone(), BrowserFilter::default(), 0, 50, false).unwrap();
+        assert_eq!(ids(&all.rows).last().map(String::as_str), Some("s2"), "NULL times sort last");
+
+        // Search reaches child values and reduces them to one parent row.
+        let search = |needle: &str| {
+            let mut found = ids(&browser_page_blocking(db.clone(), BrowserFilter { search: Some(needle.into()), ..Default::default() }, 0, 50, false).unwrap().rows);
+            found.sort();
+            found
+        };
+        assert_eq!(search("needle-header"), ["c1"]);
+        assert_eq!(search("secret plan"), ["s1", "v1"]);
+        assert_eq!(search("cdn.example/redirect"), ["d1"]);
+        assert_eq!(search("Down%20loads"), ["d1"], "local paths are not URL-decoded");
+        assert_eq!(search("S-1-5-21-2"), ["v4"]);
+        assert_eq!(search("100%"), Vec::<String>::new(), "LIKE metacharacters are literal");
+        let referrals = browser_page_blocking(db.clone(), BrowserFilter { referral: true, ..Default::default() }, 0, 50, false).unwrap();
+        assert_eq!(ids(&referrals.rows), ["r1"]);
+
+        let ascending = browser_domains_blocking(db.clone(), BrowserFilter::default(), 0, 1, true).unwrap();
+        assert_eq!((ascending.total, ascending.domains[0].visit_count), (3, 1));
+
+        // Record detail: relations by stored ids, no cache body inline.
+        let download = browser_record_blocking(host.clone(), "d1".into()).unwrap();
+        assert_eq!(map_text(&download.row, "download_path"), "C:\\Users\\alice\\Down%20loads\\tool.exe");
+        assert_eq!(download.download_chain.iter().map(|row| map_text(row, "url")).collect::<Vec<_>>(), ["https://cdn.example/redirect", "https://dl.example/tool.exe"]);
+        assert_eq!(download.input.as_ref().map(|input| map_text(input, "browser")), Some("Chrome".into()));
+        assert_eq!(download.sources.len(), 1);
+        let visit = browser_record_blocking(host.clone(), "v1".into()).unwrap();
+        assert_eq!(visit.url_summary.as_ref().map(|summary| map_text(summary, "visit_count")), Some("2".into()));
+        assert_eq!(visit.search_terms.len(), 1);
+        let summary_record = browser_record_blocking(host.clone(), "s1".into()).unwrap();
+        assert_eq!(summary_record.url_summary.as_ref().map(|summary| map_text(summary, "source_table")), Some("urls".into()));
+        let cache = browser_record_blocking(host.clone(), "c1".into()).unwrap();
+        let details = cache.cache.unwrap();
+        assert_eq!((map_text(&details, "body_length"), map_text(&details, "body_type")), ("11".into(), "text".into()));
+        assert!(!details.contains_key("body"));
+
+        use base64::Engine as _;
+        let decode = |chunk: BrowserCacheBody| base64::engine::general_purpose::STANDARD.decode(chunk.data_b64).unwrap();
+        assert_eq!(decode(browser_cache_body_blocking(host.clone(), "c1".into(), 0, 5).unwrap()), b"hello");
+        let tail = browser_cache_body_blocking(host.clone(), "c1".into(), 6, 100).unwrap();
+        assert_eq!(tail.total, 11);
+        assert_eq!(decode(tail), b"cache");
+        assert_eq!(decode(browser_cache_body_blocking(host.clone(), "c2".into(), 0, 100).unwrap()), vec![0, 1, 2, 255]);
+        assert!(browser_cache_body_blocking(host.clone(), "v1".into(), 0, 10).is_err());
+
+        // Flow follows stored from/opener links inside the visit's input only.
+        let flow = browser_visit_flow_blocking(host.clone(), "v2".into()).unwrap();
+        assert_eq!(flow.nodes.iter().map(|node| node.record_id.as_str()).collect::<Vec<_>>(), ["v1", "v2", "v3"]);
+        assert_eq!(flow.nodes.iter().filter(|node| node.is_target).map(|node| node.record_id.as_str()).collect::<Vec<_>>(), ["v2"]);
+        let mut edges: Vec<(String, String, String)> = flow.edges.iter().map(|edge| (edge.from.clone(), edge.to.clone(), edge.kind.clone())).collect();
+        edges.sort();
+        assert_eq!(edges, vec![
+            ("v1".into(), "v2".into(), "from_visit".into()),
+            ("v1".into(), "v3".into(), "from_visit".into()),
+            ("v2".into(), "v3".into(), "opener_visit".into()),
+        ]);
+        assert!(browser_visit_flow_blocking(host, "c1".into()).is_err());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Two snapshots of one ChatGPT conversation (messages with a non-current
+    /// branch, an attachment, a collected response) and an untimed list trace.
+    fn write_ai_overview(root: &Path) -> PathBuf {
+        let conn = wina_core::derived::create_database(&root.join("_OVERVIEW"), "AiConversations").unwrap();
+        let base = |id: &str, kind: &str, time: Option<&str>, extra: &[(&str, rusqlite::types::Value)]| {
+            let mut cells = vec![
+                ("record_id", t(id)), ("host_id", t("h")), ("dataset_id", t("g")), ("overview_name", t("AiConversations")),
+                ("record_kind", t(kind)),
+            ];
+            if let Some(time) = time {
+                cells.push(("timestamp", t(time)));
+                cells.push(("timestamp_kind", t("캐시 관찰 시각")));
+            }
+            cells.extend(extra.iter().cloned());
+            insert_row(&conn, "AiConversations", &cells);
+        };
+        let recovered = |messages: i64| -> Vec<(&str, rusqlite::types::Value)> {
+            vec![
+                ("provider", t("ChatGPT")), ("conversation_id", t("conv-x")), ("title", t("Plan")), ("body_recovered", n(1)),
+                ("message_count", n(messages)), ("current_branch_message_count", n(messages - 1)), ("structural_node_count", n(messages + 1)),
+                ("attachment_count", n(1)),
+            ]
+        };
+        base("conv1", "conversation", Some("2026-02-01 10:00:00.000"), &recovered(3));
+        base("conv2", "conversation", Some("2026-01-31 10:00:00.000"), &recovered(2));
+        base("list1", "list_entry", None, &[
+            ("provider", t("Claude")), ("conversation_id", t("conv-y")), ("title", t("Untimed list")), ("body_recovered", n(0)),
+            ("list_ordinal", n(0)), ("list_item_count", n(1)),
+        ]);
+        for (ordinal, role, current, content) in [(0, "user", 1, "first question"), (1, "assistant", 0, "older answer"), (2, "assistant", 1, "current answer")] {
+            insert_row(&conn, "AiMessages", &[
+                ("record_id", t("conv1")), ("ordinal", n(ordinal)), ("node_id", t(&format!("n{ordinal}"))), ("role", t(role)),
+                ("content", t(content)), ("on_current_branch", n(current)),
+            ]);
+        }
+        insert_row(&conn, "AiAttachments", &[
+            ("record_id", t("conv1")), ("ordinal", n(0)), ("message_ordinal", n(0)), ("file_name", t("a.pdf")), ("extracted_text", t("pdf text")),
+        ]);
+        insert_row(&conn, "AiConversationTexts", &[("record_id", t("conv1")), ("ordinal", n(0)), ("text_kind", t("interpretation_json")), ("text_value", t("{\"a\":1}"))]);
+        insert_row(&conn, "AiConversationTexts", &[("record_id", t("conv1")), ("ordinal", n(1)), ("text_kind", t("search_text")), ("text_value", t("first question needle-msg"))]);
+        insert_row(&conn, "source_records", &[
+            ("record_id", t("conv1")), ("ordinal", n(0)), ("source_dataset_id", t("f")), ("source_artifact", t("Browser")),
+            ("source_db", t("BROWSER/a_Cache.sqlite")), ("source_table", t("CacheEntries")), ("source_rowid", n(7)),
+        ]);
+        insert_row(&conn, "AiResponseBodies", &[
+            ("source_db", t("BROWSER/a_Cache.sqlite")), ("source_table", t("CacheEntries")), ("source_rowid", n(7)),
+            ("response_body", t("RAW-RESPONSE")), ("byte_length", n(12)),
+        ]);
+        root.join("_OVERVIEW").join("AiConversations.sqlite")
+    }
+
+    #[test]
+    fn ai_view_reads_stored_messages_branches_and_snapshots() {
+        let root = temp_root("ai-overview");
+        let db = write_ai_overview(&root).to_string_lossy().to_string();
+        let page = |query: AiQuery| ai_page_blocking(db.clone(), AiQuery { limit: 50, ..query }).unwrap();
+
+        let all = page(AiQuery::default());
+        assert_eq!(ids(&all.rows), ["conv1", "conv2", "list1"], "newest first, untimed last");
+        assert_eq!(all.kinds.iter().map(|kind| (kind.value.as_str(), kind.count)).collect::<Vec<_>>(), [("conversation", 2), ("list_entry", 1)]);
+        assert_eq!(ids(&page(AiQuery { kind: Some("list_entry".into()), ..Default::default() }).rows), ["list1"]);
+        assert_eq!(ids(&page(AiQuery { untimed: true, ..Default::default() }).rows), ["list1"]);
+        assert_eq!(ids(&page(AiQuery { search: Some("needle-msg".into()), ..Default::default() }).rows), ["conv1"]);
+        let narrowed = page(AiQuery { kind: Some("conversation".into()), search: Some("plan".into()), ..Default::default() });
+        assert_eq!((narrowed.row_count, narrowed.kinds.len()), (2, 1));
+
+        let record = ai_record_blocking(db.clone(), "conv1".into()).unwrap();
+        assert_eq!(
+            record.messages.iter().map(|m| (map_text(m, "content"), map_text(m, "on_current_branch"))).collect::<Vec<_>>(),
+            vec![("first question".into(), "1".into()), ("older answer".into(), "0".into()), ("current answer".into(), "1".into())]
+        );
+        assert_eq!(record.attachments.iter().map(|a| map_text(a, "message_ordinal")).collect::<Vec<_>>(), ["0"]);
+        assert_eq!(record.interpretation.as_deref(), Some("{\"a\":1}"));
+        assert_eq!(record.sources.iter().map(|s| map_text(s, "response_length")).collect::<Vec<_>>(), ["12"]);
+        assert_eq!(ids(&record.snapshots), ["conv2"]);
+
+        let list = ai_record_blocking(db.clone(), "list1".into()).unwrap();
+        assert!(list.messages.is_empty() && list.snapshots.is_empty());
+        assert_eq!(list.row.get("message_count"), Some(&Value::Null), "unknown counts stay NULL");
+
+        let chunk = ai_response_body_blocking(db.clone(), "BROWSER/a_Cache.sqlite".into(), "CacheEntries".into(), 7, 4, 100).unwrap();
+        assert_eq!((chunk.data.as_str(), chunk.total), ("RESPONSE", 12));
+        assert!(ai_response_body_blocking(db, "BROWSER/a_Cache.sqlite".into(), "CacheEntries".into(), 8, 0, 10).is_err());
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
 
 fn main() {
@@ -11424,17 +9363,17 @@ fn main() {
             pick_folder,
             file_references,
             path_reference_accounts,
-            browser_activity_summary,
-            browser_activity_insights,
-            browser_activity_domains,
-            browser_activity_page,
+            browser_scope,
+            browser_summary,
+            browser_domains,
+            browser_page,
+            browser_record,
+            browser_cache_body,
+            browser_visit_flow,
             account_event_page,
-            ai_referrals,
-            cache_entries,
-            cache_entry_body,
-            browser_visit_graph,
-            ai_conversations,
-            ai_conversation_detail,
+            ai_page,
+            ai_record,
+            ai_response_body,
             powershell_search_rowids
         ])
         .setup(|app| {

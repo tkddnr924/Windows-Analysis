@@ -5,8 +5,9 @@ import { displayRegistryKeyPath } from "@/lib/registryPath";
 import { executableNote } from "./executableCatalog";
 import { ACCOUNT_ROLE_LABELS } from "./executionHistory";
 import { lookupEventCatalog, parseEventData, extractEventField, extractPsClassicField, tagsForSecurityEvent, EVENT_QUICK_FIELDS, LOGON_TYPE_LABELS } from "./eventCatalog";
+import { downloadStateLabel, transitionLabel } from "./browserView";
 
-export type FieldKind = "text" | "path" | "code" | "hash" | "bytes" | "json" | "badge" | "privileges" | "accountSid" | "account" | "byteSize" | "durationMs" | "cacheData" | "mftData";
+export type FieldKind = "text" | "path" | "code" | "hash" | "bytes" | "json" | "badge" | "privileges" | "accountSid" | "account" | "byteSize" | "durationMs" | "mftData";
 
 export interface FieldSpec {
   key: string;
@@ -1049,7 +1050,7 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     customView: "browserHistory",
     // Browser records use an evidence-type title, not a page title or URL:
     // those vary by source and belong in the browser-specific fields below.
-    title: (r) => `BrowserActivity:${r.event_type === "download" ? "Download" : r.event_type === "cache" ? "Cache" : "Visit"}`,
+    title: (r) => `BrowserActivity:${({ download: "Download", cache: "Cache", url_summary: "UrlSummary" } as Record<string, string>)[r.event_type] ?? "Visit"}`,
     subtitle: (r) => r.timestamp || "",
     overviewTime: "hide",
     // The timeline already owns the timestamp column. Show the actual URL as
@@ -1062,57 +1063,96 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     // therefore contains only actual visits and downloads.
     timelineField: "timestamp",
     timelineInclude: (r) => r.event_type === "visit" || r.event_type === "download",
-    tags: (r) => tagsForDangerType(r.danger).concat(r.event_type === "download" ? tagsForPath(r.detail) : []),
+    tags: (r) => tagsForDangerType(r.danger).concat(r.event_type === "download" ? tagsForPath(r.download_current_path || r.download_path || r.detail) : []),
     priorityColumns: ["account", "event_type", "browser", "timestamp", "title", "url", "size_bytes", "source_url"],
-    sections: [{
-      heading: (r) => `브라우저 ${r.event_type === "download" ? "다운로드" : r.event_type === "cache" ? "캐시" : "접근"}`,
-      fields: [
-      { key: "title", label: "방문 Title", compute: (r) => r.title || "" },
-      { key: "browser", label: "브라우저" },
+    // docs-07: stored values only; local paths are never URL-decoded (R05).
+    sections: [
       {
-        key: "url_raw",
-        label: "URL 원본",
-        kind: "path",
-        compute: (r) => r.event_type === "cache" ? r.url : r.url_raw || r.url,
+        heading: (r) => `브라우저 ${({ download: "다운로드", cache: "캐시", url_summary: "URL 요약" } as Record<string, string>)[r.event_type] ?? "방문"}`,
+        fields: [
+          { key: "timestamp_kind", label: "대표 시각 의미" },
+          { key: "title", label: "제목" },
+          { key: "url_raw", label: "URL 원문", kind: "path", compute: (r) => r.url_raw || r.url || "" },
+          {
+            key: "url",
+            label: "URL (디코딩)",
+            kind: "path",
+            compute: (r) => {
+              const value = r.url || "";
+              try { const decoded = decodeURIComponent(value); return decoded === (r.url_raw || value) ? "" : decoded; } catch { return ""; }
+            },
+          },
+          { key: "detail", label: "상세", compute: (r) => (r.event_type === "download" ? "" : r.detail || "") },
+          { key: "ai_service_provider", label: "AI 서비스 호스트" },
+          { key: "ai_referral_provider", label: "AI 유입 표식", compute: (r) => [r.ai_referral_provider, r.ai_referral_param].filter(Boolean).join(" · ") },
+        ],
       },
-      { key: "account", label: "브라우저 접근 계정", kind: "account" },
       {
-        key: "url",
-        label: "URL (디코딩)",
-        kind: "path",
-        compute: (r) => {
-          const value = r.url || "";
-          try { return decodeURIComponent(value); } catch { return value; }
-        },
+        heading: "입력 · 계정",
+        fields: [
+          { key: "browser", label: "브라우저" },
+          { key: "profile", label: "프로필" },
+          { key: "input_kind", label: "입력 종류" },
+          { key: "account", label: "계정", kind: "account" },
+        ],
       },
-      { key: "visit_count", label: "방문 횟수", compute: (r) => r.event_type === "visit" ? r.visit_count : "" },
-      // 주소창에 URL을 직접 입력해 이동한 횟수 — 링크 경유 방문과 달리
-      // "의도적으로 찾아간 사이트"임을 입증하는 값(T7).
-      { key: "typed_count", label: "주소창 직접 입력 횟수", compute: (r) => r.event_type === "visit" ? r.typed_count : "" },
-      { key: "detail", label: "저장 경로", kind: "path", compute: (r) => r.event_type === "download" ? r.detail : "" },
-      { key: "download_path", label: "다운로드 저장 경로", kind: "path" },
-      { key: "download_path_resolved", label: "다운로드 저장 경로 (환경변수 해석)", kind: "path" },
       {
-        key: "size_bytes",
-        label: "크기 (Bytes)",
-        kind: "byteSize",
-        compute: (r) => r.event_type === "download" || r.event_type === "cache" ? r.size_bytes || r.size : "",
+        heading: "방문",
+        fields: [
+          { key: "visit_id", label: "visits.id" },
+          { key: "visit_source", label: "방문 출처" },
+          { key: "transition_core", label: "이동 방식", compute: (r) => [transitionLabel(r.transition_core, r.transition_qualifiers), r.transition_raw].filter(Boolean).join(" · ") },
+          { key: "visit_duration_us", label: "머문 시간 (μs)" },
+          { key: "external_referrer_url", label: "외부 referrer", kind: "path" },
+          { key: "visit_count", label: "방문 횟수 (URL 누적)" },
+          { key: "typed_count", label: "주소창 직접 입력 횟수 (URL 누적)" },
+        ],
       },
-      { key: "mime", label: "다운로드 파일 유형", compute: (r) => r.event_type === "download" ? r.mime : "" },
-      { key: "http_status", label: "HTTP 상태" },
       {
-        key: "cache_file_type",
-        label: "파일 유형",
-        compute: (r) => {
-          if (r.event_type !== "cache") return "";
-          if (r.mime) return r.mime;
-          const path = (r.url || "").split(/[?#]/)[0];
-          const extension = path.includes(".") ? path.slice(path.lastIndexOf(".") + 1).toLowerCase() : "";
-          return extension ? `.${extension}` : "알 수 없음";
-        },
+        heading: "다운로드",
+        fields: [
+          { key: "download_current_path", label: "현재 경로", kind: "path" },
+          { key: "download_current_path_resolved", label: "현재 경로 (환경변수 해석)", kind: "path" },
+          { key: "download_path", label: "목표 경로", kind: "path" },
+          { key: "download_path_resolved", label: "목표 경로 (환경변수 해석)", kind: "path" },
+          { key: "download_referrer", label: "유입 페이지", kind: "path" },
+          { key: "download_tab_url", label: "탭 URL", kind: "path" },
+          { key: "download_tab_referrer_url", label: "탭 referrer", kind: "path" },
+          { key: "download_site_url", label: "사이트 URL", kind: "path" },
+          { key: "download_url_first", label: "최초 다운로드 URL", kind: "path" },
+          { key: "download_url_final", label: "최종 다운로드 URL", kind: "path" },
+          { key: "download_chain_count", label: "URL 체인 수" },
+          { key: "download_http_method", label: "HTTP 메서드" },
+          { key: "download_state", label: "상태", compute: (r) => (r.download_state ? `${downloadStateLabel(r.download_state)}${downloadStateLabel(r.download_state) === r.download_state ? "" : ` (${r.download_state})`}` : "") },
+          { key: "download_interrupt_reason", label: "중단 사유 코드" },
+          { key: "danger", label: "위험 유형 코드" },
+          { key: "download_start_time", label: "시작 시각" },
+          { key: "download_end_time", label: "종료 시각" },
+          { key: "download_last_access_time", label: "마지막 접근 시각" },
+          { key: "received_bytes", label: "실수신 크기", kind: "byteSize" },
+          { key: "total_bytes", label: "예상 크기", kind: "byteSize" },
+          { key: "mime", label: "MIME", compute: (r) => (r.event_type === "cache" ? "" : r.mime || "") },
+          { key: "original_mime", label: "원래 MIME" },
+          { key: "download_opened", label: "열기 여부", valueLabels: { "1": "열림", "0": "열지 않음" } },
+          { key: "download_guid", label: "GUID", kind: "hash" },
+        ],
       },
-      { key: "cache_data", label: "캐시 데이터", kind: "cacheData", compute: (r) => r.event_type === "cache" ? "cache" : "" },
-    ]}],
+      {
+        heading: "캐시",
+        fields: [
+          { key: "request_url", label: "요청 URL", kind: "path" },
+          { key: "cache_key", label: "캐시 키", kind: "path" },
+          { key: "http_status", label: "HTTP 코드" },
+          { key: "http_reason", label: "HTTP 사유" },
+          { key: "status", label: "상태 줄" },
+          { key: "content_encoding", label: "Content-Encoding" },
+          { key: "body_bytes", label: "본문 크기", kind: "byteSize" },
+          { key: "cache_request_time", label: "요청 시각" },
+          { key: "cache_response_time", label: "응답 시각" },
+          { key: "cache_creation_time", label: "캐시 생성 시각" },
+        ],
+      },
+    ],
   },
 
   // Chrome disk-cache entries (browser_cache_parser) — a normal table, but with

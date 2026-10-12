@@ -25,7 +25,7 @@ import RegistryView from "@/components/RegistryView";
 import WerView from "@/components/WerView";
 import UsnJrnlView from "@/components/UsnJrnlView";
 import MftView from "@/components/MftView";
-import BrowserHistoryView from "@/components/BrowserHistoryView";
+import BrowserActivityView from "@/components/BrowserActivityView";
 import GlobalProgress from "@/components/GlobalProgress";
 import { usePipelineRun } from "@/lib/usePipelineRun";
 import CircularProgress from "@mui/material/CircularProgress";
@@ -863,12 +863,17 @@ export default function Home() {
         .map((row) => Number((row as Record<string, unknown>).__rowid)),
     );
   }, [activeTab, hostBookmarkRefKeys]);
-  // AI conversations are derived rows and cannot be bookmarked; resolve their
-  // source cache record instead. With several origins the analyst picks one in
-  // the detail panel's source list.
+  // AI conversation rows bookmark like other overview rows: through their
+  // own coordinates and source refs (bookmark redesign: viewer-20).
   const aiConversationsFile = overviewFiles?.find((file) => file.tableName === "AiConversations") ?? null;
-  const resolveAiConversationSources = async (rowId: number) =>
-    aiConversationsFile ? window.api.readRecordSources(aiConversationsFile.fullPath, aiConversationsFile.tableName, rowId) : [];
+  const isAiRowBookmarked = useCallback(
+    (row: Record<string, string>) => {
+      const rowid = Number((row as Record<string, unknown>).__rowid);
+      if (!aiConversationsFile || !Number.isSafeInteger(rowid)) return false;
+      return isRecordBookmarked(hostBookmarkRefKeys, { fullPath: aiConversationsFile.fullPath, tableName: aiConversationsFile.tableName, rowid }, parseSourceRefs(row.__source_refs));
+    },
+    [aiConversationsFile, hostBookmarkRefKeys],
+  );
   // Bookmark state and toggle for one raw record — shared by the detail panel's
   // source list and the AI conversation modal.
   const isRawRecordBookmarked = useCallback(
@@ -1183,20 +1188,15 @@ export default function Home() {
                   onToggleBookmark={(rowid) => handleToggleActiveRowBookmark(rowid)}
                 />
               ) : getArtifactView(activeTab.file.name)?.customView === "browserHistory" ? (
-                <BrowserHistoryView
+                <BrowserActivityView
                   dbPath={activeTab.file.fullPath}
-                  tableName={activeTab.file.tableName}
+                  aiDbPath={aiConversationsFile?.fullPath ?? null}
                   hostDir={selectedHost?.dir ?? ""}
                   timeRange={timeRange}
-                  // BrowserActivity is server-paginated, so the active tab
-                  // deliberately has no materialised rows — and bookmarks live
-                  // on the raw source record, not on this derived row. Match
-                  // each row through the source coordinates it carries.
                   isRowBookmarked={isActiveRowBookmarked}
-                  onToggleBookmark={(rowid) => handleToggleActiveRowBookmark(rowid)}
-                  resolveAiConversationSources={resolveAiConversationSources}
-                  isRawRecordBookmarked={isRawRecordBookmarked}
-                  onToggleRawRecordBookmark={bookmarkRawRecord}
+                  onToggleBookmark={(row) => { void handleToggleSourceAwareBookmark(row, activeTab.file.fullPath, activeTab.file.tableName, Number((row as Record<string, unknown>).__rowid)); }}
+                  isAiRowBookmarked={isAiRowBookmarked}
+                  onToggleAiBookmark={aiConversationsFile ? (row) => { void handleToggleSourceAwareBookmark(row, aiConversationsFile.fullPath, aiConversationsFile.tableName, Number((row as Record<string, unknown>).__rowid)); } : undefined}
                 />
               ) : getArtifactView(activeTab.file.name)?.customView === "firewall" ? (
                 <FirewallView
