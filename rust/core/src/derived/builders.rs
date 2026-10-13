@@ -209,11 +209,15 @@ fn rdp_cache(ctx: &Ctx) -> Result<usize> {
     let mut db = DerivedDb::create(&ctx.overview_dir(), "RdpCache")?;
     let facts = ctx.out_dir.join("RDPCACHE").join("RdpBitmapCache.sqlite");
     for row in overview::read_table_with_rowid(&facts, "RdpBitmapCache") {
-        if g(&row, "kind") != "fragment" {
+        let kind = g(&row, "kind");
+        let status = g(&row, "_status");
+        // Fragments plus every failed row (docs-10); ok tiles/mosaics stay in facts.
+        let failed = !status.is_empty() && status != "ok";
+        if kind != "fragment" && !failed {
             continue;
         }
         let mut rec = ctx.record(spec);
-        rec.set("event_type", text("fragment"));
+        rec.set("event_type", text(kind));
         rec.account(g(&row, "account"), &ctx.meta);
         rec.set("source_file", text(g(&row, "source_file")));
         rec.set("fragment_index", int(g(&row, "fragment_index")));
@@ -223,7 +227,9 @@ fn rdp_cache(ctx: &Ctx) -> Result<usize> {
         rec.set("rows", int(g(&row, "rows")));
         rec.set("cols", int(g(&row, "cols")));
         rec.set("image", text(g(&row, "image")));
-        rec.set("status", text(g(&row, "_status")));
+        rec.set("status", text(status));
+        rec.set("tile_index", int(g(&row, "tile_index")));
+        rec.set("error", text(g(&row, "_error")));
         rec.source(source_from_parts(
             ctx,
             "RDPCACHE/RdpBitmapCache.sqlite",
@@ -687,3 +693,49 @@ fn path_references(ctx: &Ctx, registry: &RegistryOverviewCache) -> Result<usize>
     db.finish()
 }
 
+
+#[cfg(test)]
+mod rdp_cache_tests {
+    use super::*;
+    use crate::derived::{stamp_facts_generation, FactsIndex, MetaLookup};
+    use rusqlite::Connection;
+
+    #[test]
+    fn fragments_and_error_rows_are_stored_tiles_and_mosaics_are_not() {
+        let root = std::env::temp_dir().join(format!("wa-rdp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("RDPCACHE")).unwrap();
+        let facts = root.join("RDPCACHE/RdpBitmapCache.sqlite");
+        let conn = Connection::open(&facts).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE RdpBitmapCache(kind TEXT,account TEXT,source_file TEXT,fragment_index TEXT,tile_count TEXT,cols TEXT,rows TEXT,tile_index TEXT,count TEXT,width TEXT,height TEXT,key TEXT,image TEXT,_source_file TEXT,_status TEXT,_error TEXT);
+             INSERT INTO RdpBitmapCache VALUES('fragment','u','Cache0000.bin','1','3','3','1',NULL,NULL,'192','64',NULL,'iVBOR','/c/Cache0000.bin','ok',NULL);
+             INSERT INTO RdpBitmapCache VALUES('tile','u','Cache0000.bin',NULL,NULL,NULL,NULL,'7','1','64','64','k','iVBOR','/c/Cache0000.bin','ok',NULL);
+             INSERT INTO RdpBitmapCache VALUES('mosaic','u','Cache0000.bin',NULL,'9','3','3',NULL,NULL,'192','192',NULL,'iVBOR','/c/Cache0000.bin','ok',NULL);
+             INSERT INTO RdpBitmapCache VALUES('tile','u','Cache0001.bin',NULL,NULL,NULL,NULL,'12',NULL,NULL,NULL,NULL,NULL,'/c/Cache0001.bin','corrupted','tile 12: runs past end');
+             INSERT INTO RdpBitmapCache VALUES('tile','u','bcache24.bmc',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,'/c/bcache24.bmc','unreadable_file','read failed');",
+        )
+        .unwrap();
+        drop(conn);
+        stamp_facts_generation(&facts, "rdp-gen").unwrap();
+        crate::derived::create_database(&root.join("_OVERVIEW"), "Metadata").unwrap();
+        let ctx = Ctx { out_dir: &root, target: &root, host_id: "host", dataset_id: "new",
+            facts: FactsIndex::load(&root).unwrap(), meta: MetaLookup::load(&root).unwrap() };
+        assert_eq!(rdp_cache(&ctx).unwrap(), 3);
+        let conn = Connection::open(root.join("_OVERVIEW/RdpCache.sqlite")).unwrap();
+        let rows: Vec<(String, String, Option<i64>, Option<String>, bool)> = conn
+            .prepare("SELECT event_type,status,tile_index,error,image IS NOT NULL FROM RdpCache ORDER BY source_file")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(rows, vec![
+            ("fragment".into(), "ok".into(), None, None, true),
+            ("tile".into(), "corrupted".into(), Some(12), Some("tile 12: runs past end".into()), false),
+            ("tile".into(), "unreadable_file".into(), None, Some("read failed".into()), false),
+        ]);
+        drop(conn);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}

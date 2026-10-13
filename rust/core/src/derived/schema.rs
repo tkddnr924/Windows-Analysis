@@ -1025,6 +1025,8 @@ CREATE TABLE "RdpCache" (
   "cols" INTEGER,
   "image" TEXT,
   "status" TEXT,
+  "tile_index" INTEGER,
+  "error" TEXT,
   PRIMARY KEY(record_id),
   CHECK(overview_name = 'RdpCache'),
   CHECK(timestamp IS NULL OR timestamp_kind IS NOT NULL)
@@ -1050,7 +1052,7 @@ CREATE TABLE "source_records" (
 CREATE INDEX idx_source_lookup ON source_records(source_db, source_table, source_rowid, source_field);
 
 CREATE TABLE _wina_derived_version (name TEXT NOT NULL PRIMARY KEY, version INTEGER NOT NULL);
-INSERT INTO _wina_derived_version(name,version) VALUES ('overview_contract',1);
+INSERT INTO _wina_derived_version(name,version) VALUES ('overview_contract',1),('rdp_cache',2);
 "#;
 
 const RDP_CACHE_COLUMNS: &[&str] = &[
@@ -1073,6 +1075,8 @@ const RDP_CACHE_COLUMNS: &[&str] = &[
     "cols",
     "image",
     "status",
+    "tile_index",
+    "error",
 ];
 
 const RDP_CACHE_SOURCE_RECORDS_COLUMNS: &[&str] = &[

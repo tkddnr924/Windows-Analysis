@@ -8,6 +8,7 @@ import { lookupEventCatalog, parseEventData, extractEventField, extractPsClassic
 import { downloadStateLabel, transitionLabel } from "./browserView";
 import { STAGE_LABELS } from "./remoteAccess";
 import { RELATION_LABELS as SMB_RELATION_LABELS } from "./smbHistory";
+import { RDP_STATUS_LABELS } from "./rdpCache";
 
 const SMB_DIRECTION_VALUE_LABELS: Record<string, string> = { inbound: "인바운드", outbound: "아웃바운드", unknown: "방향 미확인" };
 
@@ -1319,8 +1320,9 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     ]}],
   },
 
+  // Raw facts table: generic table only (docs-10 user decision: tiles/mosaic
+  // are not displayed as images).
   RdpBitmapCache: {
-    customView: "rdpCache",
     title: (r) => (r.kind === "mosaic" ? `${r.source_file} (모자이크)` : `${r.source_file} 타일 ${r.tile_index}`),
     subtitle: (r) => (r.width && r.height ? `${r.width}×${r.height}` : ""),
     sections: [{ heading: "타일", fields: [
@@ -1333,23 +1335,30 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     ]}],
   },
 
-  // Processed overview: the stitched/reconstructed RDP cache images (fragments
-  // + mosaic), split out of the raw RdpBitmapCache table into 종합 분석.
+  // docs-10: stored reconstructed fragments + failed rows (_OVERVIEW only).
   RdpCache: {
     customView: "rdpCache",
-    title: (r) => `${r.source_file} 복원 조각 ${r.fragment_index}`,
-    subtitle: (r) => (r.cols && r.rows ? `${r.cols}×${r.rows} 타일` : ""),
-    sections: [{ heading: "복원 조각", fields: [
-      { key: "event_type", label: "종류" },
-      { key: "source_file", label: "캐시 파일" },
-      { key: "fragment_index", label: "조각 번호" },
-      { key: "tile_count", label: "타일 수" },
-      { key: "cols", label: "가로 타일" },
-      { key: "rows", label: "세로 타일" },
-      { key: "width", label: "너비" },
-      { key: "height", label: "높이" },
-      { key: "status", label: "복원 상태" },
-    ]}],
+    title: (r) => (r.event_type === "fragment" ? `${r.source_file} 복원 조각 ${r.fragment_index}` : [r.source_file, r.tile_index && `타일 ${r.tile_index}`].filter(Boolean).join(" ")),
+    subtitle: (r) => (r.cols && r.rows ? `${r.cols}×${r.rows} 타일` : r.error || ""),
+    sections: [
+      { heading: "복원 조각", fields: [
+        { key: "event_type", label: "종류", valueLabels: { fragment: "복원 조각", tile: "타일", mosaic: "모자이크" } },
+        { key: "status", label: "상태", valueLabels: RDP_STATUS_LABELS },
+        { key: "error", label: "오류" },
+        { key: "source_file", label: "캐시 파일" },
+        { key: "fragment_index", label: "조각 번호" },
+        { key: "tile_index", label: "타일 번호" },
+        { key: "tile_count", label: "타일 수" },
+        { key: "cols", label: "가로 타일" },
+        { key: "rows", label: "세로 타일" },
+        { key: "width", label: "너비" },
+        { key: "height", label: "높이" },
+      ]},
+      { heading: "계정", fields: [
+        { key: "account", label: "계정", kind: "account" },
+        { key: "account_sid", label: "SID", kind: "accountSid" },
+      ]},
+    ],
   },
 
   RemoteDesktopHistory: {

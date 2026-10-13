@@ -1248,7 +1248,14 @@ export default function Home() {
                   accountDirectory={currentAccountDirectory}
                 />
               ) : getArtifactView(activeTab.file.name)?.customView === "rdpCache" ? (
-                <RdpCacheView data={activeTab.data} mode={activeTab.file.name === "RdpBitmapCache" ? "tiles" : "fragments"} />
+                <RdpCacheView
+                  fileName={activeTab.file.name}
+                  data={activeTab.data}
+                  hostDir={selectedHost?.dir ?? ""}
+                  onNavigate={handleNavigate}
+                  onFetchLinkedRows={fetchLinkedRows}
+                  accountDirectory={currentAccountDirectory}
+                />
               ) : getArtifactView(activeTab.file.name)?.customView === "powershellFlow" ? (
                 <PowerShellFlowView
                   dbPath={activeTab.file.fullPath}

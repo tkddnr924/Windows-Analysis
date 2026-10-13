@@ -888,6 +888,11 @@ export default function ArtifactDetailView({ spec, row, evidenceTime, onNavigate
 
   return (
     <div style={{ minWidth: 0, maxWidth: "100%" }}>
+      {row.overview_name === "RdpCache" && row.image && (
+        <div style={{ padding: "14px 16px", borderBottom: "1px solid var(--border-subtle)", lineHeight: 0 }}>
+          <img src={`data:image/png;base64,${row.image}`} alt={`${row.source_file} ${row.fragment_index}`} style={{ maxWidth: "100%", imageRendering: "pixelated", border: "1px solid var(--border)", borderRadius: "var(--radius)" }} />
+        </div>
+      )}
       <div style={{ padding: "18px 16px 14px", borderBottom: "1px solid var(--border-subtle)" }}>
         <div className="dfir-section-label" style={{ marginBottom: 8 }}>증거 개요</div>
         <div style={{ padding: "12px 14px", background: "var(--bg-elevated)", border: "1px solid color-mix(in srgb, var(--text-faint) 38%, transparent)", borderRadius: "var(--radius)" }}>
