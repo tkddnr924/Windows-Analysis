@@ -714,37 +714,45 @@ const EVENT_1002_SCALARS: &[(&str, &str)] = &[
     ("PackageRelativeAppId", "package_relative_app_id"),
 ];
 
+/// Template insert order (%1..%n) of each provider's message; an unnamed
+/// `Data.#text` payload carries the values in exactly this order.
+const EVENT_1001_ORDER: &[&str] = &[
+    "Bucket", "BucketType", "EventName", "Response", "CabId", "P1", "P2", "P3", "P4", "P5",
+    "P6", "P7", "P8", "P9", "P10", "AttachedFiles", "StorePath", "AnalysisSymbol", "Rechecking",
+    "ReportId", "ReportStatus", "HashedBucket", "CabGuid",
+];
+const EVENT_1000_ORDER: &[&str] = &[
+    "AppName", "AppVersion", "AppTimeStamp", "ModuleName", "ModuleVersion", "ModuleTimeStamp",
+    "ExceptionCode", "FaultingOffset", "ProcessId", "ProcessCreationTime", "AppPath", "ModulePath",
+    "IntegratorReportId", "PackageFullName", "PackageRelativeAppId",
+];
+const EVENT_1002_ORDER: &[&str] = &[
+    "AppName", "AppVersion", "ProcessId", "StartTime", "TerminationTime", "ExeFileName", "ReportId",
+    "PackageFullName", "PackageRelativeAppId", "HangType",
+];
+
 /// Normalize the payload shape without hiding which shape was stored.
-fn event_payload(raw: &str) -> (serde_json::Map<String, Value>, &'static str) {
+fn event_payload(raw: &str, order: &[&str]) -> (serde_json::Map<String, Value>, &'static str) {
     let mut map = parse_eventdata(raw);
     let mut format = "named";
     if let Some(Value::Object(inner)) = map.get("EventXML").cloned() {
         map = inner;
         format = "nested_eventxml";
     }
-    if !map.contains_key("P1") && !map.contains_key("EventName") {
+    if !order.iter().any(|key| map.contains_key(*key)) {
         let array = map
             .get("Data")
             .and_then(|value| value.get("#text"))
             .and_then(Value::as_array)
             .cloned();
         if let Some(array) = array {
-            let at = |index: usize| {
-                array
-                    .get(index)
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string()
-            };
-            if array.len() > 2 {
-                map.insert("EventName".into(), Value::String(at(2)));
-            }
-            for index in 1..=10usize {
-                // Unnamed layout: [2]=EventName, [5]=P1, [6]=P2 …
-                let position = 4 + index;
-                if position < array.len() {
-                    map.insert(format!("P{index}"), Value::String(at(position)));
-                }
+            for (key, value) in order.iter().zip(array.iter()) {
+                let text = match value {
+                    Value::String(text) => text.clone(),
+                    Value::Null => String::new(),
+                    other => other.to_string(),
+                };
+                map.insert((*key).to_string(), Value::String(text));
             }
             format = "unnamed_data_array";
         }
@@ -867,7 +875,13 @@ pub fn from_event_row(row: &Row) -> Option<WerRecord> {
     );
     let raw = text_of(row, "EventData");
     record.set("event_data_raw", raw.clone());
-    let (payload, format) = event_payload(&raw);
+    let order = match origin {
+        Origin::Reporting1001 => EVENT_1001_ORDER,
+        Origin::AppError1000 => EVENT_1000_ORDER,
+        Origin::AppHang1002 => EVENT_1002_ORDER,
+        Origin::ReportFile => unreachable!("report files are built from facts rows"),
+    };
+    let (payload, format) = event_payload(&raw, order);
     record.set("payload_format", format);
 
     let scalars = match origin {
@@ -1304,6 +1318,45 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(named.get("payload_format"), "named");
+    }
+
+    /// Real unnamed `Data.#text` payloads map by each provider's template
+    /// order (message inserts %1..%n), not by the 1001 P-field layout.
+    #[test]
+    fn unnamed_payloads_follow_the_provider_template_order() {
+        let crash = r##"{"Data": {"#text": ["mc3504.exe", "0.0.0.0", "6aa7950a", "mc3504.exe", "0.0.0.0", "6aa7950a", "c00000fd", "00000000000049f2", "588", "01dd446c6b8359f5", "C:\\Windows\\TEMP\\mc3504.exe", "C:\\Windows\\TEMP\\mc3504.exe", "d91d8a2b-0278-4b88-bc1a-5df632a50437", "", ""]}, "Binary": null}"##;
+        let record = from_event_row(&event_row("Application Error", "1000", crash)).unwrap();
+        assert_eq!(record.get("payload_format"), "unnamed_data_array");
+        assert_eq!(record.get("app_name"), "mc3504.exe");
+        assert_eq!(record.get("module_name"), "mc3504.exe");
+        assert_eq!(record.get("exception_code"), "c00000fd");
+        assert_eq!(record.get("exception_offset"), "00000000000049f2");
+        assert_eq!(record.get("app_pid"), "1416");
+        assert_eq!(record.get("app_path"), "C:\\Windows\\TEMP\\mc3504.exe");
+        assert_eq!(record.get("module_path"), "C:\\Windows\\TEMP\\mc3504.exe");
+        assert_eq!(record.get("integrator_report_id"), "d91d8a2b-0278-4b88-bc1a-5df632a50437");
+        assert_eq!(record.get("app_start_time_source"), "ProcessCreationTime");
+        assert_eq!(record.get("package_full_name"), "");
+
+        let report = r##"{"Data": {"#text": ["", "0", "MoAppCrash", "사용할 수 없음", "0", "Microsoft.Windows.Search_1.14.18.19041_neutral_neutral_cw5n1h2txyewy", "praid:CortanaUI", "10.0.19041.6282", "87634c04", "StackHash12_8b8", "0.0.0.0", "00000000", "8000ffff", "0", "", "", "\\\\?\\C:\\ProgramData\\Microsoft\\Windows\\WER\\ReportQueue\\AppCrash_x", "", "0", "52b483f6-56c6-4c90-ab83-4f27efd26075", "6", "", "0"]}, "Binary": null}"##;
+        let record = from_event_row(&event_row("Windows Error Reporting", "1001", report)).unwrap();
+        assert_eq!(record.get("error_type"), "MoAppCrash");
+        assert_eq!(record.get("bucket_type"), "0");
+        assert_eq!(record.get("response_text"), "사용할 수 없음");
+        assert_eq!(record.get("app_name"), "Microsoft.Windows.Search_1.14.18.19041_neutral_neutral_cw5n1h2txyewy");
+        assert_eq!(record.get("store_path"), "\\\\?\\C:\\ProgramData\\Microsoft\\Windows\\WER\\ReportQueue\\AppCrash_x");
+        assert_eq!(record.get("report_id"), "52b483f6-56c6-4c90-ab83-4f27efd26075");
+        assert_eq!(record.get("report_status_raw"), "6");
+        assert_eq!(record.get("cab_guid"), "0");
+        assert_eq!(record.signatures.iter().filter(|s| s.family == "P").count(), 10);
+
+        let hang = r##"{"Data": {"#text": ["app.exe", "1.0", "1a2b", "01dd446c6b8359f5", "4294967295", "C:\\app.exe", "11111111-2222-3333-4444-555555555555", "", "", "Unknown"]}}"##;
+        let record = from_event_row(&event_row("Application Hang", "1002", hang)).unwrap();
+        assert_eq!(record.get("app_name"), "app.exe");
+        assert_eq!(record.get("app_path"), "C:\\app.exe");
+        assert_eq!(record.get("report_id"), "11111111-2222-3333-4444-555555555555");
+        assert_eq!(record.get("termination_time_raw"), "4294967295");
+        assert_eq!(record.get("hang_type_text"), "Unknown");
     }
 
     /// A stored empty payload is not a missing payload.

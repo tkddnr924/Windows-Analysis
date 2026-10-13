@@ -11,6 +11,7 @@ import { RELATION_LABELS as SMB_RELATION_LABELS } from "./smbHistory";
 import { RDP_STATUS_LABELS } from "./rdpCache";
 import { REVIEW_SIGNAL_LABELS } from "./scheduledTasks";
 import { ruleDisplayName } from "./firewallHistory";
+import { STAGE_LABELS as WER_STAGE_LABELS, exceptionLabel } from "./werReports";
 import { CHANGE_LABELS as DEFENDER_CHANGE_LABELS, RESULT_LABELS as DEFENDER_RESULT_LABELS } from "./defenderActivity";
 
 const SMB_DIRECTION_VALUE_LABELS: Record<string, string> = { inbound: "인바운드", outbound: "아웃바운드", unknown: "방향 미확인" };
@@ -442,30 +443,59 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     priorityColumns: ["timestamp", "EventType", "AppName", "AppPath", "TargetAppId", "ReportIdentifier"],
     sections: [{ heading: "보고서", fields: [{ key: "EventType" }, { key: "AppPath" }, { key: "ReportIdentifier" }, { key: "app_pid", label: "프로세스 ID (PID)" }, { key: "app_start_time", label: "프로세스 시작 시각" }, { key: "app_uptime", label: "실행 유지 시간" }, { key: "fault_module", label: "오류 모듈" }, { key: "exception_code", label: "예외 코드" }, { key: "report", kind: "json" }] }],
   },
-  // 오류 보고 통합 파생(_OVERVIEW/WerReports) — Report.wer 산출물과 EventLog
-  // 오류 보고(1001)를 한 화면으로 합친다. 구성 원본(WER_Reports·EventLog)이
-  // 각자 타임라인에 이미 편입돼 있으므로 여기서는 편입하지 않는다(중복 방지).
+  // docs-16: Report.wer·1001·1000·1002·수집 덤프는 각각 한 행(합치지 않음). 원본이
+  // 각자 타임라인에 있으므로 여기서는 편입하지 않는다(중복 방지).
   WerReports: {
     customView: "wer",
-    title: (r) => r.app_name || "(WER)",
-    priorityColumns: ["timestamp", "error_type", "app_name", "app_path", "target_app_id", "report_identifier", "source"],
-    sections: [{ heading: "보고서", fields: [
-      { key: "error_type", label: "오류 유형" },
-      { key: "app_name", label: "프로그램" },
-      { key: "app_path", label: "프로그램 경로", kind: "path" },
-      { key: "app_path_resolved", label: "프로그램 경로 (환경변수 해석)", kind: "path" },
-      { key: "target_app_id", label: "대상 앱 ID" },
-      { key: "report_identifier", label: "보고서 ID" },
-      { key: "source", label: "출처" },
-      { key: "app_pid", label: "프로세스 ID (PID)" },
-      { key: "app_start_time", label: "프로세스 시작 시각" },
-      // 단위가 확인된 값과 원문을 섞지 않는다(docs-01).
-      { key: "app_uptime_ms", label: "실행 유지 시간", kind: "durationMs" },
-      { key: "app_uptime", label: "실행 유지 시간 원문" },
-      { key: "fault_module", label: "오류 모듈" },
-      { key: "exception_code", label: "예외 코드" },
-      { key: "report", label: "보고서 원문", kind: "json" },
-    ] }],
+    title: (r) => (r.reporting_stage === "report_generated" && r.signature_schema_status !== "mapped" ? "" : r.app_name) || r.friendly_event_name || r.error_type || "",
+    subtitle: (r) => r.app_path_resolved || r.app_path || r.report_description || "",
+    badges: [{ key: "error_type", kind: "badge" }],
+    visibleColumns: ["timestamp", "reporting_stage", "error_type", "app_name", "module_name", "exception_code", "app_path"],
+    priorityColumns: ["timestamp", "reporting_stage", "error_type", "app_name", "module_name", "exception_code", "app_path"],
+    sections: [
+      { heading: "프로그램", fields: [
+        { key: "app_name", label: "프로그램" },
+        { key: "app_version", label: "버전" },
+        { key: "app_path_resolved", label: "프로그램 경로", kind: "path", compute: (r) => r.app_path_resolved || r.app_path },
+        { key: "app_path", label: "프로그램 경로 원문", kind: "path", compute: (r) => (r.app_path && r.app_path_resolved && r.app_path !== r.app_path_resolved ? r.app_path : "") },
+        { key: "app_pid", label: "프로세스 ID" },
+        { key: "app_start_time", label: "프로세스 시작 시각" },
+        { key: "app_uptime_ms", label: "시작 → 보고 경과", kind: "durationMs" },
+        { key: "package_full_name", label: "패키지" },
+        { key: "target_app_id", label: "대상 앱 ID" },
+      ]},
+      { heading: "오류", fields: [
+        { key: "error_type", label: "오류 유형" },
+        { key: "friendly_event_name", label: "유형 이름" },
+        { key: "report_description", label: "설명" },
+        { key: "module_name", label: "오류 모듈" },
+        { key: "module_version", label: "모듈 버전" },
+        { key: "module_path", label: "모듈 경로", kind: "path" },
+        { key: "exception_code", label: "예외 코드", compute: (r) => exceptionLabel(r.exception_code) },
+        { key: "exception_offset", label: "예외 오프셋" },
+        { key: "hang_signature", label: "응답 없음 서명" },
+        { key: "hang_type_text", label: "응답 없음 유형" },
+        { key: "hresult", label: "HRESULT" },
+        { key: "install_status", label: "설치 상태" },
+        { key: "os_revision", label: "OS 리비전" },
+      ]},
+      { heading: "보고", fields: [
+        { key: "reporting_stage", label: "기록 단계", compute: (r) => WER_STAGE_LABELS[r.reporting_stage] ?? r.reporting_stage ?? "" },
+        { key: "report_identifier", label: "보고서 ID" },
+        { key: "report_id", label: "보고 ID" },
+        { key: "integrator_report_id", label: "통합 보고 ID" },
+        { key: "report_status_hex", label: "보고 상태" },
+        { key: "store_location", label: "보관 위치" },
+        { key: "store_path", label: "보관 경로", kind: "path" },
+        { key: "upload_time", label: "업로드 시각" },
+        { key: "bucket", label: "버킷" },
+        { key: "response_text", label: "응답" },
+      ]},
+      { heading: "원문", collapsible: { defaultExpanded: false }, fields: [
+        { key: "report_text", label: "보고서 원문", kind: "code" },
+        { key: "event_data_raw", label: "EventData", kind: "code" },
+      ]},
+    ],
   },
   // Windows Timeline (ActivitiesCache.db) — 계정별 앱 실행·포커스·문서 활동.
   // 실행/열기(type 5)는 실행 이력(ExecutionHistory)에도 합류한다.

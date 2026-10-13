@@ -1,391 +1,247 @@
 "use client";
+// 오류 보고 (docs-16) — _OVERVIEW WerReports 전량(전량 로드 예외). 같은 파일의
+// WerRelations(보고 식별자 일치)로 이어진 기록만 한 카드로 묶고 원본 사건은
+// 합치거나 지우지 않는다. 관계가 없는 기록은 1건 카드.
+import { useContext, useEffect, useMemo, useState } from "react";
+import BookmarkBorderOutlinedIcon from "@mui/icons-material/BookmarkBorderOutlined";
+import BookmarkOutlinedIcon from "@mui/icons-material/BookmarkOutlined";
 import CategoryOutlinedIcon from "@mui/icons-material/CategoryOutlined";
-
-import { useMemo, useState } from "react";
-import type { CsvData } from "@/lib/types";
-import { EMPTY_TIME_RANGE, inRange, rangeActive, type TimeRange } from "@/lib/timeRange";
-import RowDetailPanel from "./RowDetailPanel";
-import PaginationControls from "@/components/PaginationControls";
-import { HeaderSearchInput, SelectDropdown, SortDropdown, ViewHeader } from "@/components/FilterControls";
+import KeyboardArrowDownOutlinedIcon from "@mui/icons-material/KeyboardArrowDownOutlined";
+import LayersOutlinedIcon from "@mui/icons-material/LayersOutlined";
 import ReportProblemOutlinedIcon from "@mui/icons-material/ReportProblemOutlined";
-import SearchIcon from "@mui/icons-material/Search";
-import SortOutlinedIcon from "@mui/icons-material/SortOutlined";
-import AccessTimeIcon from "@mui/icons-material/AccessTime";
-import ExtensionOutlinedIcon from "@mui/icons-material/ExtensionOutlined";
-import ScienceOutlinedIcon from "@mui/icons-material/ScienceOutlined";
-import DescriptionOutlinedIcon from "@mui/icons-material/DescriptionOutlined";
+import StyleOutlinedIcon from "@mui/icons-material/StyleOutlined";
+import { HeaderSearchInput, MultiSelectDropdown, SortDropdown, ViewHeader } from "@/components/FilterControls";
+import PaginationControls from "@/components/PaginationControls";
+import type { CsvData, FetchLinkedRows } from "@/lib/types";
+import { EMPTY_TIME_RANGE, inRange, rangeActive, type TimeRange } from "@/lib/timeRange";
+import type { AccountDirectory } from "@/lib/accountIdentity";
+import { RecordScopeContext } from "@/lib/recordScope";
+import { CLASS_LABELS, DEFAULT_WER_FILTER, exceptionLabel, STAGE_LABELS, buildWerCards, type WerCard, type WerFilter } from "@/lib/werReports";
+import RowDetailPanel from "./RowDetailPanel";
 
-// Windows Error Reporting (Report.wer) detail view. The parser stores every
-// report field in one `report` JSON column (+ a few promoted scalars); this
-// view parses that JSON back out and lays it into meaningful sections —
-// fault signature, loaded modules, OS info — instead of a raw blob.
+const TABLE = "WerReports";
+const PAGE = 10;
+const EVENT_PAGE = 10;
+// Representative record order: report file, provider event, report event.
+const REPRESENTATIVE = ["report_written", "app_error_event", "app_hang_event", "report_generated", "collected_dump"];
 
 type Row = Record<string, string>;
+const rowidOf = (row: Row) => Number((row as Record<string, unknown>).__rowid);
 
 interface Props {
   data: CsvData;
+  onNavigate: (targetFile: string, targetColumn: string, value: string) => void;
+  onFetchLinkedRows?: FetchLinkedRows;
   bookmarkedRowids?: Set<number>;
   onToggleBookmark?: (rowid: number) => void;
   timeRange?: TimeRange;
+  accountDirectory?: AccountDirectory;
 }
 
-type Parsed = {
-  row: Row;
-  rowid: number;
-  report: Record<string, unknown>;
-  appName: string;
-  appPath: string;
-  eventType: string;
-  friendly: string;
-  timestamp: string;
-  source: string;
-};
+function Pill({ children }: { children: React.ReactNode }) {
+  return <span style={{ flexShrink: 0, color: "var(--text-dim)", fontWeight: 700, fontSize: 11.5, padding: "1px 7px", borderRadius: "var(--radius)", background: "color-mix(in srgb, var(--text-dim) 15%, transparent)", whiteSpace: "nowrap" }}>{children}</span>;
+}
 
-function safeParse(s: string): Record<string, unknown> {
-  try {
-    const o = JSON.parse(s || "{}");
-    return o && typeof o === "object" && !Array.isArray(o) ? (o as Record<string, unknown>) : {};
-  } catch {
-    return {};
+function optionsOf(rows: Row[], pick: (row: Row) => string, label: (value: string) => string = (value) => value) {
+  const tally = new Map<string, { label: string; count: number }>();
+  for (const row of rows) {
+    const value = pick(row);
+    const entry = tally.get(value) ?? { label: value ? label(value) : "(없음)", count: 0 };
+    entry.count += 1;
+    tally.set(value, entry);
   }
-}
-function basename(p: string): string {
-  return p ? p.replace(/\//g, "\\").split("\\").filter(Boolean).pop() || p : "";
-}
-// AppName/AppPath 키가 없는 보고서(업데이트 실패·진단·스토어 앱 등)는
-// Sig 배열의 "Application Name" 항목이나 TargetAppId 끝 조각에서 이름을 찾는다.
-function sigAppName(report: Record<string, unknown>): string {
-  if (!Array.isArray(report.Sig)) return "";
-  let fallback = "";
-  for (const item of report.Sig) {
-    if (!item || typeof item !== "object") continue;
-    const o = item as Record<string, unknown>;
-    const name = str(o.Name);
-    const value = str(o.Value);
-    if (!value) continue;
-    if (/application\s*name|응용\s*프로그램\s*이름/i.test(name)) return basename(value);
-    if (!fallback && /\.(exe|dll|sys)$/i.test(value)) fallback = basename(value);
-  }
-  return fallback;
-}
-function targetAppIdName(targetAppId: string): string {
-  const tail = targetAppId.split("!").filter(Boolean).pop() || "";
-  return /[\\/.]/.test(tail) ? basename(tail) : "";
-}
-function str(v: unknown): string {
-  return v === undefined || v === null ? "" : String(v);
-}
-// EventType → tone. Crashes/exceptions are danger, hangs are warning.
-function typeTone(t: string): string {
-  if (/HANG/i.test(t)) return "var(--warning)";
-  if (/CRASH|BEX|FATAL|Exception|CLR/i.test(t)) return "var(--danger)";
-  return "var(--accent)";
+  return [...tally.entries()].sort(([, a], [, b]) => a.label.localeCompare(b.label)).map(([value, entry]) => ({ value, label: entry.label, count: entry.count }));
 }
 
-export default function WerView({ data, bookmarkedRowids, onToggleBookmark, timeRange = EMPTY_TIME_RANGE }: Props) {
-  const [search, setSearch] = useState("");
-  const [typeFilter, setTypeFilter] = useState("전체");
-  const [detail, setDetail] = useState<Parsed | null>(null);
-  const [page, setPage] = useState(0);
-  // 시간순 정렬 — 기본은 오래된 순(오름차순).
+const pathOf = (row: Row) => row.app_path_resolved || row.app_path || "";
+// 1001 P1 is the app only for mapped signature schemas (e.g. LiveKernelEvent P1 is a code).
+const appNameOf = (row: Row) => (row.reporting_stage === "report_generated" && row.signature_schema_status !== "mapped" ? "" : row.app_name || "");
+
+/** Stored fault fields as one line. */
+function faultSummary(row: Row): string {
+  const module = row.module_name && row.module_name !== row.app_name ? row.module_name : "";
+  return [
+    module,
+    row.exception_code && `예외 ${exceptionLabel(row.exception_code)}${row.exception_offset ? ` @ ${row.exception_offset}` : ""}`,
+    row.hang_type_text && `응답 없음 ${row.hang_type_text}`,
+    row.hresult && `HRESULT ${row.hresult}`,
+    row.install_status && `설치 상태 ${row.install_status}`,
+    row.app_pid && `PID ${row.app_pid}`,
+  ].filter(Boolean).join(" · ");
+}
+
+function recordSummary(row: Row): string {
+  return [
+    faultSummary(row),
+    row.report_description,
+    row.store_location,
+    row.report_status_hex && `상태 ${row.report_status_hex}`,
+  ].filter(Boolean).join(" · ");
+}
+
+export default function WerView({ data, onNavigate, onFetchLinkedRows, bookmarkedRowids, onToggleBookmark, timeRange = EMPTY_TIME_RANGE, accountDirectory }: Props) {
+  const scope = useContext(RecordScopeContext);
+  const [filter, setFilter] = useState<WerFilter>(DEFAULT_WER_FILTER);
   const [sortDir, setSortDir] = useState<"asc" | "desc">("asc");
+  const [page, setPage] = useState(0);
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [eventPages, setEventPages] = useState<Record<string, number>>({});
+  const [selected, setSelected] = useState<Row | null>(null);
+  const [relations, setRelations] = useState<Row[]>([]);
+  const update = (patch: Partial<WerFilter>) => setFilter((previous) => ({ ...previous, ...patch }));
 
-  const parsed = useMemo<Parsed[]>(
-    () =>
-      data.rows.map((row) => {
-        const report = safeParse(row.report);
-        // 이 화면은 파생 WerReports와 원본 facts WER_Reports를 모두 연다 —
-        // 각 표의 자기 컬럼을 읽는다(파생은 app_path/app_name/error_type,
-        // 원본 facts는 보고서 원문 키와 같은 이름). 보고서 원문(report JSON)의
-        // 키는 WER 파일 원문이므로 그대로 둔다.
-        const appPath = row.app_path || row.AppPath || str(report.AppPath);
-        return {
-          row,
-          rowid: Number((row as unknown as Record<string, unknown>).__rowid),
-          report,
-          appName:
-            row.app_name ||
-            row.AppName ||
-            str(report.AppName) ||
-            basename(appPath) ||
-            sigAppName(report) ||
-            targetAppIdName(str(report.TargetAppId) || row.target_app_id || row.TargetAppId || "") ||
-            str(report.OriginalFilename),
-          appPath,
-          eventType: row.error_type || row.EventType || str(report.EventType),
-          friendly: str(report.FriendlyEventName),
-          timestamp: row.timestamp || "",
-          // 통합 파생이 남긴 구성 원본 — Report.wer 산출물인지 EventLog
-          // 오류 보고(1001)인지 목록에서 바로 구분한다.
-          source: row.source || "",
-        };
-      }),
-    [data.rows],
-  );
-
-  const types = useMemo(() => {
-    const seen: string[] = [];
-    for (const p of parsed) if (p.eventType && !seen.includes(p.eventType)) seen.push(p.eventType);
-    return seen.sort();
-  }, [parsed]);
+  useEffect(() => {
+    setRelations([]);
+    if (!scope?.fullPath) return;
+    let alive = true;
+    window.api.readResultFile(scope.fullPath, "WerRelations")
+      .then((result) => { if (alive) setRelations(result.rows); })
+      .catch(() => {});
+    return () => { alive = false; };
+  }, [scope?.fullPath, data]);
+  useEffect(() => { setExpanded(new Set()); setEventPages({}); }, [data]);
 
   const rangeOn = rangeActive(timeRange);
-  // 전역 기간 필터 — 건수 표기·유형 칩·목록 모두 이 범위 안에서 센다.
-  const ranged = useMemo(
-    () => (rangeOn ? parsed.filter((p) => inRange(p.timestamp, timeRange)) : parsed),
-    [parsed, rangeOn, timeRange],
-  );
-  const shown = useMemo(() => {
-    const q = search.trim().toLowerCase();
-    const filtered = ranged.filter((p) => {
-      if (typeFilter !== "전체" && p.eventType !== typeFilter) return false;
-      if (q && ![p.appName, p.appPath, p.eventType, p.friendly, str(p.report.ReportIdentifier)].some((v) => v.toLowerCase().includes(q)))
-        return false;
-      return true;
-    });
-    // timestamp 형식(YYYY-MM-DD HH:mm:ss.mmm)은 문자열 비교가 곧 시간 비교.
-    // 시각 없는 보고서는 정렬 방향과 무관하게 뒤로 보낸다.
-    return filtered.sort((a, b) => {
-      if (!a.timestamp || !b.timestamp) return a.timestamp ? -1 : b.timestamp ? 1 : 0;
-      const c = a.timestamp.localeCompare(b.timestamp);
-      return sortDir === "asc" ? c : -c;
-    });
-  }, [ranged, search, typeFilter, sortDir]);
+  const inPeriod = useMemo(() => (timestamp: string) => inRange(timestamp, timeRange), [timeRange]);
+  const cards = useMemo(() => buildWerCards(data.rows, relations, filter, inPeriod, rangeOn, sortDir), [data.rows, relations, filter, inPeriod, rangeOn, sortDir]);
+  useEffect(() => setPage(0), [filter, rangeOn, timeRange, sortDir]);
+  const matchedEvents = cards.reduce((sum, card) => sum + card.matched.size, 0);
 
-  const PAGE = 10;
-  const pageCount = Math.max(1, Math.ceil(shown.length / PAGE));
+  const typeOptions = useMemo(() => optionsOf(data.rows, (row) => row.error_type ?? ""), [data.rows]);
+  const classOptions = useMemo(() => optionsOf(data.rows, (row) => row.error_class ?? "", (value) => CLASS_LABELS[value] ?? value), [data.rows]);
+  const stageOptions = useMemo(() => optionsOf(data.rows, (row) => row.reporting_stage ?? "", (value) => STAGE_LABELS[value] ?? value), [data.rows]);
+
+  const pageCount = Math.max(1, Math.ceil(cards.length / PAGE));
   const safePage = Math.min(page, pageCount - 1);
-  const pageRows = shown.slice(safePage * PAGE, (safePage + 1) * PAGE);
+  const pageCards = cards.slice(safePage * PAGE, (safePage + 1) * PAGE);
+  const toggle = (key: string) => setExpanded((previous) => {
+    const next = new Set(previous);
+    if (next.has(key)) next.delete(key); else next.add(key);
+    return next;
+  });
+
+  const bookmarkButton = (row: Row) => {
+    const rowid = rowidOf(row);
+    if (!onToggleBookmark || !Number.isFinite(rowid)) return null;
+    const bookmarked = bookmarkedRowids?.has(rowid) ?? false;
+    return <button type="button" className={bookmarked ? "dfir-bookmark-control" : undefined} onClick={(e) => { e.stopPropagation(); onToggleBookmark(rowid); }} aria-label={bookmarked ? "북마크 해제" : "북마크 추가"} title={bookmarked ? "북마크 해제" : "북마크 추가"} style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 28, height: 28, padding: 0, flexShrink: 0, border: "none", background: "transparent", color: bookmarked ? "var(--bookmark-control)" : "var(--text-faint)", cursor: "pointer" }}>{bookmarked ? <BookmarkOutlinedIcon sx={{ fontSize: 16 }} /> : <BookmarkBorderOutlinedIcon sx={{ fontSize: 16 }} />}</button>;
+  };
+
+  const eventRow = (card: WerCard<Row>, row: Row, position: number) => {
+    const bookmarked = bookmarkedRowids?.has(rowidOf(row)) ?? false;
+    return (
+      <div key={row.record_id} className={bookmarked ? "dfir-bookmarked-row" : undefined} onClick={() => setSelected(row)}
+        onMouseEnter={(e) => { if (!bookmarked) e.currentTarget.style.background = "var(--bg-hover)"; }}
+        onMouseLeave={(e) => { if (!bookmarked) e.currentTarget.style.background = "transparent"; }}
+        style={{ display: "flex", alignItems: "center", gap: 8, minHeight: 42, padding: "7px 14px 7px 60px", borderTop: position === 0 ? "none" : "1px solid var(--border-subtle)", cursor: "pointer", opacity: card.matched.has(row.record_id) ? 1 : 0.55 }}>
+        <button type="button" onClick={(e) => { e.stopPropagation(); setSelected(row); }} aria-label={`${row.timestamp} ${row.error_type} 상세 보기`} title={[row.report_identifier, row.report_id, row.integrator_report_id, row.store_path].filter(Boolean).join("\n") || undefined}
+          style={{ flex: 1, display: "flex", alignItems: "center", gap: 10, minWidth: 0, padding: 0, border: "none", background: "transparent", color: "var(--text)", cursor: "pointer", textAlign: "left" }}>
+          <span style={{ color: "var(--text-time)", fontFamily: "var(--mono)", fontSize: 12.5, width: 176, flexShrink: 0, whiteSpace: "nowrap" }}>{row.timestamp}</span>
+          <span style={{ width: 120, flexShrink: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 12.5 }}>{STAGE_LABELS[row.reporting_stage] ?? row.reporting_stage}</span>
+          <span style={{ width: 150, flexShrink: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 12, color: "var(--text-dim)" }}>{row.error_type}</span>
+          <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text-dim)", fontSize: 12, fontFamily: "var(--mono)" }}>{recordSummary(row)}</span>
+          <span style={{ flexShrink: 0, color: "var(--text-faint)", fontFamily: "var(--mono)", fontSize: 11.5 }}>{row.event_id}</span>
+        </button>
+        {bookmarkButton(row)}
+      </div>
+    );
+  };
 
   return (
     <div className="dfir-view" style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", background: "var(--bg)", overflow: "hidden" }}>
-      <ViewHeader icon={ReportProblemOutlinedIcon} title="오류 보고" meta={`${ranged.length.toLocaleString()}건`} right={<span style={{ color: "var(--text-faint)", fontSize: 11.5 }}>{rangeOn ? "전역 기간 필터 적용" : "전체 기간"}</span>}>
-          <HeaderSearchInput value={search} onChange={(value) => { setSearch(value); setPage(0); }} placeholder="앱 이름 · 경로 · 이벤트 유형 검색" width={300} />
-          <SortDropdown value={sortDir} onChange={(next) => { setSortDir(next as "asc" | "desc"); setPage(0); }} />
-          {types.length > 1 && (
-            <SelectDropdown
-              icon={<CategoryOutlinedIcon sx={{ fontSize: 15 }} />}
-              label="유형"
-              options={["전체", ...types].map((t) => ({ value: t, label: t, count: t === "전체" ? ranged.length : ranged.filter((p) => p.eventType === t).length }))}
-              value={typeFilter}
-              onChange={(next) => { setTypeFilter(next); setPage(0); }}
-            />
-          )}
-        
+      <ViewHeader icon={ReportProblemOutlinedIcon} title="오류 보고" meta={`묶음 ${cards.length.toLocaleString()} · 일치 기록 ${matchedEvents.toLocaleString()} / ${data.rows.length.toLocaleString()}`}>
+        <HeaderSearchInput value={filter.search} onChange={(search) => update({ search })} placeholder="앱 · 경로 · 모듈 · 예외 · 보고 ID · 계정" ariaLabel="오류 보고 검색" width={300} />
+        <MultiSelectDropdown icon={<CategoryOutlinedIcon sx={{ fontSize: 15 }} />} label="유형" ariaLabel="오류 유형" options={typeOptions} selected={filter.types} onChange={(types) => update({ types })} />
+        <MultiSelectDropdown icon={<StyleOutlinedIcon sx={{ fontSize: 15 }} />} label="분류" ariaLabel="분류" options={classOptions} selected={filter.classes} onChange={(classes) => update({ classes })} />
+        <MultiSelectDropdown icon={<LayersOutlinedIcon sx={{ fontSize: 15 }} />} label="기록" ariaLabel="기록 단계" options={stageOptions} selected={filter.stages} onChange={(stages) => update({ stages })} />
+        <SortDropdown value={sortDir} onChange={(next) => setSortDir(next as "asc" | "desc")} />
       </ViewHeader>
 
       <main style={{ flex: 1, minHeight: 0, overflow: "auto", padding: 14 }}>
-        {parsed.length === 0 && <div style={{ padding: 30, textAlign: "center", color: "var(--text-faint)", fontSize: 13 }}>WER 보고서가 없습니다.</div>}
-        {pageRows.map((p, i) => {
-          const bm = (bookmarkedRowids?.has(p.rowid) ?? false) && Number.isFinite(p.rowid);
-          const tone = typeTone(p.eventType);
+        {cards.length === 0 && <div role="status" style={{ padding: 44, textAlign: "center", color: "var(--text-faint)", fontSize: 13 }}>{data.rows.length === 0 ? "기록 없음" : "일치하는 기록 없음"}</div>}
+        {pageCards.map((card) => {
+          const first = card.events[0];
+          const last = card.events[card.events.length - 1];
+          const rep = REPRESENTATIVE.map((stage) => card.events.find((row) => row.reporting_stage === stage)).find(Boolean) ?? first;
+          const name = card.events.map(appNameOf).find(Boolean) || rep.friendly_event_name || rep.error_type;
+          const types = [...new Set(card.events.map((row) => row.error_type).filter(Boolean))];
+          const path = card.events.map(pathOf).find(Boolean) ?? "";
+          const fault = card.events.map(faultSummary).find(Boolean) ?? "";
+          const line = [path, fault || rep.report_description].filter(Boolean).join(" · ");
+          const stages = new Map<string, number>();
+          for (const row of card.events) if (card.matched.has(row.record_id)) stages.set(row.reporting_stage, (stages.get(row.reporting_stage) ?? 0) + 1);
+          const grouped = card.events.length > 1;
+          const open = grouped && expanded.has(card.key);
+          const bookmarked = !grouped && (bookmarkedRowids?.has(rowidOf(first)) ?? false);
+          const eventPageCount = Math.max(1, Math.ceil(card.events.length / EVENT_PAGE));
+          const eventPage = Math.min(eventPages[card.key] ?? 0, eventPageCount - 1);
+          const pagedEvents = card.events.slice(eventPage * EVENT_PAGE, (eventPage + 1) * EVENT_PAGE);
+          const from = first.timestamp;
+          const to = grouped ? last.timestamp : "";
+          const sameDay = to && to.slice(0, 10) === from.slice(0, 10);
           return (
-            <div
-              key={i}
-              className={bm ? "dfir-bookmarked-row" : undefined}
-              onClick={() => setDetail(p)}
-              onMouseEnter={(e) => { if (!bm) e.currentTarget.style.background = "var(--bg-hover)"; }}
-              onMouseLeave={(e) => { if (!bm) e.currentTarget.style.background = "var(--bg-panel)"; }}
-              style={{ borderRadius: "var(--radius)", display: "flex", alignItems: "center", gap: 12, minHeight: 62, marginBottom: 8, padding: "10px 14px", border: "1px solid var(--border)", background: "var(--bg-panel)", cursor: "pointer", transition: "background .15s ease, border-color .15s ease" }}
-              title="클릭하면 WER 상세 보기"
-            >
-              <span aria-hidden="true" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 34, height: 34, flexShrink: 0, borderRadius: "var(--radius)", background: `color-mix(in srgb, ${tone} 15%, transparent)` }}>
-                <ReportProblemOutlinedIcon sx={{ fontSize: 17, color: tone }} />
-              </span>
-              <span style={{ flex: 1, minWidth: 0, display: "grid", gap: 3 }}>
-                <span style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
-                  <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 13.5, fontWeight: 700, color: "var(--text)" }}>{p.appName || p.friendly || p.eventType || "(이름 없음)"}</span>
-                  <Pill text={p.eventType || "?"} color={tone} />
-                  {p.source && <span className="dfir-tag" style={{ flexShrink: 0 }}>{p.source}</span>}
-                  {p.friendly && <span style={{ flexShrink: 0, fontSize: 12, color: "var(--text-faint)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 260 }}>{p.friendly}</span>}
-                </span>
-                <span title={p.appPath || undefined} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 12, color: p.appPath ? "var(--text-dim)" : "var(--text-faint)", fontFamily: "var(--mono)" }}>{p.appPath || "경로 정보 없음"}</span>
-              </span>
-              <span style={{ flexShrink: 0, width: 172, textAlign: "right", fontSize: 12.5, color: p.timestamp ? "var(--text-time)" : "var(--text-faint)", fontFamily: "var(--mono)", whiteSpace: "nowrap" }}>{p.timestamp || "시간 정보 없음"}</span>
-            </div>
+            <section key={card.key} aria-label={name} className={bookmarked ? "dfir-bookmarked-row" : undefined} style={{ marginBottom: 10, border: `1px solid ${open ? "color-mix(in srgb, var(--text-dim) 42%, var(--border))" : "var(--border)"}`, borderRadius: "var(--radius)", background: "var(--bg-panel)", overflow: "hidden" }}>
+              <div style={{ display: "flex", alignItems: "center" }}>
+                <button type="button" onClick={() => (grouped ? toggle(card.key) : setSelected(first))} aria-expanded={grouped ? open : undefined} aria-label={grouped ? undefined : `${name} 상세 보기`}
+                  onMouseEnter={(event) => { if (!open && !bookmarked) event.currentTarget.style.background = "var(--bg-hover)"; }}
+                  onMouseLeave={(event) => { event.currentTarget.style.background = open ? "color-mix(in srgb, var(--text-dim) 6%, transparent)" : "transparent"; }}
+                  style={{ flex: 1, minWidth: 0, display: "flex", alignItems: "center", gap: 12, minHeight: 60, padding: "11px 14px", border: "none", background: open ? "color-mix(in srgb, var(--text-dim) 6%, transparent)" : "transparent", color: "var(--text)", cursor: "pointer", textAlign: "left" }}>
+                  <span aria-hidden="true" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 34, height: 34, flexShrink: 0, borderRadius: "var(--radius)", background: "color-mix(in srgb, var(--text-dim) 15%, transparent)" }}>
+                    <ReportProblemOutlinedIcon sx={{ fontSize: 17, color: "var(--text-dim)" }} />
+                  </span>
+                  <span style={{ flex: 1, minWidth: 0, display: "grid", gap: 3 }}>
+                    <span style={{ display: "flex", alignItems: "baseline", gap: 8, minWidth: 0 }}>
+                      <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 13.5, fontWeight: 700 }}>{name}</span>
+                      <span title={rep.error_class_basis || undefined} style={{ flexShrink: 0, maxWidth: 320, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text-faint)", fontSize: 11.5 }}>{[CLASS_LABELS[rep.error_class] ?? rep.error_class, ...types.filter((type) => type !== name)].filter(Boolean).join(" · ")}</span>
+                    </span>
+                    {(line || grouped) && (
+                      <span style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0, color: "var(--text-dim)", fontSize: 12 }}>
+                        {line && <span title={[path, rep.module_path, rep.report_description].filter(Boolean).join("\n") || undefined} style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontFamily: "var(--mono)" }}>{line}</span>}
+                        {grouped && <>
+                          {line && <span aria-hidden="true" style={{ color: "var(--text-faint)" }}>·</span>}
+                          <span style={{ flexShrink: 0, color: "var(--text-faint)" }}>기록 {card.matched.size === card.events.length ? card.events.length.toLocaleString() : `${card.matched.size.toLocaleString()} / ${card.events.length.toLocaleString()}`}</span>
+                        </>}
+                      </span>
+                    )}
+                  </span>
+                  <span style={{ display: "flex", gap: 4, alignItems: "center", flexShrink: 0 }}>
+                    {[...stages].map(([stage, count]) => <Pill key={stage}>{STAGE_LABELS[stage] ?? stage}{count > 1 ? ` ${count}` : ""}</Pill>)}
+                  </span>
+                  <span style={{ flexShrink: 0, color: "var(--text-time)", fontFamily: "var(--mono)", fontSize: 12, whiteSpace: "nowrap" }}>
+                    {from}{to && to !== from && <><span style={{ color: "var(--text-faint)" }}> → </span>{sameDay ? to.slice(11) : to}</>}
+                  </span>
+                  {grouped && <KeyboardArrowDownOutlinedIcon aria-hidden="true" sx={{ fontSize: 20, color: "var(--text-faint)", flexShrink: 0, transform: open ? "none" : "rotate(-90deg)", transition: "transform .18s ease" }} />}
+                </button>
+                {!grouped && <span style={{ paddingRight: 10 }}>{bookmarkButton(first)}</span>}
+              </div>
+              {open && (
+                <div role="region" aria-label="관련 기록" style={{ borderTop: "1px solid var(--border-subtle)", background: "var(--bg)" }}>
+                  {pagedEvents.map((row, position) => eventRow(card, row, position))}
+                  {eventPageCount > 1 && (
+                    <div style={{ borderTop: "1px solid var(--border-subtle)", padding: "4px 0 6px" }}>
+                      <PaginationControls ariaLabel={`${name} 기록 페이지`} page={eventPage} pageCount={eventPageCount} onChange={(next) => setEventPages((previous) => ({ ...previous, [card.key]: next }))}
+                        summary={`(${(eventPage * EVENT_PAGE + 1).toLocaleString()}–${Math.min((eventPage + 1) * EVENT_PAGE, card.events.length).toLocaleString()} / ${card.events.length.toLocaleString()})`} />
+                    </div>
+                  )}
+                </div>
+              )}
+            </section>
           );
         })}
+        {cards.length > 0 && (
+          <PaginationControls ariaLabel="오류 보고 페이지" page={safePage} pageCount={pageCount} onChange={setPage}
+            summary={`(${(safePage * PAGE + 1).toLocaleString()}–${Math.min((safePage + 1) * PAGE, cards.length).toLocaleString()} / ${cards.length.toLocaleString()})`} />
+        )}
       </main>
 
-      {shown.length > 0 && (
-        <div style={{ flexShrink: 0, display: "flex", justifyContent: "center", padding: "6px 0 10px", borderTop: "1px solid var(--border-subtle)" }}>
-          <PaginationControls ariaLabel="WER 페이지" page={safePage} pageCount={pageCount} onChange={setPage} summary={`(${(safePage * PAGE + 1).toLocaleString()}–${Math.min((safePage + 1) * PAGE, shown.length).toLocaleString()} / ${shown.length.toLocaleString()})`} />
-        </div>
-      )}
-
-      {detail && (
-        <RowDetailPanel
-          row={detail.row}
-          columns={data.columns}
-          focusedColumn={null}
-          fileBaseName={data.columns.includes("error_type") ? "WerReports" : "WER_Reports"}
-          onClose={() => setDetail(null)}
-          onNavigate={() => {}}
-          isBookmarked={onToggleBookmark ? (bookmarkedRowids?.has(detail.rowid) ?? false) : undefined}
-          onToggleBookmark={onToggleBookmark && Number.isFinite(detail.rowid) ? () => onToggleBookmark(detail.rowid) : undefined}
-        />
+      {selected && (
+        <RowDetailPanel row={selected} columns={data.columns} focusedColumn={null} fileBaseName={TABLE}
+          onClose={() => setSelected(null)}
+          onNavigate={(targetFile, targetColumn, value) => { setSelected(null); onNavigate(targetFile, targetColumn, value); }}
+          onFetchLinkedRows={onFetchLinkedRows} accountDirectory={accountDirectory}
+          isBookmarked={onToggleBookmark ? bookmarkedRowids?.has(rowidOf(selected)) ?? false : undefined}
+          onToggleBookmark={onToggleBookmark ? () => onToggleBookmark(rowidOf(selected)) : undefined} />
       )}
     </div>
   );
-}
-
-
-// --- detail ---
-
-function asPairs(v: unknown): { k: string; val: string }[] {
-  // Sig/DynamicSig hold [{Name,Value}]; State/OsInfo hold [{Key,Value}].
-  if (!Array.isArray(v)) return [];
-  return v.map((item, i) => {
-    if (item && typeof item === "object") {
-      const o = item as Record<string, unknown>;
-      const k = str(o.Name ?? o.Key) || `#${i}`;
-      return { k, val: str(o.Value) };
-    }
-    return { k: `#${i}`, val: str(item) };
-  });
-}
-function asList(v: unknown): string[] {
-  return Array.isArray(v) ? v.map(str) : [];
-}
-
-function WerDetailModal({ p, onClose, isBookmarked, onToggleBookmark }: { p: Parsed; onClose: () => void; isBookmarked?: boolean; onToggleBookmark?: () => void }) {
-  const [showRaw, setShowRaw] = useState(false);
-  const [showModules, setShowModules] = useState(false);
-  const [showOs, setShowOs] = useState(false);
-  const d = p.report;
-  const tone = typeTone(p.eventType);
-
-  const sig = asPairs(d.Sig);
-  const dynSig = asPairs(d.DynamicSig);
-  const state = asPairs(d.State);
-  const osInfo = asPairs(d.OsInfo);
-  const modules = asList(d.LoadedModule);
-
-  const summary: [string, string][] = [
-    ["프로그램", p.appPath || p.appName],
-    ["원본 파일명", str(d.OriginalFilename)],
-    ["이벤트 유형", [p.eventType, p.friendly].filter(Boolean).join(" · ")],
-    ["치명적 오류", str(d.IsFatal) === "1" ? "예" : str(d.IsFatal) === "0" ? "아니오" : ""],
-    ["버킷 ID", str(d["Response.BucketId"])],
-  ];
-  const reportMeta: [string, string][] = [
-    ["보고서 ID", str(d.ReportIdentifier)],
-    ["대상 앱 버전", str(d.TargetAppVer)],
-    ["대상 앱 ID", str(d.TargetAppId) || p.row.TargetAppId || ""],
-    ["동의(Consent)", str(d.Consent)],
-    ["보고서 상태", str(d.ReportStatus)],
-  ];
-
-  return (
-    <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(1,4,9,0.6)", zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
-      <div onClick={(e) => e.stopPropagation()} style={{ width: 720, maxWidth: "100%", maxHeight: "86vh", overflow: "auto", background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "var(--radius)", boxShadow: "var(--shadow-panel)" }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "14px 18px", borderBottom: "1px solid var(--border)", borderLeft: `3px solid ${tone}`, position: "sticky", top: 0, background: "var(--bg-panel)", zIndex: 1 }}>
-          <span className="dfir-section-label">증거 상세</span>
-          <span style={{ fontSize: 15, fontWeight: 700, wordBreak: "break-all" }}>{p.appName || p.friendly || p.eventType || "(이름 없음)"}</span>
-          <Pill text={p.eventType || "?"} color={tone} />
-          {onToggleBookmark && (
-            <button
-              className={isBookmarked ? "dfir-bookmark-control" : undefined}
-              onClick={onToggleBookmark}
-              title={isBookmarked ? "북마크 해제" : "북마크에 추가"}
-              style={{ marginLeft: "auto", display: "inline-flex", alignItems: "center", gap: 5, fontSize: 11.5, padding: "4px 10px", background: isBookmarked ? "var(--bookmark-row)" : "transparent", color: isBookmarked ? "var(--bookmark-control)" : "var(--text-dim)", border: `1px solid ${isBookmarked ? "var(--bookmark-outline)" : "var(--border)"}`, borderRadius: "var(--radius)", cursor: "pointer", fontWeight: 600 }}
-            >
-              {isBookmarked ? "북마크됨" : "북마크"}
-            </button>
-          )}
-          <button onClick={onClose} style={{ marginLeft: onToggleBookmark ? 8 : "auto", background: "transparent", border: "none", color: "var(--text-faint)", fontSize: 18, cursor: "pointer" }}>×</button>
-        </div>
-
-        <div style={{ padding: "14px 18px 18px" }}>
-          {p.timestamp && (
-            <div style={{ fontSize: 13, color: "var(--text)", fontFamily: "var(--mono)", fontWeight: 600, marginBottom: 12 }}><span className="dfir-tag dfir-tag--info">기준 시간</span> {p.timestamp}</div>
-          )}
-
-          <MetaRows rows={summary} />
-
-          {sig.length > 0 && <KVSection heading={<><ExtensionOutlinedIcon sx={{ fontSize: 14 }} /> 오류 시그니처 (Sig)</>} pairs={sig} highlight />}
-          {dynSig.length > 0 && <KVSection heading={<><ScienceOutlinedIcon sx={{ fontSize: 14 }} /> 동적 시그니처 (DynamicSig)</>} pairs={dynSig} />}
-
-          <div style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 11, fontWeight: 700, color: "var(--text-faint)", margin: "16px 0 6px" }}><DescriptionOutlinedIcon sx={{ fontSize: 14 }} /> 보고서 정보</div>
-          <MetaRows rows={reportMeta} />
-
-          {modules.length > 0 && (
-            <div style={{ marginTop: 16 }}>
-              <button onClick={() => setShowModules((v) => !v)} style={collapseBtn}>
-                {showModules ? "▾" : "▸"} 로드된 모듈 <span style={{ color: "var(--text-faint)" }}>({modules.length})</span>
-              </button>
-              {showModules && (
-                <div style={{ marginTop: 6, maxHeight: 260, overflow: "auto", border: "1px solid var(--border)", borderRadius: "var(--radius)", background: "var(--bg)" }}>
-                  {modules.map((m, i) => (
-                    <div key={i} style={{ fontSize: 11, fontFamily: "var(--mono)", color: "var(--text-dim)", padding: "3px 10px", borderBottom: i < modules.length - 1 ? "1px solid var(--border-subtle)" : "none", wordBreak: "break-all" }}>{m}</div>
-                  ))}
-                </div>
-              )}
-            </div>
-          )}
-
-          {(osInfo.length > 0 || state.length > 0) && (
-            <div style={{ marginTop: 12 }}>
-              <button onClick={() => setShowOs((v) => !v)} style={collapseBtn}>
-                {showOs ? "▾" : "▸"} OS 정보 · 상태 <span style={{ color: "var(--text-faint)" }}>({osInfo.length + state.length})</span>
-              </button>
-              {showOs && (
-                <div style={{ marginTop: 6 }}>
-                  {osInfo.length > 0 && <KVSection heading="OsInfo" pairs={osInfo} compact />}
-                  {state.length > 0 && <KVSection heading="State" pairs={state} compact />}
-                </div>
-              )}
-            </div>
-          )}
-
-          <div style={{ marginTop: 12 }}>
-            <button onClick={() => setShowRaw((v) => !v)} style={collapseBtn}>
-              {showRaw ? "▾" : "▸"} 원본 전체 (JSON)
-            </button>
-            {showRaw && (
-              <pre style={{ marginTop: 6, maxHeight: 340, overflow: "auto", fontSize: 11, fontFamily: "var(--mono)", color: "var(--text-dim)", background: "var(--bg)", border: "1px solid var(--border)", borderRadius: "var(--radius)", padding: "10px 12px", whiteSpace: "pre-wrap", wordBreak: "break-all" }}>
-                {JSON.stringify(d, null, 2)}
-              </pre>
-            )}
-          </div>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function MetaRows({ rows }: { rows: [string, string][] }) {
-  const shown = rows.filter(([, v]) => v);
-  return (
-    <>
-      {shown.map(([k, v]) => (
-        <div key={k} style={{ display: "flex", gap: 12, padding: "7px 0", borderBottom: "1px solid var(--border-subtle)" }}>
-          <span style={{ flex: "0 0 108px", color: "var(--text-faint)", fontSize: 12 }}>{k}</span>
-          <span style={{ flex: 1, color: "var(--text)", fontSize: 12.5, wordBreak: "break-all", fontFamily: /경로|프로그램|버전|ID|파일/.test(k) ? "var(--mono)" : undefined }}>{v}</span>
-        </div>
-      ))}
-    </>
-  );
-}
-
-function KVSection({ heading, pairs, highlight, compact }: { heading: React.ReactNode; pairs: { k: string; val: string }[]; highlight?: boolean; compact?: boolean }) {
-  return (
-    <div style={{ marginTop: compact ? 8 : 16 }}>
-      <div style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 11, fontWeight: 700, color: "var(--text-faint)", marginBottom: 6 }}>{heading}</div>
-      <div style={{ border: "1px solid var(--border)", borderRadius: "var(--radius)", background: "var(--bg)", overflow: "hidden" }}>
-        {pairs.map((p, i) => (
-          <div key={i} style={{ display: "flex", gap: 12, padding: "5px 10px", borderTop: i === 0 ? "none" : "1px solid var(--border-subtle)", alignItems: "baseline" }}>
-            <span style={{ flex: "0 0 40%", color: "var(--text-faint)", fontSize: 11.5, wordBreak: "break-all" }}>{p.k}</span>
-            <span style={{ flex: 1, color: highlight ? "var(--accent)" : "var(--text)", fontSize: 12, fontWeight: highlight ? 600 : 400, fontFamily: "var(--mono)", wordBreak: "break-all" }}>{p.val || "—"}</span>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-const collapseBtn: React.CSSProperties = { background: "transparent", border: "none", color: "var(--text-dim)", fontSize: 12, fontWeight: 700, cursor: "pointer", padding: "4px 0" };
-
-function Pill({ text, color }: { text: string; color: string }) {
-  return <span style={{ fontSize: 11.5, fontWeight: 700, color, border: `1px solid ${color}`, borderRadius: "var(--radius)", padding: "0 6px", whiteSpace: "nowrap" }}>{text}</span>;
 }

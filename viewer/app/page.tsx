@@ -1166,9 +1166,12 @@ export default function Home() {
               ) : getArtifactView(activeTab.file.name)?.customView === "wer" ? (
                 <WerView
                   data={activeTab.data}
+                  onNavigate={handleNavigate}
+                  onFetchLinkedRows={fetchLinkedRows}
                   bookmarkedRowids={activeBookmarkedRowids}
                   onToggleBookmark={(rowid) => handleToggleActiveRowBookmark(rowid)}
                   timeRange={timeRange}
+                  accountDirectory={currentAccountDirectory}
                 />
               ) : getArtifactView(activeTab.file.name)?.customView === "registryExplorer" ? (
                 <RegistryView
