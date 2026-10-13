@@ -117,11 +117,9 @@ export interface ArtifactViewSpec {
    * timestamps (for example, the three timestamps in an LNK header). */
   timelineHeading?: string;
   /**
-   * Name of the row's leading time column, ONLY when this artifact belongs
-   * in the cross-artifact Master Timeline. Absent on purpose for tables with
-   * no meaningful single timestamp (e.g. Prefetch_LoadedFiles) and for the
-   * _OVERVIEW correlation tables (already-derived summaries — including them
-   * would double-count the same events alongside their raw source rows).
+   * Name of the row's leading time column (time-range filter, bookmark time).
+   * The master timeline reads only _OVERVIEW tables that declare it (docs-18);
+   * raw facts keep it for their own time column.
    */
   timelineField?: string;
   /** Optional record-level admission rule for the master timeline. This keeps
@@ -227,14 +225,6 @@ function tagsForRegistryFinding(r: Record<string, string>): Tag[] {
     return [{ label: "주의", severity: "warning", description: r.detail }];
   }
   return [];
-}
-
-// Event ID 0 is emitted by several application providers for their own
-// heartbeat/status messages. It is kept in the raw EventLog table so the
-// evidence remains complete, but it has no stable investigation meaning on
-// the cross-artifact timeline (where it can dominate the chronology).
-function includeEventLogTimeline(r: Record<string, string>): boolean {
-  return r.EventID.trim() !== "0";
 }
 
 function edField(jsonKey: string, label: string, opts: Partial<FieldSpec> = {}): FieldSpec {
@@ -434,19 +424,17 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
   WER_Reports: {
     customView: "wer",
     title: (r) => r.AppName || "(WER)",
-    // timestamp = 보고서의 EventTime(크래시 발생 시각). 악성코드 크래시·
-    // 익스플로잇 실패 시각의 유일한 타임라인 공급원이라 편입한다 (T6 확정:
-    // WER만 편입, RegistryFindings·CacheEntries·하이브 last_write는 제외 유지).
+    // timestamp = 보고서의 EventTime. 통합 타임라인은 _OVERVIEW WerReports로 받는다.
     timelineField: "timestamp",
     timelineTitle: (r) => r.AppName || basename(r.AppPath) || "(WER)",
     timelineSubtitle: (r) => [r.EventType, r.AppPath].filter(Boolean).join(" · "),
     priorityColumns: ["timestamp", "EventType", "AppName", "AppPath", "TargetAppId", "ReportIdentifier"],
     sections: [{ heading: "보고서", fields: [{ key: "EventType" }, { key: "AppPath" }, { key: "ReportIdentifier" }, { key: "app_pid", label: "프로세스 ID (PID)" }, { key: "app_start_time", label: "프로세스 시작 시각" }, { key: "app_uptime", label: "실행 유지 시간" }, { key: "fault_module", label: "오류 모듈" }, { key: "exception_code", label: "예외 코드" }, { key: "report", kind: "json" }] }],
   },
-  // docs-16: Report.wer·1001·1000·1002·수집 덤프는 각각 한 행(합치지 않음). 원본이
-  // 각자 타임라인에 있으므로 여기서는 편입하지 않는다(중복 방지).
+  // docs-16: Report.wer·1001·1000·1002·수집 덤프는 각각 한 행(합치지 않음).
   WerReports: {
     customView: "wer",
+    timelineField: "timestamp",
     title: (r) => (r.reporting_stage === "report_generated" && r.signature_schema_status !== "mapped" ? "" : r.app_name) || r.friendly_event_name || r.error_type || "",
     subtitle: (r) => r.app_path_resolved || r.app_path || r.report_description || "",
     badges: [{ key: "error_type", kind: "badge" }],
@@ -503,9 +491,6 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     title: (r) => r.app_name || r.display_text || "(Timeline)",
     subtitle: (r) => r.kind || "",
     timelineField: "timestamp",
-    // 실행/열기(type 5)는 ExecutionHistory로 승격되어 이미 타임라인에 있다 —
-    // 여기서 제외해 한 사건이 두 번 보이지 않게 한다(사전 캐시와 동일 규칙).
-    timelineInclude: (r) => r.activity_type !== "5",
     priorityColumns: ["timestamp", "kind", "app_name", "app_path", "display_text", "content_uri", "active_duration_s", "account"],
     sections: [
       { heading: "활동 정보", fields: [
@@ -1427,6 +1412,7 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
   // docs-13: stored Defender columns (178); child tables in detail only.
   Defender: {
     customView: "defender",
+    timelineField: "timestamp",
     title: (r) => r.threat_name || r.title || r.event_type || "",
     subtitle: (r) => r.target_path || r.config_target || r.description || "",
     badges: [{ key: "section_label", kind: "badge" }],
@@ -1566,6 +1552,7 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
   },
 
   RemoteDesktopHistory: {
+    timelineField: "timestamp",
     title: (r) => r.remote_address || "(주소 없음)",
     subtitle: (r) => r.description || "",
     badges: [
@@ -1668,6 +1655,7 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
   // by stored remote address in SmbHistoryView. Stored values only.
   SmbHistory: {
     customView: "smb",
+    timelineField: "timestamp",
     title: (r) => r.remote_address || r.account || r.description || "",
     subtitle: (r) => r.description || "",
     badges: [
@@ -1823,6 +1811,7 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
   // account (R01/A06). Paths: stored resolved first, raw kept (docs-24).
   ServiceHistory: {
     customView: "service",
+    timelineField: "timestamp",
     title: (r) => (r.group_key_kind === "record" ? r.event_type || r.description : r.group_display_name || r.service_name || r.service_key || r.event_type || ""),
     subtitle: (r) => r.image_path_resolved || r.image_path || "",
     visibleColumns: ["timestamp", "service_name", "image_path", "description", "state", "result"],
@@ -1895,6 +1884,7 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
   // docs-15: stored BitsHistory columns; job groups by stored job_group_key.
   BitsHistory: {
     customView: "bits",
+    timelineField: "timestamp",
     title: (r) => r.job_name || r.event_type || "",
     subtitle: (r) => r.url || r.local_path_resolved || r.local_path || "",
     badges: [{ key: "event_type", kind: "badge" }],
@@ -1950,6 +1940,7 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
   // docs-14: stored FirewallHistory columns; unconfirmed event meanings stay as stored.
   FirewallHistory: {
     customView: "firewall",
+    timelineField: "timestamp",
     title: (r) => (r.rule_name ? ruleDisplayName(r.rule_name) : r.event_type || ""),
     subtitle: (r) => r.app_path_resolved || r.app_path || r.service || "",
     badges: [{ key: "event_type", kind: "badge" }],
@@ -2024,6 +2015,7 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
   },
   PowerShellHistory: {
     customView: "powershellFlow",
+    timelineField: "timestamp",
     // Title names the record type (like every other view); the command,
     // script and host command line are the content sections below.
     title: (r) => r.event_type || "파워셸 기록",
@@ -2272,7 +2264,6 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
       return catalog ? base.concat([{ label: catalog.label, severity: "info", description: `이벤트 카탈로그 · ${catalog.category}` }]) : base;
     },
     timelineField: "timestamp",
-    timelineInclude: includeEventLogTimeline,
     computedColumns: [
       { key: "_ir_label", label: "이벤트 설명", size: 240, compute: (r) => lookupEventCatalog(r.Provider, r.EventID)?.label ?? "" },
       { key: "_ir_category_col", label: "구분", size: 100, compute: (r) => lookupEventCatalog(r.Provider, r.EventID)?.category ?? "" },
@@ -2410,6 +2401,82 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
         { key: "machine_id", label: "Distributed Link Tracker Machine ID" },
       ]},
       { heading: "파싱 상태", fields: [{ key: "_error", label: "파싱 오류", kind: "code" }] },
+    ],
+  },
+
+  // docs-18: every JumpList entry (path or not) for the master timeline.
+  JumpListEntries: {
+    title: (r) => basename(r.target_path) || r.app_id || "JumpList 항목",
+    subtitle: (r) => r.target_path_resolved || r.target_path || "",
+    timelineField: "timestamp",
+    timelineTitle: (r) => basename(r.target_path) || r.app_id || "JumpList 항목",
+    timelineSubtitle: (r) => r.target_path || r.jumplist_type || "",
+    tags: (r) => tagsForPath(r.target_path),
+    timelineFields: [
+      { key: "created_time", label: "LNK 생성" },
+      { key: "modified_time", label: "LNK 수정" },
+      { key: "timestamp", label: "마지막 사용" },
+    ],
+    timelineHeading: "사용 시간 흐름",
+    priorityColumns: ["timestamp", "target_path", "jumplist_type", "app_id", "account"],
+    sections: [
+      { heading: "사용 기록 (DestList)", fields: [
+        { key: "destlist_accessed", label: "마지막 사용 시각" },
+        { key: "access_count", label: "사용 횟수" },
+        { key: "hostname", label: "호스트명" },
+      ]},
+      { heading: "LNK 헤더 시간", fields: [
+        { key: "lnk_accessed", label: "LNK 헤더 접근 시각" },
+        { key: "created_time", label: "LNK 헤더 생성 시각" },
+        { key: "modified_time", label: "LNK 헤더 수정 시각" },
+      ]},
+      { heading: "대상 및 실행 정보", fields: [
+        { key: "target_path_resolved", label: "대상 경로", kind: "path", compute: (r) => r.target_path_resolved || r.target_path },
+        { key: "target_path", label: "대상 경로 원문", kind: "path", compute: (r) => (r.target_path_resolved && r.target_path !== r.target_path_resolved ? r.target_path : "") },
+        { key: "arguments", label: "실행 인수", kind: "code" },
+        { key: "working_directory", label: "작업 디렉터리", kind: "path" },
+      ]},
+      { heading: "JumpList 출처", fields: [
+        { key: "account", label: "수집 사용자", kind: "account" },
+        { key: "app_id", label: "App ID", kind: "hash" },
+        { key: "jumplist_type", label: "JumpList 유형", kind: "badge" },
+        { key: "stream_id", label: "LNK 스트림 / 엔트리 ID" },
+        { key: "machine_id", label: "Distributed Link Tracker Machine ID" },
+      ]},
+      { heading: "파싱 상태", fields: [{ key: "error", label: "파싱 오류", kind: "code" }] },
+    ],
+  },
+
+  // docs-18: every Windows Timeline activity; type 5 also feeds ExecutionHistory
+  // (the master timeline shows that shared source once).
+  TimelineActivities: {
+    title: (r) => r.app_name || r.display_text || "(Timeline)",
+    subtitle: (r) => r.kind || "",
+    timelineField: "timestamp",
+    priorityColumns: ["timestamp", "kind", "app_name", "app_path", "display_text", "content_uri", "active_duration_s", "account"],
+    sections: [
+      { heading: "활동 정보", fields: [
+        { key: "kind", label: "활동 유형", kind: "badge" },
+        { key: "app_name", label: "앱 이름" },
+        { key: "app_path_resolved", label: "앱 경로", kind: "path", compute: (r) => r.app_path_resolved || r.app_path },
+        { key: "display_text", label: "표시 텍스트" },
+        { key: "content_uri", label: "콘텐츠 URI" },
+        { key: "active_duration_s", label: "사용 시간 (초)" },
+        { key: "account", label: "계정", kind: "account" },
+      ]},
+      { heading: "시각", fields: [
+        { key: "start_time", label: "시작" },
+        { key: "end_time", label: "종료" },
+        { key: "last_modified", label: "마지막 수정" },
+        { key: "expiration", label: "만료" },
+      ]},
+      { heading: "원본", fields: [
+        { key: "activity_table", label: "원본 테이블" },
+        { key: "activity_type", label: "ActivityType" },
+        { key: "activity_id", label: "활동 ID" },
+        { key: "platform_device_id", label: "장치 ID" },
+        { key: "payload", label: "페이로드", kind: "code" },
+      ]},
     ],
   },
 

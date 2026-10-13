@@ -1,6 +1,7 @@
 import { resolveArtifactView } from "./artifactViews";
 import { browsableResultFiles } from "./resultTables";
 import { executionSourceKey, browserActivityKindKey } from "./timelineKeys";
+import { createCrossViewDeduper, orderTimelineFiles } from "./timelineSources";
 import type { CategoryEntry, TimelineSourcePage } from "./types";
 
 // Hand control back to the event loop so pending clicks/renders are processed
@@ -28,8 +29,9 @@ const YIELD_EVERY = 8000;
 // 백엔드 TIMELINE_LOGIC_VERSION(main.rs)과 동기화한다 — 구조 로직(필터키·검색
 // blob·include 규칙·원본 식별자)이 바뀌면 양쪽을 올려 기존 캐시를
 // 무효화(재빌드)한다. 3 = 저장 계약(docs-01) 전환: 파생 행은 record_id로
-// 식별하고 원본 포인터는 source_records에 있다.
-export const TIMELINE_LOGIC_VERSION = 3;
+// 식별하고 원본 포인터는 source_records에 있다. 4 = docs-18: _OVERVIEW만 입력,
+// 여러 뷰가 연결한 같은 원본 사건은 한 번만. 5 = 입력을 6개 뷰로 제한. 6 = 브라우저 방문·다운로드 추가.
+export const TIMELINE_LOGIC_VERSION = 6;
 
 // 소스 테이블을 페이지로 읽는 청크 크기. 이 청크 하나가 빌드 중 프런트 메모리
 // 피크의 상한이다(전체 테이블을 한 번에 올리지 않는다).
@@ -48,12 +50,6 @@ export class TimelineBuildAborted extends Error {
     super("timeline build aborted");
     this.name = "TimelineBuildAborted";
   }
-}
-
-// EventLog 계열(카테고리 EVENTLOG)은 파일마다 테이블명이 달라, 체크박스
-// 필터에서는 'EVENTLOG' 한 그룹으로 묶는다. 그 외는 테이블명이 곧 그룹.
-function artifactGroupOf(category: string, table: string): string {
-  return category.toUpperCase() === "EVENTLOG" ? "EVENTLOG" : table;
 }
 
 // 각 결과 테이블을 페이지 청크로 읽어 TS 스펙으로 변환하고, 경량 행 + 검색용
@@ -82,36 +78,33 @@ export async function streamBuildTimeline(
       batchBytes = 0;
     };
     let sinceYield = 0;
-    for (const category of categories) {
+    // docs-18: _OVERVIEW only; raw facts are evidence behind source_records.
+    const admit = createCrossViewDeduper();
+    for (const category of categories.filter((entry) => entry.name === "_OVERVIEW")) {
       throwIfAborted();
       // 상세 전용 자식 표(source_records·ExecutionTimes…)는 사건 행이 아니다.
-      const files = browsableResultFiles(await window.api.listResultFiles(category.fullPath));
-      for (const file of files) {
+      const files = orderTimelineFiles(
+        browsableResultFiles(await window.api.listResultFiles(category.fullPath))
+          .filter((file) => resolveArtifactView(file.name)?.timelineField),
+      );
+      for (const [fileIndex, file] of files.entries()) {
         throwIfAborted();
-        // A named spec is known up-front; an unnamed table (per-file EventLog)
-        // needs its columns, so read its first page and resolve by column shape.
-        let spec = resolveArtifactView(file.name);
-        let firstPage = spec
-          ? null
-          : await window.api.timelineSourcePage(file.fullPath, file.tableName, 0, READ_CHUNK);
-        if (!spec) spec = resolveArtifactView(file.name, firstPage?.columns);
+        const spec = resolveArtifactView(file.name);
         if (!spec?.timelineField) continue;
         const timelineField = spec.timelineField;
-        const group = artifactGroupOf(category.name, file.name);
+        const group = file.name;
+        const remember = fileIndex < files.length - 1;
         let offset: number | null = 0;
         // eslint-disable-next-line no-constant-condition
         while (true) {
           throwIfAborted();
-          const page: TimelineSourcePage =
-            offset === 0 && firstPage
-              ? firstPage
-              : await window.api.timelineSourcePage(file.fullPath, file.tableName, offset ?? 0, READ_CHUNK);
-          firstPage = null;
+          const page: TimelineSourcePage = await window.api.timelineSourcePage(file.fullPath, file.tableName, offset ?? 0, READ_CHUNK);
           if (!page.rows.length) break;
           for (const row of page.rows) {
             const ts = (row[timelineField] ?? "").trim();
             // A timeline has no defensible position for a record without a time.
             if (!ts || !(spec.timelineInclude?.(row) ?? true)) continue;
+            if (!admit(file.name, ts, row, remember)) continue;
             const filterKey =
               file.name === "ExecutionHistory"
                 ? executionSourceKey(row)
@@ -127,10 +120,7 @@ export async function streamBuildTimeline(
               has_tags: (spec.tags?.(row) ?? []).length ? 1 : 0,
               full_path: file.fullPath,
               rowid_src: Number((row as unknown as Record<string, unknown>).__rowid) || 0,
-              // 원시 테이블(EventLog 등)만 행에 `<테이블>::<rowid>` 포인터를
-              // 들고 있다. 파생 행의 식별자는 record_id이고 원본 근거는 그 DB의
-              // source_records에 있으므로, 여기서 포인터를 지어내지 않는다.
-              record_key: row._record_key || "",
+              // 파생 행의 식별자는 record_id, 원본 근거는 그 DB의 source_records.
               record_id: row.record_id || "",
               event_time: row.timestamp || "",
               // 행 사본(row_json)과 검색 문자열(search_blob)은 보내지 않는다 —
@@ -140,7 +130,7 @@ export async function streamBuildTimeline(
             batch.push(line);
             batchBytes += line.length + 1;
             if (batch.length >= INSERT_BATCH || batchBytes >= MAX_INSERT_BATCH_BYTES) await flush();
-            // Big tables (EventLog can be ~700k rows) would block the renderer's
+            // Big tables (UsnJournal can be ~350k rows) would block the renderer's
             // single thread; yield so the UI stays live and abort stays prompt.
             if (++sinceYield >= YIELD_EVERY) {
               sinceYield = 0;

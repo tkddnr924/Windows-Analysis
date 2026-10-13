@@ -85,6 +85,8 @@ pub(super) fn build_streaming(ctx: &Ctx) -> Result<Vec<(String, usize)>> {
         ("FileSystemEntries".into(), file_system_entries(ctx)?),
         ("UsnJournal".into(), super::usn::build(ctx)?),
         ("RecycleBin".into(), recycle_bin(ctx)?),
+        ("JumpListEntries".into(), jump_list_entries(ctx)?),
+        ("TimelineActivities".into(), timeline_activities(ctx)?),
     ])
 }
 
@@ -309,6 +311,123 @@ fn recycle_bin(ctx: &Ctx) -> Result<usize> {
                 None,
                 nz(get("_source_file")),
                 Some("휴지통 $I 메타데이터"),
+            )?);
+            db.write(rec)?;
+        }
+    }
+    db.finish()
+}
+
+// ---------------------------------------------------------------------------
+// JumpListEntries — every parsed entry, path or not (PathReferences keeps
+// only path-bearing entries for path lookups).
+// ---------------------------------------------------------------------------
+
+fn jump_list_entries(ctx: &Ctx) -> Result<usize> {
+    let spec = spec_of("JumpListEntries");
+    let mut db = DerivedDb::create(&ctx.overview_dir(), "JumpListEntries")?;
+    let table = "JumpList_Entries";
+    for path in fact_files(ctx.out_dir, "JUMPLIST", table) {
+        for row in crate::overview::read_table_with_rowid(&path, table) {
+            let get = |key: &str| row.get(key).map(String::as_str).unwrap_or("");
+            let mut rec = ctx.record(spec);
+            let timestamp_source = get("timestamp_source");
+            rec.timestamp(
+                get("timestamp"),
+                match timestamp_source {
+                    "destlist_accessed" => "DestList 마지막 사용 시각",
+                    "lnk_accessed" => "LNK 대상 접근 시각",
+                    _ => "원본 기록 시각",
+                },
+            );
+            rec.set("event_type", text("점프 목록"));
+            // The collection folder names the profile; names resolve via metadata only.
+            let account = crate::overview::account_from_source(get("_source_file"));
+            rec.account(&account, &ctx.meta);
+            let target_path = get("target_path");
+            rec.set("jumplist_type", text(get("jumplist_type")));
+            rec.set("app_id", text(get("app_id")));
+            rec.set("target_path", text_raw(target_path));
+            rec.set(
+                "target_path_resolved",
+                ctx.meta.resolve_path(target_path, super::is_sid(&account).then_some(account.as_str())),
+            );
+            rec.set("arguments", text_raw(get("arguments")));
+            rec.set("working_directory", text_raw(get("working_directory")));
+            rec.set("hostname", text_raw(get("hostname")));
+            rec.set("machine_id", text_raw(get("machine_id")));
+            rec.set("access_count", int(get("access_count")));
+            rec.set("lnk_accessed", text(get("lnk_accessed")));
+            rec.set("destlist_accessed", text(get("destlist_accessed")));
+            rec.set("created_time", text(get("created_time")));
+            rec.set("modified_time", text(get("modified_time")));
+            rec.set("timestamp_source", text(timestamp_source));
+            rec.set("stream_id", text(get("stream_id")));
+            rec.set("status", text(get("_status")));
+            rec.set("error", text(get("_error")));
+            rec.source(ctx.facts.source_from_record_key(
+                &format!("{}::{}::{}", super::stem_of(&path), table, get("__source_rowid")),
+                None,
+                nz(get("_source_file")),
+                Some("점프 목록 항목"),
+            )?);
+            db.write(rec)?;
+        }
+    }
+    db.finish()
+}
+
+// ---------------------------------------------------------------------------
+// TimelineActivities — every ActivitiesCache activity; type 5 also feeds
+// ExecutionHistory (same source record).
+// ---------------------------------------------------------------------------
+
+fn timeline_activities(ctx: &Ctx) -> Result<usize> {
+    let spec = spec_of("TimelineActivities");
+    let mut db = DerivedDb::create(&ctx.overview_dir(), "TimelineActivities")?;
+    let table = "Timeline_Activities";
+    for path in fact_files(ctx.out_dir, "TIMELINE", table) {
+        for row in crate::overview::read_table_with_rowid(&path, table) {
+            let get = |key: &str| row.get(key).map(String::as_str).unwrap_or("");
+            let mut rec = ctx.record(spec);
+            // The parser takes StartTime, else LastModifiedTime.
+            let timestamp = get("timestamp");
+            rec.timestamp(
+                timestamp,
+                if nz(get("start_time")).is_some() && timestamp == get("start_time") {
+                    "활동 시작 시각"
+                } else {
+                    "활동 마지막 수정 시각"
+                },
+            );
+            rec.set("event_type", text(get("kind")));
+            let account = get("account");
+            rec.account(account, &ctx.meta);
+            let app_path = get("app_path");
+            rec.set("activity_type", int(get("activity_type")));
+            rec.set("kind", text(get("kind")));
+            rec.set("app_name", text_raw(get("app_name")));
+            rec.set("app_path", text_raw(app_path));
+            rec.set(
+                "app_path_resolved",
+                ctx.meta.resolve_path(app_path, super::is_sid(account).then_some(account)),
+            );
+            rec.set("display_text", text_raw(get("display_text")));
+            rec.set("content_uri", text_raw(get("content_uri")));
+            rec.set("active_duration_s", int(get("active_duration_s")));
+            rec.set("start_time", text(get("start_time")));
+            rec.set("end_time", text(get("end_time")));
+            rec.set("last_modified", text(get("last_modified")));
+            rec.set("expiration", text(get("expiration")));
+            rec.set("activity_table", text(get("source_table")));
+            rec.set("activity_id", text(get("activity_id")));
+            rec.set("platform_device_id", text_raw(get("platform_device_id")));
+            rec.set("payload", text_raw(get("payload")));
+            rec.source(ctx.facts.source_from_record_key(
+                &format!("{}::{}::{}", super::stem_of(&path), table, get("__source_rowid")),
+                None,
+                nz(get("_source_file")),
+                Some("Windows 타임라인 활동"),
             )?);
             db.write(rec)?;
         }

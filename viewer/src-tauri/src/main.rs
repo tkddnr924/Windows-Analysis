@@ -1530,7 +1530,9 @@ async fn timeline_source_page(
 /// 구조 로직(필터키·검색 blob·include 규칙) 버전. 규칙이 바뀌면 올려 재빌드 유도.
 /// 3 = _OVERVIEW contract cutover (primary tables only, body BLOBs excluded,
 /// source_records instead of record_key for raw evidence).
-const TIMELINE_LOGIC_VERSION: i64 = 3;
+/// 4 = docs-18: _OVERVIEW tables only, a source shared by views shown once.
+/// 5 = inputs limited to six views (user-confirmed). 6 = + browser visits/downloads.
+const TIMELINE_LOGIC_VERSION: i64 = 6;
 
 fn timeline_db_path(host_dir: &str) -> PathBuf {
     Path::new(host_dir).join("_master_timeline.sqlite")
@@ -2368,7 +2370,7 @@ async fn list_result_files(category_dir: String) -> Vec<ResultFileEntry> {
 /// The 21 derived result files of docs-01. Used only to decide whether a file
 /// is a contract result; other `_OVERVIEW` files (raw facts such as
 /// MFT_Records.sqlite) are out of scope.
-const DERIVED_OVERVIEW_FILES: [&str; 21] = [
+const DERIVED_OVERVIEW_FILES: [&str; 23] = [
     "Metadata",
     "ExecutionHistory",
     "PowerShellHistory",
@@ -2390,6 +2392,8 @@ const DERIVED_OVERVIEW_FILES: [&str; 21] = [
     "UsnJournal",
     "PathReferences",
     "RecycleBin",
+    "JumpListEntries",
+    "TimelineActivities",
 ];
 
 /// Reports whether stored results follow the common contract (overview_contract=1).

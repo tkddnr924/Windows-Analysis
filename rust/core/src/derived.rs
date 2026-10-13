@@ -869,7 +869,7 @@ fn validate_lineage(out_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Build all 22 schemas, including empty results; propagate generation failures.
+/// Build all 24 schemas, including empty results; propagate generation failures.
 pub fn build_all(
     out_dir: &Path,
     target: &Path,
@@ -933,11 +933,11 @@ mod tests {
 
     #[test]
     fn every_documented_database_has_a_spec() {
-        assert_eq!(schema::SPECS.len(), 22);
+        assert_eq!(schema::SPECS.len(), 24);
         for spec in schema::SPECS {
             assert!(!spec.columns.is_empty(), "{} 컬럼 없음", spec.name);
             // metadata는 호스트 사실, RegistryExplorer는 하이브 트리라서
-            // 사건 공통 컬럼 계약을 쓰지 않는다 — 나머지 20개는 모두 쓴다.
+            // 사건 공통 컬럼 계약을 쓰지 않는다 — 나머지 22개는 모두 쓴다.
             if !matches!(spec.name, "Metadata" | "RegistryExplorer") {
                 assert!(
                     spec.columns.starts_with(COMMON_COLUMNS),
@@ -1329,7 +1329,7 @@ mod tests {
     fn build_all_publishes_every_database_even_with_no_evidence() {
         let (out_dir, target) = fixture("empty");
         let report = build_all(&out_dir, &target, "host-1", "ds-1").unwrap();
-        assert_eq!(report.len(), 22);
+        assert_eq!(report.len(), 24);
         for (index, spec) in schema::SPECS.iter().enumerate() {
             assert_eq!(report[index].0, spec.name, "보고 순서는 문서 순서다");
             let conn = open(&out_dir, spec.name);
@@ -1948,6 +1948,79 @@ mod tests {
         assert_eq!(error, None);
         assert_eq!(account, None);
         assert_eq!(sid, "S-1-5-21-1-2-3-1001");
+        let _ = std::fs::remove_dir_all(out_dir.parent().unwrap());
+    }
+
+    /// Every JumpList entry is stored, including entries without a target
+    /// path (PathReferences keeps only path-bearing ones).
+    #[test]
+    fn jump_list_entries_keep_every_raw_row() {
+        let (out_dir, target) = fixture("jumplist-entries");
+        facts_db(
+            &out_dir,
+            "JUMPLIST/JumpList_Entries.sqlite",
+            "CREATE TABLE JumpList_Entries (timestamp TEXT, timestamp_source TEXT, lnk_accessed TEXT, \
+             destlist_accessed TEXT, created_time TEXT, modified_time TEXT, access_count TEXT, hostname TEXT, \
+             app_id TEXT, jumplist_type TEXT, target_path TEXT, arguments TEXT, working_directory TEXT, \
+             machine_id TEXT, stream_id TEXT, _status TEXT, _error TEXT, _source_file TEXT NOT NULL);\
+             INSERT INTO JumpList_Entries VALUES ('2026-09-23 20:00:00.389','destlist_accessed','2026-09-23 00:00:00.000',\
+             '2026-09-23 20:00:00.389','2026-09-23 19:55:14.410','2026-09-23 19:56:22.000','1','jaitserver',\
+             '5f7b5f1e01b83767','Automatic','E:\\a.txt','','','jaitserver','1','ok',NULL,\
+             '/c/NonVolatile/JUMPLIST/Administrator/AutomaticDestinations/5f7b5f1e01b83767.automaticDestinations-ms');\
+             INSERT INTO JumpList_Entries VALUES ('2026-09-20 01:02:03.000','lnk_accessed',NULL,NULL,NULL,NULL,NULL,NULL,\
+             'a7ba40025dac9a67','Custom',NULL,NULL,NULL,NULL,NULL,'ok',NULL,\
+             '/c/NonVolatile/JUMPLIST/Administrator/CustomDestinations/a7ba40025dac9a67.customDestinations-ms');",
+        );
+        build_all(&out_dir, &target, "host-1", "ds-1").unwrap();
+        let conn = open(&out_dir, "JumpListEntries");
+        let rows: Vec<(Option<String>, Option<String>, String, Option<String>, Option<i64>, String, String)> = conn
+            .prepare(
+                "SELECT j.timestamp_kind, j.target_path, j.jumplist_type, j.account, j.access_count, s.source_table, \
+                 CAST(s.source_rowid AS TEXT) FROM JumpListEntries j JOIN source_records s ON s.record_id=j.record_id \
+                 ORDER BY s.source_rowid",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(rows, vec![
+            (Some("DestList 마지막 사용 시각".into()), Some("E:\\a.txt".into()), "Automatic".into(), Some("Administrator".into()), Some(1), "JumpList_Entries".into(), "1".into()),
+            (Some("LNK 대상 접근 시각".into()), None, "Custom".into(), Some("Administrator".into()), None, "JumpList_Entries".into(), "2".into()),
+        ]);
+        let _ = std::fs::remove_dir_all(out_dir.parent().unwrap());
+    }
+
+    /// Every Windows Timeline activity is stored, execution (type 5) included,
+    /// and the representative time names its own field.
+    #[test]
+    fn timeline_activities_keep_every_activity_type() {
+        let (out_dir, target) = fixture("timeline-activities");
+        facts_db(
+            &out_dir,
+            "TIMELINE/Timeline_Activities.sqlite",
+            "CREATE TABLE Timeline_Activities (timestamp TEXT, kind TEXT, app_name TEXT, app_path TEXT, display_text TEXT, \
+             content_uri TEXT, active_duration_s TEXT, activity_type TEXT, start_time TEXT, end_time TEXT, last_modified TEXT, \
+             expiration TEXT, account TEXT, source_table TEXT, activity_id TEXT, platform_device_id TEXT, payload TEXT, \
+             _source_file TEXT NOT NULL);\
+             INSERT INTO Timeline_Activities VALUES ('2026-09-23 15:37:05.000','실행/열기','notepad.exe','C:\\Windows\\notepad.exe',\
+             'a.txt',NULL,NULL,'5','2026-09-23 15:37:05.000',NULL,'2026-09-23 15:40:00.000',NULL,'Administrator','Activity','id-1',NULL,NULL,'/c/ActivitiesCache.db');\
+             INSERT INTO Timeline_Activities VALUES ('2026-09-23 16:00:00.000','사용(포커스)','notepad.exe',NULL,\
+             NULL,NULL,'42','6',NULL,NULL,'2026-09-23 16:00:00.000',NULL,'Administrator','ActivityOperation','id-2',NULL,NULL,'/c/ActivitiesCache.db');",
+        );
+        build_all(&out_dir, &target, "host-1", "ds-1").unwrap();
+        let conn = open(&out_dir, "TimelineActivities");
+        let rows: Vec<(String, String, i64, Option<i64>, String)> = conn
+            .prepare("SELECT event_type, timestamp_kind, activity_type, active_duration_s, activity_table FROM TimelineActivities ORDER BY activity_type")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(rows, vec![
+            ("실행/열기".into(), "활동 시작 시각".into(), 5, None, "Activity".into()),
+            ("사용(포커스)".into(), "활동 마지막 수정 시각".into(), 6, Some(42), "ActivityOperation".into()),
+        ]);
         let _ = std::fs::remove_dir_all(out_dir.parent().unwrap());
     }
 

@@ -90,6 +90,10 @@ const TABLE_ARTIFACT_KEYS: Record<string, string> = {
   POWERSHELLHISTORY: "POWERSHELL",
   SMBHISTORY: "SMBHISTORY",
   BROWSERACTIVITY: "BROWSER",
+  TIMELINEACTIVITIES: "TIMELINE",
+  WERREPORTS: "WER",
+  REMOTEDESKTOPHISTORY: "REMOTEDESKTOP",
+  USNJOURNAL: "FILESYSTEM",
 };
 
 const toolbarButtonStyle: CSSProperties = {
@@ -131,6 +135,8 @@ export function artifactChipTone(category: string, table: string): ArtifactChipT
 function artifactDisplayName(category: string, table: string): string {
   if (normalizedArtifactKey(category) === "EVENTLOG") return "EventLog";
   if (normalizedArtifactKey(table) === "JUMPLISTENTRIES") return "JumpList";
+  if (normalizedArtifactKey(table) === "TIMELINEACTIVITIES") return "Windows Timeline";
+  if (normalizedArtifactKey(table) === "WERREPORTS") return "WER";
   return table;
 }
 

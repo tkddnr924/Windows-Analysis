@@ -2141,6 +2141,187 @@ const RECYCLE_BIN_CHILDREN: &[ChildSpec] = &[
     ChildSpec { table: "source_records", columns: RECYCLE_BIN_SOURCE_RECORDS_COLUMNS },
 ];
 
+const JUMP_LIST_ENTRIES_DDL: &str = r#"PRAGMA foreign_keys=ON;
+CREATE TABLE "JumpListEntries" (
+  "record_id" TEXT NOT NULL,
+  "host_id" TEXT NOT NULL,
+  "dataset_id" TEXT NOT NULL,
+  "timestamp" TEXT,
+  "overview_name" TEXT NOT NULL,
+  "account" TEXT,
+  "account_sid" TEXT,
+  "timestamp_kind" TEXT,
+  "event_type" TEXT,
+  "description" TEXT,
+  "jumplist_type" TEXT,
+  "app_id" TEXT,
+  "target_path" TEXT,
+  "target_path_resolved" TEXT,
+  "arguments" TEXT,
+  "working_directory" TEXT,
+  "hostname" TEXT,
+  "machine_id" TEXT,
+  "access_count" INTEGER,
+  "lnk_accessed" TEXT,
+  "destlist_accessed" TEXT,
+  "created_time" TEXT,
+  "modified_time" TEXT,
+  "timestamp_source" TEXT,
+  "stream_id" TEXT,
+  "status" TEXT,
+  "error" TEXT,
+  PRIMARY KEY(record_id),
+  CHECK(overview_name = 'JumpListEntries'),
+  CHECK(timestamp IS NULL OR timestamp_kind IS NOT NULL)
+);
+CREATE INDEX "idx_JumpListEntries_time" ON "JumpListEntries"(timestamp, record_id);
+CREATE INDEX "idx_JumpListEntries_app" ON "JumpListEntries"(app_id, timestamp);
+CREATE TABLE "source_records" (
+  "record_id" TEXT NOT NULL,
+  "ordinal" INTEGER NOT NULL,
+  "source_dataset_id" TEXT NOT NULL,
+  "source_artifact" TEXT NOT NULL,
+  "source_db" TEXT NOT NULL,
+  "source_table" TEXT NOT NULL,
+  "source_rowid" INTEGER NOT NULL,
+  "source_field" TEXT,
+  "source_record_key" TEXT,
+  "source_file" TEXT,
+  "source_label" TEXT,
+  PRIMARY KEY(record_id, ordinal),
+  CHECK(ordinal >= 0),
+  FOREIGN KEY(record_id) REFERENCES "JumpListEntries"("record_id") ON DELETE CASCADE
+);
+CREATE INDEX idx_source_lookup ON source_records(source_db, source_table, source_rowid, source_field);
+
+CREATE TABLE _wina_derived_version (name TEXT NOT NULL PRIMARY KEY, version INTEGER NOT NULL);
+INSERT INTO _wina_derived_version(name,version) VALUES ('overview_contract',1);
+"#;
+
+const JUMP_LIST_ENTRIES_COLUMNS: &[&str] = &[
+    "record_id",
+    "host_id",
+    "dataset_id",
+    "timestamp",
+    "overview_name",
+    "account",
+    "account_sid",
+    "timestamp_kind",
+    "event_type",
+    "description",
+    "jumplist_type",
+    "app_id",
+    "target_path",
+    "target_path_resolved",
+    "arguments",
+    "working_directory",
+    "hostname",
+    "machine_id",
+    "access_count",
+    "lnk_accessed",
+    "destlist_accessed",
+    "created_time",
+    "modified_time",
+    "timestamp_source",
+    "stream_id",
+    "status",
+    "error",
+];
+
+const JUMP_LIST_ENTRIES_CHILDREN: &[ChildSpec] = &[
+    ChildSpec { table: "source_records", columns: RECYCLE_BIN_SOURCE_RECORDS_COLUMNS },
+];
+
+const TIMELINE_ACTIVITIES_DDL: &str = r#"PRAGMA foreign_keys=ON;
+CREATE TABLE "TimelineActivities" (
+  "record_id" TEXT NOT NULL,
+  "host_id" TEXT NOT NULL,
+  "dataset_id" TEXT NOT NULL,
+  "timestamp" TEXT,
+  "overview_name" TEXT NOT NULL,
+  "account" TEXT,
+  "account_sid" TEXT,
+  "timestamp_kind" TEXT,
+  "event_type" TEXT,
+  "description" TEXT,
+  "activity_type" INTEGER,
+  "kind" TEXT,
+  "app_name" TEXT,
+  "app_path" TEXT,
+  "app_path_resolved" TEXT,
+  "display_text" TEXT,
+  "content_uri" TEXT,
+  "active_duration_s" INTEGER,
+  "start_time" TEXT,
+  "end_time" TEXT,
+  "last_modified" TEXT,
+  "expiration" TEXT,
+  "activity_table" TEXT,
+  "activity_id" TEXT,
+  "platform_device_id" TEXT,
+  "payload" TEXT,
+  PRIMARY KEY(record_id),
+  CHECK(overview_name = 'TimelineActivities'),
+  CHECK(timestamp IS NULL OR timestamp_kind IS NOT NULL)
+);
+CREATE INDEX "idx_TimelineActivities_time" ON "TimelineActivities"(timestamp, record_id);
+CREATE INDEX "idx_TimelineActivities_type" ON "TimelineActivities"(activity_type, timestamp);
+CREATE TABLE "source_records" (
+  "record_id" TEXT NOT NULL,
+  "ordinal" INTEGER NOT NULL,
+  "source_dataset_id" TEXT NOT NULL,
+  "source_artifact" TEXT NOT NULL,
+  "source_db" TEXT NOT NULL,
+  "source_table" TEXT NOT NULL,
+  "source_rowid" INTEGER NOT NULL,
+  "source_field" TEXT,
+  "source_record_key" TEXT,
+  "source_file" TEXT,
+  "source_label" TEXT,
+  PRIMARY KEY(record_id, ordinal),
+  CHECK(ordinal >= 0),
+  FOREIGN KEY(record_id) REFERENCES "TimelineActivities"("record_id") ON DELETE CASCADE
+);
+CREATE INDEX idx_source_lookup ON source_records(source_db, source_table, source_rowid, source_field);
+
+CREATE TABLE _wina_derived_version (name TEXT NOT NULL PRIMARY KEY, version INTEGER NOT NULL);
+INSERT INTO _wina_derived_version(name,version) VALUES ('overview_contract',1);
+"#;
+
+const TIMELINE_ACTIVITIES_COLUMNS: &[&str] = &[
+    "record_id",
+    "host_id",
+    "dataset_id",
+    "timestamp",
+    "overview_name",
+    "account",
+    "account_sid",
+    "timestamp_kind",
+    "event_type",
+    "description",
+    "activity_type",
+    "kind",
+    "app_name",
+    "app_path",
+    "app_path_resolved",
+    "display_text",
+    "content_uri",
+    "active_duration_s",
+    "start_time",
+    "end_time",
+    "last_modified",
+    "expiration",
+    "activity_table",
+    "activity_id",
+    "platform_device_id",
+    "payload",
+];
+
+const TIMELINE_ACTIVITIES_CHILDREN: &[ChildSpec] = &[
+    ChildSpec { table: "source_records", columns: RECYCLE_BIN_SOURCE_RECORDS_COLUMNS },
+];
+
+
 
 // Canonical generation and reporting order.
 pub const SPECS: &[DbSpec] = &[
@@ -2238,6 +2419,20 @@ pub const SPECS: &[DbSpec] = &[
         columns: RECYCLE_BIN_COLUMNS,
         children: RECYCLE_BIN_CHILDREN,
         ddl: RECYCLE_BIN_DDL,
+    },
+    DbSpec {
+        name: "JumpListEntries",
+        table: "JumpListEntries",
+        columns: JUMP_LIST_ENTRIES_COLUMNS,
+        children: JUMP_LIST_ENTRIES_CHILDREN,
+        ddl: JUMP_LIST_ENTRIES_DDL,
+    },
+    DbSpec {
+        name: "TimelineActivities",
+        table: "TimelineActivities",
+        columns: TIMELINE_ACTIVITIES_COLUMNS,
+        children: TIMELINE_ACTIVITIES_CHILDREN,
+        ddl: TIMELINE_ACTIVITIES_DDL,
     },
 ];
 

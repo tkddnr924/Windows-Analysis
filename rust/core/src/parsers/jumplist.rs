@@ -489,6 +489,16 @@ pub fn jumplist_sources(root: &Path) -> crate::finder::Found {
         })
         .collect();
     paths.sort();
+    // A collector may copy the same file twice (JUMPLIST\<user> and
+    // LNK\<user>\Recent); identical bytes are one input, first path kept.
+    let mut seen = std::collections::HashSet::new();
+    paths.retain(|path| match std::fs::read(path) {
+        Ok(bytes) => {
+            use sha2::{Digest, Sha256};
+            seen.insert((bytes.len(), Sha256::digest(&bytes)))
+        }
+        Err(_) => true,
+    });
     crate::finder::Found { paths, errors }
 }
 
@@ -533,6 +543,24 @@ pub fn parse_jumplists(root: &Path) -> Result<Vec<Row>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The same destination file collected twice (e.g. JUMPLIST\<user> and
+    /// LNK\<user>\Recent) is one input; a different file with the same name stays.
+    #[test]
+    fn identical_destination_copies_are_one_input() {
+        let root = std::env::temp_dir().join(format!("wa-jl-dup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let a = root.join("JUMPLIST/u/AutomaticDestinations/x.automaticDestinations-ms");
+        let b = root.join("LNK/u/Recent/AutomaticDestinations/x.automaticDestinations-ms");
+        let c = root.join("JUMPLIST/v/AutomaticDestinations/x.automaticDestinations-ms");
+        for (path, bytes) in [(&a, b"same".as_slice()), (&b, b"same".as_slice()), (&c, b"other".as_slice())] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        }
+        let found = jumplist_sources(&root);
+        assert_eq!(found.paths, vec![a, c]);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     fn destlist_bytes(version: u32) -> Vec<u8> {
         // 헤더 32바이트 + 엔트리 1개(엔트리 번호 0x1a, 경로 "C:\\a.txt").

@@ -4720,7 +4720,7 @@ fn volume_relative_key(mut key: String) -> String {
 }
 
 /// per-user 아티팩트의 계정: LNK/JUMPLIST 수집 폴더 바로 다음 경로 조각.
-fn account_from_source(src: &str) -> String {
+pub(crate) fn account_from_source(src: &str) -> String {
     let parts: Vec<&str> = src.split(['/', '\\']).collect();
     for (i, part) in parts.iter().enumerate() {
         let up = part.to_uppercase();
