@@ -97,8 +97,6 @@ export const QUICK_GROUPS = [
 export type QuickGroupKey = (typeof QUICK_GROUPS)[number]["key"];
 
 const ACTIVITY_SUBTYPES = new Set(["RecentDocs", "RunMRU", "TypedPaths", "TypedURLs", "WordWheelQuery"]);
-// RecentDocs extension subkeys that hold archives.
-const ARCHIVE_EXTENSIONS = new Set([".zip", ".7z", ".rar", ".alz", ".egg", ".tar", ".gz", ".tgz", ".bz2", ".xz", ".zipx", ".cab"]);
 
 /** Quick access group (docs-06) from the stored category/subtype. */
 export function quickGroupOf(finding: Cells): QuickGroupKey {
@@ -106,7 +104,6 @@ export function quickGroupOf(finding: Cells): QuickGroupKey {
   const subtype = finding.subtype ?? "";
   if (subtype === "ShimCache") return "shimcache";
   if (subtype === "BandizipRecentArchive") return "archive";
-  if (subtype === "RecentDocs" && ARCHIVE_EXTENSIONS.has((finding.key_path ?? "").split("\\").pop()?.toLowerCase() ?? "")) return "archive";
   if (ACTIVITY_SUBTYPES.has(subtype)) return "activity";
   if (category === "자동 실행") return "autorun";
   if (category === "자격 증명 보호" || category === "보안 설정") return "security";

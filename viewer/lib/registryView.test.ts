@@ -49,11 +49,11 @@ test("quick access: settings (autorun, security, remote) apart from records; any
   assert.deepEqual(QUICK_GROUPS.map((g: { key: string }) => g.key).slice(-1), ["other"]);
 });
 
-test("archive history: Bandizip recent archives and RecentDocs of archive types; other RecentDocs stay in 사용자 활동", () => {
+test("archive history holds archiver records only; every RecentDocs entry stays in 사용자 활동", () => {
   const recentDocs = (ext: string) => quickGroupOf({ category: "기타 레지스트리", subtype: "RecentDocs", key_path: `\\ROOT\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\RecentDocs\\${ext}` });
   assert.equal(quickGroupOf({ category: "기타 레지스트리", subtype: "BandizipRecentArchive" }), "archive");
-  assert.equal(recentDocs(".zip"), "archive");
-  assert.equal(recentDocs(".7Z"), "archive");
+  assert.equal(recentDocs(".zip"), "activity");
+  assert.equal(recentDocs(".7Z"), "activity");
   assert.equal(recentDocs(".txt"), "activity");
   assert.equal(recentDocs("Folder"), "activity");
   assert.equal(QUICK_GROUPS.find((g: { key: string }) => g.key === "archive")?.section, "records");
