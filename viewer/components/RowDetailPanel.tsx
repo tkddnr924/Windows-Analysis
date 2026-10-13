@@ -1,6 +1,6 @@
 "use client";
 
-import { useContext, useEffect, useState } from "react";
+import { useContext, useEffect, useRef, useState } from "react";
 import CheckIcon from "@mui/icons-material/Check";
 import ChevronRightOutlinedIcon from "@mui/icons-material/ChevronRightOutlined";
 import DescriptionOutlinedIcon from "@mui/icons-material/DescriptionOutlined";
@@ -204,25 +204,46 @@ export default function RowDetailPanel({ row, columns, focusedColumn, evidenceTi
   // Detail-only child tables (ExecutionTimes, TaskActions, …) stay out of the
   // listings and are read per row when it is opened.
   const childTables = spec?.childTables;
-  const [children, setChildren] = useState<Record<string, DBRow[]>>({});
+  // Per child table: loading / loaded rows / failure (R11 docs-11) — a failed
+  // read is never cached as an empty result and can be retried.
+  const [children, setChildren] = useState<Record<string, { status: "loading" | "ok" | "error"; rows: DBRow[]; error?: string }>>({});
+  const [childRetry, setChildRetry] = useState<Record<string, number>>({});
+  const loadedChildren = useRef(new Set<string>());
   useEffect(() => {
+    loadedChildren.current = new Set();
     setChildren({});
+    setChildRetry({});
+  }, [scopePath, scopeTable, rowid]);
+  const retryKey = JSON.stringify(childRetry);
+  useEffect(() => {
     if (!canReadChildren || !childTables?.length) return;
     let alive = true;
-    Promise.all(childTables.map(async (child) => {
-      const childRows = await window.api.readRecordChildren(scopePath, scopeTable, rowid, child.table, child.via).catch(() => [] as DBRow[]);
-      return [child.table, childRows] as const;
-    })).then((entries) => {
-      if (alive) setChildren(Object.fromEntries(entries));
-    });
+    for (const child of childTables) {
+      if (loadedChildren.current.has(child.table)) continue;
+      setChildren((previous) => ({ ...previous, [child.table]: { status: "loading", rows: [] } }));
+      window.api.readRecordChildren(scopePath, scopeTable, rowid, child.table, { key: child.key, via: child.via })
+        .then((rows) => { if (alive) { loadedChildren.current.add(child.table); setChildren((previous) => ({ ...previous, [child.table]: { status: "ok", rows } })); } })
+        .catch((error: unknown) => { if (alive) setChildren((previous) => ({ ...previous, [child.table]: { status: "error", rows: [], error: String(error) } })); });
+    }
     return () => { alive = false; };
-  }, [canReadChildren, scopePath, scopeTable, rowid, childTables]);
+    // retryKey re-runs only tables not yet loaded.
+  }, [canReadChildren, scopePath, scopeTable, rowid, childTables, retryKey]);
 
   // 값이 있는 자식 표만 그린다 — 근거가 없으면 섹션을 만들지 않는다.
   const childSections = (childTables ?? [])
-    .map((child) => ({ child, childRows: children[child.table] ?? [] }))
-    .filter((entry) => entry.childRows.length > 0)
-    .map(({ child, childRows }) => (
+    .map((child) => ({ child, state: children[child.table], childRows: children[child.table]?.rows ?? [] }))
+    .filter((entry) => entry.state && (entry.state.status !== "ok" || entry.childRows.length > 0))
+    .map(({ child, state, childRows }) => state.status !== "ok" ? (
+      <section key={child.table} style={{ padding: "12px 16px", borderBottom: "1px solid var(--border-subtle)", display: "flex", alignItems: "center", gap: 10 }}>
+        <span className="dfir-section-label">{child.heading}</span>
+        {state.status === "loading"
+          ? <span role="status" style={{ fontSize: 12, color: "var(--text-faint)" }}>불러오는 중</span>
+          : <>
+            <span role="alert" title={state.error} style={{ fontSize: 12, color: "var(--danger)" }}>불러오지 못함</span>
+            <button type="button" onClick={() => setChildRetry((previous) => ({ ...previous, [child.table]: (previous[child.table] ?? 0) + 1 }))} style={{ marginLeft: "auto", fontSize: 12, padding: "3px 10px", border: "1px solid var(--border)", borderRadius: "var(--radius)", background: "var(--bg-elevated)", color: "var(--text)", cursor: "pointer" }}>다시 시도</button>
+          </>}
+      </section>
+    ) : (
       <section key={child.table} style={{ padding: "14px 16px 18px", borderBottom: "1px solid var(--border-subtle)" }}>
         <div className="dfir-section-label" style={{ marginBottom: 7 }}>{child.heading} ({childRows.length})</div>
         {childRows.map((childRow, index) => (

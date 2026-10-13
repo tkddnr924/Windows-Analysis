@@ -5883,6 +5883,8 @@ fn read_record_sources_blocking(
 /// Values kept as child rows instead of being forced into the common columns
 /// are read only in detail. `child_table` is validated against the file's own
 /// tables and the primary table is rejected, so listing cannot be bypassed.
+/// `child_key` names the child column holding the parent record_id (default
+/// `record_id`, e.g. `matched_record_id` for reference tables).
 /// With `via_table`/`via_key`, `child_table` is a link table: each link row's
 /// `via_key` value selects the `via_table` row with that record_id. Link
 /// columns come back as `link.<column>`, target columns as stored.
@@ -5892,11 +5894,12 @@ async fn read_record_children(
     table_name: String,
     rowid: i64,
     child_table: String,
+    child_key: Option<String>,
     via_table: Option<String>,
     via_key: Option<String>,
 ) -> Result<Vec<Map<String, Value>>, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        read_record_children_blocking(full_path, table_name, rowid, child_table, via_table.zip(via_key))
+        read_record_children_blocking(full_path, table_name, rowid, child_table, child_key, via_table.zip(via_key))
     })
     .await
     .map_err(|error| format!("자식 레코드 조회가 중단되었습니다: {error}"))?
@@ -5907,6 +5910,7 @@ fn read_record_children_blocking(
     table_name: String,
     rowid: i64,
     child_table: String,
+    child_key: Option<String>,
     via: Option<(String, String)>,
 ) -> Result<Vec<Map<String, Value>>, String> {
     let conn = open_ro(&full_path)?;
@@ -5920,8 +5924,9 @@ fn read_record_children_blocking(
     let Some(record_id) = record_id_of(&conn, &table_name, rowid)? else {
         return Ok(Vec::new());
     };
+    let key = child_key.unwrap_or_else(|| "record_id".to_string());
     let columns = payload_columns(&conn, &child_table);
-    if !columns.iter().any(|column| column == "record_id") {
+    if !columns.iter().any(|column| column == &key) {
         return Ok(Vec::new());
     }
     let Some(projection) = payload_projection(&columns) else {
@@ -5931,8 +5936,9 @@ fn read_record_children_blocking(
     let Some((via_table, via_key)) = via else {
         let order = if has_ordinal { " ORDER BY ordinal" } else { "" };
         let sql = format!(
-            "SELECT rowid AS __rowid, {projection} FROM {} WHERE record_id = ?1{order}",
-            q(&child_table)
+            "SELECT rowid AS __rowid, {projection} FROM {} WHERE {} = ?1{order}",
+            q(&child_table),
+            q(&key)
         );
         return query_rows(&conn, &sql, &[&record_id]);
     };
@@ -5960,10 +5966,11 @@ fn read_record_children_blocking(
         .join(", ");
     let order = if has_ordinal { " ORDER BY l.ordinal" } else { "" };
     let sql = format!(
-        "SELECT t.rowid AS __rowid, {link_projection}, {target_projection} FROM {} l JOIN {} t ON t.record_id = l.{} WHERE l.record_id = ?1{order}",
+        "SELECT t.rowid AS __rowid, {link_projection}, {target_projection} FROM {} l JOIN {} t ON t.record_id = l.{} WHERE l.{} = ?1{order}",
         q(&child_table),
         q(&via_table),
-        q(&via_key)
+        q(&via_key),
+        q(&key)
     );
     query_rows(&conn, &sql, &[&record_id])
 }
@@ -5989,17 +5996,40 @@ mod record_children_tests {
         drop(conn);
         let full = path.to_string_lossy().to_string();
         let via = Some(("Ctx".to_string(), "context_id".to_string()));
-        let rows = read_record_children_blocking(full.clone(), "Main".into(), 1, "Links".into(), via).unwrap();
+        let rows = read_record_children_blocking(full.clone(), "Main".into(), 1, "Links".into(), None, via).unwrap();
         let pairs: Vec<(String, String)> = rows
             .iter()
             .map(|row| (row["link.relation_kind"].as_str().unwrap().to_string(), row["event_id"].as_str().unwrap().to_string()))
             .collect();
         assert_eq!(pairs, vec![("priv".into(), "4672".into()), ("end".into(), "4634".into())]);
         // Target cannot be the primary table; the link column must exist.
-        assert!(read_record_children_blocking(full.clone(), "Main".into(), 1, "Links".into(), Some(("Main".into(), "context_id".into()))).unwrap().is_empty());
-        assert!(read_record_children_blocking(full.clone(), "Main".into(), 1, "Links".into(), Some(("Ctx".into(), "nope".into()))).unwrap().is_empty());
+        assert!(read_record_children_blocking(full.clone(), "Main".into(), 1, "Links".into(), None, Some(("Main".into(), "context_id".into()))).unwrap().is_empty());
+        assert!(read_record_children_blocking(full.clone(), "Main".into(), 1, "Links".into(), None, Some(("Ctx".into(), "nope".into()))).unwrap().is_empty());
         // Plain children are unchanged.
-        assert_eq!(read_record_children_blocking(full, "Main".into(), 2, "Links".into(), None).unwrap().len(), 1);
+        assert_eq!(read_record_children_blocking(full, "Main".into(), 2, "Links".into(), None, None).unwrap().len(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn child_key_reads_reference_rows_by_another_column() {
+        let path = std::env::temp_dir().join(format!("wa-children-key-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE Main(record_id TEXT);
+             CREATE TABLE Refs(entry_id TEXT, matched_record_id TEXT, tree_path TEXT);
+             INSERT INTO Main VALUES('r1'),('r2');
+             INSERT INTO Refs VALUES('e1','r1','\\A'),('e2','r2','\\B'),('e3',NULL,'\\C');",
+        )
+        .unwrap();
+        drop(conn);
+        let full = path.to_string_lossy().to_string();
+        let rows = read_record_children_blocking(full.clone(), "Main".into(), 2, "Refs".into(), Some("matched_record_id".into()), None).unwrap();
+        assert_eq!(rows.iter().map(|row| row["entry_id"].as_str().unwrap()).collect::<Vec<_>>(), vec!["e2"]);
+        // Without the key the table has no record_id column → no rows.
+        assert!(read_record_children_blocking(full.clone(), "Main".into(), 2, "Refs".into(), None, None).unwrap().is_empty());
+        // Unknown key column → no rows (never interpolated unchecked).
+        assert!(read_record_children_blocking(full, "Main".into(), 2, "Refs".into(), Some("nope".into()), None).unwrap().is_empty());
         let _ = std::fs::remove_file(&path);
     }
 }

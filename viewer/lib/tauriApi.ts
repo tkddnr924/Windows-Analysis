@@ -69,7 +69,7 @@ function makeApi(): ElectronApi {
     hostMetadata: (hostDir, options) => invoke<HostMetadata>("host_metadata", { hostDir, metadataIds: options?.metadataIds ?? null, kind: options?.kind ?? null })
       .then((meta) => { rows(meta.rows); rows(meta.addresses); rows(meta.gateways); rows(meta.dnsServers); rows(meta.groups); rows(meta.candidates); return meta; }),
     readRecordSources: (fullPath, tableName, rowid) => invoke<RecordSource[]>("read_record_sources", { fullPath, tableName, rowid }).then(rows),
-    readRecordChildren: (fullPath, tableName, rowid, childTable, via) => invoke<DBRow[]>("read_record_children", { fullPath, tableName, rowid, childTable, viaTable: via?.table ?? null, viaKey: via?.key ?? null }).then(rows),
+    readRecordChildren: (fullPath, tableName, rowid, childTable, options) => invoke<DBRow[]>("read_record_children", { fullPath, tableName, rowid, childTable, childKey: options?.key ?? null, viaTable: options?.via?.table ?? null, viaKey: options?.via?.key ?? null }).then(rows),
     readResultFile: (fullPath, tableName) => invoke<CsvData>("read_result_file", { fullPath, tableName: tableName ?? null }).then(table),
     readResultFilePage: (fullPath, tableName, offset, limit) => invoke<CsvData>("read_result_file_page", { fullPath, tableName: tableName ?? null, offset, limit }).then(table),
     timelineSourcePage: (fullPath, tableName, offset, limit) => invoke<TimelineSourcePage>("timeline_source_page", { fullPath, tableName: tableName ?? null, offset, limit }).then(table),

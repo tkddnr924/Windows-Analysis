@@ -9,6 +9,7 @@ import { downloadStateLabel, transitionLabel } from "./browserView";
 import { STAGE_LABELS } from "./remoteAccess";
 import { RELATION_LABELS as SMB_RELATION_LABELS } from "./smbHistory";
 import { RDP_STATUS_LABELS } from "./rdpCache";
+import { REVIEW_SIGNAL_LABELS } from "./scheduledTasks";
 
 const SMB_DIRECTION_VALUE_LABELS: Record<string, string> = { inbound: "인바운드", outbound: "아웃바운드", unknown: "방향 미확인" };
 
@@ -90,6 +91,8 @@ export interface ChildTableSpec {
   summary?: (row: Record<string, string>) => string;
   /** 링크 표 경유: 자식 행의 `key` 값 = `table`.record_id 행을 보여 준다(링크 컬럼은 `link.` 접두). */
   via?: { table: string; key: string };
+  /** 부모 record_id를 담은 자식 컬럼(기본 record_id, 예: matched_record_id). */
+  key?: string;
 }
 
 export interface ArtifactViewSpec {
@@ -963,63 +966,95 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     embeddedLinks: [{ key: "prefetch_hash", label: "Prefetch에 기록된 참조 파일", targetFile: "Prefetch_LoadedFiles", targetColumn: "prefetch_hash" }],
   },
 
+  // docs-11: definitions and scheduler events in one stored table; every value
+  // read from _OVERVIEW (definition principal ≠ event actor ≠ run user, R09/R14).
   ScheduledTasks: {
     customView: "scheduledTasks",
     // The overview identifies the evidence type first; the task's own name is
     // kept in the information section, consistently for every task record.
     title: () => "ScheduledTasks",
-    timelineTitle: (r) => r.task_name || "(이름 없음)",
-    // The evidence overview stays intentionally terse: task type + the raw
-    // registration timestamp. The action itself belongs in TaskActions below.
+    timelineTitle: (r) => r.task_name || r.event_type || "",
     subtitle: (r) => r.timestamp || "",
     overviewTime: "hide",
-    tags: (r) => tagsForPath(r.task_path),
     timelineField: "timestamp",
     priorityColumns: ["timestamp", "event_type", "task_name", "task_path", "run_as", "result"],
-    sections: [{ heading: "작업 스케줄러 정보", fields: [
-      { key: "event_type", label: "기록 종류", kind: "badge" },
-      { key: "task_name", label: "작업 이름" },
-      { key: "task_path", label: "작업 경로" },
-      { key: "run_as", label: "실행 계정", kind: "account" },
-      { key: "run_as_sid", label: "실행 계정 SID", kind: "accountSid" },
-      { key: "run_level", label: "실행 권한" },
-      { key: "logon_type", label: "로그온 유형" },
-      {
-        key: "enabled",
-        label: "작업 상태",
-        kind: "badge",
-        // 저장 계약의 플래그는 0/1이고 미확인은 NULL이다 — 모르는 값을
-        // "비활성화됨"으로 단정하지 않는다.
-        valueLabels: { "1": "활성화됨", "0": "비활성화됨" },
-        showWhenEmpty: true,
-        emptyLabel: "설정 정보 없음",
-        badgeColors: { "활성화됨": "#3fb950", "비활성화됨": "#8a8a8a" },
-      },
-      {
-        key: "hidden",
-        label: "표시 정책",
-        kind: "badge",
-        valueLabels: { "1": "숨김 처리됨", "0": "일반 표시" },
-        showWhenEmpty: true,
-        emptyLabel: "설정 정보 없음",
-        badgeColors: { "숨김 처리됨": "#d29922", "일반 표시": "#4fc1ff" },
-      },
-      { key: "is_microsoft", label: "Microsoft 기본 작업", valueLabels: { "1": "예", "0": "아니오" } },
-      { key: "author", label: "작성자" },
-      { key: "uri", label: "URI" },
-      { key: "task_description", label: "작업 설명" },
-      { key: "description", label: "설명" },
-    ]},
-    // 작업 이벤트(100/102/129/200 등) 행이 같은 표에 함께 저장된다 — 정의 행과
-    // 달리 이벤트 ID·결과를 갖는다. "정의만 있고 언제 돌았는지 모름"은 이벤트
-    // 행으로 확인한다.
-    { heading: "이벤트", fields: [
-      { key: "result", label: "결과", kind: "badge", badgeColors: { "성공": "#3fb950", "실패": "#f85149" } },
-      { key: "event_id", label: "이벤트 ID" },
-      { key: "provider", label: "공급자" },
-    ]}],
-    // 실행 명령·트리거는 정의 행의 자식 표다(원문도 함께 보존된다).
+    sections: [
+      { heading: "작업", fields: [
+        { key: "event_type", label: "기록 종류", kind: "badge" },
+        { key: "timestamp_kind", label: "대표 시각 의미" },
+        { key: "task_name", label: "작업 이름" },
+        { key: "task_path", label: "작업 경로" },
+        { key: "uri", label: "URI 원문", compute: (r) => (r.uri && r.uri !== r.task_path ? r.uri : "") },
+        { key: "task_description", label: "작업 설명" },
+        { key: "author", label: "작성자" },
+        { key: "is_microsoft", label: "Microsoft 분류", valueLabels: { "1": "예", "0": "아니오" } },
+        { key: "microsoft_basis", label: "분류 근거", compute: (r) => ({ task_path_prefix: "작업 경로", author_value: "작성자", task_path_and_author: "작업 경로 · 작성자" } as Record<string, string>)[r.microsoft_basis] ?? "" },
+        { key: "enabled", label: "사용", kind: "badge", valueLabels: { "1": "활성", "0": "비활성" }, badgeColors: { "활성": "#3fb950", "비활성": "#8a8a8a" } },
+        { key: "hidden", label: "숨김", kind: "badge", valueLabels: { "1": "숨김", "0": "표시" }, badgeColors: { "숨김": "#d29922", "표시": "#4fc1ff" } },
+        { key: "registration_date", label: "등록 시각(RegistrationInfo/Date)" },
+        { key: "registration_date_raw", label: "등록 시각 원문", compute: (r) => (r.registration_date_raw && r.registration_date_raw !== r.registration_date ? r.registration_date_raw : "") },
+        { key: "job_last_run", label: ".job 마지막 실행" },
+        { key: "job_last_run_raw", label: ".job 마지막 실행 원문", compute: (r) => (r.job_last_run_raw && r.job_last_run_raw !== r.job_last_run ? r.job_last_run_raw : "") },
+        { key: "description", label: "설명" },
+      ]},
+      { heading: "계정", fields: [
+        { key: "run_as", label: "실행 계정", kind: "account" },
+        { key: "run_as_sid", label: "실행 계정 SID", kind: "accountSid" },
+        { key: "run_as_kind", label: "실행 주체 종류", valueLabels: { user: "사용자", group: "그룹" } },
+        { key: "run_level", label: "실행 권한" },
+        { key: "logon_type", label: "로그온 유형" },
+        { key: "account", label: "대표 계정", kind: "account", compute: (r) => (r.account && r.account !== r.run_as ? r.account : "") },
+        { key: "account_sid", label: "대표 계정 SID", kind: "accountSid", compute: (r) => (r.account_sid && r.account_sid !== r.run_as_sid ? r.account_sid : "") },
+        { key: "actor_account", label: "사건 행위자" },
+        { key: "actor_sid", label: "행위자 SID", kind: "accountSid" },
+        { key: "actor_domain", label: "행위자 도메인" },
+        { key: "actor_logon_id", label: "행위자 LogonId" },
+        { key: "run_user_raw", label: "실행 사용자" },
+        { key: "run_user_sid", label: "실행 사용자 SID", kind: "accountSid" },
+      ]},
+      { heading: "이벤트", fields: [
+        { key: "event_category", label: "분류" },
+        { key: "launch_reason", label: "실행 원인" },
+        { key: "result", label: "결과", kind: "badge", badgeColors: { "성공": "#3fb950", "실패": "#f85149" } },
+        { key: "result_code_raw", label: "결과 코드" },
+        { key: "result_code_format", label: "코드 형식" },
+        { key: "action_name", label: "동작" },
+        { key: "instance_id", label: "인스턴스 ID" },
+        { key: "task_instance_id", label: "작업 인스턴스 ID" },
+        { key: "engine_pid", label: "엔진 PID" },
+        { key: "reported_process_id", label: "보고된 PID" },
+        { key: "queued_instance_id", label: "대기 인스턴스 ID" },
+        { key: "event_id", label: "이벤트 ID" },
+        { key: "provider", label: "공급자" },
+        { key: "channel", label: "채널" },
+        { key: "computer", label: "컴퓨터" },
+        { key: "event_record_id", label: "EventRecordID" },
+        { key: "level_name", label: "수준" },
+        { key: "keywords_raw", label: "Keywords" },
+      ]},
+      { heading: "원본 · 파싱", fields: [
+        { key: "source_file", label: "원본 파일", kind: "path" },
+        { key: "source_format", label: "형식" },
+        { key: "encoding", label: "인코딩" },
+        { key: "decode_status", label: "디코딩" },
+        { key: "raw_size", label: "원문 크기" },
+        { key: "raw_sha256", label: "원문 SHA-256", kind: "hash" },
+        { key: "parse_status", label: "파싱 상태", compute: (r) => (r.parse_status && r.parse_status !== "parsed" && r.parse_status !== "ok" ? r.parse_status : "") },
+        { key: "parse_error", label: "파싱 오류" },
+        { key: "parse_error_location", label: "오류 위치" },
+        { key: "task_version", label: "작업 스키마 버전" },
+      ]},
+      { heading: "작업 원문", collapsible: { defaultExpanded: false }, fields: [
+        { key: "raw_content", label: "작업 XML/원문", kind: "code" },
+        { key: "event_data_raw", label: "EventData", kind: "code" },
+      ]},
+    ],
     childTables: [
+      {
+        table: "TaskReviewSignals",
+        heading: "검토 신호",
+        summary: (r) => [REVIEW_SIGNAL_LABELS[r.signal] ?? r.signal, r.evidence_value].filter(Boolean).join(" · "),
+      },
       {
         table: "TaskActions",
         heading: "실행 명령",
@@ -1029,6 +1064,8 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
           { key: "command_resolved", label: "명령 (환경변수 해석)", kind: "code" },
           { key: "arguments", label: "인수", kind: "code" },
           { key: "working_directory", label: "작업 디렉터리", kind: "path" },
+          { key: "class_id", label: "COM ClassId" },
+          { key: "com_data", label: "COM Data", kind: "code" },
           { key: "raw_action", label: "원문", kind: "code" },
         ],
       },
@@ -1037,11 +1074,75 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
         heading: "트리거",
         fields: [
           { key: "trigger_type", label: "트리거 유형" },
+          { key: "enabled", label: "사용", valueLabels: { "1": "사용", "0": "사용 안 함" } },
           { key: "start_time", label: "시작 경계" },
           { key: "end_time", label: "종료 경계" },
-          { key: "enabled", label: "사용", valueLabels: { "1": "사용", "0": "사용 안 함" } },
+          { key: "repetition_interval", label: "반복 간격" },
+          { key: "repetition_duration", label: "반복 기간" },
+          { key: "execution_time_limit", label: "실행 제한" },
+          { key: "delay", label: "지연" },
+          { key: "random_delay", label: "임의 지연" },
+          { key: "schedule_kind", label: "일정" },
+          { key: "subscription", label: "이벤트 구독", kind: "code" },
+          { key: "state_name", label: "WNF StateName" },
+          { key: "user_id", label: "사용자" },
+          { key: "session_change_type", label: "세션 변경" },
           { key: "raw_trigger", label: "원문", kind: "code" },
         ],
+      },
+      {
+        table: "TaskPrincipals",
+        heading: "주체",
+        fields: [
+          { key: "principal_id", label: "Principal ID" },
+          { key: "principal_kind", label: "종류", valueLabels: { user: "사용자", group: "그룹" } },
+          { key: "account", label: "계정" },
+          { key: "account_sid", label: "SID" },
+          { key: "user_id", label: "UserId" },
+          { key: "group_id", label: "GroupId" },
+          { key: "logon_type", label: "로그온 유형" },
+          { key: "run_level", label: "실행 권한" },
+          { key: "process_token_sid_type", label: "토큰 SID 유형" },
+          { key: "required_privileges", label: "필요 권한" },
+        ],
+      },
+      {
+        table: "TaskSettings",
+        heading: "설정",
+        summary: (r) => `${r.setting_path || r.setting_name} = ${r.value_raw ?? ""}${r.value_source === "schema_default" ? " (스키마 기본값)" : ""}`,
+      },
+      {
+        table: "TaskComRegistrations",
+        heading: "COM 등록",
+        summary: (r) => (r.match_status === "no_registration_found" ? `${r.class_id} · 등록 없음` : [r.class_id, r.server_kind, r.server_path_resolved || r.server_path_raw, r.registry_view, r.hive_scope].filter(Boolean).join(" · ")),
+      },
+      {
+        table: "TaskFileEvidence",
+        heading: "수집 파일 사본",
+        summary: (r) => [r.collected_path || r.collected_name, r.collected_size && `${r.collected_size} B`, r.collected_sha256, "파일명 일치"].filter(Boolean).join(" · "),
+      },
+      {
+        table: "TaskRegistryEntries",
+        key: "matched_record_id",
+        heading: "TaskCache",
+        summary: (r) => [r.scope, r.guid, r.tree_path, r.key_last_write && `키 수정 ${r.key_last_write}`].filter(Boolean).join(" · "),
+      },
+      {
+        table: "TaskLiveSnapshot",
+        key: "matched_record_id",
+        heading: "수집기 라이브 목록",
+        fields: [
+          { key: "command", label: "명령", kind: "code" },
+          { key: "triggers_text", label: "트리거" },
+          { key: "account_reported", label: "계정(보고)" },
+          { key: "signature_reported", label: "서명(보고)" },
+          { key: "signer", label: "서명자(보고)" },
+        ],
+      },
+      {
+        table: "TaskEventFields",
+        heading: "이벤트 필드",
+        summary: (r) => `${r.field_name} = ${r.field_value ?? ""}`,
       },
     ],
   },

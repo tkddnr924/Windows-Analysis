@@ -581,6 +581,8 @@ fn write_task_children(
     ctx: &Ctx,
     parts: TaskXmlParts<'_>,
     hidden_declared: Option<bool>,
+    // UserId principal SID: its own environment resolves user variables.
+    user_sid: Option<&str>,
     index: &mut DefinitionIndex,
 ) -> Vec<ReviewSignal> {
     let mut signals: Vec<ReviewSignal> = Vec::new();
@@ -589,7 +591,7 @@ fn write_task_children(
     for (ordinal, action) in json_array(parts.actions_json).into_iter().enumerate() {
         let command = field(&action, "command");
         let arguments = field(&action, "arguments");
-        let resolved = ctx.meta.resolve_path(&command, None);
+        let resolved = ctx.meta.resolve_path(&command, user_sid);
         let resolved_text = match &resolved {
             Cell::Text(text) => Some(text.clone()),
             _ => None,
@@ -1093,6 +1095,7 @@ fn write_definitions(
                 principals_json: g(&row, "principals_json"),
             },
             hidden_declared,
+            (run_as_kind == "user" && super::is_sid(run_as)).then_some(run_as),
             index,
         );
         write_signals(&mut rec, &signals);
@@ -1578,6 +1581,7 @@ fn write_audit_events(
                             principals_json: &parsed.principals_json,
                         },
                         hidden_declared,
+                        (parsed.run_as_element == "UserId" && super::is_sid(&parsed.run_as)).then_some(parsed.run_as.as_str()),
                         index,
                     );
                     rec.set("action_summary", value(&parsed.actions_display));
@@ -3256,5 +3260,43 @@ mod tests {
             )
             .unwrap();
         assert_eq!(operational, "unknown");
+    }
+
+    #[test]
+    fn command_paths_resolve_with_the_task_user_environment() {
+        const USER_TASK: &str = r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <Principals><Principal id="Author"><UserId>S-1-5-21-9-1009</UserId></Principal></Principals>
+  <Actions><Exec><Command>%localappdata%\Microsoft\OneDrive\Updater.exe</Command></Exec></Actions>
+</Task>"#;
+        const GROUP_TASK: &str = r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <Principals><Principal id="Users"><GroupId>S-1-5-32-545</GroupId></Principal></Principals>
+  <Actions><Exec><Command>%localappdata%\x.exe</Command></Exec><Exec><Command>%windir%\y.exe</Command></Exec></Actions>
+</Task>"#;
+        let case = case("userenv", &[("UserTask", USER_TASK), ("GroupTask", GROUP_TASK)]);
+        let meta = Connection::open(case.root.join("_OVERVIEW/Metadata.sqlite")).unwrap();
+        meta.execute_batch(
+            "INSERT INTO metadata(metadata_id,host_id,dataset_id,kind,scope,key,value,resolution_status) VALUES
+             ('m1','host','new','env','s-1-5-21-9-1009','localappdata','C:\\Users\\jait\\AppData\\Local','resolved'),
+             ('m2','host','new','env','machine','windir','C:\\Windows','resolved');",
+        )
+        .unwrap();
+        drop(meta);
+        let ctx = ctx_of(&case);
+        build(&ctx, &empty_events()).unwrap();
+        let db = open(&case);
+        let resolved = |task: &str| -> Vec<Option<String>> {
+            db.prepare("SELECT a.command_resolved FROM TaskActions a JOIN ScheduledTasks t USING(record_id) WHERE t.task_name=?1 ORDER BY a.ordinal")
+                .unwrap()
+                .query_map([task], |row| row.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        // The user principal's own environment resolves %localappdata%.
+        assert_eq!(resolved("UserTask"), vec![Some("C:\\Users\\jait\\AppData\\Local\\Microsoft\\OneDrive\\Updater.exe".to_string())]);
+        // A group principal has no user environment: user variables stay unresolved, machine ones resolve.
+        assert_eq!(resolved("GroupTask"), vec![None, Some("C:\\Windows\\y.exe".to_string())]);
     }
 }

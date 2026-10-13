@@ -821,8 +821,9 @@ export interface ElectronApi {
   readRecordSources(fullPath: string, tableName: string, rowid: number): Promise<RecordSource[]>;
   /** 한 결과 행의 상세 전용 자식 표(ExecutionTimes·TaskActions 등) 행들.
    * 목록·검색에는 올리지 않고 행 상세에서만 조회한다. `via`: 자식 표를 링크로
-   * 써서 `via.table`의 record_id = 링크 행 `via.key` 행을 돌려준다(링크 컬럼은 `link.` 접두). */
-  readRecordChildren(fullPath: string, tableName: string, rowid: number, childTable: string, via?: { table: string; key: string }): Promise<DBRow[]>;
+   * 써서 `via.table`의 record_id = 링크 행 `via.key` 행을 돌려준다(링크 컬럼은 `link.` 접두).
+   * `key`: 부모 record_id를 담은 자식 컬럼(기본 record_id). */
+  readRecordChildren(fullPath: string, tableName: string, rowid: number, childTable: string, options?: { key?: string; via?: { table: string; key: string } }): Promise<DBRow[]>;
   readResultFile(fullPath: string, tableName?: string): Promise<CsvData>;
   readResultFilePage(fullPath: string, tableName: string | undefined, offset: number, limit: number): Promise<CsvData>;
   timelineSourcePage(fullPath: string, tableName: string | undefined, offset: number, limit: number): Promise<TimelineSourcePage>;
