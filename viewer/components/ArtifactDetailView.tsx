@@ -964,7 +964,7 @@ export default function ArtifactDetailView({ spec, row, evidenceTime, onNavigate
       {hostDir && row.overview_name === "BrowserActivity" && row.record_id && (
         <BrowserRecordExtras recordId={row.record_id} eventType={row.event_type} hostDir={hostDir} />
       )}
-      {hostDir && row.overview_name === "RemoteDesktopHistory" && (
+      {hostDir && (row.overview_name === "RemoteDesktopHistory" || row.overview_name === "SmbHistory") && (
         <LocalNetworkReference hostDir={hostDir} datasetId={row.dataset_id} />
       )}
     </div>

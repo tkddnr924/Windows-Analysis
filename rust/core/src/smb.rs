@@ -645,7 +645,7 @@ fn security_spec(eid: &str) -> Option<Spec> {
         "4624" => spec(
             SmbRole::Direct,
             "network_logon_success",
-            "네트워크 로그온 성공(LogonType 3·프로토콜 미확인)",
+            "네트워크 로그온 성공(LogonType 3)",
             "inbound",
             "network_logon_target_host",
             "client",
@@ -658,7 +658,7 @@ fn security_spec(eid: &str) -> Option<Spec> {
         "4625" => spec(
             SmbRole::Direct,
             "network_logon_failure",
-            "네트워크 로그온 실패(LogonType 3·프로토콜 미확인)",
+            "네트워크 로그온 실패(LogonType 3)",
             "inbound",
             "network_logon_target_host",
             "client",
@@ -672,7 +672,7 @@ fn security_spec(eid: &str) -> Option<Spec> {
         "4634" => spec(
             SmbRole::Context,
             "logon_instance_end",
-            "로그온 인스턴스 종료(공유 세션 종료 아님)",
+            "로그온 인스턴스 종료",
             "unknown",
             "context_event",
             "unknown",
@@ -686,7 +686,7 @@ fn security_spec(eid: &str) -> Option<Spec> {
         "4672" => spec(
             SmbRole::Context,
             "special_privileges_assigned",
-            "특수 권한 할당(관리 공유 접근 증거 아님)",
+            "특수 권한 할당",
             "unknown",
             "context_event",
             "unknown",
@@ -700,7 +700,7 @@ fn security_spec(eid: &str) -> Option<Spec> {
         "4776" => spec(
             SmbRole::Context,
             "ntlm_credential_validation",
-            "NTLM 자격 증명 검증 기록(연결 대상 미확정)",
+            "NTLM 자격 증명 검증",
             "unknown",
             "context_event",
             "unknown",
@@ -714,7 +714,7 @@ fn security_spec(eid: &str) -> Option<Spec> {
         "5140" => spec(
             SmbRole::Direct,
             "share_access",
-            "네트워크 공유 접근(세션 최초 접근 기록)",
+            "네트워크 공유 접근",
             "inbound",
             "share_server_audit",
             "client",
@@ -729,7 +729,7 @@ fn security_spec(eid: &str) -> Option<Spec> {
         "5145" => spec(
             SmbRole::Direct,
             "share_access_check",
-            "네트워크 공유 요청 권한 검사(작업 완료 아님)",
+            "네트워크 공유 요청 권한 검사",
             "inbound",
             "share_server_audit",
             "client",
@@ -757,7 +757,7 @@ fn security_spec(eid: &str) -> Option<Spec> {
         "4608" => spec(
             SmbRole::Context,
             "system_start",
-            "시스템 시작(로그온 ID 재사용 경계)",
+            "시스템 시작",
             "unknown",
             "context_event",
             "unknown",
@@ -770,7 +770,7 @@ fn security_spec(eid: &str) -> Option<Spec> {
         "4719" => spec(
             SmbRole::Context,
             "audit_policy_change",
-            "시스템 감사 정책 변경(감사 설정 관측)",
+            "시스템 감사 정책 변경",
             "unknown",
             "context_event",
             "unknown",
@@ -795,7 +795,7 @@ fn smb_provider_spec(server: bool, eid: &str) -> Spec {
     let mut spec = Spec {
         role: SmbRole::Direct,
         event_kind: "smb_channel_event_unclassified",
-        description: "SMB 로그 이벤트(공개된 의미 미확인)",
+        description: "SMB 로그 이벤트",
         direction,
         direction_basis,
         peer_role,
@@ -821,14 +821,14 @@ fn smb_provider_spec(server: bool, eid: &str) -> Spec {
         // "Rejected an insecure guest logon... The server denied the connection."
         (false, "31017") => {
             spec.event_kind = "rejected_insecure_guest_logon";
-            spec.description = "안전하지 않은 Guest 로그온 거부(서버가 연결 거부)";
+            spec.description = "안전하지 않은 Guest 로그온 거부";
             spec.result = ResultRule::Fixed("실패");
         }
         // Configuration change, not a connection.
         (false, "31018") => {
             spec.role = SmbRole::Context;
             spec.event_kind = "insecure_guest_auth_enabled";
-            spec.description = "AllowInsecureGuestAuth 사용 설정됨(환경 설정 기록)";
+            spec.description = "AllowInsecureGuestAuth 사용 설정됨";
             spec.direction = "unknown";
             spec.direction_basis = "context_event";
             spec.peer_role = "unknown";
@@ -838,7 +838,7 @@ fn smb_provider_spec(server: bool, eid: &str) -> Spec {
         // record does not state what the session then did.
         (false, "31022") => {
             spec.event_kind = "allowed_insecure_guest_logon";
-            spec.description = "안전하지 않은 Guest 로그온 허용(클라이언트 허용)";
+            spec.description = "안전하지 않은 Guest 로그온 허용";
             spec.result = ResultRule::Fixed("정보");
         }
         _ => {}
@@ -850,7 +850,7 @@ fn log_cleared_spec() -> Spec {
     Spec {
         role: SmbRole::Context,
         event_kind: "log_cleared",
-        description: "감사 로그 삭제(관측 경계)",
+        description: "감사 로그 삭제",
         direction: "unknown",
         direction_basis: "context_event",
         peer_role: "unknown",

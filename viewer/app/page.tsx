@@ -1226,7 +1226,10 @@ export default function Home() {
               ) : getArtifactView(activeTab.file.name)?.customView === "smb" ? (
                 <SmbHistoryView
                   fileName={activeTab.file.name}
+                  dbPath={activeTab.file.fullPath}
                   data={activeTab.data}
+                  hostDir={selectedHost?.dir ?? ""}
+                  ipHosts={caseNetwork?.caseId === selectedCase?.id ? caseNetwork.ipHosts : {}}
                   onNavigate={handleNavigate}
                   onFetchLinkedRows={fetchLinkedRows}
                   bookmarkedRowids={activeBookmarkedRowids}

@@ -7,6 +7,9 @@ import { ACCOUNT_ROLE_LABELS } from "./executionHistory";
 import { lookupEventCatalog, parseEventData, extractEventField, extractPsClassicField, tagsForSecurityEvent, EVENT_QUICK_FIELDS, LOGON_TYPE_LABELS } from "./eventCatalog";
 import { downloadStateLabel, transitionLabel } from "./browserView";
 import { STAGE_LABELS } from "./remoteAccess";
+import { RELATION_LABELS as SMB_RELATION_LABELS } from "./smbHistory";
+
+const SMB_DIRECTION_VALUE_LABELS: Record<string, string> = { inbound: "인바운드", outbound: "아웃바운드", unknown: "방향 미확인" };
 
 export type FieldKind = "text" | "path" | "code" | "hash" | "bytes" | "json" | "badge" | "privileges" | "accountSid" | "account" | "byteSize" | "durationMs" | "mftData";
 
@@ -84,6 +87,8 @@ export interface ChildTableSpec {
   fields?: FieldSpec[];
   /** 자식 행 한 건을 한 줄로 요약한다. 없으면 필드 목록으로 표시한다. */
   summary?: (row: Record<string, string>) => string;
+  /** 링크 표 경유: 자식 행의 `key` 값 = `table`.record_id 행을 보여 준다(링크 컬럼은 `link.` 접두). */
+  via?: { table: string; key: string };
 }
 
 export interface ArtifactViewSpec {
@@ -1446,21 +1451,18 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     ],
   },
 
-  // SMB / network-logon activity, both directions: inbound (SMBServer/Security
-  // 551·1009 and, when Security auditing is on, 4624/4625 LogonType 3) and
-  // outbound (SmbClient/Security 31010 etc. — this host reaching out to remote
-  // shares, the lateral-movement direction). Same session-flow view as RDP —
-  // repeated failures from one IP collapse into a burst, which reads as a
-  // brute-force / lateral-movement attempt.
+  // docs-09: SMB-attributed events and protocol-unknown network logons, grouped
+  // by stored remote address in SmbHistoryView. Stored values only.
   SmbHistory: {
     customView: "smb",
-    title: (r) => r.remote_address || "(주소 없음)",
+    title: (r) => r.remote_address || r.account || r.description || "",
     subtitle: (r) => r.description || "",
     badges: [
       { key: "direction", kind: "badge", badgeColors: DIRECTION_COLORS },
       { key: "result", label: "결과", kind: "badge", badgeColors: RDP_RESULT_COLORS },
     ],
-    visibleColumns: ["timestamp", "remote_address", "account", "result", "description"],
+    // (kept for when the raw table is viewed directly)
+    visibleColumns: ["timestamp", "direction", "remote_address", "account", "share_name", "result", "description"],
     filterTabs: {
       column: "result",
       tabs: [
@@ -1469,23 +1471,135 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
         { label: "성공", value: "성공" },
       ],
     },
-    priorityColumns: ["timestamp", "remote_address", "account", "result", "description"],
-    sections: [{ heading: "상세", fields: [
-      { key: "remote_address", label: "클라이언트 주소" },
-      { key: "remote_port", label: "클라이언트 포트" },
-      { key: "account", label: "계정", kind: "account" },
-      { key: "account_sid", label: "계정 SID", kind: "accountSid" },
-      { key: "share_name", label: "공유 이름" },
-      { key: "share_path", label: "공유 경로", kind: "path" },
-      { key: "target_file", label: "대상 파일", kind: "path" },
-      { key: "access_rights", label: "요청 권한" },
-      { key: "access_mask", label: "요청 권한 원문" },
-      { key: "event_type", label: "기록 종류" },
-      { key: "description", label: "설명" },
-      { key: "result", label: "결과" },
-      { key: "event_id", label: "이벤트 ID" },
-      { key: "provider", label: "공급자" },
-    ]}],
+    priorityColumns: ["timestamp", "direction", "remote_address", "account", "share_name", "result", "description"],
+    sections: [
+      { heading: "접속", fields: [
+        { key: "timestamp_kind", label: "대표 시각 의미" },
+        { key: "direction", label: "방향", valueLabels: SMB_DIRECTION_VALUE_LABELS },
+        { key: "peer_role", label: "상대 역할", valueLabels: { client: "클라이언트", server: "서버", unknown: "미확인" } },
+        { key: "protocol", label: "프로토콜", valueLabels: { smb: "SMB", unknown: "미확인" } },
+        { key: "result", label: "결과" },
+        { key: "audit_outcome", label: "감사 결과" },
+        { key: "access_semantics", label: "접근 의미", valueLabels: { share_access_first_use: "세션 최초 공유 접근", requested_access_check: "요청 권한 검사" } },
+        { key: "description", label: "설명" },
+        { key: "remote_address", label: "상대 주소" },
+        { key: "remote_address_raw", label: "상대 주소 원문", compute: (r) => (r.remote_address_raw && r.remote_address_raw !== r.remote_address ? r.remote_address_raw : "") },
+        { key: "remote_port", label: "상대 포트" },
+        { key: "remote_port_raw", label: "상대 포트 원문", compute: (r) => (r.remote_port_raw && r.remote_port_raw !== r.remote_port ? r.remote_port_raw : "") },
+        { key: "workstation_name", label: "워크스테이션 원문" },
+        { key: "peer_name_raw", label: "상대 이름 원문" },
+        { key: "logon_type", label: "로그온 유형" },
+        { key: "logon_id", label: "로그온 ID" },
+      ]},
+      { heading: "공유", fields: [
+        { key: "share_name", label: "공유 이름" },
+        { key: "share_path", label: "공유 경로", kind: "path" },
+        { key: "target_file", label: "대상 파일", kind: "path" },
+        { key: "object_type", label: "개체 유형" },
+        { key: "access_mask", label: "요청 권한 마스크" },
+        { key: "access_rights", label: "요청 권한" },
+        { key: "access_rights_unmapped", label: "미해석 권한 토큰" },
+        { key: "access_list", label: "AccessList" },
+        { key: "access_reason", label: "AccessReason" },
+      ]},
+      { heading: "계정", fields: [
+        { key: "account", label: "계정", kind: "account" },
+        { key: "account_raw", label: "계정 원문", compute: (r) => (r.account_raw && r.account_raw !== r.account ? r.account_raw : "") },
+        { key: "account_domain", label: "도메인" },
+        { key: "account_upn", label: "UPN" },
+        { key: "account_sid", label: "SID", kind: "accountSid" },
+        { key: "target_user_sid", label: "대상 사용자 SID", compute: (r) => (r.target_user_sid && r.target_user_sid !== r.account_sid ? r.target_user_sid : "") },
+        { key: "target_logon_id", label: "대상 LogonId" },
+        { key: "subject_user_sid", label: "Subject SID" },
+        { key: "subject_user_name", label: "Subject 이름" },
+        { key: "subject_domain", label: "Subject 도메인" },
+        { key: "subject_logon_id", label: "Subject LogonId" },
+      ]},
+      { heading: "상태 · 인증", fields: [
+        { key: "status_raw", label: "Status" },
+        { key: "status_meaning", label: "Status 해석" },
+        { key: "sub_status_raw", label: "SubStatus" },
+        { key: "sub_status_meaning", label: "SubStatus 해석" },
+        { key: "failure_reason_raw", label: "FailureReason" },
+        { key: "reason_raw", label: "사유" },
+        { key: "authentication_package", label: "인증 패키지" },
+        { key: "logon_process", label: "로그온 프로세스" },
+        { key: "lm_package_name", label: "LM 패키지" },
+        { key: "key_length", label: "키 길이" },
+        { key: "transmitted_services", label: "전달 서비스" },
+      ]},
+      { heading: "SMB 원문", fields: [
+        { key: "server_name_raw", label: "서버 이름" },
+        { key: "object_name_raw", label: "개체 이름" },
+        { key: "session_id", label: "세션 ID" },
+        { key: "spn_name", label: "SPN" },
+        { key: "server_names_raw", label: "서버 이름 목록" },
+        { key: "configured_names_raw", label: "구성된 이름" },
+        { key: "ip_addresses_raw", label: "IP 주소 목록" },
+        { key: "privilege_list", label: "권한 목록" },
+      ]},
+      { heading: "원본 이벤트", fields: [
+        { key: "event_id", label: "이벤트 ID" },
+        { key: "provider", label: "공급자" },
+        { key: "channel", label: "채널" },
+        { key: "computer", label: "컴퓨터" },
+        { key: "event_record_id", label: "EventRecordID" },
+        { key: "level_name", label: "수준" },
+        { key: "keywords_raw", label: "Keywords" },
+        { key: "process_id", label: "ProcessID" },
+        { key: "thread_id", label: "ThreadID" },
+        { key: "activity_id", label: "ActivityID" },
+        { key: "related_activity_id", label: "RelatedActivityID" },
+        { key: "system_user_sid", label: "서비스 주체 SID" },
+        { key: "facts_status", label: "facts 상태" },
+        { key: "facts_error", label: "facts 오류" },
+        { key: "event_data_raw", label: "EventData", kind: "code" },
+      ]},
+    ],
+    childTables: [{
+      table: "SmbRelations",
+      via: { table: "SmbContext", key: "context_id" },
+      heading: "관련 기록",
+      summary: (r) => [SMB_RELATION_LABELS[r["link.relation_kind"]] ?? r["link.relation_kind"], r.timestamp, r.event_id, r.description, r["link.logon_id"]].filter(Boolean).join(" · "),
+    }],
+  },
+
+  // docs-09 A02/A03: context records (logon end, special privileges, NTLM
+  // validation, boundaries) — opened from the SMB view, never counted as access.
+  SmbContext: {
+    title: (r) => r.description || r.event_type || "",
+    subtitle: (r) => r.account || "",
+    visibleColumns: ["timestamp", "event_id", "description", "account", "result"],
+    priorityColumns: ["timestamp", "event_id", "description", "account", "result"],
+    sections: [
+      { heading: "기록", fields: [
+        { key: "timestamp_kind", label: "대표 시각 의미" },
+        { key: "description", label: "설명" },
+        { key: "result", label: "결과" },
+        { key: "boundary_kind", label: "경계" },
+        { key: "account", label: "계정", kind: "account" },
+        { key: "account_domain", label: "도메인" },
+        { key: "account_upn", label: "UPN" },
+        { key: "account_sid", label: "SID", kind: "accountSid" },
+        { key: "logon_id", label: "로그온 ID" },
+        { key: "logon_type", label: "로그온 유형" },
+        { key: "workstation_name", label: "워크스테이션 원문" },
+        { key: "remote_address", label: "상대 주소" },
+        { key: "authentication_package", label: "인증 패키지" },
+        { key: "status_raw", label: "Status" },
+        { key: "status_meaning", label: "Status 해석" },
+        { key: "privilege_list", label: "권한 목록" },
+      ]},
+      { heading: "원본 이벤트", fields: [
+        { key: "event_id", label: "이벤트 ID" },
+        { key: "provider", label: "공급자" },
+        { key: "channel", label: "채널" },
+        { key: "computer", label: "컴퓨터" },
+        { key: "event_record_id", label: "EventRecordID" },
+        { key: "keywords_raw", label: "Keywords" },
+        { key: "event_data_raw", label: "EventData", kind: "code" },
+      ]},
+    ],
   },
 
 

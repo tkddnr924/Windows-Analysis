@@ -5883,15 +5883,20 @@ fn read_record_sources_blocking(
 /// Values kept as child rows instead of being forced into the common columns
 /// are read only in detail. `child_table` is validated against the file's own
 /// tables and the primary table is rejected, so listing cannot be bypassed.
+/// With `via_table`/`via_key`, `child_table` is a link table: each link row's
+/// `via_key` value selects the `via_table` row with that record_id. Link
+/// columns come back as `link.<column>`, target columns as stored.
 #[tauri::command]
 async fn read_record_children(
     full_path: String,
     table_name: String,
     rowid: i64,
     child_table: String,
+    via_table: Option<String>,
+    via_key: Option<String>,
 ) -> Result<Vec<Map<String, Value>>, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        read_record_children_blocking(full_path, table_name, rowid, child_table)
+        read_record_children_blocking(full_path, table_name, rowid, child_table, via_table.zip(via_key))
     })
     .await
     .map_err(|error| format!("자식 레코드 조회가 중단되었습니다: {error}"))?
@@ -5902,6 +5907,7 @@ fn read_record_children_blocking(
     table_name: String,
     rowid: i64,
     child_table: String,
+    via: Option<(String, String)>,
 ) -> Result<Vec<Map<String, Value>>, String> {
     let conn = open_ro(&full_path)?;
     let tables = table_names(&conn);
@@ -5921,16 +5927,81 @@ fn read_record_children_blocking(
     let Some(projection) = payload_projection(&columns) else {
         return Ok(Vec::new());
     };
-    let order = if columns.iter().any(|column| column == "ordinal") {
-        " ORDER BY ordinal"
-    } else {
-        ""
+    let has_ordinal = columns.iter().any(|column| column == "ordinal");
+    let Some((via_table, via_key)) = via else {
+        let order = if has_ordinal { " ORDER BY ordinal" } else { "" };
+        let sql = format!(
+            "SELECT rowid AS __rowid, {projection} FROM {} WHERE record_id = ?1{order}",
+            q(&child_table)
+        );
+        return query_rows(&conn, &sql, &[&record_id]);
     };
+    // Target must be another table of this file keyed by record_id.
+    if via_table == table_name
+        || via_table == child_table
+        || !tables.iter().any(|name| name == &via_table)
+        || !columns.iter().any(|column| column == &via_key)
+    {
+        return Ok(Vec::new());
+    }
+    let target_columns = payload_columns(&conn, &via_table);
+    if !target_columns.iter().any(|column| column == "record_id") {
+        return Ok(Vec::new());
+    }
+    let link_projection = columns
+        .iter()
+        .map(|column| format!("l.{} AS {}", q(column), q(&format!("link.{column}"))))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let target_projection = target_columns
+        .iter()
+        .map(|column| format!("t.{}", q(column)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let order = if has_ordinal { " ORDER BY l.ordinal" } else { "" };
     let sql = format!(
-        "SELECT rowid AS __rowid, {projection} FROM {} WHERE record_id = ?1{order}",
-        q(&child_table)
+        "SELECT t.rowid AS __rowid, {link_projection}, {target_projection} FROM {} l JOIN {} t ON t.record_id = l.{} WHERE l.record_id = ?1{order}",
+        q(&child_table),
+        q(&via_table),
+        q(&via_key)
     );
     query_rows(&conn, &sql, &[&record_id])
+}
+
+#[cfg(test)]
+mod record_children_tests {
+    use super::*;
+
+    #[test]
+    fn via_join_returns_linked_target_rows_in_link_order() {
+        let path = std::env::temp_dir().join(format!("wa-children-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE Main(record_id TEXT, v TEXT);
+             CREATE TABLE Links(record_id TEXT, ordinal INTEGER, context_id TEXT, relation_kind TEXT);
+             CREATE TABLE Ctx(record_id TEXT, event_id TEXT);
+             INSERT INTO Main VALUES('r1','a'),('r2','b');
+             INSERT INTO Links VALUES('r1',1,'c2','end'),('r1',0,'c1','priv'),('r2',0,'c3','end');
+             INSERT INTO Ctx VALUES('c1','4672'),('c2','4634'),('c3','4634'),('c4','4776');",
+        )
+        .unwrap();
+        drop(conn);
+        let full = path.to_string_lossy().to_string();
+        let via = Some(("Ctx".to_string(), "context_id".to_string()));
+        let rows = read_record_children_blocking(full.clone(), "Main".into(), 1, "Links".into(), via).unwrap();
+        let pairs: Vec<(String, String)> = rows
+            .iter()
+            .map(|row| (row["link.relation_kind"].as_str().unwrap().to_string(), row["event_id"].as_str().unwrap().to_string()))
+            .collect();
+        assert_eq!(pairs, vec![("priv".into(), "4672".into()), ("end".into(), "4634".into())]);
+        // Target cannot be the primary table; the link column must exist.
+        assert!(read_record_children_blocking(full.clone(), "Main".into(), 1, "Links".into(), Some(("Main".into(), "context_id".into()))).unwrap().is_empty());
+        assert!(read_record_children_blocking(full.clone(), "Main".into(), 1, "Links".into(), Some(("Ctx".into(), "nope".into()))).unwrap().is_empty());
+        // Plain children are unchanged.
+        assert_eq!(read_record_children_blocking(full, "Main".into(), 2, "Links".into(), None).unwrap().len(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
 }
 
 #[derive(Deserialize, Clone)]

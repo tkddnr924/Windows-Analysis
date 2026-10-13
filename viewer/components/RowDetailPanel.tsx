@@ -210,7 +210,7 @@ export default function RowDetailPanel({ row, columns, focusedColumn, evidenceTi
     if (!canReadChildren || !childTables?.length) return;
     let alive = true;
     Promise.all(childTables.map(async (child) => {
-      const childRows = await window.api.readRecordChildren(scopePath, scopeTable, rowid, child.table).catch(() => [] as DBRow[]);
+      const childRows = await window.api.readRecordChildren(scopePath, scopeTable, rowid, child.table, child.via).catch(() => [] as DBRow[]);
       return [child.table, childRows] as const;
     })).then((entries) => {
       if (alive) setChildren(Object.fromEntries(entries));
