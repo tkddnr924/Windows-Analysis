@@ -10,6 +10,7 @@ import { STAGE_LABELS } from "./remoteAccess";
 import { RELATION_LABELS as SMB_RELATION_LABELS } from "./smbHistory";
 import { RDP_STATUS_LABELS } from "./rdpCache";
 import { REVIEW_SIGNAL_LABELS } from "./scheduledTasks";
+import { CHANGE_LABELS as DEFENDER_CHANGE_LABELS, RESULT_LABELS as DEFENDER_RESULT_LABELS } from "./defenderActivity";
 
 const SMB_DIRECTION_VALUE_LABELS: Record<string, string> = { inbound: "인바운드", outbound: "아웃바운드", unknown: "방향 미확인" };
 
@@ -1392,33 +1393,104 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     ]}],
   },
 
+  // docs-13: stored Defender columns (178); child tables in detail only.
   Defender: {
     customView: "defender",
-    title: (r) => r.title || "(no name)",
-    subtitle: (r) => r.detail || "",
-    badges: [{ key: "section", kind: "badge" }],
-    priorityColumns: ["section", "timestamp", "title", "detail", "severity", "action", "account"],
-    sections: [{ heading: "상세", fields: [
-      { key: "severity", label: "심각도" },
-      { key: "category", label: "분류" },
-      { key: "threat_name", label: "위협 이름" },
-      { key: "target_path", label: "대상 경로", kind: "path" },
-      { key: "detection_type", label: "탐지 유형" },
-      { key: "action", label: "조치" },
-      { key: "action_time", label: "조치 시각" },
-      { key: "remediation", label: "복구 결과" },
-      // Defender가 요구한 후속 조치(재부팅 필요 등).
-      { key: "additional_actions", label: "추가 조치" },
-      { key: "process", label: "프로세스" },
-      { key: "account", label: "사용자", kind: "account" },
-      { key: "detection_user", label: "탐지 당시 사용자 원문", kind: "account" },
-      { key: "origin", label: "유입 경로" },
-      { key: "source", label: "탐지원" },
-      { key: "detail", label: "경로/내용" },
-      { key: "result", label: "결과" },
-      { key: "event_id", label: "이벤트 ID" },
-      { key: "raw_line", label: "원본 라인", kind: "code" },
-    ]}],
+    title: (r) => r.threat_name || r.title || r.event_type || "",
+    subtitle: (r) => r.target_path || r.config_target || r.description || "",
+    badges: [{ key: "section_label", kind: "badge" }],
+    visibleColumns: ["timestamp", "section_label", "title", "threat_name", "target_path", "severity", "action", "result", "account"],
+    priorityColumns: ["timestamp", "section_label", "title", "threat_name", "target_path", "severity", "action", "result", "account"],
+    sections: [
+      { heading: "탐지 · 조치", fields: [
+        { key: "threat_name", label: "위협 이름" },
+        { key: "threat_id", label: "위협 ID" },
+        { key: "severity", label: "심각도" },
+        { key: "category", label: "분류" },
+        { key: "detection_type", label: "탐지 유형" },
+        { key: "detection_source", label: "탐지원" },
+        { key: "detection_origin", label: "탐지 기원" },
+        { key: "target_path", label: "대상 경로", kind: "path" },
+        { key: "resources_raw", label: "대상 원문", kind: "code", compute: (r) => (Number(r.resource_count) > 1 ? r.resources_raw : "") },
+        { key: "process", label: "프로세스", kind: "path" },
+        { key: "detection_user", label: "탐지 계정", kind: "account" },
+        { key: "detection_id", label: "Detection ID" },
+        { key: "detection_time", label: "탐지 시각" },
+        { key: "action", label: "조치" },
+        { key: "action_time", label: "조치 시각" },
+        { key: "action_status", label: "조치 상태" },
+        { key: "remediation_user", label: "조치 수행자", kind: "account" },
+        { key: "additional_actions", label: "추가 조치" },
+        { key: "result", label: "결과", compute: (r) => (r.result && r.result !== "unknown" ? DEFENDER_RESULT_LABELS[r.result] ?? r.result : "") },
+        { key: "error_code", label: "오류 코드", compute: (r) => (r.error_code && !/^0x0+$/i.test(r.error_code) ? r.error_code : "") },
+        { key: "error_description", label: "오류 설명", compute: (r) => (r.error_code && !/^0x0+$/i.test(r.error_code) ? r.error_description : "") },
+      ]},
+      { heading: "보호 기능", fields: [
+        { key: "protection_feature", label: "보호 기능" },
+        { key: "protection_mode", label: "동작 모드" },
+        { key: "asr_rule_name", label: "ASR 규칙" },
+        { key: "asr_rule_id", label: "ASR 규칙 GUID" },
+        { key: "network_destination_raw", label: "네트워크 대상", kind: "code" },
+        { key: "policy_rule_id", label: "정책 규칙" },
+        { key: "policy_action_type", label: "정책 동작" },
+      ]},
+      { heading: "검사", fields: [
+        { key: "scan_parameters", label: "검사 종류" },
+        { key: "scan_type", label: "검사 대상" },
+        { key: "scan_trigger", label: "검사 계기" },
+        { key: "scan_resources", label: "검사 리소스", kind: "code" },
+        { key: "scan_duration_raw", label: "소요 시간" },
+        { key: "scan_id", label: "Scan ID" },
+      ]},
+      { heading: "정의 · 엔진", fields: [
+        { key: "signature_type", label: "정의 종류" },
+        { key: "update_type", label: "업데이트 종류" },
+        { key: "signature_version_previous", label: "이전 정의 버전" },
+        { key: "signature_version_current", label: "정의 버전" },
+        { key: "engine_version_previous", label: "이전 엔진 버전" },
+        { key: "engine_version_current", label: "엔진 버전" },
+        { key: "update_source", label: "업데이트 원본" },
+        { key: "update_source_path", label: "업데이트 경로", kind: "path" },
+      ]},
+      { heading: "보호 설정", fields: [
+        { key: "config_target", label: "설정 대상", kind: "code" },
+        { key: "config_change_kind", label: "변경 종류", compute: (r) => DEFENDER_CHANGE_LABELS[r.config_change_kind] ?? r.config_change_kind ?? "" },
+        { key: "config_old_raw", label: "이전 값", kind: "code" },
+        { key: "config_new_raw", label: "새 값", kind: "code" },
+        { key: "config_exclusion_kind", label: "검사 제외 종류" },
+        { key: "config_exclusion_value", label: "검사 제외 값", kind: "path" },
+        { key: "config_protection_setting", label: "보호 설정" },
+        { key: "history_cleared_time", label: "삭제 기준 시각" },
+      ]},
+      { heading: "상태 보고", fields: [
+        { key: "platform_version", label: "플랫폼 버전" },
+        { key: "rtp_state_raw", label: "실시간 보호" },
+        { key: "oa_state_raw", label: "액세스 시 검사" },
+        { key: "ioav_state_raw", label: "다운로드 검사" },
+        { key: "bm_state_raw", label: "동작 모니터링" },
+        { key: "av_signature_version", label: "바이러스 정의 버전" },
+        { key: "product_status", label: "제품 상태" },
+      ]},
+      { heading: "오류", fields: [
+        { key: "failure_type", label: "오류 종류" },
+        { key: "failure_reason", label: "오류 사유" },
+        { key: "recommendation", label: "권장 조치" },
+        { key: "exception_code", label: "예외 코드" },
+      ]},
+      { heading: "기록 주체", fields: [
+        { key: "account", label: "계정", kind: "account" },
+        { key: "account_sid", label: "SID", kind: "accountSid" },
+        { key: "event_user_raw", label: "이벤트 사용자 원문" },
+        { key: "system_user_sid", label: "보안 컨텍스트 SID", kind: "accountSid" },
+      ]},
+      { heading: "원문", collapsible: { defaultExpanded: false }, fields: [
+        { key: "event_data_raw", label: "EventData", kind: "code" },
+        { key: "raw_line", label: "원본 라인", kind: "code" },
+      ]},
+    ],
+    childTables: [
+      { table: "DefenderResources", heading: "대상 리소스", summary: (r) => `${r.resource_kind ? `${r.resource_kind}: ` : ""}${r.resource_value || r.resource_raw}` },
+    ],
   },
 
   // Raw facts table: generic table only (docs-10 user decision: tiles/mosaic
