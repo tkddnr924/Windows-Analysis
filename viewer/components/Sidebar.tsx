@@ -1,4 +1,6 @@
 "use client";
+import { OVERVIEW_TABLE_NAMES } from "@/lib/overviewLabels";
+import OverviewTableIcon from "@/components/OverviewTableIcon";
 import FilterAltOutlinedIcon from "@mui/icons-material/FilterAltOutlined";
 import CheckIcon from "@mui/icons-material/Check";
 
@@ -10,23 +12,9 @@ import AccountTreeIcon from "@mui/icons-material/AccountTree";
 import BookmarkBorderIcon from "@mui/icons-material/BookmarkBorder";
 import TimelineIcon from "@mui/icons-material/Timeline";
 import InfoOutlinedIcon from "@mui/icons-material/InfoOutlined";
-import FolderOpenOutlinedIcon from "@mui/icons-material/FolderOpenOutlined";
-import DesktopWindowsOutlinedIcon from "@mui/icons-material/DesktopWindowsOutlined";
 import HomeOutlinedIcon from "@mui/icons-material/HomeOutlined";
-import BoltOutlinedIcon from "@mui/icons-material/BoltOutlined";
-import AccountTreeOutlinedIcon from "@mui/icons-material/AccountTreeOutlined";
-import TerminalOutlinedIcon from "@mui/icons-material/TerminalOutlined";
-import DnsOutlinedIcon from "@mui/icons-material/DnsOutlined";
-import CloudDownloadOutlinedIcon from "@mui/icons-material/CloudDownloadOutlined";
-import SecurityOutlinedIcon from "@mui/icons-material/SecurityOutlined";
-import TaskOutlinedIcon from "@mui/icons-material/TaskOutlined";
-import MiscellaneousServicesOutlinedIcon from "@mui/icons-material/MiscellaneousServicesOutlined";
-import LanguageOutlinedIcon from "@mui/icons-material/LanguageOutlined";
-import PhotoLibraryOutlinedIcon from "@mui/icons-material/PhotoLibraryOutlined";
 import HistoryOutlinedIcon from "@mui/icons-material/HistoryOutlined";
 import ReportProblemOutlinedIcon from "@mui/icons-material/ReportProblemOutlined";
-import ShieldOutlinedIcon from "@mui/icons-material/ShieldOutlined";
-import DeleteOutlineOutlinedIcon from "@mui/icons-material/DeleteOutlineOutlined";
 import type { Case, Host, CategoryEntry, ResultFileEntry } from "@/lib/types";
 import { EMPTY_TIME_RANGE, rangeActive, type TimeRange } from "@/lib/timeRange";
 import { browsableResultFiles } from "@/lib/resultTables";
@@ -148,26 +136,6 @@ const OVERVIEW_ORDER: string[] = [
   "RdpCache",
 ];
 
-// 종합 분석(_OVERVIEW) tables receive analyst-facing Korean display labels.
-const OVERVIEW_TABLE_NAMES: Record<string, string> = {
-  TargetInfo: "호스트 정보",
-  ExecutionHistory: "실행 이력",
-  Defender: "Microsoft Defender 활동",
-  RegistryExplorer: "레지스트리",
-  RegistryFindings: "레지스트리 특이사항",
-  BrowserActivity: "브라우저 활동",
-  RemoteDesktopHistory: "원격 접근 이력 (RDP)",
-  SmbHistory: "SMB 접속 이력",
-  BitsHistory: "BITS 전송 이력",
-  FirewallHistory: "방화벽 이력",
-  PowerShellHistory: "파워셸 실행 이력",
-  RdpCache: "RDP Cache",
-  ScheduledTasks: "작업 스케줄러",
-  ServiceHistory: "서비스 이력",
-  FileSystemEntries: "파일 시스템 정보",
-  RecycleBin: "휴지통",
-  MFT_Records: "파일 시스템 원본 레코드",
-};
 
 // 호스트 분석 소그룹 — 분석 관점별 묶음 (2026-08-31 사용자 확정, RDP Cache는
 // 네트워크 그룹 맨 아래). "@USN"/"@WER"는 승격된 개별 항목이고
@@ -180,35 +148,6 @@ const ANALYSIS_GROUPS: { title: string; items: string[] }[] = [
   { title: "시스템 · 보안", items: ["RegistryExplorer", "Defender", "@WER"] },
 ];
 
-function OverviewTableIcon({ name }: { name: string }) {
-  const props = { sx: { fontSize: 18, color: "var(--text-faint)", flexShrink: 0 } };
-  switch (name) {
-    case "TargetInfo": return <InfoOutlinedIcon {...props} />;
-    // This icon identifies a file-system evidence view, rather than decorating
-    // the navigation label.
-    case "FileSystemEntries": return <FolderOpenOutlinedIcon {...props} />;
-    case "MFT_Records": return <FolderOpenOutlinedIcon {...props} />;
-    case "RecycleBin": return <DeleteOutlineOutlinedIcon {...props} />;
-    case "RemoteDesktopHistory": return <DesktopWindowsOutlinedIcon {...props} />;
-    case "ExecutionHistory": return <BoltOutlinedIcon {...props} />;
-    // Defender 뷰 헤더와 동일한 방패 아이콘.
-    case "Defender": return <ShieldOutlinedIcon {...props} />;
-    // 레지스트리 뷰 헤더와 같은 글리프.
-    case "RegistryExplorer": return <AccountTreeOutlinedIcon {...props} />;
-    case "PowerShellHistory": return <TerminalOutlinedIcon {...props} />;
-    case "SmbHistory": return <DnsOutlinedIcon {...props} />;
-    case "BitsHistory": return <CloudDownloadOutlinedIcon {...props} />;
-    case "FirewallHistory": return <SecurityOutlinedIcon {...props} />;
-    case "ScheduledTasks": return <TaskOutlinedIcon {...props} />;
-    // 서비스 이력 뷰 헤더와 같은 글리프.
-    case "ServiceHistory": return <MiscellaneousServicesOutlinedIcon {...props} />;
-    // Keep the navigation glyph identical to the RDP Cache view header; the
-    // remote session ledger itself uses the desktop glyph above.
-    case "RdpCache": return <PhotoLibraryOutlinedIcon {...props} />;
-    case "BrowserActivity": return <LanguageOutlinedIcon {...props} />;
-    default: return <LanguageOutlinedIcon {...props} />;
-  }
-}
 
 function sameEntry(a: ResultFileEntry | null, b: ResultFileEntry): boolean {
   return !!a && a.fullPath === b.fullPath && a.tableName === b.tableName;

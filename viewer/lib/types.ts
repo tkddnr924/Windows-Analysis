@@ -896,9 +896,6 @@ export interface SearchHit {
   /** Candidate evidence time selected by the query without serialising the
    * complete SQLite row. Empty when the artifact provides no time. */
   timestamp: string;
-  /** 원시 테이블(EventLog 등)이 행에 보관하는 `<테이블>::<rowid>` 포인터.
-   * 저장 계약 DB에서는 비어 있다 — 그쪽은 recordId와 source_records를 쓴다. */
-  recordKey: string;
   /** 파생 레코드 ID(record_id). 원본 근거는 readRecordSources로 조회한다. */
   recordId: string;
   sourceRefs: SourceRef[];

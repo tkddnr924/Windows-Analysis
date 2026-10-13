@@ -18,6 +18,9 @@ import type { AccountDirectory } from "@/lib/accountIdentity";
 import { formatEvidenceTimestamp, rangeActive, type TimeRange } from "@/lib/timeRange";
 import RowDetailPanel from "./RowDetailPanel";
 import { pathBelongsToHost } from "@/lib/viewShared";
+import { OVERVIEW_TABLE_NAMES } from "@/lib/overviewLabels";
+import OverviewTableIcon from "@/components/OverviewTableIcon";
+import { browsableResultFiles } from "@/lib/resultTables";
 
 interface Props {
   hosts: Host[];
@@ -33,11 +36,9 @@ interface Props {
 type DetailState = { hit: SearchHit; result?: ResultRow; error?: "fetch" | "missing" };
 const PAGE_SIZE = 10;
 
-// A few raw category folder names read awkwardly on their own (mirrors the
-// sidebar's mapping); everything else uses the folder name verbatim.
-const CATEGORY_LABELS: Record<string, string> = { POWERSHELL: "ConsoleHistory", RECYCLEBIN: "휴지통" };
+// docs-19: categories are _OVERVIEW tables (Korean label when known).
 function categoryLabel(name: string): string {
-  return CATEGORY_LABELS[name.toUpperCase()] ?? name;
+  return OVERVIEW_TABLE_NAMES[name] ?? name;
 }
 
 
@@ -83,20 +84,18 @@ export default function CaseSearchView({ hosts, currentHostId, timeRange, isBook
   // scope changes, so paging never mixes results from different scopes.
   const filterKey = `${[...selectedHostIds].sort().join(",")}|${[...hiddenCategories].sort().join(",")}`;
 
-  // The category options are the union of every host's category folders, so the
-  // list stays stable regardless of which hosts are currently selected.
+  // Options: union of every host's _OVERVIEW contract tables (raw facts under
+  // _OVERVIEW such as MFT_Records are not searched), stable across host picks.
   useEffect(() => {
     let cancelled = false;
-    void Promise.all(hosts.map((host) => window.api.listCategories(host.dir).catch(() => [])))
+    void Promise.all(hosts.map((host) => window.api.listResultFiles(`${host.dir}/_OVERVIEW`).catch(() => [])))
       .then((lists) => {
         if (cancelled) return;
         const names = new Set<string>();
-        // _OVERVIEW holds derived 종합 분석 tables (re-composed from the raw
-        // artifacts), so it is not a meaningful artifact filter on its own.
-        for (const list of lists) for (const entry of list) {
-          if (entry.name.toUpperCase() !== "_OVERVIEW") names.add(entry.name);
+        for (const list of lists) for (const file of browsableResultFiles(list)) {
+          if (file.derived !== false) names.add(file.name);
         }
-        setAvailableCategories([...names].sort((a, b) => a.localeCompare(b)));
+        setAvailableCategories([...names].sort((a, b) => categoryLabel(a).localeCompare(categoryLabel(b))));
       });
     return () => { cancelled = true; };
   }, [hosts]);
@@ -221,14 +220,14 @@ export default function CaseSearchView({ hosts, currentHostId, timeRange, isBook
         />
       </ViewHeader>
 
-      {visibleSourceFailures.length > 0 && <div role="alert" style={{ padding: "8px 14px", borderBottom: "1px solid color-mix(in srgb, var(--warning) 42%, var(--border))", background: "color-mix(in srgb, var(--warning) 7%, var(--bg-panel))", color: "var(--text-dim)", fontSize: 12 }}>일부 원본을 검색하지 못했습니다: {visibleSourceFailures.join(", ")}. 표시된 결과는 성공적으로 읽은 원본만 포함합니다.</div>}
+      {visibleSourceFailures.length > 0 && <div role="alert" style={{ padding: "8px 14px", borderBottom: "1px solid color-mix(in srgb, var(--warning) 42%, var(--border))", background: "color-mix(in srgb, var(--warning) 7%, var(--bg-panel))", color: "var(--text-dim)", fontSize: 12 }}>일부 분석 결과를 검색하지 못했습니다: {visibleSourceFailures.join(", ")}. 표시된 결과는 성공적으로 읽은 결과만 포함합니다.</div>}
       {visibleError && <div role="alert" style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 14px", borderBottom: "1px solid color-mix(in srgb, var(--danger) 42%, var(--border))", background: "color-mix(in srgb, var(--danger) 7%, var(--bg-panel))", color: "var(--text)", fontSize: 12 }}>{visibleError}<span style={{ marginLeft: "auto" }}><Button onClick={retrySearch}><RefreshOutlinedIcon sx={{ fontSize: 15 }} />다시 시도</Button></span></div>}
 
       {ran && resultMatchesCurrentRange && (visibleHits.length > 0 || !loading) && <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "7px 14px", borderBottom: "1px solid var(--border-subtle)", color: "var(--text-faint)", fontSize: 11.5 }}><span><strong style={{ color: "var(--text-dim)" }}>&quot;{ran}&quot;</strong> 검색 결과 · {hits.length === 0 ? "0건" : `${(page * PAGE_SIZE + 1).toLocaleString()}–${(page * PAGE_SIZE + hits.length).toLocaleString()}건 표시`}{nextOffset !== null ? " · 다음 페이지 있음" : ""}</span></div>}
 
       <section aria-label="검색 결과 원장" style={{ flex: 1, minHeight: 0, overflow: "auto" }}>
         {!ran && !loading && <EmptyState><SearchOutlinedIcon sx={{ fontSize: 28, color: "var(--text-faint)" }} />검색어를 입력한 뒤 검색을 실행하세요.</EmptyState>}
-        {(loading || rangeRefreshing) && visibleHits.length === 0 && <EmptyState><CircularProgress size={18} thickness={5} aria-label="케이스 전체 검색 중" />{rangeRefreshing ? "변경된 기간 필터로 검색 결과를 갱신하는 중입니다." : "모든 호스트의 원본을 검색하는 중입니다."}</EmptyState>}
+        {(loading || rangeRefreshing) && visibleHits.length === 0 && <EmptyState><CircularProgress size={18} thickness={5} aria-label="케이스 전체 검색 중" />{rangeRefreshing ? "변경된 기간 필터로 검색 결과를 갱신하는 중입니다." : "모든 호스트의 분석 결과를 검색하는 중입니다."}</EmptyState>}
         {noResults && <EmptyState><SearchOutlinedIcon sx={{ fontSize: 28, color: "var(--text-faint)" }} />일치하는 결과가 없습니다.</EmptyState>}
         {visibleHits.length > 0 && <div style={{ minWidth: 760, padding: "12px 14px 4px", opacity: loading ? 0.55 : 1, transition: "opacity .15s ease" }}>
           {visibleHits.map((hit, index) => <SearchLedgerRow key={`${hit.hostId}\u0000${hit.fullPath}\u0000${hit.tableName}\u0000${hit.rowid}\u0000${index}`} hit={hit} bookmarked={isBookmarked(hit)} currentHostId={currentHostId} onOpen={() => void openDetail(hit)} onOpenSource={() => onOpenSource(hit)} />)}
@@ -252,17 +251,19 @@ export default function CaseSearchView({ hosts, currentHostId, timeRange, isBook
 
 function SearchLedgerRow({ hit, bookmarked, currentHostId, onOpen, onOpenSource }: { hit: SearchHit; bookmarked: boolean; currentHostId: string | null; onOpen: () => void; onOpenSource: () => void }) {
   const hostColor = hit.hostId === currentHostId ? "var(--accent)" : "var(--text-dim)";
+  // Artifact identity: the table's own glyph and the shared chip tone.
+  const tone = artifactChipTone("_OVERVIEW", hit.tableName);
   return (
     <article className={bookmarked ? "dfir-bookmarked-row" : undefined} style={{ borderRadius: "var(--radius)", display: "flex", alignItems: "center", gap: 12, minHeight: 62, marginBottom: 8, padding: "10px 14px", border: "1px solid var(--border)", background: "var(--bg-panel)", transition: "background .15s ease, border-color .15s ease" }}
       onMouseEnter={(event) => { if (!bookmarked) event.currentTarget.style.background = "var(--bg-hover)"; }}
       onMouseLeave={(event) => { if (!bookmarked) event.currentTarget.style.background = "var(--bg-panel)"; }}>
       <button type="button" onClick={onOpen} aria-label={`${hit.hostName} ${hit.fileName} 검색 결과 상세 보기`} style={{ flex: 1, display: "flex", alignItems: "center", gap: 12, minWidth: 0, padding: 0, border: "none", background: "transparent", color: "inherit", cursor: "pointer", textAlign: "left" }}>
-        <span aria-hidden="true" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 34, height: 34, flexShrink: 0, borderRadius: "var(--radius)", background: "var(--accent-subtle)" }}>
-          <SearchOutlinedIcon sx={{ fontSize: 17, color: "var(--accent)" }} />
+        <span aria-hidden="true" title={categoryLabel(hit.tableName)} style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 34, height: 34, flexShrink: 0, borderRadius: "var(--radius)", background: tone.background }}>
+          <OverviewTableIcon name={hit.tableName} size={17} color={tone.color} />
         </span>
         <span style={{ flex: 1, minWidth: 0, display: "grid", gap: 3 }}>
           <span title={hit.matchValue} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text)", fontFamily: "var(--mono)", fontSize: 12.5, fontWeight: 650 }}>{hit.matchValue || "값 없음"}</span>
-          <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text-faint)", fontSize: 12 }}>{hit.fileName || hit.tableName} · {hit.matchColumn || "일치 필드 없음"}</span>
+          <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text-faint)", fontSize: 12 }}>{categoryLabel(hit.tableName)} · {hit.matchColumn}</span>
         </span>
         <span style={{ flexShrink: 0, maxWidth: 130, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 11.5, fontWeight: 700, color: hostColor, border: `1px solid ${hostColor}`, borderRadius: "var(--radius)", padding: "1px 8px" }}>{hit.hostName || "알 수 없는 호스트"}</span>
         <time style={{ flexShrink: 0, width: 172, textAlign: "right", color: hit.timestamp ? "var(--text-time)" : "var(--text-faint)", fontFamily: "var(--mono)", fontSize: 12.5, whiteSpace: "nowrap" }}>{hit.timestamp ? formatEvidenceTimestamp(hit.timestamp) : "시간 정보 없음"}</time>
@@ -315,15 +316,10 @@ function ArtifactCategoryFilter({ categories, hidden, onToggle, onShowAll, onHid
           <button type="button" onClick={onHideAll} style={{ fontSize: 11.5, background: "transparent", border: "none", color: "var(--text-dim)", cursor: "pointer", fontWeight: 650 }}>전체 해제</button>
         </div>
       </div>
-      {/* 필터 의미 명시 — 원본 데이터 범위만 거르고, 종합 분석(파생) 결과는
-          어떤 원본을 해제해도 항상 포함된다 (의도된 설계, 2026-08-31 확정). */}
-      <div style={{ padding: "6px 4px 0", color: "var(--text-faint)", fontSize: 11, lineHeight: 1.5 }}>
-        원본 데이터 기준 필터입니다 — 종합 분석 결과는 항상 검색에 포함됩니다.
-      </div>
       <div style={{ display: "grid", gap: 2, paddingTop: 7 }}>
         {categories.length === 0 && <div style={{ padding: "8px 10px", color: "var(--text-faint)", fontSize: 12 }}>선택할 아티팩트가 없습니다.</div>}
         {categories.map((name) => (
-          <ArtifactCheckRow key={name} label={categoryLabel(name)} checked={!hidden.has(name)} tone={artifactChipTone(name, "")} onChange={() => onToggle(name)} />
+          <ArtifactCheckRow key={name} label={categoryLabel(name)} checked={!hidden.has(name)} tone={artifactChipTone("_OVERVIEW", name)} onChange={() => onToggle(name)} />
         ))}
       </div>
     </FilterDropdown>

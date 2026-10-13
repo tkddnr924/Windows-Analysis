@@ -6057,8 +6057,6 @@ struct SearchHit {
     match_column: String,
     match_value: String,
     timestamp: String,
-    /// `<table>::<rowid>` pointer of a raw (facts) table. Empty for derived rows.
-    record_key: String,
     /// Derived row id. Opening the raw row and bookmarking resolve it through
     /// source_records; it is not itself a bookmark key.
     record_id: String,
@@ -6102,9 +6100,8 @@ fn search_case_blocking(
     let start = start.filter(|value| !value.trim().is_empty());
     let end = end.filter(|value| !value.trim().is_empty());
     let range_active = start.is_some() || end.is_some();
-    // Case-fold the requested category folders once. An empty selection means
-    // "no category filter" (search everything) rather than "match nothing", so
-    // the analyst clearing every checkbox never silently returns zero rows.
+    // docs-19: categories are _OVERVIEW table names (case-folded). An empty
+    // selection means "no filter"; the UI handles "nothing selected" itself.
     let category_filter: Option<std::collections::HashSet<String>> = categories
         .map(|list| {
             list.into_iter()
@@ -6127,30 +6124,19 @@ fn search_case_blocking(
     let mut has_next = false;
 
     for host in &hosts {
+        // docs-19: only the host's _OVERVIEW contract DBs are searched; raw
+        // facts are evidence opened through source_records.
         let mut files = Vec::new();
-        collect_sqlite(Path::new(&host.dir), &mut files);
+        collect_sqlite(&Path::new(&host.dir).join("_OVERVIEW"), &mut files);
         files.sort();
         for fp in files {
-            // Restrict to the selected category folders. The category is the
-            // first path segment under the host directory (BROWSER, EVENTLOG,
-            // …); files that cannot be placed under a category are skipped when
-            // a filter is active.
-            //
-            // `_OVERVIEW` is exempt: it is not a raw artifact bucket but the
-            // derived 종합 분석 layer (BrowserActivity, ExecutionHistory,
-            // RegistryFindings, …) re-composed from every artifact. The UI
-            // deliberately omits it from the selectable categories, so it must
-            // always be searched — otherwise unchecking any single artifact
-            // would silently drop all correlated results.
             if let Some(ref allow) = category_filter {
-                let category = fp
-                    .strip_prefix(&host.dir)
-                    .ok()
-                    .and_then(|rel| rel.components().next())
-                    .map(|segment| segment.as_os_str().to_string_lossy().to_lowercase());
-                match category {
-                    Some(name) if name == "_overview" || allow.contains(&name) => {}
-                    _ => continue,
+                let stem = fp
+                    .file_stem()
+                    .map(|stem| stem.to_string_lossy().to_lowercase())
+                    .unwrap_or_default();
+                if !allow.contains(&stem) {
+                    continue;
                 }
             }
             let conn = match open_ro(&fp.to_string_lossy()) {
@@ -6172,12 +6158,11 @@ fn search_case_blocking(
                     continue;
                 }
             };
-            // Contract DBs are searched through their primary table only;
-            // scanning children would duplicate one event per evidence row.
-            if let (Some(_), Some(primary)) =
-                (overview_contract_version(&conn), primary_table_name(&fp))
-            {
-                tables.retain(|name| name.eq_ignore_ascii_case(&primary));
+            // Primary table only (children would repeat one event per row);
+            // raw facts under _OVERVIEW (no contract stamp) are not searched.
+            match (overview_contract_version(&conn), primary_table_name(&fp)) {
+                (Some(_), Some(primary)) => tables.retain(|name| name.eq_ignore_ascii_case(&primary)),
+                _ => continue,
             }
             tables.sort();
             for table in tables {
@@ -6271,23 +6256,6 @@ fn search_case_blocking(
                 let timestamp_expr = timestamp_sql
                     .clone()
                     .unwrap_or_else(|| "''".to_string());
-                // Raw (facts) tables keep the record_key pointer. Derived rows
-                // do not: their raw evidence is reached through record_id and
-                // source_records, so a UUID never acts as a '<table>::<rowid>'
-                // pointer (docs-01 column moves).
-                let record_key_column = cols.iter().find(|column| {
-                    column.eq_ignore_ascii_case("record_key")
-                        || column.eq_ignore_ascii_case("_record_key")
-                });
-                let record_key_expr = record_key_column
-                    .map(|column| {
-                        format!(
-                            "SUBSTR(CAST({} AS TEXT), 1, {})",
-                            q(column),
-                            MATCH_PREVIEW_CHARS,
-                        )
-                    })
-                    .unwrap_or_else(|| "''".to_string());
                 // Lookup key of a derived row; detail and bookmarks resolve it
                 // through source_records.
                 let record_id_expr = if cols.iter().any(|column| column == "record_id") {
@@ -6318,11 +6286,10 @@ fn search_case_blocking(
                 // rows in memory.
                 let query_limit = if has_next { 1 } else { scan_target };
                 let sql = format!(
-                    "SELECT rowid AS __rowid, CASE {} ELSE '' END AS __match_column, CASE {} ELSE '' END AS __match_value, {} AS __timestamp, {} AS __record_key, {} AS __record_id FROM {} WHERE {} ORDER BY rowid LIMIT {}",
+                    "SELECT rowid AS __rowid, CASE {} ELSE '' END AS __match_column, CASE {} ELSE '' END AS __match_value, {} AS __timestamp, {} AS __record_id FROM {} WHERE {} ORDER BY rowid LIMIT {}",
                     match_column,
                     match_value,
                     timestamp_expr,
-                    record_key_expr,
                     record_id_expr,
                     q(&table),
                     conditions.join(" AND "),
@@ -6370,11 +6337,6 @@ fn search_case_blocking(
                             .to_string(),
                         timestamp: row
                             .get("__timestamp")
-                            .and_then(|value| value.as_str())
-                            .unwrap_or_default()
-                            .to_string(),
-                        record_key: row
-                            .get("__record_key")
                             .and_then(|value| value.as_str())
                             .unwrap_or_default()
                             .to_string(),
@@ -7472,171 +7434,111 @@ mod account_event_tests {
 mod search_case_tests {
     use super::*;
 
-    #[test]
-    fn search_case_pages_bounded_preview_and_reports_failed_source() {
+    fn temp_root(label: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
-            "windows-analysis-search-page-{}-{}",
+            "windows-analysis-search-{label}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_nanos(),
         ));
-        std::fs::create_dir_all(&root).unwrap();
-        let db_path = root.join("results.sqlite");
-        let conn = Connection::open(&db_path).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE Findings (timestamp TEXT, detail TEXT, record_key TEXT);\
-             CREATE TABLE TrailingEmpty (value TEXT);",
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO Findings VALUES (?1, ?2, ?3)",
-            rusqlite::params![
-                "2026-01-01 00:00:00.000",
-                "needle first",
-                "RawFindings::Findings::41"
-            ],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO Findings VALUES (?1, ?2, ?3)",
-            rusqlite::params![
-                "2026-01-02 00:00:00.000",
-                "needle second",
-                "RawFindings::Findings::42"
-            ],
-        )
-        .unwrap();
-        let long_detail = format!("verylong{}", "x".repeat(4_096));
-        conn.execute(
-            "INSERT INTO Findings VALUES (?1, ?2, ?3)",
-            rusqlite::params![
-                "2026-01-03 00:00:00.000",
-                long_detail,
-                format!("RawFindings::Findings::{}", "r".repeat(4_096))
-            ],
-        )
-        .unwrap();
-        drop(conn);
-        std::fs::write(root.join("unreadable.sqlite"), vec![0_u8; 128]).unwrap();
-        let hosts = vec![SearchHost {
-            id: "host-1".to_string(),
-            name: "HOST-1".to_string(),
-            dir: root.to_string_lossy().to_string(),
-        }];
+        std::fs::create_dir_all(root.join("_OVERVIEW")).unwrap();
+        root
+    }
 
-        let first = search_case_blocking("needle".to_string(), hosts.clone(), 0, 1, None, None, None);
-        assert_eq!(
-            first.hits.len(),
-            1,
-            "source failures: {:?}",
-            first.source_failures
-        );
+    /// A contract DB `_OVERVIEW/<name>.sqlite` with one primary table.
+    fn contract_db(root: &Path, name: &str, rows: &[(&str, &str)]) {
+        let conn = Connection::open(root.join("_OVERVIEW").join(format!("{name}.sqlite"))).unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TABLE \"{name}\" (record_id TEXT, timestamp TEXT, detail TEXT);\
+             CREATE TABLE source_records (record_id TEXT, ordinal INTEGER, source_db TEXT, source_table TEXT, source_rowid INTEGER);\
+             CREATE TABLE _wina_derived_version (name TEXT, version INTEGER);\
+             INSERT INTO _wina_derived_version VALUES ('overview_contract', 1);"
+        ))
+        .unwrap();
+        for (index, (timestamp, detail)) in rows.iter().enumerate() {
+            conn.execute(
+                &format!("INSERT INTO \"{name}\" VALUES (?1, ?2, ?3)"),
+                rusqlite::params![format!("{name}-{index}"), timestamp, detail],
+            )
+            .unwrap();
+        }
+    }
+
+    fn hosts(root: &Path) -> Vec<SearchHost> {
+        vec![SearchHost { id: "host-1".into(), name: "HOST-1".into(), dir: root.to_string_lossy().to_string() }]
+    }
+
+    #[test]
+    fn search_case_pages_bounded_preview_and_reports_failed_source() {
+        let root = temp_root("page");
+        let long_detail = format!("verylong{}", "x".repeat(4_096));
+        contract_db(&root, "Findings", &[
+            ("2026-01-01 00:00:00.000", "needle first"),
+            ("2026-01-02 00:00:00.000", "needle second"),
+            ("2026-01-03 00:00:00.000", &long_detail),
+        ]);
+        std::fs::write(root.join("_OVERVIEW").join("Zunreadable.sqlite"), vec![0_u8; 128]).unwrap();
+        let hosts = hosts(&root);
+
+        let first = search_case_blocking("needle".into(), hosts.clone(), 0, 1, None, None, None);
+        assert_eq!(first.hits.len(), 1, "source failures: {:?}", first.source_failures);
         assert_eq!(first.hits[0].match_column, "detail");
         assert_eq!(first.hits[0].match_value, "needle first");
         assert_eq!(first.hits[0].timestamp, "2026-01-01 00:00:00.000");
-        assert_eq!(first.hits[0].record_key, "RawFindings::Findings::41");
+        assert_eq!(first.hits[0].record_id, "Findings-0");
         assert_eq!(first.next_offset, Some(1));
         // A continuation must not hide later unreadable sources.
         assert!(!first.source_failures.is_empty());
-        // A later empty table is a valid source, not a health-check failure.
-        assert!(!first
-            .source_failures
-            .iter()
-            .any(|failure| failure == "HOST-1: results"));
 
-        let second = search_case_blocking("needle".to_string(), hosts.clone(), 1, 1, None, None, None);
+        let second = search_case_blocking("needle".into(), hosts.clone(), 1, 1, None, None, None);
         assert_eq!(second.hits.len(), 1);
         assert_eq!(second.hits[0].match_value, "needle second");
         assert_eq!(second.next_offset, None);
-        assert!(!second.source_failures.is_empty());
 
         let ranged = search_case_blocking(
-            "needle".to_string(),
+            "needle".into(),
             hosts.clone(),
             0,
             10,
-            Some("2026-01-02 00:00:00.000".to_string()),
-            Some("2026-01-02 23:59:59.999".to_string()),
+            Some("2026-01-02 00:00:00.000".into()),
+            Some("2026-01-02 23:59:59.999".into()),
             None,
         );
         assert_eq!(ranged.hits.len(), 1);
         assert_eq!(ranged.hits[0].match_value, "needle second");
 
-        let bounded_preview =
-            search_case_blocking("verylong".to_string(), hosts, 0, 10, None, None, None);
+        let bounded_preview = search_case_blocking("verylong".into(), hosts, 0, 10, None, None, None);
         assert_eq!(bounded_preview.hits.len(), 1);
         assert_eq!(bounded_preview.hits[0].match_value.chars().count(), 512);
-        assert_eq!(bounded_preview.hits[0].record_key.chars().count(), 512);
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// docs-19: only _OVERVIEW contract DBs are searched; raw folders and raw
+    /// facts stored under _OVERVIEW (MFT_Records) are not. Categories name
+    /// overview tables.
     #[test]
-    fn search_case_restricts_to_selected_categories() {
-        let root = std::env::temp_dir().join(format!(
-            "windows-analysis-search-cat-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos(),
-        ));
-        // Two raw artifact folders plus the derived _OVERVIEW layer, each with
-        // one matching row. The category is the first path segment under the
-        // host directory.
-        for category in ["BROWSER", "EVENTLOG", "_OVERVIEW"] {
-            let dir = root.join(category);
-            std::fs::create_dir_all(&dir).unwrap();
-            let conn = Connection::open(dir.join("results.sqlite")).unwrap();
-            conn.execute_batch("CREATE TABLE Rows (timestamp TEXT, detail TEXT);")
+    fn search_case_reads_overview_contract_tables_only() {
+        let root = temp_root("overview");
+        contract_db(&root, "Alpha", &[("2026-01-01 00:00:00.000", "needle Alpha")]);
+        contract_db(&root, "Beta", &[("2026-01-01 00:00:00.000", "needle Beta")]);
+        for (folder, file) in [("BROWSER", "History"), ("_OVERVIEW", "MFT_Records")] {
+            std::fs::create_dir_all(root.join(folder)).unwrap();
+            let conn = Connection::open(root.join(folder).join(format!("{file}.sqlite"))).unwrap();
+            conn.execute_batch(&format!("CREATE TABLE \"{file}\" (timestamp TEXT, detail TEXT); INSERT INTO \"{file}\" VALUES ('2026-01-01 00:00:00.000', 'needle {file}');"))
                 .unwrap();
-            conn.execute(
-                "INSERT INTO Rows VALUES (?1, ?2)",
-                rusqlite::params!["2026-01-01 00:00:00.000", format!("needle {category}")],
-            )
-            .unwrap();
         }
-        let hosts = vec![SearchHost {
-            id: "host-1".to_string(),
-            name: "HOST-1".to_string(),
-            dir: root.to_string_lossy().to_string(),
-        }];
-
-        // No filter → every folder searched (both artifacts + the overview).
-        let all = search_case_blocking("needle".to_string(), hosts.clone(), 0, 10, None, None, None);
-        assert_eq!(all.hits.len(), 3);
-
-        // Only BROWSER → the BROWSER row, plus the always-on _OVERVIEW row. The
-        // derived 종합 분석 layer must never be filtered out, so narrowing to a
-        // single artifact still surfaces its correlated overview results.
-        let browser = search_case_blocking(
-            "needle".to_string(),
-            hosts.clone(),
-            0,
-            10,
-            None,
-            None,
-            Some(vec!["browser".to_string()]),
-        );
-        let browser_values: std::collections::HashSet<&str> =
-            browser.hits.iter().map(|h| h.match_value.as_str()).collect();
-        assert_eq!(browser.hits.len(), 2);
-        assert!(browser_values.contains("needle BROWSER"));
-        assert!(browser_values.contains("needle _OVERVIEW"));
-        assert!(!browser_values.contains("needle EVENTLOG"));
-
-        // An empty selection is treated as "no filter", not "match nothing".
-        let empty = search_case_blocking(
-            "needle".to_string(),
-            hosts,
-            0,
-            10,
-            None,
-            None,
-            Some(vec![]),
-        );
-        assert_eq!(empty.hits.len(), 3);
+        let hosts = hosts(&root);
+        let values = |page: SearchCasePage| -> Vec<String> {
+            let mut values: Vec<String> = page.hits.into_iter().map(|hit| hit.match_value).collect();
+            values.sort();
+            values
+        };
+        assert_eq!(values(search_case_blocking("needle".into(), hosts.clone(), 0, 10, None, None, None)), vec!["needle Alpha", "needle Beta"]);
+        assert_eq!(values(search_case_blocking("needle".into(), hosts.clone(), 0, 10, None, None, Some(vec!["alpha".into()]))), vec!["needle Alpha"]);
+        // An empty selection is "no filter", not "match nothing".
+        assert_eq!(values(search_case_blocking("needle".into(), hosts, 0, 10, None, None, Some(vec![]))).len(), 2);
         let _ = std::fs::remove_dir_all(root);
     }
 }
@@ -9084,8 +8986,9 @@ mod overview_contract_tests {
             .iter()
             .all(|row| !row.contains_key(SOURCE_REFS_KEY)));
 
-        // Search carries the same identity: one evidence entry of the derived hit
-        // must equal the raw hit's (path, table, rowid) for bookmark state to match.
+        // Search carries the same identity: the derived hit's evidence is the
+        // raw row's (path, table, rowid). Raw facts are not search results
+        // (docs-19), so bookmark state is matched on these pointers.
         let hosts = vec![SearchHost {
             id: "host-1".to_string(),
             name: "HOST-1".to_string(),
@@ -9097,24 +9000,8 @@ mod overview_contract_tests {
             .iter()
             .find(|hit| hit.table_name == "FileSystemEntries")
             .expect("derived hit");
-        let raw_hit = found
-            .hits
-            .iter()
-            .find(|hit| hit.table_name == "Security")
-            .expect("raw hit");
+        assert!(found.hits.iter().all(|hit| hit.table_name != "Security"));
         assert_eq!(derived_hit.source_refs, expected);
-        assert!(
-            raw_hit.source_refs.is_empty(),
-            "원본 적중은 자기 자신이 북마크 키다"
-        );
-        assert!(
-            derived_hit.source_refs.iter().any(|pointer| {
-                pointer.full_path == raw_hit.full_path
-                    && pointer.table_name == raw_hit.table_name
-                    && pointer.rowid == raw_hit.rowid
-            }),
-            "파생 적중의 근거는 원본 적중과 같은 북마크 키여야 한다"
-        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -9507,3 +9394,4 @@ fn main() {
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
+
