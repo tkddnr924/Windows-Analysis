@@ -1,10 +1,10 @@
 "use client";
+import AppLoader from "@/components/AppLoader";
 import { HeaderSearchInput, SelectDropdown, ViewHeader } from "@/components/FilterControls";
 import HostConnection3D from "@/components/HostConnection3D";
 import AccountTreeOutlinedIcon2 from "@mui/icons-material/AccountTreeOutlined";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import useMediaQuery from "@mui/material/useMediaQuery";
-import CircularProgress from "@mui/material/CircularProgress";
 import RefreshOutlinedIcon from "@mui/icons-material/RefreshOutlined";
 import PaginationControls from "@/components/PaginationControls";
 import {
@@ -182,7 +182,7 @@ export default function HostConnectionView(
   if (loading) {
     return (
       <Center>
-        <CircularProgress size={18} />원격 접근 관계를 불러오는 중입니다.
+        <AppLoader message="원격 접근 관계를 불러오는 중" />
       </Center>
     );
   }

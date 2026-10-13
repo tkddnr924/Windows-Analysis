@@ -1,9 +1,9 @@
 "use client";
+import AppLoader from "@/components/AppLoader";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useModalDialog } from "@/lib/useModalDialog";
 import AccountTreeOutlinedIcon from "@mui/icons-material/AccountTreeOutlined";
 import CloseIcon from "@mui/icons-material/Close";
-import CircularProgress from "@mui/material/CircularProgress";
 import OpenInNewOutlinedIcon from "@mui/icons-material/OpenInNewOutlined";
 import type { BrowserVisitFlow, VisitFlowEdge, VisitFlowNode } from "@/lib/types";
 import { transitionLabel } from "@/lib/browserView";
@@ -449,7 +449,7 @@ export default function VisitFlowGraphModal({ state, graph, onRetry, onClose }: 
             <CloseIcon sx={{ fontSize: 18 }} />
           </button>
         </header>
-        {state === "loading" && <div style={{ display: "flex", alignItems: "center", gap: 8, color: "var(--text-dim)", fontSize: 12.5, padding: 24 }}><CircularProgress size={16} thickness={4} sx={{ color: "var(--accent)" }} />불러오는 중</div>}
+        {state === "loading" && <AppLoader compact message="방문 흐름을 불러오는 중" />}
         {state === "error" && (
           <div role="alert" style={{ display: "flex", flexDirection: "column", gap: 10, padding: 24, color: "var(--text-dim)", fontSize: 12.5 }}>
             이동 흐름을 불러오지 못했습니다.

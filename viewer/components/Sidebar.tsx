@@ -637,6 +637,7 @@ export default function Sidebar({
             <DateTimeInput
               value={timeRange.start}
               onChange={(v) => onTimeRangeChange({ ...timeRange, start: v })}
+              edge="start"
               style={timeInputStyle}
               ariaLabel="시작 시각"
               placeholder="YYYY-MM-DD HH:mm:ss"
@@ -645,6 +646,7 @@ export default function Sidebar({
             <DateTimeInput
               value={timeRange.end}
               onChange={(v) => onTimeRangeChange({ ...timeRange, end: v })}
+              edge="end"
               style={timeInputStyle}
               ariaLabel="종료 시각"
               placeholder="YYYY-MM-DD HH:mm:ss"

@@ -1,6 +1,7 @@
 "use client";
 // 브라우저 활동과 AI 대화 (docs-07) — _OVERVIEW BrowserActivity·AiConversations와
 // 자식표만 읽는다. 수집 History·캐시 파일과 facts는 다시 열지 않는다.
+import AppLoader from "@/components/AppLoader";
 import { useEffect, useMemo, useState } from "react";
 import AutoAwesomeOutlinedIcon from "@mui/icons-material/AutoAwesomeOutlined";
 import BookmarkBorderIcon from "@mui/icons-material/BookmarkBorder";
@@ -24,7 +25,6 @@ import SortIcon from "@mui/icons-material/SortOutlined";
 import SummarizeOutlinedIcon from "@mui/icons-material/SummarizeOutlined";
 import TextsmsOutlinedIcon from "@mui/icons-material/TextsmsOutlined";
 import TravelExploreOutlinedIcon from "@mui/icons-material/TravelExploreOutlined";
-import CircularProgress from "@mui/material/CircularProgress";
 import type { AiPage, AiRecord, BrowserDomainPage, BrowserFilter, BrowserInputInfo, BrowserPage, BrowserSummary } from "@/lib/types";
 import { EMPTY_TIME_RANGE, toBound, type TimeRange } from "@/lib/timeRange";
 import { KIND_LABELS, attachmentsByMessage, browserScopes, messageThread } from "@/lib/browserView";
@@ -572,7 +572,7 @@ function AiConversationModal({ dbPath, recordId, onOpenRecord, isBookmarked, onT
       {row && onToggleBookmark && Number.isSafeInteger(rowid) && <BookmarkToggle bookmarked={bookmarked} onToggle={() => onToggleBookmark(row)} />}
     </>}>
     {failed ? <div role="alert" style={{ padding: 18, color: "var(--danger)", fontSize: 12.5 }}>불러오지 못했습니다</div>
-      : !record || !row ? <div role="status" style={{ display: "flex", alignItems: "center", gap: 8, padding: 18, color: "var(--text-dim)", fontSize: 12.5 }}><CircularProgress size={15} thickness={4} />불러오는 중</div>
+      : !record || !row ? <AppLoader compact message="불러오는 중" />
       : <>
         <div style={{ flexShrink: 0, padding: "10px 16px", borderBottom: "1px solid var(--border-subtle)" }}>
           <MetaGrid items={[

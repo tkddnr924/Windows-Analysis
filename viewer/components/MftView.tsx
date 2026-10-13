@@ -1,4 +1,5 @@
 "use client";
+import AppLoader from "@/components/AppLoader";
 import FilterListOutlinedIcon from "@mui/icons-material/FilterListOutlined";
 import AccountFilterChips from "@/components/AccountFilterChips";
 import { HeaderSearchInput, SelectDropdown, ViewHeader } from "@/components/FilterControls";
@@ -570,9 +571,8 @@ export default function MftView({ dbPath, isRowBookmarked, onToggleBookmark, isR
               {results !== null ? (
                 <SearchResults rows={results} searching={searching} error={searchError} isBookmarked={isRowBookmarked} selectedRowid={selectedRowid} onSelect={setSelected} refs={pathRefs.map} accountFilter={selAccounts} />
               ) : root === null ? (
-                <div style={{ minHeight: 100, display: "flex", alignItems: "center", justifyContent: "center", gap: 8, color: "var(--text-dim)", fontSize: 12.5 }}>
-                  <CircularProgress size={17} thickness={4} />
-                  파일 시스템 레코드를 불러오는 중
+                <div style={{ height: "100%", minHeight: 160, display: "grid", placeItems: "center" }}>
+                  <AppLoader message="파일 시스템 레코드를 불러오는 중" />
                 </div>
               ) : rootError ? (
                 <div style={{ padding: "16px 8px", color: "var(--danger)", fontSize: 12.5 }}>{rootError}</div>
@@ -721,7 +721,7 @@ function MftRecordList({ rows, total, loading, error, moreFailed, query, isBookm
       </span>
     </header>
     {filterOpen && <MftListFilterModal filters={filters} anchorRow={selectedRow} countFor={countFor} onApply={onFilters} onClose={() => setFilterOpen(false)} />}
-    {loading && rows.length === 0 ? <div role="status" style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8, flex: 1, color: "var(--text-dim)", fontSize: 12.5 }}><CircularProgress size={17} thickness={4} />MFT 레코드를 불러오는 중</div> : error ? <div role="alert" style={{ padding: 16, color: "var(--danger)", fontSize: 12.5 }}>{error}</div> : !rows.length ? <div role="status" style={{ display: "grid", placeItems: "center", flex: 1, color: "var(--text-faint)", fontSize: 12.5 }}>{query || summary.length ? "조건에 맞는 MFT 레코드가 없습니다." : "표시할 MFT 레코드가 없습니다."}</div> : <div ref={scrollRef} style={{ flex: 1, minHeight: 0, overflow: "auto" }}>
+    {loading && rows.length === 0 ? <div style={{ flex: 1, display: "grid", placeItems: "center" }}><AppLoader message="MFT 레코드를 불러오는 중" /></div> : error ? <div role="alert" style={{ padding: 16, color: "var(--danger)", fontSize: 12.5 }}>{error}</div> : !rows.length ? <div role="status" style={{ display: "grid", placeItems: "center", flex: 1, color: "var(--text-faint)", fontSize: 12.5 }}>{query || summary.length ? "조건에 맞는 MFT 레코드가 없습니다." : "표시할 MFT 레코드가 없습니다."}</div> : <div ref={scrollRef} style={{ flex: 1, minHeight: 0, overflow: "auto" }}>
       <div style={{ minWidth: 0 }}>
         <div aria-hidden="true" style={{ display: "grid", gridTemplateColumns: grid, gap: 10, alignItems: "center", minHeight: 32, padding: "0 12px", borderBottom: "1px solid var(--border)", color: "var(--text-faint)", fontSize: 10.5, fontWeight: 700 }}><span>파일 이름 / 경로</span><span>{timeColumn.label}</span><span style={{ textAlign: "right" }}>크기</span><span>경로 참조 흔적</span></div>
         <div style={{ position: "relative", height: virtualizer.getTotalSize() }}>{virtualItems.map((virtualRow) => {

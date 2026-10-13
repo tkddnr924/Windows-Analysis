@@ -28,7 +28,7 @@ import MftView from "@/components/MftView";
 import BrowserActivityView from "@/components/BrowserActivityView";
 import GlobalProgress from "@/components/GlobalProgress";
 import { usePipelineRun } from "@/lib/usePipelineRun";
-import CircularProgress from "@mui/material/CircularProgress";
+import AppLoader from "@/components/AppLoader";
 import { streamBuildTimeline, TimelineBuildAborted, TIMELINE_LOGIC_VERSION } from "@/lib/masterTimeline";
 import { getArtifactView } from "@/lib/artifactViews";
 import { EMPTY_TIME_RANGE, type TimeRange } from "@/lib/timeRange";
@@ -859,9 +859,7 @@ export default function Home() {
       <main className="dfir-app" style={{ display: "flex", flexDirection: "column", height: "100%" }}>
         <div className="dfir-view" style={{ flex: 1, display: "grid", placeItems: "center", padding: 24 }}>
           {casesLoading ? (
-            <div role="status" aria-live="polite" style={{ display: "inline-flex", alignItems: "center", gap: 8, color: "var(--text-dim)", fontSize: 13 }}>
-              <CircularProgress size={16} thickness={5} aria-hidden="true" />분석 저장소를 준비하는 중
-            </div>
+            <AppLoader message="분석 저장소를 준비하는 중" />
           ) : (
             <div role="alert" style={{ maxWidth: 460, color: "var(--text)", fontSize: 13, lineHeight: 1.55 }}>
               <strong style={{ display: "block", marginBottom: 6 }}>분석 저장소를 불러오지 못했습니다.</strong>
@@ -891,9 +889,7 @@ export default function Home() {
     return (
       <main className="dfir-app" style={{ display: "flex", flexDirection: "column", height: "100%" }}>
         <div className="dfir-view" style={{ flex: 1, display: "grid", placeItems: "center", padding: 24 }}>
-          <div role="status" aria-live="polite" style={{ display: "inline-flex", alignItems: "center", gap: 8, color: "var(--text-dim)", fontSize: 13 }}>
-            <CircularProgress size={16} thickness={5} aria-hidden="true" />{selectedHost.name}의 분석 결과를 불러오는 중
-          </div>
+          <AppLoader title={selectedHost.name} message="분석 결과를 불러오는 중" />
         </div>
         {globalProgress}
       </main>
@@ -963,8 +959,8 @@ export default function Home() {
             )}
             {activeVirtualTab === "timeline" && selectedHost && (
               masterTimelineLoading ? (
-                <div role="status" aria-live="polite" style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100%", color: "var(--text-dim)", gap: 10, fontSize: 14 }}>
-                  <span>모든 아티팩트를 시간순으로 모으는 중...</span>
+                <div style={{ display: "grid", placeItems: "center", height: "100%" }}>
+                  <AppLoader message="모든 아티팩트를 시간순으로 모으는 중" />
                 </div>
               ) : masterTimelineError ? (
                 <div role="alert" style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 12, height: "100%", padding: 24, color: "var(--text)", fontSize: 13, textAlign: "center" }}>
@@ -1028,8 +1024,8 @@ export default function Home() {
               </div>
             )}
             {!activeVirtualTab && activeTab && activeTab.loading && (
-              <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100%", color: "var(--text-dim)" }}>
-                불러오는 중...
+              <div style={{ display: "grid", placeItems: "center", height: "100%" }}>
+                <AppLoader title={activeTab.file.tableName} message="불러오는 중" />
               </div>
             )}
             {!activeVirtualTab && activeTab && activeTab.error && (

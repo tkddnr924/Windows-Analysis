@@ -1,4 +1,5 @@
 "use client";
+import AppLoader from "@/components/AppLoader";
 import { lookupEventCatalog } from "@/lib/eventCatalog";
 import EventNoteOutlinedIcon from "@mui/icons-material/EventNoteOutlined";
 import { ViewHeader } from "@/components/FilterControls";
@@ -915,7 +916,7 @@ function AccountDetailPage({ account, onBack, loadEvents, timeRange, onNavigate,
             aria-label="EventLog 활동 검색"
             style={{ boxSizing: "border-box", width: "100%", height: 32, marginBottom: 8, padding: "0 10px", background: "var(--bg)", color: "var(--text)", border: "1px solid var(--border)", borderRadius: "var(--radius)", fontFamily: "var(--sans)", fontSize: 12.5, outline: "none" }}
           />}
-          {loadEvents && initialLoading && <div style={{ display: "flex", alignItems: "center", gap: 8, minHeight: 48, color: "var(--text-dim)", fontSize: 12.5 }}><CircularProgress size={16} thickness={4} /> 이 계정의 EventLog 활동을 불러오는 중…</div>}
+          {loadEvents && initialLoading && <AppLoader compact message="이 계정의 EventLog 활동을 불러오는 중" />}
           {loadEvents && refreshing && <div style={{ display: "flex", alignItems: "center", gap: 6, minHeight: 24, marginBottom: 6, color: "var(--text-dim)", fontSize: 11.5 }}><CircularProgress size={14} thickness={4} /> 결과 갱신 중… {showingPriorQuery ? "이전 결과 표시 중" : "현재 결과 확인 중"}</div>}
           {loadEvents && stale && <div style={{ marginBottom: 8, padding: "6px 8px", borderLeft: "2px solid var(--warning)", background: "var(--warning-subtle)", color: "var(--warning)", fontSize: 11.5, lineHeight: 1.35 }}>이전 파싱 결과라 계정 활동이 저장되어 있지 않습니다. 호스트를 다시 파싱하세요.</div>}
           {loadEvents && replaced && <div style={{ marginBottom: 8, padding: "6px 8px", borderLeft: "2px solid var(--warning)", background: "var(--warning-subtle)", color: "var(--warning)", fontSize: 11.5, lineHeight: 1.35 }}>파싱 결과가 교체되었습니다. 호스트 정보를 다시 열어 주세요.</div>}

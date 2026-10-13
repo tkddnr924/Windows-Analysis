@@ -3,11 +3,11 @@
 // (UsnChangeGroups)을 목록 단위로 보여 준다. 묶음을 펼치면 모든 구성 기록이
 // 저장 순서대로 나오고, 검색·변경 이유·기간에 맞은 기록만 표시된다. 대표 한
 // 행을 묶음 전체의 근거로 쓰지 않으며, 입력($J)은 근거 없이 합치지 않는다.
+import AppLoader from "@/components/AppLoader";
 import { useEffect, useMemo, useRef, useState } from "react";
 import AddCircleOutlineOutlinedIcon from "@mui/icons-material/AddCircleOutlineOutlined";
 import BookmarkBorderOutlinedIcon from "@mui/icons-material/BookmarkBorderOutlined";
 import BookmarkIcon from "@mui/icons-material/Bookmark";
-import CircularProgress from "@mui/material/CircularProgress";
 import DeleteOutlineOutlinedIcon from "@mui/icons-material/DeleteOutlineOutlined";
 import DescriptionOutlinedIcon from "@mui/icons-material/DescriptionOutlined";
 import DriveFileRenameOutlineOutlinedIcon from "@mui/icons-material/DriveFileRenameOutlineOutlined";
@@ -269,9 +269,8 @@ export default function UsnJrnlView({ dbPath, timeRange, isRowBookmarked, onTogg
       {error ? (
         <div role="alert" style={{ minHeight: 180, display: "grid", placeItems: "center", color: "var(--danger)", fontSize: 13, padding: 16, textAlign: "center" }}>{error}</div>
       ) : loading && !groups.length ? (
-        <div role="status" style={{ flex: 1, minHeight: 180, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 10, color: "var(--text-dim)", fontSize: 14 }}>
-          <CircularProgress size={19} thickness={4.5} aria-label="USN 저널을 불러오는 중" sx={{ color: "var(--accent)" }} />
-          <span>USN 저널 기록을 불러오는 중...</span>
+        <div style={{ flex: 1, minHeight: 180, display: "grid", placeItems: "center" }}>
+          <AppLoader message="USN 저널 기록을 불러오는 중" />
         </div>
       ) : !loading && !groups.length ? (
         <div role="status" style={{ minHeight: 180, display: "grid", placeItems: "center", color: "var(--text-faint)", fontSize: 13 }}>

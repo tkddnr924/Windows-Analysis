@@ -1,8 +1,8 @@
 "use client";
 
+import AppLoader from "@/components/AppLoader";
 import { type CSSProperties, useContext, useEffect, useMemo, useState } from "react";
 import Checkbox from "@mui/material/Checkbox";
-import CircularProgress from "@mui/material/CircularProgress";
 import Tooltip from "@mui/material/Tooltip";
 import BookmarkBorderIcon from "@mui/icons-material/BookmarkBorder";
 import BookmarkIcon from "@mui/icons-material/Bookmark";
@@ -476,26 +476,8 @@ export default function MasterTimeline({ hostDir, onNavigate, onFetchLinkedRows,
   // 이동·필터 변경 등 재조회는 기존 목록을 유지한 채 살짝 어둡게만 한다.
   if (loading && rows.length === 0) {
     return (
-      <div
-        role="status"
-        aria-live="polite"
-        style={{
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "center",
-          height: "100%",
-          color: "var(--text-dim)",
-          gap: 10,
-          fontSize: 14,
-        }}
-      >
-        <CircularProgress
-          size={19}
-          thickness={4.5}
-          aria-label="통합 타임라인을 불러오는 중"
-          sx={{ color: "var(--accent)" }}
-        />
-        <span>타임라인을 불러오는 중...</span>
+      <div style={{ display: "grid", placeItems: "center", height: "100%" }}>
+        <AppLoader message="타임라인을 불러오는 중" />
       </div>
     );
   }

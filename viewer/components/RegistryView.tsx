@@ -2,6 +2,7 @@
 // 레지스트리 뷰 (docs-06) — _OVERVIEW/RegistryExplorer의 모든 하이브·키·값을
 // Explorer 형태로 탐색한다. 왼쪽은 하이브 트리·퀵 접근·검색 결과, 오른쪽은
 // 선택한 키의 값 목록과 값 상세. 원본 파싱 DB는 읽지 않는다.
+import AppLoader from "@/components/AppLoader";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import AccountTreeOutlinedIcon from "@mui/icons-material/AccountTreeOutlined";
 import ArticleOutlinedIcon from "@mui/icons-material/ArticleOutlined";
@@ -367,7 +368,7 @@ export default function RegistryView({ dbPath, isRowBookmarked, onToggleBookmark
       {error ? (
         <div role="alert" style={{ flex: 1, display: "grid", placeItems: "center", color: "var(--danger)", fontSize: 13, padding: 16 }}>{error}</div>
       ) : !hives ? (
-        <div role="status" style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", gap: 10, color: "var(--text-dim)", fontSize: 13 }}><CircularProgress size={18} thickness={4.5} sx={{ color: "var(--accent)" }} />레지스트리를 불러오는 중</div>
+        <div style={{ flex: 1, display: "grid", placeItems: "center" }}><AppLoader message="레지스트리를 불러오는 중" /></div>
       ) : (
         <div style={{ flex: 1, minHeight: 0, display: "grid", gridTemplateColumns: "minmax(300px, 380px) minmax(0, 1fr)", gap: 12, padding: 12 }}>
           <aside aria-label="레지스트리 탐색" style={{ minWidth: 0, minHeight: 0, display: "flex", flexDirection: "column", border: "1px solid var(--border)", borderRadius: "var(--radius)", background: "var(--bg-panel)", overflow: "hidden" }}>

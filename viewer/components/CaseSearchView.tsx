@@ -1,4 +1,5 @@
 "use client";
+import AppLoader from "@/components/AppLoader";
 import PaginationControls from "@/components/PaginationControls";
 import { ViewHeader, MultiSelectDropdown, FilterDropdown } from "@/components/FilterControls";
 import { artifactChipTone, type ArtifactChipTone } from "@/components/MasterTimeline";
@@ -234,7 +235,7 @@ export default function CaseSearchView({ hosts, currentHostId, timeRange, isBook
 
       <section aria-label="검색 결과 원장" style={{ flex: 1, minHeight: 0, overflow: "auto" }}>
         {!ran && !loading && <EmptyState><SearchOutlinedIcon sx={{ fontSize: 28, color: "var(--text-faint)" }} />검색어를 입력한 뒤 검색을 실행하세요.</EmptyState>}
-        {(loading || rangeRefreshing) && visibleHits.length === 0 && <EmptyState><CircularProgress size={18} thickness={5} aria-label="케이스 전체 검색 중" />{rangeRefreshing ? "변경된 기간 필터로 검색 결과를 갱신하는 중입니다." : "모든 호스트의 분석 결과를 검색하는 중입니다."}</EmptyState>}
+        {(loading || rangeRefreshing) && visibleHits.length === 0 && <div style={{ minHeight: 220, display: "grid", placeItems: "center" }}><AppLoader message={rangeRefreshing ? "변경된 기간 필터로 검색 결과를 갱신하는 중" : "모든 호스트의 분석 결과를 검색하는 중"} /></div>}
         {noResults && <EmptyState><SearchOutlinedIcon sx={{ fontSize: 28, color: "var(--text-faint)" }} />일치하는 결과가 없습니다.</EmptyState>}
         {visibleHits.length > 0 && <div style={{ minWidth: 760, padding: "12px 14px 4px", opacity: loading ? 0.55 : 1, transition: "opacity .15s ease" }}>
           {visibleHits.map((hit, index) => <SearchLedgerRow key={`${hit.hostId}\u0000${hit.fullPath}\u0000${hit.tableName}\u0000${hit.rowid}\u0000${index}`} hit={hit} bookmarked={isBookmarked(hit)} currentHostId={currentHostId} onOpen={() => void openDetail(hit)} onOpenSource={() => onOpenSource(hit)} />)}
