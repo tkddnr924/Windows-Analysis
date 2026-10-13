@@ -25,6 +25,7 @@ import AccountTreeOutlinedIcon from "@mui/icons-material/AccountTreeOutlined";
 import ViewListOutlinedIcon from "@mui/icons-material/ViewListOutlined";
 import RowDetailPanel from "./RowDetailPanel";
 import { RecordScopeContext } from "@/lib/recordScope";
+import { formatSize as fmtSize } from "@/lib/byteSize";
 
 // 파일 시스템 정보는 화면용 파생 테이블(_OVERVIEW/FileSystemEntries)에서
 // 읽는다. 수십만~백만 행 규모라 폴더는 지연 로딩하고, 검색·목록은 SQLite를
@@ -150,17 +151,6 @@ function RowBadges({ row, size = 10.5 }: { row: Row; size?: number }) {
     {isUnused(row) && badge("비사용", "var(--warning)", "MFT 레코드 할당 해제 — 삭제 시각·복구 가능성의 증거가 아닙니다")}
     {issue && badge("경로 불완전", "var(--text-dim)", issue)}
   </>;
-}
-
-/** NULL/absent size is unknown ("—"), never "0 B". */
-function fmtSize(v: string | null | undefined): string {
-  if (v === null || v === undefined || v === "") return "—";
-  const n = Number(v);
-  if (!Number.isFinite(n) || n < 0) return "—";
-  if (n < 1024) return `${n} B`;
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
-  if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`;
-  return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }
 
 export default function MftView({ dbPath, isRowBookmarked, onToggleBookmark, isReferenceBookmarked, onToggleReferenceBookmark }: Props) {

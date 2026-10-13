@@ -2,6 +2,7 @@
 //! Header: u64 version at 0, size at 8, FILETIME at 16.
 //! V1: 260 UTF-16LE units at 24. V2: u32 unit count at 24, path at 28.
 //! Damaged inputs retain failure rows; collected folder names do not prove volume identity.
+//! Allocated resident `$I` bodies stored in `MFT_Records` are a second input.
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -29,6 +30,9 @@ CREATE TABLE "RecycleBin_Records" (
   "_source_file" TEXT NOT NULL,
   "_status" TEXT,
   "_error" TEXT,
+  "mft_path" TEXT,
+  "mft_entry" INTEGER,
+  "mft_seq" INTEGER,
   CHECK (r_exists IS NULL OR (typeof(r_exists) = 'integer' AND r_exists IN (0,1))),
   CHECK (file_size IS NULL OR (typeof(file_size) = 'integer' AND file_size >= 0))
 );
@@ -39,8 +43,8 @@ CREATE INDEX idx_recyclebin_volume_account ON RecycleBin_Records(volume_id, acco
 const INSERT_SQL: &str = r#"INSERT INTO "RecycleBin_Records" (
   "format_version", "original_path", "file_size", "deleted_time_raw", "timestamp",
   "account_sid", "account", "volume_id", "original_drive_letter", "recycle_name",
-  "r_exists", "_source_file", "_status", "_error"
-) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"#;
+  "r_exists", "_source_file", "_status", "_error", "mft_path", "mft_entry", "mft_seq"
+) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)"#;
 
 const STATUS_OK: &str = "ok";
 const STATUS_CORRUPTED: &str = "corrupted";
@@ -209,6 +213,9 @@ struct RecycleBinRecord {
     source_file: String,
     status: String,
     error: Option<String>,
+    mft_path: Option<String>,
+    mft_entry: Option<i64>,
+    mft_seq: Option<i64>,
 }
 
 impl RecycleBinRecord {
@@ -228,6 +235,9 @@ impl RecycleBinRecord {
             source_file,
             status: STATUS_OK.to_string(),
             error: None,
+            mft_path: None,
+            mft_entry: None,
+            mft_seq: None,
         }
     }
 }
@@ -347,24 +357,27 @@ fn record_for(path: &Path, ctx: &RecycleBinContext) -> RecycleBinRecord {
         rec.r_exists = r_exists(&r);
     }
 
-    let data = match std::fs::read(path) {
-        Ok(d) => d,
+    match std::fs::read(path) {
+        Ok(data) => apply_body(&mut rec, &data),
         Err(e) => {
             rec.status = STATUS_UNREADABLE.to_string();
             rec.error = Some(e.to_string());
-            return rec;
         }
-    };
-    match parse_dollar_i(&data) {
+    }
+    rec
+}
+
+fn apply_body(rec: &mut RecycleBinRecord, data: &[u8]) {
+    match parse_dollar_i(data) {
         Ok(parsed) => {
-            apply_header(&mut rec, parsed.header);
+            apply_header(rec, parsed.header);
             if rec.file_size.is_none() {
                 rec.status = STATUS_CORRUPTED.to_string();
                 rec.error = Some(format!(
                     "original size {} bytes out of representable range",
                     parsed.header.file_size
                 ));
-                return rec;
+                return;
             }
             rec.original_drive_letter = original_drive_letter(&parsed.original_path);
             rec.original_path = Some(parsed.original_path);
@@ -373,14 +386,13 @@ fn record_for(path: &Path, ctx: &RecycleBinContext) -> RecycleBinRecord {
             if let Some(header) = err.header {
                 rec.format_version = Some(header.version as i64);
                 if header.version == 1 || header.version == 2 {
-                    apply_header(&mut rec, header);
+                    apply_header(rec, header);
                 }
             }
             rec.status = STATUS_CORRUPTED.to_string();
             rec.error = Some(err.message);
         }
     }
-    rec
 }
 
 fn apply_header(rec: &mut RecycleBinRecord, header: DollarIHeader) {
@@ -424,6 +436,102 @@ pub fn recyclebin_sources(root: &Path) -> crate::finder::Found {
     found
 }
 
+/// Allocated `$I` record in `MFT_Records` directly under `$Recycle.Bin\<SID>\`.
+#[derive(Debug, Clone)]
+pub struct MftDollarI {
+    /// Evidence `$MFT` the record came from.
+    pub source_file: String,
+    pub volume_id: Option<String>,
+    /// In-volume path, e.g. `\$Recycle.Bin\<SID>\$IABC.txt`.
+    pub path: String,
+    pub entry: i64,
+    pub seq: Option<i64>,
+    /// Resident body; None when the MFT did not store it.
+    pub data: Option<Vec<u8>>,
+    /// Allocated `$R` with the same name in the same MFT directory.
+    pub r_exists: bool,
+}
+
+// [.., "$Recycle.Bin", SID, name] -> (SID, name).
+fn recycle_bin_child(path: &str) -> Option<(&str, &str)> {
+    let mut parts = path.rsplit('\\');
+    let name = parts.next()?;
+    let sid = parts.next()?;
+    let bin = parts.next()?;
+    (bin.eq_ignore_ascii_case("$recycle.bin") && looks_like_sid(sid)).then_some((sid, name))
+}
+
+// Same directory, `$I`/`$R` prefix dropped, case-insensitive.
+fn pair_key(source_file: &str, path: &str, name: &str) -> (String, String) {
+    let parent = &path[..path.len() - name.len()];
+    (source_file.to_string(), format!("{parent}{}", &name[2..]).to_lowercase())
+}
+
+/// Read allocated `$I`/`$R` names from an MFT_Records DB. Unallocated records are not recovered.
+pub fn mft_resident_sources(mft_db: &Path) -> Result<Vec<MftDollarI>> {
+    let conn = Connection::open_with_flags(mft_db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("open MFT DB: {}", mft_db.display()))?;
+    // $R may be a directory; $I is always a file.
+    let mut stmt = conn.prepare(
+        "SELECT _source_file, volume_id, path, entry, seq, data, data_status, is_directory FROM MFT_Records \
+         WHERE in_use = 1 AND path LIKE '%\\$Recycle.Bin\\%' ORDER BY rowid",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, Option<String>>(0)?.unwrap_or_default(),
+            r.get::<_, Option<String>>(1)?,
+            r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+            r.get::<_, Option<i64>>(3)?,
+            r.get::<_, Option<i64>>(4)?,
+            r.get::<_, Option<Vec<u8>>>(5)?,
+            r.get::<_, Option<String>>(6)?,
+            r.get::<_, Option<i64>>(7)?.unwrap_or(0) != 0,
+        ))
+    })?;
+    let mut items = Vec::new();
+    let mut r_names = std::collections::HashSet::new();
+    for row in rows {
+        let (source_file, volume_id, path, entry, seq, data, data_status, is_dir) = row?;
+        let Some((_, name)) = recycle_bin_child(&path) else { continue };
+        if is_dollar_r_name(name) {
+            r_names.insert(pair_key(&source_file, &path, name));
+        } else if let (false, true, Some(entry)) = (is_dir, is_dollar_i_name(name) && recycle_name_of(name).is_some(), entry) {
+            let data = data.filter(|_| data_status.as_deref() == Some("resident"));
+            items.push(MftDollarI { source_file, volume_id, path, entry, seq, data, r_exists: false });
+        }
+    }
+    for item in &mut items {
+        let name = item.path.rsplit('\\').next().unwrap_or_default();
+        item.r_exists = r_names.contains(&pair_key(&item.source_file, &item.path, name));
+    }
+    Ok(items)
+}
+
+fn record_for_mft(item: &MftDollarI, ctx: &RecycleBinContext) -> RecycleBinRecord {
+    let mut rec = RecycleBinRecord::empty(item.source_file.clone());
+    let (sid, name) = recycle_bin_child(&item.path).unwrap_or_default();
+    rec.account_sid = (!sid.is_empty()).then(|| sid.to_uppercase());
+    rec.account = rec
+        .account_sid
+        .as_ref()
+        .and_then(|sid| ctx.accounts.get(sid.as_str()).cloned())
+        .filter(|name| !name.is_empty());
+    rec.volume_id = item.volume_id.clone().filter(|v| !v.is_empty());
+    rec.recycle_name = recycle_name_of(name);
+    rec.r_exists = Some(i64::from(item.r_exists));
+    rec.mft_path = Some(item.path.clone());
+    rec.mft_entry = Some(item.entry);
+    rec.mft_seq = item.seq;
+    match &item.data {
+        Some(data) => apply_body(&mut rec, data),
+        None => {
+            rec.status = STATUS_UNREADABLE.to_string();
+            rec.error = Some("$I body is not resident in the MFT record".to_string());
+        }
+    }
+    rec
+}
+
 fn open_db(out: &Path) -> Result<Connection> {
     if let Some(parent) = out.parent() {
         if !parent.as_os_str().is_empty() {
@@ -462,13 +570,18 @@ fn insert(stmt: &mut rusqlite::Statement<'_>, rec: &RecycleBinRecord) -> rusqlit
         rec.source_file,
         rec.status,
         rec.error,
+        rec.mft_path,
+        rec.mft_entry,
+        rec.mft_seq,
     ])?;
     Ok(())
 }
 
 /// Retain per-input failures as rows; propagate storage failures.
+/// MFT copies identical to a collected file are skipped.
 pub fn parse_recyclebin(
     paths: &[PathBuf],
+    mft: &[MftDollarI],
     out: &Path,
     ctx: &RecycleBinContext,
 ) -> Result<RecycleBinReport> {
@@ -477,21 +590,32 @@ pub fn parse_recyclebin(
     let tx = conn.transaction()?;
     {
         let mut stmt = tx.prepare(INSERT_SQL)?;
+        // No dedup: a collected file has no proven volume identity, so an MFT copy stays its own row.
+        let mut write = |rec: RecycleBinRecord, input: PathBuf, report: &mut RecycleBinReport| {
+            if rec.status != STATUS_OK {
+                report.failed_rows += 1;
+            }
+            report.rows += 1;
+            let error = rec.error.as_ref().map(|e| match &rec.mft_path {
+                Some(path) => format!("{path}: {e}"),
+                None => e.clone(),
+            });
+            report.inputs.push(RecycleBinInput { path: input, rows: 1, error });
+            insert(&mut stmt, &rec)
+        };
         for path in paths {
             if crate::pipeline::cancelled() {
                 break;
             }
             let rec = record_for(path, ctx);
-            if rec.status != STATUS_OK {
-                report.failed_rows += 1;
+            write(rec, path.clone(), &mut report)?;
+        }
+        for item in mft {
+            if crate::pipeline::cancelled() {
+                break;
             }
-            report.rows += 1;
-            report.inputs.push(RecycleBinInput {
-                path: path.clone(),
-                rows: 1,
-                error: rec.error.clone(),
-            });
-            insert(&mut stmt, &rec)?;
+            let rec = record_for_mft(item, ctx);
+            write(rec, PathBuf::from(&item.source_file), &mut report)?;
         }
     }
     tx.commit()?;
@@ -814,7 +938,7 @@ mod tests {
         let mut context = ctx();
         context.accounts.insert(sid.to_string(), "user1".to_string());
         let report =
-            parse_recyclebin(&[ok.clone(), bad.clone(), unsupported.clone()], &out, &context)
+            parse_recyclebin(&[ok.clone(), bad.clone(), unsupported.clone()], &[], &out, &context)
                 .unwrap();
         assert_eq!((report.rows, report.failed_rows), (3, 2));
         assert_eq!(report.inputs.len(), 3);
@@ -851,6 +975,9 @@ mod tests {
                 "_source_file",
                 "_status",
                 "_error",
+                "mft_path",
+                "mft_entry",
+                "mft_seq",
             ]
         );
 
@@ -949,7 +1076,7 @@ mod tests {
         let dir = tmp("io");
         let missing = dir.join("$IGONE.txt");
         let out = dir.join("RecycleBin_Records.sqlite");
-        let report = parse_recyclebin(&[missing.clone()], &out, &ctx()).unwrap();
+        let report = parse_recyclebin(&[missing.clone()], &[], &out, &ctx()).unwrap();
         assert_eq!((report.rows, report.failed_rows), (1, 1));
         assert!(report.inputs[0].error.is_some());
         let conn = Connection::open(&out).unwrap();
@@ -965,6 +1092,106 @@ mod tests {
 
         let bad_out = dir.join("as_dir.sqlite");
         std::fs::create_dir_all(&bad_out).unwrap();
-        assert!(parse_recyclebin(&[], &bad_out, &ctx()).is_err());
+        assert!(parse_recyclebin(&[], &[], &bad_out, &ctx()).is_err());
+    }
+
+    const SID: &str = "S-1-5-21-111-222-333-500";
+
+    fn mft_db(dir: &Path, rows: &[(&str, i64, i64, Option<Vec<u8>>, &str, i64)]) -> PathBuf {
+        let db = dir.join("MFT_Records.sqlite");
+        crate::parsers::mft::parse_mft_sources(&[], &db).unwrap();
+        let conn = Connection::open(&db).unwrap();
+        for (path, in_use, is_dir, data, data_status, entry) in rows {
+            let file_name = path.rsplit('\\').next().unwrap();
+            conn.execute(
+                "INSERT INTO MFT_Records(volume_id, path, file_name, is_directory, in_use, file_size, data, entry, seq, data_status, _source_file) \
+                 VALUES ('vol-c', ?1, ?2, ?3, ?4, ?5, ?6, ?7, 3, ?8, 'E:\\C\\$MFT')",
+                rusqlite::params![path, file_name, is_dir, in_use, data.as_ref().map(|d| d.len() as i64).unwrap_or(0), data, entry, data_status],
+            )
+            .unwrap();
+        }
+        db
+    }
+
+    #[test]
+    fn mft_resident_dollar_i_in_an_allocated_sid_bin_becomes_a_row() {
+        let dir = tmp("mft");
+        let bin = format!("\\$Recycle.Bin\\{SID}");
+        let db = mft_db(&dir, &[
+            (&format!("{bin}\\$IABC.txt"), 1, 0, Some(v2(30, FT, "C:\\Users\\a\\abc.txt")), "resident", 10),
+            (&format!("{bin}\\$RABC.txt"), 1, 1, None, "not_applicable", 11),
+            (&format!("{bin}\\$INOR.exe"), 1, 0, Some(v1(40, FT, "D:\\tool.exe")), "resident", 12),
+            (&format!("{bin}\\$RNOR.exe"), 0, 0, None, "nonresident", 13),
+            (&format!("{bin}\\$IDEL.txt"), 0, 0, Some(v2(1, FT, "C:\\gone.txt")), "resident", 14),
+            (&format!("{bin}\\$IBIG.txt"), 1, 0, None, "nonresident", 15),
+            (&format!("{bin}\\$RDIR\\$IINNER.txt"), 1, 0, Some(v2(1, FT, "C:\\inner.txt")), "resident", 16),
+            ("\\Users\\a\\$Inot.txt", 1, 0, Some(v2(1, FT, "C:\\not.txt")), "resident", 17),
+            ("\\$Recycle.Bin\\$I30", 1, 0, Some(v2(1, FT, "C:\\i30.txt")), "resident", 18),
+        ]);
+        let sources = mft_resident_sources(&db).unwrap();
+        let out = dir.join("RecycleBin_Records.sqlite");
+        let mut context = ctx();
+        context.accounts.insert(SID.to_string(), "Administrator".to_string());
+        let report = parse_recyclebin(&[], &sources, &out, &context).unwrap();
+        assert_eq!((report.rows, report.failed_rows), (3, 1));
+
+        let conn = Connection::open(&out).unwrap();
+        let rows: Vec<(String, Option<String>, Option<i64>, Option<i64>, String, String, Option<String>, Option<String>, String, i64, i64, String)> = conn
+            .prepare(
+                "SELECT recycle_name, original_path, file_size, r_exists, _status, _source_file, account, volume_id, \
+                 mft_path, mft_entry, mft_seq, account_sid FROM RecycleBin_Records ORDER BY mft_entry",
+            )
+            .unwrap()
+            .query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?, r.get(11)?))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(rows.len(), 3);
+        let ok = &rows[0];
+        assert_eq!(ok.0, "ABC.txt");
+        assert_eq!(ok.1.as_deref(), Some("C:\\Users\\a\\abc.txt"));
+        assert_eq!(ok.2, Some(30));
+        assert_eq!(ok.3, Some(1), "allocated $R in the same MFT directory");
+        assert_eq!(ok.4, STATUS_OK);
+        assert_eq!(ok.5, "E:\\C\\$MFT");
+        assert_eq!(ok.6.as_deref(), Some("Administrator"));
+        assert_eq!(ok.7.as_deref(), Some("vol-c"));
+        assert_eq!(ok.8, format!("{bin}\\$IABC.txt"));
+        assert_eq!((ok.9, ok.10), (10, 3));
+        assert_eq!(ok.11, SID);
+        // Only an unallocated $R exists.
+        assert_eq!((rows[1].0.as_str(), rows[1].3, rows[1].2), ("NOR.exe", Some(0), Some(40)));
+        // Non-resident $I has no stored body: failure row, not a silent drop.
+        assert_eq!((rows[2].0.as_str(), rows[2].4.as_str(), rows[2].1.as_deref()), ("BIG.txt", STATUS_UNREADABLE, None));
+        assert!(report.inputs.iter().all(|input| input.path == Path::new("E:\\C\\$MFT")));
+    }
+
+    #[test]
+    fn collected_file_and_mft_copy_both_stay_without_volume_identity() {
+        let dir = tmp("mft-dedup");
+        let bytes = v2(30, FT, "C:\\Users\\a\\abc.txt");
+        let bin = dir.join("C").join("$Recycle.Bin").join(SID);
+        std::fs::create_dir_all(&bin).unwrap();
+        let file = bin.join("$IABC.txt");
+        std::fs::write(&file, &bytes).unwrap();
+        let mft_bin = format!("\\$Recycle.Bin\\{SID}");
+        let db = mft_db(&dir, &[
+            (&format!("{mft_bin}\\$IABC.txt"), 1, 0, Some(bytes.clone()), "resident", 10),
+            (&format!("{mft_bin}\\$IOTHER.txt"), 1, 0, Some(v2(5, FT, "C:\\other.txt")), "resident", 11),
+        ]);
+        let out = dir.join("RecycleBin_Records.sqlite");
+        let report = parse_recyclebin(&[file.clone()], &mft_resident_sources(&db).unwrap(), &out, &ctx()).unwrap();
+        assert_eq!(report.rows, 3);
+        let conn = Connection::open(&out).unwrap();
+        let names: Vec<(String, Option<i64>)> = conn
+            .prepare("SELECT recycle_name, mft_entry FROM RecycleBin_Records ORDER BY recycle_name, mft_entry")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(names, vec![("ABC.txt".to_string(), None), ("ABC.txt".to_string(), Some(10)), ("OTHER.txt".to_string(), Some(11))]);
     }
 }

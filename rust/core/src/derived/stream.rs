@@ -312,11 +312,15 @@ fn recycle_bin(ctx: &Ctx) -> Result<usize> {
             rec.set("r_exists", flag(get("r_exists")));
             rec.set("status", text(get("_status")));
             rec.set("error", text(get("_error")));
+            rec.set("mft_path", text(get("mft_path")));
+            rec.set("mft_entry", int(get("mft_entry")));
+            rec.set("mft_seq", int(get("mft_seq")));
+            let resident = !get("mft_path").is_empty();
             rec.source(ctx.facts.source_from_record_key(
                 &format!("{}::{}::{}", super::stem_of(&path), table, get("__source_rowid")),
                 None,
                 nz(get("_source_file")),
-                Some("휴지통 $I 메타데이터"),
+                Some(if resident { "MFT 상주 $I 메타데이터" } else { "휴지통 $I 메타데이터" }),
             )?);
             db.write(rec)?;
         }

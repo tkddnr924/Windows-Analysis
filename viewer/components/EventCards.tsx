@@ -120,11 +120,11 @@ export function CardShell({ label, listItem = false, tone, mark, expandable, ope
   const openBackground = mix(tone, 6);
   return (
     <section role={listItem ? "listitem" : undefined} aria-label={label} className={bookmarked ? "dfir-bookmarked-row" : undefined} style={{ marginBottom: 10, border: `1px solid ${open ? mix(tone, 42, "var(--border)") : "var(--border)"}`, borderRadius: "var(--radius)", background: "var(--bg-panel)", overflow: "hidden" }}>
-      <div style={{ display: "flex", alignItems: "center" }}>
+      <div style={{ display: "flex", alignItems: "center", background: open ? openBackground : "transparent" }}
+        onMouseEnter={(event) => { if (!open && !bookmarked) event.currentTarget.style.background = "var(--bg-hover)"; }}
+        onMouseLeave={(event) => { event.currentTarget.style.background = open ? openBackground : "transparent"; }}>
         <button type="button" onClick={onActivate} aria-expanded={expandable ? open : undefined} aria-label={buttonLabel}
-          onMouseEnter={(event) => { if (!open && !bookmarked) event.currentTarget.style.background = "var(--bg-hover)"; }}
-          onMouseLeave={(event) => { event.currentTarget.style.background = open ? openBackground : "transparent"; }}
-          style={{ flex: 1, minWidth: 0, display: "flex", alignItems: "center", gap: 12, minHeight: compact ? 46 : 60, padding: compact ? "6px 14px" : "11px 14px", border: "none", background: open ? openBackground : "transparent", color: "var(--text)", cursor: "pointer", textAlign: "left" }}>
+          style={{ flex: 1, minWidth: 0, display: "flex", alignItems: "center", gap: 12, minHeight: compact ? 46 : 60, padding: compact ? "6px 14px" : "11px 14px", border: "none", background: "transparent", color: "var(--text)", cursor: "pointer", textAlign: "left" }}>
           {mark}
           {children}
           {expandable && <KeyboardArrowDownOutlinedIcon aria-hidden="true" sx={{ fontSize: 20, color: "var(--text-faint)", flexShrink: 0, transform: open ? "none" : "rotate(-90deg)", transition: "transform .18s ease" }} />}

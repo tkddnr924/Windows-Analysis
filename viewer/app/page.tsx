@@ -11,6 +11,7 @@ import BookmarksView from "@/components/BookmarksView";
 import CaseSearchView from "@/components/CaseSearchView";
 import HostConnectionView, { type HostGraph, type ConnRecord } from "@/components/HostConnectionView";
 import RemoteAccessView from "@/components/RemoteAccessView";
+import RecycleBinView from "@/components/RecycleBinView";
 import SmbHistoryView from "@/components/SmbHistoryView";
 import BitsView from "@/components/BitsView";
 import ServiceView from "@/components/ServiceView";
@@ -1192,6 +1193,16 @@ export default function Home() {
                   data={activeTab.data}
                   hostDir={selectedHost?.dir ?? ""}
                   ipHosts={caseNetwork?.caseId === selectedCase?.id ? caseNetwork.ipHosts : {}}
+                  onNavigate={handleNavigate}
+                  onFetchLinkedRows={fetchLinkedRows}
+                  bookmarkedRowids={activeBookmarkedRowids}
+                  onToggleBookmark={(rowid) => handleToggleActiveRowBookmark(rowid)}
+                  timeRange={timeRange}
+                  accountDirectory={currentAccountDirectory}
+                />
+              ) : getArtifactView(activeTab.file.name)?.customView === "recycleBin" ? (
+                <RecycleBinView
+                  data={activeTab.data}
                   onNavigate={handleNavigate}
                   onFetchLinkedRows={fetchLinkedRows}
                   bookmarkedRowids={activeBookmarkedRowids}

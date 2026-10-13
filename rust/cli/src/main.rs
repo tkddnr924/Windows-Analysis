@@ -145,7 +145,7 @@ fn debug_parse(args: &[String]) -> Result<()> {
             if !found.errors.is_empty() {
                 bail!("RecycleBin discovery: {}", found.errors.join("; "));
             }
-            let parsed = parse_recyclebin(&found.paths, &out, &RecycleBinContext::default())?;
+            let parsed = parse_recyclebin(&found.paths, &[], &out, &RecycleBinContext::default())?;
             eprintln!("RecycleBin: {} rows, {} failed", parsed.rows, parsed.failed_rows);
             if parsed.failed_rows > 0 {
                 bail!("RecycleBin contains failed inputs");

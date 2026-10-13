@@ -1976,11 +1976,12 @@ mod tests {
             "CREATE TABLE RecycleBin_Records (format_version INTEGER, original_path TEXT, \
              file_size INTEGER, deleted_time_raw TEXT, timestamp TEXT, account_sid TEXT, \
              account TEXT, volume_id TEXT, original_drive_letter TEXT, recycle_name TEXT, \
-             r_exists INTEGER, _source_file TEXT NOT NULL, _status TEXT, _error TEXT);\
+             r_exists INTEGER, _source_file TEXT NOT NULL, _status TEXT, _error TEXT, \
+             mft_path TEXT, mft_entry INTEGER, mft_seq INTEGER);\
              INSERT INTO RecycleBin_Records VALUES (2,'C:\\Users\\a\\secret.docx',1234,\
              '133512345678901234','2026-03-04 05:06:07.890','S-1-5-21-1-2-3-1001',NULL,'vol-1',\
              'C:','$RABCDEF.docx',0,'C:\\$Recycle.Bin\\S-1-5-21-1-2-3-1001\\$IABCDEF.docx',\
-             'ok',NULL);",
+             'ok',NULL,'\\$Recycle.Bin\\S-1-5-21-1-2-3-1001\\$IABCDEF.docx',88,4);",
         );
         build_all(&out_dir, &target, "host-1", "ds-1").unwrap();
         let conn = open(&out_dir, "RecycleBin");
@@ -2026,6 +2027,12 @@ mod tests {
         assert_eq!(error, None);
         assert_eq!(account, None);
         assert_eq!(sid, "S-1-5-21-1-2-3-1001");
+        let mft: (String, i64, i64) = conn
+            .query_row("SELECT mft_path, mft_entry, mft_seq FROM RecycleBin", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(mft, ("\\$Recycle.Bin\\S-1-5-21-1-2-3-1001\\$IABCDEF.docx".to_string(), 88, 4));
         let _ = std::fs::remove_dir_all(out_dir.parent().unwrap());
     }
 

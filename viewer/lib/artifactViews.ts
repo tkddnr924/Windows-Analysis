@@ -160,7 +160,7 @@ export interface ArtifactViewSpec {
    * Overview correlations (TargetInfo, ...) read as summaries/dashboards, not
    * spreadsheets, so each gets a purpose-built view.
    */
-  customView?: "targetInfo" | "executionHistory" | "powershellFlow" | "defender" | "registryExplorer" | "rdpCache" | "browserHistory" | "smb" | "bits" | "service" | "firewall" | "scheduledTasks" | "wer" | "mft" | "usnJrnl" | "remoteAccess";
+  customView?: "targetInfo" | "executionHistory" | "powershellFlow" | "defender" | "registryExplorer" | "rdpCache" | "browserHistory" | "smb" | "bits" | "service" | "firewall" | "scheduledTasks" | "wer" | "mft" | "usnJrnl" | "remoteAccess" | "recycleBin";
   /**
    * In the sidebar, present this table split by this column: instead of one
    * row for the whole table, the category lists one entry per distinct value
@@ -375,7 +375,7 @@ export const MFT_PARENT_STATUS_LABELS: Record<string, string> = { verified: "확
 export const MFT_PATH_STATUS_LABELS: Record<string, string> = { complete: "완전한 경로", sequence_mismatch: "불완전 (부모 순번 불일치)", unknown: "불완전 (부모 미확인)" };
 export const MFT_DATA_STATUS_LABELS: Record<string, string> = { resident: "Resident 본문", resident_empty: "빈 Resident 본문", nonresident: "Non-resident (본문 미저장)", unavailable: "본문 미확보", not_applicable: "폴더 (본문 없음)" };
 const PATH_MATCH_BASIS_LABELS: Record<string, string> = { path: "경로 일치 (드라이브 미확인)", path_and_drive: "경로·드라이브 일치" };
-const RECYCLE_R_EXISTS_LABELS: Record<string, string> = { "1": "수집본에 $R 있음", "0": "수집본에 $R 없음" };
+const RECYCLE_R_EXISTS_LABELS: Record<string, string> = { "1": "있음", "0": "없음" };
 
 // 볼륨 값은 파일마다 따로 있는 값이 아니라 $Volume 레코드의 값을 그 볼륨의
 // 파일 행에 연결한 것이다. volume_id는 결과 안에서 볼륨 문맥을 구분하는 내부
@@ -680,7 +680,7 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     ]}],
   },
 
-  // 휴지통 원본 facts(RECYCLEBIN/RecycleBin_Records) — 수집된 $I 한 건.
+  // 휴지통 원본 facts(RECYCLEBIN/RecycleBin_Records) — 수집된 $I 또는 MFT 상주 $I 한 건.
   RecycleBin_Records: {
     title: (r) => (r.original_path ? r.original_path.split("\\").filter(Boolean).pop() ?? r.original_path : "") || r.recycle_name || "(휴지통)",
     subtitle: (r) => r.original_path || "",
@@ -691,17 +691,21 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
       { key: "deleted_time_raw", label: "삭제 시각 원문 (FILETIME)" },
       { key: "format_version", label: "$I 형식 버전" },
       { key: "recycle_name", label: "대응 이름" },
-      { key: "r_exists", label: "$R 수집 여부", valueLabels: RECYCLE_R_EXISTS_LABELS, showWhenEmpty: true, emptyLabel: "확인 불가" },
+      { key: "r_exists", label: "대응 $R", valueLabels: RECYCLE_R_EXISTS_LABELS, showWhenEmpty: true, emptyLabel: "확인 불가" },
       { key: "account_sid", label: "계정 SID", kind: "accountSid" },
       { key: "_status", label: "파싱 상태" },
       { key: "_error", label: "실패 사유" },
+      { key: "mft_path", label: "MFT 볼륨 내 경로", kind: "path" },
+      { key: "mft_entry", label: "MFT 엔트리" },
+      { key: "mft_seq", label: "MFT 시퀀스" },
     ]}],
   },
 
   // 휴지통 파생(_OVERVIEW/RecycleBin) — $I 한 건이 한 행. $R의 경로·종류·
-  // 본문은 저장하지 않으므로 화면에도 없다. r_exists는 수집본에 대응 $R이
-  // 있었는지만 말한다(영구 삭제·복구 가능 여부의 증거가 아니다).
+  // 본문은 저장하지 않으므로 화면에도 없다. r_exists는 수집본(또는 MFT의 할당
+  // 레코드)에 대응 $R이 있었는지만 말한다(영구 삭제·복구 가능 여부의 증거가 아니다).
   RecycleBin: {
+    customView: "recycleBin",
     title: (r) => (r.original_path ? r.original_path.split("\\").filter(Boolean).pop() ?? r.original_path : "") || r.recycle_name || "(휴지통)",
     subtitle: (r) => r.original_path || "",
     timelineField: "timestamp",
@@ -717,8 +721,12 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
       { key: "format_version", label: "$I 형식 버전" },
       { key: "recycle_name", label: "대응 이름" },
       // 1/0/NULL — 확인 불가를 "없음"으로 단정하지 않는다(docs-01).
-      { key: "r_exists", label: "$R 수집 여부", valueLabels: RECYCLE_R_EXISTS_LABELS, showWhenEmpty: true, emptyLabel: "확인 불가" },
+      { key: "r_exists", label: "대응 $R", valueLabels: RECYCLE_R_EXISTS_LABELS, showWhenEmpty: true, emptyLabel: "확인 불가" },
       { key: "volume_id", label: "볼륨 문맥", showWhenEmpty: true, emptyLabel: "확인된 볼륨 문맥 없음" },
+    ]}, { heading: "MFT 상주 $I", fields: [
+      { key: "mft_path", label: "볼륨 내 경로", kind: "path" },
+      { key: "mft_entry", label: "MFT 엔트리" },
+      { key: "mft_seq", label: "시퀀스" },
     ]}, { heading: "계정", fields: [
     ]}, { heading: "파싱", fields: [
       { key: "status", label: "상태" },

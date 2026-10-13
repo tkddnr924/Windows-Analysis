@@ -1774,23 +1774,45 @@ fn parse_recyclebin_artifact(
     outcome: &mut ArtifactOutcome,
 ) -> Result<Vec<String>> {
     entry_record_inputs(&mut outcome.entry, paths);
-    if paths.is_empty() {
+    // Staged MFT facts: this run's MFT, or the copied prior one on a scoped run.
+    let mft_db = out_dir.join("_OVERVIEW/MFT_Records.sqlite");
+    let mft = if mft_db.is_file() {
+        match recyclebin::mft_resident_sources(&mft_db) {
+            Ok(items) => items,
+            Err(error) => {
+                outcome.errors.push(format!("RecycleBin MFT {}: {error:#}", mft_db.display()));
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    if paths.is_empty() && mft.is_empty() {
         return Ok(Vec::new());
     }
     let relative = "RECYCLEBIN/RecycleBin_Records.sqlite";
     let parsed = recyclebin::parse_recyclebin(
         paths,
+        &mft,
         &out_dir.join(relative),
         &recyclebin::RecycleBinContext {
             volume_id: None,
             accounts: crate::metadata::account_names_from_facts(out_dir)?,
         },
     )?;
+    // One MFT feeds many rows: aggregate per input path.
+    let mut per_input = std::collections::BTreeMap::<PathBuf, (usize, Vec<String>)>::new();
     for input in parsed.inputs {
-        entry_record_input_count(&mut outcome.entry, &input.path, input.rows);
-        if let Some(error) = input.error {
-            entry_record_input_error(&mut outcome.entry, &input.path, &error);
-            outcome.errors.push(format!("RecycleBin {}: {error}", input.path.display()));
+        let slot = per_input.entry(input.path).or_default();
+        slot.0 += input.rows;
+        slot.1.extend(input.error);
+    }
+    for (path, (rows, errors)) in per_input {
+        entry_record_input_count(&mut outcome.entry, &path, rows);
+        if !errors.is_empty() {
+            let error = errors.join("; ");
+            entry_record_input_error(&mut outcome.entry, &path, &error);
+            outcome.errors.push(format!("RecycleBin {}: {error}", path.display()));
         }
     }
     emit(&format!("[+] {} rows -> {}", parsed.rows, relative));
@@ -2685,12 +2707,15 @@ pub fn run_host_with_log_id(
     append_current_log_lifecycle("discovery_finished");
 
     // ---- 2단계: 아티팩트 병렬 파싱 — 각 아티팩트의 원본 데이터베이스 저장 ----
-    // Serialize shared browser DB writes and registry-backed SID resolution.
+    // Serialize shared browser DB writes. RecycleBin reads Registry SIDs and
+    // staged MFT facts, so it runs after every other parser.
     let mut chains: Vec<Vec<&'static str>> = Vec::new();
     for &name in &wanted {
+        if name == "RecycleBin" {
+            continue;
+        }
         let prerequisite = match name {
             "BrowserCache" => Some("BrowserHistory"),
-            "RecycleBin" => Some("Registry"),
             _ => None,
         };
         if let Some(prerequisite) = prerequisite {
@@ -2733,6 +2758,14 @@ pub fn run_host_with_log_id(
                 });
             }
         });
+    }
+    if wanted.contains(&"RecycleBin") {
+        let (paths, discovery_errors): (&[PathBuf], &[String]) = discovered
+            .get("RecycleBin")
+            .map(|found| (found.paths.as_slice(), found.errors.as_slice()))
+            .unwrap_or((&[], &[]));
+        let outcome = run_artifact_job("RecycleBin", paths, discovery_errors, &out_dir, &dataset_id);
+        outcomes.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push(outcome);
     }
     let mut outcomes = outcomes
         .into_inner()
@@ -3276,6 +3309,43 @@ mod persistent_log_tests {
             [bad.to_string_lossy().as_ref()], |row| row.get(0),
         ).unwrap();
         assert_eq!(failed, "corrupted");
+        drop(db);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recyclebin_parses_resident_mft_dollar_i_without_collected_files() {
+        let _serial = PIPELINE_LOG_TEST_LOCK.lock();
+        CANCEL.store(false, Ordering::Relaxed);
+        let root = temporary_directory("recyclebin-mft");
+        let output = root.join("output");
+        let mft_path = output.join("_OVERVIEW/MFT_Records.sqlite");
+        mft::parse_mft_sources(&[], &mft_path).unwrap();
+        let name: Vec<u16> = "C:\\temp\\file.txt\0".encode_utf16().collect();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&2u64.to_le_bytes());
+        bytes.extend_from_slice(&128u64.to_le_bytes());
+        bytes.extend_from_slice(&133000000000000000u64.to_le_bytes());
+        bytes.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        for value in name {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        rusqlite::Connection::open(&mft_path).unwrap().execute(
+            "INSERT INTO MFT_Records(volume_id, path, file_name, is_directory, in_use, file_size, data, entry, seq, data_status, _source_file) \
+             VALUES ('vol', '\\$Recycle.Bin\\S-1-5-21-1-2-3-500\\$IAB.txt', '$IAB.txt', 0, 1, ?1, ?2, 7, 1, 'resident', 'evidence-MFT')",
+            rusqlite::params![bytes.len() as i64, bytes],
+        ).unwrap();
+        let outcome = run_artifact_job("RecycleBin", &[], &[], &output, "fixture-generation");
+        assert_eq!(outcome.entry.status, "completed", "{:?}", outcome.errors);
+        assert!(outcome.errors.is_empty());
+        assert_eq!(outcome.entry.inputs.len(), 1);
+        assert_eq!(outcome.entry.inputs[0].source_path, "evidence-MFT");
+        assert_eq!(outcome.entry.inputs[0].record_count, 1);
+        let db = rusqlite::Connection::open(output.join("RECYCLEBIN/RecycleBin_Records.sqlite")).unwrap();
+        let record: (String, i64) = db.query_row(
+            "SELECT original_path, mft_entry FROM RecycleBin_Records", [], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(record, ("C:\\temp\\file.txt".to_string(), 7));
         drop(db);
         std::fs::remove_dir_all(root).unwrap();
     }

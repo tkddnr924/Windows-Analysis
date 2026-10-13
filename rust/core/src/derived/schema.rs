@@ -2071,6 +2071,9 @@ CREATE TABLE "RecycleBin" (
   "r_exists" INTEGER CHECK ("r_exists" IN (0,1)),
   "status" TEXT,
   "error" TEXT,
+  "mft_path" TEXT,
+  "mft_entry" INTEGER,
+  "mft_seq" INTEGER,
   PRIMARY KEY(record_id),
   CHECK(overview_name = 'RecycleBin'),
   CHECK(timestamp IS NULL OR timestamp_kind IS NOT NULL)
@@ -2121,6 +2124,9 @@ const RECYCLE_BIN_COLUMNS: &[&str] = &[
     "r_exists",
     "status",
     "error",
+    "mft_path",
+    "mft_entry",
+    "mft_seq",
 ];
 
 const RECYCLE_BIN_SOURCE_RECORDS_COLUMNS: &[&str] = &[
