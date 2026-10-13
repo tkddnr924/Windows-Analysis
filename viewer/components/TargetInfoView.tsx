@@ -7,7 +7,6 @@ import { useContext, useEffect, useMemo, useRef, useState } from "react";
 import ArrowBackOutlinedIcon from "@mui/icons-material/ArrowBackOutlined";
 import BookmarkBorderOutlinedIcon from "@mui/icons-material/BookmarkBorderOutlined";
 import BookmarkIcon from "@mui/icons-material/Bookmark";
-import ChevronLeftOutlinedIcon from "@mui/icons-material/ChevronLeftOutlined";
 import ChevronRightOutlinedIcon from "@mui/icons-material/ChevronRightOutlined";
 import CircularProgress from "@mui/material/CircularProgress";
 import Tooltip from "@mui/material/Tooltip";
@@ -29,9 +28,7 @@ import { RecordScopeContext } from "@/lib/recordScope";
 import { hostDirOfResultPath } from "@/lib/resultTables";
 import { toBound, type TimeRange } from "@/lib/timeRange";
 import RowDetailPanel from "./RowDetailPanel";
-import { useModalDialog } from "@/lib/useModalDialog";
 import type { AccountDirectory } from "@/lib/accountIdentity";
-import { basename } from "@/lib/viewShared";
 import PaginationControls from "@/components/PaginationControls";
 import { expandAccountPath } from "@/lib/accountPath";
 
@@ -975,42 +972,3 @@ function AccountDetailPage({ account, onBack, loadEvents, timeRange, onNavigate,
   );
 }
 
-function EventDetailModal({ row, onClose }: { row: Row; onClose: () => void }) {
-  const dialogRef = useModalDialog(onClose);
-
-  const eid = row.EventID || "";
-  const label = EVENT_LABELS[eid] || `Event ${eid}`;
-  const summary = eventSummary(row);
-  // System/meta columns to show (skip internal + the raw EventData blob, which
-  // is expanded field-by-field below).
-  const META_ORDER = ["timestamp", "EventID", "LevelName", "Provider", "Channel", "Computer", "EventRecordID", "ProcessID", "ThreadID", "UserID", "_log", "_record_key"];
-  const meta = META_ORDER.filter((k) => row[k]).map((k) => [k, row[k]] as [string, string]);
-  // Flatten so nested objects (e.g. 1149 EventXML) expand into readable rows
-  // rather than "[object Object]".
-  const edEntries = flattenEd(parseEd(row)).filter(([, v]) => v !== "");
-
-  return (
-    <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(1,4,9,0.7)", zIndex: 300, display: "flex", alignItems: "center", justifyContent: "center", padding: 24 }}>
-      <div ref={dialogRef} role="dialog" aria-modal="true" aria-label="이벤트 상세" onClick={(e) => e.stopPropagation()} style={{ width: "min(720px, 96vw)", maxHeight: "88vh", display: "flex", flexDirection: "column", background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "var(--radius)", boxShadow: "var(--shadow-panel)", overflow: "hidden" }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "12px 16px", borderBottom: "1px solid var(--border)", background: "var(--bg-elevated)", flexShrink: 0 }}>
-          <span style={{ fontSize: 14.5, fontWeight: 700 }}>{label}</span>
-          <span style={{ fontSize: 11, color: "var(--text-faint)" }}>EventID {eid} · {row._log || row.Channel || ""}</span>
-          <span style={{ marginLeft: "auto", fontSize: 11, color: "var(--text-faint)", fontFamily: "var(--mono)" }}>{row.timestamp}</span>
-          <button onClick={onClose} title="닫기 (Esc)" style={{ background: "transparent", border: "none", color: "var(--text-dim)", fontSize: 20, cursor: "pointer", lineHeight: 1, padding: "0 4px" }}>×</button>
-        </div>
-        <div style={{ padding: "6px 16px 16px", overflow: "auto" }}>
-          {summary && <div style={{ fontSize: 12.5, color: "var(--text-dim)", padding: "4px 0 8px" }}>{summary}</div>}
-          <div style={{ fontSize: 11, fontWeight: 700, color: "var(--text-faint)", margin: "8px 0 2px" }}>이벤트</div>
-          {meta.map(([k, v]) => (
-            <DetailRow key={k} label={k} value={v} mono={k === "_record_key" || k === "UserID"} />
-          ))}
-          <div style={{ fontSize: 11, fontWeight: 700, color: "var(--text-faint)", margin: "12px 0 2px" }}>EventData ({edEntries.length})</div>
-          {edEntries.length === 0 && <div style={{ fontSize: 12, color: "var(--text-faint)", padding: "6px 0" }}>추가 데이터 없음</div>}
-          {edEntries.map(([k, v]) => (
-            <DetailRow key={k} label={k} value={String(v)} mono />
-          ))}
-        </div>
-      </div>
-    </div>
-  );
-}

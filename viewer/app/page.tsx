@@ -744,6 +744,8 @@ export default function Home() {
   }
 
   const activeTab = tabs.find((t) => keyOf(t.file) === activePath) ?? null;
+  // _OVERVIEW contract result (raw facts such as MFT_Records report derived=false).
+  const activeIsOverviewResult = Boolean(activeTab && /[\\/]_OVERVIEW[\\/]/.test(activeTab.file.fullPath) && activeTab.file.derived !== false);
   const currentAccountDirectory = selectedHost ? accountDirectories[accountDirectoryKey(selectedHost)] : undefined;
   const accountDirectoryForHostId = useCallback(
     (hostId: string): AccountDirectory | undefined => {
@@ -1179,8 +1181,9 @@ export default function Home() {
                   onInitialFilterConsumed={() => setPendingFilter(null)}
                   onNavigate={handleNavigate}
                   onFetchLinkedRows={fetchLinkedRows}
-                  bookmarkedRowids={activeBookmarkedRowids}
-                  onToggleBookmark={(rowid) => handleToggleActiveRowBookmark(rowid)}
+                  // docs-20/22: raw tables carry no bookmarks.
+                  bookmarkedRowids={activeIsOverviewResult ? activeBookmarkedRowids : undefined}
+                  onToggleBookmark={activeIsOverviewResult ? (rowid) => handleToggleActiveRowBookmark(rowid) : undefined}
                   timeRange={timeRange}
                   accountDirectory={currentAccountDirectory}
                 />

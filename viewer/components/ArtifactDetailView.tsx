@@ -11,6 +11,8 @@ import ExpandMoreOutlinedIcon from "@mui/icons-material/ExpandMoreOutlined";
 import OpenInFullOutlinedIcon from "@mui/icons-material/OpenInFullOutlined";
 import ContentCopyOutlinedIcon from "@mui/icons-material/ContentCopyOutlined";
 import CheckIcon from "@mui/icons-material/Check";
+import CategoryOutlinedIcon from "@mui/icons-material/CategoryOutlined";
+import PersonOutlineOutlinedIcon from "@mui/icons-material/PersonOutlineOutlined";
 import type { ArtifactViewSpec, DetailSectionSpec, FieldKind, FieldSpec, LinkSpec } from "@/lib/artifactViews";
 import { getArtifactView } from "@/lib/artifactViews";
 import type { BrowserRecord, BrowserVisitFlow, FetchLinkedRows } from "@/lib/types";
@@ -18,7 +20,8 @@ import AccountTreeOutlinedIcon from "@mui/icons-material/AccountTreeOutlined";
 import VisitFlowGraphModal from "./VisitFlowGraph";
 import { HexViewer } from "./HexViewer";
 import { bodyKind } from "@/lib/browserView";
-import { resolveAccountDisplay, type AccountDirectory } from "@/lib/accountIdentity";
+import { MACHINE_SCOPE_LABEL, MACHINE_SCOPE_USER, resolveAccountDisplay, type AccountDirectory } from "@/lib/accountIdentity";
+import { OVERVIEW_TABLE_NAMES } from "@/lib/overviewLabels";
 import { parsePrivileges, lookupPrivilege } from "@/lib/privileges";
 import TagList from "./TagList";
 import MiniTimeline from "./MiniTimeline";
@@ -885,6 +888,16 @@ export default function ArtifactDetailView({ spec, row, evidenceTime, onNavigate
   // Selection context does not replace any original evidence field.
   const timeValue = evidenceTime?.value ?? ((spec.timelineField ? row[spec.timelineField] : "") || row.timestamp || row.last_write || "");
   const showTime = Boolean(timeValue && (evidenceTime || spec.overviewTime !== "hide"));
+  // docs-23 common top: an _OVERVIEW record's common columns are shown here
+  // once (artifact specs do not repeat them).
+  const isOverviewRecord = Boolean(row.overview_name);
+  const timeLabel = evidenceTime?.label ?? (isOverviewRecord ? row.timestamp_kind : "");
+  const accountText = row.account === MACHINE_SCOPE_USER
+    ? `${MACHINE_SCOPE_LABEL} (HKLM)`
+    : row.account || (row.account_sid ? resolveAccountDisplay(row.account_sid, accountDirectory) || row.account_sid : "");
+  const eventTypeText = isOverviewRecord ? spec.eventTypeLabels?.[row.event_type] ?? row.event_type ?? "" : "";
+  const accountChip = isOverviewRecord ? accountText : "";
+  const descriptionText = isOverviewRecord && row.description && row.description !== title && row.description !== row.event_type ? row.description : "";
 
   return (
     <div style={{ minWidth: 0, maxWidth: "100%" }}>
@@ -894,12 +907,12 @@ export default function ArtifactDetailView({ spec, row, evidenceTime, onNavigate
         </div>
       )}
       <div style={{ padding: "18px 16px 14px", borderBottom: "1px solid var(--border-subtle)" }}>
-        <div className="dfir-section-label" style={{ marginBottom: 8 }}>증거 개요</div>
+        <div className="dfir-section-label" style={{ marginBottom: 8 }}>증거 개요{isOverviewRecord && OVERVIEW_TABLE_NAMES[row.overview_name] ? ` · ${OVERVIEW_TABLE_NAMES[row.overview_name]}` : ""}</div>
         <div style={{ padding: "12px 14px", background: "var(--bg-elevated)", border: "1px solid color-mix(in srgb, var(--text-faint) 38%, transparent)", borderRadius: "var(--radius)" }}>
           <div style={{ minWidth: 0, maxWidth: "100%", fontSize: 16, fontWeight: 700, overflowWrap: "anywhere", wordBreak: "break-word" }}>{title}</div>
           {showTime && (
             <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12.5, color: "var(--text-time)", fontFamily: "var(--mono)", fontWeight: 550, marginTop: 7 }}>
-              {evidenceTime?.label && <span>{evidenceTime.label}</span>}
+              {timeLabel && <span style={{ color: "var(--text-dim)", fontFamily: "var(--sans)", fontWeight: 500 }}>{timeLabel}</span>}
               {timeValue}
               <CopyButton value={timeValue} />
             </div>
@@ -910,6 +923,21 @@ export default function ArtifactDetailView({ spec, row, evidenceTime, onNavigate
               <CopyButton value={subtitle} />
             </div>
           )}
+          {(eventTypeText || accountChip) && (
+            <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 6, marginTop: 10 }}>
+              {eventTypeText && (
+                <span title="기록 종류" style={{ display: "inline-flex", alignItems: "center", gap: 5, maxWidth: "100%", minHeight: 24, padding: "2px 9px", borderRadius: "var(--radius)", border: "1px solid color-mix(in srgb, var(--accent) 45%, var(--border))", background: "var(--accent-subtle)", color: "var(--accent)", fontSize: 12, fontWeight: 700, overflowWrap: "anywhere" }}>
+                  <CategoryOutlinedIcon aria-hidden="true" sx={{ fontSize: 14 }} />{eventTypeText}
+                </span>
+              )}
+              {accountChip && (
+                <span title={["계정", row.account_sid && row.account_sid !== accountChip ? row.account_sid : ""].filter(Boolean).join("\n")} style={{ display: "inline-flex", alignItems: "center", gap: 5, maxWidth: "100%", minHeight: 24, padding: "2px 10px", borderRadius: 999, border: "1px solid var(--border)", background: "var(--bg-panel)", color: "var(--text)", fontSize: 12, fontWeight: 650, overflowWrap: "anywhere" }}>
+                  <PersonOutlineOutlinedIcon aria-hidden="true" sx={{ fontSize: 14, color: "var(--text-dim)" }} />{accountChip}
+                </span>
+              )}
+            </div>
+          )}
+          {descriptionText && <div title="설명" style={{ marginTop: 8, color: "var(--text-dim)", fontSize: 12.5, lineHeight: 1.5, overflowWrap: "anywhere" }}>{descriptionText}</div>}
         </div>
         {activeLinks.length > 0 && (
           <div style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 10 }}>

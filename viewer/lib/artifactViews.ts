@@ -111,6 +111,8 @@ export interface ArtifactViewSpec {
    * own concise evidence summary. */
   overviewTime?: "show" | "hide";
   badges?: FieldSpec[];
+  /** Display names of stored event_type values in the common top (docs-23). */
+  eventTypeLabels?: Record<string, string>;
   tags?: (row: Record<string, string>) => Tag[];
   timelineFields?: TimelineFieldSpec[];
   /** The timeline's evidence source when its points are not generic activity
@@ -556,7 +558,6 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
       { heading: "변경 기록", fields: [
         { key: "file_name", label: "파일명", kind: "path" },
         { key: "path", label: "전체 경로", kind: "path", showWhenEmpty: true, emptyLabel: "$J에 없는 값 — 외부 근거 없음" },
-        { key: "event_type", label: "기록 종류" },
         { key: "reason", label: "변경 이유 (이 기록)", kind: "code" },
         { key: "reason_mask", label: "변경 이유 원문 비트마스크" },
         { key: "rename_role", label: "이름 변경 역할", valueLabels: { old: "이전 이름 (OLD)", new: "새 이름 (NEW)", both: "이전·새 이름" } },
@@ -683,8 +684,6 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
       // 0/1/NULL — 미확인을 "파일"로 단정하지 않는다(docs-01).
       { key: "is_directory", label: "디렉터리", valueLabels: MFT_DIRECTORY_LABELS, showWhenEmpty: true, emptyLabel: "확인 불가" },
       { key: "in_use", label: "할당 상태", valueLabels: MFT_IN_USE_LABELS, showWhenEmpty: true, emptyLabel: "확인 불가" },
-      { key: "account", label: "계정", kind: "account", compute: (r) => r.account || r.account_sid },
-      { key: "event_type", label: "항목 종류" },
     ]}, { heading: "$STANDARD_INFORMATION (0x10)", fields: [
       { key: "si_created", label: "생성", showWhenEmpty: true, bookmarkable: true }, { key: "si_modified", label: "수정", showWhenEmpty: true, bookmarkable: true },
       { key: "si_mft_modified", label: "MFT 수정", showWhenEmpty: true, bookmarkable: true }, { key: "si_accessed", label: "접근", showWhenEmpty: true, bookmarkable: true },
@@ -753,8 +752,6 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
       { key: "r_exists", label: "$R 수집 여부", valueLabels: RECYCLE_R_EXISTS_LABELS, showWhenEmpty: true, emptyLabel: "확인 불가" },
       { key: "volume_id", label: "볼륨 문맥", showWhenEmpty: true, emptyLabel: "확인된 볼륨 문맥 없음" },
     ]}, { heading: "계정", fields: [
-      { key: "account", label: "계정", kind: "account", showWhenEmpty: true, emptyLabel: "계정명 미확인" },
-      { key: "account_sid", label: "계정 SID", kind: "accountSid" },
     ]}, { heading: "파싱", fields: [
       { key: "status", label: "상태" },
       { key: "error", label: "실패 사유" },
@@ -769,7 +766,6 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     badges: [{ key: "event_type", kind: "badge" }],
     sections: [{ heading: "참조", fields: [
       { key: "__match_basis", label: "후보 근거", valueLabels: PATH_MATCH_BASIS_LABELS },
-      { key: "account", label: "계정", kind: "account", compute: (r) => r.account || r.account_sid },
       { key: "label", label: "표시 이름" },
       { key: "target_path", label: "대상 경로 (원문)", kind: "path" },
       { key: "target_path_resolved", label: "대상 경로 (해석)", kind: "path" },
@@ -804,7 +800,6 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     sections: [{ heading: "값", fields: [
       { key: "value" },
       { key: "timestamp" },
-      { key: "event_type", label: "분류" },
     ]}],
   },
 
@@ -896,7 +891,6 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
         // KNOWNFOLDERID GUID 접두 경로는 실제 경로로 변환해 함께 보여 준다.
         { key: "program_path", label: "실행 경로 (변환)", kind: "path", compute: (r) => resolveKnownFolderPath(executionValue("userAssist", "program_path", r)) ?? "" },
         { key: "program_path", label: "원본 경로", kind: "path", compute: (r) => executionValue("userAssist", "program_path", r) },
-        { key: "account", label: "실행 계정", kind: "account", compute: (r) => executionValue("userAssist", "account", r) },
         { key: "run_count", label: "실행 횟수", compute: (r) => executionValue("userAssist", "run_count", r) },
         { key: "focus_count", label: "포커스 횟수", compute: (r) => executionValue("userAssist", "focus_count", r) },
         { key: "focus_time_ms", label: "포커스 시간", kind: "durationMs", compute: (r) => executionValue("userAssist", "focus_time_ms", r) },
@@ -904,12 +898,10 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
       { heading: "SRUM 사용 정보", fields: [
         { key: "program_name", label: "응용 프로그램", compute: (r) => executionValue("srum", "program_name", r) },
         { key: "program_path", label: "응용 프로그램 경로", kind: "path", compute: (r) => executionValue("srum", "program_path", r) },
-        { key: "account", label: "사용자", kind: "account", compute: (r) => executionValue("srum", "account", r) },
       ]},
       { heading: "BAM 실행 정보", fields: [
         { key: "program_name", label: "실행 파일", compute: (r) => executionValue("bam", "program_name", r) },
         { key: "program_path", label: "실행 경로", kind: "path", compute: (r) => executionValue("bam", "program_path", r) },
-        { key: "account_sid", label: "실행 계정", kind: "accountSid", compute: (r) => executionValue("bam", "account_sid", r) },
       ]},
       { heading: "Prefetch 실행 정보", fields: [
         { key: "program_name", label: "실행 파일", compute: (r) => executionValue("prefetch", "program_name", r) },
@@ -930,8 +922,6 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
       // account/account_sid are the common account; account_role says whose it is.
       { heading: "이벤트 계정", fields: [
         { key: "account_role", label: "계정 역할", valueLabels: ACCOUNT_ROLE_LABELS },
-        { key: "account", label: "계정", kind: "account", compute: (r) => r.account_role ? r.account : "" },
-        { key: "account_sid", label: "계정 SID", kind: "accountSid", compute: (r) => r.account_role ? r.account_sid : "" },
       ]},
       { heading: "생성 요청자 (Subject)", fields: [
         { key: "subject_user_name", label: "계정 이름 (SubjectUserName)", kind: "account" },
@@ -997,8 +987,6 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     priorityColumns: ["timestamp", "event_type", "task_name", "task_path", "run_as", "result"],
     sections: [
       { heading: "작업", fields: [
-        { key: "event_type", label: "기록 종류", kind: "badge" },
-        { key: "timestamp_kind", label: "대표 시각 의미" },
         { key: "task_name", label: "작업 이름" },
         { key: "task_path", label: "작업 경로" },
         { key: "uri", label: "URI 원문", compute: (r) => (r.uri && r.uri !== r.task_path ? r.uri : "") },
@@ -1012,7 +1000,6 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
         { key: "registration_date_raw", label: "등록 시각 원문", compute: (r) => (r.registration_date_raw && r.registration_date_raw !== r.registration_date ? r.registration_date_raw : "") },
         { key: "job_last_run", label: ".job 마지막 실행" },
         { key: "job_last_run_raw", label: ".job 마지막 실행 원문", compute: (r) => (r.job_last_run_raw && r.job_last_run_raw !== r.job_last_run ? r.job_last_run_raw : "") },
-        { key: "description", label: "설명" },
       ]},
       { heading: "계정", fields: [
         { key: "run_as", label: "실행 계정", kind: "account" },
@@ -1020,8 +1007,6 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
         { key: "run_as_kind", label: "실행 주체 종류", valueLabels: { user: "사용자", group: "그룹" } },
         { key: "run_level", label: "실행 권한" },
         { key: "logon_type", label: "로그온 유형" },
-        { key: "account", label: "대표 계정", kind: "account", compute: (r) => (r.account && r.account !== r.run_as ? r.account : "") },
-        { key: "account_sid", label: "대표 계정 SID", kind: "accountSid", compute: (r) => (r.account_sid && r.account_sid !== r.run_as_sid ? r.account_sid : "") },
         { key: "actor_account", label: "사건 행위자" },
         { key: "actor_sid", label: "행위자 SID", kind: "accountSid" },
         { key: "actor_domain", label: "행위자 도메인" },
@@ -1188,7 +1173,6 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
       {
         heading: (r) => `브라우저 ${({ download: "다운로드", cache: "캐시", url_summary: "URL 요약" } as Record<string, string>)[r.event_type] ?? "방문"}`,
         fields: [
-          { key: "timestamp_kind", label: "대표 시각 의미" },
           { key: "title", label: "제목" },
           { key: "url_raw", label: "URL 원문", kind: "path", compute: (r) => r.url_raw || r.url || "" },
           {
@@ -1211,7 +1195,6 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
           { key: "browser", label: "브라우저" },
           { key: "profile", label: "프로필" },
           { key: "input_kind", label: "입력 종류" },
-          { key: "account", label: "계정", kind: "account" },
         ],
       },
       {
@@ -1401,8 +1384,6 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
       { key: "command", label: "명령" },
       { key: "command_resolved", label: "명령 (환경변수 해석)" },
       // SOFTWARE·SYSTEM 하이브 항목은 사용자 계정이 아니라 컴퓨터 전역 설정이다.
-      { key: "account", label: "사용자", kind: "account", compute: (r) => (r.account === MACHINE_SCOPE_USER ? `${MACHINE_SCOPE_LABEL} (HKLM)` : r.account) },
-      { key: "account_sid", label: "사용자 SID", kind: "accountSid" },
       // 하이브 루트 키 이름을 라이브 마운트 지점으로 바꿔 읽히게 한다.
       { key: "key_path", label: "키 경로", compute: (r) => displayRegistryKeyPath(r.key_path, r.source) },
       { key: "source", label: "하이브" },
@@ -1495,8 +1476,6 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
         { key: "exception_code", label: "예외 코드" },
       ]},
       { heading: "기록 주체", fields: [
-        { key: "account", label: "계정", kind: "account" },
-        { key: "account_sid", label: "SID", kind: "accountSid" },
         { key: "event_user_raw", label: "이벤트 사용자 원문" },
         { key: "system_user_sid", label: "보안 컨텍스트 SID", kind: "accountSid" },
       ]},
@@ -1527,12 +1506,12 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
 
   // docs-10: stored reconstructed fragments + failed rows (_OVERVIEW only).
   RdpCache: {
+    eventTypeLabels: { fragment: "복원 조각", tile: "타일", mosaic: "모자이크" },
     customView: "rdpCache",
     title: (r) => (r.event_type === "fragment" ? `${r.source_file} 복원 조각 ${r.fragment_index}` : [r.source_file, r.tile_index && `타일 ${r.tile_index}`].filter(Boolean).join(" ")),
     subtitle: (r) => (r.cols && r.rows ? `${r.cols}×${r.rows} 타일` : r.error || ""),
     sections: [
       { heading: "복원 조각", fields: [
-        { key: "event_type", label: "종류", valueLabels: { fragment: "복원 조각", tile: "타일", mosaic: "모자이크" } },
         { key: "status", label: "상태", valueLabels: RDP_STATUS_LABELS },
         { key: "error", label: "오류" },
         { key: "source_file", label: "캐시 파일" },
@@ -1545,8 +1524,6 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
         { key: "height", label: "높이" },
       ]},
       { heading: "계정", fields: [
-        { key: "account", label: "계정", kind: "account" },
-        { key: "account_sid", label: "SID", kind: "accountSid" },
       ]},
     ],
   },
@@ -1574,12 +1551,10 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     // docs-08: stored values only; unknown direction stays neutral (R13).
     sections: [
       { heading: "접속", fields: [
-        { key: "timestamp_kind", label: "대표 시각 의미" },
         { key: "direction", label: "방향", valueLabels: { inbound: "인바운드", outbound: "아웃바운드", unknown: "방향 미확인" } },
         { key: "access_scope", label: "접근 범위", valueLabels: { remote: "원격", local: "로컬", unknown: "미확인" } },
         { key: "stage", label: "단계", valueLabels: STAGE_LABELS },
         { key: "result", label: "결과" },
-        { key: "description", label: "설명" },
         { key: "remote_address", label: "상대 주소" },
         { key: "remote_address_raw", label: "상대 주소 원문", compute: (r) => (r.remote_address_raw && r.remote_address_raw !== r.remote_address ? r.remote_address_raw : "") },
         { key: "remote_computer", label: "상대 컴퓨터" },
@@ -1591,11 +1566,9 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
         { key: "connection_id", label: "연결 ID" },
       ]},
       { heading: "계정", fields: [
-        { key: "account", label: "계정", kind: "account" },
         { key: "account_raw", label: "계정 원문", compute: (r) => (r.account_raw && r.account_raw !== r.account ? r.account_raw : "") },
         { key: "account_domain", label: "도메인" },
         { key: "account_upn", label: "UPN" },
-        { key: "account_sid", label: "SID", kind: "accountSid" },
         { key: "target_user_sid", label: "대상 사용자 SID", compute: (r) => (r.target_user_sid && r.target_user_sid !== r.account_sid ? r.target_user_sid : "") },
         { key: "system_user_sid", label: "서비스 주체 SID" },
       ]},
@@ -1675,14 +1648,12 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     priorityColumns: ["timestamp", "direction", "remote_address", "account", "share_name", "result", "description"],
     sections: [
       { heading: "접속", fields: [
-        { key: "timestamp_kind", label: "대표 시각 의미" },
         { key: "direction", label: "방향", valueLabels: SMB_DIRECTION_VALUE_LABELS },
         { key: "peer_role", label: "상대 역할", valueLabels: { client: "클라이언트", server: "서버", unknown: "미확인" } },
         { key: "protocol", label: "프로토콜", valueLabels: { smb: "SMB", unknown: "미확인" } },
         { key: "result", label: "결과" },
         { key: "audit_outcome", label: "감사 결과" },
         { key: "access_semantics", label: "접근 의미", valueLabels: { share_access_first_use: "세션 최초 공유 접근", requested_access_check: "요청 권한 검사" } },
-        { key: "description", label: "설명" },
         { key: "remote_address", label: "상대 주소" },
         { key: "remote_address_raw", label: "상대 주소 원문", compute: (r) => (r.remote_address_raw && r.remote_address_raw !== r.remote_address ? r.remote_address_raw : "") },
         { key: "remote_port", label: "상대 포트" },
@@ -1704,11 +1675,9 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
         { key: "access_reason", label: "AccessReason" },
       ]},
       { heading: "계정", fields: [
-        { key: "account", label: "계정", kind: "account" },
         { key: "account_raw", label: "계정 원문", compute: (r) => (r.account_raw && r.account_raw !== r.account ? r.account_raw : "") },
         { key: "account_domain", label: "도메인" },
         { key: "account_upn", label: "UPN" },
-        { key: "account_sid", label: "SID", kind: "accountSid" },
         { key: "target_user_sid", label: "대상 사용자 SID", compute: (r) => (r.target_user_sid && r.target_user_sid !== r.account_sid ? r.target_user_sid : "") },
         { key: "target_logon_id", label: "대상 LogonId" },
         { key: "subject_user_sid", label: "Subject SID" },
@@ -1774,14 +1743,10 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     priorityColumns: ["timestamp", "event_id", "description", "account", "result"],
     sections: [
       { heading: "기록", fields: [
-        { key: "timestamp_kind", label: "대표 시각 의미" },
-        { key: "description", label: "설명" },
         { key: "result", label: "결과" },
         { key: "boundary_kind", label: "경계" },
-        { key: "account", label: "계정", kind: "account" },
         { key: "account_domain", label: "도메인" },
         { key: "account_upn", label: "UPN" },
-        { key: "account_sid", label: "SID", kind: "accountSid" },
         { key: "logon_id", label: "로그온 ID" },
         { key: "logon_type", label: "로그온 유형" },
         { key: "workstation_name", label: "워크스테이션 원문" },
@@ -1831,9 +1796,6 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
         { key: "driver_list_raw", label: "드라이버 목록", kind: "code" },
       ]},
       { heading: "기록", fields: [
-        { key: "event_type", label: "기록 종류" },
-        { key: "timestamp_kind", label: "대표 시각 의미" },
-        { key: "description", label: "설명" },
         { key: "state", label: "상태" },
         { key: "start_type_before", label: "이전 시작 유형" },
         { key: "start_type_after", label: "시작 유형" },
@@ -1853,8 +1815,6 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
         { key: "recovery_action_raw", label: "복구 조치 원문", compute: (r) => (r.recovery_action_raw && r.recovery_action_raw !== r.recovery_action_text ? r.recovery_action_raw : "") },
       ]},
       { heading: "기록 주체", fields: [
-        { key: "account", label: "계정", kind: "account" },
-        { key: "account_sid", label: "SID", kind: "accountSid" },
         { key: "subject_user_name", label: "Subject 이름" },
         { key: "subject_user_sid", label: "Subject SID", kind: "accountSid" },
         { key: "subject_domain", label: "Subject 도메인" },
@@ -1996,8 +1956,6 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
         { key: "error_code", label: "오류 코드", compute: (r) => (r.error_code && r.error_code !== "0" ? r.error_code : "") },
       ]},
       { heading: "변경 주체", fields: [
-        { key: "account", label: "계정", kind: "account" },
-        { key: "account_sid", label: "계정 SID", kind: "accountSid" },
         { key: "modifying_app_resolved", label: "변경 앱", kind: "path", compute: (r) => r.modifying_app_resolved || r.modifying_app },
         { key: "subject_user_name", label: "Subject 이름" },
         { key: "subject_user_sid", label: "Subject SID", kind: "accountSid" },
@@ -2032,7 +1990,6 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     sections: [
       { heading: "실행 정보", fields: [
         // One account label: confirmed name, else the event SID.
-        { key: "account", label: "수행 계정", kind: "account", compute: (r) => r.account || r.account_sid },
         { key: "process", label: "수행 프로세스" },
         { key: "process_id", label: "프로세스 ID" },
         { key: "host_application", label: "호스트 애플리케이션", kind: "code", showWhenEmpty: true, emptyLabel: "기록되지 않음" },
@@ -2044,7 +2001,6 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
       { heading: "코드 블록 (ScriptBlock)", fields: [
         // 분할 4104의 재조합 결과·조각 누락 표식은 공통 description에 남는다 —
         // 잘린 본문을 완전한 원문으로 오인하지 않도록 상세 상단에 보여 준다.
-        { key: "description", label: "재조합 상태" },
         { key: "script_block", kind: "code" },
         { key: "script_block_id", label: "ScriptBlock ID" },
         { key: "script_block_expected_parts", label: "기대 조각 수" },
@@ -2437,7 +2393,6 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
         { key: "working_directory", label: "작업 디렉터리", kind: "path" },
       ]},
       { heading: "JumpList 출처", fields: [
-        { key: "account", label: "수집 사용자", kind: "account" },
         { key: "app_id", label: "App ID", kind: "hash" },
         { key: "jumplist_type", label: "JumpList 유형", kind: "badge" },
         { key: "stream_id", label: "LNK 스트림 / 엔트리 ID" },
@@ -2462,7 +2417,6 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
         { key: "display_text", label: "표시 텍스트" },
         { key: "content_uri", label: "콘텐츠 URI" },
         { key: "active_duration_s", label: "사용 시간 (초)" },
-        { key: "account", label: "계정", kind: "account" },
       ]},
       { heading: "시각", fields: [
         { key: "start_time", label: "시작" },
