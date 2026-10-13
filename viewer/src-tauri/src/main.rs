@@ -1213,6 +1213,8 @@ async fn run_host(
             // 발행이 일어난 실행(complete/partial)은 이 호스트의 테이블을 다시
             // 썼다 — 이전 북마크의 rowid 참조가 무효라 삭제한다.
             if terminal == "complete" || terminal == "partial" {
+                // docs-21: analyst-added host addresses are cleared too.
+                clear_analyst_addresses(&host_dir);
                 let removed = remove_host_bookmarks(&cd, &options.host_id);
                 if removed > 0 {
                     emit_pipeline_event(
@@ -6508,6 +6510,65 @@ async fn path_reference_accounts(host_dir: String) -> Result<Vec<String>, String
 }
 
 
+// --- commands: analyst host addresses (JSON file) ------------------------
+
+// docs-21: addresses the analyst knows the host used (e.g. an address lost
+// with an unplugged cable). Analyst input, not evidence: kept beside the host
+// results and cleared on re-parse.
+const ANALYST_ADDRESSES_FILE: &str = "analyst_addresses.json";
+
+fn read_analyst_addresses(host_dir: &Path) -> Result<Vec<String>, String> {
+    match std::fs::read_to_string(host_dir.join(ANALYST_ADDRESSES_FILE)) {
+        Ok(text) => serde_json::from_str(&text).map_err(|error| format!("추가 IP 파일을 읽을 수 없습니다: {error}")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(format!("추가 IP 파일을 읽을 수 없습니다: {error}")),
+    }
+}
+
+fn write_analyst_addresses(host_dir: &Path, addresses: &[String]) -> Result<(), String> {
+    if !host_dir.is_dir() {
+        return Err("호스트 폴더를 찾을 수 없습니다".to_string());
+    }
+    let text = serde_json::to_string_pretty(addresses).map_err(|error| error.to_string())?;
+    std::fs::write(host_dir.join(ANALYST_ADDRESSES_FILE), text).map_err(|error| format!("추가 IP를 저장하지 못했습니다: {error}"))
+}
+
+fn clear_analyst_addresses(host_dir: &Path) {
+    let _ = std::fs::remove_file(host_dir.join(ANALYST_ADDRESSES_FILE));
+}
+
+#[tauri::command]
+fn list_analyst_addresses(host_dir: String) -> Result<Vec<String>, String> {
+    read_analyst_addresses(Path::new(&host_dir))
+}
+
+#[tauri::command]
+fn add_analyst_address(host_dir: String, address: String) -> Result<Vec<String>, String> {
+    let address = address.trim().to_string();
+    if address.parse::<std::net::IpAddr>().is_err() {
+        return Err("IPv4 또는 IPv6 주소를 입력하세요.".to_string());
+    }
+    let _guard = lock_bookmarks();
+    let path = Path::new(&host_dir);
+    let mut addresses = read_analyst_addresses(path)?;
+    if addresses.contains(&address) {
+        return Err("이미 추가한 IP입니다.".to_string());
+    }
+    addresses.push(address);
+    write_analyst_addresses(path, &addresses)?;
+    Ok(addresses)
+}
+
+#[tauri::command]
+fn remove_analyst_address(host_dir: String, address: String) -> Result<Vec<String>, String> {
+    let _guard = lock_bookmarks();
+    let path = Path::new(&host_dir);
+    let mut addresses = read_analyst_addresses(path)?;
+    addresses.retain(|value| value != &address);
+    write_analyst_addresses(path, &addresses)?;
+    Ok(addresses)
+}
+
 // --- commands: bookmarks (JSON file) ---------------------------------------
 
 fn normalize_bookmark_path(path: &Path) -> PathBuf {
@@ -9092,6 +9153,9 @@ fn main() {
             linked_result_rows,
             result_row,
             result_row_by_record_id,
+            list_analyst_addresses,
+            add_analyst_address,
+            remove_analyst_address,
             list_column_values,
             mft_children,
             mft_search,
@@ -9158,3 +9222,28 @@ fn main() {
 }
 
 
+
+#[cfg(test)]
+mod analyst_address_tests {
+    use super::*;
+
+    /// Analyst-entered host addresses (docs-21): valid IPs only, no duplicates,
+    /// removable, and cleared when the host is re-parsed.
+    #[test]
+    fn analyst_addresses_add_validate_remove_and_clear() {
+        let host = std::env::temp_dir().join(format!("wa-analyst-ip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&host);
+        std::fs::create_dir_all(&host).unwrap();
+        let dir = host.to_string_lossy().to_string();
+        assert!(list_analyst_addresses(dir.clone()).unwrap().is_empty());
+        assert_eq!(add_analyst_address(dir.clone(), " 10.0.0.5 ".into()).unwrap(), vec!["10.0.0.5"]);
+        assert_eq!(add_analyst_address(dir.clone(), "fe80::1".into()).unwrap(), vec!["10.0.0.5", "fe80::1"]);
+        assert!(add_analyst_address(dir.clone(), "10.0.0.5".into()).is_err(), "duplicate");
+        assert!(add_analyst_address(dir.clone(), "10.0.0.999".into()).is_err(), "not an IP");
+        assert!(add_analyst_address(dir.clone(), "host.local".into()).is_err(), "not an IP");
+        assert_eq!(remove_analyst_address(dir.clone(), "10.0.0.5".into()).unwrap(), vec!["fe80::1"]);
+        clear_analyst_addresses(&host);
+        assert!(list_analyst_addresses(dir).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(host);
+    }
+}

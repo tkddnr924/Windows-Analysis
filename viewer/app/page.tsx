@@ -36,6 +36,7 @@ import { bookmarkKey, bookmarkKeys } from "@/lib/bookmarks";
 import { accountDirectoryFromEntries, type AccountDirectory } from "@/lib/accountIdentity";
 import { RecordScopeContext } from "@/lib/recordScope";
 import { isLoopbackAddress } from "@/lib/remoteAccess";
+import { addressOwners, networkAddresses } from "@/lib/hostNetwork";
 import type { AccountEventPage, AccountEventQuery, Bookmark, Case, Host, CategoryEntry, CsvData, ResultFileEntry, TimelineEntry, SearchHit } from "@/lib/types";
 
 interface TabState {
@@ -105,6 +106,7 @@ export default function Home() {
   // JSON repeatedly). Keyed by host id + last run time.
   const [hostGraph, setHostGraph] = useState<{ caseId: string; graph: HostGraph } | null>(null);
   const [hostGraphLoading, setHostGraphLoading] = useState(false);
+  const [analystAddresses, setAnalystAddresses] = useState<string[]>([]);
   // All IPs of every host in the case (a host can have several NICs). Shared by
   // every 케이스 분석 view so a remote IP that is really another host is
   // recognised as that host, whichever of its addresses appears. Cached per case.
@@ -482,36 +484,26 @@ export default function Home() {
   // build ip -> host and host -> ips maps. One place, so every case-analysis
   // view agrees on which IP belongs to which host. `ipHosts` keeps every host
   // on an IP (docs-08 R14); `ipToHost` is the single-host map older views use.
+  // docs-21: a host's addresses are its _OVERVIEW Metadata network entries
+  // (MetadataAddresses); no other result is read to fill them in.
+  // Analyst-added addresses (lost with an unplugged cable etc.) join them.
+  async function loadHostIps(host: Host): Promise<string[]> {
+    const db = `${host.dir}/_OVERVIEW/Metadata.sqlite`;
+    const [metadata, addresses, added] = await Promise.all([
+      window.api.readResultFile(db, "metadata"),
+      window.api.readResultFile(db, "MetadataAddresses"),
+      window.api.listAnalystAddresses(host.dir),
+    ]);
+    return [...new Set([...networkAddresses(metadata.rows, addresses.rows), ...added])];
+  }
+
   async function loadCaseNetwork(): Promise<{ ipToHost: Record<string, { id: string; name: string }>; ipHosts: Record<string, { id: string; name: string }[]>; hostIps: Record<string, string[]> }> {
-    const ipToHost: Record<string, { id: string; name: string }> = {};
-    const ipHosts: Record<string, { id: string; name: string }[]> = {};
     const hostIps: Record<string, string[]> = {};
-    for (const h of selectedCase?.hosts ?? []) {
-      let ips: string[] = [];
-      try {
-        const cats = await window.api.listCategories(h.dir);
-        const ov = cats.find((c) => c.name === "_OVERVIEW");
-        if (ov) {
-          const files = await window.api.listResultFiles(ov.fullPath);
-          const ti = files.find((f) => f.name === "TargetInfo");
-          if (ti) {
-            const d = await window.api.readResultFile(ti.fullPath, ti.tableName);
-            ips = [...new Set(d.rows.filter((r) => r.category === "NetworkInterface" && r.value).flatMap((r) => r.value.split(/[,\s]+/)).map((s) => s.trim()).filter(Boolean))];
-          }
-        }
-      } catch {
-        ips = [];
-      }
-      hostIps[h.id] = ips;
-      // Loopback identifies the current machine, not a host-to-host relation.
-      // Keep it in the raw interface list but never resolve a remote peer to it.
-      for (const ip of ips) {
-        if (isLoopbackAddress(ip)) continue;
-        ipToHost[ip] = { id: h.id, name: h.name };
-        ipHosts[ip] = [...(ipHosts[ip] ?? []), { id: h.id, name: h.name }];
-      }
-    }
-    return { ipToHost, ipHosts, hostIps };
+    const hosts = selectedCase?.hosts ?? [];
+    for (const h of hosts) hostIps[h.id] = await loadHostIps(h).catch(() => []);
+    // An address on several hosts is a candidate, never resolved to one host.
+    const owners = addressOwners(hosts.map((h) => ({ id: h.id, name: h.name, ips: hostIps[h.id] })), isLoopbackAddress);
+    return { ipToHost: Object.fromEntries(owners.unique), ipHosts: Object.fromEntries(owners.all), hostIps };
   }
 
   // Auto-(re)load the case network map whenever the case or its host set
@@ -534,75 +526,42 @@ export default function Home() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedCase, netNonce]);
 
-  // Case-level host-connection graph: read every registered host's RDP history
-  // (RemoteDesktopHistory) and its IPs (TargetInfo) from the _OVERVIEW folder,
-  // then link inbound/outbound connections. Remote IPs that match a registered
-  // host's IP become host↔host edges; the rest are external nodes.
+  // Case-level host-connection graph (docs-21): each host's addresses from its
+  // _OVERVIEW Metadata and its RemoteDesktopHistory rows; remote addresses owned
+  // by exactly one registered host become host↔host edges.
   async function buildHostGraph(): Promise<HostGraph> {
     const hosts: HostGraph["hosts"] = [];
-    const ipToHost = new Map<string, string>();
-    const perHost: { name: string; rdp: Record<string, string>[] }[] = [];
+    const perHost: { id: string; name: string; ips: string[]; rdp: Record<string, string>[] }[] = [];
     const rdpSourceFailures: string[] = [];
     const networkMappingFailures: string[] = [];
 
     for (const h of selectedCase?.hosts ?? []) {
-      let cats: CategoryEntry[] = [];
-      try {
-        cats = await window.api.listCategories(h.dir);
-      } catch {
-        rdpSourceFailures.push(`${h.name} 분석 폴더`);
-        cats = [];
-      }
-      const ov = cats.find((c) => c.name === "_OVERVIEW");
-      if (!ov) {
-        rdpSourceFailures.push(`${h.name} 분석 개요`);
-        hosts.push({ name: h.name, ips: [] });
-        continue;
-      }
-      let files: ResultFileEntry[] = [];
-      try {
-        files = await window.api.listResultFiles(ov.fullPath);
-      } catch {
-        rdpSourceFailures.push(`${h.name} 분석 결과`);
-        hosts.push({ name: h.name, ips: [] });
-        continue;
-      }
-      const ti = files.find((f) => f.name === "TargetInfo");
       let ips: string[] = [];
-      if (ti) {
-        try {
-          const d = await window.api.readResultFile(ti.fullPath, ti.tableName);
-          ips = [...new Set(d.rows.filter((r) => r.category === "NetworkInterface" && r.value).flatMap((r) => r.value.split(/[,\s]+/)).map((s) => s.trim()).filter(Boolean))];
-        } catch {
-          networkMappingFailures.push(`${h.name} 네트워크 정보`);
-          ips = [];
-        }
+      try {
+        ips = await loadHostIps(h);
+      } catch {
+        networkMappingFailures.push(`${h.name} 네트워크 정보`);
       }
       hosts.push({ name: h.name, ips });
-      ips.filter((ip) => !isLoopbackAddress(ip)).forEach((ip) => ipToHost.set(ip, h.name));
-      const readRows = async (fname: string) => {
-        const f = files.find((x) => x.name === fname);
-        if (!f) {
-          rdpSourceFailures.push(`${h.name} ${fname} 결과 없음`);
-          return [] as Record<string, string>[];
-        }
-        try {
-          return (await window.api.readResultFile(f.fullPath, f.tableName)).rows;
-        } catch {
-          rdpSourceFailures.push(`${h.name} ${fname}`);
-          return [] as Record<string, string>[];
-        }
-      };
-      perHost.push({ name: h.name, rdp: await readRows("RemoteDesktopHistory") });
+      let rdp: Record<string, string>[] = [];
+      try {
+        rdp = (await window.api.readResultFile(`${h.dir}/_OVERVIEW/RemoteDesktopHistory.sqlite`, "RemoteDesktopHistory")).rows;
+      } catch {
+        rdpSourceFailures.push(`${h.name} RemoteDesktopHistory`);
+      }
+      perHost.push({ id: h.id, name: h.name, ips, rdp });
     }
+    const owners = addressOwners(perHost, isLoopbackAddress);
 
     // LOCAL(콘솔/AD형 세션)과 loopback(HOST/127.0.0.1)은 모두 호스트별로 분리한다
     // — 여러 호스트의 로컬 세션이 하나의 공유 노드로 뭉치면 누구의 LOCAL인지 알 수
     // 없고 그래프가 실제 관계를 왜곡한다(각 LOCAL은 그 호스트 자신의 로컬 로그온).
     const classify = (remote: string, owner: string) => {
       if (isLoopbackAddress(remote)) return { id: `${owner} loop`, label: `${owner}/${remote}`, kind: "loopback" as const, isHost: false };
-      const peerHost = ipToHost.get(remote);
-      if (peerHost) return { id: peerHost, label: peerHost, kind: "host" as const, isHost: true };
+      const peerHost = owners.unique.get(remote);
+      if (peerHost) return { id: peerHost.name, label: peerHost.name, kind: "host" as const, isHost: true };
+      const candidates = owners.all.get(remote);
+      if (candidates) return { id: remote, label: `${remote} (${candidates.map((host) => host.name).join(", ")})`, kind: "external" as const, isHost: false };
       if (remote.toUpperCase() === "LOCAL") return { id: `${owner} local`, label: `${owner}/LOCAL`, kind: "local" as const, isHost: false };
       return { id: remote, label: remote, kind: "external" as const, isHost: false };
     };
@@ -639,6 +598,31 @@ export default function Home() {
       networkMappingFailures: [...new Set(networkMappingFailures)],
     };
   }
+
+  // docs-21: analyst-added addresses of the selected host.
+  useEffect(() => {
+    setAnalystAddresses([]);
+    if (!selectedHost) return;
+    let cancelled = false;
+    window.api.listAnalystAddresses(selectedHost.dir).then((list) => { if (!cancelled) setAnalystAddresses(list); }).catch(() => {});
+    return () => { cancelled = true; };
+  }, [selectedHost?.dir, selectedHost?.lastRunAt]);
+
+  /** Returns an error message, or null when saved. */
+  async function changeAnalystAddresses(change: (dir: string) => Promise<string[]>): Promise<string | null> {
+    if (!selectedHost) return null;
+    try {
+      setAnalystAddresses(await change(selectedHost.dir));
+      // Address matching changed: rebuild the case address map and graph.
+      setNetNonce((n) => n + 1);
+      setHostGraph(null);
+      return null;
+    } catch (error) {
+      return typeof error === "string" ? error : "IP를 저장하지 못했습니다.";
+    }
+  }
+  const handleAddAnalystAddress = (address: string) => changeAnalystAddresses((dir) => window.api.addAnalystAddress(dir, address));
+  const handleRemoveAnalystAddress = (address: string) => changeAnalystAddresses((dir) => window.api.removeAnalystAddress(dir, address));
 
   async function handleSelectConnections(force = false) {
     setActiveVirtualTab("connections");
@@ -1039,6 +1023,9 @@ export default function Home() {
                   onFetchLinkedRows={fetchLinkedRows}
                   isRowBookmarked={isActiveRowBookmarked}
                   onToggleBookmark={(rowid, field) => handleToggleActiveRowBookmark(rowid, field)}
+                  analystAddresses={analystAddresses}
+                  onAddAnalystAddress={handleAddAnalystAddress}
+                  onRemoveAnalystAddress={handleRemoveAnalystAddress}
                 />
               ) : getArtifactView(activeTab.file.name)?.customView === "executionHistory" ? (
                 <ExecutionHistoryView

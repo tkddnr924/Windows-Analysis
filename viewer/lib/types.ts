@@ -819,6 +819,10 @@ export interface ElectronApi {
   linkedResultRows(fullPath: string, tableName: string, matchColumn: string, matchValue: string, search: string, offset: number, limit: number): Promise<LinkedRowsPage>;
   resultRow(fullPath: string, tableName: string, rowid: number): Promise<ResultRow>;
   resultRowByRecordId(fullPath: string, tableName: string, recordId: string): Promise<ResultRow>;
+  /** docs-21: analyst-added host addresses (cleared on re-parse). */
+  listAnalystAddresses(hostDir: string): Promise<string[]>;
+  addAnalystAddress(hostDir: string, address: string): Promise<string[]>;
+  removeAnalystAddress(hostDir: string, address: string): Promise<string[]>;
   browserScope(fullPath: string): Promise<BrowserInputInfo[]>;
   browserSummary(fullPath: string, filter: BrowserFilter): Promise<BrowserSummary>;
   browserDomains(fullPath: string, filter: BrowserFilter, offset: number, limit: number, ascending: boolean): Promise<BrowserDomainPage>;

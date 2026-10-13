@@ -20,6 +20,8 @@ import SettingsOutlinedIcon from "@mui/icons-material/SettingsOutlined";
 import WarningAmberOutlinedIcon from "@mui/icons-material/WarningAmberOutlined";
 import WifiOutlinedIcon from "@mui/icons-material/WifiOutlined";
 import InfoOutlinedIcon from "@mui/icons-material/InfoOutlined";
+import AddOutlinedIcon from "@mui/icons-material/AddOutlined";
+import DeleteOutlineOutlinedIcon from "@mui/icons-material/DeleteOutlineOutlined";
 import { acbFlagNames, yesNo } from "@/lib/accountFields";
 import type { AccountEventPage, AccountEventQuery, CsvData, DBRow, HostMetadata } from "@/lib/types";
 import type { FetchLinkedRows } from "@/lib/types";
@@ -49,6 +51,10 @@ interface TargetInfoViewProps {
   isRowBookmarked?: (row: Row, field?: string) => boolean;
   onToggleBookmark?: (rowid: number, field: string) => void;
   accountDirectory?: AccountDirectory;
+  /** docs-21: analyst-added host addresses; callbacks return an error or null. */
+  analystAddresses?: string[];
+  onAddAnalystAddress?: (address: string) => Promise<string | null>;
+  onRemoveAnalystAddress?: (address: string) => Promise<string | null>;
 }
 
 // TargetInfo is a correlation of registry-derived system facts (OS build,
@@ -202,7 +208,7 @@ interface NetworkProfile {
   timestamp: string;
 }
 
-export default function TargetInfoView({ data, loadAccountEvents, timeRange, onNavigate, onFetchLinkedRows, isRowBookmarked, onToggleBookmark, accountDirectory }: TargetInfoViewProps) {
+export default function TargetInfoView({ data, loadAccountEvents, timeRange, onNavigate, onFetchLinkedRows, isRowBookmarked, onToggleBookmark, accountDirectory, analystAddresses = [], onAddAnalystAddress, onRemoveAnalystAddress }: TargetInfoViewProps) {
   // 북마크는 원본 레코드에 붙으므로 행이 실어 온 원본 좌표로 맞춘다.
   const bmRowids = useMemo(
     () => new Set((data.rows as Row[]).filter((row) => isRowBookmarked?.(row)).map((row) => Number((row as Record<string, unknown>).__rowid))),
@@ -215,6 +221,14 @@ export default function TargetInfoView({ data, loadAccountEvents, timeRange, onN
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [selectedInterface, setSelectedInterface] = useState<NetInterface | null>(null);
   const [selectedNetwork, setSelectedNetwork] = useState<NetworkProfile | null>(null);
+  const [newAddress, setNewAddress] = useState("");
+  const [addressError, setAddressError] = useState<string | null>(null);
+  const submitAddress = async () => {
+    if (!onAddAnalystAddress || !newAddress.trim()) return;
+    const error = await onAddAnalystAddress(newAddress.trim());
+    setAddressError(error);
+    if (!error) setNewAddress("");
+  };
   // 호스트 공통 참조 정보(Metadata.sqlite) — 계정·네트워크 상세 속성의 출처다.
   // 열려 있는 결과 파일 경로에서 호스트 폴더를 얻는다.
   const scope = useContext(RecordScopeContext);
@@ -467,8 +481,8 @@ export default function TargetInfoView({ data, loadAccountEvents, timeRange, onN
             )
           )}
 
-          {section === "interfaces" && (
-            interfaces.length === 0 ? <div style={{ color: "var(--text-faint)", fontSize: 13 }}>IP 구성 정보가 없습니다.</div> : interfaces.map((n) => {
+          {section === "interfaces" && (interfaces.length === 0 && !onAddAnalystAddress ? <div style={{ color: "var(--text-faint)", fontSize: 13 }}>IP 구성 정보가 없습니다.</div> : <>
+            {interfaces.map((n) => {
               const active = selectedInterface?.guid === n.guid && selectedInterface?.ip === n.ip;
               const detailLine = [n.gateway && `게이트웨이 ${n.gateway}`, n.dns && `DNS ${n.dns}`, n.domain && `도메인 ${n.domain}`].filter(Boolean).join(" · ");
               return (
@@ -491,8 +505,28 @@ export default function TargetInfoView({ data, loadAccountEvents, timeRange, onN
                   <ChevronRightOutlinedIcon sx={{ fontSize: 18, color: "var(--text-faint)", flexShrink: 0 }} />
                 </button>
               );
-            })
-          )}
+            })}
+            {analystAddresses.map((address) => (
+              <div key={`analyst|${address}`} style={{ borderRadius: "var(--radius)", display: "flex", alignItems: "center", gap: 12, minHeight: 50, marginBottom: 8, padding: "7px 10px 7px 14px", border: "1px dashed var(--border)", background: "var(--bg-panel)" }}>
+                <span aria-hidden="true" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 34, height: 34, flexShrink: 0, borderRadius: "var(--radius)", background: "color-mix(in srgb, var(--text-dim) 14%, transparent)" }}>
+                  <LanOutlinedIcon sx={{ fontSize: 17, color: "var(--text-dim)" }} />
+                </span>
+                <span style={{ flex: 1, minWidth: 0, display: "flex", alignItems: "baseline", gap: 8 }}>
+                  <span style={{ fontFamily: "var(--mono)", fontSize: 13.5, fontWeight: 700 }}>{address}</span>
+                  <span style={{ color: "var(--text-faint)", fontSize: 11.5 }}>분석가 추가</span>
+                </span>
+                {onRemoveAnalystAddress && <button type="button" onClick={() => { void onRemoveAnalystAddress(address).then(setAddressError); }} aria-label={`${address} 삭제`} title="삭제" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 28, height: 28, padding: 0, border: "none", background: "transparent", color: "var(--text-faint)", cursor: "pointer" }}><DeleteOutlineOutlinedIcon sx={{ fontSize: 16 }} /></button>}
+              </div>
+            ))}
+            {onAddAnalystAddress && (
+              <form onSubmit={(event) => { event.preventDefault(); void submitAddress(); }} style={{ display: "flex", alignItems: "center", gap: 8, minHeight: 50, padding: "7px 10px 7px 14px", border: "1px dashed var(--border)", borderRadius: "var(--radius)" }}>
+                <AddOutlinedIcon aria-hidden="true" sx={{ fontSize: 18, color: "var(--text-faint)", flexShrink: 0 }} />
+                <input value={newAddress} onChange={(event) => { setNewAddress(event.target.value); setAddressError(null); }} placeholder="IP 추가" aria-label="추가할 IP" style={{ flex: 1, minWidth: 0, minHeight: 30, padding: "4px 8px", border: "1px solid var(--border)", borderRadius: "var(--radius)", background: "var(--bg-elevated)", color: "var(--text)", fontFamily: "var(--mono)", fontSize: 12.5 }} />
+                <button type="submit" disabled={!newAddress.trim()} style={{ minHeight: 30, padding: "4px 12px", border: "1px solid var(--accent)", borderRadius: "var(--radius)", background: "var(--accent-subtle)", color: "var(--accent)", fontSize: 12, fontWeight: 700, cursor: newAddress.trim() ? "pointer" : "default", opacity: newAddress.trim() ? 1 : 0.55 }}>추가</button>
+              </form>
+            )}
+            {addressError && <div role="alert" style={{ marginTop: 6, color: "var(--danger)", fontSize: 12 }}>{addressError}</div>}
+          </>)}
 
           {section === "networks" && (
             networks.length === 0 ? <div style={{ color: "var(--text-faint)", fontSize: 13 }}>연결 기록이 없습니다.</div> : networks.map((n) => {
