@@ -34,7 +34,7 @@ const ACCOUNT_FIELDS: [&str; 6] = [
 ];
 
 /// Segment-level fields aggregated from direct (pre-carry) member evidence.
-const AGG_FIELDS: [&str; 17] = [
+const AGG_FIELDS: [&str; 16] = [
     "direction",
     "access_scope",
     "session_id",
@@ -51,7 +51,6 @@ const AGG_FIELDS: [&str; 17] = [
     "remote_address",
     "remote_port",
     "remote_computer",
-    "local_address",
 ];
 
 /// The classifier marks 4647 excluded up front; correlation lifts it only for
@@ -63,7 +62,6 @@ enum IdSpace {
     LsmSession,
     SecurityLogon,
     RdpClientConnection,
-    RdpCoreConnection,
 }
 
 impl IdSpace {
@@ -72,7 +70,6 @@ impl IdSpace {
             IdSpace::LsmSession => "lsm_session",
             IdSpace::SecurityLogon => "security_logon",
             IdSpace::RdpClientConnection => "rdp_client_connection",
-            IdSpace::RdpCoreConnection => "rdp_core_connection",
         }
     }
 }
@@ -318,29 +315,6 @@ fn put(row: &mut Row, key: &str, value: &str) {
     }
 }
 
-/// TargetLogonId 0x0 is the "no logon was created" sentinel (typical for
-/// 4625); grouping by it would merge unrelated attempts. The raw field stays
-/// untouched, only the namespace rejects it.
-fn logon_id(value: &str) -> Option<u64> {
-    let value = value.trim();
-    let parsed = if let Some(hex) = value
-        .strip_prefix("0x")
-        .or_else(|| value.strip_prefix("0X"))
-    {
-        u64::from_str_radix(hex, 16).ok()
-    } else {
-        value.parse::<u64>().ok()
-    };
-    parsed.filter(|id| *id != 0)
-}
-
-/// A placeholder GUID (all zeros, with or without braces/dashes) identifies
-/// nothing. The originals stay in the row; only grouping rejects them.
-fn is_genuine_id(value: &str) -> bool {
-    let trimmed = value.trim().trim_start_matches('{').trim_end_matches('}');
-    !trimmed.is_empty() && trimmed.chars().any(|c| c != '0' && c != '-')
-}
-
 fn connection_key(value: &str) -> String {
     uuid::Uuid::parse_str(value.trim())
         .map(|id| id.hyphenated().to_string())
@@ -348,72 +322,64 @@ fn connection_key(value: &str) -> String {
 }
 
 /// ID namespace of one row, or None when nothing identifies it. Outbound needs
-/// a real connection/activity id plus process scope — a PID alone or a time
-/// window must never link client events.
+/// a real activity id plus process scope — a PID alone or a time window must
+/// never link client events.
 fn id_namespace(row: &Row) -> Option<(IdSpace, String, String)> {
     if field(row, "direction") == "outbound" {
-        if field(row, "process_id").is_empty() {
-            return None;
-        }
         // correlation_activity_id is the classifier's genuine-GUID-only
         // field; a process id alone never groups anything.
-        let id = [
-            field(row, "connection_id"),
-            field(row, "correlation_activity_id"),
-        ]
-        .into_iter()
-        .find(|v| is_genuine_id(v))?;
+        let id = field(row, "correlation_activity_id");
+        let process = field(row, "process_id");
+        if id.is_empty() || process.is_empty() {
+            return None;
+        }
         return Some((
             IdSpace::RdpClientConnection,
             connection_key(id),
-            field(row, "process_id").to_string(),
+            process.to_string(),
         ));
     }
     let session = field(row, "session_id");
     if !session.is_empty() {
         return Some((IdSpace::LsmSession, session.to_string(), String::new()));
     }
-    if let Some(logon) = logon_id(field(row, "logon_id")) {
-        return Some((
-            IdSpace::SecurityLogon,
-            format!("0x{logon:x}"),
-            String::new(),
-        ));
-    }
-    let connection = field(row, "connection_id");
-    if is_genuine_id(connection) {
-        return Some((
-            IdSpace::RdpCoreConnection,
-            connection_key(connection),
-            String::new(),
-        ));
+    let logon = crate::derived::normalize_logon_id(field(row, "logon_id"));
+    if !logon.is_empty() {
+        return Some((IdSpace::SecurityLogon, logon, String::new()));
     }
     None
 }
 
-/// Reconnection does not prove an initial logon.
+/// Reconnection does not prove an initial logon. An outbound connection starts
+/// at its attempt (1024) or, without one, at the established event (1025).
 fn start_kind(space: IdSpace, eid: &str) -> Option<&'static str> {
-    match space {
-        IdSpace::LsmSession if eid == "21" => Some("session_logon"),
-        IdSpace::SecurityLogon if eid == "4624" => Some("logon_instance_start"),
+    match (space, eid) {
+        (IdSpace::LsmSession, "21") => Some("session_logon"),
+        (IdSpace::SecurityLogon, "4624") => Some("logon_instance_start"),
+        (IdSpace::RdpClientConnection, "1024") => Some("client_connection_attempt"),
+        (IdSpace::RdpClientConnection, "1025") => Some("client_connection_established"),
         _ => None,
     }
 }
 
-/// Events that prove an instance end. Security ends the logon instance, which
-/// is not the same thing as a desktop session ending.
-fn end_kind(space: IdSpace, eid: &str) -> Option<&'static str> {
+/// Events that open a new instance when one is already in progress. 1025
+/// completes the attempt it follows, so it never splits.
+fn opens_instance(space: IdSpace, eid: &str) -> bool {
     match space {
-        IdSpace::LsmSession => match eid {
-            "23" => Some("session_logoff"),
-            "24" | "39" | "40" => Some("session_disconnect"),
-            _ => None,
-        },
-        IdSpace::SecurityLogon => match eid {
-            "4634" => Some("logon_instance_end"),
-            _ => None,
-        },
-        IdSpace::RdpClientConnection if eid == "1026" => Some("client_disconnect"),
+        IdSpace::RdpClientConnection => eid == "1024",
+        _ => start_kind(space, eid).is_some(),
+    }
+}
+
+/// Events that prove an instance end. Security ends the logon instance, which
+/// is not the same thing as a desktop session ending. An LSM disconnect
+/// (24/39/40) leaves the session open for a reconnect (25), so only the
+/// logoff (23) ends it.
+fn end_kind(space: IdSpace, eid: &str) -> Option<&'static str> {
+    match (space, eid) {
+        (IdSpace::LsmSession, "23") => Some("session_logoff"),
+        (IdSpace::SecurityLogon, "4634") => Some("logon_instance_end"),
+        (IdSpace::RdpClientConnection, "1026") => Some("client_disconnect"),
         _ => None,
     }
 }
@@ -603,6 +569,22 @@ fn carry_into(
                     segment_key,
                 ));
             }
+            // LSM records only this host's sessions: proven remote scope of the
+            // same session instance is what makes an unaddressed one inbound.
+            if scope == "remote"
+                && field(&rows[index], "provider") == super::LSM
+                && field(&rows[index], "direction") == "unknown"
+            {
+                set(&mut rows[index], "direction", "inbound");
+                relations.push(relation_row(
+                    *from,
+                    index,
+                    "direction",
+                    "remote_scope_direction",
+                    "inbound",
+                    segment_key,
+                ));
+            }
         }
     } else {
         carry.access_scope = Some((index, own_scope));
@@ -710,14 +692,14 @@ fn walk_scope(
         }
 
         let starts = start_kind(scope.meta.space, &eid);
-        let new_attempt = scope.meta.space == IdSpace::RdpClientConnection && eid == "1024";
+        let opens = opens_instance(scope.meta.space, &eid);
         let conflicts = current
             .as_ref()
             .is_some_and(|(_, carry)| principal_conflict(carry, &rows[index]));
         let starts_new = conflicts
-            || current.as_ref().is_some_and(|(build, _)| {
-                (starts.is_some() || new_attempt) && !build.members.is_empty()
-            });
+            || current
+                .as_ref()
+                .is_some_and(|(build, _)| opens && !build.members.is_empty());
 
         // 4647 arrives excluded. It is confirmed only by a still-open, proven
         // remote logon instance with this LogonId in this same log; an
@@ -878,8 +860,10 @@ mod tests {
     const LSM: &str = "Microsoft-Windows-TerminalServices-LocalSessionManager";
     const LSM_CH: &str = "Microsoft-Windows-TerminalServices-LocalSessionManager/Operational";
     const SEC: &str = "Microsoft-Windows-Security-Auditing";
-    const SRC_LSM: &str = "Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational";
-    const SRC_SEC: &str = "Security";
+    // Same `dataset::db::table` form the derived builder assigns.
+    const SRC_LSM: &str = "ds::EVENTLOG/Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.sqlite::Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational";
+    const SRC_SEC: &str = "ds::EVENTLOG/Security.sqlite::Security";
+    const SRC_CLIENT: &str = "ds::EVENTLOG/Microsoft-Windows-TerminalServices-RDPClient%4Operational.sqlite::Microsoft-Windows-TerminalServices-RDPClient%4Operational";
 
     fn ev(pairs: &[(&str, &str)]) -> Row {
         pairs
@@ -916,7 +900,8 @@ mod tests {
             ("channel", LSM_CH),
             ("computer", "PC1"),
             ("source_scope", SRC_LSM),
-            ("direction", "inbound"),
+            // Classifier rule: LSM is inbound only with remote address evidence.
+            ("direction", if address.is_empty() { "unknown" } else { "inbound" }),
             ("stage", stage),
             ("result", "성공"),
             (
@@ -1130,27 +1115,59 @@ mod tests {
     }
 
     #[test]
-    fn session_end_discards_state_after_the_end_row() {
+    fn disconnect_keeps_the_session_instance_open_and_logoff_ends_it() {
         let mut rows = vec![
             lsm("2026-09-29 00:10:00", "21", "3", "10.0.0.5", "corp\\alice"),
             lsm("2026-09-29 00:20:00", "24", "3", "", ""),
+            lsm("2026-09-29 00:20:00", "39", "3", "", ""),
+            lsm("2026-09-29 00:20:00", "40", "3", "", ""),
             lsm("2026-09-29 00:40:00", "25", "3", "", ""),
+            lsm("2026-09-29 00:50:00", "23", "3", "", ""),
+            lsm("2026-09-29 00:50:01", "24", "3", "", ""),
         ];
         let c = correlate(&mut rows);
-        assert_eq!(
-            rows[1]["remote_address"], "10.0.0.5",
-            "the end row itself still inherits"
-        );
-        assert_eq!(
-            rows[2].get("remote_address"),
-            None,
-            "state is dropped after the end row"
-        );
         assert_eq!(c.segments.len(), 2);
-        assert_eq!(field(&c.segments[0], "end_kind"), "session_disconnect");
+        // Reconnect after a disconnect is the same session instance.
+        assert_eq!(rows[4]["remote_address"], "10.0.0.5");
+        assert_eq!(rows[4]["account_key"], "corp\\alice");
+        assert_eq!(rows[0]["segment_key"], rows[5]["segment_key"]);
+        let session = &c.segments[0];
+        assert_eq!(field(session, "start_kind"), "session_logon");
+        assert_eq!(field(session, "end_kind"), "session_logoff");
+        assert_eq!(field(session, "end_event_id"), "23");
+        assert_eq!(field(session, "disconnect_count"), "3");
+        assert_eq!(field(session, "reconnect_count"), "1");
+        assert_eq!(field(session, "event_count"), "6");
+        // State is dropped after the logoff row.
+        assert_eq!(rows[6].get("remote_address"), None);
         assert_eq!(field(&c.segments[1], "split_reason"), "after_end");
         assert_eq!(field(&c.segments[1], "start_bound"), "unobserved");
         assert_eq!(field(&c.segments[1], "end_bound"), "unobserved");
+    }
+
+    #[test]
+    fn client_connection_start_is_the_attempt_or_the_established_event() {
+        let id = "11111111-2222-3333-4444-555555555555";
+        let mut rows = vec![
+            client("2026-09-29 00:10:00", "1024", id, "10.0.0.9"),
+            client("2026-09-29 00:10:01", "1026", id, ""),
+            client("2026-09-29 00:10:02", "1102", id, "10.0.0.9"),
+            client("2026-09-29 00:10:03", "1025", id, ""),
+            client("2026-09-29 00:20:00", "1026", id, ""),
+        ];
+        let c = correlate(&mut rows);
+        assert_eq!(c.segments.len(), 2);
+        let attempt = &c.segments[0];
+        assert_eq!(field(attempt, "start_bound"), "proven");
+        assert_eq!(field(attempt, "start_kind"), "client_connection_attempt");
+        assert_eq!(field(attempt, "start_event_id"), "1024");
+        assert_eq!(field(attempt, "end_kind"), "client_disconnect");
+        // 1025 marks the established connection without splitting the instance.
+        let connected = &c.segments[1];
+        assert_eq!(field(connected, "event_count"), "3");
+        assert_eq!(field(connected, "start_kind"), "client_connection_established");
+        assert_eq!(field(connected, "start_event_id"), "1025");
+        assert_eq!(field(connected, "end_event_id"), "1026");
     }
 
     #[test]
@@ -1174,7 +1191,10 @@ mod tests {
     #[test]
     fn same_session_id_in_another_source_is_another_id() {
         let mut other = lsm("2026-09-29 00:20:00", "23", "3", "", "");
-        other.insert("source_scope".into(), "Second%4Operational".into());
+        other.insert(
+            "source_scope".into(),
+            "ds::EVENTLOG/Second%4Operational.sqlite::Second%4Operational".into(),
+        );
         let mut rows = vec![
             lsm("2026-09-29 00:10:00", "21", "3", "10.0.0.5", "corp\\alice"),
             other,
@@ -1224,15 +1244,35 @@ mod tests {
             "a genuine local success stays 성공"
         );
         assert!(has_carry(&c, 0, 1, "access_scope"));
+        // The unaddressed LSM row is already unknown (RD-05); local scope
+        // needs no direction rewrite and never yields an inbound one.
+        assert!(!c.relations.iter().any(|r| field(r, "field") == "direction"));
+        assert_eq!(field(&c.segments[0], "access_scope"), "local");
+        assert_eq!(field(&c.segments[0], "direction"), "unknown");
+        assert_eq!(c.segments[0].get("remote_address"), None);
+    }
+
+    // RD-05: an LSM record without its own address becomes inbound only when
+    // the same session instance carries proven remote scope.
+    #[test]
+    fn remote_session_scope_makes_unaddressed_lsm_inbound() {
+        let mut rows = vec![
+            lsm("2026-09-29 00:10:00", "21", "6", "10.0.0.5", "corp\\alice"),
+            lsm("2026-09-29 00:20:00", "40", "6", "", ""),
+            lsm("2026-09-29 00:30:00", "40", "7", "", ""),
+        ];
+        let c = correlate(&mut rows);
+        assert_eq!(rows[1]["access_scope"], "remote");
+        assert_eq!(rows[1]["direction"], "inbound");
         assert!(c.relations.iter().any(|r| {
-            field(r, "relation_kind") == "local_scope_direction"
+            field(r, "relation_kind") == "remote_scope_direction"
                 && field(r, "field") == "direction"
                 && field(r, "from_index") == "0"
                 && field(r, "to_index") == "1"
         }));
-        assert_eq!(field(&c.segments[0], "access_scope"), "local");
-        assert_eq!(field(&c.segments[0], "direction"), "unknown");
-        assert_eq!(c.segments[0].get("remote_address"), None);
+        // No scope evidence in its own session: stays unknown.
+        assert_eq!(rows[2]["direction"], "unknown");
+        assert_eq!(rows[2]["access_scope"], "unknown");
     }
 
     #[test]
@@ -1346,7 +1386,7 @@ mod tests {
                 ("computer", "PC1"),
                 (
                     "source_scope",
-                    "Microsoft-Windows-RemoteDesktopServices-RdpCoreTS%4Operational",
+                    "ds::EVENTLOG/Microsoft-Windows-RemoteDesktopServices-RdpCoreTS%4Operational.sqlite::Microsoft-Windows-RemoteDesktopServices-RdpCoreTS%4Operational",
                 ),
                 ("direction", "inbound"),
                 ("access_scope", "unknown"),
@@ -1367,8 +1407,9 @@ mod tests {
     }
 
     #[test]
-    fn outbound_needs_a_real_connection_id_and_process_scope() {
-        let base = |time: &str, pid: &str, conn: &str, address: &str| {
+    fn outbound_needs_a_real_activity_id_and_process_scope() {
+        const ID: &str = "11111111-2222-3333-4444-555555555555";
+        let base = |time: &str, pid: &str, activity: &str, address: &str| {
             ev(&[
                 ("timestamp", time),
                 ("event_id", "1024"),
@@ -1381,22 +1422,19 @@ mod tests {
                     "Microsoft-Windows-TerminalServices-RDPClient/Operational",
                 ),
                 ("computer", "PC1"),
-                (
-                    "source_scope",
-                    "Microsoft-Windows-TerminalServices-RDPClient%4Operational",
-                ),
+                ("source_scope", SRC_CLIENT),
                 ("direction", "outbound"),
                 ("access_scope", "remote"),
                 ("stage", "transport"),
                 ("process_id", pid),
-                ("connection_id", conn),
+                ("correlation_activity_id", activity),
                 ("remote_address", address),
             ])
         };
         let mut rows = vec![
-            base("2026-09-29 00:10:00", "100", "C1", "10.0.0.9"),
-            base("2026-09-29 00:10:30", "200", "C1", ""),
-            base("2026-09-29 00:10:40", "100", "C1", ""),
+            base("2026-09-29 00:10:00", "100", ID, "10.0.0.9"),
+            base("2026-09-29 00:10:30", "200", ID, ""),
+            base("2026-09-29 00:10:40", "100", ID, ""),
             base("2026-09-29 00:10:50", "100", "", ""),
         ];
         rows[2].insert("event_id".into(), "1025".into());
@@ -1410,12 +1448,12 @@ mod tests {
         assert_eq!(
             rows[3].get("remote_address"),
             None,
-            "no connection id, no carry"
+            "no activity id, no carry"
         );
         assert_eq!(rows[3].get("segment_key"), None);
         assert_eq!(c.segments.len(), 2);
         assert_eq!(field(&c.segments[0], "scope_process_id"), "100");
-        assert_eq!(field(&c.segments[0], "start_bound"), "unobserved");
+        assert_eq!(field(&c.segments[0], "start_kind"), "client_connection_attempt");
     }
 
     #[test]
@@ -1433,10 +1471,7 @@ mod tests {
                     "Microsoft-Windows-TerminalServices-RDPClient/Operational",
                 ),
                 ("computer", "PC1"),
-                (
-                    "source_scope",
-                    "Microsoft-Windows-TerminalServices-RDPClient%4Operational",
-                ),
+                ("source_scope", SRC_CLIENT),
                 ("direction", "outbound"),
                 ("access_scope", "remote"),
                 ("stage", "transport"),
@@ -1587,7 +1622,7 @@ mod tests {
             ("timestamp", time),
             ("event_id", eid),
             ("direction", "outbound"),
-            ("source_scope", "ClientLog"),
+            ("source_scope", SRC_CLIENT),
             ("provider", "ClientActiveXCore"),
             ("channel", "RDPClient"),
             ("computer", "PC1"),

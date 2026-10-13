@@ -92,6 +92,7 @@ export default function RegistryView({ dbPath, isRowBookmarked, onToggleBookmark
   childrenRef.current = children;
   const [selectedKey, setSelectedKey] = useState<{ hiveId: string; recordId: string } | null>(null);
   const [keyInfo, setKeyInfo] = useState<RegistryEntry | null>(null);
+  const [keyError, setKeyError] = useState<string | null>(null);
   const [values, setValues] = useState<{ rows: Row[]; total: number } | null>(null);
   const [valuesLoading, setValuesLoading] = useState(false);
   const [valuesError, setValuesError] = useState<string | null>(null);
@@ -168,7 +169,13 @@ export default function RegistryView({ dbPath, isRowBookmarked, onToggleBookmark
     const seq = ++keySeq.current;
     setValues(null);
     setValuesError(null);
-    window.api.registryEntry(dbPath, recordId).then((info) => { if (keySeq.current === seq) setKeyInfo(info); }).catch(() => {});
+    setKeyInfo(null);
+    setKeyError(null);
+    window.api.registryEntry(dbPath, recordId)
+      .then((info) => { if (keySeq.current === seq) setKeyInfo(info); })
+      .catch((e) => { if (keySeq.current === seq) setKeyError(String(e)); });
+    // The loading flag also covers this paging so 「더 불러오기」 can't fetch the same range.
+    setValuesLoading(true);
     void (async () => {
       try {
         let rows: Row[] = [];
@@ -183,6 +190,8 @@ export default function RegistryView({ dbPath, isRowBookmarked, onToggleBookmark
         } while (valueId && rows.length < total && !rows.some((row) => row.record_id === valueId));
       } catch (e) {
         if (keySeq.current === seq) setValuesError(String(e));
+      } finally {
+        if (keySeq.current === seq) setValuesLoading(false);
       }
     })();
   }, [dbPath]);
@@ -192,10 +201,18 @@ export default function RegistryView({ dbPath, isRowBookmarked, onToggleBookmark
     const seq = keySeq.current;
     setValuesLoading(true);
     window.api.registryValues(dbPath, selectedKey.recordId, values.rows.length, VALUE_PAGE)
-      .then((page) => { if (keySeq.current === seq) setValues({ rows: [...values.rows, ...page.rows], total: page.total }); })
+      .then((page) => {
+        if (keySeq.current !== seq) return;
+        const seen = new Set(values.rows.map((row) => row.record_id));
+        setValues({ rows: [...values.rows, ...page.rows.filter((row) => !seen.has(row.record_id))], total: page.total });
+      })
       .catch((e) => { if (keySeq.current === seq) setValuesError(String(e)); })
-      .finally(() => setValuesLoading(false));
+      .finally(() => { if (keySeq.current === seq) setValuesLoading(false); });
   }, [dbPath, selectedKey, values, valuesLoading]);
+  // A value filter must see every value, not just the loaded pages.
+  useEffect(() => {
+    if (valueFilter.trim() && values && values.rows.length < values.total && !valuesLoading && !valuesError) loadMoreValues();
+  }, [valueFilter, values, valuesLoading, valuesError, loadMoreValues]);
 
   useEffect(() => {
     if (!selectedValueId) { setValueEntry(null); return; }
@@ -303,7 +320,14 @@ export default function RegistryView({ dbPath, isRowBookmarked, onToggleBookmark
   // Debounced new search on query/scope/field change.
   const optionsKey = JSON.stringify(searchOptions);
   useEffect(() => {
-    if (searchOptions.query.length < 2) { searchSeq.current++; setHits([]); setSearchState({ running: false, cursor: null, done: false, progress: 0, error: null }); return; }
+    if (searchOptions.query.length < 2) {
+      searchSeq.current++;
+      setHits([]);
+      setSearchState({ running: false, cursor: null, done: false, progress: 0, error: null });
+      // The search tab disappears with its query; don't leave it selected.
+      setLeftTab((tab) => (tab === "search" ? "tree" : tab));
+      return;
+    }
     setLeftTab("search");
     const timer = window.setTimeout(() => { void runSearch(false); }, 350);
     return () => window.clearTimeout(timer);
@@ -397,6 +421,7 @@ export default function RegistryView({ dbPath, isRowBookmarked, onToggleBookmark
               <>
                 <KeyHeader
                   info={keyInfo}
+                  error={keyError}
                   hive={selectedHive}
                   isRowBookmarked={isRowBookmarked}
                   onToggleBookmark={onToggleBookmark}
@@ -639,14 +664,16 @@ function BookmarkButton({ row, isRowBookmarked, onToggleBookmark, size = 16 }: {
   );
 }
 
-function KeyHeader({ info, hive, isRowBookmarked, onToggleBookmark, onSelectAncestor }: {
+function KeyHeader({ info, error, hive, isRowBookmarked, onToggleBookmark, onSelectAncestor }: {
   info: RegistryEntry | null;
+  error: string | null;
   hive: RegistryHive | undefined;
   isRowBookmarked?: (row: Row) => boolean;
   onToggleBookmark?: (rowid: number) => void;
   onSelectAncestor: (ancestor: RegistryAncestor) => void;
 }) {
   const [copied, copy] = useCopy();
+  if (error) return <div role="alert" title={error} style={{ minHeight: 86, padding: "12px 14px", borderBottom: "1px solid var(--border-subtle)", fontSize: 12.5, color: "var(--danger)" }}>키 정보를 불러오지 못했습니다</div>;
   if (!info) return <div style={{ minHeight: 86, borderBottom: "1px solid var(--border-subtle)" }} />;
   const key = info.key;
   const display = displayRegistryKeyPath(key.key_path, hive?.hiveName);
@@ -714,7 +741,7 @@ function ValueList({ values, error, loadingMore, onMore, filter, onFilter, selec
     <div style={{ flex: 1, minHeight: 120, display: "flex", flexDirection: "column" }}>
       <div style={{ flexShrink: 0, display: "flex", alignItems: "center", gap: 10, padding: "8px 14px" }}>
         <strong style={{ fontSize: 12.5 }}>값</strong>
-        <span style={{ fontSize: 11.5, color: "var(--text-faint)", fontVariantNumeric: "tabular-nums" }}>{values ? (needle ? `${shown.length.toLocaleString()} / ${values.rows.length.toLocaleString()}` : values.total.toLocaleString()) : ""}</span>
+        <span style={{ fontSize: 11.5, color: "var(--text-faint)", fontVariantNumeric: "tabular-nums" }}>{values ? (needle ? `${shown.length.toLocaleString()} / ${values.total.toLocaleString()}` : values.total.toLocaleString()) : ""}</span>
         {values && values.total > 8 && (
           <input value={filter} onChange={(event) => onFilter(event.target.value)} placeholder="이름 · 데이터 필터" aria-label="값 필터" style={{ marginLeft: "auto", width: 220, height: 28, padding: "0 10px", fontSize: 12, background: "var(--bg-input, var(--bg-elevated))", border: "1px solid var(--border)", borderRadius: 7, color: "var(--text)", outline: "none" }} />
         )}
@@ -750,7 +777,9 @@ function ValueList({ values, error, loadingMore, onMore, filter, onFilter, selec
                 </div>
               );
             })}
-            {shown.length === 0 && <div role="status" style={{ padding: "14px 8px", color: "var(--text-faint)", fontSize: 12 }}>일치하는 값 없음</div>}
+            {shown.length === 0 && (values.rows.length < values.total
+              ? <div role="status" style={{ display: "flex", alignItems: "center", gap: 6, padding: "14px 8px", color: "var(--text-faint)", fontSize: 12 }}><CircularProgress size={13} thickness={4} />불러오는 중</div>
+              : <div role="status" style={{ padding: "14px 8px", color: "var(--text-faint)", fontSize: 12 }}>일치하는 값 없음</div>)}
             {values.rows.length < values.total && (
               <button type="button" disabled={loadingMore} onClick={onMore} style={{ margin: "6px 8px 0", minHeight: 26, padding: "0 10px", fontSize: 11.5, border: "1px solid var(--border)", borderRadius: 6, background: "transparent", color: "var(--accent)", cursor: "pointer" }}>
                 {loadingMore ? "불러오는 중…" : `더 불러오기 · ${values.rows.length.toLocaleString()} / ${values.total.toLocaleString()}`}
@@ -822,7 +851,7 @@ function ValueInspector({ dbPath, entry, isRowBookmarked, onToggleBookmark, onCl
             <BookmarkButton row={row} isRowBookmarked={isRowBookmarked} onToggleBookmark={onToggleBookmark} />
             <IconButton size="small" aria-label="값 상세 닫기" onClick={onClose} sx={{ color: "var(--text-faint)", borderRadius: "var(--radius)", fontSize: 16 }}>×</IconButton>
           </div>
-          <div style={{ flex: 1, minHeight: 0, overflow: "auto", padding: 14 }}>
+          <div style={{ flex: 1, minHeight: 0, overflow: "auto", padding: 14, ...(effective === "hex" ? { display: "flex", flexDirection: "column" } : {}) }}>
             {effective === "hex" ? (
               bytes.length ? <HexViewer bytes={bytes} maxHeight="100%" /> : <span style={{ fontSize: 12.5, color: "var(--text-faint)" }}>데이터 없음</span>
             ) : formatted.kind === "empty" ? (

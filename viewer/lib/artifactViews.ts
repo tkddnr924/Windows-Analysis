@@ -1,6 +1,5 @@
 import { tagsForBoolean, tagsForDangerType, tagsForEventLevel, tagsForNameMismatch, tagsForPath, type Tag } from "./tagging";
 import { resolveKnownFolderPath } from "@/lib/knownFolders";
-import { MACHINE_SCOPE_LABEL, MACHINE_SCOPE_USER } from "@/lib/accountIdentity";
 import { displayRegistryKeyPath } from "@/lib/registryPath";
 import { executableNote } from "./executableCatalog";
 import { ACCOUNT_ROLE_LABELS } from "./executionHistory";
@@ -110,7 +109,6 @@ export interface ArtifactViewSpec {
   /** Suppress the generic overview time when the artifact includes it in its
    * own concise evidence summary. */
   overviewTime?: "show" | "hide";
-  badges?: FieldSpec[];
   /** Display names of stored event_type values in the common top (docs-23). */
   eventTypeLabels?: Record<string, string>;
   tags?: (row: Record<string, string>) => Tag[];
@@ -242,40 +240,12 @@ function edField(jsonKey: string, label: string, opts: Partial<FieldSpec> = {}):
   };
 }
 
-const STATUS_COLORS: Record<string, string> = {
-  ok: "#3fb950",
-  live: "#3fb950",
-  corrupted: "#f85149",
-  corrupted_chunk: "#f85149",
-  corrupted_record: "#f85149",
-  unreadable_file: "#f85149",
-  carved_deleted_cell: "#d29922",
-};
-
 const LEVEL_COLORS: Record<string, string> = {
   Critical: "#f85149",
   Error: "#f85149",
   Warning: "#d29922",
   Information: "#4fc1ff",
   Verbose: "#8a8a8a",
-};
-
-const BOOL_COLORS: Record<string, string> = {
-  true: "#3fb950",
-  True: "#3fb950",
-  false: "#8a8a8a",
-  False: "#8a8a8a",
-};
-
-const DIRECTION_COLORS: Record<string, string> = {
-  inbound: "#d29922",
-  outbound: "#4fc1ff",
-};
-
-const RDP_RESULT_COLORS: Record<string, string> = {
-  "성공": "#3fb950",
-  "실패": "#f85149",
-  "정보": "#8a8a8a",
 };
 
 function basename(path: string | undefined): string {
@@ -401,7 +371,7 @@ const MFT_DIRECTORY_LABELS: Record<string, string> = { "1": "디렉터리", "0":
 // in_use=0 is a released record, not proof of deletion time or recoverability (docs-04).
 const MFT_IN_USE_LABELS: Record<string, string> = { "1": "사용 중 (할당됨)", "0": "비사용 (할당 해제)" };
 // Stored link/path/body states (docs-04 §0, FileSystemEntries).
-export const MFT_PARENT_STATUS_LABELS: Record<string, string> = { verified: "확인됨", root: "루트", sequence_mismatch: "부모 순번 불일치", unknown: "부모 미확인" };
+export const MFT_PARENT_STATUS_LABELS: Record<string, string> = { verified: "확인됨", root: "루트", deleted_parent: "삭제된 부모 폴더", sequence_mismatch: "부모 순번 불일치", unknown: "부모 미확인" };
 export const MFT_PATH_STATUS_LABELS: Record<string, string> = { complete: "완전한 경로", sequence_mismatch: "불완전 (부모 순번 불일치)", unknown: "불완전 (부모 미확인)" };
 export const MFT_DATA_STATUS_LABELS: Record<string, string> = { resident: "Resident 본문", resident_empty: "빈 Resident 본문", nonresident: "Non-resident (본문 미저장)", unavailable: "본문 미확보", not_applicable: "폴더 (본문 없음)" };
 const PATH_MATCH_BASIS_LABELS: Record<string, string> = { path: "경로 일치 (드라이브 미확인)", path_and_drive: "경로·드라이브 일치" };
@@ -421,25 +391,23 @@ const MFT_VOLUME_FIELDS: FieldSpec[] = [
 ];
 
 const VIEWS: Record<string, ArtifactViewSpec> = {
-  // Windows Error Reporting — every report field lives in one `report` JSON
-  // column; WerView parses it into fault-signature / loaded-modules sections.
+  // Raw Windows Error Reporting facts (DataTable); every report field lives in
+  // one `report` JSON column. WerView serves only the derived WerReports.
   WER_Reports: {
-    customView: "wer",
     title: (r) => r.AppName || "(WER)",
     // timestamp = 보고서의 EventTime. 통합 타임라인은 _OVERVIEW WerReports로 받는다.
     timelineField: "timestamp",
     timelineTitle: (r) => r.AppName || basename(r.AppPath) || "(WER)",
     timelineSubtitle: (r) => [r.EventType, r.AppPath].filter(Boolean).join(" · "),
     priorityColumns: ["timestamp", "EventType", "AppName", "AppPath", "TargetAppId", "ReportIdentifier"],
-    sections: [{ heading: "보고서", fields: [{ key: "EventType" }, { key: "AppPath" }, { key: "ReportIdentifier" }, { key: "app_pid", label: "프로세스 ID (PID)" }, { key: "app_start_time", label: "프로세스 시작 시각" }, { key: "app_uptime", label: "실행 유지 시간" }, { key: "fault_module", label: "오류 모듈" }, { key: "exception_code", label: "예외 코드" }, { key: "report", kind: "json" }] }],
+    sections: [{ heading: "보고서", fields: [{ key: "EventType" }, { key: "AppPath" }, { key: "ReportIdentifier" }, { key: "report", kind: "json" }] }],
   },
   // docs-16: Report.wer·1001·1000·1002·수집 덤프는 각각 한 행(합치지 않음).
   WerReports: {
     customView: "wer",
     timelineField: "timestamp",
-    title: (r) => (r.reporting_stage === "report_generated" && r.signature_schema_status !== "mapped" ? "" : r.app_name) || r.friendly_event_name || r.error_type || "",
+    title: (r) => r.app_name || r.friendly_event_name || r.error_type || "",
     subtitle: (r) => r.app_path_resolved || r.app_path || r.report_description || "",
-    badges: [{ key: "error_type", kind: "badge" }],
     visibleColumns: ["timestamp", "reporting_stage", "error_type", "app_name", "module_name", "exception_code", "app_path"],
     priorityColumns: ["timestamp", "reporting_stage", "error_type", "app_name", "module_name", "exception_code", "app_path"],
     sections: [
@@ -763,7 +731,6 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
   PathReferences: {
     title: (r) => r.label || r.target_path || r.path || "(경로 참조)",
     subtitle: (r) => [r.event_type, r.account].filter(Boolean).join(" · "),
-    badges: [{ key: "event_type", kind: "badge" }],
     sections: [{ heading: "참조", fields: [
       { key: "__match_basis", label: "후보 근거", valueLabels: PATH_MATCH_BASIS_LABELS },
       { key: "label", label: "표시 이름" },
@@ -795,7 +762,6 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     customView: "targetInfo",
     title: (r) => r.name || "(no name)",
     subtitle: (r) => r.category || "",
-    badges: [{ key: "category", kind: "badge" }],
     priorityColumns: ["category", "name", "value", "timestamp"],
     sections: [{ heading: "값", fields: [
       { key: "value" },
@@ -889,7 +855,7 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
       { heading: "UserAssist 실행 정보", fields: [
         { key: "program_name", label: "실행 항목", compute: (r) => executionValue("userAssist", "program_name", r) },
         // KNOWNFOLDERID GUID 접두 경로는 실제 경로로 변환해 함께 보여 준다.
-        { key: "program_path", label: "실행 경로 (변환)", kind: "path", compute: (r) => resolveKnownFolderPath(executionValue("userAssist", "program_path", r)) ?? "" },
+        { key: "program_path_resolved", label: "실행 경로 (변환)", kind: "path", compute: (r) => resolveKnownFolderPath(executionValue("userAssist", "program_path", r)) ?? "" },
         { key: "program_path", label: "원본 경로", kind: "path", compute: (r) => executionValue("userAssist", "program_path", r) },
         { key: "run_count", label: "실행 횟수", compute: (r) => executionValue("userAssist", "run_count", r) },
         { key: "focus_count", label: "포커스 횟수", compute: (r) => executionValue("userAssist", "focus_count", r) },
@@ -1262,7 +1228,6 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
   CacheEntries: {
     title: (r) => basename(r.url) || r.url || "(no url)",
     subtitle: (r) => r.url || "",
-    badges: [{ key: "status", kind: "badge" }],
     priorityColumns: ["response_time", "url", "status", "content_type", "content_length", "server", "account"],
     sections: [
       { heading: "HTTP 응답", fields: [
@@ -1332,7 +1297,6 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
   IEIndexDat_Records: {
     title: (r) => r.url || "(no url)",
     subtitle: (r) => r.container || "",
-    badges: [{ key: "record_type", kind: "badge" }],
     priorityColumns: ["accessed_time", "record_type", "url", "hits", "container", "account"],
     sections: [
       { heading: "상세", fields: [
@@ -1396,7 +1360,6 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     timelineField: "timestamp",
     title: (r) => r.threat_name || r.title || r.event_type || "",
     subtitle: (r) => r.target_path || r.config_target || r.description || "",
-    badges: [{ key: "section_label", kind: "badge" }],
     visibleColumns: ["timestamp", "section_label", "title", "threat_name", "target_path", "severity", "action", "result", "account"],
     priorityColumns: ["timestamp", "section_label", "title", "threat_name", "target_path", "severity", "action", "result", "account"],
     sections: [
@@ -1416,7 +1379,6 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
         { key: "detection_time", label: "탐지 시각" },
         { key: "action", label: "조치" },
         { key: "action_time", label: "조치 시각" },
-        { key: "action_status", label: "조치 상태" },
         { key: "remediation_user", label: "조치 수행자", kind: "account" },
         { key: "additional_actions", label: "추가 조치" },
         { key: "result", label: "결과", compute: (r) => (r.result && r.result !== "unknown" ? DEFENDER_RESULT_LABELS[r.result] ?? r.result : "") },
@@ -1532,10 +1494,6 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     timelineField: "timestamp",
     title: (r) => r.remote_address || "(주소 없음)",
     subtitle: (r) => r.description || "",
-    badges: [
-      { key: "direction", kind: "badge", badgeColors: DIRECTION_COLORS },
-      { key: "result", label: "결과", kind: "badge", badgeColors: RDP_RESULT_COLORS },
-    ],
     customView: "remoteAccess",
     // (kept for when the raw table is viewed directly)
     visibleColumns: ["timestamp", "direction", "remote_address", "account", "description"],
@@ -1559,11 +1517,9 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
         { key: "remote_address_raw", label: "상대 주소 원문", compute: (r) => (r.remote_address_raw && r.remote_address_raw !== r.remote_address ? r.remote_address_raw : "") },
         { key: "remote_computer", label: "상대 컴퓨터" },
         { key: "remote_port", label: "상대 포트" },
-        { key: "local_address", label: "이벤트 기록 로컬 주소" },
         { key: "logon_type", label: "로그온 유형" },
         { key: "session_id", label: "세션 ID" },
         { key: "logon_id", label: "로그온 ID" },
-        { key: "connection_id", label: "연결 ID" },
       ]},
       { heading: "계정", fields: [
         { key: "account_raw", label: "계정 원문", compute: (r) => (r.account_raw && r.account_raw !== r.account ? r.account_raw : "") },
@@ -1596,7 +1552,7 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
       {
         table: "RemoteAccessRelations",
         heading: "값 승계 · 관계",
-        summary: (r) => [({ carry_forward: "승계", local_scope_direction: "로컬 방향", logon_instance_end: "로그온 종료" } as Record<string, string>)[r.relation_kind] ?? r.relation_kind, r.field, r.value].filter(Boolean).join(" · "),
+        summary: (r) => [({ carry_forward: "승계", local_scope_direction: "로컬 방향", remote_scope_direction: "원격 방향", logon_instance_end: "로그온 종료" } as Record<string, string>)[r.relation_kind] ?? r.relation_kind, r.field, r.value].filter(Boolean).join(" · "),
       },
       {
         table: "RemoteAccessDetails",
@@ -1631,10 +1587,6 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     timelineField: "timestamp",
     title: (r) => r.remote_address || r.account || r.description || "",
     subtitle: (r) => r.description || "",
-    badges: [
-      { key: "direction", kind: "badge", badgeColors: DIRECTION_COLORS },
-      { key: "result", label: "결과", kind: "badge", badgeColors: RDP_RESULT_COLORS },
-    ],
     // (kept for when the raw table is viewed directly)
     visibleColumns: ["timestamp", "direction", "remote_address", "account", "share_name", "result", "description"],
     filterTabs: {
@@ -1847,7 +1799,6 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     timelineField: "timestamp",
     title: (r) => r.job_name || r.event_type || "",
     subtitle: (r) => r.url || r.local_path_resolved || r.local_path || "",
-    badges: [{ key: "event_type", kind: "badge" }],
     visibleColumns: ["timestamp", "event_type", "job_name", "url", "local_path", "bytes_transferred", "result", "account"],
     priorityColumns: ["timestamp", "event_type", "job_name", "url", "local_path", "bytes_transferred", "result", "account"],
     sections: [
@@ -1903,7 +1854,6 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     timelineField: "timestamp",
     title: (r) => (r.rule_name ? ruleDisplayName(r.rule_name) : r.event_type || ""),
     subtitle: (r) => r.app_path_resolved || r.app_path || r.service || "",
-    badges: [{ key: "event_type", kind: "badge" }],
     visibleColumns: ["timestamp", "event_type", "rule_name", "direction", "action", "protocol", "app_path", "account"],
     priorityColumns: ["timestamp", "event_type", "rule_name", "direction", "action", "protocol", "app_path", "account"],
     sections: [
@@ -1978,10 +1928,6 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     // script and host command line are the content sections below.
     title: (r) => r.event_type || "파워셸 기록",
     subtitle: (r) => [r.account, r.process].filter(Boolean).join(" · "),
-    badges: [
-      { key: "event_type", kind: "badge" },
-      { key: "event_id", label: "이벤트 ID", kind: "badge" },
-    ],
     tags: (r) => tagsForPath(r.script_path),
     // (kept for when the raw table is viewed directly, but the flow view is
     // the default) — the five fields the analyst actually scans.
@@ -2058,10 +2004,6 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
   Amcache_Programs: {
     title: (r) => r.Name || "(no name)",
     subtitle: (r) => [r.Version, r.Publisher].filter(Boolean).join(" · "),
-    badges: [
-      { key: "_recovery", kind: "badge", badgeColors: STATUS_COLORS },
-      { key: "StoreAppType", kind: "badge" },
-    ],
     // HiddenArp=1 means the program was deliberately hidden from Add/Remove
     // Programs — a real self-concealment technique, not just noise.
     tags: (r) => tagsForBoolean(r.HiddenArp, { label: "제어판에서 숨김(HiddenArp)", severity: "danger", description: "제어판 '프로그램 추가/제거' 목록에서 의도적으로 숨겨진 프로그램입니다. 사용자 눈에 띄지 않게 하려는 자기은폐(self-concealment) 기법으로, 정상 소프트웨어에서는 드뭅니다." }).concat(executableNoteTags(r.Name)),
@@ -2097,10 +2039,6 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
   Amcache_Files: {
     title: (r) => r.name || basename(r.lower_case_long_path) || "(no name)",
     subtitle: (r) => [r.product_name, r.version].filter(Boolean).join(" · "),
-    badges: [
-      { key: "binary_type", kind: "badge" },
-      { key: "is_os_component", label: "OS 구성요소", kind: "badge", badgeColors: { True: "#3fb950", False: "#8a8a8a" } },
-    ],
     // Filename-vs-internal-name mismatch is a classic masquerading signal
     // on top of the general suspicious-path check.
     // 구형(Win7/2008R2, Root\File) 포맷 행은 full_path/created/last_modified
@@ -2438,7 +2376,6 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     title: (r) => r.executable_filename || "(no exe)",
     subtitle: (r) => (r.run_count ? `실행 ${r.run_count}회` : ""),
     tags: (r) => executableNoteTags(r.executable_filename),
-    badges: [{ key: "_status", kind: "badge", badgeColors: STATUS_COLORS }],
     embeddedLinks: [{ key: "prefetch_hash", label: "Prefetch에 기록된 참조 파일", targetFile: "Prefetch_LoadedFiles", targetColumn: "prefetch_hash" }],
     // No timelineField: Prefetch reaches the master timeline via ExecutionHistory.
     priorityColumns: ["last_run_time", "executable_filename", "run_count"],
@@ -2486,11 +2423,6 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
   TaskScheduler_Tasks: {
     title: (r) => r.task_name || r.uri || "(작업)",
     subtitle: (r) => r.uri || r.actions || "",
-    badges: [
-      { key: "enabled", label: "사용", kind: "badge", badgeColors: BOOL_COLORS },
-      { key: "hidden", label: "숨김", kind: "badge", badgeColors: { true: "#d29922", false: "#8a8a8a" } },
-      { key: "run_level", kind: "badge" },
-    ],
     // A hidden task, and a task whose action runs from a suspicious path, are
     // both classic persistence signals.
     tags: (r) =>

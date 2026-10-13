@@ -100,10 +100,6 @@ pub struct Dump {
 }
 
 impl Dump {
-    pub fn is_minidump(&self) -> bool {
-        self.format == FORMAT_MINIDUMP
-    }
-
     pub fn issues_text(&self) -> Option<String> {
         if self.issues.is_empty() {
             None
@@ -224,7 +220,6 @@ pub struct Exception {
     pub parameters: Vec<u64>,
     pub context_rva: u32,
     pub context_size: u32,
-    pub parameters_truncated: bool,
 }
 
 pub const THREAD_FROM_LIST: &str = "thread_list";
@@ -278,7 +273,6 @@ pub struct Module {
     pub name_state: &'static str,
     pub version: Option<VersionInfo>,
     pub cv: Option<CvRecord>,
-    pub misc_record_size: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -912,12 +906,12 @@ fn read_streams(reader: &mut Reader, dump: &mut Dump) {
             }
             17 => {
                 let (state, found) = read_thread_info_list(reader, dump, stream);
-                thread_infos = found;
+                thread_infos.extend(found);
                 dump.streams[slot].parse_state = state;
             }
             24 => {
                 let (state, found) = read_thread_names(reader, dump, stream);
-                thread_names = found;
+                thread_names.extend(found);
                 dump.streams[slot].parse_state = state;
             }
             10 | 11 => {
@@ -1025,10 +1019,42 @@ fn bounded_count(
     count
 }
 
+/// Fixed header of a stream, read only when the stream itself declares that
+/// many bytes; otherwise the neighbouring bytes would be attributed to it.
+fn stream_head(reader: &mut Reader, dump: &mut Dump, stream: &Stream, size: u64) -> Option<Vec<u8>> {
+    if u64::from(stream.data_size) < size {
+        dump.issues.push(format!(
+            "스트림 {}(type {}) 크기 {}바이트가 고정 헤더 {size}바이트보다 작습니다",
+            stream.index, stream.type_code, stream.data_size
+        ));
+        return None;
+    }
+    reader.read(u64::from(stream.rva), size)
+}
+
+/// Entry bytes of a list stream and their count. `Err` carries the stream
+/// state when nothing can be read: `empty_state` only for a true empty list.
+fn list_body(
+    reader: &mut Reader,
+    dump: &mut Dump,
+    stream: &Stream,
+    (header_size, entry_size, declared): (u64, u64, u64),
+    empty_state: &'static str,
+) -> Result<(usize, Vec<u8>), &'static str> {
+    let count = bounded_count(dump, stream, header_size, entry_size, declared);
+    if count == 0 {
+        return Err(if declared == 0 { empty_state } else { STREAM_INVALID_STRUCTURE });
+    }
+    reader
+        .read(u64::from(stream.rva) + header_size, count * entry_size)
+        .map(|body| (count as usize, body))
+        .ok_or(STREAM_INVALID_STRUCTURE)
+}
+
 /// `MINIDUMP_HANDLE_DATA_STREAM` header. Handle descriptors are not stored:
 /// only the stream's own declared shape becomes evidence.
 fn read_handle_data(reader: &mut Reader, dump: &mut Dump, stream: &Stream) -> &'static str {
-    let Some(head) = reader.read(u64::from(stream.rva), 16) else {
+    let Some(head) = stream_head(reader, dump, stream, 16) else {
         return STREAM_INVALID_STRUCTURE;
     };
     let header_size = u64::from(u32le(&head, 0));
@@ -1053,7 +1079,7 @@ fn read_handle_data(reader: &mut Reader, dump: &mut Dump, stream: &Stream) -> &'
 /// `MINIDUMP_FUNCTION_TABLE_STREAM` header. The native function entries that
 /// follow are CPU-specific unwind data and are not interpreted here.
 fn read_function_table(reader: &mut Reader, dump: &mut Dump, stream: &Stream) -> &'static str {
-    let Some(head) = reader.read(u64::from(stream.rva), 24) else {
+    let Some(head) = stream_head(reader, dump, stream, 24) else {
         return STREAM_INVALID_STRUCTURE;
     };
     let header_size = u64::from(u32le(&head, 0));
@@ -1089,7 +1115,7 @@ fn read_function_table(reader: &mut Reader, dump: &mut Dump, stream: &Stream) ->
 /// revision 1 has a published body layout, so other revisions keep the two
 /// leading values and the retained raw identity instead of guessed fields.
 fn read_system_memory_info(reader: &mut Reader, dump: &mut Dump, stream: &Stream) -> &'static str {
-    let Some(head) = reader.read(u64::from(stream.rva), 4) else {
+    let Some(head) = stream_head(reader, dump, stream, 4) else {
         return STREAM_INVALID_STRUCTURE;
     };
     let revision = u64::from(u16le(&head, 0));
@@ -1113,7 +1139,7 @@ fn read_system_memory_info(reader: &mut Reader, dump: &mut Dump, stream: &Stream
 /// unknown instead of being stored as zero.
 fn read_process_vm_counters(reader: &mut Reader, dump: &mut Dump, stream: &Stream) -> &'static str {
     const SIZE: u64 = 152;
-    let Some(head) = reader.read(u64::from(stream.rva), 4) else {
+    let Some(head) = stream_head(reader, dump, stream, 4) else {
         return STREAM_INVALID_STRUCTURE;
     };
     let revision = u16le(&head, 0);
@@ -1195,22 +1221,15 @@ fn read_process_vm_counters(reader: &mut Reader, dump: &mut Dump, stream: &Strea
 
 fn read_thread_list(reader: &mut Reader, dump: &mut Dump, stream: &Stream) -> &'static str {
     const ENTRY: u64 = 48;
-    let Some(head) = reader.read(u64::from(stream.rva), 4) else {
+    let Some(head) = stream_head(reader, dump, stream, 4) else {
         return STREAM_INVALID_STRUCTURE;
     };
     let declared = u64::from(u32le(&head, 0));
-    let count = bounded_count(dump, stream, 4, ENTRY, declared);
-    if count == 0 {
-        return if declared == 0 {
-            STREAM_TYPED
-        } else {
-            STREAM_INVALID_STRUCTURE
-        };
-    }
-    let Some(body) = reader.read(u64::from(stream.rva) + 4, count * ENTRY) else {
-        return STREAM_INVALID_STRUCTURE;
+    let (count, body) = match list_body(reader, dump, stream, (4, ENTRY, declared), STREAM_TYPED) {
+        Ok(found) => found,
+        Err(state) => return state,
     };
-    for index in 0..count as usize {
+    for index in 0..count {
         let at = index * ENTRY as usize;
         dump.threads.push(Thread {
             index: index as u32,
@@ -1234,22 +1253,15 @@ fn read_thread_list(reader: &mut Reader, dump: &mut Dump, stream: &Stream) -> &'
 
 fn read_module_list(reader: &mut Reader, dump: &mut Dump, stream: &Stream) -> &'static str {
     const ENTRY: u64 = 108;
-    let Some(head) = reader.read(u64::from(stream.rva), 4) else {
+    let Some(head) = stream_head(reader, dump, stream, 4) else {
         return STREAM_INVALID_STRUCTURE;
     };
     let declared = u64::from(u32le(&head, 0));
-    let count = bounded_count(dump, stream, 4, ENTRY, declared);
-    if count == 0 {
-        return if declared == 0 {
-            STREAM_TYPED
-        } else {
-            STREAM_INVALID_STRUCTURE
-        };
-    }
-    let Some(body) = reader.read(u64::from(stream.rva) + 4, count * ENTRY) else {
-        return STREAM_INVALID_STRUCTURE;
+    let (count, body) = match list_body(reader, dump, stream, (4, ENTRY, declared), STREAM_TYPED) {
+        Ok(found) => found,
+        Err(state) => return state,
     };
-    for index in 0..count as usize {
+    for index in 0..count {
         let at = index * ENTRY as usize;
         let name_rva = u32le(&body, at + 20);
         let (name, name_state) = reader.string_at(name_rva);
@@ -1261,7 +1273,6 @@ fn read_module_list(reader: &mut Reader, dump: &mut Dump, stream: &Stream) -> &'
         let version = version_info(&body[at + 24..at + 76]);
         let cv_size = u32le(&body, at + 76);
         let cv_rva = u32le(&body, at + 80);
-        let misc_size = u32le(&body, at + 84);
         dump.modules.push(Module {
             index: index as u32,
             kind: MODULE_LOADED,
@@ -1273,7 +1284,6 @@ fn read_module_list(reader: &mut Reader, dump: &mut Dump, stream: &Stream) -> &'
             name_state: static_state(name_state),
             version,
             cv: cv_record(reader, cv_size, cv_rva),
-            misc_record_size: Some(misc_size),
         });
     }
     STREAM_TYPED
@@ -1359,7 +1369,7 @@ fn cstr(bytes: &[u8]) -> Option<String> {
 }
 
 fn read_unloaded_modules(reader: &mut Reader, dump: &mut Dump, stream: &Stream) -> &'static str {
-    let Some(head) = reader.read(u64::from(stream.rva), 12) else {
+    let Some(head) = stream_head(reader, dump, stream, 12) else {
         return STREAM_INVALID_STRUCTURE;
     };
     let header_size = u64::from(u32le(&head, 0));
@@ -1371,18 +1381,17 @@ fn read_unloaded_modules(reader: &mut Reader, dump: &mut Dump, stream: &Stream) 
         ));
         return STREAM_INVALID_STRUCTURE;
     }
-    let count = bounded_count(dump, stream, header_size, entry_size, declared);
-    if count == 0 {
-        return if declared == 0 {
-            STREAM_TYPED
-        } else {
-            STREAM_INVALID_STRUCTURE
-        };
-    }
-    let Some(body) = reader.read(u64::from(stream.rva) + header_size, count * entry_size) else {
-        return STREAM_INVALID_STRUCTURE;
+    let (count, body) = match list_body(
+        reader,
+        dump,
+        stream,
+        (header_size, entry_size, declared),
+        STREAM_TYPED,
+    ) {
+        Ok(found) => found,
+        Err(state) => return state,
     };
-    for index in 0..count as usize {
+    for index in 0..count {
         let at = index * entry_size as usize;
         let name_rva = u32le(&body, at + 20);
         let (name, name_state) = reader.string_at(name_rva);
@@ -1397,7 +1406,6 @@ fn read_unloaded_modules(reader: &mut Reader, dump: &mut Dump, stream: &Stream) 
             name_state: static_state(name_state),
             version: None,
             cv: None,
-            misc_record_size: None,
         });
     }
     STREAM_TYPED
@@ -1433,7 +1441,6 @@ fn read_exception(reader: &mut Reader, dump: &mut Dump, stream: &Stream) -> &'st
         parameters,
         context_size: u32le(&body, 160),
         context_rva: u32le(&body, 164),
-        parameters_truncated: number > 15,
     });
     if number > 15 {
         dump.issues
@@ -1566,7 +1573,7 @@ fn read_misc_info(reader: &mut Reader, dump: &mut Dump, stream: &Stream) -> &'st
 }
 
 fn read_memory_info_list(reader: &mut Reader, dump: &mut Dump, stream: &Stream) -> &'static str {
-    let Some(head) = reader.read(u64::from(stream.rva), 16) else {
+    let Some(head) = stream_head(reader, dump, stream, 16) else {
         return STREAM_INVALID_STRUCTURE;
     };
     let header_size = u64::from(u32le(&head, 0));
@@ -1578,18 +1585,17 @@ fn read_memory_info_list(reader: &mut Reader, dump: &mut Dump, stream: &Stream) 
         ));
         return STREAM_INVALID_STRUCTURE;
     }
-    let count = bounded_count(dump, stream, header_size, entry_size, declared);
-    if count == 0 {
-        return if declared == 0 {
-            STREAM_TYPED
-        } else {
-            STREAM_INVALID_STRUCTURE
-        };
-    }
-    let Some(body) = reader.read(u64::from(stream.rva) + header_size, count * entry_size) else {
-        return STREAM_INVALID_STRUCTURE;
+    let (count, body) = match list_body(
+        reader,
+        dump,
+        stream,
+        (header_size, entry_size, declared),
+        STREAM_TYPED,
+    ) {
+        Ok(found) => found,
+        Err(state) => return state,
     };
-    for index in 0..count as usize {
+    for index in 0..count {
         let at = index * entry_size as usize;
         let state = u32le(&body, at + 32);
         let protect = u32le(&body, at + 36);
@@ -1616,22 +1622,16 @@ fn read_memory_info_list(reader: &mut Reader, dump: &mut Dump, stream: &Stream) 
 /// Descriptor metadata only: the stored byte ranges are never read.
 fn read_memory_list(reader: &mut Reader, dump: &mut Dump, stream: &Stream) -> &'static str {
     const ENTRY: u64 = 16;
-    let Some(head) = reader.read(u64::from(stream.rva), 4) else {
+    let Some(head) = stream_head(reader, dump, stream, 4) else {
         return STREAM_INVALID_STRUCTURE;
     };
     let declared = u64::from(u32le(&head, 0));
-    let count = bounded_count(dump, stream, 4, ENTRY, declared);
-    if count == 0 {
-        return if declared == 0 {
-            STREAM_METADATA_ONLY
-        } else {
-            STREAM_INVALID_STRUCTURE
+    let (count, body) =
+        match list_body(reader, dump, stream, (4, ENTRY, declared), STREAM_METADATA_ONLY) {
+            Ok(found) => found,
+            Err(state) => return state,
         };
-    }
-    let Some(body) = reader.read(u64::from(stream.rva) + 4, count * ENTRY) else {
-        return STREAM_INVALID_STRUCTURE;
-    };
-    for index in 0..count as usize {
+    for index in 0..count {
         let at = index * ENTRY as usize;
         dump.regions.push(Region {
             index: index as u32,
@@ -1647,22 +1647,16 @@ fn read_memory_list(reader: &mut Reader, dump: &mut Dump, stream: &Stream) -> &'
 
 fn read_memory64_list(reader: &mut Reader, dump: &mut Dump, stream: &Stream) -> &'static str {
     const ENTRY: u64 = 16;
-    let Some(head) = reader.read(u64::from(stream.rva), 16) else {
+    let Some(head) = stream_head(reader, dump, stream, 16) else {
         return STREAM_INVALID_STRUCTURE;
     };
     let declared = u64le(&head, 0);
-    let count = bounded_count(dump, stream, 16, ENTRY, declared);
-    if count == 0 {
-        return if declared == 0 {
-            STREAM_METADATA_ONLY
-        } else {
-            STREAM_INVALID_STRUCTURE
+    let (count, body) =
+        match list_body(reader, dump, stream, (16, ENTRY, declared), STREAM_METADATA_ONLY) {
+            Ok(found) => found,
+            Err(state) => return state,
         };
-    }
-    let Some(body) = reader.read(u64::from(stream.rva) + 16, count * ENTRY) else {
-        return STREAM_INVALID_STRUCTURE;
-    };
-    for index in 0..count as usize {
+    for index in 0..count {
         let at = index * ENTRY as usize;
         let size = u64le(&body, at + 8);
         dump.regions.push(Region {
@@ -1682,7 +1676,7 @@ fn read_thread_info_list(
     dump: &mut Dump,
     stream: &Stream,
 ) -> (&'static str, Vec<(u32, ThreadInfo)>) {
-    let Some(head) = reader.read(u64::from(stream.rva), 12) else {
+    let Some(head) = stream_head(reader, dump, stream, 12) else {
         return (STREAM_INVALID_STRUCTURE, Vec::new());
     };
     let header_size = u64::from(u32le(&head, 0));
@@ -1694,15 +1688,18 @@ fn read_thread_info_list(
         ));
         return (STREAM_INVALID_STRUCTURE, Vec::new());
     }
-    let count = bounded_count(dump, stream, header_size, entry_size, declared);
-    if count == 0 {
-        return (STREAM_TYPED, Vec::new());
-    }
-    let Some(body) = reader.read(u64::from(stream.rva) + header_size, count * entry_size) else {
-        return (STREAM_INVALID_STRUCTURE, Vec::new());
+    let (count, body) = match list_body(
+        reader,
+        dump,
+        stream,
+        (header_size, entry_size, declared),
+        STREAM_TYPED,
+    ) {
+        Ok(found) => found,
+        Err(state) => return (state, Vec::new()),
     };
-    let mut found = Vec::with_capacity(count as usize);
-    for index in 0..count as usize {
+    let mut found = Vec::with_capacity(count);
+    for index in 0..count {
         let at = index * entry_size as usize;
         found.push((
             u32le(&body, at),
@@ -1728,19 +1725,16 @@ fn read_thread_names(
     stream: &Stream,
 ) -> (&'static str, Vec<(u32, String)>) {
     const ENTRY: u64 = 12;
-    let Some(head) = reader.read(u64::from(stream.rva), 4) else {
+    let Some(head) = stream_head(reader, dump, stream, 4) else {
         return (STREAM_INVALID_STRUCTURE, Vec::new());
     };
     let declared = u64::from(u32le(&head, 0));
-    let count = bounded_count(dump, stream, 4, ENTRY, declared);
-    if count == 0 {
-        return (STREAM_TYPED, Vec::new());
-    }
-    let Some(body) = reader.read(u64::from(stream.rva) + 4, count * ENTRY) else {
-        return (STREAM_INVALID_STRUCTURE, Vec::new());
+    let (count, body) = match list_body(reader, dump, stream, (4, ENTRY, declared), STREAM_TYPED) {
+        Ok(found) => found,
+        Err(state) => return (state, Vec::new()),
     };
     let mut found = Vec::new();
-    for index in 0..count as usize {
+    for index in 0..count {
         let at = index * ENTRY as usize;
         let thread_id = u32le(&body, at);
         let rva = u64le(&body, at + 4);
@@ -2139,7 +2133,6 @@ mod tests {
         assert_eq!(exception.code_name, Some("EXCEPTION_ACCESS_VIOLATION"));
         assert_eq!(exception.address, 0x7ffb_55a8_e48b);
         assert_eq!(exception.parameters, vec![1, 0xdead_beef]);
-        assert!(!exception.parameters_truncated);
 
         assert_eq!(dump.threads.len(), 2);
         let first = &dump.threads[0];
@@ -2555,5 +2548,60 @@ mod tests {
             Some("C:\\Windows\\System32\\app.exe")
         );
         assert!(dump.modules.iter().all(|module| module.kind == MODULE_LOADED));
+    }
+
+    fn thread_infos(ids: &[u32]) -> Vec<u8> {
+        let mut infos = Vec::new();
+        infos.extend_from_slice(&12u32.to_le_bytes());
+        infos.extend_from_slice(&64u32.to_le_bytes());
+        infos.extend_from_slice(&(ids.len() as u32).to_le_bytes());
+        for id in ids {
+            infos.extend_from_slice(&id.to_le_bytes());
+            infos.extend_from_slice(&[0u8; 60]);
+        }
+        infos
+    }
+
+    #[test]
+    fn repeated_thread_info_streams_keep_every_entry() {
+        let mut builder = Builder::new();
+        builder.stream(17, &thread_infos(&[10]));
+        builder.stream(17, &thread_infos(&[20]));
+        let bytes = builder.finish(0xa0f4_a793, 1, 0);
+        let (_dir, path) = write(&bytes);
+        let dump = parse_file(&path);
+        let ids: Vec<u32> = dump.threads.iter().map(|thread| thread.thread_id).collect();
+        assert_eq!(ids, vec![10, 20]);
+    }
+
+    #[test]
+    fn stream_shorter_than_its_fixed_header_is_invalid() {
+        let mut builder = Builder::new();
+        // HandleData header (16 bytes) present in the file, stream declares 4.
+        let rva = builder.place(&[16, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0]);
+        builder.raw_stream(12, 4, rva);
+        let bytes = builder.finish(0xa0f4_a793, 1, 0);
+        let (_dir, path) = write(&bytes);
+        let dump = parse_file(&path);
+        assert_eq!(dump.streams[0].parse_state, STREAM_INVALID_STRUCTURE);
+        assert!(dump.counters.is_empty());
+    }
+
+    #[test]
+    fn declared_thread_infos_that_do_not_fit_are_invalid() {
+        let mut builder = Builder::new();
+        let mut head = thread_infos(&[]);
+        head[8..12].copy_from_slice(&3u32.to_le_bytes());
+        builder.stream(17, &head);
+        let mut names = 2u32.to_le_bytes().to_vec();
+        names.extend_from_slice(&[0u8; 4]);
+        builder.stream(24, &names);
+        let bytes = builder.finish(0xa0f4_a793, 1, 0);
+        let (_dir, path) = write(&bytes);
+        let dump = parse_file(&path);
+        assert!(dump
+            .streams
+            .iter()
+            .all(|stream| stream.parse_state == STREAM_INVALID_STRUCTURE));
     }
 }

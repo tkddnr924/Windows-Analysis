@@ -3,7 +3,7 @@
 // 공용 페이지네이션 — 모든 뷰가 같은 UI를 쓴다:
 // [처음][이전] 1 2 … n-1 n [다음][끝] (+ 선택적 요약 텍스트).
 // page는 0부터 시작하고, 표시 번호는 1부터다.
-import type { CSSProperties } from "react";
+import { useEffect, type CSSProperties } from "react";
 import FirstPageIcon from "@mui/icons-material/FirstPage";
 import LastPageIcon from "@mui/icons-material/LastPage";
 import NavigateBeforeOutlinedIcon from "@mui/icons-material/NavigateBeforeOutlined";
@@ -61,8 +61,12 @@ export default function PaginationControls({
   disabled?: boolean;
   ariaLabel?: string;
 }) {
+  const safePage = Math.min(Math.max(page, 0), Math.max(pageCount - 1, 0));
+  // Push the clamp back so parents deriving offsets from page stay in range.
+  useEffect(() => {
+    if (page !== safePage) onChange(safePage);
+  }, [page, safePage, onChange]);
   if (pageCount <= 1) return null;
-  const safePage = Math.min(Math.max(page, 0), pageCount - 1);
   const go = (target: number) => {
     if (disabled) return;
     const next = Math.min(Math.max(target, 0), pageCount - 1);

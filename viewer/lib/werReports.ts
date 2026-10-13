@@ -1,6 +1,9 @@
 // Error report helpers (docs-16). Cards join records only through stored
 // WerRelations (same report identifiers); unrelated records stay single.
-// No runtime imports (Node tests).
+// Sibling imports carry `.ts` for Node tests.
+
+// @ts-expect-error -- TypeScript uses bundler resolution while Node tests need the extension.
+import { compareEvents, facetAllows, inScope, type EventGroup } from "./eventOrder.ts";
 
 type Cells = Record<string, string | undefined>;
 
@@ -30,30 +33,17 @@ export const CLASS_LABELS: Record<string, string> = {
 };
 
 function matches(row: Cells, filter: WerFilter): boolean {
-  const pick = (values: string[], value: string | undefined) => !values.length || values.includes(value ?? "");
-  if (!pick(filter.types, row.error_type) || !pick(filter.classes, row.error_class) || !pick(filter.stages, row.reporting_stage)) return false;
+  if (!facetAllows(filter.types, row.error_type) || !facetAllows(filter.classes, row.error_class) || !facetAllows(filter.stages, row.reporting_stage)) return false;
   const needle = filter.search.trim().toLowerCase();
   return !needle || [row.search_text, row.app_name, row.app_path, row.module_name, row.module_path, row.exception_code, row.report_identifier, row.report_id, row.integrator_report_id, row.account, row.account_sid].some((value) => (value ?? "").toLowerCase().includes(needle));
 }
 
+/** key: record_id of the earliest record in the group. */
+export type WerCard<R extends Cells> = EventGroup<R>;
+
 /** Time order (direction), untimed last, ties by record_id (R10). */
-function compareRows(a: Cells, b: Cells, direction: "asc" | "desc"): number {
-  const left = a.timestamp ?? "";
-  const right = b.timestamp ?? "";
-  if (!left !== !right) return left ? -1 : 1;
-  const order = left.localeCompare(right);
-  return (direction === "asc" ? order : -order) || (a.record_id ?? "").localeCompare(b.record_id ?? "");
-}
-
-export interface WerCard<R extends Cells> {
-  /** record_id of the earliest record in the group. */
-  key: string;
-  events: R[];
-  matched: Set<string>;
-}
-
 export function buildWerCards<R extends Cells>(rows: R[], relations: Cells[], filter: WerFilter, inPeriod: (timestamp: string) => boolean, periodSet: boolean, direction: "asc" | "desc"): WerCard<R>[] {
-  const kept = rows.filter((row) => (row.timestamp ? inPeriod(row.timestamp) : !periodSet));
+  const kept = rows.filter((row) => inScope(row, inPeriod, periodSet));
   const parent = new Map<string, string>(kept.map((row) => [row.record_id ?? "", row.record_id ?? ""]));
   const find = (id: string): string => {
     let root = id;
@@ -75,11 +65,11 @@ export function buildWerCards<R extends Cells>(rows: R[], relations: Cells[], fi
   for (const events of groups.values()) {
     const matched = new Set(events.filter((row) => matches(row, filter)).map((row) => row.record_id ?? ""));
     if (!matched.size) continue;
-    const earliest = events.reduce((best, row) => (compareRows(row, best, "asc") < 0 ? row : best));
-    events.sort((a, b) => compareRows(a, b, direction));
+    const earliest = events.reduce((best, row) => (compareEvents(row, best) < 0 ? row : best));
+    events.sort((a, b) => compareEvents(a, b, direction));
     cards.push({ key: earliest.record_id ?? "", events, matched });
   }
-  return cards.sort((a, b) => compareRows(a.events[0], b.events[0], direction) || a.key.localeCompare(b.key));
+  return cards.sort((a, b) => compareEvents(a.events[0], b.events[0], direction) || a.key.localeCompare(b.key));
 }
 
 // NTSTATUS meanings from [MS-ERREF] 2.3.1 (crash-relevant subset only).

@@ -286,8 +286,7 @@ times, body_file, cache_key all byte-identical).
 
 Generic table-for-table copy of a Chrome History DB (recognised by a `urls`
 table). BLOB -> hex, NULL -> SQL NULL, columns = source columns sorted (matches
-the Python writer). A new `write_table_cols` preserves all-NULL source columns
-(the Python union kept them; the plain writer had dropped them).
+the Python writer).
 
 Sample: `Administrator/CHROME/Default/History` — 6 tables (meta, urls, visits,
 content_annotations, context_annotations, visited_links): **all 0 diff**.
@@ -341,7 +340,7 @@ identical; validation is structural, which is exact.
 `wina` now mirrors main.py's CLI: `--list-artifacts`, `--list-cases`,
 `--create-case`, `--create-host` (--name/--target), `--run-host` (--host/--only),
 `--cases-dir`. case_store (Case/Host JSON, slugify/id, list/create/load/update)
-and a finder (by name/extension/suffix/content + dedupe_by_content, RegBack
+and a finder (by name/extension, RegBack
 dedup) are ported. `run_host` cleans the output dirs, discovers + parses every
 ported artifact, and writes per-source SQLite into the same CATEGORY/<name>.sqlite
 layout the Electron viewer reads — so the Rust binary is a drop-in for the

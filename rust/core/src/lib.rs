@@ -11,6 +11,7 @@ pub mod metadata;
 pub mod parse_eligibility;
 pub mod shellbag;
 pub mod parsers;
+mod sam;
 mod powershell_decode;
 mod remote_access;
 mod smb;

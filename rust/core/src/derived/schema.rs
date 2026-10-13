@@ -92,7 +92,6 @@ CREATE TABLE "metadata" (
   "dhcp_server" TEXT,
   "lease_obtained" TEXT,
   "lease_terminates" TEXT,
-  "env_name" TEXT,
   "details_json" TEXT CHECK ("details_json" IS NULL OR json_valid("details_json")),
   "selection_reason" TEXT,
   PRIMARY KEY(metadata_id),
@@ -210,7 +209,6 @@ const METADATA_COLUMNS: &[&str] = &[
     "dhcp_server",
     "lease_obtained",
     "lease_terminates",
-    "env_name",
     "details_json",
     "selection_reason",
 ];
@@ -276,6 +274,9 @@ const METADATA_CHILDREN: &[ChildSpec] = &[
 ];
 
 
+/// `execution_history` marker: 3 adds process-creation and Shell-Core events,
+/// 4 derives WER paths only from role-confirmed evidence, 5 links event
+/// evidence and drops 9708.
 const EXECUTION_HISTORY_DDL: &str = r#"PRAGMA foreign_keys=ON;
 CREATE TABLE "ExecutionHistory" (
   "record_id" TEXT NOT NULL,
@@ -898,7 +899,7 @@ CREATE INDEX "idx_RegistryQuickTargets_target" ON "RegistryQuickTargets"("target
 
 CREATE TABLE _wina_derived_version (name TEXT NOT NULL PRIMARY KEY, version INTEGER NOT NULL);
 INSERT INTO _wina_derived_version(name,version) VALUES ('overview_contract',1);
-INSERT INTO _wina_derived_version(name,version) VALUES ('registry_explorer',1);
+INSERT INTO _wina_derived_version(name,version) VALUES ('registry_explorer',2);
 "#;
 
 pub const REGISTRY_HIVES_TABLE: &str = "RegistryHives";
@@ -1182,7 +1183,7 @@ CREATE INDEX "idx_TargetAccountEventMatches_event" ON "TargetAccountEventMatches
 
 CREATE TABLE _wina_derived_version (name TEXT NOT NULL PRIMARY KEY, version INTEGER NOT NULL);
 INSERT INTO _wina_derived_version(name,version) VALUES ('overview_contract',1);
-INSERT INTO _wina_derived_version(name,version) VALUES ('target_info',2);
+INSERT INTO _wina_derived_version(name,version) VALUES ('target_info',3);
 "#;
 
 const TARGET_INFO_COLUMNS: &[&str] = &[
@@ -1405,6 +1406,7 @@ CREATE TABLE "FileSystemEntries" (
   "parent_status" TEXT,
   "path_status" TEXT,
   "data_status" TEXT,
+  "record_status" TEXT,
   "source_file" TEXT,
   "source_relative" TEXT,
   "input_name" TEXT,
@@ -1438,7 +1440,7 @@ CREATE INDEX idx_source_lookup ON source_records(source_db, source_table, source
 
 CREATE TABLE _wina_derived_version (name TEXT NOT NULL PRIMARY KEY, version INTEGER NOT NULL);
 INSERT INTO _wina_derived_version(name,version) VALUES ('overview_contract',1);
-INSERT INTO _wina_derived_version(name,version) VALUES ('file_system_entries',2);
+INSERT INTO _wina_derived_version(name,version) VALUES ('file_system_entries',3);
 "#;
 
 const FILE_SYSTEM_ENTRIES_COLUMNS: &[&str] = &[
@@ -1483,6 +1485,7 @@ const FILE_SYSTEM_ENTRIES_COLUMNS: &[&str] = &[
     "parent_status",
     "path_status",
     "data_status",
+    "record_status",
     "source_file",
     "source_relative",
     "input_name",
@@ -1650,8 +1653,7 @@ CREATE TABLE "UsnRenameEvents" (
   "matching_basis" TEXT NOT NULL,
   "old_record_id" TEXT,
   "new_record_id" TEXT,
-  "old_group_id" TEXT,
-  "new_group_id" TEXT,
+  "group_id" TEXT NOT NULL,
   "old_file_name" TEXT,
   "new_file_name" TEXT,
   "old_usn" TEXT,
@@ -1667,8 +1669,7 @@ CREATE TABLE "UsnRenameEvents" (
   CHECK(status <> 'paired' OR (old_record_id IS NOT NULL AND new_record_id IS NOT NULL)),
   FOREIGN KEY(old_record_id) REFERENCES "UsnJournal"("record_id") ON DELETE CASCADE,
   FOREIGN KEY(new_record_id) REFERENCES "UsnJournal"("record_id") ON DELETE CASCADE,
-  FOREIGN KEY(old_group_id) REFERENCES "UsnChangeGroups"("group_id") ON DELETE CASCADE,
-  FOREIGN KEY(new_group_id) REFERENCES "UsnChangeGroups"("group_id") ON DELETE CASCADE
+  FOREIGN KEY(group_id) REFERENCES "UsnChangeGroups"("group_id") ON DELETE CASCADE
 );
 CREATE INDEX "idx_UsnRenameEvents_reference" ON "UsnRenameEvents"(input_id, record_version, file_reference);
 CREATE INDEX "idx_UsnRenameEvents_status" ON "UsnRenameEvents"(status, input_id);
@@ -1715,7 +1716,7 @@ CREATE INDEX idx_source_lookup ON source_records(source_db, source_table, source
 
 CREATE TABLE _wina_derived_version (name TEXT NOT NULL PRIMARY KEY, version INTEGER NOT NULL);
 INSERT INTO _wina_derived_version(name,version) VALUES ('overview_contract',1);
-INSERT INTO _wina_derived_version(name,version) VALUES ('usn_journal',2);
+INSERT INTO _wina_derived_version(name,version) VALUES ('usn_journal',3);
 "#;
 
 const USN_JOURNAL_COLUMNS: &[&str] = &[
@@ -1847,8 +1848,7 @@ pub const USN_RENAME_EVENTS_COLUMNS: &[&str] = &[
     "matching_basis",
     "old_record_id",
     "new_record_id",
-    "old_group_id",
-    "new_group_id",
+    "group_id",
     "old_file_name",
     "new_file_name",
     "old_usn",
@@ -1985,7 +1985,7 @@ CREATE INDEX idx_PathReferenceExecutionCandidates_execution
 
 CREATE TABLE _wina_derived_version (name TEXT NOT NULL PRIMARY KEY, version INTEGER NOT NULL);
 INSERT INTO _wina_derived_version(name,version) VALUES ('overview_contract',1);
-INSERT INTO _wina_derived_version(name,version) VALUES ('path_references',3);
+INSERT INTO _wina_derived_version(name,version) VALUES ('path_references',5);
 "#;
 
 const PATH_REFERENCES_COLUMNS: &[&str] = &[

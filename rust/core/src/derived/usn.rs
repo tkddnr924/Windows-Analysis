@@ -42,6 +42,7 @@ const REASON_FLAGS: &[(u32, &str)] = &[
     (0x200000, "STREAM_CHANGE"),
     (0x400000, "TRANSACTED_CHANGE"),
     (0x800000, "INTEGRITY_CHANGE"),
+    (0x1000000, "DESIRED_STORAGE_CLASS_CHANGE"),
     (0x80000000, "CLOSE"),
 ];
 
@@ -51,6 +52,7 @@ const RENAME_NEW_BIT: u64 = 0x2000;
 
 const GROUP_SCOPE: &str = "input_id,record_version,file_reference";
 const GROUPING_BASIS: &str = "close_delimited_observations";
+// Pairing never crosses a CLOSE-delimited group: both sides share its group_id.
 const MATCHING_BASIS: &str = "input_id,record_version,file_reference,close_delimited_group,usn_order";
 
 const REPARSE_HINT: &str =
@@ -186,7 +188,7 @@ pub(super) fn build(ctx: &Ctx) -> Result<usize> {
     let table = crate::parsers::usnjrnl::USN_TABLE;
     // Collected inputs are identified separately from physical volume identity.
     let mut inputs: HashMap<String, String> = HashMap::new();
-    for path in fact_files(ctx.out_dir, "FILESYSTEM", table) {
+    for path in fact_files(ctx.out_dir, "FILESYSTEM", table)? {
         let conn = open_ro(&path)?;
         let sql = format!(
             "SELECT {FACTS_COLUMNS} FROM {} ORDER BY rowid",
@@ -788,8 +790,7 @@ fn write_rename(writer: &Writer<'_>, group: &Group, segment: &Segment) -> Result
             text(MATCHING_BASIS),
             old_lead.map(|c| text(&c.record_id)).unwrap_or(Cell::Null),
             new_lead.map(|c| text(&c.record_id)).unwrap_or(Cell::Null),
-            if old_lead.is_some() { text(&group.group_id) } else { Cell::Null },
-            if new_lead.is_some() { text(&group.group_id) } else { Cell::Null },
+            text(&group.group_id),
             old_lead.and_then(|c| c.file_name.as_deref()).map(text_raw).unwrap_or(Cell::Null),
             new_lead.and_then(|c| c.file_name.as_deref()).map(text_raw).unwrap_or(Cell::Null),
             old_lead.and_then(|c| c.usn.as_deref()).map(text).unwrap_or(Cell::Null),
@@ -864,5 +865,12 @@ mod tests {
         let flags = decoded_flags(0x100 | 0x0800_0000);
         assert_eq!(flags[0].0, "FILE_CREATE");
         assert_eq!(flags[1], ("UNKNOWN_0x08000000".into(), "0x08000000".into(), true));
+    }
+
+    #[test]
+    fn desired_storage_class_change_is_a_known_reason() {
+        let flags = decoded_flags(0x0100_0000 | CLOSE_BIT);
+        assert_eq!(flags[0], ("DESIRED_STORAGE_CLASS_CHANGE".into(), "0x01000000".into(), false));
+        assert_eq!((0x0100_0000 | CLOSE_BIT) & !known_mask(), 0);
     }
 }

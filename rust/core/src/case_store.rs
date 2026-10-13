@@ -278,17 +278,14 @@ fn write_migration_journal(cases_dir: &Path, journal: &MigrationJournal) -> Resu
     Ok(())
 }
 
-// A persistent lock *file* is intentional. On Unix the advisory flock is held
-// by the OS-owned descriptor and is released if the GUI dies, so a leftover
-// sentinel never blocks the next launch.
-#[cfg(unix)]
+// A persistent lock *file* is intentional. The OS releases the advisory lock
+// (flock / LockFileEx) with the descriptor if the process dies, so a leftover
+// sentinel never blocks the next launch on any platform.
 struct MigrationLock {
     _file: std::fs::File,
 }
 
-#[cfg(unix)]
 fn acquire_migration_lock(cases_dir: &Path) -> Result<MigrationLock> {
-    use std::os::fd::AsRawFd;
     let path = cases_dir.join(MIGRATION_LOCK_FILE);
     let file = std::fs::OpenOptions::new()
         .read(true)
@@ -298,43 +295,12 @@ fn acquire_migration_lock(cases_dir: &Path) -> Result<MigrationLock> {
         .open(&path)
         .with_context(|| format!("open migration lock {}", path.display()))?;
     for _ in 0..80 {
-        // SAFETY: `file` remains open for the MigrationLock lifetime.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-            return Ok(MigrationLock { _file: file });
-        }
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() != Some(libc::EWOULDBLOCK) {
-            return Err(error).with_context(|| format!("lock migration {}", path.display()));
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    anyhow::bail!("legacy host migration is already in progress; retry after it completes")
-}
-
-#[cfg(not(unix))]
-struct MigrationLock(PathBuf);
-
-#[cfg(not(unix))]
-impl Drop for MigrationLock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
-
-#[cfg(not(unix))]
-fn acquire_migration_lock(cases_dir: &Path) -> Result<MigrationLock> {
-    let path = cases_dir.join(MIGRATION_LOCK_FILE);
-    for _ in 0..80 {
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(_) => return Ok(MigrationLock(path)),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+        match file.try_lock() {
+            Ok(()) => return Ok(MigrationLock { _file: file }),
+            Err(std::fs::TryLockError::WouldBlock) => {
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
-            Err(error) => {
+            Err(std::fs::TryLockError::Error(error)) => {
                 return Err(error).with_context(|| format!("lock migration {}", path.display()))
             }
         }
@@ -804,7 +770,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    #[cfg(unix)]
     #[test]
     fn stale_migration_sentinel_does_not_block_recovery() {
         let root = temporary_directory("stale-lock");

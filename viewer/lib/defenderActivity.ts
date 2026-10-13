@@ -1,6 +1,9 @@
 // Microsoft Defender activity helpers (docs-13). Items follow stored groups
 // (DefenderDetectionMembers detection_key, DefenderScans scan events); rows
-// without a stored group stay single (R04). No runtime imports (Node tests).
+// without a stored group stay single (R04). Sibling imports carry `.ts` for Node tests.
+
+// @ts-expect-error -- TypeScript uses bundler resolution while Node tests need the extension.
+import { facetAllows, groupEvents, type EventGroup } from "./eventOrder.ts";
 
 type Cells = Record<string, string | undefined>;
 
@@ -41,48 +44,28 @@ export function groupIndex(members: Cells[], scans: Cells[]): Map<string, ItemRe
 }
 
 function matches(row: Cells, filter: DefenderFilter, sections: Set<string>): boolean {
-  const pick = (values: string[], value: string | undefined) => !values.length || values.includes(value ?? "");
-  if (!sections.has(row.section ?? "") || !pick(filter.severities, row.severity) || !pick(filter.categories, row.category) || !pick(filter.results, row.result)) return false;
+  if (!sections.has(row.section ?? "") || !facetAllows(filter.severities, row.severity) || !facetAllows(filter.categories, row.category) || !facetAllows(filter.results, row.result)) return false;
   const needle = filter.search.trim().toLowerCase();
   return !needle || [row.search_text, row.threat_name, row.target_path, row.title, row.detail, row.process, row.account, row.account_sid].some((value) => (value ?? "").toLowerCase().includes(needle));
 }
 
-/** Time order (direction), untimed last, ties by record_id (R17). */
-function compareRows(a: Cells, b: Cells, direction: "asc" | "desc"): number {
-  const left = a.timestamp ?? "";
-  const right = b.timestamp ?? "";
-  if (!left !== !right) return left ? -1 : 1;
-  const order = left.localeCompare(right);
-  return (direction === "asc" ? order : -order) || (a.record_id ?? "").localeCompare(b.record_id ?? "");
-}
-
-export interface DefenderItem<R extends Cells> {
-  key: string;
+export interface DefenderItem<R extends Cells> extends EventGroup<R> {
   kind: ItemKind;
-  /** Every in-period event of the item. */
-  events: R[];
-  /** record_ids matching the conditions. */
-  matched: Set<string>;
 }
 
+/** Time order (direction), untimed last, ties by record_id (R17). */
 export function buildDefenderItems<R extends Cells>(rows: R[], index: Map<string, ItemRef>, filter: DefenderFilter, inPeriod: (timestamp: string) => boolean, periodSet: boolean, direction: "asc" | "desc"): DefenderItem<R>[] {
   const present = [...new Set(rows.map((row) => row.section ?? ""))];
   const sections = new Set(selectedSections(filter, present));
-  const items = new Map<string, DefenderItem<R>>();
-  for (const row of rows) {
-    if (row.timestamp ? !inPeriod(row.timestamp) : periodSet) continue;
-    const ref = index.get(row.record_id ?? "") ?? { key: `record::${row.record_id}`, kind: "record" as const };
-    let item = items.get(ref.key);
-    if (!item) {
-      item = { key: ref.key, kind: ref.kind, events: [], matched: new Set() };
-      items.set(ref.key, item);
-    }
-    item.events.push(row);
-    if (matches(row, filter, sections)) item.matched.add(row.record_id ?? "");
-  }
-  const kept = [...items.values()].filter((item) => item.matched.size > 0);
-  for (const item of kept) item.events.sort((a, b) => compareRows(a, b, direction));
-  return kept.sort((a, b) => compareRows(a.events[0], b.events[0], direction) || a.key.localeCompare(b.key));
+  const refOf = (row: R): ItemRef => index.get(row.record_id ?? "") ?? { key: `record::${row.record_id}`, kind: "record" };
+  return groupEvents<R, DefenderItem<R>>(rows, {
+    inPeriod,
+    periodSet,
+    direction,
+    keyOf: (row) => refOf(row).key,
+    create: (key, row) => ({ key, kind: refOf(row).kind, events: [], matched: new Set() }),
+    matches: (row) => matches(row, filter, sections),
+  });
 }
 
 export interface ProtectionLatest {
@@ -108,7 +91,8 @@ export function latestProtection(states: Cells[], inPeriod: (timestamp: string) 
   }
   const result: ProtectionLatest[] = [];
   for (const [feature, list] of byFeature) {
-    list.sort((a, b) => (a.timestamp ?? "").localeCompare(b.timestamp ?? ""));
+    // Same order as the stored Rust rule: time, then observation_ordinal.
+    list.sort((a, b) => (a.timestamp ?? "").localeCompare(b.timestamp ?? "") || Number(a.observation_ordinal ?? 0) - Number(b.observation_ordinal ?? 0));
     const last = list[list.length - 1];
     const atTime = list.filter((row) => row.timestamp === last.timestamp);
     const conflict = atTime.some((row) => row.state !== atTime[0].state);

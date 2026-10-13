@@ -26,6 +26,9 @@ pub struct Shellbag {
 
 /// A BagMRU numbered value: the shell item naming child node `key_path\value_name`.
 pub struct BagRow {
+    /// Source hive identity; NTUSER.DAT hives share key paths, so nodes only
+    /// link within one hive.
+    pub hive: String,
     pub key_path: String,
     pub value_name: String,
     pub data: Vec<u8>,
@@ -88,22 +91,26 @@ fn find_sub(hay: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 /// Long folder name from a 0x3x file/folder shell item. Prefers the
-/// 0xBEEF0004 extension block's long name at its (version-based) fixed offset —
-/// exact, so no stray leading bytes — and only falls back to the longest UTF-16
-/// run, then the 8.3 short name, if that fails.
+/// 0xBEEF0004 extension block's long name at its recorded offset (block+16,
+/// libfwsi) — exact, so no stray leading bytes — and only falls back to the
+/// longest UTF-16 run, then the 8.3 short name, if that fails.
 fn folder_long_name(b: &[u8]) -> String {
     if let Some(sig) = find_sub(b, &[0x04, 0x00, 0xef, 0xbe]) {
         if sig >= 4 {
             let block_start = sig - 4;
             let version = u16::from_le_bytes([b[block_start + 2], b[block_start + 3]]);
+            let block_size = u16::from_le_bytes([b[block_start], b[block_start + 1]]) as usize;
+            let recorded = b
+                .get(block_start + 16..block_start + 18)
+                .map(|s| u16::from_le_bytes([s[0], s[1]]) as usize)
+                .filter(|&off| off >= 18 && off + 2 <= block_size);
             let name_off = block_start
-                + if version >= 9 {
-                    46
-                } else if version >= 8 {
-                    42
-                } else {
-                    34
-                };
+                + recorded.unwrap_or(match version {
+                    9.. => 46,
+                    8 => 42,
+                    7 => 38,
+                    _ => 20,
+                });
             if name_off < b.len() {
                 let first = u16::from_le_bytes([b[name_off], *b.get(name_off + 1).unwrap_or(&0)]);
                 if (0x20..=0xFFFD).contains(&first) {
@@ -141,7 +148,6 @@ fn decode_item(b: &[u8]) -> Name {
     }
     let typ = b[2]; // b[0..2] = item size
     match typ & 0x70 {
-        0x00 if typ == 0x1f || (typ & 0xf0) == 0x10 => Name::Root,
         0x10 => Name::Root, // 0x1x root/GUID
         0x20 => {
             // 0x2x volume: "C:\"
@@ -173,17 +179,18 @@ fn lower(s: &str) -> String {
 /// Reconstruct every shellbag folder from a flat list of BagMRU numbered values.
 pub fn reconstruct(rows: Vec<BagRow>) -> Vec<Shellbag> {
     use std::collections::HashMap;
-    // node_key(lower) -> (raw shell-item bytes, parent_key(lower), account)
-    let mut item: HashMap<String, Vec<u8>> = HashMap::new();
-    let mut parent: HashMap<String, String> = HashMap::new();
-    let mut account: HashMap<String, String> = HashMap::new();
-    let mut record_key: HashMap<String, String> = HashMap::new();
-    for r in &rows {
-        let node = lower(&format!("{}\\{}", r.key_path, r.value_name));
-        parent.insert(node.clone(), lower(&r.key_path));
-        item.insert(node.clone(), r.data.clone());
-        account.insert(node.clone(), r.account.clone());
-        record_key.insert(node, r.record_key.clone());
+    // (hive, lowercased node path) -> raw shell-item bytes, parent node, account
+    type Node = (String, String);
+    let mut item: HashMap<Node, Vec<u8>> = HashMap::new();
+    let mut parent: HashMap<Node, Node> = HashMap::new();
+    let mut account: HashMap<Node, String> = HashMap::new();
+    let mut record_key: HashMap<Node, String> = HashMap::new();
+    for r in rows {
+        let node = (r.hive.clone(), lower(&format!("{}\\{}", r.key_path, r.value_name)));
+        parent.insert(node.clone(), (r.hive, lower(&r.key_path)));
+        item.insert(node.clone(), r.data);
+        account.insert(node.clone(), r.account);
+        record_key.insert(node, r.record_key);
     }
 
     let mut out = Vec::new();
@@ -242,8 +249,104 @@ pub fn reconstruct(rows: Vec<BagRow>) -> Vec<Shellbag> {
             record_key: record_key.get(node).cloned().unwrap_or_default(),
         });
     }
-    // De-dup identical (path, account).
-    out.sort_by(|a, b| a.path.cmp(&b.path).then(a.account.cmp(&b.account)));
-    out.dedup_by(|a, b| a.path == b.path && a.account == b.account);
+    // De-dup identical (display, account) — the drive separates volumes;
+    // record_key keeps the survivor stable.
+    out.sort_by(|a, b| {
+        a.path
+            .cmp(&b.path)
+            .then(a.account.cmp(&b.account))
+            .then(a.display.cmp(&b.display))
+            .then(a.record_key.cmp(&b.record_key))
+    });
+    out.dedup_by(|a, b| a.path == b.path && a.account == b.account && a.display == b.display);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn volume(drive: &str) -> Vec<u8> {
+        let mut item = vec![0, 0, 0x2f];
+        item.extend_from_slice(drive.as_bytes());
+        item.extend_from_slice(b"\\\0");
+        item
+    }
+
+    /// 0x31 folder item; 0xD8 keeps the type byte out of the UTF-16 name run.
+    fn folder(name: &str) -> Vec<u8> {
+        let mut item = vec![0, 0, 0x31, 0xd8];
+        item.extend(name.encode_utf16().flat_map(u16::to_le_bytes));
+        item.extend_from_slice(&[0, 0]);
+        item
+    }
+
+    fn row(account: &str, key_path: &str, value_name: &str, data: Vec<u8>) -> BagRow {
+        BagRow {
+            hive: format!("{account}_NTUSER.DAT"),
+            key_path: key_path.into(),
+            value_name: value_name.into(),
+            data,
+            account: account.into(),
+            record_key: format!("{account}::{key_path}\\{value_name}"),
+        }
+    }
+
+    /// NTUSER.DAT hives share the `\ROOT\…\BagMRU` key path: nodes of one
+    /// hive never overwrite or link into another hive's nodes.
+    #[test]
+    fn same_key_paths_in_two_hives_stay_separate_trees() {
+        let bag = "\\ROOT\\SOFTWARE\\Microsoft\\Windows\\Shell\\BagMRU";
+        let child = format!("{bag}\\0");
+        let mut out = reconstruct(vec![
+            row("alice", bag, "0", volume("C:")),
+            row("alice", &child, "0", folder("Alpha")),
+            row("bob", bag, "0", volume("D:")),
+            row("bob", &child, "0", folder("Beta")),
+        ]);
+        out.sort_by(|a, b| a.display.cmp(&b.display));
+        let got: Vec<(String, String, String)> = out
+            .into_iter()
+            .map(|s| (s.display, s.account, s.record_key))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("C:\\Alpha".into(), "alice".into(), format!("alice::{child}\\0")),
+                ("D:\\Beta".into(), "bob".into(), format!("bob::{child}\\0")),
+            ]
+        );
+    }
+
+    #[test]
+    fn same_folder_on_two_volumes_is_kept() {
+        let bag = "\\ROOT\\SOFTWARE\\Microsoft\\Windows\\Shell\\BagMRU";
+        let mut out = reconstruct(vec![
+            row("alice", bag, "0", volume("C:")),
+            row("alice", &format!("{bag}\\0"), "0", folder("Alpha")),
+            row("alice", bag, "1", volume("D:")),
+            row("alice", &format!("{bag}\\1"), "0", folder("Alpha")),
+        ]);
+        out.sort_by(|a, b| a.display.cmp(&b.display));
+        let got: Vec<String> = out.into_iter().map(|s| s.display).collect();
+        assert_eq!(got, vec!["C:\\Alpha".to_string(), "D:\\Alpha".to_string()]);
+    }
+
+    /// v7 (Vista) BEEF0004: long name at the recorded offset 38, not 34.
+    #[test]
+    fn beef0004_v7_name_uses_recorded_offset() {
+        let name: Vec<u8> = "Gamma".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let mut block = vec![0u8; 38];
+        block[2] = 7; // version
+        block[4..8].copy_from_slice(&[0x04, 0x00, 0xef, 0xbe]);
+        block[16] = 38; // long name offset
+        block[34..38].copy_from_slice(&[b'X', 0, b'Y', 0]); // printable decoy at 34
+        block.extend(&name);
+        block.extend_from_slice(&[0, 0, 0, 0]);
+        let size = block.len() as u16;
+        block[0..2].copy_from_slice(&size.to_le_bytes());
+        let mut item = vec![0, 0, 0x31, 0xd8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, b'G', b'A', 0, 0];
+        item.extend(block);
+        assert_eq!(folder_long_name(&item), "Gamma");
+    }
 }

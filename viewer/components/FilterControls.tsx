@@ -6,7 +6,6 @@
 import { useState } from "react";
 import CheckIcon from "@mui/icons-material/Check";
 import SortOutlinedIcon from "@mui/icons-material/SortOutlined";
-import CalendarMonthOutlinedIcon from "@mui/icons-material/CalendarMonthOutlined";
 
 export interface FilterOption<T extends string> {
   value: T;
@@ -193,44 +192,6 @@ export function SortDropdown({
     ...extraOptions,
   ];
   return <SelectDropdown icon={<SortOutlinedIcon sx={{ fontSize: 15 }} />} label="정렬" options={options} value={value} defaultValue="asc" onChange={onChange} align={align} />;
-}
-
-/** 날짜(기간) 팝오버 — 전역 기간 필터를 따르지 않는 뷰 전용. */
-export function DateRangeDropdown({
-  start,
-  end,
-  onChange,
-  onReset,
-  align = "left",
-}: {
-  start: string;
-  end: string;
-  onChange: (next: { start: string; end: string }) => void;
-  onReset: () => void;
-  align?: "left" | "right";
-}) {
-  const [open, setOpen] = useState(false);
-  const active = Boolean(start || end);
-  const inputStyle: React.CSSProperties = { width: "100%", minHeight: 30, padding: "0 9px", fontSize: 11.5, fontFamily: "var(--mono)", background: "var(--bg-input)", border: "1px solid var(--border)", borderRadius: "var(--radius)", color: "var(--text)" };
-  return (
-    <FilterDropdown icon={<CalendarMonthOutlinedIcon sx={{ fontSize: 15 }} />} label="날짜" valueLabel={active ? "· 적용 중" : undefined} active={active} align={align} minWidth={252} ariaLabel="날짜 필터" open={open} onToggle={setOpen}>
-      <div style={{ display: "grid", gap: 7, padding: "4px 4px 2px" }}>
-        <label style={{ display: "grid", gap: 4, fontSize: 11, color: "var(--text-faint)", fontWeight: 650 }}>
-          시작
-          <input value={start} onChange={(event) => onChange({ start: event.target.value, end })} placeholder="YYYY-MM-DD HH:mm:ss" aria-label="시작 시각" style={inputStyle} />
-        </label>
-        <label style={{ display: "grid", gap: 4, fontSize: 11, color: "var(--text-faint)", fontWeight: 650 }}>
-          종료
-          <input value={end} onChange={(event) => onChange({ start, end: event.target.value })} placeholder="YYYY-MM-DD HH:mm:ss" aria-label="종료 시각" style={inputStyle} />
-        </label>
-        {active && (
-          <button type="button" className="nm-btn" onClick={onReset} style={{ minHeight: 29, padding: "3px 10px", background: "var(--bg-input)", border: "1px solid var(--border)", borderRadius: "var(--radius)", color: "var(--accent)", cursor: "pointer", fontSize: 11.5, fontWeight: 650 }}>
-            초기화
-          </button>
-        )}
-      </div>
-    </FilterDropdown>
-  );
 }
 
 /** 헤더 검색창 — 모든 뷰 공통 스타일. */

@@ -18,11 +18,6 @@ export function bareAccount(name: string): string {
   return tail.split("@")[0].trim();
 }
 
-/// "YYYY-MM-DD HH:MM:SS" (KST text) -> epoch ms, NaN when empty.
-export function tsMs(timestamp: string): number {
-  return timestamp ? new Date(timestamp.replace(" ", "T")).getTime() : Number.NaN;
-}
-
 /// Last path segment of a Windows or POSIX path ("" stays "").
 export function basename(path: string): string {
   const clean = (path || "").replace(/[\\/]+$/, "");

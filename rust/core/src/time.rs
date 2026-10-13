@@ -46,7 +46,9 @@ fn push_4(out: &mut Vec<u8>, v: u32) {
 /// unix 초 + 그 초의 밀리초 -> "YYYY-MM-DD HH:MM:SS.mmm" (KST).
 /// 표시 가능한 연도(1..=9999)를 벗어나면 빈 문자열(비정상 시각).
 fn fmt_kst_secs_ms(secs: i64, ms: u32) -> String {
-    let kst = secs + KST_OFFSET_SECS;
+    let Some(kst) = secs.checked_add(KST_OFFSET_SECS) else {
+        return String::new();
+    };
     let days = kst.div_euclid(86_400);
     let second_of_day = kst.rem_euclid(86_400) as u32;
     let (year, month, day) = civil_from_days(days);
@@ -139,7 +141,9 @@ pub fn fmt_ole(days: f64) -> String {
     let micros = (days * 86_400_000_000.0).round() as i64;
     // 1899-12-30 UTC in unix micros:
     const OLE_EPOCH_UNIX_MICROS: i64 = -2_209_161_600_000_000;
-    let unix_micros = OLE_EPOCH_UNIX_MICROS + micros;
+    let Some(unix_micros) = OLE_EPOCH_UNIX_MICROS.checked_add(micros) else {
+        return String::new();
+    };
     let secs = unix_micros.div_euclid(1_000_000);
     let ms = (unix_micros.rem_euclid(1_000_000) / 1000) as u32;
     fmt_kst_secs_ms(secs, ms)
@@ -179,5 +183,12 @@ mod tests {
     fn out_of_display_range_years_yield_empty() {
         assert_eq!(fmt_kst_secs_ms(-63_000_000_000, 0), ""); // 서기 이전
         assert_eq!(fmt_kst_secs_ms(260_000_000_000, 0), ""); // 9999년 초과
+    }
+
+    #[test]
+    fn extreme_inputs_yield_empty_without_overflow() {
+        assert_eq!(fmt_unix(i64::MAX), "");
+        assert_eq!(fmt_ole(f64::MIN), "");
+        assert_eq!(fmt_ole(-1.0e300), "");
     }
 }

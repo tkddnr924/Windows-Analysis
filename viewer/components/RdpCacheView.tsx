@@ -13,7 +13,8 @@ import { HeaderSearchInput, MultiSelectDropdown, ViewHeader } from "@/components
 import type { CsvData, FetchLinkedRows } from "@/lib/types";
 import { useModalDialog } from "@/lib/useModalDialog";
 import { resolveAccountDisplay, type AccountDirectory } from "@/lib/accountIdentity";
-import { DEFAULT_RDP_FILTER, RDP_STATUS_LABELS, accountKeyOf, buildRdpGroups, type RdpFilter } from "@/lib/rdpCache";
+import { DEFAULT_RDP_FILTER, RDP_FACET_VALUE, RDP_STATUS_LABELS, buildRdpGroups, rdpFacetCounts, type RdpFacet, type RdpFilter } from "@/lib/rdpCache";
+import { facetOptions, pageWindow, valueLabels } from "@/lib/eventCards";
 import RowDetailPanel from "./RowDetailPanel";
 
 type Row = Record<string, string>;
@@ -39,25 +40,15 @@ export default function RdpCacheView({ fileName, data, hostDir, onNavigate, onFe
   const zoomTitleId = useId();
   const zoomDialogRef = useModalDialog(() => setZoom(null), Boolean(zoom));
   const update = (patch: Partial<RdpFilter>) => setFilter((previous) => ({ ...previous, ...patch }));
-  useEffect(() => setBroken(new Set()), [data]);
 
   const groups = useMemo(() => buildRdpGroups(data.rows, filter), [data.rows, filter]);
   const accountLabel = (row: Row) => resolveAccountDisplay(row.account_sid || row.account || "", accountDirectory) || row.account || row.account_sid || "";
-  const accountOptions = useMemo(() => {
-    const byKey = new Map<string, { label: string; count: number }>();
-    for (const row of data.rows) {
-      const key = accountKeyOf(row);
-      const entry = byKey.get(key) ?? { label: key ? resolveAccountDisplay(key, accountDirectory) || row.account || key : "(계정 없음)", count: 0 };
-      entry.count += 1;
-      byKey.set(key, entry);
-    }
-    return [...byKey.entries()].map(([value, entry]) => ({ value, label: entry.label, count: entry.count }));
-  }, [data.rows, accountDirectory]);
-  const statusOptions = useMemo(() => {
-    const tally = new Map<string, number>();
-    for (const row of data.rows) tally.set(row.status ?? "", (tally.get(row.status ?? "") ?? 0) + 1);
-    return [...tally.entries()].map(([value, count]) => ({ value, label: RDP_STATUS_LABELS[value] ?? (value || "(없음)"), count }));
-  }, [data.rows]);
+  // Options are the stored values (plus current selections); counts follow the other conditions.
+  const labels = useMemo(() => ({
+    accounts: valueLabels(data.rows, RDP_FACET_VALUE.accounts, (value, row) => resolveAccountDisplay(value, accountDirectory) || row.account || value, "(계정 없음)"),
+    statuses: valueLabels(data.rows, RDP_FACET_VALUE.statuses, (value) => RDP_STATUS_LABELS[value] ?? value),
+  }), [data.rows, accountDirectory]);
+  const option = (facet: RdpFacet) => facetOptions(labels[facet], rdpFacetCounts(data.rows, filter, facet), filter[facet]);
   const fragmentCount = groups.reduce((sum, group) => sum + group.fragments.length, 0);
   const errorCount = groups.reduce((sum, group) => sum + group.errors.length, 0);
   const markBroken = (recordId: string) => setBroken((previous) => (previous.has(recordId) ? previous : new Set(previous).add(recordId)));
@@ -66,8 +57,8 @@ export default function RdpCacheView({ fileName, data, hostDir, onNavigate, onFe
     <div style={{ flex: 1, minHeight: 0, minWidth: 0, display: "flex", flexDirection: "column" }}>
       <ViewHeader icon={PhotoLibraryOutlinedIcon} title="RDP 비트맵 캐시" meta={`파일 ${groups.length.toLocaleString()} · 복원 조각 ${fragmentCount.toLocaleString()}${errorCount ? ` · 오류 ${errorCount.toLocaleString()}` : ""}`}>
         <HeaderSearchInput value={filter.search} onChange={(search) => update({ search })} placeholder="캐시 파일 · 계정 · SID" ariaLabel="RDP 캐시 검색" width={240} />
-        {accountOptions.length > 1 && <MultiSelectDropdown icon={<PersonOutlineIcon sx={{ fontSize: 15 }} />} label="계정" ariaLabel="계정" options={accountOptions} selected={filter.accounts} onChange={(accounts) => update({ accounts })} />}
-        {statusOptions.length > 1 && <MultiSelectDropdown icon={<FactCheckOutlinedIcon sx={{ fontSize: 15 }} />} label="상태" ariaLabel="상태" options={statusOptions} selected={filter.statuses} onChange={(statuses) => update({ statuses })} />}
+        {labels.accounts.size > 1 && <MultiSelectDropdown icon={<PersonOutlineIcon sx={{ fontSize: 15 }} />} label="계정" ariaLabel="계정" options={option("accounts")} selected={filter.accounts} onChange={(accounts) => update({ accounts })} />}
+        {labels.statuses.size > 1 && <MultiSelectDropdown icon={<FactCheckOutlinedIcon sx={{ fontSize: 15 }} />} label="상태" ariaLabel="상태" options={option("statuses")} selected={filter.statuses} onChange={(statuses) => update({ statuses })} />}
       </ViewHeader>
 
       <main style={{ flex: 1, minHeight: 0, overflow: "auto", padding: "14px 16px 24px" }}>
@@ -167,18 +158,15 @@ export default function RdpCacheView({ fileName, data, hostDir, onNavigate, onFe
 function Gallery({ items, render, resetKey }: { items: Row[]; render: (row: Row) => React.ReactNode; resetKey: string }) {
   const [page, setPage] = useState(0);
   useEffect(() => setPage(0), [resetKey]);
-  const pageCount = Math.max(1, Math.ceil(items.length / PAGE_SIZE));
-  const safePage = Math.min(page, pageCount - 1);
-  const start = safePage * PAGE_SIZE;
+  const pager = pageWindow(items.length, page, PAGE_SIZE);
   return (
     <div>
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))", gap: 8 }}>
-        {items.slice(start, start + PAGE_SIZE).map(render)}
+        {items.slice(pager.start, pager.end).map(render)}
       </div>
-      {pageCount > 1 && (
+      {pager.pageCount > 1 && (
         <div style={{ display: "flex", justifyContent: "center", marginTop: 10 }}>
-          <PaginationControls ariaLabel="복원 조각 페이지" page={safePage} pageCount={pageCount} onChange={setPage}
-            summary={`(${(start + 1).toLocaleString()}–${Math.min(items.length, start + PAGE_SIZE).toLocaleString()} / ${items.length.toLocaleString()})`} />
+          <PaginationControls ariaLabel="복원 조각 페이지" page={pager.page} pageCount={pager.pageCount} onChange={setPage} summary={pager.summary} />
         </div>
       )}
     </div>

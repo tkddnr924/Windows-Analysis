@@ -1,5 +1,8 @@
 // SMB history helpers (docs-09). Navigation groups by stored remote address;
-// events without an address are never merged. No runtime imports (Node tests).
+// events without an address are never merged. Sibling imports carry `.ts` for Node tests.
+
+// @ts-expect-error -- TypeScript uses bundler resolution while Node tests need the extension.
+import { compareEvents, groupEvents, inScope, type EventGroup } from "./eventOrder.ts";
 
 type Cells = Record<string, string | undefined>;
 
@@ -21,68 +24,51 @@ const SEARCH_FIELDS = [
   "account_upn", "account_sid", "target_user_sid", "subject_user_sid",
 ];
 
-function matchesExceptResult(event: Cells, filter: SmbFilter): boolean {
-  if (filter.directions.length && !filter.directions.includes(event.direction ?? "")) return false;
-  if (filter.accounts.length && !filter.accounts.includes(event.account_key ?? "")) return false;
-  const needle = filter.search.trim().toLowerCase();
-  if (needle && !SEARCH_FIELDS.some((field) => (event[field] ?? "").toLowerCase().includes(needle))) return false;
-  return true;
-}
+export type SmbFacet = "results" | "directions" | "accounts";
 
-function matches(event: Cells, filter: SmbFilter): boolean {
-  return (!filter.results.length || filter.results.includes(event.result ?? "")) && matchesExceptResult(event, filter);
-}
-
-/** Untimed events count only when no period is set (R13). */
-function inScope(event: Cells, inPeriod: (timestamp: string) => boolean, periodSet: boolean): boolean {
-  if (!event.timestamp) return !periodSet;
-  return inPeriod(event.timestamp);
-}
-
-const byTime = (left: Cells, right: Cells) => {
-  const a = left.timestamp ?? "";
-  const b = right.timestamp ?? "";
-  if (!a !== !b) return a ? -1 : 1;
-  return a < b ? -1 : a > b ? 1 : (left.record_id ?? "").localeCompare(right.record_id ?? "");
+export const SMB_FACET_VALUE: Record<SmbFacet, (event: Cells) => string> = {
+  results: (event) => event.result ?? "",
+  directions: (event) => event.direction ?? "",
+  accounts: (event) => event.account_key ?? "",
 };
+const FACETS: SmbFacet[] = ["results", "directions", "accounts"];
 
-export interface SmbGroup<E extends Cells> {
-  /** "address:<addr>" or "record:<id>". */
-  key: string;
-  address: string;
-  /** Every in-scope event of the group, time order. */
-  events: E[];
-  /** record_ids that match the event conditions. */
-  matched: Set<string>;
-}
-
-/** Groups with at least one matching event; each keeps its whole in-scope context (R11). */
-export function buildSmbGroups<E extends Cells>(events: E[], filter: SmbFilter, inPeriod: (timestamp: string) => boolean, periodSet = false): SmbGroup<E>[] {
-  const groups = new Map<string, SmbGroup<E>>();
-  for (const event of events) {
-    if (!inScope(event, inPeriod, periodSet)) continue;
-    const address = (event.remote_address ?? "").trim();
-    const key = address ? `address:${address}` : `record:${event.record_id}`;
-    let group = groups.get(key);
-    if (!group) {
-      group = { key, address, events: [], matched: new Set() };
-      groups.set(key, group);
-    }
-    group.events.push(event);
-    if (matches(event, filter)) group.matched.add(event.record_id ?? "");
+/** Every condition except `skip`. */
+function matches(event: Cells, filter: SmbFilter, skip: SmbFacet | null = null): boolean {
+  for (const facet of FACETS) {
+    if (facet !== skip && filter[facet].length && !filter[facet].includes(SMB_FACET_VALUE[facet](event))) return false;
   }
-  const kept = [...groups.values()].filter((group) => group.matched.size > 0);
-  for (const group of kept) group.events.sort(byTime);
-  return kept.sort((left, right) => byTime(left.events[0], right.events[0]) || left.key.localeCompare(right.key));
+  const needle = filter.search.trim().toLowerCase();
+  return !needle || SEARCH_FIELDS.some((field) => (event[field] ?? "").toLowerCase().includes(needle));
 }
 
-/** Events per result under every other condition. */
-export function smbResultCounts(events: Cells[], filter: SmbFilter, inPeriod: (timestamp: string) => boolean, periodSet = false): Record<string, number> {
+export interface SmbGroup<E extends Cells> extends EventGroup<E> {
+  /** key: "address:<addr>" or "record:<id>". */
+  address: string;
+}
+
+/** Groups with at least one matching event; each keeps its whole in-scope context (R11; untimed only without a period, R13). */
+export function buildSmbGroups<E extends Cells>(events: E[], filter: SmbFilter, inPeriod: (timestamp: string) => boolean, periodSet = false): SmbGroup<E>[] {
+  return groupEvents<E, SmbGroup<E>>(events, {
+    inPeriod,
+    periodSet,
+    keyOf: (event) => {
+      const address = (event.remote_address ?? "").trim();
+      return address ? `address:${address}` : `record:${event.record_id}`;
+    },
+    create: (key, event) => ({ key, address: (event.remote_address ?? "").trim(), events: [], matched: new Set() }),
+    matches: (event) => matches(event, filter),
+  });
+}
+
+/** Events per stored value of one facet under every other condition and the
+ *  period (shows what that facet's selection hides). */
+export function smbFacetCounts(events: Cells[], filter: SmbFilter, facet: SmbFacet, inPeriod: (timestamp: string) => boolean, periodSet = false): Record<string, number> {
   const counts: Record<string, number> = {};
   for (const event of events) {
-    if (!inScope(event, inPeriod, periodSet) || !matchesExceptResult(event, filter)) continue;
-    const result = event.result ?? "";
-    counts[result] = (counts[result] ?? 0) + 1;
+    if (!inScope(event, inPeriod, periodSet) || !matches(event, filter, facet)) continue;
+    const value = SMB_FACET_VALUE[facet](event);
+    counts[value] = (counts[value] ?? 0) + 1;
   }
   return counts;
 }
@@ -116,17 +102,17 @@ export function buildContextItems<E extends Cells>(records: E[], context: E[], r
   const items: ContextItem<E>[] = [];
   for (const [recordId, list] of children) {
     const record = recordById.get(recordId)!;
-    list.sort((a, b) => byTime(a.row, b.row));
+    list.sort((a, b) => compareEvents(a.row, b.row));
     items.push({ key: `linked:${recordId}`, kind: "linked", time: record.timestamp ?? "", record, children: list });
   }
   for (const row of context) if (!linked.has(row.record_id ?? "")) items.push({ key: `single:${row.record_id}`, kind: "single", time: row.timestamp ?? "", row });
   return items
     .filter((item) => (item.time ? inPeriod(item.time) : !periodSet))
-    .sort((a, b) => byTime({ timestamp: a.time, record_id: a.key }, { timestamp: b.time, record_id: b.key }));
+    .sort((a, b) => compareEvents({ timestamp: a.time, record_id: a.key }, { timestamp: b.time, record_id: b.key }));
 }
 
 // Stored enumerations → short labels; unknown values stay raw.
-export const SMB_DIRECTION_LABELS: Record<string, string> = { inbound: "인바운드", outbound: "아웃바운드" };
+export const SMB_DIRECTION_LABELS: Record<string, string> = { inbound: "인바운드", outbound: "아웃바운드", unknown: "방향 미확인" };
 export const RELATION_LABELS: Record<string, string> = { logon_instance_end: "로그온 종료", special_privileges: "특수 권한" };
 // SmbContext event_type → short label.
 export const CONTEXT_KIND_LABELS: Record<string, string> = {
@@ -142,6 +128,7 @@ export const EVIDENCE_KIND_LABELS: Record<string, string> = {
   service_state: "서비스 상태",
   service_start_type_change: "시작 유형 변경",
   service_configuration: "서비스 설정",
+  service_subkey: "서비스 하위 키",
   share_configuration: "공유 설정",
   share_definition: "공유 정의",
   control_set_selection: "ControlSet",

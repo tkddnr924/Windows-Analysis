@@ -154,6 +154,38 @@ fn name_refs(window: &str, class_suffix: &str) -> Vec<(String, String)> {
     found
 }
 
+/// Start of the record-end hash (8 consecutive one-character tokens between
+/// NULs), by the same rule as `tokens_from`.
+fn hash_start(data: &[u8], start: usize, end: usize) -> Option<usize> {
+    let mut i = start;
+    let mut run = 0usize;
+    let mut run_start = start;
+    while i < end {
+        let stop = data[i..end]
+            .iter()
+            .position(|&b| b == 0)
+            .map_or(end, |p| i + p);
+        let raw = &data[i..stop];
+        let at = i;
+        i = stop + 1;
+        if raw.is_empty() {
+            continue;
+        }
+        if raw.len() == 1 && printable(raw) {
+            if run == 0 {
+                run_start = at;
+            }
+            run += 1;
+            if run >= 8 {
+                return Some(run_start);
+            }
+        } else {
+            run = 0;
+        }
+    }
+    None
+}
+
 fn scan_bindings(
     data: &[u8],
     search_end: usize,
@@ -161,31 +193,39 @@ fn scan_bindings(
     push: &mut dyn FnMut(Row) -> Result<()>,
     seen: &mut BTreeSet<String>,
 ) -> Result<()> {
-    for off in find_all(data, search_end, b"__FilterToConsumerBinding\x00") {
-        let end = (off + 1024).min(data.len());
+    const SIG: &[u8] = b"__FilterToConsumerBinding\x00";
+    for off in find_all(data, search_end, SIG) {
+        // One record: up to the end hash or the next binding, whichever is first.
+        let body = off + SIG.len();
+        let mut end = (off + 1024).min(data.len());
+        if let Some(rel) = data[body.min(end)..end].windows(SIG.len()).position(|w| w == SIG) {
+            end = body + rel;
+        }
+        if let Some(hash) = hash_start(data, body.min(end), end) {
+            end = hash;
+        }
         let window: String = data[off..end]
             .iter()
             .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '\0' })
             .collect();
-        let consumers = name_refs(&window, "EventConsumer");
-        let filters = name_refs(&window, "EventFilter");
-        for (consumer_type, consumer_name) in &consumers {
-            for (_, filter_name) in &filters {
-                if consumer_name.is_empty() || filter_name.is_empty() {
-                    continue;
-                }
-                let key = format!("B|{consumer_type}|{consumer_name}|{filter_name}");
-                if !seen.insert(key) {
-                    continue;
-                }
-                let mut row = base_row("바인딩", source);
-                row.insert("name".into(), format!("{filter_name} → {consumer_name}"));
-                row.insert("consumer_type".into(), consumer_type.clone());
-                row.insert("consumer_name".into(), consumer_name.clone());
-                row.insert("filter_name".into(), filter_name.clone());
-                push(row)?;
-            }
+        // A binding instance holds one consumer and one filter reference; anything else is not paired.
+        let (consumers, filters) = (name_refs(&window, "EventConsumer"), name_refs(&window, "EventFilter"));
+        let ([(consumer_type, consumer_name)], [(_, filter_name)]) = (consumers.as_slice(), filters.as_slice()) else {
+            continue;
+        };
+        if consumer_name.is_empty() || filter_name.is_empty() {
+            continue;
         }
+        let key = format!("B|{consumer_type}|{consumer_name}|{filter_name}");
+        if !seen.insert(key) {
+            continue;
+        }
+        let mut row = base_row("바인딩", source);
+        row.insert("name".into(), format!("{filter_name} → {consumer_name}"));
+        row.insert("consumer_type".into(), consumer_type.clone());
+        row.insert("consumer_name".into(), consumer_name.clone());
+        row.insert("filter_name".into(), filter_name.clone());
+        push(row)?;
     }
     Ok(())
 }
@@ -301,7 +341,6 @@ type ChunkScan<'a> = &'a mut dyn FnMut(&[u8], usize, &mut dyn FnMut(Row) -> Resu
 /// 읽어(총 3회) "바인딩 → 필터 → 컨슈머" 표 순서를 유지한다.
 fn scan_file_chunked(
     path: &Path,
-    source: &str,
     scan: ChunkScan<'_>,
     push: &mut dyn FnMut(Row) -> Result<()>,
 ) -> std::result::Result<(), String> {
@@ -329,7 +368,6 @@ fn scan_file_chunked(
             buf.len().saturating_sub(SCAN_OVERLAP)
         };
         scan(&buf, search_end, push).map_err(|e| e.to_string())?;
-        let _ = source;
         if eof {
             return Ok(());
         }
@@ -361,7 +399,6 @@ pub fn parse_wmi_stream(
             let counted = &mut count;
             let result = scan_file_chunked(
                 path,
-                &source,
                 &mut |data, search_end, sink| pass(data, search_end, &src, sink, seen_ref),
                 &mut |row| {
                     *counted += 1;
@@ -451,6 +488,39 @@ fn blob(parts: &[&[u8]]) -> Vec<u8> {
         assert_eq!(rows[1]["namespace"], "root\\cimv2");
         assert_eq!(rows[2]["name"], "BadConsumer");
         assert!(rows[2]["details"].contains("cmd.exe /c evil.bat"));
+    }
+
+    /// Adjacent bindings within 1 KiB: each record pairs only its own
+    /// consumer and filter, never a cross product with the neighbour.
+    #[test]
+    fn adjacent_bindings_pair_only_within_their_record() {
+        let data = blob(&[
+            b"__FilterToConsumerBinding\x00\x00CommandLineEventConsumer.Name=\"EvilConsumer\"\x00\x10\x00__EventFilter.Name=\"EvilFilter\"\x00",
+            &hash_tail(),
+            // No end hash: the next binding signature bounds this record.
+            b"__FilterToConsumerBinding\x00\x00ActiveScriptEventConsumer.Name=\"ScriptConsumer\"\x00\x10\x00__EventFilter.Name=\"ScriptFilter\"\x00",
+            b"__FilterToConsumerBinding\x00\x00NTEventLogEventConsumer.Name=\"SCM Event Log Consumer\"\x00\x10\x00__EventFilter.Name=\"SCM Event Log Filter\"\x00",
+            &hash_tail(),
+        ]);
+        let dir = std::env::temp_dir().join(format!("wina-wmi-adjacent-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("OBJECTS.DATA");
+        std::fs::write(&path, &data).unwrap();
+        let rows = parse_wmi_from(&[path]).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        let pairs: Vec<(&str, &str)> = rows
+            .iter()
+            .filter(|r| r["kind"] == "바인딩")
+            .map(|r| (r["filter_name"].as_str(), r["consumer_name"].as_str()))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("EvilFilter", "EvilConsumer"),
+                ("ScriptFilter", "ScriptConsumer"),
+                ("SCM Event Log Filter", "SCM Event Log Consumer"),
+            ]
+        );
     }
 
     /// 청크 경계 회귀: 시그니처·레코드가 4MiB 청크 끝에 걸쳐도 겹침 재스캔으로

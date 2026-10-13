@@ -1,8 +1,9 @@
 //! Per-log collection evidence; no absence-to-audit-policy inference.
+use super::eventlog_inputs::LogInputs;
 use super::{Ctx, DerivedDb};
 use crate::overview::EventLogOverviewCache;
 use anyhow::Result;
-use rusqlite::{params, Connection, OpenFlags};
+use rusqlite::params;
 use std::collections::{BTreeMap, HashSet};
 
 const LOGS: &[&str] = &[
@@ -44,47 +45,25 @@ pub(super) fn populate(ctx: &Ctx, db: &DerivedDb, events: &EventLogOverviewCache
             value.last = Some(value.last.map_or(time,|v|v.max(time)));
         } else { value.untimed += 1; }
     }
-    let path = ctx.out_dir.join("EVENTLOG/EventLogInputs.sqlite");
-    let mut discovered = false;
+    let inputs = LogInputs::read(ctx, relevant)?;
     let mut seen = HashSet::new();
-    if path.exists() {
-        let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        discovered = conn.query_row("SELECT EXISTS(SELECT 1 FROM EventLogInputs WHERE status='discovery_complete')",[],|r|r.get(0))?;
-        let mut stmt = conn.prepare("SELECT rowid,source_file,facts_db,facts_table,status,row_count,error FROM EventLogInputs WHERE status<>'discovery_complete' ORDER BY rowid")?;
-        let mut rows = stmt.query([])?;
-        while let Some(row) = rows.next()? {
-            let file: Option<String> = row.get(1)?;
-            let table: String = row.get::<_,Option<String>>(3)?.filter(|s|!s.is_empty()).unwrap_or_else(|| {
-                file.as_deref().unwrap_or("").rsplit(['/', '\\']).next().unwrap_or("")
-                    .rsplit_once('.').map(|(stem,_)|stem).unwrap_or("").to_string()
-            });
-            if !relevant(&table) { continue; }
-            seen.insert(table.to_ascii_lowercase());
-            let status: String = row.get(4)?;
-            let count = row.get::<_,Option<String>>(5)?.and_then(|v|v.parse::<i64>().ok());
-            let state = match (status.as_str(), count) {
-                ("read_failed",_) => "read_failed",
-                ("parsed",Some(0)) => "collected_empty",
-                ("parsed",Some(_)) => "collected",
-                _ => "unknown",
-            };
-            let source = ctx.facts.source_from_row(&path,"EventLogInputs",row.get(0)?,file.as_deref(),Some("collection_observation"))?
-                .ok_or_else(||anyhow::anyhow!("missing EventLogInputs provenance"))?;
-            let stats = bounds.remove(table.as_str()).unwrap_or_default();
-            let parsed = status == "parsed";
-            let facts_generation = ctx.facts.by_stem(&table).map(|facts|ctx.facts.generation(facts)).transpose()?;
-            db.conn().execute(
-                "INSERT INTO SmbLogObservations(observation_id,host_id,dataset_id,log_name,source_file,facts_db,facts_table,
-                 collection_state,input_row_count,event_count,corrupted_count,untimed_count,first_observed_time,last_observed_time,
-                 audit_setting_state,error,source_dataset_id,source_db,source_table,source_rowid,facts_generation)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,'unknown',?15,?16,?17,?18,?19,?20)",
-                params![uuid::Uuid::new_v4().to_string(),ctx.host_id,ctx.dataset_id,table,file,
-                    row.get::<_,Option<String>>(2)?.filter(|s|!s.is_empty()),
-                    row.get::<_,Option<String>>(3)?.filter(|s|!s.is_empty()),state,count,
-                    parsed.then_some(stats.count),parsed.then_some(stats.corrupt),parsed.then_some(stats.untimed),
-                    stats.first,stats.last,row.get::<_,Option<String>>(6)?,source.dataset,source.db,source.table,source.rowid,facts_generation],
-            )?;
-        }
+    for input in &inputs.logs {
+        let table = input.log_name.as_str();
+        seen.insert(table.to_ascii_lowercase());
+        let source = inputs.source(ctx, input)?;
+        let stats = bounds.remove(table).unwrap_or_default();
+        let parsed = input.parsed();
+        let facts_generation = ctx.facts.by_stem(table).map(|facts|ctx.facts.generation(facts)).transpose()?;
+        db.conn().execute(
+            "INSERT INTO SmbLogObservations(observation_id,host_id,dataset_id,log_name,source_file,facts_db,facts_table,
+             collection_state,input_row_count,event_count,corrupted_count,untimed_count,first_observed_time,last_observed_time,
+             audit_setting_state,error,source_dataset_id,source_db,source_table,source_rowid,facts_generation)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,'unknown',?15,?16,?17,?18,?19,?20)",
+            params![uuid::Uuid::new_v4().to_string(),ctx.host_id,ctx.dataset_id,table,input.source_file,
+                input.facts_db,input.facts_table,input.collection_state(),input.input_rows,
+                parsed.then_some(stats.count),parsed.then_some(stats.corrupt),parsed.then_some(stats.untimed),
+                stats.first,stats.last,input.error,source.dataset,source.db,source.table,source.rowid,facts_generation],
+        )?;
     }
     for (table,stats) in bounds {
         seen.insert(table.to_ascii_lowercase());
@@ -105,7 +84,7 @@ pub(super) fn populate(ctx: &Ctx, db: &DerivedDb, events: &EventLogOverviewCache
             "INSERT INTO SmbLogObservations(observation_id,host_id,dataset_id,log_name,collection_state,audit_setting_state)
              VALUES(?1,?2,?3,?4,?5,'unknown')",
             params![uuid::Uuid::new_v4().to_string(),ctx.host_id,ctx.dataset_id,log,
-                if discovered { "not_collected" } else { "unknown" }],
+                inputs.absent_state()],
         )?;
     }
     Ok(())
@@ -115,6 +94,7 @@ pub(super) fn populate(ctx: &Ctx, db: &DerivedDb, events: &EventLogOverviewCache
 mod tests {
     use super::*;
     use crate::derived::{FactsIndex, MetaLookup, stamp_facts_generation};
+    use rusqlite::Connection;
     #[test]
     fn empty_failed_missing_and_unobserved_are_distinct() {
         let root = std::env::temp_dir().join(format!("wina-smb-logs-{}",uuid::Uuid::new_v4()));

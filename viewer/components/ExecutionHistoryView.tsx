@@ -12,7 +12,6 @@ import KeyboardArrowRightOutlinedIcon from "@mui/icons-material/KeyboardArrowRig
 import PaginationControls from "@/components/PaginationControls";
 import ClearOutlinedIcon from "@mui/icons-material/ClearOutlined";
 import FilterListOutlinedIcon from "@mui/icons-material/FilterListOutlined";
-import SearchOutlinedIcon from "@mui/icons-material/SearchOutlined";
 import BoltOutlinedIcon from "@mui/icons-material/BoltOutlined";
 import Checkbox from "@mui/material/Checkbox";
 import IconButton from "@mui/material/IconButton";
@@ -124,11 +123,10 @@ export default function ExecutionHistoryView({ data, onNavigate, onFetchLinkedRo
     return [...counts.entries()].sort(([left], [right]) => sourceLabel(left).localeCompare(sourceLabel(right)));
   }, [all]);
   const activeSourceCount = sources.filter(([source]) => !disabledSources.has(source)).length;
-  const filtersActive = disabledSources.size > 0 || onlyRisk || onlyUnsigned || excludeWindows || Boolean(search.trim());
-  // 시간 정보가 없는 항목은 기간 필터로 거를 수 없으므로 필터와 무관하게 남긴다
-  // (아래에서 "시간 정보 없음" 섹션으로 분리 표시).
+  const filtersActive = disabledSources.size > 0 || hiddenAccounts.size > 0 || onlyRisk || onlyUnsigned || excludeWindows || Boolean(search.trim());
+  // Same rule as SMB/remote access: an active range drops untimed entries.
   const inGlobalRange = useMemo(
-    () => all.filter((entry) => !entry.timestamp || !rangeActive(timeRange) || inRange(entry.timestamp, timeRange)),
+    () => !rangeActive(timeRange) ? all : all.filter((entry) => entry.timestamp && inRange(entry.timestamp, timeRange)),
     [all, timeRange],
   );
   const allAccounts = useMemo(
@@ -147,8 +145,7 @@ export default function ExecutionHistoryView({ data, onNavigate, onFetchLinkedRo
       const compare = left.timestamp.localeCompare(right.timestamp);
       return sort === "oldest" ? compare : -compare;
     });
-    // 기간 필터가 켜지면 시간 없는 항목은 결과에서 제외된다(inGlobalRange에서
-    // 이미 걸러짐) — 여기서는 꺼져 있을 때만 별도 구역으로 모은다.
+    // Untimed entries only exist here when no range is active.
     const untimed = kept
       .filter((entry) => !entry.timestamp)
       .sort((left, right) => left.display.title.localeCompare(right.display.title));
@@ -164,7 +161,7 @@ export default function ExecutionHistoryView({ data, onNavigate, onFetchLinkedRo
   const pageEnd = Math.min(filtered.length, safePage * EXEC_PAGE_SIZE + EXEC_PAGE_SIZE);
   const allSourcesSelected = sources.length > 0 && activeSourceCount === sources.length;
   const sourceSelectionPartial = activeSourceCount > 0 && !allSourcesSelected;
-  const clearFilters = () => { setDisabledSources(new Set()); setOnlyRisk(false); setOnlyUnsigned(false); setExcludeWindows(false); setSearch(""); };
+  const clearFilters = () => { setDisabledSources(new Set()); setHiddenAccounts(new Set()); setOnlyRisk(false); setOnlyUnsigned(false); setExcludeWindows(false); setSearch(""); };
   const renderRow = (entry: Entry) => {
     const bookmarked = bookmarkedRowids?.has(entry.rowid) ?? false;
     const selectedRow = selected?.rowid === entry.rowid && selected.source === entry.source;
@@ -199,7 +196,7 @@ export default function ExecutionHistoryView({ data, onNavigate, onFetchLinkedRo
   };
 
   return <div className="dfir-view" style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", background: "var(--bg)" }}>
-    <ViewHeader icon={BoltOutlinedIcon} title="실행 이력" meta={`${filtered.length.toLocaleString()}건`} right={<span style={{ color: "var(--text-faint)", fontSize: 11.5 }}>{rangeActive(timeRange) ? "전역 기간 필터 적용" : "전체 기간"}</span>}>
+    <ViewHeader icon={BoltOutlinedIcon} title="실행 이력" meta={`${(filtered.length + untimed.length).toLocaleString()}건`} right={<span style={{ color: "var(--text-faint)", fontSize: 11.5 }}>{rangeActive(timeRange) ? "전역 기간 필터 적용" : "전체 기간"}</span>}>
       <HeaderSearchInput value={search} onChange={setSearch} placeholder="이름 · 경로 · 명령줄 · 계정 검색" ariaLabel="실행 이력 검색" width={280} />
       <AccountFilterChips accounts={allAccounts} hidden={hiddenAccounts} onToggle={(account: string) => setHiddenAccounts((previous) => { const next = new Set(previous); if (next.has(account)) next.delete(account); else next.add(account); return next; })} onReset={() => setHiddenAccounts(new Set())} accountDirectory={accountDirectory} />
       <SelectDropdown

@@ -9,11 +9,10 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use notatin::cell_value::CellValue;
 use notatin::parser::ParserIterator;
-use notatin::parser_builder::ParserBuilder;
 
 use crate::hex::hex_lower;
 use crate::sqlite::Row;
-use crate::time::{fmt_filetime, fmt_kst};
+use crate::time::fmt_filetime;
 
 pub const PROGRAMS_TABLE: &str = "Amcache_Programs";
 pub const FILES_TABLE: &str = "Amcache_Files";
@@ -176,37 +175,45 @@ pub struct AmcacheParse {
     pub log_apply_error: Option<String>,
 }
 
+/// The value after the first four characters (char-boundary safe), if any.
+fn after_prefix4(s: &str) -> Option<&str> {
+    s.char_indices().nth(4).map(|(i, _)| &s[i..])
+}
+
+/// regipy AmCachePlugin post-processing: strip the 4-char prefix on
+/// file_id / program_id and derive sha1 from file_id.
+fn strip_id_prefixes(row: &mut Row) {
+    if let Some(fid) = row.get("file_id").cloned() {
+        if fid != "0" {
+            if let Some(stripped) = after_prefix4(&fid).map(str::to_string) {
+                row.insert("file_id".into(), stripped.clone());
+                row.entry("sha1".into()).or_insert(stripped);
+            }
+        }
+    }
+    if let Some(sha) = row.get("sha1").cloned() {
+        if row.get("file_id").is_none_or(|f| *f != sha) {
+            if let Some(s) = after_prefix4(&sha) {
+                row.insert("sha1".into(), s.to_string());
+            }
+        }
+    }
+    if let Some(pid) = row.get("program_id").cloned() {
+        if let Some(s) = after_prefix4(&pid) {
+            row.insert("program_id".into(), s.to_string());
+        }
+    }
+}
+
 /// `logs`는 호출자가 확정한 파싱 계획의 트랜잭션 로그 목록이다 — 파서가
 /// 디렉터리를 재탐색하지 않아야 보고서의 입력 목록·logsDiscovered와 실제
 /// 적용 로그가 항상 같은 스냅샷을 가리킨다.
 pub fn parse_amcache(hive: &Path, logs: &[PathBuf]) -> Result<AmcacheParse> {
     let source = hive.to_string_lossy().to_string();
-    let make_builder = |with_logs: bool| {
-        // notatin stores the path, so a borrowed &Path fails the 'static bound.
-        #[allow(clippy::unnecessary_to_owned)]
-        let mut builder = ParserBuilder::from_path(hive.to_path_buf());
-        if with_logs {
-            for log in logs {
-                builder.with_transaction_log(log.clone());
-            }
-        }
-        // 복구 정책(사용자 확정): 삭제된 셀은 복구하지 않는다 — Registry
-        // 파서와 동일하게 할당된(live) 키만 순회한다.
-        builder
-    };
-    // Registry 파서와 같은 규칙: 로그 포함 빌드가 실패해도 유효한 기본
-    // 하이브까지 버리지 않고, 실패 사유를 남긴 뒤 로그 없이 한 번 재시도한다.
-    let mut log_apply_error: Option<String> = None;
-    let parser = match make_builder(!logs.is_empty()).build() {
-        Ok(parser) => parser,
-        Err(error) => {
-            if logs.is_empty() {
-                return Err(error.into());
-            }
-            log_apply_error = Some(error.to_string());
-            make_builder(false).build()?
-        }
-    };
+    // 복구 정책(사용자 확정): 삭제된 셀은 복구하지 않는다(live 키만).
+    // 로그 실패 시 사유를 남기고 로그 없이 재시도 — Registry와 같은 헬퍼.
+    let (parser, log_apply_error) =
+        crate::parsers::registry::build_parser_with_log_fallback(hive, logs, false)?;
     let mut programs: Vec<Row> = Vec::new();
     let mut files: Vec<Row> = Vec::new();
 
@@ -215,7 +222,7 @@ pub fn parse_amcache(hive: &Path, logs: &[PathBuf]) -> Result<AmcacheParse> {
             Some(s) => s,
             None => continue,
         };
-        let ts = fmt_kst(key.last_key_written_date_and_time());
+        let ts = fmt_filetime(key.detail.last_key_written_date_and_time() as i64);
 
         let kind = classify_key(&segs);
         let is_prog_modern = kind == AmcacheKeyKind::ProgramModern;
@@ -269,28 +276,7 @@ pub fn parse_amcache(hive: &Path, logs: &[PathBuf]) -> Result<AmcacheParse> {
                     }
                 }
             }
-            // regipy AmCachePlugin post-processing: strip the 4-char prefix on
-            // file_id / program_id, derive sha1 from file_id, size hex->int.
-            if let Some(fid) = row.get("file_id").cloned() {
-                if fid != "0" && fid.len() > 4 {
-                    let stripped = fid[4..].to_string();
-                    row.insert("file_id".into(), stripped.clone());
-                    row.entry("sha1".into()).or_insert(stripped);
-                }
-            }
-            if let Some(sha) = row.get("sha1").cloned() {
-                let s = if sha.len() > 4 && row.get("file_id").is_none_or(|f| *f != sha) {
-                    sha[4..].to_string()
-                } else {
-                    sha
-                };
-                row.insert("sha1".into(), s);
-            }
-            if let Some(pid) = row.get("program_id").cloned() {
-                if pid.len() > 4 {
-                    row.insert("program_id".into(), pid[4..].to_string());
-                }
-            }
+            strip_id_prefixes(&mut row);
             if !is_file_legacy {
                 if let Some(sz) = row.get("size").cloned() {
                     if let Ok(n) = i64::from_str_radix(sz.trim_start_matches("0x"), 16) {
@@ -317,7 +303,22 @@ pub fn parse_amcache(hive: &Path, logs: &[PathBuf]) -> Result<AmcacheParse> {
 
 #[cfg(test)]
 mod tests {
-    use super::{after_root, classify_key, legacy_filetime, map_legacy_file, AmcacheKeyKind};
+    use super::{after_root, classify_key, legacy_filetime, map_legacy_file, strip_id_prefixes, AmcacheKeyKind};
+    use crate::sqlite::Row;
+
+    #[test]
+    fn non_ascii_ids_do_not_panic() {
+        let mut row = Row::new();
+        row.insert("file_id".into(), "가나다".into());
+        row.insert("program_id".into(), "가나다라마".into());
+        strip_id_prefixes(&mut row);
+        assert_eq!(row.get("program_id").map(String::as_str), Some("마"));
+        let mut ascii = Row::new();
+        ascii.insert("file_id".into(), "0000abcd".into());
+        strip_id_prefixes(&mut ascii);
+        assert_eq!(ascii.get("file_id").map(String::as_str), Some("abcd"));
+        assert_eq!(ascii.get("sha1").map(String::as_str), Some("abcd"));
+    }
 
     #[test]
     fn legacy_file_value_ids_map_to_modern_columns() {

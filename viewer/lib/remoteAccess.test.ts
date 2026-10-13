@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 // @ts-expect-error -- TypeScript uses bundler resolution while this test uses Node directly.
-import { DEFAULT_FILTER, accountKeyOf, buildGroups, hostCandidates, resultCounts } from "./remoteAccess.ts";
+import { DEFAULT_FILTER, ID_SPACE_LABELS, accountKeyOf, buildGroups, facetCounts, hostCandidates } from "./remoteAccess.ts";
 
 const ev = (record_id: string, timestamp: string, extra: Record<string, string> = {}) => ({ record_id, timestamp, result: "성공", direction: "inbound", access_scope: "remote", ...extra });
 const always = () => true;
@@ -34,7 +34,24 @@ test("event conditions pick groups but keep their whole context with match count
   // Local/unknown-scope evidence is kept but not shown by default (R01).
   assert.deepEqual(buildGroups([ev("l", "2026-01-01 12:00:00.000", { access_scope: "local", direction: "unknown" })], new Map(), DEFAULT_FILTER, always), []);
   assert.deepEqual(groups.map((g: { key: string; events: unknown[]; matched: Set<string> }) => [g.key, g.events.length, [...g.matched]]), [["segment:s1", 2, ["b"]]]);
-  assert.deepEqual(resultCounts(events, DEFAULT_FILTER, always), { 성공: 1, 정보: 2 });
+  assert.deepEqual(facetCounts(events, DEFAULT_FILTER, "results", always), { 성공: 1, 정보: 2 });
+});
+
+test("facet counts use stored values (incl. unknown) and every other condition plus period", () => {
+  const events = [
+    ev("a", "2026-01-01 10:00:00.000", { access_scope: "unknown", direction: "inbound" }),
+    ev("b", "2026-01-01 10:01:00.000", { access_scope: "local", direction: "unknown" }),
+    ev("c", "2026-01-01 10:02:00.000", { access_scope: "remote", direction: "outbound" }),
+    ev("d", "2026-02-01 10:00:00.000", { access_scope: "remote", direction: "outbound" }),
+    ev("e", "2026-01-01 10:03:00.000", { access_scope: "remote", direction: "outbound", result: "정보" }),
+  ];
+  const january = (timestamp: string) => timestamp.startsWith("2026-01");
+  // Scope counts ignore the scope filter itself but honour result + period.
+  assert.deepEqual(facetCounts(events, DEFAULT_FILTER, "scopes", january, true), { unknown: 1, local: 1, remote: 1 });
+  // Direction counts honour the default remote scope.
+  assert.deepEqual(facetCounts(events, DEFAULT_FILTER, "directions", january, true), { outbound: 1 });
+  assert.deepEqual(facetCounts(events, { ...DEFAULT_FILTER, scopes: [] }, "directions", january, true), { inbound: 1, unknown: 1, outbound: 1 });
+  assert.deepEqual(facetCounts(events, DEFAULT_FILTER, "accounts", always), { "": 2 });
 });
 
 test("search covers SID, remote computer and description; account filter uses the identity key", () => {
@@ -72,4 +89,9 @@ test("every registered host on an address is a candidate; loopback and LOCAL nev
   assert.deepEqual(hostCandidates("127.0.0.1", { "127.0.0.1": [{ id: "h1", name: "A" }] }), []);
   assert.deepEqual(hostCandidates("LOCAL", map), []);
   assert.deepEqual(hostCandidates("", map), []);
+});
+
+test("every id_space the Rust correlator emits has a label", () => {
+  // rust/core/src/remote_access/relations.rs IdSpace::as_str
+  assert.deepEqual(Object.keys(ID_SPACE_LABELS).sort(), ["lsm_session", "rdp_client_connection", "security_logon"]);
 });

@@ -91,6 +91,7 @@ export default function BrowserActivityView({ dbPath, aiDbPath, hostDir = "", ti
   const [inputs, setInputs] = useState<BrowserInputInfo[]>([]);
   const [scopeKeys, setScopeKeys] = useState<string[]>([]);
   const [kinds, setKinds] = useState<string[]>(DEFAULT_KINDS);
+  const [searchDraft, setSearchDraft] = useState("");
   const [search, setSearch] = useState("");
   const [sort, setSort] = useState("asc");
   const [dayMode, setDayMode] = useState<DayMode | null>(null);
@@ -102,7 +103,9 @@ export default function BrowserActivityView({ dbPath, aiDbPath, hostDir = "", ti
   const [aiPanel, setAiPanel] = useState<AiPanel>("conversation");
   const [aiUntimed, setAiUntimed] = useState(false);
   const [aiData, setAiData] = useState<AiPage>({ rows: [], rowCount: 0, kinds: [] });
-  const [aiUntimedCount, setAiUntimedCount] = useState(0);
+  // Per-kind counts under the current filter, independent of the open panel.
+  const [aiKinds, setAiKinds] = useState<AiPage["kinds"]>([]);
+  const [aiUntimedKinds, setAiUntimedKinds] = useState<AiPage["kinds"]>([]);
   const [referrals, setReferrals] = useState<BrowserPage>({ rows: [], rowCount: 0 });
   const [aiPage, setAiPage] = useState(0);
   const [detail, setDetail] = useState<Row | null>(null);
@@ -129,6 +132,10 @@ export default function BrowserActivityView({ dbPath, aiDbPath, hostDir = "", ti
     untimed: mode.kind === "untimed",
   }), [scopeFilter, search, mode.kind, mode.kind === "day" ? mode.day : ""]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  useEffect(() => {
+    const timeout = window.setTimeout(() => setSearch(searchDraft), 280);
+    return () => window.clearTimeout(timeout);
+  }, [searchDraft]);
   useEffect(() => {
     let alive = true;
     window.api.browserScope(dbPath).then((result) => { if (alive) { setInputs(result); clear("scope"); } }).catch(() => { if (alive) fail("scope", "브라우저 입력을 불러오지 못했습니다."); });
@@ -161,7 +168,12 @@ export default function BrowserActivityView({ dbPath, aiDbPath, hostDir = "", ti
     if (!aiDbPath) return;
     let alive = true;
     const base = { search: search.trim() || undefined, start, end };
-    window.api.aiPage(aiDbPath, { ...base, untimed: true, offset: 0, limit: 1 }).then((result) => { if (alive) setAiUntimedCount(result.rowCount); }).catch(() => {});
+    window.api.aiPage(aiDbPath, { ...base, untimed: true, offset: 0, limit: 1 })
+      .then((result) => { if (alive) { setAiUntimedKinds(result.kinds); clear("aiUntimed"); } })
+      .catch(() => { if (alive) fail("aiUntimed", "AI 시각 미상 건수를 불러오지 못했습니다."); });
+    window.api.aiPage(aiDbPath, { ...base, untimed: aiUntimed, offset: 0, limit: 1 })
+      .then((result) => { if (alive) { setAiKinds(result.kinds); clear("aiKinds"); } })
+      .catch(() => { if (alive) fail("aiKinds", "AI 종류별 건수를 불러오지 못했습니다."); });
     if (aiPanel === "referral") return () => { alive = false; };
     window.api.aiPage(aiDbPath, { ...base, kind: aiPanel, untimed: aiUntimed, offset: aiPage * AI_PAGE_SIZE, limit: AI_PAGE_SIZE })
       .then((result) => { if (alive) { setAiData(result); clear("ai"); } })
@@ -178,7 +190,7 @@ export default function BrowserActivityView({ dbPath, aiDbPath, hostDir = "", ti
 
   const openRecord = (row: Row) => {
     if (!hostDir) { setDetail(row); return; }
-    window.api.browserRecord(hostDir, row.record_id).then((record) => setDetail(record.row)).catch(() => fail("detail", "기록 상세를 불러오지 못했습니다."));
+    window.api.browserRecord(hostDir, row.record_id).then((record) => { setDetail(record.row); clear("detail"); }).catch(() => fail("detail", "기록 상세를 불러오지 못했습니다."));
   };
 
   const activeDay = mode.kind === "day" ? mode.day : "";
@@ -190,8 +202,10 @@ export default function BrowserActivityView({ dbPath, aiDbPath, hostDir = "", ti
   const pageCount = Math.max(1, Math.ceil(data.rowCount / PAGE_SIZE));
   const safePage = Math.min(page, pageCount - 1);
   const kindCount = (kind: string) => summary?.kinds.find((entry) => entry.value === kind)?.count;
-  const aiKindCount = (kind: string) => aiData.kinds.find((entry) => entry.value === kind)?.count ?? 0;
-  const aiTotal = aiData.kinds.reduce((sum, entry) => sum + entry.count, 0);
+  const aiKindCount = (kind: string) => aiKinds.find((entry) => entry.value === kind)?.count ?? 0;
+  const aiTotal = aiKinds.reduce((sum, entry) => sum + entry.count, 0);
+  const aiUntimedCount = aiUntimedKinds.find((entry) => entry.value === aiPanel)?.count ?? 0;
+  const selectedKindTotal = (summary?.kinds ?? []).filter((entry) => kinds.includes(entry.value)).reduce((sum, entry) => sum + entry.count, 0);
   const errorMessages = Object.values(errors).filter((message): message is string => Boolean(message));
   const ledgerLabel = mode.kind === "day" ? mode.day : mode.kind === "untimed" ? "시각 미상" : "기간 전체";
   const aiRows = aiPanel === "referral" ? referrals.rows : aiData.rows;
@@ -199,9 +213,9 @@ export default function BrowserActivityView({ dbPath, aiDbPath, hostDir = "", ti
 
   return <div className="dfir-view" style={{ flex: 1, minHeight: 0, display: "flex", overflow: "hidden" }}>
     <main style={{ flex: "1 1 auto", minWidth: 0, minHeight: 0, display: "flex", flexDirection: "column", overflow: "hidden", background: "var(--bg)" }}>
-      <ViewHeader icon={LanguageOutlinedIcon} title="브라우저 활동" meta={`입력 ${inputs.length} · 기록 ${(summary?.kinds.reduce((sum, entry) => sum + entry.count, 0) ?? 0).toLocaleString()}`}
+      <ViewHeader icon={LanguageOutlinedIcon} title="브라우저 활동" meta={`입력 ${inputs.length} · 기록 ${selectedKindTotal.toLocaleString()}`}
         right={errorMessages.length > 0 ? <span role="alert" style={{ display: "inline-flex", alignItems: "center", gap: 7, minWidth: 0, color: "var(--warning)", fontSize: 11.5 }}><span>{errorMessages.join(" ")}</span><button className="nm-btn" type="button" onClick={() => { setErrors({}); setReload((value) => value + 1); }} style={{ flexShrink: 0, padding: "3px 7px", borderRadius: "var(--radius)", border: "1px solid var(--border)", background: "var(--bg-elevated)", color: "var(--text-dim)", cursor: "pointer", fontSize: 11 }}>다시 시도</button></span> : undefined}>
-        <HeaderSearchInput value={search} onChange={setSearch} placeholder="URL · 제목 · 경로 · 계정 · 검색어 · 대화" ariaLabel="브라우저 기록 검색" width={320} />
+        <HeaderSearchInput value={searchDraft} onChange={setSearchDraft} placeholder="URL · 제목 · 경로 · 계정 · 검색어 · 대화" ariaLabel="브라우저 기록 검색" width={320} />
         <MultiSelectDropdown icon={<PersonOutlineIcon sx={{ fontSize: 15 }} />} label="범위" ariaLabel="브라우저 범위" options={scopes.map((scope) => ({ value: scope.key, label: `${scope.label}${scope.owner ? ` · ${scope.owner}` : ""}`, count: scope.recordCount }))} selected={scopeKeys} onChange={(next) => { setScopeKeys(next); setDayMode(null); }} />
         <MultiSelectDropdown icon={<Inventory2OutlinedIcon sx={{ fontSize: 15 }} />} label="종류" ariaLabel="기록 종류" options={Object.entries(KIND_LABELS).map(([value, label]) => ({ value, label, count: kindCount(value) }))} selected={kinds} onChange={(next) => { setKinds(next); setDayMode(null); }} />
         <SortDropdown value={sort} onChange={setSort} />
@@ -302,7 +316,7 @@ export default function BrowserActivityView({ dbPath, aiDbPath, hostDir = "", ti
               <button className="nm-btn" role="tab" aria-selected={aiPanel === "conversation"} onClick={() => setAiPanel("conversation")} style={controlButton(aiPanel === "conversation")}><TextsmsOutlinedIcon sx={{ fontSize: 15 }} />대화 본문 {aiKindCount("conversation").toLocaleString()}</button>
               <button className="nm-btn" role="tab" aria-selected={aiPanel === "list_entry"} onClick={() => setAiPanel("list_entry")} style={controlButton(aiPanel === "list_entry")}><ListAltOutlinedIcon sx={{ fontSize: 15 }} />목록 흔적 {aiKindCount("list_entry").toLocaleString()}</button>
               <button className="nm-btn" role="tab" aria-selected={aiPanel === "referral"} onClick={() => setAiPanel("referral")} style={controlButton(aiPanel === "referral")}><TravelExploreOutlinedIcon sx={{ fontSize: 15 }} />AI 유입 표식 {referrals.rowCount.toLocaleString()}</button>
-              {aiPanel !== "referral" && aiUntimedCount > 0 && <button className="nm-btn" type="button" aria-pressed={aiUntimed} onClick={() => setAiUntimed((value) => !value)} style={{ ...controlButton(aiUntimed), marginLeft: "auto" }}>시각 미상 {aiUntimedCount.toLocaleString()}</button>}
+              {aiPanel !== "referral" && (aiUntimedCount > 0 || aiUntimed) && <button className="nm-btn" type="button" aria-pressed={aiUntimed} onClick={() => setAiUntimed((value) => !value)} style={{ ...controlButton(aiUntimed), marginLeft: "auto" }}>시각 미상 {aiUntimedCount.toLocaleString()}</button>}
             </div>
             <div role="tabpanel" style={{ flex: 1, minHeight: 0, overflow: "auto", padding: 12 }}>
               {!aiDbPath && aiPanel !== "referral" ? <div role="status" style={{ padding: 16, color: "var(--text-faint)", fontSize: 12.5 }}>AI 대화 기록 없음</div>

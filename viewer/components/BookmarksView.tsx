@@ -13,7 +13,7 @@ import ComputerOutlinedIcon from "@mui/icons-material/ComputerOutlined";
 import CircularProgress from "@mui/material/CircularProgress";
 import type { Bookmark, FetchLinkedRows, Host, ResultRow } from "@/lib/types";
 import { getArtifactView, resolveArtifactView } from "@/lib/artifactViews";
-import { formatEvidenceTimestamp, type TimeRange } from "@/lib/timeRange";
+import { formatEvidenceTimestamp } from "@/lib/timeRange";
 import TagList from "./TagList";
 import RowDetailPanel from "./RowDetailPanel";
 import PaginationControls from "@/components/PaginationControls";
@@ -27,7 +27,6 @@ interface BookmarksViewProps {
   hosts: Host[];
   hostIpMap: Record<string, { id: string; name: string }>;
   currentHostId: string | null;
-  timeRange: TimeRange;
   onRemove: (bookmark: Bookmark) => void;
   onNavigate: (targetFile: string, targetColumn: string, value: string) => void;
   onFetchLinkedRows: FetchLinkedRows;
@@ -153,7 +152,7 @@ function EntryOpenButton({ entry, onOpen }: { entry: BookmarkEntry; onOpen: (ent
   );
 }
 
-export default function BookmarksView({ bookmarks, hosts, hostIpMap, currentHostId, timeRange, onRemove, onNavigate, onFetchLinkedRows, accountDirectoryForHost, onOpenRecord }: BookmarksViewProps) {
+export default function BookmarksView({ bookmarks, hosts, hostIpMap, currentHostId, onRemove, onNavigate, onFetchLinkedRows, accountDirectoryForHost, onOpenRecord }: BookmarksViewProps) {
   // Inherit the result view's open/bookmark actions for source records.
   const outerScope = useContext(RecordScopeContext);
   const [detail, setDetail] = useState<{ bookmark: Bookmark; row: Record<string, string>; columns: string[]; evidenceTime: { value: string; label?: string } } | null>(null);
@@ -163,23 +162,25 @@ export default function BookmarksView({ bookmarks, hosts, hostIpMap, currentHost
   const [viewMode, setViewMode] = useState<"timeline" | "sequence">("timeline");
 
   useEffect(() => {
+    // Drop cache entries of removed bookmarks.
+    const ids = new Set(bookmarks.map((bookmark) => bookmark.id));
+    setRowCache((previous) => Object.keys(previous).every((id) => ids.has(id)) ? previous : Object.fromEntries(Object.entries(previous).filter(([id]) => ids.has(id))));
     const missing = bookmarks.filter((bookmark) => rowCache[bookmark.id] === undefined);
     if (missing.length === 0) return;
     let cancelled = false;
-    const resolved: [string, RowLoad][] = [];
     let nextIndex = 0;
+    // Each result is committed as it arrives, even after cancellation.
+    const commit = (id: string, load: RowLoad) => setRowCache((previous) => ids.has(id) ? { ...previous, [id]: load } : previous);
     const worker = async () => {
       while (!cancelled) {
         const bookmark = missing[nextIndex++];
         if (!bookmark) return;
         // docs-20: the _OVERVIEW record itself, by record_id.
-        try { resolved.push([bookmark.id, { status: "ready", data: await window.api.resultRowByRecordId(bookmark.fullPath, bookmark.tableName, bookmark.recordId) }]); }
-        catch { resolved.push([bookmark.id, { status: "error" }]); }
+        try { commit(bookmark.id, { status: "ready", data: await window.api.resultRowByRecordId(bookmark.fullPath, bookmark.tableName, bookmark.recordId) }); }
+        catch { commit(bookmark.id, { status: "error" }); }
       }
     };
-    void Promise.all(Array.from({ length: Math.min(MAX_CONCURRENT_ROW_LOOKUPS, missing.length) }, worker)).then(() => {
-      if (!cancelled && resolved.length > 0) setRowCache((previous) => ({ ...previous, ...Object.fromEntries(resolved) }));
-    });
+    void Promise.all(Array.from({ length: Math.min(MAX_CONCURRENT_ROW_LOOKUPS, missing.length) }, worker));
     return () => { cancelled = true; };
     // `rowCache` is deliberately excluded: entries queue once per attempt;
     // retry clears only failed keys and advances `lookupAttempt`.
@@ -203,7 +204,7 @@ export default function BookmarksView({ bookmarks, hosts, hostIpMap, currentHost
     const unresolved = entries.filter((entry) => !entry.row);
     const compare = (left: BookmarkEntry, right: BookmarkEntry) => sortDir === "asc" ? left.eventTime.localeCompare(right.eventTime) : right.eventTime.localeCompare(left.eventTime);
     return { timedEntries: timed.sort(compare), undatedEntries: undated, unresolvedEntries: unresolved };
-  }, [entries, sortDir, timeRange]);
+  }, [entries, sortDir]);
 
   const sequenceEntries = useMemo<SequenceEntry[]>(() => timedEntries.map((entry) => {
     const peer = (entry.row?.remote_address ?? "").trim();
@@ -212,10 +213,9 @@ export default function BookmarksView({ bookmarks, hosts, hostIpMap, currentHost
     const rawDirection = entry.row?.direction?.toLowerCase();
     const direction: SequenceEntry["direction"] = peer && rawDirection === "inbound" ? "inbound" : peer && rawDirection === "outbound" ? "outbound" : "unknown";
     return { ...entry, peer, peerHostId: peerHost?.id ?? "", peerHostName: isLoopback ? `로컬 루프백 (${peer})` : peerHost?.name ?? peer, isLoopback, direction };
-  }).sort((left, right) => left.eventTime.localeCompare(right.eventTime)), [hostIpMap, timedEntries]);
+  }), [hostIpMap, timedEntries]);
 
   const failedCount = entries.filter((entry) => entry.load?.status === "error").length;
-  const emptyForRange = timedEntries.length === 0 && undatedEntries.length === 0 && unresolvedEntries.length === 0;
   const openDetail = (entry: BookmarkEntry) => {
     if (entry.row) setDetail({
       bookmark: entry.bookmark,
@@ -236,7 +236,7 @@ export default function BookmarksView({ bookmarks, hosts, hostIpMap, currentHost
       <ViewHeader icon={BookmarkBorderOutlinedIcon} title="분석 정보" titleId="analysis-info-title" meta={`${bookmarks.length.toLocaleString()}건 · 북마크 전체`} right={<><div style={{ display: "flex", gap: 4 }} role="group" aria-label="정렬 순서"><ControlButton active={sortDir === "asc"} onClick={() => setSortDir("asc")} ariaLabel="시간 오름차순 정렬">오래된순</ControlButton><ControlButton active={sortDir === "desc"} onClick={() => setSortDir("desc")} ariaLabel="시간 내림차순 정렬">최근순</ControlButton></div><div style={{ display: "flex", gap: 4 }} role="group" aria-label="분석 정보 표시 방식"><ControlButton active={viewMode === "timeline"} onClick={() => setViewMode("timeline")} ariaLabel="시간 원장 보기"><TimelineOutlinedIcon sx={{ fontSize: 15, verticalAlign: "-3px", marginRight: "4px" }} />시간 원장</ControlButton><ControlButton active={viewMode === "sequence"} onClick={() => setViewMode("sequence")} ariaLabel="호스트 흐름 보기"><AccountTreeOutlinedIcon sx={{ fontSize: 15, verticalAlign: "-3px", marginRight: "4px" }} />호스트 흐름</ControlButton></div></>} />
 
       {failedCount > 0 && <div role="alert" style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0, padding: "7px 14px", borderBottom: "1px solid color-mix(in srgb, var(--danger) 42%, var(--border))", background: "color-mix(in srgb, var(--danger) 7%, var(--bg-panel))", color: "var(--text)", fontSize: 12 }}>기록 {failedCount}건을 불러오지 못했습니다.<button type="button" onClick={retryFailedRows} style={{ display: "inline-flex", alignItems: "center", gap: 4, marginLeft: "auto", minHeight: 26, padding: "2px 8px", border: "1px solid var(--border)", borderRadius: "var(--radius)", background: "transparent", color: "var(--text-dim)", cursor: "pointer", fontSize: 11.5 }}><RefreshOutlinedIcon sx={{ fontSize: 14 }} />다시 시도</button></div>}
-      {emptyForRange ? <div role="status" style={{ display: "grid", placeItems: "center", flex: 1, minHeight: 0, color: "var(--text-faint)", fontSize: 12.5 }}>기간 필터 내 시간 정보가 있는 북마크가 없습니다.</div> : viewMode === "timeline" ? <TimelineLedger entries={timedEntries} undatedEntries={undatedEntries} unresolvedEntries={unresolvedEntries} currentHostId={currentHostId} onOpen={openDetail} onRemove={onRemove} /> : <HostFlowLedger entries={sequenceEntries} undatedEntries={undatedEntries} unresolvedEntries={unresolvedEntries} currentHostId={currentHostId} onOpen={openDetail} onRemove={onRemove} accountDirectoryForHost={accountDirectoryForHost} />}
+      {viewMode === "timeline" ? <TimelineLedger entries={timedEntries} undatedEntries={undatedEntries} unresolvedEntries={unresolvedEntries} currentHostId={currentHostId} onOpen={openDetail} onRemove={onRemove} /> : <HostFlowLedger entries={sequenceEntries} undatedEntries={undatedEntries} unresolvedEntries={unresolvedEntries} currentHostId={currentHostId} onOpen={openDetail} onRemove={onRemove} accountDirectoryForHost={accountDirectoryForHost} />}
       {detail && (
         // Coordinates of the bookmarked row, so the panel reads its evidence.
         <RecordScopeContext.Provider value={{ ...outerScope, fullPath: detail.bookmark.fullPath, tableName: detail.bookmark.tableName, openRecord: onOpenRecord ?? outerScope?.openRecord }}>
@@ -342,7 +342,6 @@ function HostFlowLedger({ entries, undatedEntries, unresolvedEntries, currentHos
   const pagedUnresolved = usePagedEntries(unresolvedEntries);
   const pageEntries = pagedFlow.rows;
   const participants = sequenceParticipants(pageEntries, currentHostId);
-  if (entries.length === 0 && undatedEntries.length === 0 && unresolvedEntries.length === 0) return <div role="status" style={{ display: "grid", placeItems: "center", flex: 1, minHeight: 0, color: "var(--text-faint)", fontSize: 12.5 }}>기간 필터 내 시간 정보가 있는 북마크가 없습니다.</div>;
   const timeGutter = 196;
   const laneWidth = 220;
   const canvasWidth = Math.max(680, participants.length * laneWidth);

@@ -87,6 +87,7 @@ fn sid_of(raw: &str) -> Option<&str> {
 pub(super) fn build_event_backed(
     ctx: &Ctx,
     events: &EventLogOverviewCache,
+    wer: Vec<crate::wer_evidence::WerRecord>,
 ) -> Result<Vec<(String, usize)>> {
     Ok(vec![
         ("ScheduledTasks".into(), super::scheduled_tasks::build(ctx, events)?),
@@ -99,7 +100,7 @@ pub(super) fn build_event_backed(
         ("BitsHistory".into(), super::bits_history::build(ctx, events)?),
         ("FirewallHistory".into(), super::firewall_history::build(ctx, events)?),
         ("PowerShellHistory".into(), powershell_history(ctx, events)?),
-        ("WerReports".into(), super::wer_reports::build(ctx, events)?),
+        ("WerReports".into(), super::wer_reports::build(ctx, wer)?),
         ("Defender".into(), super::defender::build(ctx, events)?),
         ("RdpCache".into(), rdp_cache(ctx)?),
     ])
@@ -110,7 +111,7 @@ pub(super) fn build_event_backed(
 fn powershell_history(ctx: &Ctx, events: &EventLogOverviewCache) -> Result<usize> {
     let spec = spec_of("PowerShellHistory");
     let mut db = DerivedDb::create(&ctx.overview_dir(), "PowerShellHistory")?;
-    for row in overview::build_powershell_history_with_events(ctx.out_dir, events) {
+    for row in overview::build_powershell_history_with_events(ctx.out_dir, events)? {
         let kind = g(&row, "kind");
         let account = g(&row, "account");
         let mut rec = ctx.record(spec);
@@ -208,7 +209,7 @@ fn rdp_cache(ctx: &Ctx) -> Result<usize> {
     let spec = spec_of("RdpCache");
     let mut db = DerivedDb::create(&ctx.overview_dir(), "RdpCache")?;
     let facts = ctx.out_dir.join("RDPCACHE").join("RdpBitmapCache.sqlite");
-    for row in overview::read_table_with_rowid(&facts, "RdpBitmapCache") {
+    for row in overview::read_table_with_rowid(&facts, "RdpBitmapCache")? {
         let kind = g(&row, "kind");
         let status = g(&row, "_status");
         // Fragments plus every failed row (docs-10); ok tiles/mosaics stay in facts.
@@ -251,9 +252,10 @@ pub(super) fn build_registry_backed(
     ctx: &Ctx,
     registry: &RegistryOverviewCache,
     events: &EventLogOverviewCache,
+    wer_starts: Vec<Row>,
 ) -> Result<Vec<(String, usize)>> {
     Ok(vec![
-        ("ExecutionHistory".into(), execution_history(ctx, registry, events)?),
+        ("ExecutionHistory".into(), execution_history(ctx, registry, events, wer_starts)?),
         ("RegistryFindings".into(), registry_findings(ctx, registry)?),
         ("TargetInfo".into(), target_info(ctx, registry, events)?),
         ("PathReferences".into(), path_references(ctx, registry)?),
@@ -263,10 +265,15 @@ pub(super) fn build_registry_backed(
 
 // --- ExecutionHistory -------------------------------------------------------
 
-fn execution_history(ctx: &Ctx, registry: &RegistryOverviewCache, events: &EventLogOverviewCache) -> Result<usize> {
+fn execution_history(
+    ctx: &Ctx,
+    registry: &RegistryOverviewCache,
+    events: &EventLogOverviewCache,
+    wer_starts: Vec<Row>,
+) -> Result<usize> {
     let spec = spec_of("ExecutionHistory");
     let mut db = DerivedDb::create(&ctx.overview_dir(), "ExecutionHistory")?;
-    for row in overview::build_execution_history_with_registry(ctx.out_dir, registry, events)? {
+    for row in overview::build_execution_history_with_registry(ctx.out_dir, registry, wer_starts)? {
         let evidence = g(&row, "source_artifact");
         let account = g(&row, "user");
         let program_path = g(&row, "program_path");
@@ -607,7 +614,7 @@ fn target_info(
     }
     // Materialized hosts facts provide real rowid provenance.
     let ancillary_db = ancillary::ancillary_path(ctx.out_dir);
-    for row in overview::read_table_with_rowid(&ancillary_db, ancillary::HOSTS_TABLE) {
+    for row in overview::read_table_with_rowid(&ancillary_db, ancillary::HOSTS_TABLE)? {
         let mut rec = ctx.record(spec);
         rec.set("event_type", text("HostsFile"));
         rec.set("category", text("HostsFile"));
@@ -636,7 +643,7 @@ fn target_info(
 fn path_references(ctx: &Ctx, registry: &RegistryOverviewCache) -> Result<usize> {
     let spec = spec_of("PathReferences");
     let mut db = DerivedDb::create(&ctx.overview_dir(), "PathReferences")?;
-    for row in overview::build_path_references(ctx.out_dir, registry) {
+    for row in overview::build_path_references(ctx.out_dir, registry)? {
         let kind = g(&row, "kind");
         let account = g(&row, "account");
         let target_path = g(&row, "target_path");

@@ -34,29 +34,21 @@ pub const DOWNLOADS_FIELD_ORDER: &[&str] = &[
     "_source_file",
 ];
 
-/// 수집 경로에서 계정명 추정. 수집기 배치(BROWSER/<계정>/…)를 우선하고,
-/// 원본 이미지 경로(Users\<계정>, Documents and Settings\<계정>)로 폴백,
-/// 마지막엔 부모 폴더명.
+/// 수집 경로에서 계정명. 브라우저 공용 규칙(BROWSER/<계정>, Users/<계정>/AppData)을
+/// 우선하고, XP 프로필(Documents and Settings\<계정>)을 보탠다. 근거가 없으면 "ie".
 pub fn ie_account(path: &Path) -> String {
+    let shared = crate::parsers::browser_cache::account_of(path);
+    if !shared.is_empty() {
+        return shared;
+    }
     let parts: Vec<String> = path
         .components()
         .map(|c| c.as_os_str().to_string_lossy().to_string())
         .collect();
-    for (i, part) in parts.iter().enumerate() {
-        if part.eq_ignore_ascii_case("BROWSER") && i + 1 < parts.len() {
-            return parts[i + 1].clone();
-        }
-    }
-    for (i, part) in parts.iter().enumerate() {
-        if (part.eq_ignore_ascii_case("Users") || part.eq_ignore_ascii_case("Documents and Settings"))
-            && i + 1 < parts.len()
-        {
-            return parts[i + 1].clone();
-        }
-    }
-    path.parent()
-        .and_then(|p| p.file_name())
-        .map(|n| n.to_string_lossy().to_string())
+    parts
+        .windows(2)
+        .find(|w| w[0].eq_ignore_ascii_case("Documents and Settings"))
+        .map(|w| w[1].clone())
         .unwrap_or_else(|| "ie".into())
 }
 
@@ -121,6 +113,8 @@ fn utf16_strings(blob: &[u8], min_chars: usize) -> Vec<String> {
 pub struct WebCacheCounts {
     pub history: usize,
     pub downloads: usize,
+    /// Records (or their Url value) libesedb could not read.
+    pub skipped_records: usize,
 }
 
 /// 스트리밍 이벤트 — 방문 기록 컨테이너를 전부 처리한 뒤에야 다운로드 행이
@@ -162,7 +156,12 @@ pub fn parse_webcache(
         _ => anyhow::bail!("Containers schema unexpected: {:?}", cols),
     };
     let mut targets: Vec<(i64, String, bool)> = Vec::new();
-    for rec in containers.iter_records()?.filter_map(|r| r.ok()) {
+    let mut skipped_records = 0usize;
+    for rec in containers.iter_records()? {
+        let Ok(rec) = rec else {
+            skipped_records += 1;
+            continue;
+        };
         let id = rec.value(id_i).ok().and_then(|v| v.to_i64());
         let name = rec
             .value(name_i)
@@ -181,6 +180,7 @@ pub fn parse_webcache(
     let mut counts = WebCacheCounts {
         history: 0,
         downloads: 0,
+        skipped_records,
     };
     // 방문 기록 컨테이너 → 다운로드 컨테이너 2단계 순회 — 이벤트 순서 보장의
     // 근거다 (WebCacheEvent 문서 참조).
@@ -215,13 +215,20 @@ pub fn parse_webcache(
             Some(i) => i,
             None => continue,
         };
-        for rec in table.iter_records()?.filter_map(|r| r.ok()) {
+        for rec in table.iter_records()? {
             if crate::pipeline::cancelled() {
                 break;
             }
+            let Ok(rec) = rec else {
+                counts.skipped_records += 1;
+                continue;
+            };
             let url = match rec.value(url_i) {
                 Ok(v) => value_text(&rec, url_i, &v),
-                Err(_) => String::new(),
+                Err(_) => {
+                    counts.skipped_records += 1;
+                    continue;
+                }
             };
             if url.is_empty() {
                 continue;
@@ -274,7 +281,10 @@ mod tests {
         let xp = PathBuf::from("/mnt/c/Documents and Settings/old/Local Settings/index.dat");
         assert_eq!(ie_account(&xp), "old");
         let bare = PathBuf::from("/tmp/WebCache/WebCacheV01.dat");
-        assert_eq!(ie_account(&bare), "WebCache");
+        assert_eq!(ie_account(&bare), "ie");
+        // The examiner's own home directory is not an evidence account.
+        let examiner = PathBuf::from("/Users/examiner/case/IE/WebCacheV01.dat");
+        assert_eq!(ie_account(&examiner), "ie");
     }
 
     #[test]

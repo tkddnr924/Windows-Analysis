@@ -56,19 +56,34 @@ fn kind_label(activity_type: i64) -> String {
     }
 }
 
-/// 경로에서 계정 이름 추출 — `.../TIMELINE/<계정>/ConnectedDevicesPlatform/...`
-/// 배치에서 ConnectedDevicesPlatform 바로 앞 구성 요소가 계정이다.
+/// 경로에서 계정 이름 추출 — 수집기 배치 `.../TIMELINE/<계정>/ConnectedDevicesPlatform/...`
+/// 또는 원본 구조 `.../<계정>/AppData/Local/ConnectedDevicesPlatform/...`. 근거가 없으면 빈 값.
 fn account_from_path(path: &Path) -> String {
     let parts: Vec<String> = path
         .components()
         .map(|c| c.as_os_str().to_string_lossy().to_string())
         .collect();
-    for (i, part) in parts.iter().enumerate() {
-        if part.eq_ignore_ascii_case("ConnectedDevicesPlatform") && i > 0 {
-            return parts[i - 1].clone();
-        }
+    let Some(i) = parts
+        .iter()
+        .position(|p| p.eq_ignore_ascii_case("ConnectedDevicesPlatform"))
+        .filter(|&i| i > 0)
+    else {
+        return String::new();
+    };
+    let prev = &parts[i - 1];
+    if !["Local", "LocalLow", "Roaming", "AppData"]
+        .iter()
+        .any(|c| prev.eq_ignore_ascii_case(c))
+    {
+        return prev.clone();
     }
-    String::new()
+    // Profile folder directly above AppData.
+    parts[..i]
+        .iter()
+        .rposition(|p| p.eq_ignore_ascii_case("AppData"))
+        .filter(|&j| j > 0)
+        .map(|j| parts[j - 1].clone())
+        .unwrap_or_default()
 }
 
 /// 16바이트 GUID 블롭 -> 표준 표기 (앞 3필드는 리틀엔디언).
@@ -171,8 +186,9 @@ fn read_activity_table(
     });
     let mapped = mapped.map_err(|e| anyhow::anyhow!("{table} 조회 실패: {e}"))?;
     let mut count = 0usize;
-    for item in mapped.flatten() {
-        let (id, app_id_raw, activity_type, payload_raw, last_modified, expiration, device, start, end) = item;
+    for item in mapped {
+        let (id, app_id_raw, activity_type, payload_raw, last_modified, expiration, device, start, end) =
+            item.map_err(|e| anyhow::anyhow!("{table} {count}행 이후 읽기 실패: {e}"))?;
         let payload_text = String::from_utf8_lossy(&payload_raw).into_owned();
         let payload_json: Value = serde_json::from_str(&payload_text).unwrap_or(Value::Null);
         let app_path = best_app_id(&app_id_raw);
@@ -455,5 +471,28 @@ mod tests {
         assert_eq!(row["start_time"], "");
         assert_eq!(row["timestamp"], row["last_modified"]);
         assert!(!row["timestamp"].is_empty());
+    }
+
+    #[test]
+    fn account_comes_from_profile_not_appdata_container() {
+        let p = |s: &str| account_from_path(Path::new(s));
+        assert_eq!(p("/c/Users/alice/AppData/Local/ConnectedDevicesPlatform/L.alice/ActivitiesCache.db"), "alice");
+        assert_eq!(p("/x/TIMELINE/bob/ConnectedDevicesPlatform/L.bob/ActivitiesCache.db"), "bob");
+        assert_eq!(p("/x/Local/ConnectedDevicesPlatform/ActivitiesCache.db"), "");
+    }
+
+    #[test]
+    fn row_step_error_is_reported_not_truncated_success() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE n (v INTEGER); INSERT INTO n VALUES (1), (2);
+             CREATE VIEW Activity AS SELECT x'00' AS Id, '' AS AppId,
+               CASE WHEN v = 2 THEN abs(-9223372036854775807 - 1) ELSE 5 END AS ActivityType,
+               x'' AS Payload, 1747900000 AS LastModifiedTime, 0 AS ExpirationTime,
+               '' AS PlatformDeviceId FROM n;",
+        )
+        .unwrap();
+        let result = read_activity_table(&conn, "Activity", "a", "Activity", "src", &mut |_| Ok(()));
+        assert!(result.is_err(), "step error must not be a truncated Ok: {result:?}");
     }
 }

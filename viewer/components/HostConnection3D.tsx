@@ -5,6 +5,7 @@
 // 물리 시뮬레이션 없이 같은 데이터는 항상 같은 자리에 놓인다.
 import { useEffect, useMemo, useRef, useState } from "react";
 import * as THREE from "three";
+import { ipv4Net, isPrivateIpv4 } from "@/lib/hostNetwork";
 
 // 등록 호스트와 같은 네트워크(/24) 대역은 푸른 계열, 외부는 밝은 회색 계열.
 const BLUE_TONES = ["#5f8fd8", "#6d84cf", "#4f9bc4", "#7490e2", "#54a3ab"];
@@ -34,15 +35,16 @@ export interface Graph3DEdge {
   peer: string;
   direction: "inbound" | "outbound" | "unknown";
   count: number;
-  fail: number;
   last: string;
-  /** 원본 이벤트 행 — peerKind(local/loopback) 판별용. */
-  rows?: { peerKind?: string }[];
+  /** 원본 이벤트 행 — peerKind(local/loopback) 판별·원본 주소용. */
+  rows?: { peerKind?: string; peer?: string }[];
 }
 
 interface Props {
   nodes: Graph3DNode[];
   edges: Graph3DEdge[];
+  /** Edges of the current view mode; hover stats count only these. */
+  statEdges: Graph3DEdge[];
   /** 등록 호스트들이 속한 /24 대역 접두사 목록 ("a.b.c"). */
   hostNets: string[];
   /** 호스트별 /24 목록 — 외부 뷰에서 네트워크가 다른 호스트를 별개
@@ -62,25 +64,6 @@ interface Props {
 }
 
 const lowerKey = (v: string) => v.toLocaleLowerCase();
-
-/** RFC1918 사설 IP — 호스트 대역과 달라도 내부로 취급한다. */
-function isPrivateIp(label: string): boolean {
-  // 네 옥텟 모두 0~255인 유효 IPv4만 RFC1918로 분류한다 — 접두사 정규식만
-  // 쓰면 10.999.1.1 같은 손상·비정상 주소가 내부 클러스터로 이동해 외부
-  // 통신 판단을 왜곡한다. 비정상 주소는 외부/미상으로 남긴다.
-  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(label.trim());
-  if (!m) return false;
-  const octets = [Number(m[1]), Number(m[2]), Number(m[3]), Number(m[4])];
-  if (octets.some((value) => value > 255)) return false;
-  return octets[0] === 10
-    || (octets[0] === 192 && octets[1] === 168)
-    || (octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31);
-}
-
-function networkGroupOf(label: string): string | null {
-  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.\d{1,3}$/.exec(label.trim());
-  return m ? `${m[1]}.${m[2]}.${m[3]}` : null;
-}
 
 function hashOf(text: string): number {
   return [...text].reduce((h, ch) => ((h * 31) + ch.charCodeAt(0)) >>> 0, 7);
@@ -174,9 +157,12 @@ function layout3d(nodes: Graph3DNode[], edges: Graph3DEdge[], hostNets: string[]
   });
   const peers = nodes.filter((n) => !n.registered && !loopbackKeys.has(n.key));
   const loopbackNodes = nodes.filter((n) => !n.registered && loopbackKeys.has(n.key));
+  // Classify by the raw peer address; labels may carry owner candidates.
+  const addressOf = new Map<string, string>();
+  edges.forEach((e) => { const peer = e.rows?.[0]?.peer; if (peer) addressOf.set(lowerKey(e.peer), peer); });
   const groups = new Map<string, { label: string; net: string; members: Graph3DNode[] }>();
   peers.forEach((n) => {
-    const net = networkGroupOf(n.label);
+    const net = ipv4Net(addressOf.get(n.key) ?? n.label);
     const gk = net ? `net:${net}` : `one:${n.key}`;
     const g = groups.get(gk) ?? { label: net ? `${net}.x` : n.label, net: net ? `${net}.x` : "", members: [] };
     g.members.push(n);
@@ -202,7 +188,7 @@ function layout3d(nodes: Graph3DNode[], edges: Graph3DEdge[], hostNets: string[]
   // 사설(RFC1918) 대역은 호스트 대역과 달라도 내부다 — 다만 망을 나눈
   // 의도를 존중해 호스트 지형과 병합하지는 않고 별도 내부 클러스터로 둔다.
   const isPrivateGroup = (g: { net: string; members: Graph3DNode[] }) =>
-    !isSameNet(g) && (g.net ? isPrivateIp(g.net.replace(/\.x$/, ".0")) : g.members.some((m) => isPrivateIp(m.label)));
+    !isSameNet(g) && (g.net ? isPrivateIpv4(g.net.replace(/\.x$/, ".0")) : g.members.some((m) => isPrivateIpv4(addressOf.get(m.key) ?? m.label)));
   const privateGroups = sortedGroups.filter(isPrivateGroup);
   const externalGroups = sortedGroups.filter((g) => !isSameNet(g) && !isPrivateGroup(g));
 
@@ -450,7 +436,7 @@ function layout3d(nodes: Graph3DNode[], edges: Graph3DEdge[], hostNets: string[]
   return { laid, links };
 }
 
-export default function HostConnection3D({ nodes, edges, hostNets, hostNetInfo, mode, width, height, selected, onNode, onClear }: Props) {
+export default function HostConnection3D({ nodes, edges, statEdges, hostNets, hostNetInfo, mode, width, height, selected, onNode, onClear }: Props) {
   const graphRef = useRef<{ cameraPosition: (pos: object, lookAt?: object, ms?: number) => void; zoomToFit: (ms?: number, px?: number) => void } | null>(null);
   const [hoverKey, setHoverKey] = useState<string | null>(null);
   // 타일을 클릭하면 호버 강조를 고정(핀)한다 — 배경 클릭이나 재클릭으로 해제.
@@ -469,18 +455,17 @@ export default function HostConnection3D({ nodes, edges, hostNets, hostNetInfo, 
 
   const { laid, links } = useMemo(() => layout3d(nodes, edges, hostNets, hostNetInfo, mode), [nodes, edges, hostNets, hostNetInfo, mode]);
   const statsByKey = useMemo(() => {
-    const map = new Map<string, { count: number; fail: number; last: string }>();
-    edges.forEach((e) => {
+    const map = new Map<string, { count: number; last: string }>();
+    statEdges.forEach((e) => {
       for (const k of [lowerKey(e.host), lowerKey(e.peer)]) {
-        const entry = map.get(k) ?? { count: 0, fail: 0, last: "" };
+        const entry = map.get(k) ?? { count: 0, last: "" };
         entry.count += e.count;
-        entry.fail += e.fail;
         if (e.last && e.last > entry.last) entry.last = e.last;
         map.set(k, entry);
       }
     });
     return map;
-  }, [edges]);
+  }, [statEdges]);
   // 뷰 모드가 바뀌면 이전 뷰의 핀·호버 강조를 지운다.
   useEffect(() => {
     setPinnedKey(null);
@@ -527,7 +512,11 @@ export default function HostConnection3D({ nodes, edges, hostNets, hostNetInfo, 
   // 시작 카메라: 위에서 내려보는 정돈된 등각 시점 + 전체 화면 맞춤.
   // 회전은 지평선 아래로 뒤집히지 않게 제한하고, 강한 앰비언트 광으로
   // 앱의 파스텔 플랫 톤을 유지한다 (번들거리는 3D 광택 제거).
-  const model = useMemo(() => `${laid.length}|${links.length}`, [laid.length, links.length]);
+  // Reset the camera only on mount and mode switch, not on every filter change.
+  const laidRef = useRef(laid);
+  useEffect(() => {
+    laidRef.current = laid;
+  }, [laid]);
   useEffect(() => {
     if (!ForceGraph3D) return;
     let tries = 0;
@@ -546,7 +535,7 @@ export default function HostConnection3D({ nodes, edges, hostNets, hostNetInfo, 
       window.clearInterval(timer);
       // 낮게 눕힌 시점(고도 ~28°, 야 ~25°). zoomToFit은 낮은 각도에서
       // 오동작하므로 노드 분포에서 거리를 직접 계산해 고정한다.
-      const maxExtent = laid.reduce((acc, n) => Math.max(acc, Math.hypot(n.fx, n.fz) + Math.abs(n.fy)), 1);
+      const maxExtent = laidRef.current.reduce((acc, n) => Math.max(acc, Math.hypot(n.fx, n.fz) + Math.abs(n.fy)), 1);
       const distance = Math.max(480, maxExtent * 2.2);
       const direction = { x: 300, y: 380, z: 640 };
       const length = Math.hypot(direction.x, direction.y, direction.z);
@@ -570,7 +559,7 @@ export default function HostConnection3D({ nodes, edges, hostNets, hostNetInfo, 
 
     }, 60);
     return () => window.clearInterval(timer);
-  }, [ForceGraph3D, model]);
+  }, [ForceGraph3D, mode]);
 
   const nodeObject = (raw: object) => {
     const node = raw as LaidNode;
@@ -702,7 +691,6 @@ export default function HostConnection3D({ nodes, edges, hostNets, hostNetInfo, 
           {hoverTileInfo.stats && (
             <div style={{ marginTop: 3 }}>
               이벤트 {hoverTileInfo.stats.count.toLocaleString()}건
-              {hoverTileInfo.stats.fail > 0 && <span style={{ color: "var(--danger)" }}> · 실패 {hoverTileInfo.stats.fail.toLocaleString()}</span>}
             </div>
           )}
         </div>

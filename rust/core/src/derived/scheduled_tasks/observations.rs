@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use anyhow::Result;
 use rusqlite::{params, Connection, OpenFlags};
 
+use crate::derived::eventlog_inputs::LogInputs;
 use crate::derived::{Ctx, DerivedDb};
 use crate::overview::EventLogOverviewCache;
 
@@ -93,89 +94,45 @@ pub(super) fn populate(ctx: &Ctx, db: &DerivedDb, events: &EventLogOverviewCache
         }
     }
 
-    let inputs = ctx.out_dir.join("EVENTLOG/EventLogInputs.sqlite");
-    let mut discovered = false;
+    let inputs = LogInputs::read(ctx, relevant)?;
     let mut seen: Vec<String> = Vec::new();
-    if inputs.exists() {
-        let conn = Connection::open_with_flags(&inputs, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        discovered = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM EventLogInputs WHERE status='discovery_complete')",
-            [],
-            |row| row.get(0),
+    for input in &inputs.logs {
+        let table = input.log_name.as_str();
+        seen.push(table.to_ascii_lowercase());
+        let source = inputs.source(ctx, input)?;
+        let stats = bounds.remove(table).unwrap_or_default();
+        let parsed = input.parsed();
+        let facts_generation = ctx.facts.by_stem(table)
+            .map(|facts| ctx.facts.generation(facts)).transpose()?;
+        db.conn().execute(
+            "INSERT INTO TaskLogObservations(observation_id,host_id,dataset_id,observation_kind,log_name,source_file,
+             facts_db,facts_table,collection_state,input_row_count,event_count,task_event_count,corrupted_count,
+             untimed_count,first_observed_time,last_observed_time,error,source_dataset_id,source_db,source_table,source_rowid,facts_generation)
+             VALUES(?1,?2,?3,'event_log',?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
+            params![
+                uuid::Uuid::new_v4().to_string(),
+                ctx.host_id,
+                ctx.dataset_id,
+                table,
+                input.source_file,
+                input.facts_db,
+                input.facts_table,
+                input.collection_state(),
+                input.input_rows,
+                parsed.then_some(stats.count),
+                parsed.then_some(stats.task_count),
+                parsed.then_some(stats.corrupt),
+                parsed.then_some(stats.untimed),
+                stats.first,
+                stats.last,
+                input.error,
+                source.dataset,
+                source.db,
+                source.table,
+                source.rowid,
+                facts_generation,
+            ],
         )?;
-        let mut query = conn.prepare(
-            "SELECT rowid,source_file,facts_db,facts_table,status,row_count,error FROM EventLogInputs
-             WHERE status<>'discovery_complete' ORDER BY rowid",
-        )?;
-        let mut rows = query.query([])?;
-        while let Some(row) = rows.next()? {
-            let file: Option<String> = row.get(1)?;
-            let table: String = row
-                .get::<_, Option<String>>(3)?
-                .filter(|value| !value.is_empty())
-                .unwrap_or_else(|| {
-                    file.as_deref()
-                        .unwrap_or("")
-                        .rsplit(['/', '\\'])
-                        .next()
-                        .unwrap_or("")
-                        .rsplit_once('.')
-                        .map(|(stem, _)| stem)
-                        .unwrap_or("")
-                        .to_string()
-                });
-            if !relevant(&table) {
-                continue;
-            }
-            seen.push(table.to_ascii_lowercase());
-            let status: String = row.get(4)?;
-            let count = row
-                .get::<_, Option<String>>(5)?
-                .and_then(|value| value.parse::<i64>().ok());
-            let state = match (status.as_str(), count) {
-                ("read_failed", _) => "read_failed",
-                ("parsed", Some(0)) => "collected_empty",
-                ("parsed", Some(_)) => "collected",
-                _ => "unknown",
-            };
-            let source = ctx
-                .facts
-                .source_from_row(&inputs, "EventLogInputs", row.get(0)?, file.as_deref(), Some("collection_observation"))?
-                .ok_or_else(|| anyhow::anyhow!("EventLogInputs 출처를 확인하지 못했습니다"))?;
-            let stats = bounds.remove(&table).unwrap_or_default();
-            let parsed = status == "parsed";
-            let facts_generation = ctx.facts.by_stem(&table)
-                .map(|facts| ctx.facts.generation(facts)).transpose()?;
-            db.conn().execute(
-                "INSERT INTO TaskLogObservations(observation_id,host_id,dataset_id,observation_kind,log_name,source_file,
-                 facts_db,facts_table,collection_state,input_row_count,event_count,task_event_count,corrupted_count,
-                 untimed_count,first_observed_time,last_observed_time,error,source_dataset_id,source_db,source_table,source_rowid,facts_generation)
-                 VALUES(?1,?2,?3,'event_log',?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
-                params![
-                    uuid::Uuid::new_v4().to_string(),
-                    ctx.host_id,
-                    ctx.dataset_id,
-                    table,
-                    file,
-                    row.get::<_, Option<String>>(2)?.filter(|value| !value.is_empty()),
-                    row.get::<_, Option<String>>(3)?.filter(|value| !value.is_empty()),
-                    state,
-                    count,
-                    parsed.then_some(stats.count),
-                    parsed.then_some(stats.task_count),
-                    parsed.then_some(stats.corrupt),
-                    parsed.then_some(stats.untimed),
-                    stats.first,
-                    stats.last,
-                    row.get::<_, Option<String>>(6)?,
-                    source.dataset,
-                    source.db,
-                    source.table,
-                    source.rowid,
-                    facts_generation,
-                ],
-            )?;
-        }
     }
 
     // Logs that produced rows without an input manifest entry.
@@ -220,7 +177,7 @@ pub(super) fn populate(ctx: &Ctx, db: &DerivedDb, events: &EventLogOverviewCache
                 ctx.host_id,
                 ctx.dataset_id,
                 log,
-                if discovered { "not_collected" } else { "unknown" },
+                inputs.absent_state(),
             ],
         )?;
     }

@@ -14,7 +14,6 @@ use serde::Serialize;
 
 use crate::hex::hex_lower;
 use crate::sqlite::{Row, StreamWriter};
-use crate::time::fmt_kst;
 
 pub const REG_TABLE: &str = "Registry";
 pub const REG_FILENAMES: &[&str] = &["SYSTEM", "SOFTWARE", "SAM", "SECURITY", "DEFAULT"];
@@ -688,6 +687,35 @@ pub fn parse_hive_stream(primary: &Path, out: &Path) -> Result<usize> {
     Ok(parse_hive_stream_with_metrics(primary, &logs, out)?.row_count)
 }
 
+/// Shared Registry/Amcache contract: build with the given transaction logs;
+/// if that fails, keep the reason and retry once with the primary hive only.
+/// Returns the parser and the log-apply error (None if no logs or applied).
+pub(crate) fn build_parser_with_log_fallback(
+    primary: &Path,
+    logs: &[PathBuf],
+    recover_deleted: bool,
+) -> Result<(notatin::parser::Parser, Option<String>)> {
+    let make_builder = |with_logs: bool| {
+        // notatin stores the path, so a borrowed &Path fails the 'static bound.
+        #[allow(clippy::unnecessary_to_owned)]
+        let mut builder = ParserBuilder::from_path(primary.to_path_buf());
+        if with_logs {
+            for log in logs {
+                builder.with_transaction_log(log.clone());
+            }
+        }
+        if recover_deleted {
+            builder.recover_deleted(true);
+        }
+        builder
+    };
+    match make_builder(!logs.is_empty()).build() {
+        Ok(parser) => Ok((parser, None)),
+        Err(error) if !logs.is_empty() => Ok((make_builder(false).build()?, Some(error.to_string()))),
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// `logs`: 파이프라인이 계획 단계에서 고정한 이 하이브의 트랜잭션 로그 목록.
 /// 파싱 시점에 다시 발견하지 않으므로, 목록화 이후 수집 디렉터리가 변해도
 /// 계획·실제 입력·보고서가 같은 스냅샷을 쓴다 (Amcache와 동일 계약).
@@ -700,35 +728,22 @@ pub fn parse_hive_stream_with_metrics(
     let recovery_plan = registry_recovery_plan();
     let recovery_logs_discovered = logs.len();
     let logs_to_apply: Vec<PathBuf> = transaction_logs_to_apply(logs, recovery_plan).to_vec();
-    let make_builder = |with_logs: bool| {
-        // notatin stores the path, so a borrowed &Path fails the 'static bound.
-        #[allow(clippy::unnecessary_to_owned)]
-        let mut builder = ParserBuilder::from_path(primary.to_path_buf());
-        if with_logs {
-            for log in &logs_to_apply {
-                builder.with_transaction_log(log.clone());
-            }
-        }
-        if recovery_plan.recover_deleted_cells {
-            builder.recover_deleted(true);
-        }
-        builder
-    };
     // 로그 포함 빌드가 실패해도(손상·적용 불가 .LOG1/.LOG2) 유효한 기본
     // 하이브까지 통째로 버리지 않는다 — 정책은 "로그 문제를 기록하고 하이브
     // 파싱은 계속". 실패 사유를 메트릭에 남기고 로그 없이 한 번 재시도한다.
     let mut recovery_log_count = logs_to_apply.len();
     let mut recovery_log_apply_error: Option<String> = None;
-    let mut build_parser = || match make_builder(!logs_to_apply.is_empty()).build() {
-        Ok(parser) => Ok(parser),
-        Err(error) => {
-            if logs_to_apply.is_empty() {
-                return Err(error);
-            }
-            recovery_log_apply_error = Some(error.to_string());
+    let mut build_parser = || -> Result<notatin::parser::Parser> {
+        let (parser, log_error) = build_parser_with_log_fallback(
+            primary,
+            &logs_to_apply,
+            recovery_plan.recover_deleted_cells,
+        )?;
+        if log_error.is_some() {
             recovery_log_count = 0;
-            make_builder(false).build()
         }
+        recovery_log_apply_error = log_error;
+        Ok(parser)
     };
     let (parser, recovery_permit_wait_ms, build_recovery_ms) =
         if recovery_plan.recover_deleted_cells {
@@ -757,7 +772,8 @@ pub fn parse_hive_stream_with_metrics(
         if crate::pipeline::cancelled() {
             break;
         }
-        let last_write = fmt_kst(key.last_key_written_date_and_time());
+        // Raw ticks: notatin's DateTime wraps an unset FILETIME to 2185.
+        let last_write = crate::time::fmt_filetime(key.detail.last_key_written_date_and_time() as i64);
         let path = key.path.clone();
         // Buffer one key to attach its final readable-value count to every row.
         let mut value_rows: Vec<Row> = Vec::new();
@@ -1163,7 +1179,6 @@ mod tests {
         root: usize,
         soft: usize,
         empty: usize,
-        odd: usize,
         truncated: usize,
     }
 
@@ -1375,7 +1390,6 @@ mod tests {
             root: HIVE_BIN_DATA_OFFSET + root as usize,
             soft: HIVE_BIN_DATA_OFFSET + soft as usize,
             empty: HIVE_BIN_DATA_OFFSET + empty as usize,
-            odd: HIVE_BIN_DATA_OFFSET + odd as usize,
             truncated: HIVE_BIN_DATA_OFFSET + truncated as usize,
         };
         (builder.finish(), offsets)
@@ -1393,8 +1407,25 @@ mod tests {
 
     // Parse real bytes; expose unexpected SQL NULLs explicitly.
     fn parse_fixture(label: &str) -> (Vec<String>, Vec<BTreeMap<String, String>>, FixtureKeys) {
-        let dir = registry_temp_dir(label);
         let (bytes, offsets) = fixture_hive();
+        let (columns, rows) = parse_fixture_bytes(label, bytes);
+        (columns, rows, offsets)
+    }
+
+    #[test]
+    fn unset_key_last_write_stays_empty() {
+        let (mut bytes, offsets) = fixture_hive();
+        // nk timestamp sits after the 4-byte cell size, "nk" and flags.
+        let at = offsets.empty + 8;
+        assert_eq!(&bytes[offsets.empty + 4..offsets.empty + 6], b"nk");
+        bytes[at..at + 8].copy_from_slice(&0u64.to_le_bytes());
+        let (_, rows) = parse_fixture_bytes("zero-ft", bytes);
+        assert_eq!(key_row(&rows, "\\ROOT\\Soft\\Empty")["last_write"], "");
+        assert!(!value_row(&rows, "\\ROOT\\Soft", "Str")["last_write"].is_empty());
+    }
+
+    fn parse_fixture_bytes(label: &str, bytes: Vec<u8>) -> (Vec<String>, Vec<BTreeMap<String, String>>) {
+        let dir = registry_temp_dir(label);
         let hive = dir.join("SYSTEM");
         std::fs::write(&hive, bytes).unwrap();
         let out = dir.join("SYSTEM.sqlite");
@@ -1430,7 +1461,7 @@ mod tests {
             .map(|r| r.unwrap())
             .collect();
         assert_eq!(metrics.row_count, rows.len());
-        (columns, rows, offsets)
+        (columns, rows)
     }
 
     // Raw names distinguish the default value from literal "(default)".

@@ -249,7 +249,8 @@ export function describeFilters(filters: ListFilters): string[] {
   const out: string[] = [];
   const time = timeSummary(filters);
   if (time) out.push(time);
-  if (filters.kind !== DEFAULT_LIST_FILTERS.kind) out.push(filters.kind === "dir" ? "폴더만" : "파일·폴더");
+  // Shown even at its default: the file-only kind still narrows the list.
+  if (filters.kind !== "all") out.push(filters.kind === "dir" ? "폴더만" : "파일만");
   if (filters.inUse !== "all") out.push(filters.inUse === "1" ? "사용 중 레코드" : "비사용 레코드");
   if (filters.pathPrefix.trim()) out.push(`폴더: ${filters.pathPrefix.trim()}`);
   const noise = noiseExcluded(filters);
@@ -267,9 +268,14 @@ export function describeFilters(filters: ListFilters): string[] {
   return out;
 }
 
-/** Conditions that narrow the result (sort excluded). */
-export function activeFilterCount(filters: ListFilters): number {
-  return describeFilters(filters).length;
+/** The one reset: clear conditions, keep sort and period fields. */
+export function resetFilters(filters: ListFilters): ListFilters {
+  return { ...DEFAULT_LIST_FILTERS, sortKey: filters.sortKey, sortDesc: filters.sortDesc, timeKeys: filters.timeKeys };
+}
+
+/** Conditions differ from the defaults (reset has something to do). */
+export function filtersNarrowed(filters: ListFilters): boolean {
+  return describeFilters(filters).join("\n") !== describeFilters(DEFAULT_LIST_FILTERS).join("\n");
 }
 
 /** IPC options for mft_records_page. Invalid time input sends no bounds (the

@@ -34,7 +34,7 @@ export default function SelectionDecoder({ containerRef }: { containerRef: RefOb
   const popupRef = useRef<HTMLDivElement>(null);
   const [selection, setSelection] = useState<{ text: string; top: number; bottom: number; left: number } | null>(null);
   const [decoded, setDecoded] = useState<{ label: string; result: DecodeResult } | null>(null);
-  const [copied, setCopied] = useState(false);
+  const [copied, setCopied] = useState<"ok" | "failed" | null>(null);
   const [top, setTop] = useState(0);
 
   useEffect(() => {
@@ -43,11 +43,15 @@ export default function SelectionDecoder({ containerRef }: { containerRef: RefOb
     const capture = () => {
       const current = window.getSelection();
       const text = current?.toString() ?? "";
-      if (!current || !text.trim() || !current.rangeCount || !container.contains(current.anchorNode)) return;
+      if (!current || !text.trim() || !current.rangeCount) {
+        setSelection(null);
+        return;
+      }
+      if (!container.contains(current.anchorNode)) return;
       const rect = current.getRangeAt(0).getBoundingClientRect();
       setSelection({ text, top: rect.top, bottom: rect.bottom, left: Math.max(MARGIN, Math.min(rect.left, window.innerWidth - WIDTH - MARGIN)) });
       setDecoded(null);
-      setCopied(false);
+      setCopied(null);
     };
     const close = () => setSelection(null);
     container.addEventListener("mouseup", capture);
@@ -76,9 +80,9 @@ export default function SelectionDecoder({ containerRef }: { containerRef: RefOb
   async function copy(text: string) {
     try {
       await navigator.clipboard.writeText(text);
-      setCopied(true);
+      setCopied("ok");
     } catch {
-      setCopied(false);
+      setCopied("failed");
     }
   }
 
@@ -88,7 +92,7 @@ export default function SelectionDecoder({ containerRef }: { containerRef: RefOb
         <span style={{ fontSize: 11.5, color: "var(--text-faint)", marginRight: 4 }}>선택 {selection.text.length.toLocaleString()}자 디코딩</span>
         {DECODERS.map((decoder) => {
           const active = decoded?.label === decoder.label;
-          return <button key={decoder.id} type="button" className="nm-btn" onClick={() => { setDecoded({ label: decoder.label, result: decoder.run(selection.text) }); setCopied(false); }} aria-pressed={active} style={{ ...buttonStyle, color: active ? "var(--accent)" : buttonStyle.color, borderColor: active ? "var(--accent)" : "var(--border)" }}>{decoder.label}</button>;
+          return <button key={decoder.id} type="button" className="nm-btn" onClick={() => { setDecoded({ label: decoder.label, result: decoder.run(selection.text) }); setCopied(null); }} aria-pressed={active} style={{ ...buttonStyle, color: active ? "var(--accent)" : buttonStyle.color, borderColor: active ? "var(--accent)" : "var(--border)" }}>{decoder.label}</button>;
         })}
         <button type="button" className="nm-btn" onClick={() => setSelection(null)} aria-label="디코딩 창 닫기" style={{ ...buttonStyle, marginLeft: "auto", padding: "1px 7px" }}>×</button>
       </div>
@@ -96,7 +100,8 @@ export default function SelectionDecoder({ containerRef }: { containerRef: RefOb
         <>
           <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11.5, color: "var(--text-faint)", flexShrink: 0 }}>
             <span>{decoded.label} 디코딩 · {decoded.result.encoding}</span>
-            <button type="button" className="nm-btn" onClick={() => decoded.result.ok && copy(decoded.result.text)} aria-label="디코딩 결과 복사" title={copied ? "복사됨" : "복사"} style={{ ...buttonStyle, minHeight: 22, width: 26, padding: 0, marginLeft: "auto" }}>{copied ? <CheckIcon sx={{ fontSize: 14, color: "var(--success)" }} /> : <ContentCopyOutlinedIcon sx={{ fontSize: 13 }} />}</button>
+            {copied === "failed" && <span role="status" style={{ marginLeft: "auto", color: "var(--warning)" }}>복사 실패</span>}
+            <button type="button" className="nm-btn" onClick={() => decoded.result.ok && copy(decoded.result.text)} aria-label="디코딩 결과 복사" title={copied === "ok" ? "복사됨" : "복사"} style={{ ...buttonStyle, minHeight: 22, width: 26, padding: 0, marginLeft: copied === "failed" ? 0 : "auto" }}>{copied === "ok" ? <CheckIcon sx={{ fontSize: 14, color: "var(--success)" }} /> : <ContentCopyOutlinedIcon sx={{ fontSize: 13 }} />}</button>
           </div>
           <pre style={{ margin: 0, minHeight: 0, maxHeight: 260, overflow: "auto", padding: 8, background: "var(--bg-input)", border: "1px solid var(--border-subtle)", borderRadius: "var(--radius)", fontFamily: "var(--mono)", fontSize: 12, lineHeight: 1.5, whiteSpace: "pre-wrap", wordBreak: "break-word", color: "var(--text)" }}>{decoded.result.text}</pre>
         </>

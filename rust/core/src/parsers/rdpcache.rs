@@ -16,7 +16,6 @@ use crate::hex::hex_lower;
 use crate::sqlite::Row;
 
 pub const RDP_TABLE: &str = "RdpBitmapCache";
-pub const CONTENT_MARKER: &str = "RDP8bmp";
 const MAGIC: &[u8] = b"RDP8bmp\x00";
 pub const RDP_FIELD_ORDER: &[&str] = &[
     "kind",
@@ -358,6 +357,22 @@ fn blit(canvas: &mut [u8], stride: usize, cx: usize, cy: usize, t: &Tile) {
         canvas[dst..dst + w3].copy_from_slice(&t.rgb[y * w3..(y + 1) * w3]);
     }
 }
+
+/// Pixel offsets of `n` grid slots, each as wide as its largest tile
+/// (`TILE` when empty); the last entry is the total extent.
+fn grid_offsets(n: usize, sizes: impl Iterator<Item = (usize, usize)>) -> Vec<usize> {
+    let mut extent = vec![0usize; n];
+    for (slot, size) in sizes {
+        extent[slot] = extent[slot].max(size);
+    }
+    let mut offsets = Vec::with_capacity(n + 1);
+    offsets.push(0);
+    for size in extent {
+        offsets.push(offsets[offsets.len() - 1] + if size == 0 { TILE } else { size });
+    }
+    offsets
+}
+
 fn bg_canvas(w: usize, h: usize) -> Vec<u8> {
     let mut c = vec![0u8; w * h * 3];
     for i in 0..w * h {
@@ -372,10 +387,12 @@ fn mosaic_row(src: &str, full: &str, tiles: &[Tile]) -> Option<Row> {
     }
     let cols = MOSAIC_COLS.min(tiles.len());
     let rows_n = tiles.len().div_ceil(cols);
-    let (mw, mh) = (cols * TILE, rows_n * TILE);
+    let xs = grid_offsets(cols, tiles.iter().enumerate().map(|(i, t)| (i % cols, t.w)));
+    let ys = grid_offsets(rows_n, tiles.iter().enumerate().map(|(i, t)| (i / cols, t.h)));
+    let (mw, mh) = (xs[cols], ys[rows_n]);
     let mut canvas = bg_canvas(mw, mh);
     for (i, t) in tiles.iter().enumerate() {
-        blit(&mut canvas, mw * 3, (i % cols) * TILE, (i / cols) * TILE, t);
+        blit(&mut canvas, mw * 3, xs[i % cols], ys[i / cols], t);
     }
     let mut r = Row::new();
     r.insert("kind".into(), "mosaic".into());
@@ -521,17 +538,16 @@ fn fragment_image(
     if cols > 200 || rows > 200 {
         return (0, 0, 0, 0, Vec::new());
     } // cap at ~12800x12800 px to prevent OOM
-    let (w, h) = (cols * TILE, rows * TILE);
+    // Stitched neighbours share an edge length, so sizing each grid column
+    // and row by its own tiles leaves no gap between 64x56 and 64x64 tiles.
+    let slot = |m: &usize| ((pos[m].0 - minx) as usize, (pos[m].1 - miny) as usize);
+    let xs = grid_offsets(cols, members.iter().map(|m| (slot(m).0, byid[m].w)));
+    let ys = grid_offsets(rows, members.iter().map(|m| (slot(m).1, byid[m].h)));
+    let (w, h) = (xs[cols], ys[rows]);
     let mut canvas = bg_canvas(w, h);
     for m in members {
-        let (px, py) = pos[m];
-        blit(
-            &mut canvas,
-            w * 3,
-            (px - minx) as usize * TILE,
-            (py - miny) as usize * TILE,
-            byid[m],
-        );
+        let (x, y) = slot(m);
+        blit(&mut canvas, w * 3, xs[x], ys[y], byid[m]);
     }
     (cols, rows, w, h, canvas)
 }
@@ -821,5 +837,41 @@ mod bmc_tests {
             .iter()
             .all(|r| r.get("account").map(String::as_str) == Some("victim")));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Tile whose rows are distinct colours, so edges are never uniform.
+    fn striped(i: usize, w: usize, h: usize, seed: u8) -> Tile {
+        let mut rgb = Vec::with_capacity(w * h * 3);
+        for y in 0..h {
+            for x in 0..w {
+                rgb.extend([seed.wrapping_add(y as u8), x as u8, 7]);
+            }
+        }
+        Tile { i, w, h, key: String::new(), rgb }
+    }
+
+    #[test]
+    fn short_tiles_are_laid_out_without_background_bands() {
+        // A 64x56 tile whose bottom row continues into the 64x64 tile below.
+        let top = striped(0, 64, 56, 0);
+        let mut below = striped(1, 64, 64, 100);
+        let bottom_row = top.rgb[55 * 64 * 3..].to_vec();
+        below.rgb[..64 * 3].copy_from_slice(&bottom_row);
+        let tiles = vec![top, below];
+        let byid: HashMap<usize, &Tile> = tiles.iter().map(|t| (t.i, t)).collect();
+        let (comps, pos) = stitch(&tiles);
+        assert_eq!(comps[0].len(), 2);
+        let (_, _, w, h, canvas) = fragment_image(&comps[0], &pos, &byid);
+        assert_eq!((w, h), (64, 120));
+        // Row 56 is the first row of the lower tile, not background.
+        assert_eq!(&canvas[56 * 64 * 3..56 * 64 * 3 + 3], &bottom_row[..3]);
+    }
+
+    #[test]
+    fn tiles_larger_than_the_grid_unit_do_not_panic() {
+        let tiles = vec![striped(0, 128, 128, 0), striped(1, 64, 64, 50)];
+        let row = mosaic_row("Cache0000.bin", "/x/Cache0000.bin", &tiles).unwrap();
+        assert_eq!(row.get("width").map(String::as_str), Some("192"));
+        assert_eq!(row.get("height").map(String::as_str), Some("128"));
     }
 }

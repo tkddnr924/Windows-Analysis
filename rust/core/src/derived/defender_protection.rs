@@ -42,7 +42,8 @@ fn parse(time: &str) -> Option<chrono::NaiveDateTime> {
 }
 
 /// Seconds between two stored timestamps; unparsable values stay unknown.
-fn gap(from: &str, to: &str) -> Cell {
+/// The one stored-time difference rule for every Defender table.
+pub(super) fn gap(from: &str, to: &str) -> Cell {
     match (parse(from), parse(to)) {
         (Some(from), Some(to)) => Cell::Int(to.signed_duration_since(from).num_seconds()),
         _ => Cell::Null,

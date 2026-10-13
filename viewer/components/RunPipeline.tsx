@@ -109,21 +109,21 @@ function formatDuration(secs: number): string {
 
 function StatusPill({ status }: { status: string | null }) {
   if (status === "running")
-    return <span style={statusPillStyle("var(--accent)", "var(--accent-subtle)")}><CircularProgress size={11} thickness={5} />실행 중</span>;
+    return <span style={statusPillStyle("var(--accent)")}><CircularProgress size={11} thickness={5} />실행 중</span>;
   if (status === "queued")
-    return <span style={statusPillStyle("var(--text-dim)", "var(--bg-elevated)")}><TimerOutlinedIcon sx={{ fontSize: 13 }} />대기 중</span>;
+    return <span style={statusPillStyle("var(--text-dim)")}><TimerOutlinedIcon sx={{ fontSize: 13 }} />대기 중</span>;
   if (status === "ok" || status === "complete")
-    return <span style={statusPillStyle("var(--success)", "var(--success-subtle)")}><TaskAltIcon sx={{ fontSize: 13 }} />완료</span>;
+    return <span style={statusPillStyle("var(--success)")}><TaskAltIcon sx={{ fontSize: 13 }} />완료</span>;
   if (status === "error")
-    return <span style={statusPillStyle("var(--danger)", "var(--danger-subtle)")}><ErrorOutlineIcon sx={{ fontSize: 13 }} />오류</span>;
+    return <span style={statusPillStyle("var(--danger)")}><ErrorOutlineIcon sx={{ fontSize: 13 }} />오류</span>;
   if (status === "partial")
-    return <span style={statusPillStyle("var(--warning)", "var(--warning-subtle)")}><ErrorOutlineIcon sx={{ fontSize: 13 }} />부분 완료</span>;
+    return <span style={statusPillStyle("var(--warning)")}><ErrorOutlineIcon sx={{ fontSize: 13 }} />부분 완료</span>;
   if (status === "cancelled")
-    return <span style={statusPillStyle("var(--text-dim)", "var(--bg-elevated)")}><CancelOutlinedIcon sx={{ fontSize: 13 }} />취소됨</span>;
-  return <span style={statusPillStyle("var(--text-faint)", "var(--bg-elevated)")}><TimerOutlinedIcon sx={{ fontSize: 13 }} />미실행</span>;
+    return <span style={statusPillStyle("var(--text-dim)")}><CancelOutlinedIcon sx={{ fontSize: 13 }} />취소됨</span>;
+  return <span style={statusPillStyle("var(--text-faint)")}><TimerOutlinedIcon sx={{ fontSize: 13 }} />미실행</span>;
 }
 
-function statusPillStyle(color: string, _background: string): React.CSSProperties {
+function statusPillStyle(color: string): React.CSSProperties {
   // 라벨은 아웃라인 스타일 — 채움 배경 대신 색 테두리 + 투명 배경.
   return { display: "inline-flex", alignItems: "center", justifyContent: "center", gap: 4, fontSize: 11, fontWeight: 600, color, background: "transparent", border: `1px solid color-mix(in srgb, ${color} 55%, transparent)`, padding: "2px 8px", borderRadius: "var(--radius)", textAlign: "center" };
 }
@@ -193,17 +193,24 @@ function RunLogDetail({ host, report }: { host: Host; report: ParseReport }) {
   const [openError, setOpenError] = useState<string | null>(null);
   const [opening, setOpening] = useState(false);
   const runId = report.runId;
+  // Latest requested run id; stale responses for an older run are dropped.
+  const runIdRef = useRef(runId);
+  runIdRef.current = runId;
 
   async function load() {
     if (!runId) return;
+    const requested = runId;
     setLoaded(false);
     setError(null);
+    setText(null);
     try {
-      const preview = await window.api.parseRunLog(host.dir, runId);
+      const preview = await window.api.parseRunLog(host.dir, requested);
+      if (runIdRef.current !== requested) return;
       setText(preview.text);
       setTruncated(preview.truncated);
       setLoaded(true);
     } catch (cause) {
+      if (runIdRef.current !== requested) return;
       setError(errorMessage(cause, "실행 로그를 불러오지 못했습니다."));
     }
   }
@@ -528,13 +535,14 @@ export default function RunPipeline({ activeCase, onChanged, onOpenHost, run }: 
   }
 
   function handleCancel() {
-    // This is the sole whole-queue cancellation path.  It derives from the
-    // hoisted run state, so returning to this screen cannot lose the control.
-    if (hasActiveRuns) void window.api.cancelPipeline(undefined, true);
+    // Whole-queue stop goes through the hook so each run is marked cancelled.
+    for (const entry of runs) {
+      if (entry.status === "queued" || entry.status === "running") void handleCancelRun(entry.runId);
+    }
   }
 
-  function handleCancelRun(runId: string) {
-    void run.cancel(runId);
+  async function handleCancelRun(runId: string) {
+    setActionError((await run.cancel(runId)) ? null : "파싱을 취소하지 못했습니다.");
   }
 
   function openRename(host: Host) {

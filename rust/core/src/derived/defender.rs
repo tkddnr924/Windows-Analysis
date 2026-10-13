@@ -5,12 +5,12 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::Result;
-use rusqlite::{Connection, OpenFlags};
 use serde_json::{Map, Value};
 
 use super::defender_protection as protection;
 use super::defender_protection::Observation;
 use super::defender_support as support;
+use super::eventlog_inputs::LogInputs;
 use super::schema::{ChildSpec, DbSpec};
 use super::{Cell, Ctx, DerivedDb, Record, SourceRef};
 use crate::overview::EventLogOverviewCache;
@@ -304,6 +304,16 @@ fn int_text(raw: &str) -> Cell {
     }
 }
 
+/// Payload instant as KST (`parse_log_time` rule) plus the written value in
+/// `<column>_raw`. FILETIME zero (1601-01-01 UTC) is "never", not a time.
+fn set_payload_time(record: &mut Record, column: &str, raw: &str) {
+    let parsed = support::parse_log_time(raw)
+        .map(|parsed| parsed.display)
+        .filter(|display| display != "1601-01-01 09:00:00.000");
+    record.set(column, opt_value(parsed.as_deref()));
+    record.set(&format!("{column}_raw"), value(raw));
+}
+
 fn g<'a>(row: &'a Row, key: &str) -> &'a str {
     row.get(key).map(String::as_str).unwrap_or("")
 }
@@ -485,6 +495,31 @@ fn protection_setting(target: &str) -> Option<String> {
         .map(|_| last.to_string())
 }
 
+/// Disable* values that switch a tracked feature; DWORD 1 disables it and 0
+/// enables it. Other values, a removal or another setting stay unknown/none.
+const SETTING_FEATURES: &[(&str, &str)] = &[
+    ("DisableRealtimeMonitoring", protection::FEATURE_REALTIME),
+    ("DisableOnAccessProtection", protection::FEATURE_ON_ACCESS),
+    ("DisableIOAVProtection", protection::FEATURE_IOAV),
+    ("DisableBehaviorMonitoring", protection::FEATURE_BEHAVIOR),
+];
+
+fn setting_state(target: &str, new: &ConfigValue) -> Option<(&'static str, &'static str)> {
+    let last = target.rsplit('\\').next()?;
+    let feature = SETTING_FEATURES.iter().find(|(name, _)| name.eq_ignore_ascii_case(last))?.1;
+    let raw = new.value.trim();
+    let number = match raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) {
+        Some(hex) => u64::from_str_radix(hex, 16).ok(),
+        None => raw.parse::<u64>().ok(),
+    };
+    let state = match (new.state, number) {
+        ("value", Some(1)) => protection::STATE_OFF,
+        ("value", Some(0)) => protection::STATE_ON,
+        _ => protection::STATE_UNKNOWN,
+    };
+    Some((feature, state))
+}
+
 fn is_zero(code: &str) -> bool {
     let trimmed = code.trim();
     let digits = trimmed
@@ -645,6 +680,9 @@ struct Stored {
     event_record_id: Option<i64>,
     timestamp: Option<String>,
     detection_id: String,
+    /// Detection instant as stored (KST): the payload `Detection Time` of an
+    /// EVTX event, the line time of an MPDetection record.
+    detection_time: Option<String>,
     threat_name: String,
     action: String,
     action_performer: String,
@@ -855,12 +893,13 @@ fn event_record(
         "action_time",
         if section == "threat_action" { value(timestamp) } else { Cell::Null },
     );
-    record.set("action_status", value(&payload.first(&["Action Status"])));
     record.set("additional_actions", value(&payload.first(&["Additional Actions String"])));
     record.set("additional_actions_id", int_text(&payload.first(&["Additional Actions ID"])));
     let remediation_user = payload.first(&["Remediation User"]);
     record.set("remediation_user", value(&remediation_user));
-    record.set("status_raw", value(&payload.first(&["Status"])));
+    // 1116/1117 template field; Pre Execution/Post Clean Status stay in the
+    // field child. No template has `Status` or `Action Status`.
+    record.set("status_raw", value(&payload.first(&["Status Code"])));
     let error_code = payload.first(&["Error Code"]);
     let error_description = payload.first(&["Error Description"]);
     record.set("error_code", value(&error_code));
@@ -1012,15 +1051,15 @@ fn event_record(
     record.set("as_signature_version", value(&payload.get("AS security intelligence version")));
     record.set("av_signature_age_raw", value(&payload.get("Last AV security intelligence age")));
     record.set("as_signature_age_raw", value(&payload.get("Last AS security intelligence age")));
-    record.set("av_signature_created", value(&payload.get("AV security intelligence creation time")));
-    record.set("as_signature_created", value(&payload.get("AS security intelligence creation time")));
+    set_payload_time(&mut record, "av_signature_created", &payload.get("AV security intelligence creation time"));
+    set_payload_time(&mut record, "as_signature_created", &payload.get("AS security intelligence creation time"));
     record.set("last_quick_scan_age_raw", value(&payload.get("Last quick scan age")));
-    record.set("last_quick_scan_start", value(&payload.get("Last quick scan start time")));
-    record.set("last_quick_scan_end", value(&payload.get("Last quick scan end time")));
+    set_payload_time(&mut record, "last_quick_scan_start", &payload.get("Last quick scan start time"));
+    set_payload_time(&mut record, "last_quick_scan_end", &payload.get("Last quick scan end time"));
     record.set("last_quick_scan_source", value(&payload.get("Last quick scan source")));
     record.set("last_full_scan_age_raw", value(&payload.get("Last full scan age")));
-    record.set("last_full_scan_start", value(&payload.get("Last full scan start time")));
-    record.set("last_full_scan_end", value(&payload.get("Last full scan end time")));
+    set_payload_time(&mut record, "last_full_scan_start", &payload.get("Last full scan start time"));
+    set_payload_time(&mut record, "last_full_scan_end", &payload.get("Last full scan end time"));
     record.set("last_full_scan_source", value(&payload.get("Last full scan source")));
     record.set("latest_engine_version", value(&payload.get("Latest engine version")));
     record.set("latest_platform_version", value(&payload.get("Latest platform version")));
@@ -1063,7 +1102,7 @@ fn event_record(
         }
     }
     record.set("config_protection_setting", opt_value(protection_setting(&target).as_deref()));
-    record.set("history_cleared_time", value(&payload.first(&["Timestamp", "Time"])));
+    set_payload_time(&mut record, "history_cleared_time", &payload.first(&["Timestamp", "Time"]));
 
     // Account roles: the payload user, the detection subject, the performer
     // and the event's security context stay separate.
@@ -1244,21 +1283,24 @@ fn event_record(
             order: observations.len(),
         });
     }
-    if let Some((feature, state, basis)) = match event_type.as_str() {
-        "realtime_protection_enabled" => Some((protection::FEATURE_REALTIME, protection::STATE_ON, protection::BASIS_STATE_EVENT)),
-        "realtime_protection_disabled" => Some((protection::FEATURE_REALTIME, protection::STATE_OFF, protection::BASIS_STATE_EVENT)),
-        "realtime_protection_config_changed" => Some((protection::FEATURE_REALTIME, protection::STATE_UNKNOWN, protection::BASIS_CONFIG_CHANGE)),
-        "malware_scanning_enabled" => Some((protection::FEATURE_MALWARE_SCANNING, protection::STATE_ON, protection::BASIS_STATE_EVENT)),
-        "malware_scanning_disabled" => Some((protection::FEATURE_MALWARE_SCANNING, protection::STATE_OFF, protection::BASIS_STATE_EVENT)),
-        "virus_scanning_enabled" => Some((protection::FEATURE_VIRUS_SCANNING, protection::STATE_ON, protection::BASIS_STATE_EVENT)),
-        "virus_scanning_disabled" => Some((protection::FEATURE_VIRUS_SCANNING, protection::STATE_OFF, protection::BASIS_STATE_EVENT)),
+    if let Some((feature, state, basis, state_raw)) = match event_type.as_str() {
+        "realtime_protection_enabled" => Some((protection::FEATURE_REALTIME, protection::STATE_ON, protection::BASIS_STATE_EVENT, None)),
+        "realtime_protection_disabled" => Some((protection::FEATURE_REALTIME, protection::STATE_OFF, protection::BASIS_STATE_EVENT, None)),
+        "realtime_protection_config_changed" => Some((protection::FEATURE_REALTIME, protection::STATE_UNKNOWN, protection::BASIS_CONFIG_CHANGE, None)),
+        "malware_scanning_enabled" => Some((protection::FEATURE_MALWARE_SCANNING, protection::STATE_ON, protection::BASIS_STATE_EVENT, None)),
+        "malware_scanning_disabled" => Some((protection::FEATURE_MALWARE_SCANNING, protection::STATE_OFF, protection::BASIS_STATE_EVENT, None)),
+        "virus_scanning_enabled" => Some((protection::FEATURE_VIRUS_SCANNING, protection::STATE_ON, protection::BASIS_STATE_EVENT, None)),
+        "virus_scanning_disabled" => Some((protection::FEATURE_VIRUS_SCANNING, protection::STATE_OFF, protection::BASIS_STATE_EVENT, None)),
+        "configuration_changed" => setting_state(&target, &new_config).map(|(feature, state)| {
+            (feature, state, protection::BASIS_CONFIG_CHANGE, (!new_config.value.is_empty()).then(|| new_config.value.clone()))
+        }),
         _ => None,
     } {
         observations.push(Observation {
             record_id: record_id.clone(),
             feature,
             state,
-            state_raw: None,
+            state_raw,
             basis,
             timestamp: (!timestamp.is_empty()).then(|| timestamp.to_string()),
             timestamp_kind: (!timestamp.is_empty()).then_some(TIME_KIND_EVENT),
@@ -1276,6 +1318,7 @@ fn event_record(
         event_record_id: g(row, "EventRecordID").trim().parse::<i64>().ok(),
         timestamp: (!timestamp.is_empty()).then(|| timestamp.to_string()),
         detection_id,
+        detection_time: detection_time.map(|parsed| parsed.display),
         threat_name,
         action,
         action_performer: remediation_user,
@@ -1366,7 +1409,7 @@ fn mpdetection_rows(ctx: &Ctx, db: &mut DerivedDb, stored: &mut Vec<Stored>) -> 
                 other => other,
             }),
         );
-        record.set("timestamp_raw", opt_value(detection.timestamp_raw.as_deref()));
+        record.set("timestamp_raw", value(&detection.timestamp_raw));
         // The zone the stored instant came from, never an assumed shift.
         record.set("timestamp_zone_source", opt_value(detection.source_timezone.as_deref()));
         record.set("timestamp_parse_state", value(&detection.timestamp_state));
@@ -1437,6 +1480,7 @@ fn mpdetection_rows(ctx: &Ctx, db: &mut DerivedDb, stored: &mut Vec<Stored>) -> 
             event_record_id: None,
             timestamp: detection.timestamp.clone(),
             detection_id: String::new(),
+            detection_time: detection.timestamp.clone(),
             threat_name: detection.threat_name.clone().unwrap_or_default(),
             action: String::new(),
             action_performer: String::new(),
@@ -1569,13 +1613,21 @@ fn pick<'a>(members: &[&'a Stored], event_type: &str) -> Option<&'a Stored> {
         .min_by(|a, b| order_key(a).cmp(&order_key(b)))
 }
 
+/// Scan lifecycle kinds; offline-scan configuration (2030/2031) is no scan.
+const SCAN_LIFECYCLE: &[&str] =
+    &["scan_started", "scan_completed", "scan_cancelled", "scan_paused", "scan_resumed", "scan_error"];
+
+/// The first non-empty value of one scan fact across the ordered members.
+fn first_fact<'a>(facts: &[&'a ScanFacts], field: impl Fn(&'a ScanFacts) -> &'a str) -> Option<&'a str> {
+    facts.iter().map(|facts| field(facts)).find(|found| !found.is_empty())
+}
 
 fn scans(ctx: &Ctx, db: &mut DerivedDb, stored: &[Stored]) -> Result<()> {
     let mut keys: Vec<String> = Vec::new();
     let mut groups: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     for (index, row) in stored.iter().enumerate() {
         let Some(scan) = &row.scan else { continue };
-        if row.section != "scan" {
+        if !SCAN_LIFECYCLE.contains(&row.event_type.as_str()) {
             continue;
         }
         let key = if scan.scan_id.is_empty() { row.record_id.clone() } else { scan.scan_id.clone() };
@@ -1592,12 +1644,21 @@ fn scans(ctx: &Ctx, db: &mut DerivedDb, stored: &[Stored]) -> Result<()> {
         let error = pick(&members, "scan_error");
         let pauses = members.iter().filter(|row| row.event_type == "scan_paused").count() as i64;
         let resumes = members.iter().filter(|row| row.event_type == "scan_resumed").count() as i64;
-        let facts = start
-            .or(completion)
-            .or(cancel)
-            .or(error)
-            .and_then(|row| row.scan.as_ref());
-        let scan_id = facts.map(|facts| facts.scan_id.clone()).unwrap_or_default();
+        // Lifecycle facts first, then the other members in log order; the
+        // Scan ID is the group key and survives a rotated-out start.
+        let mut ordered: Vec<&Stored> = [start, completion, cancel, error].into_iter().flatten().collect();
+        let mut rest: Vec<&Stored> = members
+            .iter()
+            .copied()
+            .filter(|row| !ordered.iter().any(|picked| std::ptr::eq(*picked, *row)))
+            .collect();
+        rest.sort_by_key(|row| order_key(row));
+        ordered.extend(rest);
+        let facts: Vec<&ScanFacts> = ordered.iter().filter_map(|row| row.scan.as_ref()).collect();
+        let scan_id = first_fact(&facts, |facts| facts.scan_id.as_str()).unwrap_or("");
+        let scan_type = first_fact(&facts, |facts| facts.scan_type.as_str());
+        let scan_parameters = first_fact(&facts, |facts| facts.scan_parameters.as_str());
+        let user = facts.iter().find(|facts| !facts.user_raw.is_empty() || !facts.user_sid.is_empty());
         // Only an observed pair states a pairing; a missing partner is not a stop.
         let pairing = match (start.is_some(), completion.is_some(), cancel.is_some(), error.is_some()) {
             (true, true, _, _) => "start_and_completion",
@@ -1610,7 +1671,7 @@ fn scans(ctx: &Ctx, db: &mut DerivedDb, stored: &[Stored]) -> Result<()> {
             _ => "unknown",
         };
         let elapsed = match (start.and_then(|row| row.timestamp.as_deref()), completion.and_then(|row| row.timestamp.as_deref())) {
-            (Some(from), Some(to)) => elapsed_seconds(from, to),
+            (Some(from), Some(to)) => protection::gap(from, to),
             _ => Cell::Null,
         };
         let duration = completion.and_then(|row| row.scan.as_ref());
@@ -1620,10 +1681,10 @@ fn scans(ctx: &Ctx, db: &mut DerivedDb, stored: &[Stored]) -> Result<()> {
                 value(&uuid::Uuid::new_v4().to_string()),
                 value(ctx.host_id),
                 value(ctx.dataset_id),
-                value(&scan_id),
+                value(scan_id),
                 value(if scan_id.is_empty() { "absent" } else { "present" }),
-                opt_value(facts.map(|facts| facts.scan_type.as_str())),
-                opt_value(facts.map(|facts| facts.scan_parameters.as_str())),
+                opt_value(scan_type),
+                opt_value(scan_parameters),
                 value(if start.is_some() {
                     "start_event"
                 } else if completion.is_some() {
@@ -1651,24 +1712,12 @@ fn scans(ctx: &Ctx, db: &mut DerivedDb, stored: &[Stored]) -> Result<()> {
                 value(pairing),
                 value("observed_scan_id_events"),
                 Cell::Int(members.len() as i64),
-                opt_value(facts.map(|facts| facts.user_sid.as_str())),
-                opt_value(facts.map(|facts| facts.user_raw.as_str())),
+                opt_value(user.map(|facts| facts.user_sid.as_str())),
+                opt_value(user.map(|facts| facts.user_raw.as_str())),
             ],
         )?;
     }
     Ok(())
-}
-
-fn elapsed_seconds(from: &str, to: &str) -> Cell {
-    let parse = |time: &str| {
-        chrono::NaiveDateTime::parse_from_str(time, "%Y-%m-%d %H:%M:%S%.f")
-            .or_else(|_| chrono::NaiveDateTime::parse_from_str(time, "%Y-%m-%d %H:%M:%S"))
-            .ok()
-    };
-    match (parse(from), parse(to)) {
-        (Some(from), Some(to)) => Cell::Int(to.signed_duration_since(from).num_seconds()),
-        _ => Cell::Null,
-    }
 }
 
 // --- summaries and candidates ----------------------------------------------
@@ -1711,19 +1760,21 @@ fn summaries(ctx: &Ctx, db: &mut DerivedDb, stored: &[Stored]) -> Result<()> {
     Ok(())
 }
 
-/// Equal threat name and time across the two sources is a candidate only;
-/// duplicates stay as two records (A06).
+/// Equal threat name and detection instant across the two sources is a
+/// candidate only; duplicates stay as two records (A06). The EVTX record time
+/// is when the event was written, not when the threat was detected.
 fn candidates(ctx: &Ctx, db: &mut DerivedDb, stored: &[Stored]) -> Result<()> {
     let events: Vec<&Stored> = stored
         .iter()
         .filter(|row| row.event_type != "mpdetection_detection" && row.section == "threat")
         .collect();
     for row in stored.iter().filter(|row| row.event_type == "mpdetection_detection") {
-        if row.threat_name.is_empty() || row.timestamp.is_none() {
+        let Some(detected) = row.detection_time.as_deref() else { continue };
+        if row.threat_name.is_empty() {
             continue;
         }
         for event in &events {
-            if event.threat_name != row.threat_name || event.timestamp != row.timestamp {
+            if event.threat_name != row.threat_name || event.detection_time.as_deref() != Some(detected) {
                 continue;
             }
             db.insert_child(
@@ -1735,9 +1786,9 @@ fn candidates(ctx: &Ctx, db: &mut DerivedDb, stored: &[Stored]) -> Result<()> {
                     value(&event.record_id),
                     value(&row.record_id),
                     value("candidate"),
-                    value("same_threat_name_and_timestamp"),
+                    value("same_threat_name_and_detection_time"),
                     value(&row.threat_name),
-                    opt_value(row.timestamp.as_deref()),
+                    value(detected),
                 ],
             )?;
         }
@@ -1753,51 +1804,18 @@ fn input_observations(
     mut stats: BTreeMap<String, LogStats>,
     files: &[MpFile],
 ) -> Result<()> {
-    let manifest = ctx.out_dir.join("EVENTLOG/EventLogInputs.sqlite");
+    let inputs = LogInputs::read(ctx, |name| name.to_lowercase().contains("defender"))?;
     let mut seen: Vec<String> = Vec::new();
-    let mut discovered = false;
-    if manifest.exists() {
-        let conn = Connection::open_with_flags(&manifest, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        discovered = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM EventLogInputs WHERE status='discovery_complete')",
-            [],
-            |row| row.get(0),
+    for input in &inputs.logs {
+        let name = input.log_name.as_str();
+        let source = inputs.source(ctx, input)?;
+        let found = stats.remove(name).unwrap_or_default();
+        seen.push(name.to_lowercase());
+        eventlog_observation(
+            ctx, db, name, input.source_file.as_deref().unwrap_or(""), input.facts_db.as_deref().unwrap_or(""),
+            input.facts_table.as_deref().unwrap_or(""), input.collection_state(), input.input_rows, &found,
+            input.error.as_deref(), Some(&source),
         )?;
-        let mut query = conn.prepare(
-            "SELECT rowid,source_file,facts_db,facts_table,status,row_count,error FROM EventLogInputs \
-             WHERE status<>'discovery_complete' ORDER BY rowid",
-        )?;
-        let mut rows = query.query([])?;
-        while let Some(row) = rows.next()? {
-            let file: Option<String> = row.get(1)?;
-            let table: String = row.get::<_, Option<String>>(3)?.unwrap_or_default();
-            let name = if table.is_empty() {
-                file.as_deref().unwrap_or("").rsplit(['/', '\\']).next().unwrap_or("").to_string()
-            } else {
-                table.clone()
-            };
-            if !name.to_lowercase().contains("defender") {
-                continue;
-            }
-            let status: String = row.get(4)?;
-            let count = row.get::<_, Option<String>>(5)?.and_then(|value| value.parse::<i64>().ok());
-            let state = match (status.as_str(), count) {
-                ("read_failed", _) => "read_failed",
-                ("parsed", Some(0)) => "collected_empty",
-                ("parsed", Some(_)) => "collected",
-                _ => "unknown",
-            };
-            let source = ctx
-                .facts
-                .source_from_row(&manifest, "EventLogInputs", row.get(0)?, file.as_deref(), Some("collection_observation"))?
-                .ok_or_else(|| anyhow::anyhow!("EventLogInputs 출처가 없습니다"))?;
-            let found = stats.remove(table.as_str()).unwrap_or_default();
-            seen.push(name.to_lowercase());
-            eventlog_observation(
-                ctx, db, &table, file.as_deref().unwrap_or(""), row.get::<_, Option<String>>(2)?.unwrap_or_default().as_str(),
-                &table, state, count, &found, row.get::<_, Option<String>>(6)?.as_deref(), Some(&source),
-            )?;
-        }
     }
     let remaining: Vec<(String, LogStats)> = stats.into_iter().collect();
     for (table, found) in remaining {
@@ -1833,7 +1851,7 @@ fn input_observations(
             Cell::Null,
             opt_value(facts.map(|facts| facts.relative.as_str())),
             opt_value(facts.map(|_| *log)),
-            value(if discovered && facts.is_none() { "not_collected" } else { "unknown" }),
+            value(if facts.is_none() { inputs.absent_state() } else { "unknown" }),
         ];
         values.extend(std::iter::repeat(Cell::Null).take(INPUT_OBSERVATIONS.len() - values.len()));
         db.insert_child("DefenderInputObservations", &values)?;
@@ -2000,7 +2018,6 @@ CREATE TABLE "Defender" (
   "action" TEXT,
   "action_id" INTEGER,
   "action_time" TEXT,
-  "action_status" TEXT,
   "additional_actions" TEXT,
   "additional_actions_id" INTEGER,
   "remediation_user" TEXT,
@@ -2072,14 +2089,20 @@ CREATE TABLE "Defender" (
   "av_signature_age_raw" TEXT,
   "as_signature_age_raw" TEXT,
   "av_signature_created" TEXT,
+  "av_signature_created_raw" TEXT,
   "as_signature_created" TEXT,
+  "as_signature_created_raw" TEXT,
   "last_quick_scan_age_raw" TEXT,
   "last_quick_scan_start" TEXT,
+  "last_quick_scan_start_raw" TEXT,
   "last_quick_scan_end" TEXT,
+  "last_quick_scan_end_raw" TEXT,
   "last_quick_scan_source" TEXT,
   "last_full_scan_age_raw" TEXT,
   "last_full_scan_start" TEXT,
+  "last_full_scan_start_raw" TEXT,
   "last_full_scan_end" TEXT,
+  "last_full_scan_end_raw" TEXT,
   "last_full_scan_source" TEXT,
   "latest_engine_version" TEXT,
   "latest_platform_version" TEXT,
@@ -2105,6 +2128,7 @@ CREATE TABLE "Defender" (
   "config_exclusion_value" TEXT,
   "config_protection_setting" TEXT,
   "history_cleared_time" TEXT,
+  "history_cleared_time_raw" TEXT,
   "account_role" TEXT,
   "account_name_source" TEXT,
   "event_user_raw" TEXT,
@@ -2402,7 +2426,7 @@ CREATE TABLE "source_records" (
 CREATE INDEX idx_source_lookup ON source_records(source_db, source_table, source_rowid, source_field);
 
 CREATE TABLE _wina_derived_version (name TEXT NOT NULL PRIMARY KEY, version INTEGER NOT NULL);
-INSERT INTO _wina_derived_version(name,version) VALUES ('overview_contract',1),('defender',3);
+INSERT INTO _wina_derived_version(name,version) VALUES ('overview_contract',1),('defender',5);
 "#;
 
 const MAIN: &[&str] = &[
@@ -2444,7 +2468,6 @@ const MAIN: &[&str] = &[
     "action",
     "action_id",
     "action_time",
-    "action_status",
     "additional_actions",
     "additional_actions_id",
     "remediation_user",
@@ -2516,14 +2539,20 @@ const MAIN: &[&str] = &[
     "av_signature_age_raw",
     "as_signature_age_raw",
     "av_signature_created",
+    "av_signature_created_raw",
     "as_signature_created",
+    "as_signature_created_raw",
     "last_quick_scan_age_raw",
     "last_quick_scan_start",
+    "last_quick_scan_start_raw",
     "last_quick_scan_end",
+    "last_quick_scan_end_raw",
     "last_quick_scan_source",
     "last_full_scan_age_raw",
     "last_full_scan_start",
+    "last_full_scan_start_raw",
     "last_full_scan_end",
+    "last_full_scan_end_raw",
     "last_full_scan_source",
     "latest_engine_version",
     "latest_platform_version",
@@ -2549,6 +2578,7 @@ const MAIN: &[&str] = &[
     "config_exclusion_value",
     "config_protection_setting",
     "history_cleared_time",
+    "history_cleared_time_raw",
     "account_role",
     "account_name_source",
     "event_user_raw",
@@ -2987,6 +3017,62 @@ mod tests {
         assert_eq!(one::<i64>(&db, "SELECT COUNT(*) FROM pragma_foreign_key_check"), 0);
     }
 
+    // RD-01: payload UTC instants are stored as KST like every other time;
+    // the written value stays in a _raw column and FILETIME zero is no time.
+    #[test]
+    fn payload_utc_times_are_stored_as_kst_with_raw_kept() {
+        let case = Case::new(2);
+        let db = case.build(vec![
+            event(
+                "1013",
+                1,
+                "2026-08-23 07:34:59.772",
+                r#"{"Timestamp":"2026-08-21T22:34:59Z"}"#,
+            ),
+            event(
+                "1151",
+                2,
+                "2026-08-23 00:45:13.838",
+                r#"{"AV security intelligence creation time":"2026-08-22T07:31:42Z","AS security intelligence creation time":"2026-08-22T07:31:42Z","Last quick scan start time":"2026-08-21T22:35:00Z","Last quick scan end time":"2026-08-21T22:36:46Z","Last full scan start time":"1601-01-01T00:00:00Z","Last full scan end time":"1601-01-01T00:00:00Z"}"#,
+            ),
+        ]);
+        let (cleared, cleared_raw): (String, String) = db
+            .query_row(
+                "SELECT history_cleared_time,history_cleared_time_raw FROM Defender WHERE event_id=1013",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(cleared, "2026-08-22 07:34:59.000");
+        assert_eq!(cleared_raw, "2026-08-21T22:34:59Z");
+        let health: (String, String, String, String, String) = db
+            .query_row(
+                "SELECT av_signature_created,as_signature_created,last_quick_scan_start,last_quick_scan_end,last_quick_scan_start_raw FROM Defender WHERE event_id=1151",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            health,
+            (
+                "2026-08-22 16:31:42.000".to_string(),
+                "2026-08-22 16:31:42.000".to_string(),
+                "2026-08-22 07:35:00.000".to_string(),
+                "2026-08-22 07:36:46.000".to_string(),
+                "2026-08-21T22:35:00Z".to_string(),
+            )
+        );
+        let (full_start, full_start_raw): (Option<String>, String) = db
+            .query_row(
+                "SELECT last_full_scan_start,last_full_scan_start_raw FROM Defender WHERE event_id=1151",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(full_start, None);
+        assert_eq!(full_start_raw, "1601-01-01T00:00:00Z");
+    }
+
     // R03/R04/R05: actions keep their own rows; identity never comes from
     // similar time/name/path.
     #[test]
@@ -3320,11 +3406,13 @@ mod tests {
         std::fs::write(support.join("MPDetection-20260403-000000.log"), headless).unwrap();
         case.prepare();
 
+        // RD-14: the EVTX record is written after the detection instant; the
+        // match uses the payload Detection Time, not the record time.
         let db = case.build(vec![event(
             "1116",
             1,
-            "2026-04-01 10:00:00.000",
-            r#"{"Threat Name":"Trojan:Win32/X","Path":"file:_C:\\tmp\\a.exe"}"#,
+            "2026-04-01 10:00:00.218",
+            r#"{"Threat Name":"Trojan:Win32/X","Path":"file:_C:\\tmp\\a.exe","Detection Time":"2026-04-01T01:00:00.000Z"}"#,
         )]);
 
         // One EVTX row plus the little-endian lines and the big-endian line.
@@ -3385,12 +3473,14 @@ mod tests {
             "undetermined_encoding"
         );
         assert_eq!(observation("%20260401%").2, Some(3));
-        // A06: equal threat and time is a candidate, never a merged detection.
-        let (basis, relation): (String, String) = db
-            .query_row("SELECT match_basis,relation FROM DefenderSourceCandidates", [], |r| Ok((r.get(0)?, r.get(1)?)))
+        // A06: equal threat and detection time is a candidate, never a merged
+        // detection.
+        let (basis, relation, time): (String, String, String) = db
+            .query_row("SELECT match_basis,relation,timestamp FROM DefenderSourceCandidates", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
             .unwrap();
         assert_eq!(relation, "candidate");
-        assert!(basis.contains("threat_name"));
+        assert_eq!(basis, "same_threat_name_and_detection_time");
+        assert_eq!(time, "2026-04-01 10:00:00.000");
         assert_eq!(one::<i64>(&db, "SELECT COUNT(*) FROM DefenderDetections"), 4);
         // MPDetection rows point at their own preserved facts rows.
         assert_eq!(
@@ -3757,5 +3847,147 @@ mod tests {
         assert_eq!(state(2).0, "other_guid");
         assert_eq!(state(2).1, Some(2));
         assert_eq!(state(3), ("absent".to_string(), None, None));
+    }
+
+    // RD-11: 1116/1117 write `Status Code`; there is no `Status` or
+    // `Action Status` template field, so no column claims one.
+    #[test]
+    fn threat_status_comes_from_the_manifest_status_code() {
+        let case = Case::new(1);
+        let db = case.build(vec![event(
+            "1117",
+            1,
+            "2026-09-08 01:49:54.328",
+            r#"{"Detection ID":"{D9}","Threat Name":"T","Status Code":"3","Status Description":"","Pre Execution Status":"3","Post Clean Status":"0","Action Name":"격리","Additional Actions String":"No additional actions required"}"#,
+        )]);
+        assert_eq!(one::<String>(&db, "SELECT status_raw FROM Defender WHERE event_id=1117"), "3");
+        assert_eq!(
+            one::<i64>(&db, "SELECT COUNT(*) FROM pragma_table_info('Defender') WHERE name='action_status'"),
+            0
+        );
+    }
+
+    // RD-12: a 5007 change of a Disable* protection value is a config-change
+    // observation; 0x1 is off, 0x0 is on, a removed value stays unknown.
+    #[test]
+    fn protection_setting_changes_become_config_observations() {
+        let case = Case::new(4);
+        let db = case.build(vec![
+            event(
+                "5007",
+                1,
+                "2026-09-01 00:00:00.000",
+                r#"{"Old Value":"HKLM\\SOFTWARE\\Microsoft\\Windows Defender\\Real-Time Protection\\DisableRealtimeMonitoring = 0x0","New Value":"HKLM\\SOFTWARE\\Microsoft\\Windows Defender\\Real-Time Protection\\DisableRealtimeMonitoring = 0x1"}"#,
+            ),
+            event(
+                "5007",
+                2,
+                "2026-09-01 00:01:00.000",
+                r#"{"Old Value":"","New Value":"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows Defender\\Real-Time Protection\\DisableBehaviorMonitoring = 0x0"}"#,
+            ),
+            event(
+                "5007",
+                3,
+                "2026-09-01 00:02:00.000",
+                r#"{"Old Value":"HKLM\\SOFTWARE\\Microsoft\\Windows Defender\\Real-Time Protection\\DisableIOAVProtection = 0x1","New Value":""}"#,
+            ),
+            event(
+                "5007",
+                4,
+                "2026-09-01 00:03:00.000",
+                r#"{"Old Value":"HKLM\\SOFTWARE\\Microsoft\\Windows Defender\\Features\\TamperProtection = 0x4","New Value":"HKLM\\SOFTWARE\\Microsoft\\Windows Defender\\Features\\TamperProtection = 0x5"}"#,
+            ),
+        ]);
+        let observed = |feature: &str| -> (String, Option<String>, String, i64) {
+            db.query_row(
+                "SELECT state,state_raw,state_basis,event_id FROM DefenderProtectionStates WHERE feature=?1",
+                [feature],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(observed("realtime_protection"), ("off".to_string(), Some("0x1".to_string()), "config_change".to_string(), 5007));
+        assert_eq!(observed("behavior_monitoring"), ("on".to_string(), Some("0x0".to_string()), "config_change".to_string(), 5007));
+        assert_eq!(observed("ioav"), ("unknown".to_string(), None, "config_change".to_string(), 5007));
+        // No published on/off meaning for this value: no observation.
+        assert_eq!(one::<i64>(&db, "SELECT COUNT(*) FROM DefenderProtectionStates"), 3);
+        assert_eq!(
+            one::<String>(&db, "SELECT state FROM DefenderProtectionLatest WHERE feature='realtime_protection'"),
+            "off"
+        );
+    }
+
+    // RD-13: the Scan ID group key survives rotation of the lifecycle events,
+    // and offline-scan configuration events are not scans.
+    #[test]
+    fn scan_id_survives_pause_only_groups_and_offline_config_is_no_scan() {
+        let case = Case::new(3);
+        let db = case.build(vec![
+            event(
+                "1003",
+                1,
+                "2026-08-05 10:01:00.000",
+                r#"{"Scan ID":"{S2}","Scan Type":"빠른 검사","Scan Parameters":"검사 매개변수","Domain":"NT AUTHORITY","User":"SYSTEM","SID":"S-1-5-18"}"#,
+            ),
+            event("1004", 2, "2026-08-05 10:02:00.000", r#"{"Scan ID":"{S2}"}"#),
+            event("2030", 3, "2026-08-05 11:00:00.000", "{}"),
+        ]);
+        assert_eq!(one::<i64>(&db, "SELECT COUNT(*) FROM DefenderScans"), 1);
+        let scan: (String, String, String, String, String, String, i64, i64) = db
+            .query_row(
+                "SELECT scan_id,scan_id_state,scan_type,scan_parameters,user_sid,pairing_state,pause_count,resume_count FROM DefenderScans",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            scan,
+            (
+                "{S2}".to_string(),
+                "present".to_string(),
+                "빠른 검사".to_string(),
+                "검사 매개변수".to_string(),
+                "S-1-5-18".to_string(),
+                "unknown".to_string(),
+                1,
+                1
+            )
+        );
+        assert_eq!(one::<String>(&db, "SELECT user_raw FROM DefenderScans"), "NT AUTHORITY\\SYSTEM");
+    }
+
+    // RD-15: a read_failed Defender log is named from its file stem and is
+    // not reported a second time as never collected.
+    #[test]
+    fn read_failed_log_keeps_its_name_and_is_not_also_uncollected() {
+        let case = Case::new(1);
+        std::fs::remove_file(case.root.join("EVENTLOG/Microsoft-Windows-Windows Defender%4Operational.sqlite")).unwrap();
+        let manifest = case.root.join("EVENTLOG/EventLogInputs.sqlite");
+        let conn = Connection::open(&manifest).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE EventLogInputs(source_file TEXT,facts_db TEXT,facts_table TEXT,status TEXT,row_count TEXT,error TEXT);
+             INSERT INTO EventLogInputs VALUES('','','','discovery_complete','1',NULL);
+             INSERT INTO EventLogInputs VALUES('C:\\evidence\\Microsoft-Windows-Windows Defender%4Operational.evtx',
+               '','','read_failed',NULL,'access denied');",
+        )
+        .unwrap();
+        drop(conn);
+        stamp_facts_generation(&manifest, "facts-old").unwrap();
+
+        let db = case.build(Vec::new());
+        let rows: Vec<(Option<String>, String)> = db
+            .prepare(
+                "SELECT log_name,collection_state FROM DefenderInputObservations \
+                 WHERE input_kind='eventlog' AND (log_name IS NULL OR log_name LIKE '%Operational') ORDER BY 1",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            rows,
+            vec![(Some("Microsoft-Windows-Windows Defender%4Operational".to_string()), "read_failed".to_string())]
+        );
     }
 }

@@ -246,14 +246,12 @@ pub struct RecycleBinInput {
     pub path: PathBuf,
     /// Failed inputs also retain one row.
     pub rows: usize,
-    pub status: String,
     pub error: Option<String>,
 }
 
 #[derive(Debug, Default, Clone)]
 pub struct RecycleBinReport {
     pub rows: usize,
-    pub ok_rows: usize,
     pub failed_rows: usize,
     pub inputs: Vec<RecycleBinInput>,
 }
@@ -484,16 +482,13 @@ pub fn parse_recyclebin(
                 break;
             }
             let rec = record_for(path, ctx);
-            if rec.status == STATUS_OK {
-                report.ok_rows += 1;
-            } else {
+            if rec.status != STATUS_OK {
                 report.failed_rows += 1;
             }
             report.rows += 1;
             report.inputs.push(RecycleBinInput {
                 path: path.clone(),
                 rows: 1,
-                status: rec.status.clone(),
                 error: rec.error.clone(),
             });
             insert(&mut stmt, &rec)?;
@@ -821,14 +816,12 @@ mod tests {
         let report =
             parse_recyclebin(&[ok.clone(), bad.clone(), unsupported.clone()], &out, &context)
                 .unwrap();
-        assert_eq!((report.rows, report.ok_rows, report.failed_rows), (3, 1, 2));
+        assert_eq!((report.rows, report.failed_rows), (3, 2));
         assert_eq!(report.inputs.len(), 3);
         assert_eq!(report.inputs[0].path, ok);
         assert_eq!(report.inputs[0].rows, 1);
-        assert_eq!(report.inputs[0].status, STATUS_OK);
         assert_eq!(report.inputs[0].error, None);
         assert_eq!(report.inputs[1].path, bad);
-        assert_eq!(report.inputs[1].status, STATUS_CORRUPTED);
         assert!(report.inputs[1].error.as_ref().unwrap().contains("24-byte header"));
         assert_eq!(report.inputs[2].path, unsupported);
         assert!(report.inputs[2].error.as_ref().unwrap().contains("unsupported"));
@@ -958,7 +951,6 @@ mod tests {
         let out = dir.join("RecycleBin_Records.sqlite");
         let report = parse_recyclebin(&[missing.clone()], &out, &ctx()).unwrap();
         assert_eq!((report.rows, report.failed_rows), (1, 1));
-        assert_eq!(report.inputs[0].status, STATUS_UNREADABLE);
         assert!(report.inputs[0].error.is_some());
         let conn = Connection::open(&out).unwrap();
         let (status, has_err): (String, bool) = conn

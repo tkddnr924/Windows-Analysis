@@ -159,7 +159,6 @@ function FileRow({
   selected,
   indent,
   leading,
-  count,
   prominent = false,
   onSelectFile,
 }: {
@@ -168,7 +167,6 @@ function FileRow({
   selected: boolean;
   indent: number;
   leading?: React.ReactNode;
-  count?: number;
   /** Host-analysis navigation uses the same tab scale as Dashboard/Timeline. */
   prominent?: boolean;
   onSelectFile: (file: ResultFileEntry) => void;
@@ -178,12 +176,13 @@ function FileRow({
   // 없는 항목(EmptyPinnedRow·EmptyCategoryRow)은 눌리지 않고 0건 테이블만
   // 눌리던 차이를 없앤다 (2026-09-03 사용자 확정 — 2026-09-01의 "열람은
   // 그대로 가능" 결정을 대체).
-  const empty = entry.rowCount === 0;
+  const failed = entry.readError !== undefined;
+  const empty = failed || entry.rowCount === 0;
   const active = selected && !empty;
   return (
     <div
       onClick={empty ? undefined : () => onSelectFile(entry)}
-      title={empty ? "데이터 없음 — 추출된 레코드가 없습니다" : `${entry.relativePath} · ${entry.tableName}`}
+      title={failed ? entry.readError : empty ? "데이터 없음 — 추출된 레코드가 없습니다" : `${entry.relativePath} · ${entry.tableName}`}
       style={{
         display: "flex",
         alignItems: "center",
@@ -214,7 +213,7 @@ function FileRow({
         {leading}
         <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>{label}</span>
       </span>
-      {empty && <span style={{ flexShrink: 0, color: "var(--text-faint)", opacity: 0.7, fontSize: 10.5, fontWeight: 500 }}>데이터 없음</span>}
+      {empty && <span style={{ flexShrink: 0, color: failed ? "var(--danger)" : "var(--text-faint)", opacity: 0.7, fontSize: 10.5, fontWeight: 500 }}>{failed ? "읽기 실패" : "데이터 없음"}</span>}
     </div>
   );
 }
@@ -296,25 +295,46 @@ interface CategoryNodeProps {
    * expanded and visually distinguished from the raw per-artifact tree. */
   pinned?: boolean;
   hideHeader?: boolean;
-  onNavigate?: (targetFile: string, targetColumn: string, value: string) => void;
   /** 이 파일 이름은 목록에서 숨긴다(고정 항목으로 승격된 경우). */
   hideFileName?: string;
   /** 이미 조회된 파일 목록 — 있으면 다시 조회하지 않는다(비싼 COUNT 절약). */
   preloadedFiles?: ResultFileEntry[];
 }
 
-function CategoryNode({ category, selectedFile, onSelectFile, displayName, pinned, hideHeader, hideFileName, preloadedFiles, onNavigate }: CategoryNodeProps) {
+function SidebarErrorRow({ message, detail, onRetry, indent = 14 }: { message: string; detail: string; onRetry: () => void; indent?: number }) {
+  return (
+    <div role="alert" title={detail} style={{ display: "flex", alignItems: "center", gap: 8, padding: `6px 10px 8px ${indent}px`, color: "var(--danger)", fontSize: 12 }}>
+      <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{message}</span>
+      <button type="button" onClick={onRetry} style={{ marginLeft: "auto", flexShrink: 0, fontSize: 11.5, background: "transparent", border: "none", color: "var(--accent)", cursor: "pointer", fontWeight: 650 }}>다시 시도</button>
+    </div>
+  );
+}
+
+function CategoryNode({ category, selectedFile, onSelectFile, displayName, pinned, hideHeader, hideFileName, preloadedFiles }: CategoryNodeProps) {
   const [expanded, setExpanded] = useState(false);
   const [files, setFiles] = useState<ResultFileEntry[] | null>(null);
+  const [filesError, setFilesError] = useState<string | null>(null);
+  const [filesNonce, setFilesNonce] = useState(0);
 
   useEffect(() => {
     // 상세 전용 자식 표(source_records·ExecutionTimes…)는 열람 대상이 아니다.
+    setFilesError(null);
     if (preloadedFiles) {
       setFiles(browsableResultFiles(preloadedFiles));
       return;
     }
-    window.api.listResultFiles(category.fullPath).then((list) => setFiles(browsableResultFiles(list)));
-  }, [category.fullPath, preloadedFiles]);
+    let cancelled = false;
+    window.api.listResultFiles(category.fullPath)
+      .then((list) => {
+        if (!cancelled) setFiles(browsableResultFiles(list));
+      })
+      .catch((error) => {
+        if (!cancelled) setFilesError(error instanceof Error ? error.message : String(error));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [category.fullPath, preloadedFiles, filesNonce]);
 
   // Group the per-table entries back by their source file, so one .sqlite is
   // one node (expandable when it holds several tables).
@@ -358,6 +378,9 @@ function CategoryNode({ category, selectedFile, onSelectFile, displayName, pinne
         <span>{displayName ?? category.name}</span>
         <span style={{ color: "var(--text-faint)", fontWeight: 400, fontSize: 11.5 }}>{byFile ? byFile.length : ""}</span>
       </div>}
+      {isExpanded && filesError && (
+        <SidebarErrorRow message="목록을 불러오지 못했습니다" detail={filesError} indent={28} onRetry={() => setFilesNonce((value) => value + 1)} />
+      )}
       {isExpanded && byFile && (
         <div style={{ paddingBottom: pinned ? 4 : 0 }}>
           {byFile.length === 0 && (
@@ -388,22 +411,18 @@ interface PinnedNavRowProps {
   count?: number;
   selected: boolean;
   onClick: () => void;
-  /** When true the row shows a spinner and is not clickable (background work
-   * — e.g. the master timeline — is still building). */
-  busy?: boolean;
 }
 
-function PinnedNavRow({ icon, label, count, selected, onClick, busy }: PinnedNavRowProps) {
+function PinnedNavRow({ icon, label, count, selected, onClick }: PinnedNavRowProps) {
   return (
     <div
-      onClick={busy ? undefined : onClick}
-      title={busy ? "백그라운드에서 준비 중…" : undefined}
+      onClick={onClick}
       style={{
         display: "flex",
         alignItems: "center",
         gap: 10,
         padding: "10px 12px",
-        cursor: busy ? "progress" : "pointer",
+        cursor: "pointer",
         fontSize: 14,
         fontWeight: selected ? 700 : 600,
         background: selected
@@ -413,10 +432,10 @@ function PinnedNavRow({ icon, label, count, selected, onClick, busy }: PinnedNav
         boxShadow: selected
           ? "inset 4px 4px 9px rgba(3, 8, 14, 0.50), inset -3px -3px 7px rgba(142, 188, 230, 0.13), 0 1px 0 rgba(142, 188, 230, 0.14)"
           : "none",
-        color: busy ? "var(--text-faint)" : selected ? "var(--text)" : "var(--text-dim)",
+        color: selected ? "var(--text)" : "var(--text-dim)",
       }}
       onMouseEnter={(e) => {
-        if (!selected && !busy) e.currentTarget.style.background = "var(--bg-hover)";
+        if (!selected) e.currentTarget.style.background = "var(--bg-hover)";
       }}
       onMouseLeave={(e) => {
         if (!selected) e.currentTarget.style.background = "transparent";
@@ -424,11 +443,7 @@ function PinnedNavRow({ icon, label, count, selected, onClick, busy }: PinnedNav
     >
       <span style={{ display: "flex", color: selected ? "var(--accent)" : "var(--text-faint)" }}>{icon}</span>
       <span>{label}</span>
-      {busy ? (
-        <span className="wa-spin" style={{ marginLeft: "auto" }} />
-      ) : (
-        count !== undefined && <span style={{ color: "var(--text-faint)", fontWeight: 400, fontSize: 11.5 }}>{count}</span>
-      )}
+      {count !== undefined && <span style={{ color: "var(--text-faint)", fontWeight: 400, fontSize: 11.5 }}>{count}</span>}
     </div>
   );
 }
@@ -451,7 +466,6 @@ interface SidebarProps {
   bookmarkCount: number;
   timeRange: TimeRange;
   onTimeRangeChange: (range: TimeRange) => void;
-  onNavigate: (targetFile: string, targetColumn: string, value: string) => void;
 }
 
 export default function Sidebar({
@@ -471,7 +485,6 @@ export default function Sidebar({
   bookmarkCount,
   timeRange,
   onTimeRangeChange,
-  onNavigate,
 }: SidebarProps) {
   const [rawDataExpanded, setRawDataExpanded] = useState(false);
   const hasTimeRange = rangeActive(timeRange);
@@ -479,20 +492,27 @@ export default function Sidebar({
   // 호스트 정보(TargetInfo)는 호스트 분석 최상단 고정 항목으로 승격 —
   // 종합 분석 목록에서는 숨겨 중복 표시를 피한다.
   const [fetchedOverviewFiles, setFetchedOverviewFiles] = useState<ResultFileEntry[] | null>(null);
+  const [overviewError, setOverviewError] = useState<string | null>(null);
+  const [overviewNonce, setOverviewNonce] = useState(0);
   useEffect(() => {
+    setOverviewError(null);
     if (overviewFiles || !overviewCategory) {
       setFetchedOverviewFiles(null);
       return;
     }
     let cancelled = false;
-    window.api.listResultFiles(overviewCategory.fullPath).then((files) => {
-      if (!cancelled) setFetchedOverviewFiles(files);
-    });
+    window.api.listResultFiles(overviewCategory.fullPath)
+      .then((files) => {
+        if (!cancelled) setFetchedOverviewFiles(files);
+      })
+      .catch((error) => {
+        if (!cancelled) setOverviewError(error instanceof Error ? error.message : String(error));
+      });
     return () => {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [overviewFiles, overviewCategory?.fullPath]);
+  }, [overviewFiles, overviewCategory?.fullPath, overviewNonce]);
   const effectiveOverviewFiles = overviewFiles ?? fetchedOverviewFiles;
   const targetInfoEntry = effectiveOverviewFiles?.find((file) => file.name === "TargetInfo") ?? null;
   // 분석 메뉴는 ANALYSIS_GROUPS에 정한 뷰만 보여 준다(사용자 확정). _OVERVIEW에
@@ -513,20 +533,27 @@ export default function Sidebar({
   // 다른 아티팩트처럼 원본 데이터 목록에도 남는다.
   const werCategory = categories.find((c) => c.name === "WER");
   const [werEntry, setWerEntry] = useState<ResultFileEntry | null>(null);
+  const [werError, setWerError] = useState<string | null>(null);
+  const [werNonce, setWerNonce] = useState(0);
   useEffect(() => {
+    setWerError(null);
     if (!werCategory) {
       setWerEntry(null);
       return;
     }
     let cancelled = false;
-    window.api.listResultFiles(werCategory.fullPath).then((files) => {
-      if (!cancelled) setWerEntry(files.find((file) => file.name === "WER_Reports") ?? files[0] ?? null);
-    });
+    window.api.listResultFiles(werCategory.fullPath)
+      .then((files) => {
+        if (!cancelled) setWerEntry(files.find((file) => file.name === "WER_Reports") ?? files[0] ?? null);
+      })
+      .catch((error) => {
+        if (!cancelled) setWerError(error instanceof Error ? error.message : String(error));
+      });
     return () => {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [werCategory?.fullPath]);
+  }, [werCategory?.fullPath, werNonce]);
   // 재파싱본은 통합 파생(_OVERVIEW/WerReports: Report.wer + EventLog 오류
   // 보고 1001)을 우선해 연다. 파생이 없는 구 파싱본은 WER 카테고리 산출물로
   // 열어 기존 동작을 유지한다.
@@ -663,6 +690,9 @@ export default function Sidebar({
           {/* 호스트 분석 — the currently open host */}
           <div style={{ borderBottom: "1px solid var(--border-subtle)" }}>
             <div style={{ padding: "12px 14px 6px", fontSize: 11.5, fontWeight: 750, letterSpacing: 0.6, color: "var(--text-faint)", textTransform: "uppercase" }}>호스트 분석</div>
+            {overviewError && (
+              <SidebarErrorRow message="분석 목록을 불러오지 못했습니다" detail={overviewError} onRetry={() => setOverviewNonce((value) => value + 1)} />
+            )}
             {targetInfoEntry && (
               <PinnedNavRow
                 icon={<InfoOutlinedIcon sx={{ fontSize: 19 }} />}
@@ -690,6 +720,7 @@ export default function Sidebar({
                 if (item === "@WER") {
                   const entry = effectiveWerEntry;
                   if (entry) rows.push(<PinnedNavRow key="wer" icon={<ReportProblemOutlinedIcon sx={{ fontSize: 19 }} />} label="오류 보고" selected={sameEntry(selectedFile, entry)} onClick={() => onSelectFile(entry)} />);
+                  else if (werError) rows.push(<SidebarErrorRow key="wer" message="오류 보고를 불러오지 못했습니다" detail={werError} onRetry={() => setWerNonce((value) => value + 1)} />);
                   else rows.push(<EmptyPinnedRow key="wer" icon={<ReportProblemOutlinedIcon sx={{ fontSize: 19 }} />} label="오류 보고" />);
                   continue;
                 }
@@ -735,13 +766,13 @@ export default function Sidebar({
         {rawDataExpanded && orderedNames.map((name) => {
           const category = presentByName.get(name);
           return category ? (
-            <CategoryNode key={category.fullPath} category={category} displayName={CATEGORY_LABELS[category.name]} selectedFile={selectedFile} onSelectFile={onSelectFile} onNavigate={onNavigate} />
+            <CategoryNode key={category.fullPath} category={category} displayName={CATEGORY_LABELS[category.name]} selectedFile={selectedFile} onSelectFile={onSelectFile} />
           ) : (
             <EmptyCategoryRow key={name} name={name} label={CATEGORY_LABELS[name]} />
           );
         })}
         {rawDataExpanded && leftoverCategories.map((category) => (
-          <CategoryNode key={category.fullPath} category={category} selectedFile={selectedFile} onSelectFile={onSelectFile} onNavigate={onNavigate} />
+          <CategoryNode key={category.fullPath} category={category} selectedFile={selectedFile} onSelectFile={onSelectFile} />
         ))}
         {rawDataExpanded && [...overviewRawByFile.entries()].map(([name, tables]) => (
           <FileNode key={`raw-${name}`} fileName={name} label={OVERVIEW_TABLE_NAMES[name] ?? name} tables={tables} selectedFile={selectedFile} indent={12} leading={<OverviewTableIcon name={name} />} onSelectFile={onSelectFile} />

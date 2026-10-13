@@ -301,7 +301,7 @@ pub(super) fn build(ctx: &Ctx) -> Result<usize> {
         .ok_or_else(|| anyhow!("{DB_NAME} 파생 계약이 등록되지 않았습니다"))?;
     let mut db = DerivedDb::create(&ctx.overview_dir(), DB_NAME)?;
     // Exact table discovery: numbered inputs (_2) are found by having CacheEntries.
-    for path in fact_files(ctx.out_dir, BROWSER_DIR, CACHE_TABLE) {
+    for path in fact_files(ctx.out_dir, BROWSER_DIR, CACHE_TABLE)? {
         if crate::pipeline::cancelled() {
             break;
         }

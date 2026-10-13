@@ -75,55 +75,6 @@ pub fn by_extension(root: &Path, exts: &[&str]) -> Found {
         errors,
     }
 }
-pub fn by_suffix(root: &Path, suffixes: &[&str]) -> Found {
-    let lower: Vec<String> = suffixes.iter().map(|s| s.to_lowercase()).collect();
-    let (files, errors) = walk_files(root);
-    Found {
-        paths: files
-            .into_iter()
-            .filter(|p| {
-                let n = p
-                    .file_name()
-                    .map(|x| x.to_string_lossy().to_lowercase())
-                    .unwrap_or_default();
-                lower.iter().any(|s| n.ends_with(s))
-            })
-            .collect(),
-        errors,
-    }
-}
-pub fn by_content(root: &Path, marker: &str) -> Found {
-    use std::io::Read;
-    let utf8 = marker.as_bytes().to_vec();
-    let utf16: Vec<u8> = marker.bytes().flat_map(|b| [b, 0]).collect();
-    let (files, mut errors) = walk_files(root);
-    let mut paths = Vec::new();
-    for p in files {
-        // Only the first 4 KB — never slurp whole files (a target can hold huge
-        // unrelated files, which made content discovery crawl).
-        let mut head = Vec::new();
-        match std::fs::File::open(&p) {
-            Ok(f) => {
-                if std::io::Read::take(f, 4096).read_to_end(&mut head).is_err() {
-                    // 열렸지만 앞부분을 읽지 못한 파일은 "비대상"이 아니라
-                    // 판정 불가 — 실패로 기록해 증거 누락과 구분한다.
-                    errors.push(format!("{}: 내용 판별용 앞부분 읽기 실패", p.display()));
-                    continue;
-                }
-            }
-            Err(error) => {
-                errors.push(format!("{}: {error}", p.display()));
-                continue;
-            }
-        }
-        if head.windows(utf8.len()).any(|w| w == utf8.as_slice())
-            || head.windows(utf16.len()).any(|w| w == utf16.as_slice())
-        {
-            paths.push(p);
-        }
-    }
-    Found { paths, errors }
-}
 
 #[cfg(test)]
 mod tests {

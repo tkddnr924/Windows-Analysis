@@ -15,7 +15,7 @@ import RefreshOutlinedIcon from "@mui/icons-material/RefreshOutlined";
 import CircularProgress from "@mui/material/CircularProgress";
 import type { FetchLinkedRows, Host, ResultRow, SearchHit } from "@/lib/types";
 import type { AccountDirectory } from "@/lib/accountIdentity";
-import { formatEvidenceTimestamp, rangeActive, type TimeRange } from "@/lib/timeRange";
+import { formatEvidenceTimestamp, rangeActive, rangeBounds, type TimeRange } from "@/lib/timeRange";
 import RowDetailPanel from "./RowDetailPanel";
 import { pathBelongsToHost } from "@/lib/viewShared";
 import { OVERVIEW_TABLE_NAMES } from "@/lib/overviewLabels";
@@ -74,11 +74,15 @@ export default function CaseSearchView({ hosts, currentHostId, timeRange, isBook
   const [selectedHostIds, setSelectedHostIds] = useState<string[]>([]);
   const [hiddenCategories, setHiddenCategories] = useState<Set<string>>(new Set());
   const [availableCategories, setAvailableCategories] = useState<string[]>([]);
+  const [categoryFailures, setCategoryFailures] = useState<string[]>([]);
+  const [categoryAttempt, setCategoryAttempt] = useState(0);
   const requestId = useRef(0);
   const detailRequestId = useRef(0);
 
-  const searchRange = rangeActive(timeRange) ? { start: timeRange.start, end: timeRange.end } : undefined;
-  const rangeKey = `${timeRange.start || ""}\u0000${timeRange.end || ""}`;
+  const bounds = rangeBounds(timeRange);
+  const searchRange = bounds.start || bounds.end ? bounds : undefined;
+  // Normalized bounds: keystrokes that do not change the range never re-query.
+  const rangeKey = `${bounds.start}\u0000${bounds.end}`;
 
   // Restart a running query from its first page whenever the host/category
   // scope changes, so paging never mixes results from different scopes.
@@ -88,17 +92,18 @@ export default function CaseSearchView({ hosts, currentHostId, timeRange, isBook
   // _OVERVIEW such as MFT_Records are not searched), stable across host picks.
   useEffect(() => {
     let cancelled = false;
-    void Promise.all(hosts.map((host) => window.api.listResultFiles(`${host.dir}/_OVERVIEW`).catch(() => [])))
-      .then((lists) => {
+    void Promise.all(hosts.map((host) => window.api.listResultFiles(`${host.dir}/_OVERVIEW`).then((list) => ({ host, list }), () => ({ host, list: null }))))
+      .then((results) => {
         if (cancelled) return;
         const names = new Set<string>();
-        for (const list of lists) for (const file of browsableResultFiles(list)) {
+        for (const { list } of results) if (list) for (const file of browsableResultFiles(list)) {
           if (file.derived !== false) names.add(file.name);
         }
+        setCategoryFailures(results.filter((result) => !result.list).map((result) => result.host.name));
         setAvailableCategories([...names].sort((a, b) => categoryLabel(a).localeCompare(categoryLabel(b))));
       });
     return () => { cancelled = true; };
-  }, [hosts]);
+  }, [hosts, categoryAttempt]);
 
   // Drop a stale hidden category if the underlying case no longer offers it.
   useEffect(() => {
@@ -157,10 +162,11 @@ export default function CaseSearchView({ hosts, currentHostId, timeRange, isBook
 
   // A global incident-window change must never relabel results produced for a
   // different range. Hide that ledger immediately, then restart the last
-  // successful query from its first page using the new bounds.
+  // successful query from its first page once range typing settles.
   useEffect(() => {
     if (!ran || resultRangeKey === rangeKey) return;
-    void runSearch(ran, 0);
+    const timer = window.setTimeout(() => void runSearch(ran, 0), 280);
+    return () => window.clearTimeout(timer);
   }, [rangeKey, ran, resultRangeKey]);
 
   // Re-run the last query from page 0 when the host/category scope changes.
@@ -221,6 +227,7 @@ export default function CaseSearchView({ hosts, currentHostId, timeRange, isBook
       </ViewHeader>
 
       {visibleSourceFailures.length > 0 && <div role="alert" style={{ padding: "8px 14px", borderBottom: "1px solid color-mix(in srgb, var(--warning) 42%, var(--border))", background: "color-mix(in srgb, var(--warning) 7%, var(--bg-panel))", color: "var(--text-dim)", fontSize: 12 }}>일부 분석 결과를 검색하지 못했습니다: {visibleSourceFailures.join(", ")}. 표시된 결과는 성공적으로 읽은 결과만 포함합니다.</div>}
+      {categoryFailures.length > 0 && <div role="alert" style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 14px", borderBottom: "1px solid color-mix(in srgb, var(--warning) 42%, var(--border))", background: "color-mix(in srgb, var(--warning) 7%, var(--bg-panel))", color: "var(--text-dim)", fontSize: 12 }}>아티팩트 목록을 불러오지 못한 호스트: {categoryFailures.join(", ")}. 아티팩트 필터에 일부 항목이 빠져 있을 수 있습니다.<span style={{ marginLeft: "auto" }}><Button onClick={() => setCategoryAttempt((attempt) => attempt + 1)}><RefreshOutlinedIcon sx={{ fontSize: 15 }} />다시 시도</Button></span></div>}
       {visibleError && <div role="alert" style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 14px", borderBottom: "1px solid color-mix(in srgb, var(--danger) 42%, var(--border))", background: "color-mix(in srgb, var(--danger) 7%, var(--bg-panel))", color: "var(--text)", fontSize: 12 }}>{visibleError}<span style={{ marginLeft: "auto" }}><Button onClick={retrySearch}><RefreshOutlinedIcon sx={{ fontSize: 15 }} />다시 시도</Button></span></div>}
 
       {ran && resultMatchesCurrentRange && (visibleHits.length > 0 || !loading) && <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "7px 14px", borderBottom: "1px solid var(--border-subtle)", color: "var(--text-faint)", fontSize: 11.5 }}><span><strong style={{ color: "var(--text-dim)" }}>&quot;{ran}&quot;</strong> 검색 결과 · {hits.length === 0 ? "0건" : `${(page * PAGE_SIZE + 1).toLocaleString()}–${(page * PAGE_SIZE + hits.length).toLocaleString()}건 표시`}{nextOffset !== null ? " · 다음 페이지 있음" : ""}</span></div>}
@@ -330,4 +337,3 @@ function EmptyState({ children }: { children: React.ReactNode }) {
   return <div role="status" style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 9, minHeight: 220, padding: 24, color: "var(--text-faint)", fontSize: 13, textAlign: "center" }}>{children}</div>;
 }
 
-const singleLine: React.CSSProperties = { minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text-dim)", fontSize: 12 };

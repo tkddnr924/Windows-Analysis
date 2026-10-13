@@ -104,7 +104,8 @@ CREATE TABLE "BitsQueue_Jobs" (
   "other_time2_raw" TEXT,
   "metadata_padding_hex" TEXT,
   "metadata_state" TEXT NOT NULL,
-  "trailing_length" INTEGER,
+  "transfer_trailing_length" INTEGER,
+  "metadata_trailing_length" INTEGER,
   "parse_status" TEXT NOT NULL,
   "parse_method" TEXT,
   "parse_error" TEXT,
@@ -307,10 +308,10 @@ fn write_records(conn: &Connection, display: &str, parsed: &ParsedQueue) -> Resu
          access_token_length,transfer_section_kind,declared_file_count,parsed_file_count,
          file_reference_guids,error_count,errors_json,transient_error_count,retry_delay_raw,
          timeout_raw,created_raw,modified_raw,other_time0_raw,other_time1_raw,other_time2_raw,
-         metadata_padding_hex,metadata_state,trailing_length,parse_status,parse_method,parse_error,
-         record_blob,_source_file)
+         metadata_padding_hex,metadata_state,transfer_trailing_length,metadata_trailing_length,
+         parse_status,parse_method,parse_error,record_blob,_source_file)
          VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,
-         ?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35,?36,?37,?38,?39,?40,?41,?42,?43,?44)"
+         ?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35,?36,?37,?38,?39,?40,?41,?42,?43,?44,?45)"
     ))?;
     for job in &parsed.jobs {
         job_statement.execute(params![
@@ -352,7 +353,8 @@ fn write_records(conn: &Connection, display: &str, parsed: &ParsedQueue) -> Resu
             job.other_time2_raw.map(|value| value.to_string()),
             &job.metadata_padding_hex,
             job.metadata_state,
-            job.trailing_length,
+            job.transfer_trailing_length,
+            job.metadata_trailing_length,
             job.parse_status,
             job.parse_method,
             &job.parse_error,
@@ -603,7 +605,8 @@ fn write_jobs(
          transfer_section_kind,declared_file_count,parsed_file_count,file_reference_guids,error_count,
          errors_json,transient_error_count,retry_delay_raw,timeout_raw,created_raw,modified_raw,
          other_time0_raw,other_time1_raw,other_time2_raw,metadata_padding_hex,metadata_state,
-         trailing_length,parse_status,parse_method,parse_error,record_blob
+         transfer_trailing_length,metadata_trailing_length,parse_status,parse_method,parse_error,
+         record_blob
          FROM \"{JOB_TABLE}\" ORDER BY rowid"
     ))?;
     let mut candidate_count = conn.prepare(&format!(
@@ -732,10 +735,11 @@ fn write_jobs(
                 opt(row.get::<_, Option<String>>(37)?.as_deref()),
                 opt(row.get::<_, Option<String>>(38)?.as_deref()),
                 int_opt(row.get(39)?),
-                opt(row.get::<_, Option<String>>(40)?.as_deref()),
+                int_opt(row.get(40)?),
                 opt(row.get::<_, Option<String>>(41)?.as_deref()),
                 opt(row.get::<_, Option<String>>(42)?.as_deref()),
-                blob_cell(row.get::<_, Option<Vec<u8>>>(43)?),
+                opt(row.get::<_, Option<String>>(43)?.as_deref()),
+                blob_cell(row.get::<_, Option<Vec<u8>>>(44)?),
                 t(JOB_BASIS),
                 t(&source.dataset),
                 t(&source.db),

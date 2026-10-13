@@ -7,7 +7,7 @@ import CloseOutlinedIcon from "@mui/icons-material/CloseOutlined";
 import { useModalDialog } from "@/lib/useModalDialog";
 import {
   AROUND_PRESETS, DEFAULT_LIST_FILTERS, EXTENSION_PRESETS, MFT_TIME_FIELDS, NOISE_FOLDERS, SIZE_PRESETS,
-  activityOf, noiseExcluded, presetActive, timeBounds, timeFieldsLabel, timeKeysFor, toListOptions,
+  activityOf, noiseExcluded, presetActive, resetFilters, timeBounds, timeFieldsLabel, timeKeysFor, toListOptions,
   withNoiseExcluded, withTimeKeys, withTimeMode,
   type Activity, type ExtensionPreset, type ListFilters, type SizePreset, type TimeMode,
 } from "@/lib/mftListFilters";
@@ -294,7 +294,7 @@ export default function MftListFilterModal({ filters, anchorRow, countFor, onApp
           <span role="status" aria-live="polite" style={{ fontSize: 12.5, color: count.failed ? "var(--danger)" : "var(--text-dim)", fontVariantNumeric: "tabular-nums" }}>
             {bounds.error ? "시각을 확인하세요" : count.failed ? "건수를 세지 못했습니다" : count.loading || count.value === null ? "건수 확인 중…" : <><strong style={{ fontSize: 15, fontWeight: 650, color: "var(--text)" }}>{count.value.toLocaleString()}</strong>건</>}
           </span>
-          <button type="button" onClick={() => { setDraft({ ...DEFAULT_LIST_FILTERS }); setCustomExtension(false); }} style={{ ...ghost, marginLeft: "auto" }}>초기화</button>
+          <button type="button" onClick={() => { setDraft(resetFilters(draft)); setCustomExtension(false); }} style={{ ...ghost, marginLeft: "auto" }}>초기화</button>
           <button type="button" onClick={onClose} style={ghost}>취소</button>
           <button type="button" data-dialog-autofocus disabled={Boolean(bounds.error)} onClick={() => { onApply(draft); onClose(); }} title={bounds.error ?? undefined} style={{ height: 34, padding: "0 20px", fontSize: 12.5, fontWeight: 650, border: "none", borderRadius: 8, background: "var(--accent)", color: "var(--bg-panel)", cursor: bounds.error ? "not-allowed" : "pointer", opacity: bounds.error ? 0.4 : 1 }}>적용</button>
         </footer>

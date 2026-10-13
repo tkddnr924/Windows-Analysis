@@ -19,6 +19,7 @@ import { inRange, rangeActive, timeColumnFor, EMPTY_TIME_RANGE, type TimeRange }
 import RowDetailPanel from "./RowDetailPanel";
 import ColumnFilterControl from "./ColumnFilterControl";
 import type { AccountDirectory } from "@/lib/accountIdentity";
+import { rowidFilterValue, rowidJumpState, rowsWithJumpRow } from "@/lib/tableJump";
 
 const ROW_HEIGHT = 26;
 const DEFAULT_COLUMN_WIDTH = 220;
@@ -65,12 +66,15 @@ interface DataTableProps {
   /** 원본 테이블 페이지 로딩: 스크롤이 끝에 가까워지면 다음 청크를 요청한다.
    * data.rows가 data.rowCount보다 적을 때만 전달된다. */
   onLoadMore?: () => void;
+  /** Reads one row by rowid when a jump target is beyond the loaded rows. */
+  onLookupRow: (rowid: number) => Promise<Record<string, string> | null>;
 }
 
 export default function DataTable({
   fileName,
   data,
   onLoadMore,
+  onLookupRow,
   initialFilter,
   onInitialFilterConsumed,
   onNavigate,
@@ -96,7 +100,6 @@ export default function DataTable({
   // path, mismatched name, error-level event, …) — the same signal that drives
   // the ⛔/⚠ marker column.
   const tagsFn = artifactSpec?.tags;
-  const rowTagCount = (row: Record<string, string>): number => (tagsFn ? tagsFn(row).length : 0);
 
   useEffect(() => {
     if (!initialFilter) return;
@@ -105,6 +108,39 @@ export default function DataTable({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [initialFilter]);
 
+  const partiallyLoaded = data.rows.length < data.rowCount;
+  // A row jump is resolved against the table, not only the loaded chunk.
+  const jumpRowid = rowidFilterValue(columnFilters);
+  const jumpState = jumpRowid ? rowidJumpState(data.rows, jumpRowid, !partiallyLoaded) : null;
+  const [jumpLookup, setJumpLookup] = useState<
+    | { rowid: string; status: "loading" }
+    | { rowid: string; status: "found"; row: Record<string, string> }
+    | { rowid: string; status: "missing" }
+    | { rowid: string; status: "error"; error: string }
+    | null
+  >(null);
+  useEffect(() => {
+    if (!jumpRowid || jumpState !== "lookup") return;
+    let alive = true;
+    setJumpLookup({ rowid: jumpRowid, status: "loading" });
+    onLookupRow(Number(jumpRowid))
+      .then((row) => {
+        if (alive) setJumpLookup(row ? { rowid: jumpRowid, status: "found", row } : { rowid: jumpRowid, status: "missing" });
+      })
+      .catch((error: unknown) => {
+        if (alive) setJumpLookup({ rowid: jumpRowid, status: "error", error: String(error) });
+      });
+    return () => {
+      alive = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [jumpRowid, jumpState]);
+  const currentLookup = jumpLookup && jumpLookup.rowid === jumpRowid && jumpState === "lookup" ? jumpLookup : null;
+  const jumpStatus = jumpState === "missing" ? "missing" : currentLookup?.status ?? null;
+  const sourceRows = useMemo(
+    () => rowsWithJumpRow(data.rows, jumpRowid, currentLookup?.status === "found" ? currentLookup : null),
+    [data.rows, jumpRowid, currentLookup],
+  );
   const displayColumns = useMemo(() => {
     // A curated view can restrict the table to a fixed set of columns; the
     // rest stay in each row's data (for links, filter tabs, detail panel).
@@ -174,17 +210,14 @@ export default function DataTable({
   // The column the global incident-window filter applies to (null = this table
   // has no time column, so the filter leaves it alone).
   const timeColumn = useMemo(
-    () => timeColumnFor(artifactSpec, data.columns, data.rows[0]),
+    () => timeColumnFor(artifactSpec, data.columns, data.rows),
     [artifactSpec, data.columns, data.rows]
   );
 
   const searchedRows = useMemo(() => {
-    let rows = data.rows;
+    let rows = sourceRows;
     if (timeColumn && rangeActive(timeRange)) {
       rows = rows.filter((row) => inRange(row[timeColumn] ?? "", timeRange));
-    }
-    if (filterTabs && activeTab !== undefined) {
-      rows = rows.filter((row) => (row[filterTabs.column] ?? "") === activeTab);
     }
     if (onlySuspicious && tagsFn) {
       rows = rows.filter((row) => tagsFn(row).length > 0);
@@ -192,7 +225,7 @@ export default function DataTable({
     if (!search.trim()) return rows;
     const needle = search.toLowerCase();
     return rows.filter((row) => data.columns.some((col) => (row[col] ?? "").toLowerCase().includes(needle)));
-  }, [data.rows, data.columns, search, filterTabs, activeTab, timeColumn, timeRange, onlySuspicious, tagsFn]);
+  }, [sourceRows, data.columns, search, timeColumn, timeRange, onlySuspicious, tagsFn]);
 
   const table = useReactTable({
     data: searchedRows,
@@ -207,7 +240,19 @@ export default function DataTable({
     getSortedRowModel: getSortedRowModel(),
   });
 
-  const { rows } = table.getRowModel();
+  // The tab filter runs last so each tab can count the rows every other filter leaves.
+  const filteredRows = table.getRowModel().rows;
+  const rows = useMemo(
+    () => filterTabs && activeTab !== undefined ? filteredRows.filter((row) => (row.original[filterTabs.column] ?? "") === activeTab) : filteredRows,
+    [filteredRows, filterTabs, activeTab],
+  );
+  const appliedFilters = [
+    timeColumn && rangeActive(timeRange) ? "기간" : "",
+    onlySuspicious && tagsFn ? "의심만" : "",
+    search.trim() ? "검색" : "",
+    filterTabs && activeTab !== undefined ? "탭" : "",
+    columnFilters.length > 0 ? `열 ${columnFilters.length}` : "",
+  ].filter(Boolean);
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const virtualizer = useVirtualizer({
@@ -228,15 +273,14 @@ export default function DataTable({
   useEffect(() => {
     // 필터로 걸러진 목록 기준 마지막 근처에 오면 다음 청크를 이어 받는다 —
     // 검색 중이라면 일치 행을 찾을 때까지 자연스럽게 전체를 훑게 된다.
-    if (onLoadMore && lastVisibleIndex >= rows.length - 40) onLoadMore();
-  }, [onLoadMore, lastVisibleIndex, rows.length]);
+    // A row jump is resolved by lookup; scanning chunks for it is pointless.
+    if (onLoadMore && !jumpRowid && lastVisibleIndex >= rows.length - 40) onLoadMore();
+  }, [onLoadMore, jumpRowid, lastVisibleIndex, rows.length]);
   const totalHeight = virtualizer.getTotalSize();
   const paddingTop = virtualRows.length > 0 ? virtualRows[0].start : 0;
   const paddingBottom = virtualRows.length > 0 ? totalHeight - virtualRows[virtualRows.length - 1].end : 0;
 
   const activeFilterCount = columnFilters.length;
-
-  const partiallyLoaded = data.rows.length < data.rowCount;
 
   return (
     <div className="dfir-view" style={{ display: "flex", flexDirection: "column", flex: 1, minHeight: 0, minWidth: 0 }}>
@@ -244,6 +288,13 @@ export default function DataTable({
         <div role="status" style={{ flexShrink: 0, display: "flex", alignItems: "center", gap: 8, padding: "6px 14px", borderBottom: "1px solid var(--border-subtle)", background: "color-mix(in srgb, var(--accent) 6%, var(--bg-panel))", color: "var(--text-dim)", fontSize: 11.5 }}>
           <span style={{ fontFamily: "var(--mono)", color: "var(--text)" }}>{data.rows.length.toLocaleString()} / {data.rowCount.toLocaleString()}행 로드됨</span>
           <span>스크롤하면 이어서 불러옵니다 · 검색·필터·정렬은 로드된 행 기준입니다</span>
+        </div>
+      )}
+      {jumpStatus && jumpStatus !== "found" && (
+        <div role={jumpStatus === "loading" ? "status" : "alert"} style={{ flexShrink: 0, display: "flex", alignItems: "center", gap: 8, padding: "6px 14px", borderBottom: "1px solid var(--border-subtle)", background: jumpStatus === "loading" ? "var(--bg-panel)" : "color-mix(in srgb, var(--danger) 10%, var(--bg-panel))", color: "var(--text)", fontSize: 11.5 }}>
+          <span>{jumpStatus === "loading" ? "행을 불러오는 중" : jumpStatus === "missing" ? "행을 찾을 수 없습니다" : "행을 불러오지 못했습니다"}</span>
+          <span style={{ fontFamily: "var(--mono)", color: "var(--text-dim)" }}>rowid {jumpRowid}</span>
+          {currentLookup?.status === "error" && <span style={{ color: "var(--text-dim)", wordBreak: "break-word" }}>{currentLookup.error}</span>}
         </div>
       )}
       <div
@@ -334,8 +385,8 @@ export default function DataTable({
           {filterTabs.tabs.map((tab) => {
             const count =
               tab.value === undefined
-                ? data.rows.length
-                : data.rows.filter((r) => (r[filterTabs.column] ?? "") === tab.value).length;
+                ? filteredRows.length
+                : filteredRows.filter((r) => (r.original[filterTabs.column] ?? "") === tab.value).length;
             const active = activeTab === tab.value;
             return (
               <button
@@ -547,7 +598,7 @@ export default function DataTable({
         </span>
         <span>
           표시 <strong style={{ color: "var(--text-dim)" }}>{rows.length.toLocaleString()}</strong>건
-          {columnFilters.length > 0 || search.trim() || activeTab !== undefined ? " (필터 적용됨)" : ""}
+          {appliedFilters.length > 0 ? ` (필터 적용됨: ${appliedFilters.join(" · ")})` : ""}
         </span>
         <span>
           컬럼 <strong style={{ color: "var(--text-dim)" }}>{displayColumns.length}</strong>개
@@ -566,7 +617,7 @@ export default function DataTable({
         return (
           <RowDetailPanel
             row={selectedCell.row}
-            columns={displayColumns}
+            columns={data.columns}
             focusedColumn={selectedCell.column}
             fileBaseName={fileBaseName}
             onClose={() => setSelectedCell(null)}

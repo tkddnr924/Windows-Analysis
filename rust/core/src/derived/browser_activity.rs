@@ -21,7 +21,7 @@ pub(super) const DB_NAME: &str = "BrowserActivity";
 /// Storage contract for this database. Results without it lack individual
 /// visits, chains, search terms and per-row cache bodies, so they need a
 /// reparse rather than a column backfill.
-pub(super) const CONTRACT_VERSION: i64 = 2;
+pub(super) const CONTRACT_VERSION: i64 = 3;
 
 const BROWSER_DIR: &str = "BROWSER";
 
@@ -747,17 +747,22 @@ fn ie_visit_url(raw: &str) -> String {
     }
 }
 
-/// iedownload metadata (" | " segments) carries the original URL.
-fn ie_download_url(metadata: &str, fallback: &str) -> String {
-    match metadata.rfind("http") {
-        Some(at) => metadata[at..]
-            .split(" | ")
-            .next()
-            .unwrap_or("")
-            .trim()
-            .to_string(),
-        None => fallback.to_string(),
+/// iedownload metadata is " | "-joined strings from the ResponseHeaders blob.
+/// Only a whole segment that is a URL counts; several distinct URLs leave the
+/// file URL unknown (one of them may be a referrer).
+fn ie_download_url(metadata: &str) -> Option<&str> {
+    let mut found: Option<&str> = None;
+    for segment in metadata.split(" | ").map(str::trim) {
+        let lower = segment.get(..8).unwrap_or(segment).to_ascii_lowercase();
+        if !(lower.starts_with("http://") || lower.starts_with("https://")) {
+            continue;
+        }
+        match found {
+            Some(previous) if previous != segment => return None,
+            _ => found = Some(segment),
+        }
     }
+    found
 }
 
 // ---------------------------------------------------------------------------
@@ -766,7 +771,9 @@ fn ie_download_url(metadata: &str, fallback: &str) -> String {
 
 struct Input {
     input_id: String,
-    kind: &'static str,
+    /// Facts tables decide which events exist; None when the collected file
+    /// had no rows, so the input is recorded without events.
+    kind: Option<&'static str>,
     path: PathBuf,
     relative: String,
     generation: String,
@@ -788,10 +795,18 @@ impl Input {
     fn source_file(&self) -> Option<&str> {
         self.identity.source_file.as_deref().and_then(nz)
     }
+
+    fn recorded_kind(&self) -> &str {
+        nz(&self.identity.input_kind)
+            .or(self.kind)
+            .unwrap_or("unknown")
+    }
 }
 
 /// Discover inputs by the facts tables they actually contain. Output file names
-/// (including collision numbers like `_2`) never decide identity or kind.
+/// (including collision numbers like `_2`) never decide identity or kind. A
+/// recorded browser input without event tables (an empty History copy) stays
+/// in the inventory so 'collected but empty' differs from 'not collected'.
 fn discover_inputs(ctx: &Ctx) -> Result<Vec<Input>> {
     let dir = ctx.out_dir.join(BROWSER_DIR);
     let mut files: Vec<PathBuf> = match std::fs::read_dir(&dir) {
@@ -807,9 +822,10 @@ fn discover_inputs(ctx: &Ctx) -> Result<Vec<Input>> {
     for path in files {
         let conn = open_ro(&path)?;
         let tables = table_names(&conn)?;
-        let Some(kind) = input_kind(&tables) else {
+        let kind = input_kind(&tables);
+        if kind.is_none() && !tables.contains("_wina_browser_input") {
             continue;
-        };
+        }
         let identity = read_identity(&conn, &path)?;
         let facts = ctx
             .facts
@@ -863,7 +879,7 @@ fn write_input_row(ctx: &Ctx, db: &mut DerivedDb, input: &Input, ordinal: usize)
             Cell::Text(ctx.host_id.to_string()),
             Cell::Text(ctx.dataset_id.to_string()),
             Cell::Int(ordinal as i64),
-            text_opt(nz(&input.identity.input_kind).or(Some(input.kind))),
+            text(input.recorded_kind()),
             text_opt(input.identity.browser.as_deref()),
             text_opt(input.identity.profile.as_deref()),
             text_opt(input.identity.account_label.as_deref()),
@@ -885,10 +901,7 @@ fn new_record(ctx: &Ctx, input: &Input, event_type: &str, account_label: &str) -
     record.set("browser", text_opt(input.identity.browser.as_deref()));
     record.set("profile", text_opt(input.identity.profile.as_deref()));
     record.set("account_label", text(account_label));
-    record.set(
-        "input_kind",
-        text_opt(nz(&input.identity.input_kind).or(Some(input.kind))),
-    );
+    record.set("input_kind", text(input.recorded_kind()));
     // Confirmed Windows identity only; the collected label stays separate.
     let (account, sid) = confirmed_account(ctx, account_label);
     record.set("account", account);
@@ -932,10 +945,10 @@ pub(super) fn build(ctx: &Ctx) -> Result<usize> {
     for (ordinal, input) in discover_inputs(ctx)?.into_iter().enumerate() {
         write_input_row(ctx, &mut db, &input, ordinal)?;
         match input.kind {
-            "history" => history_input(ctx, &mut db, &input)?,
-            "cache" => cache_input(ctx, &mut db, &input)?,
-            "ie_webcache" => ie_webcache_input(ctx, &mut db, &input)?,
-            "ie_indexdat" => ie_indexdat_input(ctx, &mut db, &input)?,
+            Some("history") => history_input(ctx, &mut db, &input)?,
+            Some("cache") => cache_input(ctx, &mut db, &input)?,
+            Some("ie_webcache") => ie_webcache_input(ctx, &mut db, &input)?,
+            Some("ie_indexdat") => ie_indexdat_input(ctx, &mut db, &input)?,
             _ => {}
         }
     }
@@ -1173,6 +1186,12 @@ struct ChainLink {
     rowid: i64,
 }
 
+impl ChainLink {
+    fn position(&self) -> Option<i64> {
+        self.chain_index.trim().parse().ok()
+    }
+}
+
 fn read_chains(conn: &Connection) -> Result<HashMap<String, Vec<ChainLink>>> {
     let mut chains: HashMap<String, Vec<ChainLink>> = HashMap::new();
     let mut stmt = conn.prepare("SELECT rowid AS __rowid, * FROM \"downloads_url_chains\"")?;
@@ -1190,8 +1209,10 @@ fn read_chains(conn: &Connection) -> Result<HashMap<String, Vec<ChainLink>>> {
                 rowid,
             });
     }
+    // Unknown positions sort after known ones (by rowid) but never count as
+    // the first or final link.
     for links in chains.values_mut() {
-        links.sort_by_key(|link| link.chain_index.parse::<i64>().unwrap_or(i64::MAX));
+        links.sort_by_key(|link| (link.position().is_none(), link.position(), link.rowid));
     }
     Ok(chains)
 }
@@ -1218,8 +1239,9 @@ fn write_downloads(
         let rowid: i64 = row.get(0)?;
         let download_id = col(row, &index, "id");
         let links = chains.get(download_id.trim());
-        let first = links.and_then(|links| links.first());
-        let last = links.and_then(|links| links.last());
+        let mut ordered = links.into_iter().flatten().filter(|link| link.position().is_some());
+        let first = ordered.next();
+        let last = ordered.last().or(first);
 
         // Local paths keep their literal text — '%' is a valid path character.
         let target_path = col(row, &index, "target_path");
@@ -1408,7 +1430,10 @@ fn cache_input(ctx: &Ctx, db: &mut DerivedDb, input: &Input) -> Result<()> {
                 text(&title)
             },
         );
-        record.set("url", text(&request_url));
+        // Same meaning as other branches: url decoded, url_raw as recorded.
+        let url = url_decode(&request_url);
+        record.set("url", text(&url));
+        record.set("url_raw", text(&request_url));
         record.set("request_url", text(&request_url));
         record.set("cache_key", text(&col(row, &index, "cache_key")));
         record.set("status", text(&status_line));
@@ -1419,7 +1444,8 @@ fn cache_input(ctx: &Ctx, db: &mut DerivedDb, input: &Input) -> Result<()> {
             "content_encoding",
             text(&col(row, &index, "content_encoding")),
         );
-        record.set("size", text(&size_raw));
+        // size is the display form everywhere; size_bytes holds the number.
+        record.set("size", text(&human_bytes(&size_raw)));
         record.set("size_bytes", int(&size_raw));
         record.set("cache_request_time", text(&request_time));
         record.set("cache_response_time", text(&response_time));
@@ -1580,15 +1606,24 @@ fn ie_webcache_input(ctx: &Ctx, db: &mut DerivedDb, input: &Input) -> Result<()>
             };
             let label = input.account_label();
             let raw = col(row, &index, "url");
-            let url = ie_download_url(&col(row, &index, "metadata"), &raw);
+            let metadata = col(row, &index, "metadata");
+            let file_url = ie_download_url(&metadata);
             let mut record = new_record(ctx, input, "download", &label);
             record.timestamp(&stamp, kind);
-            record.set("title", text(&url_basename(&url_decode(&url))));
-            record.set("url", text(&url_decode(&url)));
+            match file_url {
+                Some(url) => {
+                    let decoded = url_decode(url);
+                    record.set("title", text(&url_basename(&decoded)));
+                    record.set("url", text(&decoded));
+                    set_ai_marks(&mut record, url);
+                }
+                None => {
+                    record.set("url", text(&raw));
+                }
+            }
             record.set("url_raw", text(&raw));
-            record.set("source_url", text(&url_decode(&url)));
-            record.set("detail", text(&col(row, &index, "metadata")));
-            set_ai_marks(&mut record, &url);
+            // IE facts carry no identified referrer, so source_url stays NULL.
+            record.set("detail", text(&metadata));
             record.source(source_ref(
                 ctx,
                 input,
@@ -3010,5 +3045,156 @@ mod tests {
             )
             .unwrap();
         assert_eq!(version, CONTRACT_VERSION);
+    }
+
+    #[test]
+    fn ie_download_url_uses_one_whole_url_segment() {
+        // 'http' inside a local path never starts the URL.
+        assert_eq!(
+            ie_download_url(r"https://files.test/setup.exe | C:\Users\a\Downloads\httpd-setup.exe"),
+            Some("https://files.test/setup.exe")
+        );
+        assert_eq!(
+            ie_download_url("a | https://files.test/x.exe | https://files.test/x.exe | b"),
+            Some("https://files.test/x.exe")
+        );
+        // Several distinct URLs: which one is the file is unknown.
+        assert_eq!(ie_download_url("https://files.test/a.exe | https://ref.test/page"), None);
+        assert_eq!(ie_download_url(r"C:\httpd\x.exe"), None);
+    }
+
+    #[test]
+    fn ie_download_without_referrer_evidence_has_no_source_url() {
+        let case = case("ie-download-source");
+        let web = facts(
+            &case,
+            "web.sqlite",
+            "CREATE TABLE IEWebCache_Downloads(accessed_time TEXT,modified_time TEXT,url TEXT,metadata TEXT);",
+        );
+        identify(&web, "/BROWSER/analyst/IE/WebCacheV01.dat", "ie_webcache", Some("IE"));
+        exec(&web, "INSERT INTO IEWebCache_Downloads VALUES(NULL,NULL,'iedownload:{a}','https://files.test/one.exe | C:\\dl\\httpd.exe')", &[]);
+        exec(&web, "INSERT INTO IEWebCache_Downloads VALUES(NULL,NULL,'iedownload:{b}','https://files.test/two.exe | https://ref.test/page')", &[]);
+        let db = run(&case);
+        let rows: Vec<(String, Option<String>, Option<String>, Option<String>)> = db
+            .prepare("SELECT url,url_raw,title,source_url FROM BrowserActivity ORDER BY url_raw")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "https://files.test/one.exe".into(),
+                    Some("iedownload:{a}".into()),
+                    Some("one.exe".into()),
+                    None
+                ),
+                // Ambiguous metadata keeps the recorded key; no URL is chosen.
+                ("iedownload:{b}".into(), Some("iedownload:{b}".into()), None, None),
+            ]
+        );
+    }
+
+    #[test]
+    fn unparsable_chain_index_never_becomes_the_final_url() {
+        let case = case("chain-order");
+        let path = facts(&case, "history.sqlite", HISTORY_DDL);
+        identify(&path, "/evidence/BROWSER/u/CHROME/Default/History", "history", None);
+        exec(
+            &path,
+            "INSERT INTO downloads(id,target_path,start_time) VALUES('7','C:\\x.zip','13380000000000000')",
+            &[],
+        );
+        for (index, url) in [
+            ("1", "https://cdn.test/final.zip"),
+            ("0", "https://start.test/first.zip"),
+            ("", "https://broken.test/unknown.zip"),
+        ] {
+            exec(
+                &path,
+                "INSERT INTO downloads_url_chains(chain_index,id,url) VALUES(?1,'7',?2)",
+                rusqlite::params![index, url],
+            );
+        }
+        let db = run(&case);
+        let row: (String, String, String, i64) = db
+            .query_row(
+                "SELECT url,download_url_first,download_url_final,download_chain_count
+                 FROM BrowserActivity WHERE event_type='download'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            (
+                "https://cdn.test/final.zip".into(),
+                "https://start.test/first.zip".into(),
+                "https://cdn.test/final.zip".into(),
+                3
+            )
+        );
+    }
+
+    #[test]
+    fn cache_url_and_size_follow_the_shared_column_meaning() {
+        let case = case("cache-columns");
+        let path = facts(&case, "cache.sqlite", CACHE_DDL);
+        identify(
+            &path,
+            "/evidence/BROWSER/u/CHROME/Default/Cache/Cache_Data/index",
+            "cache",
+            None,
+        );
+        exec(
+            &path,
+            "INSERT INTO CacheEntries(response_time,url,content_length,cache_key,body_recovered,_source_file)
+             VALUES('2026-09-30 01:00:00.000','https://example.test/q?s=%ED%95%9C','2048','k1','0','index')",
+            &[],
+        );
+        let db = run(&case);
+        let row: (String, String, String, String, i64) = db
+            .query_row(
+                "SELECT url,url_raw,request_url,size,size_bytes FROM BrowserActivity",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            (
+                "https://example.test/q?s=한".into(),
+                "https://example.test/q?s=%ED%95%9C".into(),
+                "https://example.test/q?s=%ED%95%9C".into(),
+                "2.0 KB".into(),
+                2048
+            )
+        );
+    }
+
+    #[test]
+    fn collected_input_without_facts_tables_is_still_recorded() {
+        let case = case("empty-history");
+        // Facts copy of an empty History: identity only, no urls/visits tables.
+        let path = facts(&case, "Administrator_Edge.sqlite", "CREATE TABLE meta(key TEXT,value TEXT);");
+        identify(&path, "/evidence/BROWSER/Administrator/EDGE/Default/History", "history", Some("Edge"));
+        let db = run(&case);
+        let input: (String, Option<String>, String) = db
+            .query_row(
+                "SELECT input_kind,browser,facts_db FROM BrowserInputs",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            input,
+            ("history".into(), Some("Edge".into()), "BROWSER/Administrator_Edge.sqlite".into())
+        );
+        let events: i64 = db
+            .query_row("SELECT count(*) FROM BrowserActivity", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(events, 0);
     }
 }

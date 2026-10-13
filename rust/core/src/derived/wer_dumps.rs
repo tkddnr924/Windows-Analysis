@@ -14,10 +14,12 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OpenFlags};
 use sha2::{Digest, Sha256};
 
 use super::{text, text_opt, Cell, Ctx, Record, SourceRef};
+use crate::overview::basename_win;
 use crate::parsers::wer_dump::{self, Dump, MODULE_LOADED, MODULE_UNLOADED};
 use crate::time::{fmt_filetime, fmt_unix};
 
@@ -31,6 +33,7 @@ pub(super) const THREADS_TABLE: &str = "Wer_Dump_Threads";
 pub(super) const MODULES_TABLE: &str = "Wer_Dump_Modules";
 pub(super) const REGIONS_TABLE: &str = "Wer_Dump_Memory_Regions";
 pub(super) const COUNTERS_TABLE: &str = "Wer_Dump_Counters";
+pub(super) const DISCOVERY_ERRORS_TABLE: &str = "Wer_Dump_Discovery_Errors";
 pub(super) const ARTIFACT: &str = "WerCrashDump";
 
 /// Whole-file hashing stays bounded; larger dumps keep their size only.
@@ -43,6 +46,8 @@ CREATE TABLE "Wer_Dump_Files" (
   "collected_directory" TEXT NOT NULL,
   "location_role" TEXT NOT NULL,
   "report_file" TEXT,
+  "report_lookup_state" TEXT NOT NULL,
+  "report_lookup_error" TEXT,
   "byte_count" INTEGER,
   "sha256" TEXT,
   "hash_state" TEXT NOT NULL,
@@ -219,6 +224,9 @@ CREATE TABLE "Wer_Dump_Counters" (
   "value" INTEGER,
   "value_hex" TEXT NOT NULL
 );
+CREATE TABLE "Wer_Dump_Discovery_Errors" (
+  "error" TEXT NOT NULL
+);
 "#;
 
 // --- discovery --------------------------------------------------------------
@@ -233,12 +241,18 @@ pub(super) const LOCATION_WER_TEMP: &str = "wer_temp_directory";
 pub(super) const LOCATION_WER_TREE: &str = "wer_directory";
 pub(super) const LOCATION_OTHER: &str = "other_collected_location";
 
+pub(super) const LOOKUP_FOUND: &str = "found";
+pub(super) const LOOKUP_ABSENT: &str = "absent";
+pub(super) const LOOKUP_UNREADABLE: &str = "unreadable";
+
 struct Collected {
     path: PathBuf,
     directory: String,
     location_role: &'static str,
     /// The `Report.wer` collected in the same directory, by its real path.
     report_file: Option<String>,
+    report_lookup_state: &'static str,
+    report_lookup_error: Option<String>,
 }
 
 fn has_component(path: &Path, name: &str) -> bool {
@@ -250,31 +264,73 @@ fn has_component(path: &Path, name: &str) -> bool {
     })
 }
 
-/// A report file collected in the same directory, found by reading the
-/// directory itself rather than by assuming a file name case.
-fn report_in_directory(directory: &Path) -> Option<PathBuf> {
-    let entries = std::fs::read_dir(directory).ok()?;
-    let mut found: Vec<PathBuf> = entries
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.is_file()
-                && path
-                    .file_name()
-                    .map(|name| name.to_string_lossy().eq_ignore_ascii_case("Report.wer"))
-                    .unwrap_or(false)
-        })
-        .collect();
-    found.sort();
-    found.into_iter().next()
+/// Outcome of checking a dump's directory for its `Report.wer`.
+#[derive(Clone)]
+struct ReportLookup {
+    state: &'static str,
+    report: Option<PathBuf>,
+    error: Option<String>,
 }
 
-fn collected_dumps(target: &Path) -> Vec<Collected> {
-    let mut files: Vec<PathBuf> = walkdir::WalkDir::new(target)
+/// A report file collected in the same directory, found by reading the
+/// directory itself rather than by assuming a file name case. A directory or
+/// entry that cannot be read is "unreadable", never "absent".
+fn report_lookup(directory: &Path) -> ReportLookup {
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) => {
+            return ReportLookup {
+                state: LOOKUP_UNREADABLE,
+                report: None,
+                error: Some(format!("{}: {error}", directory.display())),
+            }
+        }
+    };
+    let mut found = Vec::new();
+    let mut errors = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                errors.push(format!("{}: {error}", directory.display()));
+                continue;
+            }
+        };
+        if !entry.file_name().to_string_lossy().eq_ignore_ascii_case("Report.wer") {
+            continue;
+        }
+        let path = entry.path();
+        match std::fs::metadata(&path) {
+            Ok(meta) if meta.is_file() => found.push(path),
+            Ok(_) => {}
+            Err(error) => errors.push(format!("{}: {error}", path.display())),
+        }
+    }
+    found.sort();
+    match found.into_iter().next() {
+        Some(report) => ReportLookup {
+            state: LOOKUP_FOUND,
+            report: Some(report),
+            error: None,
+        },
+        None if errors.is_empty() => ReportLookup {
+            state: LOOKUP_ABSENT,
+            report: None,
+            error: None,
+        },
+        None => ReportLookup {
+            state: LOOKUP_UNREADABLE,
+            report: None,
+            error: Some(errors.join(" | ")),
+        },
+    }
+}
+
+/// Collected dumps plus the walk failures met while searching for them.
+fn collected_dumps(target: &Path) -> (Vec<Collected>, Vec<String>) {
+    let (files, errors) = crate::finder::walk_files(target);
+    let mut files: Vec<PathBuf> = files
         .into_iter()
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.file_type().is_file())
-        .map(|entry| entry.into_path())
         .filter(|path| {
             path.extension()
                 .map(|ext| {
@@ -285,26 +341,29 @@ fn collected_dumps(target: &Path) -> Vec<Collected> {
         })
         .collect();
     files.sort();
-    let mut reports: BTreeMap<PathBuf, Option<PathBuf>> = BTreeMap::new();
-    files
+    let mut lookups: BTreeMap<PathBuf, ReportLookup> = BTreeMap::new();
+    let collected = files
         .into_iter()
         .map(|path| {
             let directory = path.parent().map(Path::to_path_buf).unwrap_or_default();
-            let report = reports
+            let lookup = lookups
                 .entry(directory.clone())
-                .or_insert_with(|| report_in_directory(&directory))
+                .or_insert_with(|| report_lookup(&directory))
                 .clone();
-            let parent_name = directory
+            // Roles read the path inside the collection, never the folders
+            // above it on the analyst's machine.
+            let relative = directory.strip_prefix(target).unwrap_or(&directory);
+            let parent_name = relative
                 .file_name()
                 .map(|name| name.to_string_lossy().to_string())
                 .unwrap_or_default();
-            let location_role = if report.is_some() {
+            let location_role = if lookup.report.is_some() {
                 LOCATION_REPORT_DIR
             } else if parent_name.eq_ignore_ascii_case("CrashDumps") {
                 LOCATION_CRASH_DUMPS
-            } else if parent_name.eq_ignore_ascii_case("Temp") && has_component(&directory, "WER") {
+            } else if parent_name.eq_ignore_ascii_case("Temp") && has_component(relative, "WER") {
                 LOCATION_WER_TEMP
-            } else if has_component(&directory, "WER") {
+            } else if has_component(relative, "WER") {
                 LOCATION_WER_TREE
             } else {
                 LOCATION_OTHER
@@ -313,10 +372,13 @@ fn collected_dumps(target: &Path) -> Vec<Collected> {
                 path,
                 directory: directory.display().to_string(),
                 location_role,
-                report_file: report.map(|path| path.display().to_string()),
+                report_file: lookup.report.map(|path| path.display().to_string()),
+                report_lookup_state: lookup.state,
+                report_lookup_error: lookup.error,
             }
         })
-        .collect()
+        .collect();
+    (collected, errors)
 }
 
 // --- helpers ----------------------------------------------------------------
@@ -327,14 +389,6 @@ fn int_u64(value: u64) -> Option<i64> {
 
 fn hex_u64(value: u64) -> String {
     format!("0x{value:x}")
-}
-
-fn file_name_of(path: &str) -> String {
-    path.replace('/', "\\")
-        .rsplit('\\')
-        .next()
-        .unwrap_or_default()
-        .to_string()
 }
 
 /// Hash the collected file as a whole so the stored evidence can be tied back
@@ -383,9 +437,18 @@ pub(super) fn prepare_inputs(
     conn.execute_batch(CREATE_SQL)?;
     conn.execute_batch("BEGIN")?;
     let mut rows = 0usize;
-    for collected in collected_dumps(target) {
+    let (collected, errors) = collected_dumps(target);
+    for collected in collected {
         let dump = wer_dump::parse_file(&collected.path);
         rows += insert_dump(&conn, &collected, &dump)?;
+    }
+    // A directory that could not be searched is evidence of an incomplete
+    // search, not of an absent dump.
+    for error in errors {
+        rows += conn.execute(
+            &format!("INSERT INTO \"{DISCOVERY_ERRORS_TABLE}\" (error) VALUES (?1)"),
+            [error],
+        )?;
     }
     conn.execute_batch("COMMIT")?;
     drop(conn);
@@ -435,7 +498,8 @@ fn insert_dump(conn: &Connection, collected: &Collected, dump: &Dump) -> Result<
     conn.execute(
         &format!(
             "INSERT INTO \"{FILES_TABLE}\" (_source_file, file_name, collected_directory, \
-             location_role, report_file, byte_count, sha256, hash_state, format, parse_status, \
+             location_role, report_file, report_lookup_state, report_lookup_error, byte_count, \
+             sha256, hash_state, format, parse_status, \
              parse_error, signature_ascii, signature_hex, version_raw, version_low, version_high, \
              checksum, time_date_stamp, time_date_stamp_kst, flags, flags_hex, stream_count, \
              stream_directory_rva, directory_state, issue_count, issues, processor_architecture, \
@@ -456,14 +520,16 @@ fn insert_dump(conn: &Connection, collected: &Collected, dump: &Dump) -> Result<
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,\
              ?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35,?36,?37,?38,?39,?40,?41,?42,\
              ?43,?44,?45,?46,?47,?48,?49,?50,?51,?52,?53,?54,?55,?56,?57,?58,?59,?60,?61,?62,?63,\
-             ?64,?65,?66,?67,?68,?69,?70,?71,?72,?73,?74,?75,?76,?77,?78,?79)"
+             ?64,?65,?66,?67,?68,?69,?70,?71,?72,?73,?74,?75,?76,?77,?78,?79,?80,?81)"
         ),
         rusqlite::params![
             source_file,
-            file_name_of(&source_file),
+            basename_win(&source_file),
             collected.directory,
             collected.location_role,
             collected.report_file,
+            collected.report_lookup_state,
+            collected.report_lookup_error,
             int_u64(dump.byte_count),
             sha256,
             hash_state,
@@ -542,7 +608,7 @@ fn insert_dump(conn: &Connection, collected: &Collected, dump: &Dump) -> Result<
             exception.as_ref().map(|value| i64::from(value.context_size)),
             exception_thread_in_list,
             first_module_path.clone(),
-            first_module_path.as_deref().map(file_name_of),
+            first_module_path.as_deref().map(basename_win),
             dump.threads.len() as i64,
             loaded,
             unloaded,
@@ -662,11 +728,11 @@ fn insert_dump(conn: &Connection, collected: &Collected, dump: &Dump) -> Result<
                     .filter(|value| !value.is_empty()),
                 name,
                 module.name_state,
-                module.name.as_deref().map(file_name_of),
+                module.name.as_deref().map(basename_win),
                 module
                     .name
                     .as_deref()
-                    .map(|name| file_name_of(name).to_lowercase()),
+                    .map(|name| basename_win(name).to_lowercase()),
                 version.as_ref().map(|info| info.file_version.clone()),
                 version.as_ref().map(|info| info.product_version.clone()),
                 version.as_ref().map(|info| i64::from(info.file_flags)),
@@ -748,14 +814,6 @@ pub(super) struct FileRow {
     pub search_values: Vec<String>,
 }
 
-struct ChildRows {
-    streams: Vec<Vec<Cell>>,
-    threads: Vec<Vec<Cell>>,
-    modules: Vec<Vec<Cell>>,
-    regions: Vec<Vec<Cell>>,
-    counters: Vec<Vec<Cell>>,
-}
-
 fn open_facts(out_dir: &Path) -> Result<Option<Connection>> {
     let path = dump_path(out_dir);
     if !path.exists() {
@@ -785,6 +843,8 @@ fn cell_text(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<Cell> {
 const FILE_COLUMNS: &[(&str, &str, bool)] = &[
     ("format", "dump_format", false),
     ("parse_status", "dump_parse_status", false),
+    ("report_lookup_state", "dump_report_lookup_state", false),
+    ("report_lookup_error", "dump_report_lookup_error", false),
     ("parse_error", "dump_parse_error", false),
     ("signature_hex", "dump_signature_hex", false),
     ("version_raw", "dump_version_raw", true),
@@ -892,181 +952,51 @@ fn read_files(conn: &Connection) -> Result<Vec<FileRow>> {
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-fn read_children(conn: &Connection, source_file: &str) -> Result<ChildRows> {
-    let mut streams = Vec::new();
-    {
+/// Facts child tables and the overview child tables they fill, in output
+/// order. Columns are selected by the overview child's own column names, so a
+/// renamed or missing column fails the query instead of shifting values.
+const CHILD_TABLES: &[(&str, &str)] = &[
+    (STREAMS_TABLE, "WerDumpStreams"),
+    (THREADS_TABLE, "WerDumpThreads"),
+    (MODULES_TABLE, "WerDumpModules"),
+    (REGIONS_TABLE, "WerDumpMemoryRegions"),
+    (COUNTERS_TABLE, "WerDumpCounters"),
+];
+
+/// Every child row of one dump as (overview child table, values); each value
+/// keeps the storage type it was written with.
+fn read_children(conn: &Connection, source_file: &str) -> Result<Vec<(&'static str, Vec<Cell>)>> {
+    let mut children = Vec::new();
+    for &(facts_table, child_table) in CHILD_TABLES {
+        // record_id and ordinal are assigned by the overview record.
+        let columns = super::wer_reports::SPEC
+            .child(child_table)
+            .and_then(|spec| spec.columns.strip_prefix(&["record_id", "ordinal"][..]))
+            .ok_or_else(|| anyhow::anyhow!("{child_table} 자식 테이블 정의가 없습니다"))?;
+        let selected: Vec<String> = columns.iter().map(|column| format!("\"{column}\"")).collect();
         let mut query = conn.prepare(&format!(
-            "SELECT stream_index,stream_type,stream_type_name,data_size,stream_rva,range_state,\
-             parse_state,overlaps,header_size,entry_size,declared_entries,stored_entries,sha256,\
-             prefix_hex,text_value,note FROM \"{STREAMS_TABLE}\" WHERE _source_file=?1 \
-             ORDER BY rowid"
+            "SELECT {} FROM \"{facts_table}\" WHERE _source_file=?1 ORDER BY rowid",
+            selected.join(",")
         ))?;
-        let mapped = query.query_map([source_file], |row| {
-            Ok(vec![
-                cell_int(row, 0)?,
-                cell_int(row, 1)?,
-                cell_text(row, 2)?,
-                cell_int(row, 3)?,
-                cell_int(row, 4)?,
-                cell_text(row, 5)?,
-                cell_text(row, 6)?,
-                cell_int(row, 7)?,
-                cell_int(row, 8)?,
-                cell_int(row, 9)?,
-                cell_int(row, 10)?,
-                cell_int(row, 11)?,
-                cell_text(row, 12)?,
-                cell_text(row, 13)?,
-                cell_text(row, 14)?,
-                cell_text(row, 15)?,
-            ])
-        })?;
-        for row in mapped {
-            streams.push(row?);
+        let mut rows = query.query([source_file])?;
+        while let Some(row) = rows.next()? {
+            let mut values = Vec::with_capacity(columns.len());
+            for index in 0..columns.len() {
+                values.push(match row.get_ref(index)? {
+                    ValueRef::Null => Cell::Null,
+                    ValueRef::Integer(value) => Cell::Int(value),
+                    ValueRef::Text(bytes) => Cell::Text(std::str::from_utf8(bytes)?.to_string()),
+                    ValueRef::Blob(bytes) => Cell::Blob(bytes.to_vec()),
+                    ValueRef::Real(_) => anyhow::bail!(
+                        "{facts_table}.{}: 실수 값은 저장하지 않습니다",
+                        columns[index]
+                    ),
+                });
+            }
+            children.push((child_table, values));
         }
     }
-    let mut threads = Vec::new();
-    {
-        let mut query = conn.prepare(&format!(
-            "SELECT thread_index,source_stream,thread_id,suspend_count,priority_class,priority,\
-             teb,teb_hex,stack_start,stack_start_hex,stack_size,stack_rva,context_rva,\
-             context_size,thread_name,is_exception_thread,dump_flags,dump_error,exit_status,\
-             create_time_raw,create_time,exit_time_raw,exit_time,kernel_time_100ns,\
-             user_time_100ns,start_address_hex,affinity_hex FROM \"{THREADS_TABLE}\" \
-             WHERE _source_file=?1 ORDER BY rowid"
-        ))?;
-        let mapped = query.query_map([source_file], |row| {
-            Ok(vec![
-                cell_int(row, 0)?,
-                cell_text(row, 1)?,
-                cell_int(row, 2)?,
-                cell_int(row, 3)?,
-                cell_int(row, 4)?,
-                cell_int(row, 5)?,
-                cell_int(row, 6)?,
-                cell_text(row, 7)?,
-                cell_int(row, 8)?,
-                cell_text(row, 9)?,
-                cell_int(row, 10)?,
-                cell_int(row, 11)?,
-                cell_int(row, 12)?,
-                cell_int(row, 13)?,
-                cell_text(row, 14)?,
-                cell_int(row, 15)?,
-                cell_int(row, 16)?,
-                cell_int(row, 17)?,
-                cell_int(row, 18)?,
-                cell_int(row, 19)?,
-                cell_text(row, 20)?,
-                cell_int(row, 21)?,
-                cell_text(row, 22)?,
-                cell_int(row, 23)?,
-                cell_int(row, 24)?,
-                cell_text(row, 25)?,
-                cell_text(row, 26)?,
-            ])
-        })?;
-        for row in mapped {
-            threads.push(row?);
-        }
-    }
-    let mut modules = Vec::new();
-    {
-        let mut query = conn.prepare(&format!(
-            "SELECT module_index,module_kind,base_of_image,base_of_image_hex,size_of_image,\
-             checksum,time_date_stamp,time_date_stamp_kst,module_path,module_path_state,\
-             file_name,file_name_lower,file_version,product_version,file_flags,file_os,\
-             file_type,file_subtype,cv_signature,cv_guid,cv_age,pdb_file_name,cv_state \
-             FROM \"{MODULES_TABLE}\" WHERE _source_file=?1 ORDER BY rowid"
-        ))?;
-        let mapped = query.query_map([source_file], |row| {
-            Ok(vec![
-                cell_int(row, 0)?,
-                cell_text(row, 1)?,
-                cell_int(row, 2)?,
-                cell_text(row, 3)?,
-                cell_int(row, 4)?,
-                cell_int(row, 5)?,
-                cell_int(row, 6)?,
-                cell_text(row, 7)?,
-                cell_text(row, 8)?,
-                cell_text(row, 9)?,
-                cell_text(row, 10)?,
-                cell_text(row, 11)?,
-                cell_text(row, 12)?,
-                cell_text(row, 13)?,
-                cell_int(row, 14)?,
-                cell_int(row, 15)?,
-                cell_int(row, 16)?,
-                cell_int(row, 17)?,
-                cell_text(row, 18)?,
-                cell_text(row, 19)?,
-                cell_int(row, 20)?,
-                cell_text(row, 21)?,
-                cell_text(row, 22)?,
-            ])
-        })?;
-        for row in mapped {
-            modules.push(row?);
-        }
-    }
-    let mut regions = Vec::new();
-    {
-        let mut query = conn.prepare(&format!(
-            "SELECT region_index,source_stream,base_address,base_address_hex,allocation_base,\
-             allocation_base_hex,allocation_protect,region_size,state,state_name,protect,\
-             protect_name,region_type,region_type_name,stored_data_size \
-             FROM \"{REGIONS_TABLE}\" WHERE _source_file=?1 ORDER BY rowid"
-        ))?;
-        let mapped = query.query_map([source_file], |row| {
-            Ok(vec![
-                cell_int(row, 0)?,
-                cell_text(row, 1)?,
-                cell_int(row, 2)?,
-                cell_text(row, 3)?,
-                cell_int(row, 4)?,
-                cell_text(row, 5)?,
-                cell_int(row, 6)?,
-                cell_int(row, 7)?,
-                cell_int(row, 8)?,
-                cell_text(row, 9)?,
-                cell_int(row, 10)?,
-                cell_text(row, 11)?,
-                cell_int(row, 12)?,
-                cell_text(row, 13)?,
-                cell_int(row, 14)?,
-            ])
-        })?;
-        for row in mapped {
-            regions.push(row?);
-        }
-    }
-    let mut counters = Vec::new();
-    {
-        let mut query = conn.prepare(&format!(
-            "SELECT stream_type,struct_name,field_name,value,value_hex FROM \"{COUNTERS_TABLE}\" \
-             WHERE _source_file=?1 ORDER BY rowid"
-        ))?;
-        let mapped = query.query_map([source_file], |row| {
-            Ok(vec![
-                cell_int(row, 0)?,
-                cell_text(row, 1)?,
-                cell_text(row, 2)?,
-                cell_int(row, 3)?,
-                cell_text(row, 4)?,
-            ])
-        })?;
-        for row in mapped {
-            counters.push(row?);
-        }
-    }
-    Ok(ChildRows {
-        streams,
-        threads,
-        modules,
-        regions,
-        counters,
-    })
+    Ok(children)
 }
 
 // --- overview records -------------------------------------------------------
@@ -1149,20 +1079,8 @@ pub(super) fn build(ctx: &Ctx) -> Result<Vec<DumpRecord>> {
         record.set("relation_count", Cell::Int(0));
         record.set("search_text", Cell::Text(file.search_values.join("\n")));
 
-        for values in children.streams {
-            record.child("WerDumpStreams", values);
-        }
-        for values in children.threads {
-            record.child("WerDumpThreads", values);
-        }
-        for values in children.modules {
-            record.child("WerDumpModules", values);
-        }
-        for values in children.regions {
-            record.child("WerDumpMemoryRegions", values);
-        }
-        for values in children.counters {
-            record.child("WerDumpCounters", values);
+        for (table, values) in children {
+            record.child(table, values);
         }
         paths(&mut record, &file);
         record.set(
@@ -1226,7 +1144,7 @@ fn paths(record: &mut Record, file: &FileRow) {
         ],
     );
     if let Some(path) = file.first_module_path.as_deref() {
-        let name = file_name_of(path);
+        let name = basename_win(path);
         record.child(
             "WerPaths",
             vec![
@@ -1283,14 +1201,16 @@ pub(super) struct Observation {
 pub(super) fn observation(ctx: &Ctx, dumps: &[DumpRecord]) -> Result<Observation> {
     let facts_path = dump_path(ctx.out_dir);
     let found = ctx.facts.by_path(&facts_path);
+    // Only a dump whose bytes could not be read fails; an identified
+    // non-minidump container or version was read successfully.
     let failed = dumps
         .iter()
         .filter(|dump| {
-            !matches!(
+            matches!(
                 dump.record.get("dump_parse_status"),
                 Some(Cell::Text(status))
-                    if status.as_str() == wer_dump::STATUS_PARSED
-                        || status.as_str() == wer_dump::STATUS_PARSED_WITH_ISSUES
+                    if status.as_str() == wer_dump::STATUS_READ_FAILED
+                        || status.as_str() == wer_dump::STATUS_TRUNCATED
             )
         })
         .count() as i64;
@@ -1303,6 +1223,23 @@ pub(super) fn observation(ctx: &Ctx, dumps: &[DumpRecord]) -> Result<Observation
             )
         })
         .count();
+    let lookup_failed = dumps
+        .iter()
+        .filter(|dump| {
+            matches!(
+                dump.record.get("dump_report_lookup_state"),
+                Some(Cell::Text(state)) if state.as_str() == LOOKUP_UNREADABLE
+            )
+        })
+        .count();
+    let discovery_errors: i64 = match (found, open_facts(ctx.out_dir)?) {
+        (Some(_), Some(conn)) => conn.query_row(
+            &format!("SELECT COUNT(*) FROM \"{DISCOVERY_ERRORS_TABLE}\""),
+            [],
+            |row| row.get(0),
+        )?,
+        _ => 0,
+    };
     let (collection_state, facts_db, facts_table, facts_generation, source) = match found {
         Some(db) if !dumps.is_empty() => {
             let generation = ctx.facts.generation(db)?;
@@ -1341,9 +1278,11 @@ pub(super) fn observation(ctx: &Ctx, dumps: &[DumpRecord]) -> Result<Observation
         record_count: dumps.len() as i64,
         failed_count: failed,
         note: format!(
-            "수집 덤프 {}개, 미니덤프가 아닌 컨테이너 {}개",
+            "수집 덤프 {}개, 미니덤프가 아닌 컨테이너 {}개, 보고서 확인 실패 {}개, 탐색 실패 {}건",
             dumps.len(),
-            unsupported
+            unsupported,
+            lookup_failed,
+            discovery_errors
         ),
         source,
     })
@@ -1369,7 +1308,8 @@ mod tests {
         std::fs::write(temp_dir.join("WER1.tmp.dmp"), b"").unwrap();
         std::fs::write(other.join("x.mdmp"), b"").unwrap();
 
-        let found = collected_dumps(&base);
+        let (found, errors) = collected_dumps(&base);
+        assert!(errors.is_empty());
         let roles: BTreeMap<String, &'static str> = found
             .iter()
             .map(|dump| {
@@ -1397,6 +1337,68 @@ mod tests {
             .find(|dump| dump.location_role == LOCATION_CRASH_DUMPS)
             .unwrap();
         assert_eq!(crash.report_file, None);
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// A directory that cannot be read is neither "no report" nor silently
+    /// skipped: walk failures and report lookup failures stay recorded.
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_locations_are_recorded() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("wina-dumps-locked-{}", uuid::Uuid::new_v4()));
+        let target = base.join("target");
+        let out = base.join("out");
+        let report_dir = target.join("WER/ReportQueue/abc");
+        let locked = target.join("WER/ReportArchive/locked");
+        std::fs::create_dir_all(&report_dir).unwrap();
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(report_dir.join("Report.wer"), b"Version=1").unwrap();
+        std::fs::write(report_dir.join("memory.hdmp"), b"").unwrap();
+        std::fs::write(locked.join("hidden.dmp"), b"").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let published = prepare_inputs(&out, &target, "facts");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        published.unwrap();
+        let conn = Connection::open(dump_path(&out)).unwrap();
+        let errors: Vec<String> = conn
+            .prepare("SELECT error FROM Wer_Dump_Discovery_Errors")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("locked"), "{errors:?}");
+        let state: String = conn
+            .query_row(
+                "SELECT report_lookup_state FROM Wer_Dump_Files WHERE file_name='memory.hdmp'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "found");
+        drop(conn);
+
+        let lookup = report_lookup(&target.join("WER/ReportQueue/missing"));
+        assert_eq!(lookup.state, LOOKUP_UNREADABLE);
+        assert!(lookup.report.is_none() && lookup.error.is_some());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// Location roles read the path inside the collection, not the folders
+    /// above it on the analyst's machine.
+    #[test]
+    fn location_roles_ignore_the_collection_root() {
+        let base = std::env::temp_dir().join(format!("wina-dumps-root-{}", uuid::Uuid::new_v4()));
+        let target = base.join("WER");
+        let other = target.join("Other");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("x.mdmp"), b"").unwrap();
+        let (found, errors) = collected_dumps(&target);
+        assert!(errors.is_empty());
+        assert_eq!(found[0].location_role, LOCATION_OTHER);
         std::fs::remove_dir_all(&base).unwrap();
     }
 }

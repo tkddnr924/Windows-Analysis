@@ -166,24 +166,35 @@ pub fn parse_index_dat(
         row.insert("container".into(), container.clone());
         row.insert("account".into(), account.to_string());
         row.insert("_source_file".into(), source.clone());
-        let url = if record_type == "REDR" {
-            zstring(rec, OFF_REDR_URL)
-        } else {
-            row.insert("modified_time".into(), ft(le_u64(rec, OFF_MODIFIED)));
-            row.insert("accessed_time".into(), ft(le_u64(rec, OFF_ACCESSED)));
-            row.insert(
-                "hits".into(),
-                le_u32(rec, OFF_HITS)
-                    .map(|h| h.to_string())
-                    .unwrap_or_default(),
-            );
-            let url_off = le_u32(rec, OFF_URL).unwrap_or(0) as usize;
-            let fn_off = le_u32(rec, OFF_FILENAME).unwrap_or(0) as usize;
-            row.insert("filename".into(), zstring(rec, fn_off));
-            zstring(rec, url_off)
+        let url = match record_type {
+            "REDR" => zstring(rec, OFF_REDR_URL),
+            // libmsiecf: LEAK leaves time/hits/location uninitialized; only the
+            // filename offset is defined.
+            "LEAK" => {
+                let fn_off = le_u32(rec, OFF_FILENAME).unwrap_or(0) as usize;
+                row.insert("filename".into(), zstring(rec, fn_off));
+                String::new()
+            }
+            _ => {
+                row.insert("modified_time".into(), ft(le_u64(rec, OFF_MODIFIED)));
+                row.insert("accessed_time".into(), ft(le_u64(rec, OFF_ACCESSED)));
+                row.insert(
+                    "hits".into(),
+                    le_u32(rec, OFF_HITS)
+                        .map(|h| h.to_string())
+                        .unwrap_or_default(),
+                );
+                let url_off = le_u32(rec, OFF_URL).unwrap_or(0) as usize;
+                let fn_off = le_u32(rec, OFF_FILENAME).unwrap_or(0) as usize;
+                row.insert("filename".into(), zstring(rec, fn_off));
+                zstring(rec, url_off)
+            }
         };
-            if url.is_empty() {
+            let keep = !url.is_empty()
+                || (record_type == "LEAK" && row.get("filename").is_some_and(|f| !f.is_empty()));
+            if !keep {
                 // URL 없는 항목(빈 슬롯/부분 덮어쓰기)은 증거 가치가 없다 — skip.
+                // LEAK는 캐시 파일명만 정의돼 있어 파일명으로 남긴다.
                 off += nblocks * BLOCK;
                 continue;
             }
@@ -239,6 +250,16 @@ mod tests {
         put_u32(&mut b, r2 + 4, 1);
         let redr = b"http://redirect.example.com/";
         b[r2 + OFF_REDR_URL..r2 + OFF_REDR_URL + redr.len()].copy_from_slice(redr);
+
+        let r3 = BLOCK * 4; // LEAK record, 1 block, uninitialized "time/url" bytes
+        b[r3..r3 + 4].copy_from_slice(b"LEAK");
+        put_u32(&mut b, r3 + 4, 1);
+        put_u64(&mut b, r3 + OFF_ACCESSED, 129_600_000_000_000_002);
+        put_u32(&mut b, r3 + OFF_URL, 0x68);
+        put_u32(&mut b, r3 + OFF_HITS, 99);
+        put_u32(&mut b, r3 + OFF_FILENAME, 0x68);
+        let leaked = b"leaked[1].htm";
+        b[r3 + 0x68..r3 + 0x68 + leaked.len()].copy_from_slice(leaked);
         b
     }
 
@@ -262,7 +283,7 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        assert_eq!(count, 2);
+        assert_eq!(count, 3);
         let url_row = &rows[0];
         assert_eq!(url_row.get("record_type").map(String::as_str), Some("URL"));
         assert_eq!(
@@ -279,6 +300,12 @@ mod tests {
             redr_row.get("url").map(String::as_str),
             Some("http://redirect.example.com/")
         );
+        let leak_row = &rows[2];
+        assert_eq!(leak_row.get("record_type").map(String::as_str), Some("LEAK"));
+        assert_eq!(leak_row.get("filename").map(String::as_str), Some("leaked[1].htm"));
+        assert_eq!(leak_row.get("url").map(String::as_str), Some(""));
+        assert!(leak_row.get("accessed_time").is_none());
+        assert!(leak_row.get("hits").is_none());
         let _ = std::fs::remove_dir_all(dir);
     }
 

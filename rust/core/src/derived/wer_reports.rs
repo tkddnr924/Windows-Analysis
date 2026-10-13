@@ -7,8 +7,8 @@ use anyhow::{anyhow, Result};
 
 use super::schema::{ChildSpec, DbSpec};
 use super::{int, is_sid, nz, text, text_raw, Cell, Ctx, DerivedDb, Record, SourceRef};
-use crate::overview::EventLogOverviewCache;
-use crate::wer_evidence::{self, Origin, WerRecord};
+use crate::overview::basename_win;
+use crate::wer_evidence::{Origin, WerRecord};
 
 /// Counts and sizes are stored as INTEGER so a real 0 differs from NULL.
 const INT_COLUMNS: &[&str] = &[
@@ -35,14 +35,6 @@ fn cell_for(column: &str, value: &str) -> Cell {
 /// recorded path. Nothing else is rewritten.
 fn normalize_path(raw: &str) -> String {
     raw.strip_prefix("\\\\?\\").unwrap_or(raw).to_string()
-}
-
-fn file_name_of(path: &str) -> String {
-    path.replace('/', "\\")
-        .rsplit('\\')
-        .next()
-        .unwrap_or_default()
-        .to_string()
 }
 
 /// The recording subject of an event is stored in its own role; it is never
@@ -174,8 +166,8 @@ fn record(ctx: &Ctx, item: &WerRecord) -> Result<Record> {
                 Cell::Text(path.role.to_string()),
                 Cell::Text(path.raw.clone()),
                 Cell::Text(normalized.clone()),
-                text(&file_name_of(&normalized)),
-                text(&file_name_of(&normalized).to_lowercase()),
+                text(&basename_win(&normalized)),
+                text(&basename_win(&normalized).to_lowercase()),
                 resolved,
                 Cell::Text(status.to_string()),
                 Cell::Text(path.basis.to_string()),
@@ -431,8 +423,8 @@ pub(super) fn prepare_inputs(
     super::wer_dumps::prepare_inputs(out_dir, target, dataset_id)
 }
 
-pub(super) fn build(ctx: &Ctx, events: &EventLogOverviewCache) -> Result<usize> {
-    let mut items = wer_evidence::collect(ctx.out_dir, events)?;
+/// `items` is the WER collection shared with ExecutionHistory.
+pub(super) fn build(ctx: &Ctx, mut items: Vec<WerRecord>) -> Result<usize> {
     for item in items.iter_mut() {
         resolve_account(ctx, item);
     }
@@ -703,6 +695,8 @@ CREATE TABLE "WerReports" (
   "dump_location_role" TEXT,
   "dump_collected_directory" TEXT,
   "dump_report_file" TEXT,
+  "dump_report_lookup_state" TEXT,
+  "dump_report_lookup_error" TEXT,
   "record_key" TEXT,
   "source_file" TEXT,
   "search_text" TEXT,
@@ -949,7 +943,7 @@ CREATE TABLE "WerDumpCounters" (
 
 CREATE TABLE _wina_derived_version (name TEXT NOT NULL PRIMARY KEY, version INTEGER NOT NULL);
 INSERT INTO _wina_derived_version(name,version) VALUES ('overview_contract',1);
-INSERT INTO _wina_derived_version(name,version) VALUES ('wer_reports',5);
+INSERT INTO _wina_derived_version(name,version) VALUES ('wer_reports',6);
 "#;
 
 const MAIN: &[&str] = &[
@@ -1004,6 +998,7 @@ const MAIN: &[&str] = &[
     "dump_exception_code_hex", "dump_exception_code_name", "dump_exception_address_hex",
     "dump_exception_parameters", "dump_exception_thread_in_list", "dump_file_name",
     "dump_location_role", "dump_collected_directory", "dump_report_file",
+    "dump_report_lookup_state", "dump_report_lookup_error",
     "record_key", "source_file", "search_text",
 ];
 
@@ -1187,6 +1182,10 @@ mod tests {
         Connection::open(root.join("_OVERVIEW/WerReports.sqlite")).unwrap()
     }
 
+    fn build_from(ctx: &Ctx, events: &crate::overview::EventLogOverviewCache) -> Result<usize> {
+        build(ctx, crate::wer_evidence::collect(ctx.out_dir, events)?)
+    }
+
     #[test]
     fn storage_keeps_types_stages_relations_paths_and_failures() {
         let root = facts_root("storage");
@@ -1253,7 +1252,7 @@ mod tests {
             meta: MetaLookup::load(&root).unwrap(),
         };
         // Upload telemetry is not a report: four report rows plus two events.
-        assert_eq!(build(&ctx, &events).unwrap(), 6);
+        assert_eq!(build_from(&ctx, &events).unwrap(), 6);
         let db = open(&root);
 
         // R01/A04: each family keeps its own role; no merged exception column.
@@ -1563,7 +1562,7 @@ mod tests {
             facts: FactsIndex::load(&root).unwrap(),
             meta: MetaLookup::load(&root).unwrap(),
         };
-        assert_eq!(build(&ctx, &events).unwrap(), 0);
+        assert_eq!(build_from(&ctx, &events).unwrap(), 0);
         let db = open(&root);
         let states: Vec<(String, String)> = db
             .prepare("SELECT scope,collection_state FROM WerObservations ORDER BY scope")
@@ -1592,7 +1591,7 @@ mod tests {
             facts: FactsIndex::load(&root).unwrap(),
             meta: MetaLookup::load(&root).unwrap(),
         };
-        assert_eq!(build(&ctx, &events).unwrap(), 0);
+        assert_eq!(build_from(&ctx, &events).unwrap(), 0);
         let db = open(&root);
         assert_eq!(
             db.query_row(
@@ -1628,7 +1627,7 @@ mod tests {
             facts: FactsIndex::load(&root).unwrap(),
             meta: MetaLookup::load(&root).unwrap(),
         };
-        assert_eq!(build(&ctx, &events).unwrap(), 2);
+        assert_eq!(build_from(&ctx, &events).unwrap(), 2);
         let db = open(&root);
         let stored: Vec<(String, String, Option<String>)> = db
             .prepare(
@@ -1700,7 +1699,7 @@ mod tests {
             meta: MetaLookup::load(&root).unwrap(),
         };
         // One report plus three collected dump files.
-        assert_eq!(build(&ctx, &events).unwrap(), 4);
+        assert_eq!(build_from(&ctx, &events).unwrap(), 4);
         let db = open(&root);
 
         let dumps: Vec<(String, String, Option<String>, String, i64)> = db
@@ -1740,6 +1739,26 @@ mod tests {
                     "user_minidump".to_string(),
                     1
                 ),
+            ]
+        );
+
+        // Each dump records whether its directory was checked for a report.
+        let lookups: Vec<(String, String, Option<String>)> = db
+            .prepare(
+                "SELECT dump_file_name,dump_report_lookup_state,dump_report_lookup_error
+                 FROM WerReports WHERE origin='crash_dump' ORDER BY dump_file_name",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            lookups,
+            vec![
+                ("MEMORY.DMP".to_string(), "absent".to_string(), None),
+                ("app.exe.4242.dmp".to_string(), "absent".to_string(), None),
+                ("crash.dmp".to_string(), "found".to_string(), None),
             ]
         );
 
@@ -1950,6 +1969,7 @@ mod tests {
             )
         );
 
+        // The kernel container was read and identified; it is not a failure.
         let observation: (String, i64, i64, Option<String>) = db
             .query_row(
                 "SELECT collection_state,record_count,failed_count,facts_generation
@@ -1963,7 +1983,7 @@ mod tests {
             (
                 "collected".to_string(),
                 3,
-                1,
+                0,
                 Some("facts-new".to_string())
             )
         );

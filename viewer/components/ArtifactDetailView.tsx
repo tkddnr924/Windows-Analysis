@@ -9,8 +9,9 @@ import CircularProgress from "@mui/material/CircularProgress";
 import ExpandLessOutlinedIcon from "@mui/icons-material/ExpandLessOutlined";
 import ExpandMoreOutlinedIcon from "@mui/icons-material/ExpandMoreOutlined";
 import OpenInFullOutlinedIcon from "@mui/icons-material/OpenInFullOutlined";
-import ContentCopyOutlinedIcon from "@mui/icons-material/ContentCopyOutlined";
-import CheckIcon from "@mui/icons-material/Check";
+import { CopyButton, JsonToggleButton, valueControlButtonStyle } from "./ValueControls";
+import { prettyJsonOrNull, unescapeControlSequences } from "@/lib/jsonText";
+import { fallbackLinkedRowTitle } from "@/lib/linkedRowTitle";
 import CategoryOutlinedIcon from "@mui/icons-material/CategoryOutlined";
 import PersonOutlineOutlinedIcon from "@mui/icons-material/PersonOutlineOutlined";
 import type { ArtifactViewSpec, DetailSectionSpec, FieldKind, FieldSpec, LinkSpec } from "@/lib/artifactViews";
@@ -83,55 +84,6 @@ function formatDurationMs(value: string): string {
   return `${(minutes / 60).toFixed(1)}시간`;
 }
 
-// JSON.stringify가 되돌려 놓는 \r \n \t 이스케이프를 실제 줄바꿈·들여쓰기로
-// 풀어 사람이 읽게 만든다. 경로의 "C:\\Windows" 같은 진짜 역슬래시(\\)는
-// 짝으로 건너뛰어 훼손하지 않는다.
-function unescapeControlSequences(text: string): string {
-  let out = "";
-  for (let i = 0; i < text.length; i += 1) {
-    const ch = text[i];
-    if (ch !== "\\") {
-      out += ch;
-      continue;
-    }
-    const next = text[i + 1];
-    if (next === "\\") {
-      out += "\\\\";
-      i += 1;
-      continue;
-    }
-    if (next === "r") {
-      // \r\n 은 한 번의 줄바꿈으로 합친다.
-      if (text[i + 2] === "\\" && text[i + 3] === "n") i += 2;
-      out += "\n";
-      i += 1;
-      continue;
-    }
-    if (next === "n") {
-      out += "\n";
-      i += 1;
-      continue;
-    }
-    if (next === "t") {
-      out += "    ";
-      i += 1;
-      continue;
-    }
-    out += ch;
-  }
-  return out;
-}
-
-function prettyJsonOrNull(value: string): string | null {
-  const trimmed = value.trim();
-  if (!trimmed || (trimmed[0] !== "{" && trimmed[0] !== "[")) return null;
-  try {
-    return JSON.stringify(JSON.parse(trimmed), null, 2);
-  } catch {
-    return null;
-  }
-}
-
 // Renders a code/JSON blob. When the value parses as JSON it defaults to a
 // beautified (indented) view with a toggle back to the original one-line
 // form; otherwise it just shows the raw text. An expand button opens the
@@ -142,60 +94,19 @@ function CodeOrJsonBlock({ raw, expandTitle }: { raw: string; expandTitle?: stri
   const pretty = prettyJsonOrNull(raw);
   const [beautified, setBeautified] = useState(true);
   const [expanded, setExpanded] = useState(false);
-  const [copied, setCopied] = useState(false);
-  const [copyError, setCopyError] = useState(false);
+  // Beautified view also expands control escapes; copy keeps the raw value.
+  const shown = pretty !== null && beautified ? unescapeControlSequences(pretty) : raw;
   const isJson = pretty !== null;
-  // 보기 좋게 정렬 모드에서는 제어문자 이스케이프도 실제 줄바꿈으로 풀어
-  // 보여준다 (복사는 항상 원본 그대로).
-  const shown = isJson && beautified ? unescapeControlSequences(pretty as string) : raw;
-
-  async function copy() {
-    try {
-      await navigator.clipboard.writeText(raw);
-      setCopied(true);
-      setCopyError(false);
-      window.setTimeout(() => setCopied(false), 1000);
-    } catch {
-      setCopyError(true);
-      window.setTimeout(() => setCopyError(false), 2400);
-    }
-  }
-
-  const btnStyle: React.CSSProperties = {
-    display: "inline-flex",
-    alignItems: "center",
-    justifyContent: "center",
-    gap: 4,
-    minHeight: 25,
-    fontSize: 11.5,
-    padding: "2px 9px",
-    background: "transparent",
-    color: "var(--accent)",
-    border: "1px solid var(--border)",
-    borderRadius: "var(--radius)",
-    cursor: "pointer",
-  };
 
   return (
     <div>
-      <div style={{ display: "flex", justifyContent: "flex-end", gap: 6, marginBottom: 4 }}>
-        {isJson && (
-          <button
-            onClick={() => setBeautified((b) => !b)}
-            title={beautified ? "원본(압축) 보기" : "보기 좋게 정렬"}
-            style={btnStyle}
-          >
-            {"{ }"}
-          </button>
-        )}
-        <button onClick={copy} title={copyError ? "복사 실패" : copied ? "복사됨" : "복사"} aria-label={copyError ? "복사 실패" : copied ? "복사됨" : "값 복사"} style={{ ...btnStyle, width: 28, padding: 0, color: copyError ? "var(--danger)" : "var(--text-dim)" }}>
-          {copied ? <CheckIcon sx={{ fontSize: 16, color: "var(--success)" }} /> : <ContentCopyOutlinedIcon sx={{ fontSize: 15 }} />}
-        </button>
-        <button onClick={() => setExpanded(true)} title="크게 보기" aria-label="크게 보기" style={{ ...btnStyle, width: 28, padding: 0, color: "var(--text-dim)" }}>
+      <div style={{ display: "flex", justifyContent: "flex-end", alignItems: "center", gap: 6, marginBottom: 4 }}>
+        {isJson && <JsonToggleButton beautified={beautified} onToggle={() => setBeautified((b) => !b)} />}
+        <CopyButton value={raw} />
+        <button onClick={() => setExpanded(true)} title="크게 보기" aria-label="크게 보기" style={{ ...valueControlButtonStyle, width: 28, padding: 0, color: "var(--text-dim)" }}>
           <OpenInFullOutlinedIcon aria-hidden="true" sx={{ fontSize: 15 }} />
         </button>
       </div>
-      {copyError && <div role="status" style={{ marginBottom: 4, color: "var(--danger)", fontSize: 10.5 }}>클립보드에 복사하지 못했습니다.</div>}
       {expanded && <CodeModal code={shown} title={expandTitle ?? "코드 보기"} onClose={() => setExpanded(false)} />}
       <pre
         style={{
@@ -234,47 +145,6 @@ function Badge({ text, color }: { text: string; color?: string }) {
   );
 }
 
-function CopyButton({ value }: { value: string }) {
-  const [copied, setCopied] = useState(false);
-  const [copyError, setCopyError] = useState(false);
-  return (
-    <button
-      onClick={async (e) => {
-        e.stopPropagation();
-        try {
-          await navigator.clipboard.writeText(value);
-          setCopied(true);
-          setCopyError(false);
-          window.setTimeout(() => setCopied(false), 1000);
-        } catch {
-          setCopyError(true);
-          window.setTimeout(() => setCopyError(false), 2400);
-        }
-      }}
-      title={copyError ? "복사 실패" : copied ? "복사됨" : "복사"}
-      aria-label={copyError ? "복사 실패" : copied ? "복사됨" : "값 복사"}
-      style={{
-        display: "inline-flex",
-        alignItems: "center",
-        justifyContent: "center",
-        width: 34,
-        height: 32,
-        padding: 0,
-        background: "transparent",
-        color: copyError ? "var(--danger)" : "var(--text-faint)",
-        border: "none",
-        borderRadius: "var(--radius)",
-        cursor: "pointer",
-        flexShrink: 0,
-        transition: "background .12s ease, color .12s ease",
-      }}
-      onMouseEnter={(event) => { event.currentTarget.style.background = "var(--bg-elevated)"; event.currentTarget.style.color = "var(--text)"; }}
-      onMouseLeave={(event) => { event.currentTarget.style.background = "transparent"; event.currentTarget.style.color = copyError ? "var(--danger)" : "var(--text-faint)"; }}
-    >
-      {copied ? <CheckIcon sx={{ fontSize: 19, color: "var(--success)" }} /> : <ContentCopyOutlinedIcon sx={{ fontSize: 18 }} />}
-    </button>
-  );
-}
 
 function AccountValue({ account, accountDirectory }: { account: string; accountDirectory?: AccountDirectory }) {
   const display = resolveAccountDisplay(account, accountDirectory);
@@ -413,18 +283,25 @@ function BrowserRecordExtras({ recordId, eventType, hostDir }: { recordId: strin
   const [flowState, setFlowState] = useState<"idle" | "loading" | "ready" | "error">("idle");
   const [flow, setFlow] = useState<BrowserVisitFlow | null>(null);
   const [flowOpen, setFlowOpen] = useState(false);
+  const flowToken = useRef(0);
   useEffect(() => {
     let alive = true;
+    flowToken.current += 1;
     setRecord(null);
     setFailed(false);
     setFlowOpen(false);
+    setFlow(null);
+    setFlowState("idle");
     window.api.browserRecord(hostDir, recordId).then((result) => { if (alive) setRecord(result); }).catch(() => { if (alive) setFailed(true); });
     return () => { alive = false; };
   }, [hostDir, recordId]);
   const loadFlow = () => {
+    const token = ++flowToken.current;
     setFlowOpen(true);
     setFlowState("loading");
-    window.api.browserVisitFlow(hostDir, recordId).then((result) => { setFlow(result); setFlowState("ready"); }).catch(() => setFlowState("error"));
+    window.api.browserVisitFlow(hostDir, recordId)
+      .then((result) => { if (token !== flowToken.current) return; setFlow(result); setFlowState("ready"); })
+      .catch(() => { if (token === flowToken.current) setFlowState("error"); });
   };
   if (failed) return <ExtraSection heading="연결 기록"><span role="alert" style={{ color: "var(--danger)", fontSize: 12 }}>불러오지 못했습니다</span></ExtraSection>;
   if (!record) return null;
@@ -499,11 +376,16 @@ function BrowserRecordExtras({ recordId, eventType, hostDir }: { recordId: strin
 }
 
 // Same-generation metadata interfaces shown as a separate reference; never
-// copied into the event's local_address (docs-08 R15).
+// copied into the event (docs-08 R15).
 function LocalNetworkReference({ hostDir, datasetId }: { hostDir: string; datasetId?: string }) {
   const [interfaces, setInterfaces] = useState<{ id: string; name: string; addresses: string; gateways: string; dns: string }[] | null>(null);
+  const [failed, setFailed] = useState(false);
+  const [attempt, setAttempt] = useState(0);
   useEffect(() => {
     let alive = true;
+    // Never show another host's interfaces while the new lookup is pending.
+    setInterfaces(null);
+    setFailed(false);
     window.api.hostMetadata(hostDir, { kind: "network" }).then((meta) => {
       if (!alive) return;
       const join = (rows: Record<string, unknown>[], id: string) => rows.filter((entry) => entry.metadata_id === id).map((entry) => String(entry.address ?? "")).filter(Boolean).join(", ");
@@ -518,9 +400,19 @@ function LocalNetworkReference({ hostDir, datasetId }: { hostDir: string; datase
         })
         .filter((entry) => entry.addresses || entry.gateways || entry.dns);
       setInterfaces(list);
-    }).catch(() => { if (alive) setInterfaces([]); });
+    }).catch(() => { if (alive) setFailed(true); });
     return () => { alive = false; };
-  }, [hostDir, datasetId]);
+  }, [hostDir, datasetId, attempt]);
+  if (failed) {
+    return (
+      <ExtraSection heading="로컬 네트워크 참조 (수집 시점)">
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span role="alert" style={{ fontSize: 12, color: "var(--danger)" }}>네트워크 정보를 불러오지 못했습니다.</span>
+          <button type="button" onClick={() => setAttempt((value) => value + 1)} style={{ marginLeft: "auto", fontSize: 12, padding: "3px 10px", border: "1px solid var(--border)", borderRadius: "var(--radius)", background: "var(--bg-elevated)", color: "var(--text)", cursor: "pointer" }}>다시 시도</button>
+        </div>
+      </ExtraSection>
+    );
+  }
   if (!interfaces?.length) return null;
   return (
     <ExtraSection heading="로컬 네트워크 참조 (수집 시점)">
@@ -536,7 +428,7 @@ function LocalNetworkReference({ hostDir, datasetId }: { hostDir: string; datase
   );
 }
 
-function FieldRow({ field, row, onFetchLinkedRows, hostDir, accountDirectory, onToggleFieldBookmark, isFieldBookmarked }: { field: FieldSpec; row: Record<string, string>; onFetchLinkedRows?: FetchLinkedRows; hostDir?: string; accountDirectory?: AccountDirectory; onToggleFieldBookmark?: (field: string) => void; isFieldBookmarked?: (field: string) => boolean }) {
+function FieldRow({ field, row, accountDirectory, onToggleFieldBookmark, isFieldBookmarked }: { field: FieldSpec; row: Record<string, string>; accountDirectory?: AccountDirectory; onToggleFieldBookmark?: (field: string) => void; isFieldBookmarked?: (field: string) => boolean }) {
   // resultRow returns SQL NULL as null; treat it as an empty value.
   const raw: string = (field.compute ? field.compute(row) : row[field.key]) ?? "";
   if (raw === "" && !field.showWhenEmpty) return null;
@@ -610,7 +502,7 @@ function FieldRow({ field, row, onFetchLinkedRows, hostDir, accountDirectory, on
       </div>
       {((!hasInlineCodeControls && raw) || (field.bookmarkable && raw && onToggleFieldBookmark)) && (
         <span style={{ display: "inline-flex", alignItems: "center", gap: 4, flexShrink: 0 }}>
-          {!hasInlineCodeControls && raw && <CopyButton value={raw} />}
+          {!hasInlineCodeControls && raw && <CopyButton value={raw} variant="plain" />}
           {field.bookmarkable && raw && onToggleFieldBookmark && (
             <button
               type="button"
@@ -644,7 +536,7 @@ function LinkedRowList({
     const isPrefetchReference = link.targetFile === "Prefetch_LoadedFiles";
     const title = isPrefetchReference
       ? record.loaded_filename || "(파일명 없음)"
-      : targetSpec ? targetSpec.title(record) : Object.values(record)[1] ?? "";
+      : targetSpec ? targetSpec.title(record) : fallbackLinkedRowTitle(record);
     const subtitle = isPrefetchReference
       ? record.file_reference || ""
       : targetSpec?.subtitle?.(record) ?? "";
@@ -680,14 +572,6 @@ function LinkPagination({
   const totalPages = Math.max(1, Math.ceil(rowCount / pageSize));
   const start = page * pageSize + 1;
   const end = Math.min((page + 1) * pageSize, rowCount);
-  const buttonStyle: React.CSSProperties = {
-    padding: "3px 8px",
-    borderRadius: "var(--radius)",
-    border: "1px solid var(--border)",
-    background: "var(--bg-elevated)",
-    color: "var(--text-dim)",
-    fontSize: 11,
-  };
   return (
     <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, padding: "7px 10px", borderTop: "1px solid var(--border-subtle)", fontSize: 11.5, color: "var(--text-faint)" }}>
       <span>{start.toLocaleString()}–{end.toLocaleString()} / {rowCount.toLocaleString()}개</span>
@@ -703,14 +587,27 @@ function LinkAccordion({ link, value, onFetchLinkedRows }: { link: LinkSpec; val
   const [rows, setRows] = useState<Record<string, string>[] | null>(null);
   const [rowCount, setRowCount] = useState(0);
   const [notFound, setNotFound] = useState(false);
+  const [failed, setFailed] = useState(false);
+  const [attempt, setAttempt] = useState(0);
   const [loading, setLoading] = useState(false);
   const [page, setPage] = useState(0);
+  // Page and rows belong to one source row; reset before fetching another.
+  const [shownSource, setShownSource] = useState({ link, value });
+  if (shownSource.link !== link || shownSource.value !== value) {
+    setShownSource({ link, value });
+    setPage(0);
+    setRows(null);
+    setRowCount(0);
+    setNotFound(false);
+    setFailed(false);
+  }
 
   useEffect(() => {
     if (!expanded) return;
     let active = true;
     setLoading(true);
     setNotFound(false);
+    setFailed(false);
     onFetchLinkedRows(link.targetFile, link.targetColumn, value, { offset: page * LINKED_ROWS_PAGE_SIZE, limit: LINKED_ROWS_PAGE_SIZE })
       .then((result) => {
         if (!active) return;
@@ -720,10 +617,10 @@ function LinkAccordion({ link, value, onFetchLinkedRows }: { link: LinkSpec; val
           setRowCount(result.rowCount);
         }
       })
-      .catch(() => { if (active) setNotFound(true); })
+      .catch(() => { if (active) setFailed(true); })
       .finally(() => { if (active) setLoading(false); });
     return () => { active = false; };
-  }, [expanded, link, onFetchLinkedRows, page, value]);
+  }, [expanded, link, onFetchLinkedRows, page, value, attempt]);
 
   return (
     <div style={{ border: "1px solid var(--border)", borderRadius: "var(--radius)", overflow: "hidden" }}>
@@ -736,9 +633,15 @@ function LinkAccordion({ link, value, onFetchLinkedRows }: { link: LinkSpec; val
         <div style={{ borderTop: "1px solid var(--border)", maxHeight: 260, overflow: "auto" }}>
           {loading && <div style={{ padding: "10px", fontSize: 12, color: "var(--text-dim)" }}>불러오는 중...</div>}
           {notFound && <div style={{ padding: "10px", fontSize: 12, color: "var(--text-faint)" }}>연결된 원본 테이블을 찾을 수 없습니다.</div>}
-          {!loading && rows?.length === 0 && <div style={{ padding: "10px", fontSize: 12, color: "var(--text-faint)" }}>연결된 항목이 없습니다.</div>}
-          {!loading && rows && <LinkedRowList link={link} rows={rows} />}
-          {!loading && rows && <LinkPagination page={page} pageSize={LINKED_ROWS_PAGE_SIZE} rowCount={rowCount} onPageChange={setPage} />}
+          {failed && (
+            <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "10px" }}>
+              <span role="alert" style={{ fontSize: 12, color: "var(--danger)" }}>연결된 항목을 조회하지 못했습니다.</span>
+              <button type="button" onClick={() => setAttempt((current) => current + 1)} style={{ marginLeft: "auto", fontSize: 12, padding: "3px 10px", border: "1px solid var(--border)", borderRadius: "var(--radius)", background: "var(--bg-elevated)", color: "var(--text)", cursor: "pointer" }}>다시 시도</button>
+            </div>
+          )}
+          {!loading && !failed && !notFound && rows?.length === 0 && <div style={{ padding: "10px", fontSize: 12, color: "var(--text-faint)" }}>연결된 항목이 없습니다.</div>}
+          {!loading && !failed && !notFound && rows && <LinkedRowList link={link} rows={rows} />}
+          {!loading && !failed && !notFound && rows && <LinkPagination page={page} pageSize={LINKED_ROWS_PAGE_SIZE} rowCount={rowCount} onPageChange={setPage} />}
         </div>
       )}
     </div>
@@ -755,6 +658,16 @@ function EmbeddedLinkRows({ link, value, onFetchLinkedRows }: { link: LinkSpec; 
   const [loading, setLoading] = useState(true);
   const sectionRef = useRef<HTMLDivElement>(null);
   const savedDrawerScrollTop = useRef<number | null>(null);
+  // Search and page belong to one detail row; reset them before fetching another row.
+  const [shownValue, setShownValue] = useState(value);
+  if (shownValue !== value) {
+    setShownValue(value);
+    setQueryInput("");
+    setQuery("");
+    setPage(0);
+    setRows(null);
+    setRowCount(0);
+  }
 
   function changePage(nextPage: number) {
     const drawerScroller = sectionRef.current?.closest<HTMLElement>("[data-detail-scroll-container]");
@@ -820,7 +733,7 @@ function EmbeddedLinkRows({ link, value, onFetchLinkedRows }: { link: LinkSpec; 
   );
 }
 
-function DetailSection({ section, row, onFetchLinkedRows, hostDir, accountDirectory, onToggleFieldBookmark, isFieldBookmarked }: { section: DetailSectionSpec; row: Record<string, string>; onFetchLinkedRows?: FetchLinkedRows; hostDir?: string; accountDirectory?: AccountDirectory; onToggleFieldBookmark?: (field: string) => void; isFieldBookmarked?: (field: string) => boolean }) {
+function DetailSection({ section, row, accountDirectory, onToggleFieldBookmark, isFieldBookmarked }: { section: DetailSectionSpec; row: Record<string, string>; accountDirectory?: AccountDirectory; onToggleFieldBookmark?: (field: string) => void; isFieldBookmarked?: (field: string) => boolean }) {
   const visibleFields = section.fields.filter((field) => field.showWhenEmpty || (field.compute ? field.compute(row) : row[field.key]));
   const [expanded, setExpanded] = useState(section.collapsible?.defaultExpanded ?? true);
   if (visibleFields.length === 0) return null;
@@ -831,7 +744,7 @@ function DetailSection({ section, row, onFetchLinkedRows, hostDir, accountDirect
     return (
       <div style={{ padding: "14px 16px", borderBottom: "1px solid var(--border-subtle)" }}>
         <div className="dfir-section-label" style={{ marginBottom: 6 }}>{heading}</div>
-        {visibleFields.map((field) => <FieldRow key={field.key} field={field} row={row} onFetchLinkedRows={onFetchLinkedRows} hostDir={hostDir} accountDirectory={accountDirectory} onToggleFieldBookmark={onToggleFieldBookmark} isFieldBookmarked={isFieldBookmarked} />)}
+        {visibleFields.map((field) => <FieldRow key={field.key} field={field} row={row} accountDirectory={accountDirectory} onToggleFieldBookmark={onToggleFieldBookmark} isFieldBookmarked={isFieldBookmarked} />)}
       </div>
     );
   }
@@ -850,7 +763,7 @@ function DetailSection({ section, row, onFetchLinkedRows, hostDir, accountDirect
       </button>
       {expanded && (
         <div style={{ padding: "0 16px 12px" }}>
-          {visibleFields.map((field) => <FieldRow key={field.key} field={field} row={row} onFetchLinkedRows={onFetchLinkedRows} hostDir={hostDir} accountDirectory={accountDirectory} onToggleFieldBookmark={onToggleFieldBookmark} isFieldBookmarked={isFieldBookmarked} />)}
+          {visibleFields.map((field) => <FieldRow key={field.key} field={field} row={row} accountDirectory={accountDirectory} onToggleFieldBookmark={onToggleFieldBookmark} isFieldBookmarked={isFieldBookmarked} />)}
         </div>
       )}
     </section>
@@ -878,9 +791,7 @@ export default function ArtifactDetailView({ spec, row, evidenceTime, onNavigate
   const subtitle = spec.subtitle?.(row);
   const tags = spec.tags?.(row) ?? [];
 
-  const timelinePoints = (spec.timelineFields ?? [])
-    .map((f) => ({ label: f.label, value: row[f.key] ?? "" }))
-    .filter((p) => p.value);
+  const timelinePoints = (spec.timelineFields ?? []).map((f) => ({ label: f.label, value: row[f.key] ?? "" }));
 
   const activeLinks = (spec.links ?? []).filter((link) => row[link.key]);
   const activeEmbeddedLinks = (spec.embeddedLinks ?? []).filter((link) => row[link.key]);
@@ -914,13 +825,13 @@ export default function ArtifactDetailView({ spec, row, evidenceTime, onNavigate
             <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12.5, color: "var(--text-time)", fontFamily: "var(--mono)", fontWeight: 550, marginTop: 7 }}>
               {timeLabel && <span style={{ color: "var(--text-dim)", fontFamily: "var(--sans)", fontWeight: 500 }}>{timeLabel}</span>}
               {timeValue}
-              <CopyButton value={timeValue} />
+              <CopyButton value={timeValue} variant="plain" />
             </div>
           )}
           {subtitle && !showTime && (
             <div style={{ display: "inline-flex", alignItems: "center", gap: 6, minWidth: 0, maxWidth: "100%", fontSize: 12.5, color: "var(--text-time)", fontFamily: "var(--mono)", fontWeight: 550, marginTop: 7, overflowWrap: "anywhere", wordBreak: "break-word" }}>
               <span style={{ minWidth: 0 }}>{subtitle}</span>
-              <CopyButton value={subtitle} />
+              <CopyButton value={subtitle} variant="plain" />
             </div>
           )}
           {(eventTypeText || accountChip) && (
@@ -967,18 +878,13 @@ export default function ArtifactDetailView({ spec, row, evidenceTime, onNavigate
         )}
       </div>
 
-      {timelinePoints.length >= 2 && (
-        <div style={{ padding: "14px 16px 10px", borderBottom: "1px solid var(--border-subtle)" }}>
-          <div className="dfir-section-label" style={{ marginBottom: 6 }}>{spec.timelineHeading ?? "시간 흐름"}</div>
-          <MiniTimeline points={timelinePoints} />
-        </div>
-      )}
+      <MiniTimeline points={timelinePoints} heading={spec.timelineHeading ?? "시간 흐름"} />
 
       {spec.sections.map((section, index) => section.slot ? (
         // Content supplied by the opening panel, placed where the spec puts it.
         <Fragment key={`slot-${section.slot}-${index}`}>{slots?.[section.slot] ?? null}</Fragment>
       ) : (
-        <DetailSection key={`${typeof section.heading === "string" ? section.heading : "computed"}-${index}`} section={section} row={row} onFetchLinkedRows={onFetchLinkedRows} hostDir={hostDir} accountDirectory={accountDirectory} onToggleFieldBookmark={onToggleFieldBookmark} isFieldBookmarked={isFieldBookmarked} />
+        <DetailSection key={`${typeof section.heading === "string" ? section.heading : "computed"}-${index}`} section={section} row={row} accountDirectory={accountDirectory} onToggleFieldBookmark={onToggleFieldBookmark} isFieldBookmarked={isFieldBookmarked} />
       ))}
 
       {activeEmbeddedLinks.map((link) =>

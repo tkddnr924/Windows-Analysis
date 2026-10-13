@@ -421,6 +421,13 @@ fn operational_meaning(event_id: &str) -> Option<EventMeaning> {
             "실행 중 인스턴스 완료 대기",
             "event_324_queued_until_instance_completes",
         ),
+        "325" => meaning(
+            "작업 대기열 등록",
+            "condition",
+            "",
+            "실행 요청 대기열 등록",
+            "event_325_launch_request_queued",
+        ),
         "326" => meaning(
             "작업 미시작",
             "condition",
@@ -561,6 +568,7 @@ const SETTING_DEFAULTS: &[(&str, &str)] = &[
     ("Enabled", "true"),
     ("Hidden", "false"),
     ("DeleteExpiredTaskAfter", "PT0S"),
+    ("ExecutionTimeLimit", "PT72H"),
     ("Priority", "7"),
     ("RunOnlyIfIdle", "false"),
     ("UseUnifiedSchedulingEngine", "false"),
@@ -652,7 +660,8 @@ fn write_task_children(
     }
 
     for trigger in json_array(parts.triggers_json) {
-        let repetition = trigger.get("repetition").cloned().unwrap_or(Value::Null);
+        let [interval, duration, stop_at_end] =
+            repetition_cells(&trigger.get("repetition").cloned().unwrap_or(Value::Null));
         let schedule = trigger.get("schedule").cloned().unwrap_or(Value::Null);
         rec.child(
             "TaskTriggers",
@@ -664,9 +673,9 @@ fn write_task_children(
                 value(&field(&trigger, "start_time_raw")),
                 value(&field(&trigger, "end_time")),
                 value(&field(&trigger, "end_time_raw")),
-                value(&field(&repetition, "interval")),
-                value(&field(&repetition, "duration")),
-                bool_cell(&repetition, "stop_at_duration_end"),
+                interval,
+                duration,
+                stop_at_end,
                 value(&field(&trigger, "execution_time_limit")),
                 value(&field(&trigger, "delay")),
                 value(&field(&trigger, "random_delay")),
@@ -815,11 +824,38 @@ fn write_signals(rec: &mut Record, signals: &[ReviewSignal]) {
         if signals.is_empty() {
             Cell::Null
         } else {
-            let mut names: Vec<&str> = signals.iter().map(|s| s.signal).collect();
-            names.dedup();
-            Cell::Text(names.join(", "))
+            Cell::Text(review_signal_summary(signals))
         },
     );
+}
+
+/// Distinct signal kinds in first-seen order; counts live in review_signal_count.
+fn review_signal_summary(signals: &[ReviewSignal]) -> String {
+    let mut names: Vec<&str> = Vec::new();
+    for signal in signals {
+        if !names.contains(&signal.signal) {
+            names.push(signal.signal);
+        }
+    }
+    names.join(", ")
+}
+
+/// Repetition cells for XML (ISO 8601 keys) and .job (minute counts) triggers.
+fn repetition_cells(repetition: &Value) -> [Cell; 3] {
+    let minutes = |key| repetition.get(key).and_then(Value::as_u64);
+    if let Some(interval) = minutes("interval_minutes") {
+        // A .job trigger with a zero interval does not repeat.
+        if interval == 0 {
+            return [Cell::Null, Cell::Null, Cell::Null];
+        }
+        let duration = minutes("duration_minutes").map_or(Cell::Null, |m| Cell::Text(format!("PT{m}M")));
+        return [Cell::Text(format!("PT{interval}M")), duration, Cell::Null];
+    }
+    [
+        value(&field(repetition, "interval")),
+        value(&field(repetition, "duration")),
+        bool_cell(repetition, "stop_at_duration_end"),
+    ]
 }
 
 /// Everything the view and the case-wide search must match on, in one column,
@@ -912,7 +948,7 @@ fn write_definitions(
     if !definition_facts_usable(&facts)? {
         return Ok(written);
     }
-    for row in overview::read_table_with_rowid(&facts, DEFINITION_TABLE) {
+    for row in overview::read_table_with_rowid(&facts, DEFINITION_TABLE)? {
         let uri = g(&row, "uri");
         let author = g(&row, "author");
         let task_path = if uri.is_empty() { g(&row, "task_name") } else { uri };
@@ -1201,8 +1237,7 @@ fn common_event_fields(rec: &mut Record, row: &Row) {
     );
     rec.set("record_key", value(g(row, "_record_key")));
     rec.set("source_file", value(g(row, "_source_file")));
-    // Only the facts row's own status; an already-set payload parse status
-    // (audited task XML) must not be cleared here.
+    // Facts row status; payload-level parse results are applied afterwards.
     if let Some(status) = super::nz(g(row, "_status")) {
         rec.set("parse_status", Cell::Text(status.to_string()));
     }
@@ -1523,6 +1558,10 @@ fn write_audit_events(
             value(&ed(&payload, "ClientProcessId")),
         );
 
+        // Facts status first; the audited XML result below then refines it.
+        common_event_fields(&mut rec, row);
+        let facts_ok = matches!(super::nz(g(row, "_status")), None | Some("ok"));
+
         // The audited task XML travels with the event; parse it into the same
         // children as a collected definition, but keep it a separate record.
         let mut signals = Vec::new();
@@ -1541,7 +1580,9 @@ fn write_audit_events(
             rec.set("raw_size", Cell::Int(content.len() as i64));
             match crate::parsers::taskscheduler::parse_task_xml(&content) {
                 Ok(parsed) => {
-                    rec.set("parse_status", Cell::Text("parsed".into()));
+                    if facts_ok {
+                        rec.set("parse_status", Cell::Text("parsed".into()));
+                    }
                     rec.set("task_version", value(&parsed.task_version));
                     rec.set("task_namespace", value(&parsed.namespace));
                     rec.set("root_children", value(&parsed.root_children.join(", ")));
@@ -1610,7 +1651,6 @@ fn write_audit_events(
             }
         }
 
-        common_event_fields(&mut rec, row);
         let searchable = write_event_fields(&mut rec, &payload);
         write_signals(&mut rec, &signals);
         rec.set(
@@ -1918,6 +1958,7 @@ CREATE TABLE "TaskRegistryEntries" (
   "matched_record_id" TEXT,
   "match_status" TEXT NOT NULL,
   "match_basis" TEXT,
+  "tree_node_state" TEXT,
   "source_dataset_id" TEXT,
   "source_db" TEXT,
   "source_table" TEXT,
@@ -2044,7 +2085,7 @@ CREATE TABLE "TaskLogObservations" (
      OR (source_dataset_id IS NOT NULL AND source_db IS NOT NULL AND source_table IS NOT NULL AND source_rowid IS NOT NULL))
 );
 CREATE TABLE _wina_derived_version (name TEXT NOT NULL PRIMARY KEY, version INTEGER NOT NULL);
-INSERT INTO _wina_derived_version(name,version) VALUES ('overview_contract',1),('scheduled_tasks',2);
+INSERT INTO _wina_derived_version(name,version) VALUES ('overview_contract',1),('scheduled_tasks',4);
 "#;
 
 const MAIN: &[&str] = &[
@@ -2266,6 +2307,7 @@ const TASK_REGISTRY_ENTRIES: &[&str] = &[
     "matched_record_id",
     "match_status",
     "match_basis",
+    "tree_node_state",
     "source_dataset_id",
     "source_db",
     "source_table",
@@ -2768,6 +2810,39 @@ mod tests {
         assert_eq!(state, "not_collected");
     }
 
+    // RD-02: an invalid audited task XML keeps its payload status even though
+    // the facts row itself reads `_status=ok`.
+    #[test]
+    fn audited_xml_parse_failure_is_not_overwritten_by_facts_status() {
+        let case = case("audit-invalid", &[]);
+        event_facts(&case, "Security", 1);
+        let mut row = event(
+            "4698",
+            SECURITY_PROVIDER,
+            1,
+            "2026-02-07 04:00:00.000",
+            &serde_json::json!({
+                "SubjectUserName": "analyst",
+                "TaskName": "\\Custom\\Broken",
+                "TaskContent": "<Task><Actions><Exec>",
+            })
+            .to_string(),
+        );
+        row.insert("_status".into(), "ok".into());
+        let events = EventLogOverviewCache::from_rows_for_tests(vec![row]);
+        let ctx = ctx_of(&case);
+        assert_eq!(build(&ctx, &events).unwrap(), 1);
+        let (status, error): (String, Option<String>) = open(&case)
+            .query_row(
+                "SELECT parse_status,parse_error FROM ScheduledTasks WHERE event_id=4698",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(error.is_some(), "the XML failure must be recorded");
+        assert_eq!(status, "invalid_format");
+    }
+
     #[test]
     fn events_keep_roles_results_and_payload_fields() {
         let case = case("events", &[("Updater", DATED_TASK)]);
@@ -3039,12 +3114,12 @@ mod tests {
         // A tree entry whose GUID has no Tasks key is reported, not judged.
         let ghost: String = db
             .query_row(
-                "SELECT match_status FROM TaskRegistryEntries WHERE tree_path='Ghost'",
+                "SELECT tree_node_state FROM TaskRegistryEntries WHERE tree_path='Ghost'",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(ghost, "tree_without_tasks_key");
+        assert_eq!(ghost, "tasks_key_missing");
         let generation: String = db
             .query_row(
                 "SELECT source_dataset_id FROM TaskRegistryEntries WHERE scope='tasks'",
@@ -3298,5 +3373,112 @@ mod tests {
         assert_eq!(resolved("UserTask"), vec![Some("C:\\Users\\jait\\AppData\\Local\\Microsoft\\OneDrive\\Updater.exe".to_string())]);
         // A group principal has no user environment: user variables stay unresolved, machine ones resolve.
         assert_eq!(resolved("GroupTask"), vec![None, Some("C:\\Windows\\y.exe".to_string())]);
+    }
+
+    #[test]
+    fn every_documented_launch_condition_event_has_a_meaning() {
+        for id in 322..=332 {
+            assert!(operational_meaning(&id.to_string()).is_some(), "event {id}");
+        }
+        assert_eq!(operational_meaning("325").unwrap().category, "condition");
+    }
+
+    #[test]
+    fn job_repetition_minutes_become_trigger_durations() {
+        let job = serde_json::json!({"interval_minutes": 15, "duration_minutes": 60, "raw": "0f003c00"});
+        let cells = repetition_cells(&job);
+        assert!(matches!(&cells[0], Cell::Text(t) if t == "PT15M"));
+        assert!(matches!(&cells[1], Cell::Text(t) if t == "PT60M"));
+        // No interval means the .job trigger does not repeat.
+        let none = repetition_cells(&serde_json::json!({"interval_minutes": 0, "duration_minutes": 0}));
+        assert!(matches!(none[0], Cell::Null) && matches!(none[1], Cell::Null));
+        let xml = serde_json::json!({"interval": "PT5M", "duration": "P1D", "stop_at_duration_end": true});
+        let cells = repetition_cells(&xml);
+        assert!(matches!(&cells[0], Cell::Text(t) if t == "PT5M"));
+        assert!(matches!(&cells[1], Cell::Text(t) if t == "P1D"));
+    }
+
+    #[test]
+    fn execution_time_limit_has_its_schema_default() {
+        assert!(SETTING_DEFAULTS.contains(&("ExecutionTimeLimit", "PT72H")));
+    }
+
+    #[test]
+    fn review_signal_summary_lists_each_kind_once() {
+        let signal = |name| ReviewSignal {
+            signal: name,
+            basis: String::new(),
+            evidence: String::new(),
+            action_ordinal: None,
+        };
+        let signals = [
+            signal("script_host_command"),
+            signal("encoded_command_argument"),
+            signal("script_host_command"),
+        ];
+        assert_eq!(
+            review_signal_summary(&signals),
+            "script_host_command, encoded_command_argument"
+        );
+    }
+
+    #[test]
+    fn tree_state_does_not_replace_definition_match() {
+        let case = case("treestate", &[("Updater", DATED_TASK)]);
+        let registry = case.root.join("REGISTRY/SOFTWARE.sqlite");
+        std::fs::create_dir_all(registry.parent().unwrap()).unwrap();
+        let conn = Connection::open(&registry).unwrap();
+        conn.execute_batch(r#"CREATE TABLE Registry(last_write TEXT,key_path TEXT,value_name TEXT,value_type TEXT,value_data TEXT,value_data_hex TEXT,entry_kind TEXT,_source_file TEXT);
+        INSERT INTO Registry VALUES('2026-02-03','\ROOT\Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\Tree\Custom\Updater','Id','RegSz','{GUID-9}',NULL,'value','SOFTWARE');
+        INSERT INTO Registry VALUES('2026-02-03','\ROOT\Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\Tree\Custom','SD','RegBinary','00','00','value','SOFTWARE');"#).unwrap();
+        drop(conn);
+        stamp_facts_generation(&registry, "registry-old").unwrap();
+        let ctx = ctx_of(&case);
+        build(&ctx, &empty_events()).unwrap();
+        let db = open(&case);
+        let row: (Option<String>, String, Option<String>) = db
+            .query_row(
+                "SELECT matched_record_id,match_status,tree_node_state FROM TaskRegistryEntries WHERE tree_path='Custom\\Updater'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert!(row.0.is_some());
+        assert_eq!(row.1, "matched_definition");
+        assert_eq!(row.2.as_deref(), Some("tasks_key_missing"));
+        let folder: String = db
+            .query_row(
+                "SELECT tree_node_state FROM TaskRegistryEntries WHERE tree_path='Custom'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(folder, "folder_node");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_target_is_reported_as_scan_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let case = case("scanfail", &[("Updater", DATED_TASK)]);
+        let locked = case.target.join("Locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let result = prepare_inputs(&case.root, &case.target, "new");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        result.unwrap();
+        let conn = Connection::open(case.root.join(supplemental::SUPPLEMENTAL_DB)).unwrap();
+        let rows: Vec<(String, String, Option<String>)> = conn
+            .prepare("SELECT input_kind,status,error FROM TaskSupplementalInputs ORDER BY input_kind")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        for (kind, status, error) in rows {
+            assert_eq!(status, "scan_failed", "{kind}");
+            assert!(error.unwrap().contains("Locked"), "{kind}");
+        }
     }
 }

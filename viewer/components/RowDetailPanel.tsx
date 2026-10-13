@@ -1,12 +1,12 @@
 "use client";
 
 import { useContext, useEffect, useRef, useState } from "react";
-import CheckIcon from "@mui/icons-material/Check";
 import ChevronRightOutlinedIcon from "@mui/icons-material/ChevronRightOutlined";
 import DescriptionOutlinedIcon from "@mui/icons-material/DescriptionOutlined";
 import FolderOpenOutlinedIcon from "@mui/icons-material/FolderOpenOutlined";
 import LinkOutlinedIcon from "@mui/icons-material/LinkOutlined";
-import ContentCopyOutlinedIcon from "@mui/icons-material/ContentCopyOutlined";
+import { hasControlSequences, prettyJsonOrNull, unescapeControlSequences } from "@/lib/jsonText";
+import { CopyButton, JsonToggleButton } from "./ValueControls";
 import { resolveArtifactView, type FieldSpec } from "@/lib/artifactViews";
 import { RecordScopeContext } from "@/lib/recordScope";
 import type { DBRow, FetchLinkedRows } from "@/lib/types";
@@ -41,51 +41,15 @@ interface RowDetailPanelProps {
   relatedEvidence?: { id: string; label: string; subtitle?: string; onOpen: () => void }[];
 }
 
-function tryPrettyJson(value: string): string | null {
-  const trimmed = value.trim();
-  if (!trimmed || (trimmed[0] !== "{" && trimmed[0] !== "[")) return null;
-  try {
-    return JSON.stringify(JSON.parse(trimmed), null, 2);
-  } catch {
-    return null;
-  }
-}
-
-// Turn literal escape sequences ("\r\n", "\n", "\t") — which many EventData
-// blobs store as two-character text, not real whitespace — into actual line
-// breaks/tabs so multi-line content reads normally. Display-only.
-function unescapeWhitespace(s: string): string {
-  return s
-    .replace(/\\r\\n/g, "\n")
-    .replace(/\\n/g, "\n")
-    .replace(/\\r/g, "\n")
-    .replace(/\\t/g, "\t");
-}
-
 function RawFieldValue({ column, value, focused }: { column: string; value: string; focused: boolean }) {
-  const [copied, setCopied] = useState(false);
-  const [copyError, setCopyError] = useState(false);
   const [beautified, setBeautified] = useState(true);
   const [unescaped, setUnescaped] = useState(false);
-  const pretty = tryPrettyJson(value);
+  const pretty = prettyJsonOrNull(value);
   const isJson = pretty !== null;
-  const hasEscapes = /\\[rnt]/.test(value);
-  const baseText = isJson && beautified ? pretty! : value;
-  const shownText = unescaped ? unescapeWhitespace(baseText) : baseText;
+  const baseText = isJson && beautified ? pretty : value;
+  const hasEscapes = hasControlSequences(baseText);
+  const shownText = unescaped ? unescapeControlSequences(baseText) : baseText;
   const isEmpty = !value;
-
-  async function copy() {
-    try {
-      await navigator.clipboard.writeText(value);
-      setCopied(true);
-      setCopyError(false);
-      setTimeout(() => setCopied(false), 1200);
-    } catch {
-      setCopyError(true);
-      setTimeout(() => setCopyError(false), 2400);
-    }
-  }
-
   return (
     <div
       style={{
@@ -123,24 +87,7 @@ function RawFieldValue({ column, value, focused }: { column: string; value: stri
       </div>
       {!isEmpty && (
         <div style={{ display: "inline-flex", alignItems: "center", gap: 4, paddingTop: 0 }}>
-          {isJson && (
-          <button
-            className="nm-btn"
-            onClick={() => setBeautified((b) => !b)}
-            title={beautified ? "원본(압축) 보기" : "보기 좋게 정렬"}
-            style={{
-              fontSize: 11,
-              padding: "2px 8px",
-              background: "var(--bg-elevated)",
-              color: "var(--accent)",
-              border: "1px solid var(--border)",
-              borderRadius: "var(--radius)",
-              cursor: "pointer",
-            }}
-          >
-            {"{ }"}
-          </button>
-        )}
+          {isJson && <JsonToggleButton beautified={beautified} onToggle={() => setBeautified((b) => !b)} />}
         {hasEscapes && (
           <button
             className="nm-btn"
@@ -159,28 +106,7 @@ function RawFieldValue({ column, value, focused }: { column: string; value: stri
             ↵ \n 치환
           </button>
         )}
-        <button
-          className="nm-btn"
-          onClick={copy}
-          title={copyError ? "복사 실패" : copied ? "복사됨" : "값 복사"}
-          aria-label={copyError ? `${column} 복사 실패` : copied ? `${column} 복사됨` : `${column} 값 복사`}
-          style={{
-            display: "inline-flex",
-            alignItems: "center",
-            justifyContent: "center",
-            width: 32,
-            height: 28,
-            padding: 0,
-            background: "var(--bg-elevated)",
-            color: "var(--text-dim)",
-            border: "1px solid var(--border)",
-            borderRadius: "var(--radius)",
-            cursor: "pointer",
-          }}
-        >
-          {copied ? <CheckIcon sx={{ fontSize: 16, color: "var(--success)" }} /> : <ContentCopyOutlinedIcon sx={{ fontSize: 15, color: copyError ? "var(--danger)" : undefined }} />}
-        </button>
-        {copyError && <span role="status" style={{ color: "var(--danger)", fontSize: 10.5, whiteSpace: "nowrap" }}>복사 실패</span>}
+        <CopyButton value={value} label={column} />
         </div>
       )}
     </div>

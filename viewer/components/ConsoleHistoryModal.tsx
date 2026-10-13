@@ -87,6 +87,11 @@ export default function ConsoleHistoryModal({ account, rows, onClose }: { accoun
   const searchRef = useRef<HTMLInputElement>(null);
   const viewRef = useRef<EditorView | null>(null);
   const wrapCompartment = useRef(new Compartment());
+  // Read at editor creation so a rebuilt editor keeps the current wrap setting.
+  const wrapRef = useRef(wrap);
+  wrapRef.current = wrap;
+  const copyTimer = useRef<number | undefined>(undefined);
+  useEffect(() => () => window.clearTimeout(copyTimer.current), []);
 
   const doc = useMemo(() => buildConsoleDoc(rows), [rows]);
   const matches = useMemo(() => findMatches(doc.text, query), [doc.text, query]);
@@ -125,7 +130,7 @@ export default function ConsoleHistoryModal({ account, rows, onClose }: { accoun
           theme,
           matchField,
           statusField,
-          wrapCompartment.current.of([]),
+          wrapCompartment.current.of(wrapRef.current ? EditorView.lineWrapping : []),
           keymap.of([{ key: "Mod-f", run: () => { searchRef.current?.focus(); searchRef.current?.select(); return true; } }]),
         ],
       }),
@@ -158,14 +163,15 @@ export default function ConsoleHistoryModal({ account, rows, onClose }: { accoun
   }
 
   async function copyAll() {
+    window.clearTimeout(copyTimer.current);
     try {
       await navigator.clipboard.writeText(doc.text);
       setCopied(true);
       setCopyError(false);
-      window.setTimeout(() => setCopied(false), 1200);
+      copyTimer.current = window.setTimeout(() => setCopied(false), 1200);
     } catch {
       setCopyError(true);
-      window.setTimeout(() => setCopyError(false), 2400);
+      copyTimer.current = window.setTimeout(() => setCopyError(false), 2400);
     }
   }
 

@@ -1,6 +1,7 @@
 "use client";
 
-import { useId, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
+import { useVirtualizer } from "@tanstack/react-virtual";
 import CheckIcon from "@mui/icons-material/Check";
 import ContentCopyOutlinedIcon from "@mui/icons-material/ContentCopyOutlined";
 import { hexDump } from "@/lib/textDecoders";
@@ -23,6 +24,8 @@ export function HexViewer({ bytes, maxHeight = 320, fontSize = 12 }: { bytes: Ui
   const [anchor, setAnchor] = useState<number | null>(null);
   const [focus, setFocus] = useState<number | null>(null);
   const [copied, setCopied] = useState<string | null>(null);
+  // New buffer: offsets from the previous one are meaningless.
+  useEffect(() => { setAnchor(null); setFocus(null); setHover(null); }, [bytes]);
   const start = anchor === null ? null : Math.min(anchor, focus ?? anchor);
   const end = anchor === null ? null : Math.max(anchor, focus ?? anchor);
   const selected = (index: number) => start !== null && end !== null && index >= start && index <= end;
@@ -48,6 +51,13 @@ export function HexViewer({ bytes, maxHeight = 320, fontSize = 12 }: { bytes: Ui
     );
   };
   const rows = Math.ceil(bytes.length / 16);
+  // Large values (e.g. 284 KB REG_BINARY) would create ~570k nodes; render visible rows only.
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const rowHeight = Math.round(fontSize * 1.65);
+  const virtualizer = useVirtualizer({ count: rows, getScrollElement: () => scrollRef.current, estimateSize: () => rowHeight, overscan: 16 });
+  const virtualRows = virtualizer.getVirtualItems();
+  const padTop = virtualRows[0]?.start ?? 0;
+  const padBottom = virtualRows.length ? virtualizer.getTotalSize() - virtualRows[virtualRows.length - 1].end : 0;
   const info = start === null || end === null ? hover : start;
   const infoByte: number | undefined = info === null ? undefined : bytes[info];
   const status = start !== null && end !== null && end > start
@@ -57,26 +67,28 @@ export function HexViewer({ bytes, maxHeight = 320, fontSize = 12 }: { bytes: Ui
       : `${bytes.length.toLocaleString()} bytes · 클릭으로 선택, Shift+클릭으로 범위 선택`;
   const button: React.CSSProperties = { display: "inline-flex", alignItems: "center", gap: 4, minHeight: 22, padding: "0 7px", fontSize: 11, border: "1px solid var(--border)", borderRadius: "var(--radius)", background: "var(--bg-elevated)", color: "var(--text-dim)", cursor: "pointer" };
   return (
-    <div style={{ display: "grid", minWidth: 0, border: "1px solid var(--border-subtle)", borderRadius: "var(--radius)", background: "var(--bg-input)", overflow: "hidden" }}>
-      <div onMouseLeave={() => setHover(null)} style={{ overflow: "auto", maxHeight, fontFamily: MONO, fontSize, lineHeight: 1.65, userSelect: "none" }}>
+    <div style={{ display: "flex", flexDirection: "column", minWidth: 0, minHeight: 0, border: "1px solid var(--border-subtle)", borderRadius: "var(--radius)", background: "var(--bg-input)", overflow: "hidden" }}>
+      <div ref={scrollRef} onMouseLeave={() => setHover(null)} style={{ flex: "0 1 auto", minHeight: 0, overflow: "auto", maxHeight, fontFamily: MONO, fontSize, lineHeight: `${rowHeight}px`, userSelect: "none" }}>
         <div style={{ display: "inline-block", minWidth: "100%", padding: "4px 10px 6px" }}>
           <div style={{ position: "sticky", top: 0, display: "flex", alignItems: "center", gap: 14, padding: "2px 0 4px", marginBottom: 2, borderBottom: "1px solid var(--border-subtle)", background: "var(--bg-input)", color: "var(--text-faint)", whiteSpace: "pre" }}>
             <span style={{ width: "8ch" }}>Offset</span>
             <span style={{ display: "flex", gap: 0 }}>{COLUMNS.map((column) => <span key={column} style={{ width: "3ch", textAlign: "center", marginRight: column === 7 ? "1ch" : 0, color: hover !== null && hover % 16 === column ? "var(--accent)" : undefined }}>{column.toString(16).toUpperCase().padStart(2, "0")}</span>)}</span>
             <span>ASCII</span>
           </div>
-          {Array.from({ length: rows }, (_, row) => {
+          {padTop > 0 && <div style={{ height: padTop }} />}
+          {virtualRows.map(({ index: row }) => {
             const base = row * 16;
             const indexes = COLUMNS.map((column) => base + column).filter((index) => index < bytes.length);
             const rowHovered = hover !== null && Math.floor(hover / 16) === row;
             return (
-              <div key={row} style={{ display: "flex", alignItems: "center", gap: 14, whiteSpace: "pre" }}>
+              <div key={row} style={{ display: "flex", alignItems: "center", gap: 14, height: rowHeight, whiteSpace: "pre" }}>
                 <span style={{ width: "8ch", color: rowHovered ? "var(--accent)" : "var(--text-faint)" }}>{base.toString(16).toUpperCase().padStart(8, "0")}</span>
                 <span style={{ display: "flex", width: "49ch" }}>{indexes.map((index) => cell(index, bytes[index].toString(16).toUpperCase().padStart(2, "0"), "3ch", { marginRight: index % 16 === 7 ? "1ch" : 0 }))}</span>
                 <span style={{ display: "flex", borderLeft: "1px solid var(--border-subtle)", paddingLeft: 10 }}>{indexes.map((index) => cell(index, bytes[index] >= 0x20 && bytes[index] < 0x7f ? String.fromCharCode(bytes[index]) : ".", "1ch"))}</span>
               </div>
             );
           })}
+          {padBottom > 0 && <div style={{ height: padBottom }} />}
         </div>
       </div>
       <div style={{ display: "flex", alignItems: "center", gap: 6, padding: "4px 8px", borderTop: "1px solid var(--border-subtle)", background: "var(--bg-panel)", fontSize: 11, color: "var(--text-dim)" }}>

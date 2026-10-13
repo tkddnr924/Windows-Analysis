@@ -46,6 +46,7 @@ interface TargetInfoViewProps {
   /** Bookmark state of the source record a row (optionally one timestamp
    *  field) points at. */
   isRowBookmarked?: (row: Row, field?: string) => boolean;
+  isRecordBookmarked?: (row: Row) => boolean;
   onToggleBookmark?: (rowid: number, field: string) => void;
   accountDirectory?: AccountDirectory;
   /** docs-21: analyst-added host addresses; callbacks return an error or null. */
@@ -163,15 +164,6 @@ function buildAccount(r: Row, meta?: DBRow, groups?: string): Account {
   };
 }
 
-function KeyVal({ label, children }: { label: string; children: React.ReactNode }) {
-  return (
-    <div style={{ display: "grid", gridTemplateColumns: "minmax(94px, 0.7fr) minmax(0, 1.3fr)", gap: 10, padding: "7px 0", borderBottom: "1px solid var(--border-subtle)" }}>
-      <span style={{ color: "var(--text-dim)", fontSize: 13 }}>{label}</span>
-      <span style={{ color: "var(--text)", fontSize: 13, wordBreak: "break-all" }}>{children || "—"}</span>
-    </div>
-  );
-}
-
 function DetailSurface({ title, count, trailing, children }: { title: string; count?: number; trailing?: React.ReactNode; children: React.ReactNode }) {
   return (
     <section style={{ background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "var(--radius)", boxShadow: "var(--shadow-card)", overflow: "hidden" }}>
@@ -205,19 +197,32 @@ interface NetworkProfile {
   timestamp: string;
 }
 
-export default function TargetInfoView({ data, loadAccountEvents, timeRange, onNavigate, onFetchLinkedRows, isRowBookmarked, onToggleBookmark, accountDirectory, analystAddresses = [], onAddAnalystAddress, onRemoveAnalystAddress }: TargetInfoViewProps) {
+// Fields the account detail can bookmark (see AccountDetailPage time rows).
+
+export default function TargetInfoView({ data, loadAccountEvents, timeRange, onNavigate, onFetchLinkedRows, isRowBookmarked, isRecordBookmarked, onToggleBookmark, accountDirectory, analystAddresses = [], onAddAnalystAddress, onRemoveAnalystAddress }: TargetInfoViewProps) {
   // 북마크는 원본 레코드에 붙으므로 행이 실어 온 원본 좌표로 맞춘다.
+  // Account bookmarks are field bookmarks; any of them marks the row.
   const bmRowids = useMemo(
-    () => new Set((data.rows as Row[]).filter((row) => isRowBookmarked?.(row)).map((row) => Number((row as Record<string, unknown>).__rowid))),
-    [data.rows, isRowBookmarked],
+    () => new Set((data.rows as Row[])
+      .filter((row) => isRecordBookmarked?.(row))
+      .map((row) => Number((row as Record<string, unknown>).__rowid))),
+    [data.rows, isRecordBookmarked],
   );
   const [selectedAccount, setSelectedAccount] = useState<Account | null>(null);
   // 좌측 범주 내비게이션(25%)에서 고른 섹션을 우측(75%)에 표시한다.
   const [section, setSection] = useState<"accounts" | "system" | "interfaces" | "networks" | "hosts">("accounts");
   // 시스템 값 카드 클릭 → 즉시 복사, 잠깐 "복사됨" 표시.
-  const [copiedKey, setCopiedKey] = useState<string | null>(null);
+  const [copied, setCopied] = useState<{ key: string; failed: boolean } | null>(null);
   const [selectedInterface, setSelectedInterface] = useState<NetInterface | null>(null);
   const [selectedNetwork, setSelectedNetwork] = useState<NetworkProfile | null>(null);
+  // A replaced result drops selections that point at old rows.
+  const [selectionData, setSelectionData] = useState(data);
+  if (selectionData !== data) {
+    setSelectionData(data);
+    setSelectedAccount(null);
+    setSelectedInterface(null);
+    setSelectedNetwork(null);
+  }
   const [newAddress, setNewAddress] = useState("");
   const [addressError, setAddressError] = useState<string | null>(null);
   const submitAddress = async () => {
@@ -445,7 +450,7 @@ export default function TargetInfoView({ data, loadAccountEvents, timeRange, onN
                   const value = system.get(k)?.value || "";
                   // 시각·빌드류 값은 모노스페이스로.
                   const mono = /Time|Date|Build/i.test(k) || /^\d{4}-\d{2}-\d{2}/.test(value);
-                  const copied = copiedKey === k;
+                  const copyState = copied?.key === k ? copied : null;
                   return (
                     <button
                       key={k}
@@ -454,12 +459,14 @@ export default function TargetInfoView({ data, loadAccountEvents, timeRange, onN
                       aria-label={`${SYSTEM_LABELS[k] ?? k} 값 복사`}
                       onClick={() => {
                         if (!value) return;
-                        navigator.clipboard?.writeText(value).then(() => {
-                          setCopiedKey(k);
-                          setTimeout(() => setCopiedKey((current) => (current === k ? null : current)), 1200);
-                        });
+                        const done = (failed: boolean) => {
+                          setCopied({ key: k, failed });
+                          setTimeout(() => setCopied((current) => (current?.key === k ? null : current)), failed ? 2400 : 1200);
+                        };
+                        if (!navigator.clipboard) { done(true); return; }
+                        navigator.clipboard.writeText(value).then(() => done(false), () => done(true));
                       }}
-                      style={{ border: `1px solid ${copied ? "color-mix(in srgb, var(--success) 55%, var(--border))" : "var(--border)"}`, borderRadius: "var(--radius)", background: "var(--bg-panel)", padding: "10px 14px", display: "flex", alignItems: "center", gap: 12, color: "inherit", cursor: value ? "pointer" : "default", textAlign: "left", fontFamily: "inherit", transition: "background .15s ease, border-color .15s ease" }}
+                      style={{ border: `1px solid ${copyState ? `color-mix(in srgb, ${copyState.failed ? "var(--danger)" : "var(--success)"} 55%, var(--border))` : "var(--border)"}`, borderRadius: "var(--radius)", background: "var(--bg-panel)", padding: "10px 14px", display: "flex", alignItems: "center", gap: 12, color: "inherit", cursor: value ? "pointer" : "default", textAlign: "left", fontFamily: "inherit", transition: "background .15s ease, border-color .15s ease" }}
                       onMouseEnter={(e) => { e.currentTarget.style.background = "var(--bg-hover)"; }}
                       onMouseLeave={(e) => { e.currentTarget.style.background = "var(--bg-panel)"; }}
                     >
@@ -470,7 +477,7 @@ export default function TargetInfoView({ data, loadAccountEvents, timeRange, onN
                         <span style={{ color: "var(--text-dim)", fontSize: 12 }}>{SYSTEM_LABELS[k] ?? k}</span>
                         <span style={{ color: value ? "var(--text)" : "var(--text-faint)", fontSize: 13.5, fontWeight: 700, fontFamily: mono ? "var(--mono)" : undefined, wordBreak: "break-all" }}>{value || "정보 없음"}</span>
                       </span>
-                      {copied && <span style={{ flexShrink: 0, color: "var(--success)", fontSize: 11.5, fontWeight: 700 }}>복사됨</span>}
+                      {copyState && <span role={copyState.failed ? "alert" : undefined} style={{ flexShrink: 0, color: copyState.failed ? "var(--danger)" : "var(--success)", fontSize: 11.5, fontWeight: 700 }}>{copyState.failed ? "복사 실패" : "복사됨"}</span>}
                     </button>
                   );
                 })}
@@ -677,7 +684,6 @@ const EVENT_LABELS: Record<string, string> = {
   "4624": "로그온", "4625": "로그온 실패", "4634": "로그오프", "4647": "로그오프", "4648": "명시적 자격증명 로그온",
   "4672": "특수 권한 부여", "4776": "자격증명 검증",
 };
-const evPgBtn = (disabled: boolean): React.CSSProperties => ({ fontSize: 11.5, padding: "3px 10px", background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: "var(--radius)", color: "var(--text-dim)", cursor: disabled ? "default" : "pointer", opacity: disabled ? 0.4 : 1 });
 
 function DetailGroup({ title, children }: { title: string; children: React.ReactNode }) {
   return (

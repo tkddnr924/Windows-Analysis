@@ -30,8 +30,10 @@ export default function AccountFilterChips({
 }) {
   const [open, setOpen] = useState(false);
   if (accounts.length === 0) return null;
-  const visibleCount = accounts.length - hidden.size;
-  const filtering = hidden.size > 0;
+  // Hidden may hold accounts no longer listed; count only listed ones.
+  const visibleCount = accounts.filter((account) => !hidden.has(account)).length;
+  const filtering = visibleCount < accounts.length;
+  const allHidden = visibleCount === 0;
   return (
     <div style={{ position: "relative", display: "inline-flex" }}>
       <button
@@ -56,7 +58,7 @@ export default function AccountFilterChips({
                 <button type="button" onClick={onReset} disabled={!filtering} style={{ background: "transparent", border: "none", color: filtering ? "var(--accent)" : "var(--text-faint)", cursor: filtering ? "pointer" : "default", fontSize: 11.5, fontWeight: 600, padding: 0 }}>
                   전체 선택
                 </button>
-                <button type="button" onClick={() => accounts.filter((account) => !hidden.has(account)).forEach(onToggle)} disabled={hidden.size === accounts.length} style={{ background: "transparent", border: "none", color: hidden.size === accounts.length ? "var(--text-faint)" : "var(--accent)", cursor: hidden.size === accounts.length ? "default" : "pointer", fontSize: 11.5, fontWeight: 600, padding: 0 }}>
+                <button type="button" onClick={() => accounts.filter((account) => !hidden.has(account)).forEach(onToggle)} disabled={allHidden} style={{ background: "transparent", border: "none", color: allHidden ? "var(--text-faint)" : "var(--accent)", cursor: allHidden ? "default" : "pointer", fontSize: 11.5, fontWeight: 600, padding: 0 }}>
                   전체 해제
                 </button>
               </span>

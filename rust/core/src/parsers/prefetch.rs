@@ -110,6 +110,14 @@ fn parse_legacy_scca(data: &[u8]) -> Result<LegacyPrefetch> {
         26 => (0x80, 8, 0xD0),
         other => anyhow::bail!("unsupported SCCA version {other}"),
     };
+    // 실행 시각·횟수는 필수 필드 — 잘린 파일을 "0회 실행"으로 발행하지 않는다.
+    let required = (times_off + times_n * 8).max(count_off + 4);
+    if data.len() < required {
+        anyhow::bail!(
+            "truncated SCCA v{version}: {} bytes < {required} required",
+            data.len()
+        );
+    }
     let executable = utf16z(&data[0x10..0x4C.min(data.len())]);
     let hash = u32le(data, 0x4C)
         .map(|h| format!("{:08X}", h))
@@ -411,5 +419,12 @@ mod tests {
         assert!(parse_legacy_scca(b"MAM\x04short").is_err());
         let v30 = synthetic(30, 0x80, 0xD0);
         assert!(parse_legacy_scca(&v30).is_err());
+    }
+
+    #[test]
+    fn truncated_v26_is_an_error_not_zero_runs() {
+        let mut v26 = synthetic(26, 0x80, 0xD0);
+        v26.truncate(0xC0); // past the 0x9C legacy floor, before run count 0xD0
+        assert!(parse_legacy_scca(&v26).is_err());
     }
 }

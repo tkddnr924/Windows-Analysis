@@ -14,8 +14,9 @@
 //! flags/sizes/entry numbers, the unnamed resident `$DATA` body as a BLOB,
 //! NULL for anything the evidence does not contain — followed by the four
 //! appended state columns. A parent reference is only used when the referenced
-//! record exists in the same input, carries the referenced sequence and is a
-//! directory, so a reused or stale reference never yields a rooted path;
+//! record exists in the same input, carries the referenced sequence (or is the
+//! freed directory one sequence on, `deleted_parent`) and is a directory, so a
+//! reused or stale reference never yields a rooted path;
 //! `parent_status`/`path_status` say why, and `data_status` says what the
 //! unnamed `$DATA` really carried.
 use std::collections::{HashMap, HashSet};
@@ -25,7 +26,7 @@ use std::rc::Rc;
 use anyhow::{anyhow, Result};
 use mft::attribute::header::ResidentialHeader;
 use mft::attribute::x30::{FileNameAttr, FileNamespace};
-use mft::attribute::{MftAttributeContent, MftAttributeType};
+use mft::attribute::{MftAttribute, MftAttributeContent, MftAttributeType};
 use mft::MftParser;
 use rusqlite::Connection;
 
@@ -33,6 +34,9 @@ use crate::sqlite::quote_ident;
 use crate::time::fmt_kst_ft;
 
 pub const MFT_TABLE: &str = "MFT_Records";
+/// Child table: every non-DOS $FILE_NAME of a record other than the one
+/// chosen for its MFT_Records row (hard links, POSIX names).
+pub const MFT_NAMES_TABLE: &str = "MFT_FileNames";
 pub const MFT_FIELD_ORDER: &[&str] = &[
     "volume_id",
     "volume_label",
@@ -67,6 +71,9 @@ pub const MFT_FIELD_ORDER: &[&str] = &[
     "parent_status",
     "path_status",
     "data_status",
+    "record_status",
+    // Raw header hard link count, not interpreted.
+    "hard_link_count",
 ];
 
 const ROOT_ENTRY: u64 = 5;
@@ -90,8 +97,6 @@ const BATCH_BYTES: usize = 64 * 1024 * 1024;
 #[derive(Debug, Clone)]
 pub struct MftSourceReport {
     pub source: PathBuf,
-    /// Internal per-source volume key written into every row of this source.
-    pub volume_id: String,
     pub record_count: usize,
     pub error: Option<String>,
 }
@@ -157,6 +162,18 @@ struct RecordFacts {
     /// `Some(empty)` = a real zero-byte resident body.
     data: Option<Vec<u8>>,
     data_shape: DataShape,
+    /// Every $FILE_NAME in attribute order; `chosen` indexes `name` here.
+    names: Vec<FileNameAttr>,
+    chosen: Option<usize>,
+}
+
+fn namespace_text(namespace: &FileNamespace) -> &'static str {
+    match namespace {
+        FileNamespace::POSIX => "posix",
+        FileNamespace::Win32 => "win32",
+        FileNamespace::DOS => "dos",
+        FileNamespace::Win32AndDos => "win32_and_dos",
+    }
 }
 
 /// $FILE_NAME namespace priority: Win32/Win32AndDos > POSIX > DOS.
@@ -168,6 +185,14 @@ fn namespace_priority(namespace: &FileNamespace) -> i32 {
     }
 }
 
+/// The single rule choosing the $FILE_NAME of a record: a strictly higher
+/// namespace priority wins, so the first name of a priority is kept.
+/// Returns the new priority when `candidate` should replace `current`.
+fn preferred_name(current: Option<i32>, candidate: &FileNamespace) -> Option<i32> {
+    let priority = namespace_priority(candidate);
+    (priority > current.unwrap_or(-1)).then_some(priority)
+}
+
 /// Header identity is retained even without a readable FILE_NAME.
 struct IndexEntry {
     name: String,
@@ -176,32 +201,74 @@ struct IndexEntry {
     parent: Option<(u64, u16)>,
     sequence: u16,
     is_directory: bool,
+    in_use: bool,
 }
 
-/// Decode only FILE_NAME; pass 1 never reads resident bodies of base records.
+/// Attribute headers the `mft` crate can walk before a zero-length one, and
+/// whether such a header ends the chain. The crate advances by each header's
+/// `record_length` unchecked, so a zero length repeats one attribute forever.
+fn walkable_attributes(entry: &mft::MftEntry) -> (usize, bool) {
+    let data = &entry.data;
+    let mut offset = usize::from(entry.header.first_attribute_record_offset);
+    let mut count = 0;
+    loop {
+        let Some(head) = offset.checked_add(8).and_then(|end| data.get(offset..end)) else {
+            return (count, false);
+        };
+        if head[..4] == [0xFF; 4] {
+            return (count, false);
+        }
+        let length = u32::from_le_bytes([head[4], head[5], head[6], head[7]]) as usize;
+        if length == 0 {
+            return (count, true);
+        }
+        count += 1;
+        offset = offset.saturating_add(length);
+    }
+}
+
+/// Every decodable attribute of one record, ending before a zero-length header.
+fn attributes(entry: &mft::MftEntry) -> impl Iterator<Item = MftAttribute> + '_ {
+    let (count, _) = walkable_attributes(entry);
+    entry.iter_attributes().take(count).filter_map(|a| a.ok())
+}
+
+/// Decode only FILE_NAME; pass 1 never reads resident bodies of base records
+/// unless a zero-length header forces the bounded unfiltered walk.
 fn index_entry(entry: &mft::MftEntry) -> IndexEntry {
     let mut best: Option<(i32, String, u64, u16)> = None;
-    for attr in entry
-        .iter_attributes_matching(Some(vec![MftAttributeType::FileName]))
-        .filter_map(|a| a.ok())
-    {
+    let mut consider = |attr: MftAttribute| {
         if let MftAttributeContent::AttrX30(f) = attr.data {
-            let priority = namespace_priority(&f.namespace);
-            if best.as_ref().map_or(true, |(p, _, _, _)| priority > *p) {
+            if let Some(priority) = preferred_name(best.as_ref().map(|(p, _, _, _)| *p), &f.namespace) {
                 best = Some((priority, f.name, f.parent.entry, f.parent.sequence));
             }
         }
+    };
+    let (count, stalled) = walkable_attributes(entry);
+    if stalled {
+        entry
+            .iter_attributes()
+            .take(count)
+            .filter_map(|a| a.ok())
+            .for_each(&mut consider);
+    } else {
+        entry
+            .iter_attributes_matching(Some(vec![MftAttributeType::FileName]))
+            .filter_map(|a| a.ok())
+            .for_each(&mut consider);
     }
     let (priority, name, parent) = best.map_or_else(
         || (-1, String::new(), None),
         |(priority, name, entry, sequence)| (priority, name, Some((entry, sequence))),
     );
+    let flags = entry.header.flags.bits();
     IndexEntry {
         name,
         priority,
         parent,
         sequence: entry.header.sequence,
-        is_directory: entry.header.flags.bits() & FLAG_DIRECTORY != 0,
+        is_directory: flags & FLAG_DIRECTORY != 0,
+        in_use: flags & FLAG_IN_USE != 0,
     }
 }
 
@@ -217,15 +284,19 @@ struct Extension {
 /// The base keeps what it already carries; $FILE_NAME follows namespace
 /// priority; $DATA size/body come from whichever record holds them.
 fn absorb(facts: &mut RecordFacts, ext: RecordFacts) {
+    let offset = facts.names.len();
     if let Some(name) = ext.name {
-        let better = facts
-            .name
-            .as_ref()
-            .map_or(true, |cur| namespace_priority(&name.namespace) > namespace_priority(&cur.namespace));
+        let better = preferred_name(
+            facts.name.as_ref().map(|cur| namespace_priority(&cur.namespace)),
+            &name.namespace,
+        )
+        .is_some();
         if better {
             facts.name = Some(name);
+            facts.chosen = ext.chosen.map(|i| i + offset);
         }
     }
+    facts.names.extend(ext.names);
     if facts.standard_info.is_none() {
         facts.standard_info = ext.standard_info;
     }
@@ -250,9 +321,9 @@ fn absorb(facts: &mut RecordFacts, ext: RecordFacts) {
 /// file itself, so they are skipped.
 fn extract(entry: &mft::MftEntry) -> RecordFacts {
     let mut facts = RecordFacts::default();
-    let mut best_priority: i32 = -1;
+    let mut best_priority: Option<i32> = None;
 
-    for attr in entry.iter_attributes().filter_map(|a| a.ok()) {
+    for attr in attributes(entry) {
         if attr.header.type_code == MftAttributeType::DATA && attr.header.name.is_empty() {
             match &attr.header.residential_header {
                 ResidentialHeader::NonResident(nr) => {
@@ -299,11 +370,12 @@ fn extract(entry: &mft::MftEntry) -> RecordFacts {
                 });
             }
             MftAttributeContent::AttrX30(f) => {
-                let priority = namespace_priority(&f.namespace);
-                if priority > best_priority {
-                    best_priority = priority;
-                    facts.name = Some(f);
+                if let Some(priority) = preferred_name(best_priority, &f.namespace) {
+                    best_priority = Some(priority);
+                    facts.chosen = Some(facts.names.len());
+                    facts.name = Some(f.clone());
                 }
+                facts.names.push(f);
             }
             _ => {}
         }
@@ -334,7 +406,7 @@ fn volume_facts(entry: &mft::MftEntry) -> Option<VolumeFacts> {
     let mut has_name = false;
     let mut is_volume_record = false;
 
-    for attr in entry.iter_attributes().filter_map(|a| a.ok()) {
+    for attr in attributes(entry) {
         match (&attr.header.type_code, &attr.data) {
             (MftAttributeType::VolumeName, MftAttributeContent::Raw(raw)) => {
                 facts.label = Some(utf16le(&raw.data));
@@ -374,6 +446,10 @@ enum ParentStatus {
     /// The referenced record exists in this input, carries the referenced
     /// sequence and is a directory.
     Verified,
+    /// The referenced record is a freed directory one sequence past the
+    /// reference: NTFS raises the sequence on free, so this is the deleted
+    /// directory itself, not a reused slot.
+    DeletedParent,
     /// No record with that number in this input.
     Missing,
     /// The record is there but at another sequence: the slot was reused, so
@@ -392,6 +468,7 @@ impl ParentStatus {
         match self {
             ParentStatus::Root => "root",
             ParentStatus::Verified => "verified",
+            ParentStatus::DeletedParent => "deleted_parent",
             ParentStatus::Missing => "missing",
             ParentStatus::SequenceMismatch => "sequence_mismatch",
             ParentStatus::NotDirectory => "not_directory",
@@ -399,11 +476,17 @@ impl ParentStatus {
             ParentStatus::Unknown => "unknown",
         }
     }
+
+    /// The link leads to the parent's own record, so the path continues.
+    fn links(self) -> bool {
+        matches!(self, ParentStatus::Verified | ParentStatus::DeletedParent)
+    }
 }
 
-/// How much of the path could be rebuilt from verified links, written to
+/// How much of the path could be rebuilt from checked links, written to
 /// `path_status`. Only `Complete` means every link up to the real root was
-/// verified; everything else keeps the `\$Orphan` presentation and says why.
+/// verified or led to its freed directory; everything else keeps the
+/// `\$Orphan` presentation and says why.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PathStatus {
     Complete,
@@ -429,7 +512,9 @@ impl PathStatus {
     /// The reason a parent link could not be used, as a path state.
     fn of_parent(status: ParentStatus) -> PathStatus {
         match status {
-            ParentStatus::Root | ParentStatus::Verified => PathStatus::Complete,
+            ParentStatus::Root | ParentStatus::Verified | ParentStatus::DeletedParent => {
+                PathStatus::Complete
+            }
             ParentStatus::Missing => PathStatus::Orphan,
             ParentStatus::SequenceMismatch => PathStatus::SequenceMismatch,
             ParentStatus::NotDirectory => PathStatus::NotDirectory,
@@ -445,7 +530,8 @@ const ORPHAN_PATH: &str = "\\$Orphan";
 
 /// Validate one parent link inside one input: the referenced record must exist
 /// here, its own sequence must match the reference (otherwise the slot was
-/// reused by another file) and it must be a directory.
+/// reused by another file, unless it is the freed directory one sequence on)
+/// and it must be a directory.
 fn check_parent(
     index: &HashMap<u64, IndexEntry>,
     record: u64,
@@ -454,6 +540,14 @@ fn check_parent(
 ) -> ParentStatus {
     match index.get(&parent) {
         None => ParentStatus::Missing,
+        Some(p)
+            if parent != record
+                && !p.in_use
+                && p.is_directory
+                && sequence.checked_add(1) == Some(p.sequence) =>
+        {
+            ParentStatus::DeletedParent
+        }
         Some(p) if p.sequence != sequence => ParentStatus::SequenceMismatch,
         Some(_) if parent == record => ParentStatus::Cycle,
         Some(p) if !p.is_directory => ParentStatus::NotDirectory,
@@ -532,7 +626,7 @@ impl PathResolver {
             }
             self.stack.push(current);
             match check_parent(index, current, parent, sequence) {
-                ParentStatus::Verified => current = parent,
+                status if status.links() => current = parent,
                 ParentStatus::Cycle => return self.poison(),
                 other => break self.orphaned(PathStatus::of_parent(other)),
             }
@@ -627,19 +721,33 @@ fn create_schema(conn: &Connection) -> Result<()> {
   \"parent_status\" TEXT,
   \"path_status\" TEXT,
   \"data_status\" TEXT,
+  \"record_status\" TEXT,
+  \"hard_link_count\" INTEGER,
   CHECK (is_directory IN (0,1)),
   CHECK (in_use IN (0,1)),
   CHECK (file_size IS NULL OR (typeof(file_size) = 'integer' AND file_size >= 0)),
   CHECK (data IS NULL OR typeof(data) = 'blob'),
   CHECK (parent_seq IS NULL OR (typeof(parent_seq) = 'integer' AND parent_seq >= 0)),
   CHECK (parent_status IS NULL OR parent_status IN
-    ('root','verified','missing','sequence_mismatch','not_directory','cycle','unknown')),
+    ('root','verified','deleted_parent','missing','sequence_mismatch','not_directory','cycle','unknown')),
   CHECK (path_status IS NULL OR path_status IN
     ('complete','orphan','sequence_mismatch','not_directory','cycle','unknown')),
   CHECK (data_status IS NULL OR data_status IN
-    ('resident','resident_empty','nonresident','unavailable','not_applicable'))
+    ('resident','resident_empty','nonresident','unavailable','not_applicable')),
+  CHECK (record_status IS NULL OR record_status IN ('ok','fixup_mismatch','bad_signature'))
+);
+DROP TABLE IF EXISTS {names};
+CREATE TABLE {names} (
+  \"volume_id\" TEXT NOT NULL,
+  \"entry\" INTEGER NOT NULL,
+  \"seq\" INTEGER NOT NULL,
+  \"parent_entry\" INTEGER NOT NULL,
+  \"parent_seq\" INTEGER NOT NULL,
+  \"name\" TEXT NOT NULL,
+  \"namespace\" TEXT NOT NULL
 )",
-        table = table
+        table = table,
+        names = quote_ident(MFT_NAMES_TABLE)
     ))?;
     Ok(())
 }
@@ -651,8 +759,10 @@ fn create_indexes(conn: &Connection) -> Result<()> {
     let table = quote_ident(MFT_TABLE);
     conn.execute_batch(&format!(
         "CREATE INDEX IF NOT EXISTS idx_mft_children ON {table}(volume_id, parent_entry, is_directory, file_name COLLATE NOCASE);
-         CREATE INDEX IF NOT EXISTS idx_mft_reference ON {table}(volume_id, entry, seq);",
-        table = table
+         CREATE INDEX IF NOT EXISTS idx_mft_reference ON {table}(volume_id, entry, seq);
+         CREATE INDEX IF NOT EXISTS idx_mft_names_reference ON {names}(volume_id, entry, seq);",
+        table = table,
+        names = quote_ident(MFT_NAMES_TABLE)
     ))?;
     Ok(())
 }
@@ -683,12 +793,30 @@ fn nullable(text: String) -> Option<String> {
     }
 }
 
+/// The `mft` crate sizes every record from record 0 and divides by that size;
+/// a source whose first record is not a FILE record with a size is rejected.
+fn check_first_record(source: &Path) -> std::result::Result<(), SourceFailure> {
+    use std::io::Read;
+    let mut head = [0u8; 32];
+    std::fs::File::open(source)
+        .and_then(|mut file| file.read_exact(&mut head))
+        .map_err(|e| SourceFailure::Input(e.to_string()))?;
+    let size = u32::from_le_bytes([head[28], head[29], head[30], head[31]]);
+    if &head[..4] != b"FILE" || size == 0 {
+        return Err(SourceFailure::Input(
+            "첫 MFT 레코드가 FILE 레코드가 아니거나 크기가 0입니다".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Parse one `$MFT` into the already-created table under `volume_id`.
 fn stream_source(
     conn: &Connection,
     source: &Path,
     volume_id: &str,
 ) -> std::result::Result<usize, SourceFailure> {
+    check_first_record(source)?;
     let mut parser =
         MftParser::from_path(source).map_err(|e| SourceFailure::Input(e.to_string()))?;
 
@@ -747,9 +875,8 @@ fn stream_source(
             // A directory's name may live only in an extension: children
             // resolve their paths through it.
             if let Some(f) = &ext.facts.name {
-                let priority = namespace_priority(&f.namespace);
                 let entry = index.get_mut(base).expect("base checked above");
-                if priority > entry.priority {
+                if let Some(priority) = preferred_name(Some(entry.priority), &f.namespace) {
                     entry.priority = priority;
                     entry.name = f.name.clone();
                     entry.parent = Some((f.parent.entry, f.parent.sequence));
@@ -764,6 +891,12 @@ fn stream_source(
 
     let sql = insert_sql();
     let mut stmt = conn.prepare(&sql).map_err(storage)?;
+    let mut names_stmt = conn
+        .prepare(&format!(
+            "INSERT INTO {} (volume_id, entry, seq, parent_entry, parent_seq, name, namespace) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            quote_ident(MFT_NAMES_TABLE)
+        ))
+        .map_err(storage)?;
     conn.execute_batch("BEGIN").map_err(storage)?;
     let mut total = 0usize;
     let mut pending = 0usize;
@@ -783,6 +916,14 @@ fn stream_source(
         if merged.contains(&record) {
             continue;
         }
+        // The crate also accepts BAAD (NTFS-declared bad) and all-zero
+        // records; zero ones carry nothing, BAAD ones are kept but marked.
+        let record_status = match &header.signature {
+            b"FILE" if entry.valid_fixup == Some(false) => "fixup_mismatch",
+            b"FILE" => "ok",
+            b"BAAD" => "bad_signature",
+            _ => continue,
+        };
         let in_use = i64::from(header.flags.bits() & FLAG_IN_USE != 0);
         let is_directory = header.flags.bits() & FLAG_DIRECTORY != 0;
         let mut facts = extract(&entry);
@@ -829,7 +970,7 @@ fn stream_source(
             } else if let (Some(parent_entry), Some(sequence)) = (parent, parent_seq) {
                 let status = check_parent(&index, record, parent_entry, sequence);
                 let base = match status {
-                    ParentStatus::Verified => resolver.resolve(parent_entry, &index),
+                    status if status.links() => resolver.resolve(parent_entry, &index),
                     other => resolver.orphaned(PathStatus::of_parent(other)),
                 };
                 let path = match name.as_deref() {
@@ -936,8 +1077,26 @@ fn stream_source(
             parent_status.as_str(),
             path_status.as_str(),
             data_status,
+            record_status,
+            i64::from(header.hard_link_count),
         ])
         .map_err(storage)?;
+        for (i, f) in facts.names.iter().enumerate() {
+            if Some(i) == facts.chosen || f.namespace == FileNamespace::DOS {
+                continue;
+            }
+            names_stmt
+                .execute(rusqlite::params![
+                    volume_id,
+                    record as i64,
+                    i64::from(header.sequence),
+                    f.parent.entry as i64,
+                    i64::from(f.parent.sequence),
+                    f.name,
+                    namespace_text(&f.namespace),
+                ])
+                .map_err(storage)?;
+        }
 
         total += 1;
         pending += 1;
@@ -972,10 +1131,19 @@ pub fn parse_mft_sources(sources: &[PathBuf], out: &Path) -> Result<Vec<MftSourc
     let mut reports: Vec<MftSourceReport> = Vec::with_capacity(sources.len());
     for source in sources {
         let volume_id = volume_key(source, &mut taken);
-        let report = match stream_source(&conn, source, &volume_id) {
+        // A crate panic on one corrupt input fails that input only.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            stream_source(&conn, source, &volume_id)
+        }))
+        .unwrap_or_else(|payload| {
+            Err(SourceFailure::Input(format!(
+                "MFT 파싱 중 패닉: {}",
+                crate::pipeline::panic_details(payload)
+            )))
+        });
+        let report = match outcome {
             Ok(record_count) => MftSourceReport {
                 source: source.clone(),
-                volume_id,
                 record_count,
                 error: None,
             },
@@ -983,16 +1151,14 @@ pub fn parse_mft_sources(sources: &[PathBuf], out: &Path) -> Result<Vec<MftSourc
                 // Roll the open transaction back, then drop whatever earlier
                 // batches committed: a reported failure must leave no rows.
                 let _ = conn.execute_batch("ROLLBACK");
-                conn.execute(
-                    &format!(
-                        "DELETE FROM {} WHERE volume_id = ?1",
-                        quote_ident(MFT_TABLE)
-                    ),
-                    rusqlite::params![volume_id],
-                )?;
+                for table in [MFT_TABLE, MFT_NAMES_TABLE] {
+                    conn.execute(
+                        &format!("DELETE FROM {} WHERE volume_id = ?1", quote_ident(table)),
+                        rusqlite::params![volume_id],
+                    )?;
+                }
                 MftSourceReport {
                     source: source.clone(),
-                    volume_id,
                     record_count: 0,
                     error: Some(message),
                 }
@@ -1261,6 +1427,18 @@ mod tests {
     fn query_one<T: rusqlite::types::FromSql>(db: &Path, sql: &str) -> T {
         let conn = Connection::open(db).unwrap();
         conn.query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+
+    /// The volume key the rows of `source` were stored under.
+    fn stored_key(db: &Path, source: &Path) -> String {
+        Connection::open(db)
+            .unwrap()
+            .query_row(
+                "SELECT DISTINCT volume_id FROM MFT_Records WHERE _source_file = ?1",
+                [source.to_string_lossy()],
+                |r| r.get(0),
+            )
+            .unwrap()
     }
 
     /// (parent_entry, parent_seq, parent_status, path, path_status, data_status).
@@ -1747,7 +1925,7 @@ mod tests {
         assert_eq!(reports.len(), 2);
         assert!(reports.iter().all(|r| r.error.is_none()));
         assert!(reports.iter().all(|r| r.record_count >= 4));
-        assert_ne!(reports[0].volume_id, reports[1].volume_id);
+        assert_ne!(stored_key(&out, &first), stored_key(&out, &second));
         assert_eq!(reports[0].source, first);
         assert_eq!(reports[1].source, second);
 
@@ -1756,7 +1934,7 @@ mod tests {
         let per_volume: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM MFT_Records WHERE entry = 7 AND volume_id = ?1",
-                rusqlite::params![reports[0].volume_id],
+                rusqlite::params![stored_key(&out, &first)],
                 |r| r.get(0),
             )
             .unwrap();
@@ -1830,7 +2008,7 @@ mod tests {
         let orphans: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM MFT_Records WHERE volume_id = ?1",
-                rusqlite::params![reports[0].volume_id],
+                rusqlite::params![volume_key(&broken, &mut HashSet::new())],
                 |r| r.get(0),
             )
             .unwrap();
@@ -1869,11 +2047,11 @@ mod tests {
         assert_eq!(names.as_slice(), MFT_FIELD_ORDER);
         // The approved 28 fields keep their order; the new state columns are
         // appended behind them.
-        assert_eq!(names.len(), 32);
+        assert_eq!(names.len(), 34);
         assert_eq!(names[27], "_source_file");
         assert_eq!(
             &names[28..],
-            &["parent_seq", "parent_status", "path_status", "data_status"]
+            &["parent_seq", "parent_status", "path_status", "data_status", "record_status", "hard_link_count"]
         );
         let typed: HashMap<&str, &str> = columns
             .iter()
@@ -1952,13 +2130,14 @@ mod tests {
         let second = write_mft(&dir.join("b"), "$MFT", &records);
 
         let out = dir.join("MFT_Records.sqlite");
-        let run = parse_mft_sources(&[first.clone(), second.clone()], &out).unwrap();
-        let again = parse_mft_sources(&[first.clone()], &dir.join("again.sqlite")).unwrap();
+        parse_mft_sources(&[first.clone(), second.clone()], &out).unwrap();
+        let again = dir.join("again.sqlite");
+        parse_mft_sources(&[first.clone()], &again).unwrap();
 
         // Same label, different sources -> different keys.
-        assert_ne!(run[0].volume_id, run[1].volume_id);
+        assert_ne!(stored_key(&out, &first), stored_key(&out, &second));
         // Same source, another run -> same key.
-        assert_eq!(run[0].volume_id, again[0].volume_id);
+        assert_eq!(stored_key(&out, &first), stored_key(&again, &first));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2167,6 +2346,112 @@ mod tests {
             "SELECT COUNT(*) FROM MFT_Records WHERE path_status = 'complete' AND path LIKE '\\$Orphan%'",
         );
         assert_eq!(rooted_orphans, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// NTFS raises a record's sequence when it frees it, so a child of a
+    /// deleted directory references header_seq - 1. That link is kept, with
+    /// its own status; any other mismatch is still rejected.
+    #[test]
+    fn freed_parent_directory_at_next_sequence_rebuilds_the_path() {
+        let dir = temp_dir("parent-freed");
+        let records = with_root(vec![
+            // 6: a freed directory (flags: directory, not in use) at sequence 5.
+            mft_record(5, 0x02, &[si(), file_name_attr(mft_ref(5, ROOT_SEQ), "Gone", 0)]),
+            // 7: its child, referencing the sequence before the free.
+            mft_record(2, 0x00, &[si(), file_name_attr(mft_ref(6, 4), "lost.txt", 0)]),
+            // 8: an allocated directory at sequence 4.
+            mft_record(4, 0x03, &[si(), file_name_attr(mft_ref(5, ROOT_SEQ), "Live", 0)]),
+            // 9: references 8 one sequence back, but 8 is allocated: reused.
+            mft_record(1, 0x01, &[si(), file_name_attr(mft_ref(8, 3), "reused.txt", 0)]),
+            // 10: a freed directory at sequence 7.
+            mft_record(7, 0x02, &[si(), file_name_attr(mft_ref(5, ROOT_SEQ), "Old", 0)]),
+            // 11: references 10 three sequences back: not the last occupant.
+            mft_record(1, 0x00, &[si(), file_name_attr(mft_ref(10, 4), "older.txt", 0)]),
+            // 12: a freed file at sequence 3; a file holds no children.
+            mft_record(3, 0x00, &[si(), file_name_attr(mft_ref(5, ROOT_SEQ), "f.bin", 0)]),
+            // 13: references 12 one sequence back.
+            mft_record(1, 0x00, &[si(), file_name_attr(mft_ref(12, 2), "under-file.txt", 0)]),
+            // 14: a file in freed directory 15, which is itself in freed directory 6.
+            mft_record(1, 0x00, &[si(), file_name_attr(mft_ref(15, 2), "deep.txt", 0)]),
+            // 15: freed directory at sequence 3 under freed directory 6.
+            mft_record(3, 0x02, &[si(), file_name_attr(mft_ref(6, 4), "Sub", 0)]),
+        ]);
+        let src = write_mft(&dir, "$MFT", &records);
+        let out = dir.join("MFT_Records.sqlite");
+        parse_mft_stream(&src, &out).unwrap();
+
+        assert_eq!(
+            row_state(&out, "file_name = 'lost.txt'"),
+            (
+                Some(6),
+                Some(4),
+                "deleted_parent".into(),
+                "\\Gone\\lost.txt".into(),
+                "complete".into(),
+                "unavailable".into(),
+            )
+        );
+        assert_eq!(
+            row_state(&out, "file_name = 'deep.txt'"),
+            (
+                Some(15),
+                Some(2),
+                "deleted_parent".into(),
+                "\\Gone\\Sub\\deep.txt".into(),
+                "complete".into(),
+                "unavailable".into(),
+            )
+        );
+        for (name, parent, parent_seq, status) in [
+            ("reused.txt", 8, 3, "sequence_mismatch"),
+            ("older.txt", 10, 4, "sequence_mismatch"),
+            ("under-file.txt", 12, 2, "sequence_mismatch"),
+        ] {
+            assert_eq!(
+                row_state(&out, &format!("file_name = '{name}'")),
+                (
+                    Some(parent),
+                    Some(parent_seq),
+                    status.into(),
+                    format!("\\$Orphan\\{name}"),
+                    "sequence_mismatch".into(),
+                    "unavailable".into(),
+                ),
+                "{name}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The `mft` crate advances by each attribute's own length; a length of 0
+    /// must end the attribute walk instead of repeating one attribute forever.
+    #[test]
+    fn zero_length_attribute_ends_the_walk_instead_of_spinning() {
+        let dir = temp_dir("zero-attr");
+        let mut stalled = resident_attr(0x80, "", b"body");
+        put(&mut stalled, 4, &0u32.to_le_bytes());
+        let records = with_root(vec![mft_record(
+            1,
+            0x01,
+            &[si(), file_name_attr(mft_ref(5, ROOT_SEQ), "a.txt", 0), stalled],
+        )]);
+        let src = write_mft(&dir, "$MFT", &records);
+        let out = dir.join("MFT_Records.sqlite");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker_out = out.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(parse_mft_stream(&src, &worker_out).map(|_| ()).is_ok());
+        });
+        let finished = rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("parse must terminate");
+        assert!(finished);
+        let (_, _, parent_status, path, _, data_status) = row_state(&out, "file_name = 'a.txt'");
+        assert_eq!(parent_status, "verified");
+        assert_eq!(path, "\\a.txt");
+        // The attribute after which the walk stopped is not decoded.
+        assert_eq!(data_status, "unavailable");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2454,14 +2739,15 @@ mod tests {
         let first = write_mft(&dir.join("c"), "$MFT", &build("C", 4, b"first"));
         let second = write_mft(&dir.join("d"), "$MFT", &build("D", 11, b"second"));
         let out = dir.join("MFT_Records.sqlite");
-        let reports = parse_mft_sources(&[first, second], &out).unwrap();
+        parse_mft_sources(&[first.clone(), second.clone()], &out).unwrap();
+        let (first_key, second_key) = (stored_key(&out, &first), stored_key(&out, &second));
 
         // Entry 7 exists in both inputs with the same name: each row keeps the
         // parent sequence of its own input.
         assert_eq!(
             row_state(
                 &out,
-                &format!("entry = 7 AND volume_id = '{}'", reports[0].volume_id)
+                &format!("entry = 7 AND volume_id = '{first_key}'")
             ),
             (
                 Some(6),
@@ -2475,7 +2761,7 @@ mod tests {
         assert_eq!(
             row_state(
                 &out,
-                &format!("entry = 7 AND volume_id = '{}'", reports[1].volume_id)
+                &format!("entry = 7 AND volume_id = '{second_key}'")
             ),
             (
                 Some(6),
@@ -2496,8 +2782,8 @@ mod tests {
             )
             .unwrap()
         };
-        assert_eq!(body_of(&reports[0].volume_id), b"first".to_vec());
-        assert_eq!(body_of(&reports[1].volume_id), b"second".to_vec());
+        assert_eq!(body_of(&first_key), b"first".to_vec());
+        assert_eq!(body_of(&second_key), b"second".to_vec());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2607,6 +2893,93 @@ mod tests {
         );
         let roots: i64 = query_one(&out, "SELECT COUNT(*) FROM MFT_Records WHERE path = '\\'");
         assert_eq!(roots, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn zero_filled_source_fails_alone_instead_of_panicking() {
+        let dir = temp_dir("zero-source");
+        let zero = dir.join("zero.mft");
+        std::fs::write(&zero, vec![0u8; 2048]).unwrap();
+        let good = write_mft(
+            &dir,
+            "$MFT",
+            &with_root(vec![mft_record(2, 0x01, &[si(), file_name_attr(mft_ref(5, ROOT_SEQ), "ok.txt", 0)])]),
+        );
+        let out = dir.join("MFT_Records.sqlite");
+        let reports = parse_mft_sources(&[zero, good], &out).unwrap();
+        assert!(reports[0].error.is_some());
+        assert_eq!(reports[0].record_count, 0);
+        assert!(reports[1].error.is_none());
+        assert!(reports[1].record_count >= 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bad_signature_and_torn_records_carry_record_status() {
+        let dir = temp_dir("record-status");
+        let mut baad = mft_record(2, 0x01, &[si(), file_name_attr(mft_ref(5, ROOT_SEQ), "baad.txt", 0)]);
+        put(&mut baad, 0, b"BAAD");
+        let mut torn = mft_record(2, 0x01, &[si(), file_name_attr(mft_ref(5, ROOT_SEQ), "torn.txt", 0)]);
+        put(&mut torn, 510, &7u16.to_le_bytes());
+        let fine = mft_record(2, 0x01, &[si(), file_name_attr(mft_ref(5, ROOT_SEQ), "fine.txt", 0)]);
+        let src = write_mft(&dir, "$MFT", &with_root(vec![baad, torn, fine]));
+        let out = dir.join("MFT_Records.sqlite");
+        parse_mft_stream(&src, &out).unwrap();
+        let status = |name: &str| -> String {
+            Connection::open(&out)
+                .unwrap()
+                .query_row(
+                    "SELECT record_status FROM MFT_Records WHERE file_name = ?1",
+                    [name],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(status("baad.txt"), "bad_signature");
+        assert_eq!(status("torn.txt"), "fixup_mismatch");
+        assert_eq!(status("fine.txt"), "ok");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hard_link_names_are_kept_in_child_table() {
+        let dir = temp_dir("hard-links");
+        let mut linked = mft_record(
+            2,
+            0x01,
+            &[
+                si(),
+                file_name_attr(mft_ref(5, ROOT_SEQ), "first.txt", 0),
+                resident_attr(0x30, "", &file_name_body(mft_ref(5, ROOT_SEQ), 2, "FIRST~1.TXT", 0)),
+                file_name_attr(mft_ref(5, ROOT_SEQ), "second.txt", 0),
+            ],
+        );
+        put(&mut linked, 18, &2u16.to_le_bytes());
+        let src = write_mft(&dir, "$MFT", &with_root(vec![linked]));
+        let out = dir.join("MFT_Records.sqlite");
+        parse_mft_stream(&src, &out).unwrap();
+        let conn = Connection::open(&out).unwrap();
+        // The primary row is unchanged: one row, the first Win32 name.
+        let (count, links): (i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), MAX(hard_link_count) FROM MFT_Records WHERE entry = 6",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((count, links), (1, 2));
+        assert_eq!(query_one::<String>(&out, "SELECT file_name FROM MFT_Records WHERE entry = 6"), "first.txt");
+        let rows: Vec<(i64, i64, i64, i64, String, String)> = conn
+            .prepare(&format!(
+                "SELECT entry, seq, parent_entry, parent_seq, name, namespace FROM {MFT_NAMES_TABLE} ORDER BY rowid"
+            ))
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(rows, vec![(6, 2, 5, i64::from(ROOT_SEQ), "second.txt".to_string(), "win32".to_string())]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

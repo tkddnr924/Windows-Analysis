@@ -199,19 +199,8 @@ export interface ResultFileEntry {
   rowCount: number;
   /** True for _OVERVIEW contract (derived) DBs; false for raw parser facts. */
   derived?: boolean;
-}
-
-/** Parser-provided source and recovery summary for one result table. */
-export interface ResultProvenance {
-  sourceFile: string;
-  recovery: string;
-}
-
-/** A supplementary source input that the parser explicitly consumed. */
-export interface ArtifactInputFile {
-  name: string;
-  kind: "hive" | "transactionLog" | string;
-  detail: string;
+  /** Set when the file or table could not be read (not 0 rows). */
+  readError?: string;
 }
 
 export interface ParseReportArtifact {
@@ -567,9 +556,9 @@ export interface TimelinePageRow {
   rowidSrc: number;
   /** 원시 테이블이 보관한 `<테이블>::<rowid>` 포인터. 파생 행은 비어 있다. */
   recordKey: string;
-  /** 파생 레코드 ID. 화면 식별·조회는 (파일·표·rowid)로 하고 원본 근거는
-   * readRecordSources로 읽으므로 표시에는 쓰지 않는다 — 재파싱 전후 기록을
-   * 잇는 키가 아니라는 계약(docs-01)을 화면이 어기지 않게 보관만 한다. */
+  /** 파생 레코드 ID. 화면 식별·조회는 (파일·표·rowid)로 하므로 표시에는 쓰지
+   * 않는다 — 재파싱 전후 기록을 잇는 키가 아니라는 계약(docs-01)을 화면이
+   * 어기지 않게 보관만 한다. */
   recordId: string;
   eventTime: string;
   /** 원본 행 — 백엔드가 페이지마다 원본 파일에서 읽어 붙인다. */
@@ -704,24 +693,6 @@ export interface AccountDirectoryEntry {
  * 0/1 플래그는 "0"/"1", 미확인은 null로 도착한다 — 빈 문자열과 구분된다. */
 export type DBRow = Record<string, string>;
 
-/** 한 결과 행이 가리키는 원본 근거 한 건(source_records). 한 행이 여러 원본을
- * 가질 수 있어 항상 목록으로 다룬다. */
-export interface RecordSource {
-  ordinal: string;
-  source_dataset_id: string;
-  source_artifact: string;
-  /** 호스트 상대 경로. 열람에는 백엔드가 검증한 source_full_path를 쓴다. */
-  source_db: string;
-  source_table: string;
-  source_rowid: string;
-  source_field: string | null;
-  source_record_key: string | null;
-  source_file: string | null;
-  source_label: string | null;
-  /** 호스트 루트 안에서 확인된 절대 경로. 확인 실패·파일 없음은 "". */
-  source_full_path: string;
-}
-
 /** FileSystemEntries가 담은 입력(볼륨) 문맥. 같은 값이라고 해서 실제로
  * 같은 볼륨이라는 증거는 아니다(docs-01). */
 export interface MftVolume {
@@ -765,11 +736,9 @@ export interface ElectronApi {
   /** Resize the single desktop window to fit the current application stage. */
   pickFolder(): Promise<string | null>;
   listCases(): Promise<ListCasesResult>;
-  createCase(name: string): Promise<Case>;
   createHost(caseId: string, name: string, targetDir: string): Promise<Host>;
   /** Changes display metadata only; evidence and result paths remain immutable. */
   renameHost(caseId: string, hostId: string, name: string): Promise<Host>;
-  deleteCase(caseId: string): Promise<boolean>;
   deleteHost(caseId: string, hostId: string): Promise<boolean>;
   listArtifacts(): Promise<string[]>;
   runHost(options: RunHostOptions): Promise<PipelineResult>;
@@ -791,8 +760,6 @@ export interface ElectronApi {
   /** 발행된 파생 DB가 저장 계약을 따르는지 확인한다. 읽기 전용이다 — 낡은
    * 결과는 다시 쓰지 않고 재파싱을 안내한다. */
   overviewContractStatus(hostDir: string): Promise<OverviewContractStatus>;
-  resultProvenance(fullPath: string, tableName: string): Promise<ResultProvenance[]>;
-  artifactInputFiles(sourceFile: string): Promise<ArtifactInputFile[]>;
   parseReport(hostDir: string): Promise<ParseReport | null>;
   /** Reads a bounded immutable run log; never scans or reparses evidence. */
   parseRunLog(hostDir: string, runId: string): Promise<ParseLogPreview>;
@@ -805,9 +772,6 @@ export interface ElectronApi {
   accountDirectory(hostDir: string): Promise<AccountDirectoryEntry[]>;
   /** 호스트 공통 참조 정보(Metadata.sqlite) — 호스트 화면의 상세 속성. */
   hostMetadata(hostDir: string, options?: { metadataIds?: string[]; kind?: string }): Promise<HostMetadata>;
-  /** 한 결과 행의 원본 근거 목록(source_records). 원본 facts 테이블처럼
-   * source_records가 없는 파일은 빈 배열이다. */
-  readRecordSources(fullPath: string, tableName: string, rowid: number): Promise<RecordSource[]>;
   /** 한 결과 행의 상세 전용 자식 표(ExecutionTimes·TaskActions 등) 행들.
    * 목록·검색에는 올리지 않고 행 상세에서만 조회한다. `via`: 자식 표를 링크로
    * 써서 `via.table`의 record_id = 링크 행 `via.key` 행을 돌려준다(링크 컬럼은 `link.` 접두).
@@ -838,7 +802,6 @@ export interface ElectronApi {
   /** parentEntry null = 부모 연결 미확인 묶음. parentSeq null + parentEntry = 볼륨 루트. */
   mftChildren(fullPath: string, parentEntry: number | null, parentSeq: number | null, offset?: number, limit?: number, volumeId?: string): Promise<MftChildrenPage>;
   mftSearch(fullPath: string, query: string, limit: number, volumeId?: string): Promise<DBRow[]>;
-  mftRow(fullPath: string, rowid: number, volumeId?: string): Promise<DBRow | null>;
   /** 상주 $DATA 본문 — 상세에서 분석가가 요청할 때만 호출한다. */
   mftRecordBody(fullPath: string, rowid: number, volumeId?: string): Promise<MftRecordBody>;
   /** 결과가 담은 볼륨 문맥 목록. 선택한 볼륨 안에서만 경로·부모를 해석한다. */
@@ -857,11 +820,9 @@ export interface ElectronApi {
   registryValueChunk(fullPath: string, recordId: string, field: "hex" | "text", offset: number, length: number): Promise<RegistryValueChunk>;
   registrySearch(fullPath: string, options: RegistrySearchOptions, cursor: number | null, limit: number): Promise<RegistrySearchPage>;
   registryQuickAccess(fullPath: string): Promise<RegistryQuickAccess>;
-  listColumnValues(fullPath: string, column: string, tableName?: string): Promise<{ value: string; count: number }[]>;
   searchCase(query: string, hosts: { id: string; name: string; dir: string }[], offset: number, limit: number, range?: { start?: string; end?: string }, categories?: string[]): Promise<SearchCasePage>;
   listBookmarks(hostDir: string): Promise<Bookmark[]>;
   toggleBookmark(hostDir: string, entry: BookmarkInput): Promise<Bookmark[]>;
-  updateBookmarkNote(hostDir: string, id: string, note: string): Promise<Bookmark[]>;
   /** Stored candidate references for the file records on screen. */
   fileReferences(hostDir: string, datasetId: string, volumeId: string | undefined, fileRecordIds: string[]): Promise<FileReference[]>;
   pathReferenceAccounts(hostDir: string): Promise<string[]>;
@@ -890,7 +851,7 @@ export interface SearchHit {
   /** Candidate evidence time selected by the query without serialising the
    * complete SQLite row. Empty when the artifact provides no time. */
   timestamp: string;
-  /** 파생 레코드 ID(record_id). 원본 근거는 readRecordSources로 조회한다. */
+  /** 파생 레코드 ID(record_id). */
   recordId: string;
 }
 

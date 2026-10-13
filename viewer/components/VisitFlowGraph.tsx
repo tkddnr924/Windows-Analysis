@@ -217,8 +217,23 @@ function NodeDetail({ node, parentEdge }: { node: VisitFlowNode; parentEdge?: Vi
   );
 }
 
+function defaultSelection(graph: BrowserVisitFlow): string | null {
+  // 기본 선택: 대상(이 항목) 방문 중 가장 최근 것.
+  const targets = graph.nodes.filter((n) => n.isTarget);
+  const latest = targets.reduce<VisitFlowNode | null>((best, n) => (!best || n.time > best.time ? n : best), null);
+  return latest?.recordId ?? graph.nodes[graph.nodes.length - 1]?.recordId ?? null;
+}
+
 function GraphCanvas({ graph }: { graph: BrowserVisitFlow }) {
   const layout = useMemo(() => layoutGraph(graph), [graph]);
+  const newTabPairs = useMemo(() => {
+    const kindsByPair = new Map<string, Set<string>>();
+    for (const edge of layout.edges) {
+      const pair = `${edge.from}\u0000${edge.to}`;
+      kindsByPair.set(pair, (kindsByPair.get(pair) ?? new Set()).add(edge.kind));
+    }
+    return new Set([...kindsByPair].filter(([, kinds]) => kinds.size > 1).map(([pair]) => pair));
+  }, [layout]);
   const viewportRef = useRef<HTMLDivElement>(null);
   const [view, setView] = useState({ x: 0, y: 0, k: 1 });
   const viewRef = useRef(view);
@@ -227,12 +242,13 @@ function GraphCanvas({ graph }: { graph: BrowserVisitFlow }) {
   // 뷰포트를 타깃해 노드 선택이 죽는다 — 캡처 없이 window 리스너로 추적하고,
   // 드래그로 끝난 click만 suppress 플래그로 무시한다.
   const suppressClickRef = useRef(false);
-  const [selectedId, setSelectedId] = useState<string | null>(() => {
-    // 기본 선택: 대상(이 항목) 방문 중 가장 최근 것.
-    const targets = graph.nodes.filter((n) => n.isTarget);
-    const latest = targets.reduce<VisitFlowNode | null>((best, n) => (!best || n.time > best.time ? n : best), null);
-    return latest?.recordId ?? graph.nodes[graph.nodes.length - 1]?.recordId ?? null;
-  });
+  const [selectedId, setSelectedId] = useState<string | null>(() => defaultSelection(graph));
+  // A replaced graph (retry) re-derives the default selection.
+  const [selectionGraph, setSelectionGraph] = useState(graph);
+  if (selectionGraph !== graph) {
+    setSelectionGraph(graph);
+    setSelectedId(defaultSelection(graph));
+  }
 
   const fit = () => {
     const el = viewportRef.current;
@@ -364,13 +380,15 @@ function GraphCanvas({ graph }: { graph: BrowserVisitFlow }) {
               const y1 = from.y + NODE_H / 2;
               const x2 = to.x;
               const y2 = to.y + NODE_H / 2;
+              // A pair linked both ways (same tab + new tab) bows the new-tab edge apart.
+              const sag = newTabPairs.has(`${edge.from}\u0000${edge.to}`) && edge.kind === "opener_visit" ? 22 : 0;
               const bend = Math.max(36, (x2 - x1) / 2);
               const newTab = edge.kind === "opener_visit";
               const color = newTab ? "var(--warning)" : "var(--accent)";
               return (
                 <path
-                  key={`${edge.from}-${edge.to}`}
-                  d={`M ${x1} ${y1} C ${x1 + bend} ${y1}, ${x2 - bend} ${y2}, ${x2} ${y2}`}
+                  key={`${edge.from}-${edge.to}-${edge.kind}`}
+                  d={`M ${x1} ${y1} C ${x1 + bend} ${y1 + sag}, ${x2 - bend} ${y2 + sag}, ${x2} ${y2}`}
                   fill="none"
                   stroke={color}
                   strokeWidth={1.6}

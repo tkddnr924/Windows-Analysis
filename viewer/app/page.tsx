@@ -32,12 +32,14 @@ import CircularProgress from "@mui/material/CircularProgress";
 import { streamBuildTimeline, TimelineBuildAborted, TIMELINE_LOGIC_VERSION } from "@/lib/masterTimeline";
 import { getArtifactView } from "@/lib/artifactViews";
 import { EMPTY_TIME_RANGE, type TimeRange } from "@/lib/timeRange";
-import { bookmarkKey, bookmarkKeys } from "@/lib/bookmarks";
+import { bookmarkKey, bookmarkKeys, bookmarkRecordKey, bookmarkRecordKeys } from "@/lib/bookmarks";
 import { accountDirectoryFromEntries, type AccountDirectory } from "@/lib/accountIdentity";
 import { RecordScopeContext } from "@/lib/recordScope";
 import { isLoopbackAddress } from "@/lib/remoteAccess";
 import { addressOwners, networkAddresses } from "@/lib/hostNetwork";
+import { bareAccount } from "@/lib/viewShared";
 import type { AccountEventPage, AccountEventQuery, Bookmark, Case, Host, CategoryEntry, CsvData, ResultFileEntry, TimelineEntry, SearchHit } from "@/lib/types";
+import { pendingFilterFor, type PendingFilter } from "@/lib/tableJump";
 
 interface TabState {
   file: ResultFileEntry;
@@ -73,7 +75,6 @@ function resultFileStem(fullPath: string): string {
 }
 
 export default function Home() {
-  const [cases, setCases] = useState<Case[]>([]);
   const [casesError, setCasesError] = useState<string | null>(null);
   const [casesLoading, setCasesLoading] = useState(true);
   // The backend exposes one internal root collection for compatibility. The
@@ -84,7 +85,9 @@ export default function Home() {
   const [categories, setCategories] = useState<CategoryEntry[]>([]);
   const [tabs, setTabs] = useState<TabState[]>([]);
   const [activePath, setActivePath] = useState<string | null>(null);
-  const [pendingFilter, setPendingFilter] = useState<{ column: string; value: string } | null>(null);
+  // Bound to its target table so a view that never consumes it cannot leak it
+  // into a later DataTable.
+  const [pendingFilter, setPendingFilter] = useState<PendingFilter | null>(null);
   const [activeVirtualTab, setActiveVirtualTab] = useState<VirtualTab>(null);
   const [bookmarks, setBookmarks] = useState<Bookmark[]>([]);
   // Bookmark persistence failures must remain visible to the analyst. Do not
@@ -110,7 +113,7 @@ export default function Home() {
   // All IPs of every host in the case (a host can have several NICs). Shared by
   // every 케이스 분석 view so a remote IP that is really another host is
   // recognised as that host, whichever of its addresses appears. Cached per case.
-  const [caseNetwork, setCaseNetwork] = useState<{ caseId: string; sig: string; nonce: number; ipToHost: Record<string, { id: string; name: string }>; ipHosts: Record<string, { id: string; name: string }[]>; hostIps: Record<string, string[]> } | null>(null);
+  const [caseNetwork, setCaseNetwork] = useState<{ caseId: string; sig: string; nonce: number; ipToHost: Record<string, { id: string; name: string }>; ipHosts: Record<string, { id: string; name: string }[]> } | null>(null);
   // Bumped when a parse finishes so the network map reloads even if the host
   // SET is unchanged (re-parsing an existing host adds/updates its TargetInfo).
   const [netNonce, setNetNonce] = useState(0);
@@ -187,7 +190,6 @@ export default function Home() {
     try {
       const result = await window.api.listCases();
       if (sequence !== caseRefreshSequence.current) return result.cases;
-      setCases(result.cases);
       setCasesError(result.error);
       // Keep the drilled-in root collection in sync with live host metadata.
       setSelectedCase((prev) => (prev ? result.cases.find((c) => c.id === prev.id) ?? null : null));
@@ -246,9 +248,21 @@ export default function Home() {
   // Whether the published derived results follow the current storage contract.
   // Stale results are never rebuilt at read time; the analyst is told to reparse.
   const [contractNotice, setContractNotice] = useState<{ files: string[] } | null>(null);
+  // A failed host open is shown as a failure, never as an empty host.
+  const [hostOpenError, setHostOpenError] = useState<string | null>(null);
+  const hostOpenSequence = useRef(0);
 
-  const openHost = useCallback(async (h: Host) => {
+  const openHost = useCallback(async (h: Host): Promise<boolean> => {
+    const sequence = ++hostOpenSequence.current;
     setSelectedHost(h);
+    // Drop the previous host's lists before any await so they cannot be shown
+    // (or opened) under the new host.
+    setCategories([]);
+    setOverviewFiles(null);
+    setBookmarks([]);
+    setContractNotice(null);
+    setPendingFilter(null);
+    setHostOpenError(null);
     setTabs([]);
     setActivePath(null);
     setActiveVirtualTab(null);
@@ -256,29 +270,37 @@ export default function Home() {
     setHostOpening(true);
     try {
       const [found, hostBookmarks] = await Promise.all([window.api.listCategories(h.dir), window.api.listBookmarks(parentDir(h.dir))]);
-      setCategories(found);
-      setBookmarks(hostBookmarks);
-      // The check never blocks browsing; it only raises a notice.
-      window.api.overviewContractStatus(h.dir).then((status) => {
-        setContractNotice(status.contractOk ? null : { files: status.legacyFiles });
-      }).catch(() => setContractNotice(null));
+      if (sequence !== hostOpenSequence.current) return false;
       // 결과 보기의 첫 화면은 호스트 정보다. 없으면(파싱 전 등) 빈 상태 유지.
       const overview = found.find((category) => category.name === "_OVERVIEW");
-      if (overview) {
-        const files = await window.api.listResultFiles(overview.fullPath);
-        setOverviewFiles(files);
-        const targetInfo = files.find((file) => file.name === "TargetInfo");
-        if (targetInfo) await handleSelectFile(targetInfo);
-      } else {
-        setOverviewFiles([]);
-      }
+      const files = overview ? await window.api.listResultFiles(overview.fullPath) : [];
+      if (sequence !== hostOpenSequence.current) return false;
+      setCategories(found);
+      setBookmarks(hostBookmarks);
+      setOverviewFiles(files);
+      // The check never blocks browsing; it only raises a notice.
+      window.api.overviewContractStatus(h.dir).then((status) => {
+        if (sequence === hostOpenSequence.current) setContractNotice(status.contractOk ? null : { files: status.legacyFiles });
+      }).catch(() => {
+        if (sequence === hostOpenSequence.current) setContractNotice(null);
+      });
+      const targetInfo = files.find((file) => file.name === "TargetInfo");
+      if (targetInfo) await handleSelectFile(targetInfo);
+      return true;
+    } catch (error) {
+      if (sequence === hostOpenSequence.current) setHostOpenError(String(error));
+      return false;
     } finally {
-      setHostOpening(false);
+      if (sequence === hostOpenSequence.current) setHostOpening(false);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   function backToHosts() {
+    hostOpenSequence.current++;
+    setHostOpening(false);
+    setHostOpenError(null);
+    setPendingFilter(null);
     setOverviewFiles(null);
     setSelectedHost(null);
     setCategories([]);
@@ -293,6 +315,9 @@ export default function Home() {
   // tables, so identity is the file path + table name, not the path alone.
   async function handleSelectFile(file: ResultFileEntry) {
     setActiveVirtualTab(null);
+    // A filter queued for another table must not survive a new selection;
+    // jump callers set theirs after this returns.
+    setPendingFilter(null);
     const key = keyOf(file);
     // 활성 원본 테이블은 한 번에 하나만 메모리에 상주시킨다 — 다른 파일을 열면
     // 이전 탭에 쌓인 행(대형 EventLog면 스크롤로 수십만 행)을 즉시 버려 웹뷰
@@ -371,24 +396,26 @@ export default function Home() {
   // single fixed table. The _record_key value encodes the real log table —
   // "Security_2::57" (legacy hosts: "Security.evtx::123") — so resolve the
   // target table from it.
-  function resolveTargetFile(targetFile: string, targetColumn: string, value: string): string {
-    if (targetColumn === "_record_key" && value.includes("::")) {
-      return value.split("::")[0].replace(/\.evtx$/i, "");
-    }
-    return targetFile;
-  }
+  const findTargetFile = useCallback(
+    async (targetFile: string, targetColumn: string, value: string): Promise<ResultFileEntry | null> => {
+      const targetBaseName = (
+        targetColumn === "_record_key" && value.includes("::") ? value.split("::")[0].replace(/\.evtx$/i, "") : targetFile
+      ).toLowerCase();
+      for (const cat of categories) {
+        const files = await window.api.listResultFiles(cat.fullPath);
+        const match = files.find((f) => f.name.toLowerCase() === targetBaseName);
+        if (match) return match;
+      }
+      return null;
+    },
+    [categories]
+  );
 
   async function handleNavigate(targetFile: string, targetColumn: string, value: string) {
-    const targetBaseName = resolveTargetFile(targetFile, targetColumn, value).toLowerCase();
-    for (const cat of categories) {
-      const files = await window.api.listResultFiles(cat.fullPath);
-      const match = files.find((f) => f.name.toLowerCase() === targetBaseName);
-      if (match) {
-        await handleSelectFile(match);
-        setPendingFilter({ column: targetColumn, value });
-        return;
-      }
-    }
+    const match = await findTargetFile(targetFile, targetColumn, value);
+    if (!match) return;
+    await handleSelectFile(match);
+    setPendingFilter({ tableKey: keyOf(match), column: targetColumn, value });
   }
 
   // Same target-table lookup as handleNavigate, but asks SQLite for only the
@@ -396,28 +423,19 @@ export default function Home() {
   // Prefetch loaded-file table just to show a small related-evidence list.
   const fetchLinkedRows = useCallback(
     async (targetFile: string, targetColumn: string, value: string, query?: { search?: string; offset?: number; limit?: number }) => {
-      const targetBaseName =
-        targetColumn === "_record_key" && value.includes("::")
-          ? value.split("::")[0].replace(/\.evtx$/i, "").toLowerCase()
-          : targetFile.toLowerCase();
-      for (const cat of categories) {
-        const files = await window.api.listResultFiles(cat.fullPath);
-        const match = files.find((f) => f.name.toLowerCase() === targetBaseName);
-        if (match) {
-          return window.api.linkedResultRows(
-            match.fullPath,
-            match.tableName,
-            targetColumn,
-            value,
-            query?.search ?? "",
-            query?.offset ?? 0,
-            query?.limit ?? 100,
-          );
-        }
-      }
-      return null;
+      const match = await findTargetFile(targetFile, targetColumn, value);
+      if (!match) return null;
+      return window.api.linkedResultRows(
+        match.fullPath,
+        match.tableName,
+        targetColumn,
+        value,
+        query?.search ?? "",
+        query?.offset ?? 0,
+        query?.limit ?? 100,
+      );
     },
-    [categories]
+    [findTargetFile]
   );
 
   // Account activity comes from TargetAccountEvents stored at parse time
@@ -497,13 +515,13 @@ export default function Home() {
     return [...new Set([...networkAddresses(metadata.rows, addresses.rows), ...added])];
   }
 
-  async function loadCaseNetwork(): Promise<{ ipToHost: Record<string, { id: string; name: string }>; ipHosts: Record<string, { id: string; name: string }[]>; hostIps: Record<string, string[]> }> {
-    const hostIps: Record<string, string[]> = {};
+  async function loadCaseNetwork(): Promise<{ ipToHost: Record<string, { id: string; name: string }>; ipHosts: Record<string, { id: string; name: string }[]> }> {
     const hosts = selectedCase?.hosts ?? [];
-    for (const h of hosts) hostIps[h.id] = await loadHostIps(h).catch(() => []);
+    const perHost: { id: string; name: string; ips: string[] }[] = [];
+    for (const h of hosts) perHost.push({ id: h.id, name: h.name, ips: await loadHostIps(h).catch(() => []) });
     // An address on several hosts is a candidate, never resolved to one host.
-    const owners = addressOwners(hosts.map((h) => ({ id: h.id, name: h.name, ips: hostIps[h.id] })), isLoopbackAddress);
-    return { ipToHost: Object.fromEntries(owners.unique), ipHosts: Object.fromEntries(owners.all), hostIps };
+    const owners = addressOwners(perHost, isLoopbackAddress);
+    return { ipToHost: Object.fromEntries(owners.unique), ipHosts: Object.fromEntries(owners.all) };
   }
 
   // Auto-(re)load the case network map whenever the case or its host set
@@ -586,7 +604,7 @@ export default function Home() {
           direction,
           timestamp: r.timestamp || "",
           // normalize DOMAIN\/HOST\ prefix to the bare username (matches the RDP view)
-          account: ((r.account || "").replace(/\//g, "\\").split("\\").pop() || "").split("@")[0],
+          account: bareAccount(r.account || ""),
           result: r.result || "",
         });
       }
@@ -693,16 +711,7 @@ export default function Home() {
     }
   }
 
-  async function handleUpdateBookmarkNote(id: string, note: string) {
-    if (!selectedHost) return;
-    try {
-      const result = await window.api.updateBookmarkNote(parentDir(selectedHost.dir), id, note);
-      setBookmarks(result);
-      setBookmarkError(null);
-    } catch {
-      setBookmarkError("북마크 메모를 저장하지 못했습니다. 분석 저장소 권한을 확인하세요.");
-    }
-  }
+
 
   // Open a search hit's exact row (same cross-host logic as bookmarks).
   async function handleOpenSearchHit(h: SearchHit) {
@@ -714,7 +723,7 @@ export default function Home() {
         return sourcePath === hostPath || sourcePath.startsWith(`${hostPath}/`);
       }) : undefined);
     if (target && target.id !== selectedHost?.id) {
-      await openHost(target);
+      if (!(await openHost(target))) return;
     }
     const entry: ResultFileEntry = {
       name: h.tableName,
@@ -725,7 +734,7 @@ export default function Home() {
       rowCount: 0,
     };
     await handleSelectFile(entry);
-    setPendingFilter({ column: "__rowid", value: String(h.rowid) });
+    setPendingFilter({ tableKey: keyOf(entry), column: "__rowid", value: String(h.rowid) });
   }
 
   function isSearchHitBookmarked(hit: SearchHit): boolean {
@@ -760,6 +769,7 @@ export default function Home() {
   );
   // Bookmark identities (docs-20): table + record_id + field.
   const hostBookmarkKeys = useMemo(() => bookmarkKeys(bookmarksForCurrentHost), [bookmarksForCurrentHost]);
+  const hostBookmarkRecordKeys = useMemo(() => bookmarkRecordKeys(bookmarksForCurrentHost), [bookmarksForCurrentHost]);
   const allBookmarkKeys = useMemo(() => bookmarkKeys(bookmarks), [bookmarks]);
   const activeBookmarkedRowids = useMemo(() => {
     if (!activeTab?.data) return undefined;
@@ -787,14 +797,15 @@ export default function Home() {
   // are backend-verified inside the host root; the row is filtered by rowid.
   const openRecordRef = useRef<(fullPath: string, tableName: string, rowid: number) => void>(() => {});
   openRecordRef.current = (fullPath: string, tableName: string, rowid: number) => {
-    void handleSelectFile({
+    const entry: ResultFileEntry = {
       name: tableName,
       fileName: resultFileStem(fullPath),
       tableName,
       relativePath: "",
       fullPath,
       rowCount: 0,
-    }).then(() => setPendingFilter({ column: "__rowid", value: String(rowid) }));
+    };
+    void handleSelectFile(entry).then(() => setPendingFilter({ tableKey: keyOf(entry), column: "__rowid", value: String(rowid) }));
   };
   const openRecord = useCallback((fullPath: string, tableName: string, rowid: number) => {
     openRecordRef.current(fullPath, tableName, rowid);
@@ -817,6 +828,11 @@ export default function Home() {
       Boolean(activeTab && row.record_id && hostBookmarkKeys.has(bookmarkKey(activeTab.file.tableName, row.record_id, field))),
     [activeTab, hostBookmarkKeys],
   );
+  const isActiveRecordBookmarked = useCallback(
+    (row: Record<string, string>) =>
+      Boolean(activeTab && row.record_id && hostBookmarkRecordKeys.has(bookmarkRecordKey(activeTab.file.tableName, row.record_id))),
+    [activeTab, hostBookmarkRecordKeys],
+  );
 
   // A parse keeps running in the Electron main process even after we leave the
   // RunPipeline screen; this floating bar keeps its progress visible everywhere
@@ -828,8 +844,7 @@ export default function Home() {
       hostName={run.runningHostName ?? ""}
       stepLabel={run.stepLabel}
       percent={run.percent}
-      complete={run.runComplete}
-      hadError={run.hadError}
+      failedCount={run.failedArtifacts.length}
       runningCount={runningPipelineCount}
       queuedCount={queuedPipelineCount}
       onOpen={selectedHost ? backToHosts : undefined}
@@ -885,6 +900,25 @@ export default function Home() {
     );
   }
 
+  if (hostOpenError) {
+    const failedHost = selectedHost;
+    return (
+      <main className="dfir-app" style={{ display: "flex", flexDirection: "column", height: "100%" }}>
+        <div className="dfir-view" style={{ flex: 1, display: "grid", placeItems: "center", padding: 24 }}>
+          <div role="alert" style={{ maxWidth: 460, color: "var(--text)", fontSize: 13, lineHeight: 1.55 }}>
+            <strong style={{ display: "block", marginBottom: 6 }}>{failedHost.name}의 분석 결과를 불러오지 못했습니다.</strong>
+            <span style={{ color: "var(--text-dim)", wordBreak: "break-word" }}>{hostOpenError}</span>
+            <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
+              <button type="button" onClick={() => { void openHost(failedHost); }}>다시 시도</button>
+              <button type="button" onClick={backToHosts}>홈</button>
+            </div>
+          </div>
+        </div>
+        {globalProgress}
+      </main>
+    );
+  }
+
   // Screen 3: a host is open → browse its artifacts.
   return (
     <main className="dfir-app" style={{ display: "flex", flexDirection: "column", height: "100%" }}>
@@ -904,12 +938,11 @@ export default function Home() {
           activeVirtualTab={activeVirtualTab}
           onSelectTimeline={handleSelectTimeline}
           onSelectBookmarks={handleSelectBookmarks}
-          onSelectConnections={handleSelectConnections}
+          onSelectConnections={() => handleSelectConnections()}
           onSelectSearch={() => setActiveVirtualTab("search")}
           bookmarkCount={bookmarks.length}
           timeRange={timeRange}
           onTimeRangeChange={setTimeRange}
-          onNavigate={handleNavigate}
         />
           <RecordScopeContext.Provider value={recordScope}>
           <div style={{ flex: 1, minWidth: 0, minHeight: 0, display: "flex", flexDirection: "column" }}>
@@ -959,7 +992,6 @@ export default function Home() {
                 hosts={selectedCase?.hosts ?? []}
                 hostIpMap={caseNetwork?.caseId === selectedCase?.id ? caseNetwork.ipToHost : {}}
                 currentHostId={selectedHost?.id ?? null}
-                timeRange={timeRange}
                 onRemove={handleRemoveBookmark}
                 onNavigate={handleNavigate}
                 onFetchLinkedRows={fetchLinkedRows}
@@ -986,7 +1018,6 @@ export default function Home() {
                 graph={selectedCase && hostGraph?.caseId === selectedCase.id ? hostGraph.graph : null}
                 loading={hostGraphLoading}
                 timeRange={timeRange}
-                focusHostName={selectedHost?.name ?? null}
                 onRefresh={() => handleSelectConnections(true)}
               />
             )}
@@ -1023,6 +1054,7 @@ export default function Home() {
                   accountDirectory={currentAccountDirectory}
                   onNavigate={handleNavigate}
                   onFetchLinkedRows={fetchLinkedRows}
+                  isRecordBookmarked={isActiveRecordBookmarked}
                   isRowBookmarked={isActiveRowBookmarked}
                   onToggleBookmark={(rowid, field) => handleToggleActiveRowBookmark(rowid, field)}
                   analystAddresses={analystAddresses}
@@ -1159,7 +1191,6 @@ export default function Home() {
                 />
               ) : getArtifactView(activeTab.file.name)?.customView === "remoteAccess" ? (
                 <RemoteAccessView
-                  key={activeTab.file.fullPath}
                   fileName={activeTab.file.name}
                   dbPath={activeTab.file.fullPath}
                   data={activeTab.data}
@@ -1174,10 +1205,13 @@ export default function Home() {
                 />
               ) : (
                 <DataTable
+                  // One instance per table: column filters never carry over.
+                  key={keyOf(activeTab.file)}
                   fileName={activeTab.file.name}
                   data={activeTab.data}
                   onLoadMore={activeTab.data.rows.length < activeTab.data.rowCount ? loadMoreRawRows : undefined}
-                  initialFilter={pendingFilter}
+                  onLookupRow={(rowid) => window.api.resultRow(activeTab.file.fullPath, activeTab.file.tableName, rowid).then((result) => result.row)}
+                  initialFilter={pendingFilterFor(pendingFilter, keyOf(activeTab.file))}
                   onInitialFilterConsumed={() => setPendingFilter(null)}
                   onNavigate={handleNavigate}
                   onFetchLinkedRows={fetchLinkedRows}

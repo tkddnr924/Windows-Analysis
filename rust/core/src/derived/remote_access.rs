@@ -97,7 +97,6 @@ CREATE TABLE RemoteAccessSegments (
   remote_address TEXT,
   remote_port INTEGER,
   remote_computer TEXT,
-  local_address TEXT,
   PRIMARY KEY(segment_id),
   FOREIGN KEY(first_record_id) REFERENCES RemoteDesktopHistory(record_id),
   FOREIGN KEY(last_record_id) REFERENCES RemoteDesktopHistory(record_id),
@@ -122,7 +121,6 @@ CREATE TABLE RemoteDesktopHistory (
   remote_address TEXT,
   remote_computer TEXT,
   remote_port INTEGER,
-  local_address TEXT,
   logon_type INTEGER,
   session_id TEXT,
   logon_id TEXT,
@@ -145,7 +143,6 @@ CREATE TABLE RemoteDesktopHistory (
   thread_id TEXT,
   activity_id TEXT,
   related_activity_id TEXT,
-  connection_id TEXT,
   remote_address_raw TEXT,
   status TEXT,
   sub_status TEXT,
@@ -228,7 +225,7 @@ CREATE INDEX idx_RemoteDesktopHistory_filter ON RemoteDesktopHistory(access_scop
 CREATE INDEX idx_RemoteDesktopHistory_segment ON RemoteDesktopHistory(segment_id,timestamp,record_id);
 CREATE INDEX idx_source_lookup ON source_records(source_db,source_table,source_rowid,source_field);
 CREATE TABLE _wina_derived_version(name TEXT NOT NULL PRIMARY KEY,version INTEGER NOT NULL);
-INSERT INTO _wina_derived_version VALUES('overview_contract',1),('remote_desktop_history',2);
+INSERT INTO _wina_derived_version VALUES('overview_contract',1),('remote_desktop_history',4);
 "#;
 
 const MAIN: &[&str] = &[
@@ -248,7 +245,6 @@ const MAIN: &[&str] = &[
     "remote_address",
     "remote_computer",
     "remote_port",
-    "local_address",
     "logon_type",
     "session_id",
     "logon_id",
@@ -271,7 +267,6 @@ const MAIN: &[&str] = &[
     "thread_id",
     "activity_id",
     "related_activity_id",
-    "connection_id",
     "remote_address_raw",
     "status",
     "sub_status",
@@ -371,7 +366,6 @@ const SEGMENTS: &[&str] = &[
     "remote_address",
     "remote_port",
     "remote_computer",
-    "local_address",
 ];
 
 const OBSERVATIONS: &[&str] = &[
@@ -613,14 +607,21 @@ pub(super) fn build(ctx: &Ctx, cache: &EventLogOverviewCache) -> Result<usize> {
             }
         }
     }
-    let mut carried: HashMap<usize, Vec<&Row>> = HashMap::new();
+    // One source row per (recipient, donor): every carried field of a donor
+    // cites the same facts row, so the fields share one label.
+    let mut carried: HashMap<usize, Vec<(usize, Vec<&str>)>> = HashMap::new();
     for relation in &correlated.relations {
         if matches!(
             g(relation, "relation_kind"),
-            "carry_forward" | "local_scope_direction"
+            "carry_forward" | "local_scope_direction" | "remote_scope_direction"
         ) {
             let recipient = relation_index(relation, "to_index", events.len())?;
-            carried.entry(recipient).or_default().push(relation);
+            let donor = relation_index(relation, "from_index", events.len())?;
+            let donors = carried.entry(recipient).or_default();
+            match donors.iter_mut().find(|(index, _)| *index == donor) {
+                Some((_, fields)) => fields.push(g(relation, "field")),
+                None => donors.push((donor, vec![g(relation, "field")])),
+            }
         }
     }
     let mut records: Vec<Option<Record>> = events
@@ -739,15 +740,10 @@ pub(super) fn build(ctx: &Ctx, cache: &EventLogOverviewCache) -> Result<usize> {
             );
         }
         record.source(Some(sources[index].clone()));
-        for relation in carried.get(&index).into_iter().flatten() {
-            let donor = relation_index(relation, "from_index", sources.len())?;
-            let mut source = sources[donor].clone();
+        for (donor, fields) in carried.get(&index).into_iter().flatten() {
+            let mut source = sources[*donor].clone();
             source.field = Some("EventData".into());
-            source.label = Some(format!(
-                "same-instance {}: {}",
-                g(relation, "relation_kind"),
-                g(relation, "field")
-            ));
+            source.label = Some(format!("same-instance carry: {}", fields.join(", ")));
             record.source(Some(source));
         }
         let id = record.record_id.clone();
@@ -786,7 +782,7 @@ pub(super) fn build(ctx: &Ctx, cache: &EventLogOverviewCache) -> Result<usize> {
         let to = relation_index(relation, "to_index", record_ids.len())?;
         let (parent, related) = if matches!(
             g(relation, "relation_kind"),
-            "carry_forward" | "local_scope_direction"
+            "carry_forward" | "local_scope_direction" | "remote_scope_direction"
         ) {
             (to, from)
         } else {
@@ -825,4 +821,109 @@ fn relation_index(row: &Row, key: &str, count: usize) -> Result<usize> {
         .ok()
         .filter(|index| *index < count)
         .ok_or_else(|| anyhow!("invalid remote evidence index: {key}={}", g(row, key)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::derived::{stamp_facts_generation, FactsIndex, MetaLookup};
+    use rusqlite::Connection;
+
+    const LSM_STEM: &str = "Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational";
+    const LSM: &str = "Microsoft-Windows-TerminalServices-LocalSessionManager";
+
+    struct Fixture {
+        root: std::path::PathBuf,
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    impl Fixture {
+        fn new(rows: usize) -> Self {
+            let root = std::env::temp_dir()
+                .join(format!("wina-remote-access-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(root.join("EVENTLOG")).unwrap();
+            let path = root.join("EVENTLOG").join(format!("{LSM_STEM}.sqlite"));
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(&format!("CREATE TABLE \"{LSM_STEM}\"(EventData TEXT);"))
+                .unwrap();
+            for _ in 0..rows {
+                conn.execute(&format!("INSERT INTO \"{LSM_STEM}\"(EventData) VALUES('{{}}')"), [])
+                    .unwrap();
+            }
+            drop(conn);
+            stamp_facts_generation(&path, "facts-old").unwrap();
+            Self { root }
+        }
+
+        fn run(&self, rows: Vec<Row>) -> Connection {
+            crate::derived::create_database(&self.root.join("_OVERVIEW"), "Metadata").unwrap();
+            let ctx = Ctx {
+                out_dir: &self.root,
+                target: &self.root,
+                host_id: "host",
+                dataset_id: "new",
+                facts: FactsIndex::load(&self.root).unwrap(),
+                meta: MetaLookup::load(&self.root).unwrap(),
+            };
+            build(&ctx, &EventLogOverviewCache::from_rows_for_tests(rows)).unwrap();
+            Connection::open(ctx.overview_dir().join("RemoteDesktopHistory.sqlite")).unwrap()
+        }
+    }
+
+    fn lsm(n: usize, eid: &str, ts: &str, payload: &str) -> Row {
+        Row::from([
+            ("Provider".to_string(), LSM.to_string()),
+            ("Channel".to_string(), format!("{LSM}/Operational")),
+            ("Computer".to_string(), "WIN-TEST".to_string()),
+            ("EventID".to_string(), eid.to_string()),
+            ("EventRecordID".to_string(), n.to_string()),
+            ("timestamp".to_string(), ts.to_string()),
+            ("EventData".to_string(), payload.to_string()),
+            ("_record_key".to_string(), format!("{LSM_STEM}::{n}")),
+            ("_source_file".to_string(), format!("{LSM_STEM}.evtx")),
+            ("_status".to_string(), "ok".to_string()),
+        ])
+    }
+
+    #[test]
+    fn carried_fields_cite_each_donor_facts_row_once() {
+        let fixture = Fixture::new(2);
+        let conn = fixture.run(vec![
+            lsm(
+                1,
+                "21",
+                "2026-01-01 00:00:00.000",
+                r#"{"EventXML":{"User":"CORP\\alice","SessionID":3,"Address":"10.0.0.5"}}"#,
+            ),
+            lsm(2, "40", "2026-01-01 00:01:00.000", r#"{"EventXML":{"Session":3,"Reason":5}}"#),
+        ]);
+        let carried: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM RemoteAccessRelations r JOIN RemoteDesktopHistory h
+                 ON h.record_id=r.record_id WHERE h.event_id=40",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(carried > 1, "fixture must carry several fields");
+        let (rows, distinct, label): (i64, i64, String) = conn
+            .query_row(
+                "SELECT COUNT(*),
+                        COUNT(DISTINCT source_db||'|'||source_table||'|'||source_rowid||'|'||ifnull(source_field,'')),
+                        max(CASE WHEN source_rowid=1 THEN source_label END)
+                 FROM source_records s JOIN RemoteDesktopHistory h ON h.record_id=s.record_id
+                 WHERE h.event_id=40",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(rows, 2, "own row plus one donor row");
+        assert_eq!(distinct, rows);
+        assert!(label.contains("account_name") && label.contains("remote_address"));
+    }
 }

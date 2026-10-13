@@ -12,7 +12,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::sqlite::{Row, StreamWriter};
-use crate::time::fmt_kst;
+use crate::time::{fmt_kst, fmt_unix};
 
 /// IR-relevant collected logs (exact filenames, case-insensitive).
 /// "%4" is the on-disk escaping for "/".
@@ -89,7 +89,6 @@ pub const EVENT_COLUMNS: &[&str] = &[
 // ---------------------------------------------------------------------------
 
 pub const INPUTS_TABLE: &str = "EventLogInputs";
-pub const INPUTS_DB: &str = "EventLogInputs.sqlite";
 pub const INPUTS_RELATIVE: &str = "EVENTLOG/EventLogInputs.sqlite";
 pub const INPUT_FIELDS: &[&str] = &[
     "source_file",
@@ -369,24 +368,9 @@ impl<'a> EvtRing<'a> {
     }
 }
 
-/// 바이너리 SID → "S-1-5-…" (srum.rs의 _format_sid와 동일 규칙).
+/// Truncated SIDs (< 8 bytes) are dropped.
 fn evt_format_sid(data: &[u8]) -> String {
-    if data.len() < 8 {
-        return String::new();
-    }
-    let revision = data[0];
-    let sub_count = data[1] as usize;
-    let authority = data[2..8].iter().fold(0u64, |a, &b| (a << 8) | b as u64);
-    let mut parts = vec!["S".to_string(), revision.to_string(), authority.to_string()];
-    let mut off = 8;
-    for _ in 0..sub_count {
-        if off + 4 > data.len() {
-            break;
-        }
-        parts.push(u32::from_le_bytes(data[off..off + 4].try_into().unwrap()).to_string());
-        off += 4;
-    }
-    parts.join("-")
+    crate::hex::format_binary_sid(data).unwrap_or_default()
 }
 
 /// UTF-16LE 널 종료 문자열 (오프셋부터, 버퍼 끝까지 안전 절단).
@@ -452,7 +436,11 @@ fn evt_start(data: &[u8], ring: &EvtRing) -> usize {
             && evt_u32(data, i + 8) == EVT_EOF_MAGIC[2]
             && evt_u32(data, i + 12) == EVT_EOF_MAGIC[3]
         {
-            let footer = i - 4; // 매직 앞의 length(0x28) 필드가 레코드 시작
+            // The magic must follow a whole record header inside the ring.
+            let Some(footer) = i.checked_sub(4).filter(|f| *f >= EVT_HEADER) else {
+                i += 4;
+                continue;
+            };
             let begin = evt_u32(data, footer + 0x14) as usize;
             if begin >= EVT_HEADER && begin < data.len() && looks_like_record(begin - EVT_HEADER) {
                 return begin - EVT_HEADER;
@@ -522,14 +510,7 @@ fn evt_record_row(rec: &[u8], channel: &str) -> Option<Row> {
         "Category".into(),
         Value::Number(serde_json::Number::from(category)),
     );
-    payload.insert(
-        "TimeWritten".into(),
-        Value::String(
-            DateTime::<Utc>::from_timestamp(time_written, 0)
-                .map(fmt_kst)
-                .unwrap_or_default(),
-        ),
-    );
+    payload.insert("TimeWritten".into(), Value::String(fmt_unix(time_written)));
     if data_len > 0 && data_off + data_len <= rec.len() {
         payload.insert(
             "Data".into(),
@@ -539,12 +520,7 @@ fn evt_record_row(rec: &[u8], channel: &str) -> Option<Row> {
 
     let (level, level_name) = evt_level(event_type);
     let mut row = Row::new();
-    row.insert(
-        "timestamp".into(),
-        DateTime::<Utc>::from_timestamp(time_generated, 0)
-            .map(fmt_kst)
-            .unwrap_or_default(),
-    );
+    row.insert("timestamp".into(), fmt_unix(time_generated));
     row.insert("Channel".into(), channel.to_string());
     // Event Viewer 표기와 동일하게 하위 16비트가 이벤트 번호다(상위는
     // severity/facility 비트).
@@ -643,6 +619,9 @@ pub fn parse_evt_stream(path: &Path, out: &Path, table: &str) -> Result<usize> {
             consumed += 4;
             gap += 4;
         }
+    }
+    if gap > 0 {
+        push_corrupted(&mut writer, &mut next_rowid, format!("resync: skipped {gap} bytes"))?;
     }
     writer.finish()
 }
@@ -868,7 +847,7 @@ mod evt_tests {
         std::fs::write(&evt, data).unwrap();
         let out = dir.join("out.sqlite");
         let n = parse_evt_stream(&evt, &out, "SecEvent").unwrap();
-        let rows = crate::overview::read_table(&out, "SecEvent");
+        let rows = crate::overview::read_table(&out, "SecEvent").unwrap();
         assert_eq!(rows.len(), n);
         let _ = std::fs::remove_dir_all(dir);
         rows
@@ -967,6 +946,50 @@ mod evt_tests {
         assert!(ok[0].get("EventData").unwrap().contains("wrapped-first"));
         assert_eq!(ok[0].get("EventRecordID").map(String::as_str), Some("7"));
         assert!(ok[1].get("EventData").unwrap().contains("second"));
+    }
+
+    #[test]
+    fn eof_magic_at_ring_start_does_not_underflow() {
+        let r1 = record(3, 0x0200, 0x04, "after");
+        let mut stream = Vec::new();
+        for m in EVT_EOF_MAGIC {
+            stream.extend(m.to_le_bytes());
+        }
+        stream.extend(&r1);
+        let file_len = (EVT_HEADER + stream.len()) as u32;
+        let mut data = header(0xFFFF_FFFF, true, file_len);
+        data.extend(stream);
+        let rows = parse_to_rows(&data);
+        assert!(rows
+            .iter()
+            .any(|r| r.get("EventRecordID").map(String::as_str) == Some("3")));
+    }
+
+    #[test]
+    fn zero_evt_times_stay_empty() {
+        let mut r1 = record(1, 0x0210, 0x08, "zero");
+        put_u32(&mut r1, 0x0C, 0);
+        put_u32(&mut r1, 0x10, 0);
+        let mut stream = r1;
+        stream.extend(eof_record(EVT_HEADER as u32));
+        let file_len = (EVT_HEADER + stream.len()) as u32;
+        let mut data = header(EVT_HEADER as u32, false, file_len);
+        data.extend(stream);
+        let rows = parse_to_rows(&data);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get("timestamp").map(String::as_str).unwrap_or(""), "");
+        assert!(rows[0].get("EventData").unwrap().contains("\"TimeWritten\": \"\""));
+    }
+
+    #[test]
+    fn unrecoverable_tail_is_reported() {
+        let file_len = (EVT_HEADER + 0x40) as u32;
+        let mut data = header(0xFFFF_FFFF, true, file_len);
+        data.extend([0xCC; 0x40]);
+        let rows = parse_to_rows(&data);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get("_status").map(String::as_str), Some("corrupted_chunk"));
+        assert!(rows[0].get("_error").unwrap().contains("64"));
     }
 
     #[test]

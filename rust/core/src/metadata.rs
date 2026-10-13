@@ -8,10 +8,13 @@ use rusqlite::types::Value as SqlValue;
 use rusqlite::{Connection, OpenFlags};
 use uuid::Uuid;
 
+use crate::sam::{le_u16, machine_sid_from_v, sam_v_field, unhex, utf16le, well_known_account};
+
 const REGISTRY_DIR: &str = "REGISTRY";
 const REG_TABLE: &str = "Registry";
 const OVERVIEW_DIR: &str = "_OVERVIEW";
 const METADATA_DB: &str = "Metadata.sqlite";
+const ALIAS_MEMBERS_MARKER: &str = "\\aliases\\members\\";
 
 // Equal-rank disagreement remains a conflict.
 const RANK_PRIMARY: u8 = 0;
@@ -201,6 +204,7 @@ struct RegRow {
     value_name: String,
     value_type: String,
     value_data: String,
+    value_hex: String,
     last_write: String,
     source_file: String,
 }
@@ -316,31 +320,47 @@ fn load_hive(db: &Path, target: &Path) -> Result<Option<Hive>> {
     if is_regback(&stem) {
         return Ok(None);
     }
-    let Ok(con) = Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY) else {
+    let con = Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("open {}", db.display()))?;
+    // Only a database without a Registry table is not a hive (e.g. RegistryInputs).
+    let has_registry: bool = con
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+            [REG_TABLE],
+            |r| r.get(0),
+        )
+        .with_context(|| format!("read schema {}", db.display()))?;
+    if !has_registry {
         return Ok(None);
-    };
+    }
     let query = format!(
         "SELECT rowid, key_path, value_name, value_type, value_data, last_write, \
-         _source_file, _recovery FROM \"{REG_TABLE}\""
+         _source_file, _recovery, value_data_hex FROM \"{REG_TABLE}\""
     );
-    let Ok(mut stmt) = con.prepare(&query) else {
-        return Ok(None);
-    };
+    let mut stmt = con
+        .prepare(&query)
+        .with_context(|| format!("read {}", db.display()))?;
     let dataset_id = crate::derived::facts_dataset_id(db)?;
     let mut rows = Vec::new();
-    let Ok(mut q) = stmt.query([]) else {
-        return Ok(None);
-    };
-    while let Ok(Some(r)) = q.next() {
+    let mut q = stmt.query([]).with_context(|| format!("read {}", db.display()))?;
+    while let Some(r) = q.next().with_context(|| format!("read {}", db.display()))? {
         // Historical recovered cells must not override current settings.
         let recovery: String = r.get(7).unwrap_or_default();
         if !recovery.is_empty() && recovery != "live" {
             continue;
         }
         let key_path: String = r.get(1).unwrap_or_default();
+        let key_low = key_path.to_lowercase();
+        // Raw bytes are kept only where the type field is not a real type.
+        let value_hex = if key_low.contains(ALIAS_MEMBERS_MARKER) {
+            r.get::<_, Option<String>>(8).ok().flatten().unwrap_or_default()
+        } else {
+            String::new()
+        };
         let row = RegRow {
             rowid: r.get(0).unwrap_or_default(),
-            key_low: key_path.to_lowercase(),
+            key_low,
+            value_hex,
             key_path,
             value_name: r.get(2).unwrap_or_default(),
             value_type: r.get(3).unwrap_or_default(),
@@ -410,58 +430,6 @@ impl Facts {
 // Conversions
 // ---------------------------------------------------------------------------
 
-fn unhex(s: &str) -> Vec<u8> {
-    let s = s.trim();
-    if s.len() % 2 != 0 {
-        return Vec::new();
-    }
-    let b = s.as_bytes();
-    let hv = |c: u8| -> Option<u8> {
-        match c {
-            b'0'..=b'9' => Some(c - b'0'),
-            b'a'..=b'f' => Some(c - b'a' + 10),
-            b'A'..=b'F' => Some(c - b'A' + 10),
-            _ => None,
-        }
-    };
-    let mut out = Vec::with_capacity(s.len() / 2);
-    let mut i = 0;
-    while i + 1 < b.len() {
-        match (hv(b[i]), hv(b[i + 1])) {
-            (Some(h), Some(l)) => out.push((h << 4) | l),
-            _ => return Vec::new(),
-        }
-        i += 2;
-    }
-    out
-}
-
-fn le_u16(b: &[u8], off: usize) -> u16 {
-    if off + 2 > b.len() {
-        0
-    } else {
-        u16::from_le_bytes([b[off], b[off + 1]])
-    }
-}
-
-fn le_u32(b: &[u8], off: usize) -> u32 {
-    if off + 4 > b.len() {
-        0
-    } else {
-        u32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
-    }
-}
-
-fn le_u64(b: &[u8], off: usize) -> u64 {
-    if off + 8 > b.len() {
-        0
-    } else {
-        let mut a = [0u8; 8];
-        a.copy_from_slice(&b[off..off + 8]);
-        u64::from_le_bytes(a)
-    }
-}
-
 fn filetime(ticks: u64) -> Option<String> {
     if ticks == 0 {
         None
@@ -486,16 +454,6 @@ fn unix_time(value: &str) -> Option<String> {
     } else {
         Some(text)
     }
-}
-
-fn utf16le(raw: &[u8]) -> String {
-    let u: Vec<u16> = raw
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
-        .collect();
-    String::from_utf16_lossy(&u)
-        .trim_end_matches('\0')
-        .to_string()
 }
 
 // Decode raw multi-values, never comma-joined display values.
@@ -545,7 +503,7 @@ fn prefix_from_mask(mask: &str) -> Option<i64> {
     }
     let bits = u32::from_be_bytes([parts[0], parts[1], parts[2], parts[3]]);
     let ones = bits.leading_ones();
-    if bits.wrapping_shl(ones) != 0 {
+    if bits.checked_shl(ones).unwrap_or(0) != 0 {
         return None;
     }
     Some(ones as i64)
@@ -572,15 +530,6 @@ fn normalize_mac(raw: &str) -> Option<String> {
 
 fn sid_rid(sid: &str) -> Option<i64> {
     sid.rsplit('-').next()?.parse::<i64>().ok()
-}
-
-fn well_known_account(sid: &str) -> Option<&'static str> {
-    match sid.to_uppercase().as_str() {
-        "S-1-5-18" => Some("LocalSystem"),
-        "S-1-5-19" => Some("LocalService"),
-        "S-1-5-20" => Some("NetworkService"),
-        _ => None,
-    }
 }
 
 /// Virtual service (S-1-5-80) and IIS app pool (S-1-5-82) SIDs are the SHA-1 of
@@ -647,20 +596,6 @@ fn virtual_account_row(sid: &str, domain: &str, name: &str, source: &str, reason
     row
 }
 
-const ACB_FLAGS: &[(u16, &str)] = &[
-    (0x0001, "Disabled"),
-    (0x0002, "HomeDirRequired"),
-    (0x0004, "PwNotRequired"),
-    (0x0008, "TempDuplicate"),
-    (0x0010, "Normal"),
-    (0x0020, "MNSLogon"),
-    (0x0040, "DomainTrust"),
-    (0x0080, "WorkstationTrust"),
-    (0x0100, "ServerTrust"),
-    (0x0200, "PwNoExpire"),
-    (0x0400, "AutoLocked"),
-];
-
 // ---------------------------------------------------------------------------
 // Metadata rows
 // ---------------------------------------------------------------------------
@@ -702,7 +637,6 @@ struct MetaRow {
     dhcp_server: Option<String>,
     lease_obtained: Option<String>,
     lease_terminates: Option<String>,
-    env_name: Option<String>,
     details: serde_json::Map<String, serde_json::Value>,
     selection_reason: Option<String>,
     refs: Vec<SourceRef>,
@@ -838,7 +772,6 @@ impl<'a> Writer<'a> {
             text(&row.dhcp_server),
             text(&row.lease_obtained),
             text(&row.lease_terminates),
-            text(&row.env_name),
             text(&details),
             text(&row.selection_reason),
         ];
@@ -851,10 +784,10 @@ impl<'a> Writer<'a> {
                  profile_path_resolved, created, last_login, password_last_set, \
                  last_failed_login, login_count, failed_login_count, disabled, special_account, \
                  account_flags, interface_id, interface_name, mac_address, network_profile, \
-                 dhcp_enabled, dhcp_server, lease_obtained, lease_terminates, env_name, \
+                 dhcp_enabled, dhcp_server, lease_obtained, lease_terminates, \
                  details_json, selection_reason) VALUES (\
                  ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,\
-                 ?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35,?36,?37,?38,?39,?40,?41)",
+                 ?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35,?36,?37,?38,?39,?40)",
                 rusqlite::params_from_iter(params),
             )
             .with_context(|| format!("metadata insert {}/{}", row.kind, row.key))?;
@@ -979,17 +912,18 @@ fn build_host(facts: &Facts, writer: &mut Writer<'_>) -> Result<()> {
             );
         }
         for row in hive.values("\\control\\timezoneinformation", "Bias") {
-            // Bias is signed minutes: UTC = local time + Bias.
+            // Bias is signed minutes: UTC = local time + Bias. Standard time
+            // only; the DST-inclusive value is ActiveTimeBias below.
             if let Ok(raw) = row.value_data.trim().parse::<u32>() {
                 let offset = -(raw as i32 as i64);
-                host_field(&mut fields, "utc_offset_minutes").0.push(
+                host_field(&mut fields, "standard_offset_minutes").0.push(
                     &offset.to_string(),
                     RANK_PRIMARY,
                     "SYSTEM Control\\TimeZoneInformation\\Bias",
                     hive.source_ref(row, "value_data"),
                     hive.observed(row),
                 );
-                host_field(&mut fields, "utc_offset_minutes")
+                host_field(&mut fields, "standard_offset_minutes")
                     .1
                     .insert("bias_raw".into(), row.value_data.clone().into());
             }
@@ -997,7 +931,7 @@ fn build_host(facts: &Facts, writer: &mut Writer<'_>) -> Result<()> {
         for row in hive.values("\\control\\timezoneinformation", "ActiveTimeBias") {
             if let Ok(raw) = row.value_data.trim().parse::<u32>() {
                 let offset = -(raw as i32 as i64);
-                host_field(&mut fields, "utc_offset_minutes")
+                host_field(&mut fields, "standard_offset_minutes")
                     .1
                     .insert("active_offset_minutes".into(), offset.into());
             }
@@ -1177,72 +1111,6 @@ struct AccountFacts {
     services: Vec<(String, SourceRef)>,
 }
 
-// Machine SID is the validated 24-byte SAM V tail, not a profile-name guess.
-fn machine_sid_from_v(hex: &str) -> Option<String> {
-    let b = unhex(hex);
-    if b.len() < 24 {
-        return None;
-    }
-    let tail = &b[b.len() - 24..];
-    if tail[0] != 1 || tail[1] != 4 || tail[7] != 5 {
-        return None;
-    }
-    let mut subs = Vec::with_capacity(4);
-    for i in 0..4 {
-        subs.push(le_u32(tail, 8 + i * 4));
-    }
-    if subs[0] != 21 {
-        return None;
-    }
-    Some(format!(
-        "S-1-5-21-{}-{}-{}",
-        subs[1], subs[2], subs[3]
-    ))
-}
-
-fn sam_f(b: &[u8]) -> Option<(SamUser, u16)> {
-    if b.len() < 0x44 {
-        return None;
-    }
-    let acb = le_u16(b, 0x38);
-    let user = SamUser {
-        rid_sam: Some(le_u32(b, 0x30) as i64),
-        last_login: filetime(le_u64(b, 0x08)),
-        password_last_set: filetime(le_u64(b, 0x18)),
-        last_failed_login: filetime(le_u64(b, 0x28)),
-        login_count: Some(le_u16(b, 0x42) as i64),
-        failed_login_count: Some(le_u16(b, 0x40) as i64),
-        disabled: Some(i64::from(acb & 0x0001 != 0)),
-        acb: Some(acb),
-        ..Default::default()
-    };
-    Some((user, acb))
-}
-
-// SAM V offsets are relative to the data region at 0xCC.
-fn sam_v_field(b: &[u8], index: usize) -> Option<String> {
-    if b.len() < 0xCC {
-        return None;
-    }
-    let base = index * 12;
-    if base + 8 > b.len() {
-        return None;
-    }
-    let off = le_u32(b, base) as usize;
-    let len = le_u32(b, base + 4) as usize;
-    if len == 0 {
-        return None;
-    }
-    let start = 0xCC + off;
-    let end = start.checked_add(len)?;
-    if start >= b.len() {
-        return None;
-    }
-    let text = utf16le(&b[start..end.min(b.len())]);
-    let text = text.trim().to_string();
-    (!text.is_empty()).then_some(text)
-}
-
 fn collect_accounts(facts: &Facts) -> AccountFacts {
     let mut machine = Field::default();
     let mut account_domain = None;
@@ -1282,7 +1150,7 @@ fn collect_accounts(facts: &Facts) -> AccountFacts {
             }
             if row
                 .key_low
-                .ends_with("\\winlogon\\specialaccounts\\userlist")
+                .ends_with(crate::sam::SPECIAL_ACCOUNTS_USERLIST_SUFFIX)
                 && !row.value_name.is_empty()
             {
                 hidden.insert(
@@ -1410,10 +1278,17 @@ fn collect_accounts(facts: &Facts) -> AccountFacts {
             if rid == 0 {
                 continue;
             }
-            let mut user = match sam_f(&f) {
-                Some((u, _)) => u,
-                None => SamUser::default(),
-            };
+            let mut user = crate::sam::sam_f(&f).map_or_else(SamUser::default, |f| SamUser {
+                rid_sam: Some(f.rid as i64),
+                last_login: filetime(f.last_login),
+                password_last_set: filetime(f.password_last_set),
+                last_failed_login: filetime(f.last_failed_login),
+                login_count: Some(f.login_count as i64),
+                failed_login_count: Some(f.failed_login_count as i64),
+                disabled: Some(i64::from(f.disabled())),
+                acb: Some(f.acb),
+                ..Default::default()
+            });
             user.rid = rid;
             user.observed_at = observed;
             if let Some(r) = f_ref {
@@ -1446,9 +1321,9 @@ fn collect_accounts(facts: &Facts) -> AccountFacts {
             sam_users.push(user);
         }
 
-        // Member keys encode SID prefix and RID; values encode alias RIDs.
+        // Member keys encode SID prefix and RID; value bytes list u32 LE alias RIDs.
         for row in &hive.rows {
-            let marker = "\\aliases\\members\\";
+            let marker = ALIAS_MEMBERS_MARKER;
             let Some(i) = row.key_low.find(marker) else {
                 continue;
             };
@@ -1463,24 +1338,22 @@ fn collect_accounts(facts: &Facts) -> AccountFacts {
             let Ok(member_rid) = u32::from_str_radix(rid_hex, 16) else {
                 continue;
             };
-            let Some(alias_rid) = row.value_data.chars().next().map(|c| c as u32) else {
-                continue;
-            };
-            if alias_rid == 0 {
+            // The type field holds the alias count, so value_data text is not the data.
+            let bytes = unhex(&row.value_hex);
+            if bytes.is_empty() || bytes.len() % 4 != 0 {
                 continue;
             }
             let member_sid = format!("{prefix}-{member_rid}");
             let builtin = row.key_low.contains("\\domains\\builtin\\");
-            let group_sid = if builtin {
-                Some(format!("S-1-5-32-{alias_rid}"))
-            } else {
-                None
-            };
-            let group_name = alias_names.get(&alias_rid).cloned();
-            groups
-                .entry(member_sid.to_lowercase())
-                .or_default()
-                .push((group_sid, group_name));
+            let member_groups = groups.entry(member_sid.to_lowercase()).or_default();
+            for chunk in bytes.chunks_exact(4) {
+                let alias_rid = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                if alias_rid == 0 {
+                    continue;
+                }
+                let group_sid = builtin.then(|| format!("S-1-5-32-{alias_rid}"));
+                member_groups.push((group_sid, alias_names.get(&alias_rid).cloned()));
+            }
         }
     }
 
@@ -1521,7 +1394,6 @@ fn classify_account(sid: &str, machine_sid: Option<&str>) -> &'static str {
 
 #[derive(Clone)]
 struct EnvVar {
-    name: String,
     raw: Option<String>,
     status: &'static str,
     observed_at: Option<String>,
@@ -1596,10 +1468,9 @@ impl EnvModel {
     }
 }
 
-fn env_var_from_field(name: &str, field: Field, note: Option<String>) -> EnvVar {
+fn env_var_from_field(field: Field, note: Option<String>) -> EnvVar {
     let picked = field.pick();
     EnvVar {
-        name: name.to_string(),
         raw: picked.value,
         status: picked.status,
         observed_at: picked.observed_at,
@@ -1657,8 +1528,6 @@ struct EnvBuild {
 
 fn build_env_model(facts: &Facts, accounts: &AccountFacts) -> EnvBuild {
     let mut machine: BTreeMap<String, Field> = BTreeMap::new();
-    let mut machine_names: BTreeMap<String, String> = BTreeMap::new();
-
 
     let mut add_machine =
         |name: &str, data: &str, rank: u8, label: &str, src: SourceRef, observed: Option<String>| {
@@ -1666,7 +1535,6 @@ fn build_env_model(facts: &Facts, accounts: &AccountFacts) -> EnvBuild {
                 return;
             }
             let low = name.to_lowercase();
-            machine_names.entry(low.clone()).or_insert(name.to_string());
             machine
                 .entry(low)
                 .or_default()
@@ -1739,8 +1607,7 @@ fn build_env_model(facts: &Facts, accounts: &AccountFacts) -> EnvBuild {
 
     let mut model = EnvModel::default();
     for (low, field) in machine {
-        let name = machine_names.get(&low).cloned().unwrap_or_else(|| low.clone());
-        let var = env_var_from_field(&name, field, None);
+        let var = env_var_from_field(field, None);
         model.machine.insert(low, var);
     }
 
@@ -1757,7 +1624,6 @@ fn build_env_model(facts: &Facts, accounts: &AccountFacts) -> EnvBuild {
                     model.machine.insert(
                         "systemdrive".into(),
                         EnvVar {
-                            name: "SystemDrive".into(),
                             raw: Some(format!("{}:", bytes[0])),
                             status: "resolved",
                             observed_at: system_root.observed_at.clone(),
@@ -1798,7 +1664,6 @@ fn build_env_model(facts: &Facts, accounts: &AccountFacts) -> EnvBuild {
         let sid_low = sid.to_lowercase();
         scope_refs.entry(sid_low.clone()).or_insert(scope_ref);
         let mut vars: BTreeMap<String, Field> = BTreeMap::new();
-        let mut names: BTreeMap<String, String> = BTreeMap::new();
         for row in &hive.rows {
             let user_env = row.key_low.ends_with("\\environment")
                 && !row.key_low.contains("\\software\\");
@@ -1825,7 +1690,6 @@ fn build_env_model(facts: &Facts, accounts: &AccountFacts) -> EnvBuild {
                 continue;
             }
             let low = name.to_lowercase();
-            names.entry(low.clone()).or_insert(name.to_string());
             let rank = if shell { RANK_SECONDARY } else { RANK_PRIMARY };
             vars.entry(low).or_default().push(
                 &row.value_data,
@@ -1837,8 +1701,7 @@ fn build_env_model(facts: &Facts, accounts: &AccountFacts) -> EnvBuild {
         }
         let entry = model.users.entry(sid_low).or_default();
         for (low, field) in vars {
-            let name = names.get(&low).cloned().unwrap_or_else(|| low.clone());
-            entry.insert(low, env_var_from_field(&name, field, None));
+            entry.insert(low, env_var_from_field(field, None));
         }
     }
 
@@ -1850,7 +1713,6 @@ fn build_env_model(facts: &Facts, accounts: &AccountFacts) -> EnvBuild {
         let sid_low = profile.sid.to_lowercase();
         let entry = model.users.entry(sid_low).or_default();
         entry.entry("userprofile".into()).or_insert(EnvVar {
-            name: "USERPROFILE".into(),
             raw: Some(profile.raw_path.clone()),
             status: "resolved",
             observed_at: profile.observed_at.clone(),
@@ -2041,21 +1903,27 @@ fn build_networks(facts: &Facts, writer: &mut Writer<'_>) -> Result<()> {
             row.status = "missing";
         }
 
-        // Static address/mask pairs precede DHCP lease values.
+        // Static address/mask pairs precede DHCP lease values; a static list holding
+        // only placeholders (DHCP adapters keep "0.0.0.0") falls through to the lease.
+        let assigned = |name: &str| {
+            get(name)
+                .map(|(data, src, _)| (multi_values(data), src.clone()))
+                .filter(|(values, _)| values.iter().any(|a| !is_placeholder_address(a)))
+        };
         let mut addresses: Vec<AddressRow> = Vec::new();
-        let (addr_values, mask_values, addr_src) = match get("ipaddress") {
-            Some((data, src, _)) if !multi_values(data).is_empty() => (
-                multi_values(data),
+        let (addr_values, mask_values, addr_src) = match assigned("ipaddress") {
+            Some((values, src)) => (
+                values,
                 get("subnetmask").map(|(d, _, _)| multi_values(d)).unwrap_or_default(),
-                Some(src.clone()),
+                Some(src),
             ),
-            _ => match get("dhcpipaddress") {
-                Some((data, src, _)) => (
-                    multi_values(data),
+            None => match assigned("dhcpipaddress") {
+                Some((values, src)) => (
+                    values,
                     get("dhcpsubnetmask")
                         .map(|(d, _, _)| multi_values(d))
                         .unwrap_or_default(),
-                    Some(src.clone()),
+                    Some(src),
                 ),
                 None => (Vec::new(), Vec::new(), None),
             },
@@ -2079,12 +1947,10 @@ fn build_networks(facts: &Facts, writer: &mut Writer<'_>) -> Result<()> {
         }
         row.addresses = addresses;
 
-        let (gw_values, gw_src) = match get("defaultgateway") {
-            Some((data, src, _)) if !multi_values(data).is_empty() => {
-                (multi_values(data), Some(src.clone()))
-            }
-            _ => match get("dhcpdefaultgateway") {
-                Some((data, src, _)) => (multi_values(data), Some(src.clone())),
+        let (gw_values, gw_src) = match assigned("defaultgateway") {
+            Some((values, src)) => (values, Some(src)),
+            None => match assigned("dhcpdefaultgateway") {
+                Some((values, src)) => (values, Some(src)),
                 None => (Vec::new(), None),
             },
         };
@@ -2224,6 +2090,10 @@ fn build_networks(facts: &Facts, writer: &mut Writer<'_>) -> Result<()> {
                 "DateLastConnected" => {
                     if let Some(when) = systemtime_hex(&row.value_data) {
                         entry.observed_at = Some(when);
+                        // Host-local wall clock, not the KST used elsewhere.
+                        entry
+                            .details
+                            .insert("observed_at_clock".into(), "host_local".into());
                         entry.add_ref(hive.source_ref(row, "value_data"));
                     }
                 }
@@ -2250,7 +2120,8 @@ fn build_networks(facts: &Facts, writer: &mut Writer<'_>) -> Result<()> {
     Ok(())
 }
 
-// Decode SYSTEMTIME to UTC+9; zero year means unset.
+// Reformat a SYSTEMTIME as stored (host-local wall clock, no offset applied);
+// zero year means unset.
 fn systemtime_hex(hex: &str) -> Option<String> {
     let b = unhex(hex);
     if b.len() < 16 {
@@ -2272,13 +2143,22 @@ fn systemtime_hex(hex: &str) -> Option<String> {
 // Generation
 // ---------------------------------------------------------------------------
 
-/// Build Metadata.sqlite and return its primary-row count.
+/// Metadata.sqlite build outcome.
+#[derive(Debug)]
+pub struct MetadataBuild {
+    /// Primary-row count.
+    pub rows: usize,
+    /// Optional inputs that could not be read and were skipped.
+    pub input_errors: Vec<String>,
+}
+
+/// Build Metadata.sqlite; unreadable SRUM facts are skipped and reported.
 pub fn build_metadata(
     out_dir: &Path,
     target: &Path,
     host_id: &str,
     dataset_id: &str,
-) -> Result<usize> {
+) -> Result<MetadataBuild> {
     let facts = Facts::load(out_dir, target)?;
     let conn = crate::derived::create_database(&out_dir.join(OVERVIEW_DIR), "Metadata")?;
     let accounts = collect_accounts(&facts);
@@ -2287,18 +2167,25 @@ pub fn build_metadata(
     let tx = conn.unchecked_transaction()?;
     let mut writer = Writer::new(&conn, host_id, dataset_id, &facts);
     build_host(&facts, &mut writer)?;
-    let observed_fixed = observed_fixed_sids(out_dir, &facts, &mut writer)?;
+    let mut input_errors = Vec::new();
+    let observed_fixed = observed_fixed_sids(out_dir, &facts, &mut writer, &mut input_errors)?;
     write_accounts(&accounts, &env.model, &observed_fixed, &mut writer)?;
     build_networks(&facts, &mut writer)?;
     write_env(&env, &mut writer)?;
-    let count = writer.count;
+    let rows = writer.count;
     tx.commit()?;
-    Ok(count)
+    Ok(MetadataBuild { rows, input_errors })
 }
 
 /// First registry/SRUM observation of each DWM/UMFD SID. SRUM facts
 /// generations are registered on `writer` so their refs can be stored.
-fn observed_fixed_sids(out_dir: &Path, facts: &Facts, writer: &mut Writer<'_>) -> Result<Vec<(String, SourceRef)>> {
+/// Unreadable SRUM facts DBs are skipped and pushed to `input_errors`.
+fn observed_fixed_sids(
+    out_dir: &Path,
+    facts: &Facts,
+    writer: &mut Writer<'_>,
+    input_errors: &mut Vec<String>,
+) -> Result<Vec<(String, SourceRef)>> {
     let mut found: BTreeMap<String, SourceRef> = BTreeMap::new();
     for hive in &facts.hives {
         for row in &hive.rows {
@@ -2318,53 +2205,75 @@ fn observed_fixed_sids(out_dir: &Path, facts: &Facts, writer: &mut Writer<'_>) -
         .unwrap_or_default();
     files.sort();
     for path in files {
-        let Ok(conn) = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY) else {
-            continue;
-        };
-        let tables: Vec<String> = conn
-            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE '\\_%' ESCAPE '\\'")?
-            .query_map([], |r| r.get(0))?
-            .collect::<rusqlite::Result<_>>()?;
-        let stem = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-        let db_rel = format!("SRUM/{}", path.file_name().map(|s| s.to_string_lossy()).unwrap_or_default());
-        let mut used = false;
-        for table in tables {
-            let has_user = conn
-                .prepare(&format!("PRAGMA table_info(\"{table}\")"))?
-                .query_map([], |r| r.get::<_, String>(1))?
-                .filter_map(|c| c.ok())
-                .any(|c| c == "user");
-            if !has_user {
-                continue;
-            }
-            let mut stmt = conn.prepare(&format!(
-                "SELECT user, MIN(rowid) FROM \"{table}\" \
-                 WHERE user LIKE 'S-1-5-90-0-%' OR user LIKE 'S-1-5-96-0-%' GROUP BY user"
-            ))?;
-            let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
-            for (sid, rowid) in rows.filter_map(|r| r.ok()) {
-                if fixed_virtual_account(&sid).is_none() || found.contains_key(&sid.to_uppercase()) {
-                    continue;
+        // SRUM only adds DWM/UMFD evidence: an unreadable file is skipped and
+        // reported instead of failing the whole Metadata build.
+        match srum_fixed_sids(&path, &found) {
+            Ok((sids, db_rel)) => {
+                if !sids.is_empty() {
+                    // Unstamped facts cannot be cited; reparse is required (same as registry).
+                    writer.source_dataset.insert(db_rel, crate::derived::facts_dataset_id(&path)?);
                 }
-                used = true;
-                found.insert(sid.to_uppercase(), SourceRef {
-                    artifact: "SRUM",
-                    db: db_rel.clone(),
-                    table: table.clone(),
-                    rowid,
-                    field: Some("user".into()),
-                    record_key: Some(format!("{stem}::{table}::{rowid}")),
-                    file: None,
-                    label: Some(sid),
-                });
+                found.extend(sids);
             }
-        }
-        if used {
-            // Unstamped facts cannot be cited; reparse is required (same as registry).
-            writer.source_dataset.insert(db_rel, crate::derived::facts_dataset_id(&path)?);
+            Err(error) => {
+                let name = path.file_name().map(|s| s.to_string_lossy()).unwrap_or_default();
+                input_errors.push(format!("SRUM/{name} skipped: {error:#}"));
+            }
         }
     }
     Ok(found.into_iter().collect())
+}
+
+/// New DWM/UMFD SIDs in one SRUM facts DB and its relative path.
+fn srum_fixed_sids(
+    path: &Path,
+    known: &BTreeMap<String, SourceRef>,
+) -> Result<(Vec<(String, SourceRef)>, String)> {
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let tables: Vec<String> = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE '\\_%' ESCAPE '\\'")?
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let stem = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    let db_rel = format!("SRUM/{}", path.file_name().map(|s| s.to_string_lossy()).unwrap_or_default());
+    let mut out: Vec<(String, SourceRef)> = Vec::new();
+    for table in tables {
+        let has_user = conn
+            .prepare(&format!("PRAGMA table_info(\"{table}\")"))?
+            .query_map([], |r| r.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .iter()
+            .any(|c| c == "user");
+        if !has_user {
+            continue;
+        }
+        let mut stmt = conn.prepare(&format!(
+            "SELECT user, MIN(rowid) FROM \"{table}\" \
+             WHERE user LIKE 'S-1-5-90-0-%' OR user LIKE 'S-1-5-96-0-%' GROUP BY user"
+        ))?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+        for row in rows {
+            let (sid, rowid) = row?;
+            let upper = sid.to_uppercase();
+            if fixed_virtual_account(&sid).is_none()
+                || known.contains_key(&upper)
+                || out.iter().any(|(k, _)| *k == upper)
+            {
+                continue;
+            }
+            out.push((upper, SourceRef {
+                artifact: "SRUM",
+                db: db_rel.clone(),
+                table: table.clone(),
+                rowid,
+                field: Some("user".into()),
+                record_key: Some(format!("{stem}::{table}::{rowid}")),
+                file: None,
+                label: Some(sid),
+            }));
+        }
+    }
+    Ok((out, db_rel))
 }
 
 fn write_accounts(
@@ -2444,10 +2353,8 @@ fn write_accounts(
         row.domain = accounts.account_domain.clone();
         if let Some(acb) = user.acb {
             row.account_flags = Some(format!("0x{acb:04X}"));
-            let flags: Vec<serde_json::Value> = ACB_FLAGS
-                .iter()
-                .filter(|(bit, _)| acb & bit != 0)
-                .map(|(_, name)| serde_json::Value::from(*name))
+            let flags: Vec<serde_json::Value> = crate::sam::acb_flag_names(acb)
+                .map(serde_json::Value::from)
                 .collect();
             row.details
                 .insert("acb_flags".into(), serde_json::Value::Array(flags));
@@ -2596,7 +2503,6 @@ fn write_env(env: &EnvBuild, writer: &mut Writer<'_>) -> Result<()> {
 }
 
 fn apply_env(row: &mut MetaRow, var: &EnvVar, model: &EnvModel, sid: Option<&str>) {
-    row.env_name = Some(var.name.clone());
     row.raw_value = var.raw.clone();
     row.observed_at = var.observed_at.clone();
     row.selection_reason = var.selection_reason.clone();
@@ -2659,14 +2565,6 @@ pub fn account_names_from_facts(out_dir: &Path) -> Result<HashMap<String, String
 // Stored lookups
 // ---------------------------------------------------------------------------
 
-pub struct MetadataEntryRef<'a> {
-    pub metadata_id: &'a str,
-    pub kind: &'a str,
-    pub scope: &'a str,
-    pub key: &'a str,
-    pub value: Option<&'a str>,
-}
-
 #[derive(Clone, Debug)]
 pub struct AccountEntry {
     pub sid: String,
@@ -2677,18 +2575,10 @@ pub struct AccountEntry {
     pub profile_path_resolved: Option<String>,
 }
 
-struct EntryRow {
-    metadata_id: String,
-    kind: String,
-    scope: String,
-    key: String,
-    value: Option<String>,
-}
-
 /// Read stored metadata without reparsing evidence.
 pub struct MetadataLookup {
-    entries: Vec<EntryRow>,
-    index: HashMap<(String, String, String), usize>,
+    /// (kind, scope, key) → metadata_id.
+    index: HashMap<(String, String, String), String>,
     accounts: BTreeMap<String, AccountEntry>,
     names: HashMap<String, Vec<String>>,
     host: BTreeMap<String, String>,
@@ -2709,7 +2599,6 @@ impl MetadataLookup {
              account_kind, domain, profile_path, profile_path_resolved \
              FROM \"metadata\"",
         )?;
-        let mut entries = Vec::new();
         let mut index = HashMap::new();
         let mut accounts: BTreeMap<String, AccountEntry> = BTreeMap::new();
         let mut names: HashMap<String, Vec<String>> = HashMap::new();
@@ -2779,21 +2668,10 @@ impl MetadataLookup {
                 }
                 _ => {}
             }
-            index.insert(
-                (kind.clone(), scope.clone(), key.clone()),
-                entries.len(),
-            );
-            entries.push(EntryRow {
-                metadata_id,
-                kind,
-                scope,
-                key,
-                value,
-            });
+            index.insert((kind, scope, key), metadata_id);
         }
         profiles.sort_by_key(|(path, _)| std::cmp::Reverse(path.len()));
         Ok(Self {
-            entries,
             index,
             accounts,
             names,
@@ -2915,40 +2793,51 @@ impl MetadataLookup {
 
     /// Account SID and environment-name keys must be lowercase.
     pub fn metadata_id(&self, kind: &str, scope: &str, key: &str) -> Option<&str> {
-        let idx = self
-            .index
-            .get(&(kind.to_string(), scope.to_string(), key.to_string()))?;
-        Some(self.entries[*idx].metadata_id.as_str())
-    }
-
-    pub fn entries(&self) -> impl Iterator<Item = MetadataEntryRef<'_>> {
-        self.entries.iter().map(|e| MetadataEntryRef {
-            metadata_id: &e.metadata_id,
-            kind: &e.kind,
-            scope: &e.scope,
-            key: &e.key,
-            value: e.value.as_deref(),
-        })
-    }
-
-    pub fn find(&self, kind: &str) -> Vec<(&str, &str, Option<&str>)> {
-        self.entries
-            .iter()
-            .filter(|e| e.kind == kind)
-            .map(|e| {
-                (
-                    e.metadata_id.as_str(),
-                    e.key.as_str(),
-                    e.value.as_deref(),
-                )
-            })
-            .collect()
+        self.index
+            .get(&(kind.to_string(), scope.to_string(), key.to_string()))
+            .map(String::as_str)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unreadable_srum_db_is_reported_without_failing_metadata() {
+        let fx = Fixture::new("bad-srum");
+        write_software(&fx, base_software("D:\\Users\\analyst"));
+        let srum = fx.root.join("SRUM").join("SRUDB.sqlite");
+        std::fs::create_dir_all(srum.parent().unwrap()).unwrap();
+        std::fs::write(&srum, b"not a sqlite database, just garbage bytes....").unwrap();
+        let build = build_metadata(&fx.root, Path::new("/evidence"), "host-1", "ds-1").unwrap();
+        assert!(build.rows > 0);
+        assert_eq!(build.input_errors.len(), 1);
+        assert!(build.input_errors[0].starts_with("SRUM/SRUDB.sqlite skipped: "), "{:?}", build.input_errors);
+    }
+
+    #[test]
+    fn unreadable_registry_table_is_an_error_not_missing_hive() {
+        let dir = std::env::temp_dir().join(format!("wina-md-loadhive-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let broken = dir.join("SYSTEM.sqlite");
+        Connection::open(&broken).unwrap().execute_batch("CREATE TABLE Registry(key_path TEXT);").unwrap();
+        let other = dir.join("RegistryInputs.sqlite");
+        Connection::open(&other).unwrap().execute_batch("CREATE TABLE inputs(x TEXT);").unwrap();
+        let broken_result = load_hive(&broken, &dir);
+        let other_result = load_hive(&other, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(broken_result.is_err());
+        assert!(other_result.unwrap().is_none());
+    }
+
+    #[test]
+    fn prefix_from_mask_accepts_slash_32() {
+        assert_eq!(prefix_from_mask("255.255.255.255"), Some(32));
+        assert_eq!(prefix_from_mask("255.255.255.254"), Some(31));
+        assert_eq!(prefix_from_mask("0.0.0.0"), Some(0));
+        assert_eq!(prefix_from_mask("255.0.255.0"), None);
+    }
 
     // Distinct from the derived generation to detect provenance substitution.
     const FACTS_DATASET: &str = "facts-generation-0001";
@@ -2977,15 +2866,25 @@ mod tests {
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS \"Registry\" (last_write TEXT, key_path TEXT, \
                  value_name TEXT, value_type TEXT, value_data TEXT, _recovery TEXT, \
-                 _source_file TEXT)",
+                 _source_file TEXT, value_data_hex TEXT)",
                 [],
             )
             .unwrap();
             for (key_path, value_name, value_type, value_data) in rows {
+                // Parser keeps raw bytes; string types are UTF-16LE.
+                let hex = if *value_type == "REG_BINARY" {
+                    value_data.to_string()
+                } else {
+                    value_data
+                        .encode_utf16()
+                        .flat_map(u16::to_le_bytes)
+                        .map(|b| format!("{b:02x}"))
+                        .collect()
+                };
                 conn.execute(
                     "INSERT INTO \"Registry\" VALUES ('2026-01-02 03:04:05.678', ?1, ?2, ?3, ?4, \
-                     'live', '/evidence/HIVE')",
-                    rusqlite::params![key_path, value_name, value_type, value_data],
+                     'live', '/evidence/HIVE', ?5)",
+                    rusqlite::params![key_path, value_name, value_type, value_data, hex],
                 )
                 .unwrap();
             }
@@ -2994,7 +2893,7 @@ mod tests {
         }
 
         fn build(&self) -> usize {
-            build_metadata(&self.root, Path::new("/evidence"), "host-1", "ds-1").unwrap()
+            build_metadata(&self.root, Path::new("/evidence"), "host-1", "ds-1").unwrap().rows
         }
 
         fn db(&self) -> Connection {
@@ -3025,7 +2924,7 @@ mod tests {
     fn user_v_hex(name: &str, full: &str) -> String {
         let mut head = vec![0u8; 0xCC];
         let mut data: Vec<u8> = Vec::new();
-        let mut put = |index: usize, text: &str, head: &mut Vec<u8>, data: &mut Vec<u8>| {
+        let put = |index: usize, text: &str, head: &mut Vec<u8>, data: &mut Vec<u8>| {
             let off = data.len() as u32;
             let bytes: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
             data.extend(&bytes);
@@ -3124,10 +3023,17 @@ mod tests {
                     "",
                 ),
                 (
+                    "\\ROOT\\SAM\\Domains\\Builtin\\Aliases\\Names\\Users",
+                    "(default)",
+                    "545",
+                    "",
+                ),
+                // Two alias RIDs (545, 544): type code 2 is rendered as REG_EXPAND_SZ.
+                (
                     "\\ROOT\\SAM\\Domains\\Builtin\\Aliases\\Members\\S-1-5-21-11-22-33\\000003E9",
                     "(default)",
-                    "REG_SZ",
-                    "\u{220}",
+                    "REG_EXPAND_SZ",
+                    "\u{221}\u{0}\u{220}\u{0}",
                 ),
             ],
         );
@@ -3174,16 +3080,24 @@ mod tests {
         );
         assert_eq!(lookup.account("S-1-5-21-99-99-99-1234"), None);
 
-        let (group_sid, group_name): (Option<String>, Option<String>) = conn
-            .query_row(
+        let groups: Vec<(Option<String>, Option<String>)> = conn
+            .prepare(
                 "SELECT g.group_sid, g.group_name FROM MetadataGroups g \
-                 JOIN metadata m ON m.metadata_id = g.metadata_id WHERE m.rid = 1001",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                 JOIN metadata m ON m.metadata_id = g.metadata_id WHERE m.rid = 1001 \
+                 ORDER BY g.group_sid",
             )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
             .unwrap();
-        assert_eq!(group_sid.as_deref(), Some("S-1-5-32-544"));
-        assert_eq!(group_name.as_deref(), Some("Administrators"));
+        assert_eq!(
+            groups,
+            vec![
+                (Some("S-1-5-32-544".into()), Some("Administrators".into())),
+                (Some("S-1-5-32-545".into()), Some("Users".into())),
+            ]
+        );
     }
 
     #[test]
@@ -3509,14 +3423,14 @@ mod tests {
         let conn = Connection::open(&db).unwrap();
         conn.execute(
             "CREATE TABLE \"Registry\" (last_write TEXT, key_path TEXT, value_name TEXT, \
-             value_type TEXT, value_data TEXT, _recovery TEXT, _source_file TEXT)",
+             value_type TEXT, value_data TEXT, _recovery TEXT, _source_file TEXT, value_data_hex TEXT)",
             [],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO \"Registry\" VALUES ('2026-01-02 03:04:05.678', \
              '\\ROOT\\Microsoft\\Windows NT\\CurrentVersion', 'ProductName', 'REG_SZ', \
-             'Windows 10 Pro', 'live', '/evidence/SOFTWARE')",
+             'Windows 10 Pro', 'live', '/evidence/SOFTWARE', '')",
             [],
         )
         .unwrap();
@@ -3670,6 +3584,52 @@ mod tests {
             )
             .unwrap();
         assert_eq!(gateway, "192.168.10.1");
+    }
+
+    #[test]
+    fn dhcp_lease_used_when_static_list_is_placeholder() {
+        let fx = Fixture::new("network_dhcp");
+        let key = "\\ROOT\\ControlSet001\\Services\\Tcpip\\Parameters\\Interfaces\\{dhcp}";
+        fx.hive(
+            "SYSTEM",
+            &[
+                ("\\ROOT\\Select", "Current", "REG_DWORD", "1"),
+                (key, "IPAddress", "REG_MULTI_SZ", "[\"0.0.0.0\"]"),
+                (key, "SubnetMask", "REG_MULTI_SZ", "[\"0.0.0.0\"]"),
+                (key, "DefaultGateway", "REG_MULTI_SZ", "[\"0.0.0.0\"]"),
+                (key, "DhcpIPAddress", "REG_SZ", "10.0.0.15"),
+                (key, "DhcpSubnetMask", "REG_SZ", "255.255.255.0"),
+                (key, "DhcpDefaultGateway", "REG_MULTI_SZ", "[\"10.0.0.1\"]"),
+                (key, "EnableDHCP", "REG_DWORD", "1"),
+            ],
+        );
+        fx.build();
+        let conn = fx.db();
+        let metadata_id: String = conn
+            .query_row(
+                "SELECT metadata_id FROM metadata WHERE kind='network' AND key='{dhcp}'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let (address, prefix): (String, i64) = conn
+            .query_row(
+                "SELECT address, prefix_length FROM MetadataAddresses \
+                 WHERE metadata_id=?1 AND ordinal=0",
+                [&metadata_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(address, "10.0.0.15");
+        assert_eq!(prefix, 24);
+        let gateway: String = conn
+            .query_row(
+                "SELECT address FROM MetadataGateways WHERE metadata_id=?1 AND ordinal=0",
+                [&metadata_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(gateway, "10.0.0.1");
     }
 
     #[test]

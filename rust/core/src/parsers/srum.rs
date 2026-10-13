@@ -10,33 +10,11 @@ use std::path::Path;
 use anyhow::Result;
 use libesedb::{EseDb, Value};
 
-use crate::hex::hex_lower;
+use crate::hex::{format_binary_sid, hex_lower};
 use crate::sqlite::{Row, StreamWriter};
 use crate::time::fmt_ole;
 
 pub const SRUM_PREFIX: &[&str] = &["timestamp", "app", "user", "AutoIncId", "AppId", "UserId"];
-
-
-/// A binary SID -> "S-1-5-..." (matches the Python _format_sid).
-fn format_sid(data: &[u8]) -> String {
-    if data.len() < 8 {
-        return hex_lower(data);
-    }
-    let revision = data[0];
-    let sub_count = data[1] as usize;
-    let authority = data[2..8].iter().fold(0u64, |a, &b| (a << 8) | b as u64);
-    let mut parts = vec!["S".to_string(), revision.to_string(), authority.to_string()];
-    let mut off = 8;
-    for _ in 0..sub_count {
-        if off + 4 > data.len() {
-            break;
-        }
-        let v = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
-        parts.push(v.to_string());
-        off += 4;
-    }
-    parts.join("-")
-}
 
 fn utf16le(b: &[u8]) -> String {
     let u: Vec<u16> = b
@@ -137,7 +115,7 @@ fn friendly_name(guid: &str, cols: &[String]) -> String {
     )
 }
 
-fn build_id_map(db: &EseDb) -> HashMap<i64, String> {
+fn build_id_map(db: &EseDb, skipped: &mut Skipped) -> HashMap<i64, String> {
     let mut map = HashMap::new();
     let table = match db.table_by_name("SruDbIdMapTable") {
         Ok(t) => t,
@@ -157,10 +135,17 @@ fn build_id_map(db: &EseDb) -> HashMap<i64, String> {
         _ => return map,
     };
     if let Ok(records) = table.iter_records() {
-        for rec in records.filter_map(|r| r.ok()) {
+        for rec in records {
+            let Ok(rec) = rec else {
+                skipped.records += 1;
+                continue;
+            };
             let idx = rec.value(ii).ok().and_then(|v| as_int(&v));
             let id_type = it.and_then(|i| rec.value(i).ok()).and_then(|v| as_int(&v));
             let blob = rec.value(ib).ok();
+            if idx.is_none() || blob.is_none() {
+                skipped.values += 1;
+            }
             if let (Some(idx), Some(v)) = (idx, blob) {
                 let bytes: Vec<u8> = match &v {
                     Value::Binary(b) | Value::LargeBinary(b) | Value::SuperLarge(b) => b.clone(),
@@ -176,7 +161,7 @@ fn build_id_map(db: &EseDb) -> HashMap<i64, String> {
                     continue;
                 }
                 let s = if id_type == Some(3) {
-                    format_sid(&bytes)
+                    format_binary_sid(&bytes).unwrap_or_else(|| hex_lower(&bytes))
                 } else {
                     utf16le(&bytes)
                 };
@@ -187,12 +172,32 @@ fn build_id_map(db: &EseDb) -> HashMap<i64, String> {
     map
 }
 
+/// Integer SRUM columns holding FILETIMEs (sample: every row of
+/// NetworkConnectivityUsage.ConnectStartTime, ApplicationTimeline.EndTime and
+/// the {7ACBBAA3…} table's StartTime/EndTime). Durations stay raw.
+const FILETIME_COLUMNS: &[&str] = &["ConnectStartTime", "StartTime", "EndTime"];
+
+fn filetime_column(name: &str, v: &Value) -> Option<String> {
+    if !FILETIME_COLUMNS.contains(&name) {
+        return None;
+    }
+    as_int(v).map(crate::time::fmt_filetime)
+}
+
+/// Records and values that libesedb could not read in one table.
+#[derive(Default)]
+struct Skipped {
+    records: usize,
+    values: usize,
+}
+
 fn dump_table_stream(
     table: &libesedb::Table,
     id_map: &HashMap<i64, String>,
     source: &str,
     out: &Path,
     name: &str,
+    skipped: &mut Skipped,
 ) -> Result<usize> {
     let cols: Vec<String> = table
         .iter_columns()?
@@ -211,17 +216,24 @@ fn dump_table_stream(
     universe.push("_source_file".to_string());
     let uref: Vec<&str> = universe.iter().map(|s| s.as_str()).collect();
     let mut writer = StreamWriter::create(out, name, &uref, SRUM_PREFIX)?;
-    for rec in table.iter_records()?.filter_map(|r| r.ok()) {
+    for rec in table.iter_records()? {
         if crate::pipeline::cancelled() {
             break;
         }
+        let Ok(rec) = rec else {
+            skipped.records += 1;
+            continue;
+        };
         let mut row = Row::new();
         row.insert("_source_file".into(), source.into());
         let (mut app_id, mut user_id) = (None, None);
         for (i, name) in cols.iter().enumerate() {
             let v = match rec.value(i as i32) {
                 Ok(v) => v,
-                Err(_) => continue,
+                Err(_) => {
+                    skipped.values += 1;
+                    continue;
+                }
             };
             if name == "AppId" {
                 app_id = as_int(&v);
@@ -233,7 +245,9 @@ fn dump_table_stream(
             } else {
                 name
             };
-            row.insert(key.into(), render_record_value(&rec, i as i32, &v));
+            let text = filetime_column(name, &v)
+                .unwrap_or_else(|| render_record_value(&rec, i as i32, &v));
+            row.insert(key.into(), text);
         }
         if let Some(a) = app_id {
             row.insert("app".into(), id_map.get(&a).cloned().unwrap_or_default());
@@ -246,7 +260,13 @@ fn dump_table_stream(
     writer.finish()
 }
 
-pub fn parse_srum_stream(path: &Path, out_db: &Path) -> Result<Vec<(String, usize)>> {
+/// Per-table row counts plus unreadable-record notes (empty when clean).
+pub struct SrumParse {
+    pub tables: Vec<(String, usize)>,
+    pub skipped: Vec<String>,
+}
+
+pub fn parse_srum_stream(path: &Path, out_db: &Path) -> Result<SrumParse> {
     let source = path.to_string_lossy().to_string();
     let db = EseDb::open(path).map_err(|e| {
         anyhow::anyhow!(
@@ -254,7 +274,10 @@ pub fn parse_srum_stream(path: &Path, out_db: &Path) -> Result<Vec<(String, usiz
             e
         )
     })?;
-    let id_map = build_id_map(&db);
+    let mut notes = Vec::new();
+    let mut id_skipped = Skipped::default();
+    let id_map = build_id_map(&db, &mut id_skipped);
+    push_skipped(&mut notes, "SruDbIdMapTable", &id_skipped);
     let mut out: Vec<(String, usize)> = Vec::new();
     for table in db.iter_tables()?.filter_map(|t| t.ok()) {
         let gname = table.name()?;
@@ -279,8 +302,33 @@ pub fn parse_srum_stream(path: &Path, out_db: &Path) -> Result<Vec<(String, usiz
         while out.iter().any(|(existing, _)| *existing == name) {
             name.push('_');
         }
-        let n = dump_table_stream(&table, &id_map, &source, out_db, &name)?;
+        let mut skipped = Skipped::default();
+        let n = dump_table_stream(&table, &id_map, &source, out_db, &name, &mut skipped)?;
+        push_skipped(&mut notes, &gname, &skipped);
         out.push((name, n));
     }
-    Ok(out)
+    Ok(SrumParse { tables: out, skipped: notes })
+}
+
+fn push_skipped(notes: &mut Vec<String>, table: &str, skipped: &Skipped) {
+    if skipped.records > 0 || skipped.values > 0 {
+        notes.push(format!(
+            "{table}: 읽기 실패 레코드 {}건, 값 {}건",
+            skipped.records, skipped.values
+        ));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn known_filetime_columns_are_formatted_durations_are_not() {
+        let ft = Value::I64(134_285_780_749_171_136);
+        let text = filetime_column("ConnectStartTime", &ft).unwrap();
+        assert!(text.starts_with("2026-"), "{text}");
+        assert_eq!(filetime_column("ConnectedTime", &Value::I64(852_265)), None);
+        assert_eq!(filetime_column("EndTime", &Value::I64(0)).as_deref(), Some(""));
+    }
 }

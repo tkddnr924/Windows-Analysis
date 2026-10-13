@@ -4,6 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use super::schema::{ChildSpec, DbSpec};
+use super::eventlog_inputs::LogInputs;
 use super::{Cell, Ctx, DerivedDb, Record};
 use crate::overview::EventLogOverviewCache;
 use crate::sqlite::Row;
@@ -249,338 +250,431 @@ const IPSEC_DRIVER: &str = "Audit IPsec Driver";
 const OTHER_POLICY: &str = "Audit Other Policy Change Events";
 const OTHER_OBJECT_ACCESS: &str = "Audit Other Object Access Events";
 
-/// Microsoft-documented Security-channel audits that belong to this view:
-/// title and owning subcategory come from the published subcategory pages of
-/// the Windows 10 audit reference. `scope` is the evidence family, not a
-/// claim about what happened on the wire.
-fn documented_audit(event_id: i64) -> Option<(&'static str, &'static str, &'static str, &'static str)> {
+/// Microsoft's published definition of a Security audit: title, owning
+/// subcategory (Windows 10 audit reference subcategory pages) and evidence
+/// family. `scope` is the evidence family, not a claim about what happened
+/// on the wire.
+#[derive(Clone, Copy)]
+struct AuditDoc {
+    event_type: &'static str,
+    description: &'static str,
+    scope: &'static str,
+    subcategory: &'static str,
+}
+
+/// A Security-channel audit this view takes. The manifest template and the
+/// documented definition live in one entry, so they cannot drift apart.
+#[derive(Clone, Copy)]
+struct Audit {
+    shape: Shape,
+    /// Template version the Security-Auditing manifest declares.
+    version: i64,
+    /// `None`: the manifest defines a template but Microsoft publishes no
+    /// subcategory page, so nothing about the event is labeled.
+    doc: Option<AuditDoc>,
+}
+
+type Template = (Shape, i64);
+const RULE: Template = (Shape::Rule, 0);
+const PACKET: Template = (Shape::Packet, 0);
+const PACKET_V1: Template = (Shape::Packet, 1);
+const DOS: Template = (Shape::Dos, 0);
+const IPSEC: Template = (Shape::Ipsec, 0);
+const IPSEC_V1: Template = (Shape::Ipsec, 1);
+const IPSEC_POLICY: Template = (Shape::IpsecPolicy, 0);
+const WFP_OBJECT: Template = (Shape::WfpObject, 0);
+const PASTORE: Template = (Shape::PaStore, 0);
+
+fn doc(
+    event_type: &'static str,
+    description: &'static str,
+    scope: &'static str,
+    subcategory: &'static str,
+    (shape, version): Template,
+) -> Audit {
+    Audit {
+        shape,
+        version,
+        doc: Some(AuditDoc { event_type, description, scope, subcategory }),
+    }
+}
+
+/// Security-channel audits that belong to this view.
+fn security_audit(event_id: i64) -> Option<Audit> {
     Some(match event_id {
         // Audit MPSSVC Rule-Level Policy Change.
-        4944 => ("시작 시 활성 정책", "Windows 방화벽 시작 시 활성 정책 기록", "rule_policy_audit", MPSSVC_POLICY),
-        4945 => ("시작 시 규칙 나열", "Windows 방화벽 시작 시 규칙 나열", "rule_policy_audit", MPSSVC_POLICY),
-        4946 => ("규칙 추가 (감사)", "방화벽 예외 목록에 규칙 추가", "rule_policy_audit", MPSSVC_POLICY),
-        4947 => ("규칙 수정 (감사)", "방화벽 예외 목록의 규칙 수정", "rule_policy_audit", MPSSVC_POLICY),
-        4948 => ("규칙 삭제 (감사)", "방화벽 예외 목록의 규칙 삭제", "rule_policy_audit", MPSSVC_POLICY),
-        4949 => ("설정 기본값 복원", "방화벽 설정을 기본값으로 복원", "rule_policy_audit", MPSSVC_POLICY),
-        4950 => ("설정 변경 (감사)", "방화벽 설정 변경", "rule_policy_audit", MPSSVC_POLICY),
-        4951 => ("규칙 무시 — 주 버전", "주 버전 미인식으로 규칙 무시", "rule_policy_audit", MPSSVC_POLICY),
-        4952 => ("규칙 일부 무시 — 부 버전", "부 버전 미인식으로 규칙 일부 무시", "rule_policy_audit", MPSSVC_POLICY),
-        4953 => ("규칙 무시 — 구문 분석 실패", "규칙 구문 분석 실패로 무시", "rule_policy_audit", MPSSVC_POLICY),
-        4954 => ("그룹 정책 설정 적용", "방화벽 그룹 정책 설정 변경 적용", "rule_policy_audit", MPSSVC_POLICY),
-        4956 => ("활성 프로필 변경", "방화벽 활성 프로필 변경", "rule_policy_audit", MPSSVC_POLICY),
-        4957 => ("규칙 미적용", "방화벽이 규칙을 적용하지 않음", "rule_policy_audit", MPSSVC_POLICY),
-        4958 => (
+        4944 => doc("시작 시 활성 정책", "Windows 방화벽 시작 시 활성 정책 기록", "rule_policy_audit", MPSSVC_POLICY, RULE),
+        4945 => doc("시작 시 규칙 나열", "Windows 방화벽 시작 시 규칙 나열", "rule_policy_audit", MPSSVC_POLICY, RULE),
+        4946 => doc("규칙 추가 (감사)", "방화벽 예외 목록에 규칙 추가", "rule_policy_audit", MPSSVC_POLICY, RULE),
+        4947 => doc("규칙 수정 (감사)", "방화벽 예외 목록의 규칙 수정", "rule_policy_audit", MPSSVC_POLICY, RULE),
+        4948 => doc("규칙 삭제 (감사)", "방화벽 예외 목록의 규칙 삭제", "rule_policy_audit", MPSSVC_POLICY, RULE),
+        4949 => doc("설정 기본값 복원", "방화벽 설정을 기본값으로 복원", "rule_policy_audit", MPSSVC_POLICY, RULE),
+        4950 => doc("설정 변경 (감사)", "방화벽 설정 변경", "rule_policy_audit", MPSSVC_POLICY, RULE),
+        4951 => doc("규칙 무시 — 주 버전", "주 버전 미인식으로 규칙 무시", "rule_policy_audit", MPSSVC_POLICY, RULE),
+        4952 => doc("규칙 일부 무시 — 부 버전", "부 버전 미인식으로 규칙 일부 무시", "rule_policy_audit", MPSSVC_POLICY, RULE),
+        4953 => doc("규칙 무시 — 구문 분석 실패", "규칙 구문 분석 실패로 무시", "rule_policy_audit", MPSSVC_POLICY, RULE),
+        4954 => doc("그룹 정책 설정 적용", "방화벽 그룹 정책 설정 변경 적용", "rule_policy_audit", MPSSVC_POLICY, RULE),
+        4956 => doc("활성 프로필 변경", "방화벽 활성 프로필 변경", "rule_policy_audit", MPSSVC_POLICY, RULE),
+        4957 => doc("규칙 미적용", "방화벽이 규칙을 적용하지 않음", "rule_policy_audit", MPSSVC_POLICY, RULE),
+        4958 => doc(
             "규칙 미적용 — 미구성 항목",
             "구성되지 않은 항목을 참조해 규칙 미적용",
             "rule_policy_audit",
             MPSSVC_POLICY,
+            RULE,
         ),
         // Audit Other System Events — firewall service and driver lifecycle.
-        5024 => ("방화벽 서비스 시작", "Windows 방화벽 서비스 시작 성공", "service_lifecycle_audit", OTHER_SYSTEM),
-        5025 => ("방화벽 서비스 중지", "Windows 방화벽 서비스 중지", "service_lifecycle_audit", OTHER_SYSTEM),
-        5027 => (
+        5024 => doc("방화벽 서비스 시작", "Windows 방화벽 서비스 시작 성공", "service_lifecycle_audit", OTHER_SYSTEM, RULE),
+        5025 => doc("방화벽 서비스 중지", "Windows 방화벽 서비스 중지", "service_lifecycle_audit", OTHER_SYSTEM, RULE),
+        5027 => doc(
             "정책 읽기 실패",
             "로컬 저장소에서 정책을 가져오지 못함 — 현재 정책 유지",
             "service_lifecycle_audit",
             OTHER_SYSTEM,
+            RULE,
         ),
-        5028 => (
+        5028 => doc(
             "정책 구문 분석 실패",
             "새 정책 구문 분석 실패 — 현재 정책 유지",
             "service_lifecycle_audit",
             OTHER_SYSTEM,
+            RULE,
         ),
-        5029 => ("드라이버 초기화 실패", "서비스가 드라이버 초기화 실패", "service_lifecycle_audit", OTHER_SYSTEM),
-        5030 => ("방화벽 서비스 시작 실패", "Windows 방화벽 서비스 시작 실패", "service_lifecycle_audit", OTHER_SYSTEM),
-        5032 => ("차단 알림 실패", "차단 사실을 사용자에게 알리지 못함", "service_lifecycle_audit", OTHER_SYSTEM),
-        5033 => ("방화벽 드라이버 시작", "Windows 방화벽 드라이버 시작 성공", "service_lifecycle_audit", OTHER_SYSTEM),
-        5034 => ("방화벽 드라이버 중지", "Windows 방화벽 드라이버 중지", "service_lifecycle_audit", OTHER_SYSTEM),
-        5035 => ("방화벽 드라이버 시작 실패", "Windows 방화벽 드라이버 시작 실패", "service_lifecycle_audit", OTHER_SYSTEM),
-        5037 => (
+        5029 => doc("드라이버 초기화 실패", "서비스가 드라이버 초기화 실패", "service_lifecycle_audit", OTHER_SYSTEM, RULE),
+        5030 => doc("방화벽 서비스 시작 실패", "Windows 방화벽 서비스 시작 실패", "service_lifecycle_audit", OTHER_SYSTEM, RULE),
+        5032 => doc("차단 알림 실패", "차단 사실을 사용자에게 알리지 못함", "service_lifecycle_audit", OTHER_SYSTEM, RULE),
+        5033 => doc("방화벽 드라이버 시작", "Windows 방화벽 드라이버 시작 성공", "service_lifecycle_audit", OTHER_SYSTEM, RULE),
+        5034 => doc("방화벽 드라이버 중지", "Windows 방화벽 드라이버 중지", "service_lifecycle_audit", OTHER_SYSTEM, RULE),
+        5035 => doc("방화벽 드라이버 시작 실패", "Windows 방화벽 드라이버 시작 실패", "service_lifecycle_audit", OTHER_SYSTEM, RULE),
+        5037 => doc(
             "방화벽 드라이버 런타임 오류",
             "드라이버가 심각한 런타임 오류로 종료",
             "service_lifecycle_audit",
             OTHER_SYSTEM,
+            RULE,
         ),
         // Audit Filtering Platform Connection. These are per-packet/per-call
         // permission audits: an allowed connection is not a transfer.
-        5031 => (
+        5031 => doc(
             "인바운드 수신 차단",
             "방화벽 서비스가 응용 프로그램의 인바운드 수신을 차단함",
             "connection_audit",
             FP_CONNECTION,
+            RULE,
         ),
-        5150 => ("패킷 차단 (WFP·연결 감사)", "Windows 필터링 플랫폼이 패킷을 차단함", "connection_audit", FP_CONNECTION),
-        5151 => (
+        5150 => doc("패킷 차단 (WFP·연결 감사)", "Windows 필터링 플랫폼이 패킷을 차단함", "connection_audit", FP_CONNECTION, PACKET),
+        5151 => doc(
             "패킷 차단 (제한적 WFP 필터·연결 감사)",
             "더 제한적인 Windows 필터링 플랫폼 필터가 패킷을 차단함",
             "connection_audit",
             FP_CONNECTION,
+            PACKET,
         ),
-        5154 => (
+        5154 => doc(
             "포트 수신 허용 (WFP)",
             "Windows 필터링 플랫폼이 응용 프로그램·서비스의 포트 수신 대기를 허용함",
             "listen_bind_audit",
             FP_CONNECTION,
+            PACKET,
         ),
-        5155 => (
+        5155 => doc(
             "포트 수신 차단 (WFP)",
             "Windows 필터링 플랫폼이 응용 프로그램·서비스의 포트 수신 대기를 차단함",
             "listen_bind_audit",
             FP_CONNECTION,
+            PACKET,
         ),
-        5156 => (
+        5156 => doc(
             "연결 허용 (WFP)",
             "Windows 필터링 플랫폼이 연결을 허용함 — 허용 감사이며 실제 데이터 교환을 뜻하지 않음",
             "connection_audit",
             FP_CONNECTION,
+            PACKET_V1,
         ),
-        5157 => (
+        5157 => doc(
             "연결 차단 (WFP)",
             "Windows 필터링 플랫폼이 연결을 차단함",
             "connection_audit",
             FP_CONNECTION,
+            PACKET_V1,
         ),
-        5158 => (
+        5158 => doc(
             "로컬 포트 바인드 허용 (WFP)",
             "Windows 필터링 플랫폼이 로컬 포트 바인드를 허용함",
             "listen_bind_audit",
             FP_CONNECTION,
+            PACKET,
         ),
-        5159 => (
+        5159 => doc(
             "로컬 포트 바인드 차단 (WFP)",
             "Windows 필터링 플랫폼이 로컬 포트 바인드를 차단함",
             "listen_bind_audit",
             FP_CONNECTION,
+            PACKET,
         ),
         // Audit Filtering Platform Packet Drop.
-        5152 => (
+        5152 => doc(
             "패킷 차단 (WFP·패킷 삭제 감사)",
             "Windows 필터링 플랫폼이 패킷을 차단함",
             "packet_drop_audit",
             FP_PACKET_DROP,
+            PACKET,
         ),
-        5153 => (
+        5153 => doc(
             "패킷 차단 (제한적 WFP 필터·패킷 삭제 감사)",
             "더 제한적인 Windows 필터링 플랫폼 필터가 패킷을 차단함",
             "packet_drop_audit",
             FP_PACKET_DROP,
+            PACKET,
         ),
+        // Layer-2 packet audits: the manifest defines their template, but no
+        // Microsoft subcategory page lists them, so they stay unlabeled.
+        5146 | 5147 => Audit { shape: PACKET.0, version: PACKET.1, doc: None },
         // Audit Other Object Access Events — filtering platform DoS defence.
-        5148 => (
+        5148 => doc(
             "DoS 공격 감지 — 방어 모드 진입 (WFP)",
             "Windows 필터링 플랫폼이 DoS 공격을 감지해 방어 모드로 전환하고 관련 패킷을 버림",
             "dos_mitigation_audit",
             OTHER_OBJECT_ACCESS,
+            DOS,
         ),
-        5149 => (
+        5149 => doc(
             "DoS 공격 완화 — 정상 처리 재개 (WFP)",
             "DoS 공격이 가라앉아 정상 처리가 재개됨",
             "dos_mitigation_audit",
             OTHER_OBJECT_ACCESS,
+            DOS,
         ),
         // Audit IPsec Main Mode.
-        4646 => ("IPsec 주 모드 보안 ID 기록", "IPsec 주 모드 협상의 보안 ID 기록", "ipsec_main_mode", IPSEC_MAIN),
-        4650 => (
+        4646 => doc("IPsec 주 모드 보안 ID 기록", "IPsec 주 모드 협상의 보안 ID 기록", "ipsec_main_mode", IPSEC_MAIN, IPSEC),
+        4650 => doc(
             "IPsec 주 모드 SA 설정 — 확장 모드 미사용·인증서 미사용",
             "IPsec 주 모드 보안 연결(SA)이 설정됨",
             "ipsec_main_mode",
             IPSEC_MAIN,
+            IPSEC,
         ),
-        4651 => (
+        4651 => doc(
             "IPsec 주 모드 SA 설정 — 확장 모드 미사용·인증서 인증",
             "IPsec 주 모드 보안 연결(SA)이 인증서 인증으로 설정됨",
             "ipsec_main_mode",
             IPSEC_MAIN,
+            IPSEC,
         ),
-        4652 | 4653 => ("IPsec 주 모드 협상 실패", "IPsec 주 모드 협상이 실패함", "ipsec_main_mode", IPSEC_MAIN),
-        4655 => ("IPsec 주 모드 SA 종료", "IPsec 주 모드 보안 연결(SA)이 종료됨", "ipsec_main_mode", IPSEC_MAIN),
-        4976 => (
+        4652 | 4653 => doc("IPsec 주 모드 협상 실패", "IPsec 주 모드 협상이 실패함", "ipsec_main_mode", IPSEC_MAIN, IPSEC),
+        4655 => doc("IPsec 주 모드 SA 종료", "IPsec 주 모드 보안 연결(SA)이 종료됨", "ipsec_main_mode", IPSEC_MAIN, IPSEC),
+        4976 => doc(
             "IPsec 주 모드 잘못된 협상 패킷",
             "주 모드 협상 중 유효하지 않은 협상 패킷을 수신함",
             "ipsec_main_mode",
             IPSEC_MAIN,
+            IPSEC,
         ),
-        5049 => ("IPsec 보안 연결(SA) 삭제", "IPsec 보안 연결이 삭제됨", "ipsec_main_mode", IPSEC_MAIN),
-        5453 => (
+        // Filed under Main Mode, but its template names only the changed
+        // profile and the deleted SA's id/name — a policy-object payload.
+        5049 => doc("IPsec 보안 연결(SA) 삭제", "IPsec 보안 연결이 삭제됨", "ipsec_main_mode", IPSEC_MAIN, IPSEC_POLICY),
+        5453 => doc(
             "IPsec 협상 실패 — IKEEXT 서비스 미시작",
             "IKE/AuthIP 키 모듈(IKEEXT) 서비스가 시작되지 않아 협상 실패",
             "ipsec_main_mode",
             IPSEC_MAIN,
+            IPSEC,
         ),
         // Audit IPsec Quick Mode.
-        4977 => (
+        4977 => doc(
             "IPsec 빠른 모드 잘못된 협상 패킷",
             "빠른 모드 협상 중 유효하지 않은 협상 패킷을 수신함",
             "ipsec_quick_mode",
             IPSEC_QUICK,
+            IPSEC,
         ),
-        5451 => ("IPsec 빠른 모드 SA 설정", "IPsec 빠른 모드 보안 연결(SA)이 설정됨", "ipsec_quick_mode", IPSEC_QUICK),
-        5452 => ("IPsec 빠른 모드 SA 종료", "IPsec 빠른 모드 보안 연결(SA)이 종료됨", "ipsec_quick_mode", IPSEC_QUICK),
+        5451 => doc("IPsec 빠른 모드 SA 설정", "IPsec 빠른 모드 보안 연결(SA)이 설정됨", "ipsec_quick_mode", IPSEC_QUICK, IPSEC_V1),
+        5452 => doc("IPsec 빠른 모드 SA 종료", "IPsec 빠른 모드 보안 연결(SA)이 종료됨", "ipsec_quick_mode", IPSEC_QUICK, IPSEC_V1),
         // Audit IPsec Extended Mode.
-        4978 => (
+        4978 => doc(
             "IPsec 확장 모드 잘못된 협상 패킷",
             "확장 모드 협상 중 유효하지 않은 협상 패킷을 수신함",
             "ipsec_extended_mode",
             IPSEC_EXTENDED,
+            IPSEC,
         ),
-        4979..=4982 => (
+        4979..=4982 => doc(
             "IPsec 주 모드·확장 모드 SA 설정",
             "IPsec 주 모드와 확장 모드 보안 연결(SA)이 설정됨",
             "ipsec_extended_mode",
             IPSEC_EXTENDED,
+            IPSEC,
         ),
-        4983 | 4984 => (
+        4983 | 4984 => doc(
             "IPsec 확장 모드 협상 실패",
             "확장 모드 협상 실패로 대응 주 모드 보안 연결이 삭제됨",
             "ipsec_extended_mode",
             IPSEC_EXTENDED,
+            IPSEC,
         ),
         // Audit IPsec Driver.
-        4960 => (
+        4960 => doc(
             "IPsec 인바운드 패킷 삭제 — 무결성 검사 실패",
             "무결성 검사에 실패한 인바운드 패킷을 IPsec이 삭제함",
             "ipsec_driver",
             IPSEC_DRIVER,
+            IPSEC,
         ),
-        4961 => (
+        4961 => doc(
             "IPsec 인바운드 패킷 삭제 — 재생 검사 실패",
             "재생 검사에 실패한 인바운드 패킷을 IPsec이 삭제함",
             "ipsec_driver",
             IPSEC_DRIVER,
+            IPSEC,
         ),
-        4962 => (
+        4962 => doc(
             "IPsec 인바운드 패킷 삭제 — 일련번호 과소",
             "일련번호가 낮아 재생 여부를 보장할 수 없는 패킷을 삭제함",
             "ipsec_driver",
             IPSEC_DRIVER,
+            IPSEC,
         ),
-        4963 => (
+        4963 => doc(
             "IPsec 평문 인바운드 패킷 삭제",
             "보호돼야 할 평문 인바운드 패킷을 IPsec이 삭제함",
             "ipsec_driver",
             IPSEC_DRIVER,
+            IPSEC,
         ),
-        4965 => (
+        4965 => doc(
             "IPsec SPI 불일치 패킷 수신",
             "잘못된 보안 매개 변수 인덱스(SPI)를 가진 패킷을 수신함",
             "ipsec_driver",
             IPSEC_DRIVER,
+            IPSEC,
         ),
-        5478 => ("IPsec 서비스 시작", "IPsec 서비스가 시작됨", "ipsec_driver", IPSEC_DRIVER),
-        5479 => ("IPsec 서비스 종료", "IPsec 서비스가 종료됨", "ipsec_driver", IPSEC_DRIVER),
-        5480 => (
+        5478 => doc("IPsec 서비스 시작", "IPsec 서비스가 시작됨", "ipsec_driver", IPSEC_DRIVER, IPSEC),
+        5479 => doc("IPsec 서비스 종료", "IPsec 서비스가 종료됨", "ipsec_driver", IPSEC_DRIVER, IPSEC),
+        5480 => doc(
             "IPsec 네트워크 인터페이스 목록 조회 실패",
             "IPsec 서비스가 전체 네트워크 인터페이스 목록을 가져오지 못함",
             "ipsec_driver",
             IPSEC_DRIVER,
+            IPSEC,
         ),
-        5483 => (
+        5483 => doc(
             "IPsec RPC 서버 초기화 실패",
             "IPsec 서비스가 RPC 서버 초기화에 실패해 시작하지 못함",
             "ipsec_driver",
             IPSEC_DRIVER,
+            IPSEC,
         ),
-        5484 => (
+        5484 => doc(
             "IPsec 서비스 심각한 오류 종료",
             "IPsec 서비스가 심각한 오류로 종료됨",
             "ipsec_driver",
             IPSEC_DRIVER,
+            IPSEC,
         ),
-        5485 => (
+        5485 => doc(
             "IPsec PnP 필터 처리 실패",
             "네트워크 인터페이스 PnP 이벤트에서 일부 IPsec 필터를 처리하지 못함",
             "ipsec_driver",
             IPSEC_DRIVER,
+            IPSEC,
         ),
         // Audit Filtering Platform Policy Change — IPsec policy objects.
-        4709 => ("IPsec 서비스 시작됨", "IPsec 서비스가 시작됨", "ipsec_policy_change", FP_POLICY),
-        4710 => ("IPsec 서비스 사용 안 함", "IPsec 서비스가 사용 안 함으로 설정됨", "ipsec_policy_change", FP_POLICY),
-        4711 => (
+        4709 => doc("IPsec 서비스 시작됨", "IPsec 서비스가 시작됨", "ipsec_policy_change", FP_POLICY, IPSEC_POLICY),
+        4710 => doc("IPsec 서비스 사용 안 함", "IPsec 서비스가 사용 안 함으로 설정됨", "ipsec_policy_change", FP_POLICY, IPSEC_POLICY),
+        4711 => doc(
             "IPsec 정책 엔진 동작",
             "PAStore 엔진 동작 중 하나가 기록됨 — 세부 동작은 payload 원문으로 확인",
             "ipsec_policy_change",
             FP_POLICY,
+            IPSEC_POLICY,
         ),
-        4712 => (
+        4712 => doc(
             "IPsec 서비스 오류 가능성",
             "IPsec 서비스가 심각할 수 있는 오류를 만남",
             "ipsec_policy_change",
             FP_POLICY,
+            IPSEC_POLICY,
         ),
-        5040 => ("IPsec 인증 집합 추가", "IPsec 설정 변경 — 인증 집합 추가", "ipsec_policy_change", FP_POLICY),
-        5041 => ("IPsec 인증 집합 수정", "IPsec 설정 변경 — 인증 집합 수정", "ipsec_policy_change", FP_POLICY),
-        5042 => ("IPsec 인증 집합 삭제", "IPsec 설정 변경 — 인증 집합 삭제", "ipsec_policy_change", FP_POLICY),
-        5043 => ("연결 보안 규칙 추가", "IPsec 설정 변경 — 연결 보안 규칙 추가", "ipsec_policy_change", FP_POLICY),
-        5044 => ("연결 보안 규칙 수정", "IPsec 설정 변경 — 연결 보안 규칙 수정", "ipsec_policy_change", FP_POLICY),
-        5045 => ("연결 보안 규칙 삭제", "IPsec 설정 변경 — 연결 보안 규칙 삭제", "ipsec_policy_change", FP_POLICY),
-        5046 => ("IPsec 암호화 집합 추가", "IPsec 설정 변경 — 암호화 집합 추가", "ipsec_policy_change", FP_POLICY),
-        5047 => ("IPsec 암호화 집합 수정", "IPsec 설정 변경 — 암호화 집합 수정", "ipsec_policy_change", FP_POLICY),
-        5048 => ("IPsec 암호화 집합 삭제", "IPsec 설정 변경 — 암호화 집합 삭제", "ipsec_policy_change", FP_POLICY),
+        5040 => doc("IPsec 인증 집합 추가", "IPsec 설정 변경 — 인증 집합 추가", "ipsec_policy_change", FP_POLICY, IPSEC_POLICY),
+        5041 => doc("IPsec 인증 집합 수정", "IPsec 설정 변경 — 인증 집합 수정", "ipsec_policy_change", FP_POLICY, IPSEC_POLICY),
+        5042 => doc("IPsec 인증 집합 삭제", "IPsec 설정 변경 — 인증 집합 삭제", "ipsec_policy_change", FP_POLICY, IPSEC_POLICY),
+        5043 => doc("연결 보안 규칙 추가", "IPsec 설정 변경 — 연결 보안 규칙 추가", "ipsec_policy_change", FP_POLICY, IPSEC_POLICY),
+        5044 => doc("연결 보안 규칙 수정", "IPsec 설정 변경 — 연결 보안 규칙 수정", "ipsec_policy_change", FP_POLICY, IPSEC_POLICY),
+        5045 => doc("연결 보안 규칙 삭제", "IPsec 설정 변경 — 연결 보안 규칙 삭제", "ipsec_policy_change", FP_POLICY, IPSEC_POLICY),
+        5046 => doc("IPsec 암호화 집합 추가", "IPsec 설정 변경 — 암호화 집합 추가", "ipsec_policy_change", FP_POLICY, IPSEC_POLICY),
+        5047 => doc("IPsec 암호화 집합 수정", "IPsec 설정 변경 — 암호화 집합 수정", "ipsec_policy_change", FP_POLICY, IPSEC_POLICY),
+        5048 => doc("IPsec 암호화 집합 삭제", "IPsec 설정 변경 — 암호화 집합 삭제", "ipsec_policy_change", FP_POLICY, IPSEC_POLICY),
         // Audit Filtering Platform Policy Change — WFP objects and PAStore.
-        5440 => (
+        5440 => doc(
             "BFE 시작 시 콜아웃 존재",
             "기본 필터링 엔진 시작 시 존재한 콜아웃 기록",
             "filtering_platform_policy_change",
             FP_POLICY,
+            WFP_OBJECT,
         ),
-        5441 => (
+        5441 => doc(
             "BFE 시작 시 필터 존재",
             "기본 필터링 엔진 시작 시 존재한 필터 기록",
             "filtering_platform_policy_change",
             FP_POLICY,
+            WFP_OBJECT,
         ),
-        5442 => (
+        5442 => doc(
             "BFE 시작 시 공급자 존재",
             "기본 필터링 엔진 시작 시 존재한 공급자 기록",
             "filtering_platform_policy_change",
             FP_POLICY,
+            WFP_OBJECT,
         ),
-        5443 => (
+        5443 => doc(
             "BFE 시작 시 공급자 컨텍스트 존재",
             "기본 필터링 엔진 시작 시 존재한 공급자 컨텍스트 기록",
             "filtering_platform_policy_change",
             FP_POLICY,
+            WFP_OBJECT,
         ),
-        5444 => (
+        5444 => doc(
             "BFE 시작 시 하위 계층 존재",
             "기본 필터링 엔진 시작 시 존재한 하위 계층 기록",
             "filtering_platform_policy_change",
             FP_POLICY,
+            WFP_OBJECT,
         ),
-        5446 => ("WFP 콜아웃 변경", "Windows 필터링 플랫폼 콜아웃이 변경됨", "filtering_platform_policy_change", FP_POLICY),
-        5447 => ("WFP 필터 변경", "Windows 필터링 플랫폼 필터가 변경됨", "filtering_platform_policy_change", OTHER_POLICY),
-        5448 => ("WFP 공급자 변경", "Windows 필터링 플랫폼 공급자가 변경됨", "filtering_platform_policy_change", FP_POLICY),
-        5449 => (
+        5446 => doc("WFP 콜아웃 변경", "Windows 필터링 플랫폼 콜아웃이 변경됨", "filtering_platform_policy_change", FP_POLICY, WFP_OBJECT),
+        5447 => doc("WFP 필터 변경", "Windows 필터링 플랫폼 필터가 변경됨", "filtering_platform_policy_change", OTHER_POLICY, WFP_OBJECT),
+        5448 => doc("WFP 공급자 변경", "Windows 필터링 플랫폼 공급자가 변경됨", "filtering_platform_policy_change", FP_POLICY, WFP_OBJECT),
+        5449 => doc(
             "WFP 공급자 컨텍스트 변경",
             "Windows 필터링 플랫폼 공급자 컨텍스트가 변경됨",
             "filtering_platform_policy_change",
             FP_POLICY,
+            WFP_OBJECT,
         ),
-        5450 => (
+        5450 => doc(
             "WFP 하위 계층 변경",
             "Windows 필터링 플랫폼 하위 계층이 변경됨",
             "filtering_platform_policy_change",
             FP_POLICY,
+            WFP_OBJECT,
         ),
-        5456 => ("AD IPsec 정책 적용", "PAStore 엔진이 Active Directory IPsec 정책을 적용함", "filtering_platform_policy_change", FP_POLICY),
-        5457 => ("AD IPsec 정책 적용 실패", "PAStore 엔진이 Active Directory IPsec 정책 적용에 실패함", "filtering_platform_policy_change", FP_POLICY),
-        5458 => ("캐시된 AD IPsec 정책 적용", "PAStore 엔진이 로컬 캐시된 AD IPsec 정책을 적용함", "filtering_platform_policy_change", FP_POLICY),
-        5459 => ("캐시된 AD IPsec 정책 적용 실패", "PAStore 엔진이 로컬 캐시된 AD IPsec 정책 적용에 실패함", "filtering_platform_policy_change", FP_POLICY),
-        5460 => ("로컬 레지스트리 IPsec 정책 적용", "PAStore 엔진이 로컬 레지스트리 IPsec 정책을 적용함", "filtering_platform_policy_change", FP_POLICY),
-        5461 => ("로컬 레지스트리 IPsec 정책 적용 실패", "PAStore 엔진이 로컬 레지스트리 IPsec 정책 적용에 실패함", "filtering_platform_policy_change", FP_POLICY),
-        5462 => ("일부 IPsec 규칙 적용 실패", "PAStore 엔진이 활성 IPsec 정책의 일부 규칙을 적용하지 못함", "filtering_platform_policy_change", FP_POLICY),
-        5463 => ("IPsec 정책 변경 없음 확인", "PAStore 엔진이 활성 IPsec 정책 변경을 조회해 변경 없음을 확인함", "filtering_platform_policy_change", FP_POLICY),
-        5464 => ("IPsec 정책 변경 적용", "PAStore 엔진이 활성 IPsec 정책 변경을 조회해 적용함", "filtering_platform_policy_change", FP_POLICY),
-        5465 => ("IPsec 정책 강제 다시 로드", "PAStore 엔진이 IPsec 정책 강제 다시 로드 제어를 처리함", "filtering_platform_policy_change", FP_POLICY),
-        5466 => ("AD 접근 불가 — 캐시 정책 사용", "AD에 접근할 수 없어 캐시된 AD IPsec 정책을 사용함", "filtering_platform_policy_change", FP_POLICY),
-        5467 => ("AD 접근 가능 — 변경 없음", "AD에 접근 가능하며 IPsec 정책 변경이 없어 캐시 사용을 중단함", "filtering_platform_policy_change", FP_POLICY),
-        5468 => ("AD 접근 가능 — 변경 적용", "AD에 접근 가능하며 IPsec 정책 변경을 적용하고 캐시 사용을 중단함", "filtering_platform_policy_change", FP_POLICY),
-        5471 => ("로컬 저장소 IPsec 정책 로드", "PAStore 엔진이 로컬 저장소 IPsec 정책을 로드함", "filtering_platform_policy_change", FP_POLICY),
-        5472 => ("로컬 저장소 IPsec 정책 로드 실패", "PAStore 엔진이 로컬 저장소 IPsec 정책 로드에 실패함", "filtering_platform_policy_change", FP_POLICY),
-        5473 => ("디렉터리 저장소 IPsec 정책 로드", "PAStore 엔진이 디렉터리 저장소 IPsec 정책을 로드함", "filtering_platform_policy_change", FP_POLICY),
-        5474 => ("디렉터리 저장소 IPsec 정책 로드 실패", "PAStore 엔진이 디렉터리 저장소 IPsec 정책 로드에 실패함", "filtering_platform_policy_change", FP_POLICY),
-        5477 => ("빠른 모드 필터 추가 실패", "PAStore 엔진이 빠른 모드 필터를 추가하지 못함", "filtering_platform_policy_change", FP_POLICY),
+        5456 => doc("AD IPsec 정책 적용", "PAStore 엔진이 Active Directory IPsec 정책을 적용함", "filtering_platform_policy_change", FP_POLICY, PASTORE),
+        5457 => doc("AD IPsec 정책 적용 실패", "PAStore 엔진이 Active Directory IPsec 정책 적용에 실패함", "filtering_platform_policy_change", FP_POLICY, PASTORE),
+        5458 => doc("캐시된 AD IPsec 정책 적용", "PAStore 엔진이 로컬 캐시된 AD IPsec 정책을 적용함", "filtering_platform_policy_change", FP_POLICY, PASTORE),
+        5459 => doc("캐시된 AD IPsec 정책 적용 실패", "PAStore 엔진이 로컬 캐시된 AD IPsec 정책 적용에 실패함", "filtering_platform_policy_change", FP_POLICY, PASTORE),
+        5460 => doc("로컬 레지스트리 IPsec 정책 적용", "PAStore 엔진이 로컬 레지스트리 IPsec 정책을 적용함", "filtering_platform_policy_change", FP_POLICY, PASTORE),
+        5461 => doc("로컬 레지스트리 IPsec 정책 적용 실패", "PAStore 엔진이 로컬 레지스트리 IPsec 정책 적용에 실패함", "filtering_platform_policy_change", FP_POLICY, PASTORE),
+        5462 => doc("일부 IPsec 규칙 적용 실패", "PAStore 엔진이 활성 IPsec 정책의 일부 규칙을 적용하지 못함", "filtering_platform_policy_change", FP_POLICY, PASTORE),
+        5463 => doc("IPsec 정책 변경 없음 확인", "PAStore 엔진이 활성 IPsec 정책 변경을 조회해 변경 없음을 확인함", "filtering_platform_policy_change", FP_POLICY, PASTORE),
+        5464 => doc("IPsec 정책 변경 적용", "PAStore 엔진이 활성 IPsec 정책 변경을 조회해 적용함", "filtering_platform_policy_change", FP_POLICY, PASTORE),
+        5465 => doc("IPsec 정책 강제 다시 로드", "PAStore 엔진이 IPsec 정책 강제 다시 로드 제어를 처리함", "filtering_platform_policy_change", FP_POLICY, PASTORE),
+        5466 => doc("AD 접근 불가 — 캐시 정책 사용", "AD에 접근할 수 없어 캐시된 AD IPsec 정책을 사용함", "filtering_platform_policy_change", FP_POLICY, PASTORE),
+        5467 => doc("AD 접근 가능 — 변경 없음", "AD에 접근 가능하며 IPsec 정책 변경이 없어 캐시 사용을 중단함", "filtering_platform_policy_change", FP_POLICY, PASTORE),
+        5468 => doc("AD 접근 가능 — 변경 적용", "AD에 접근 가능하며 IPsec 정책 변경을 적용하고 캐시 사용을 중단함", "filtering_platform_policy_change", FP_POLICY, PASTORE),
+        5471 => doc("로컬 저장소 IPsec 정책 로드", "PAStore 엔진이 로컬 저장소 IPsec 정책을 로드함", "filtering_platform_policy_change", FP_POLICY, PASTORE),
+        5472 => doc("로컬 저장소 IPsec 정책 로드 실패", "PAStore 엔진이 로컬 저장소 IPsec 정책 로드에 실패함", "filtering_platform_policy_change", FP_POLICY, PASTORE),
+        5473 => doc("디렉터리 저장소 IPsec 정책 로드", "PAStore 엔진이 디렉터리 저장소 IPsec 정책을 로드함", "filtering_platform_policy_change", FP_POLICY, PASTORE),
+        5474 => doc("디렉터리 저장소 IPsec 정책 로드 실패", "PAStore 엔진이 디렉터리 저장소 IPsec 정책 로드에 실패함", "filtering_platform_policy_change", FP_POLICY, PASTORE),
+        5477 => doc("빠른 모드 필터 추가 실패", "PAStore 엔진이 빠른 모드 필터를 추가하지 못함", "filtering_platform_policy_change", FP_POLICY, PASTORE),
         _ => return None,
     })
 }
@@ -667,29 +761,11 @@ const MPSSVC_MANIFEST: &str = "mpssvc.dll 10.0.26100.9549 WEVT_TEMPLATE";
 const AUDIT_MANIFEST: &str =
     "Microsoft-Windows-Security-Auditing 매니페스트 {54849625-5478-4994-a5ba-3e3b0328c30d} (Windows 10 17134 덤프)";
 
-/// Template family and template version of a Security-channel event as the
-/// Microsoft-Windows-Security-Auditing manifest declares them.
-fn audit_shape(event_id: i64) -> Option<(Shape, i64)> {
-    Some(match event_id {
-        4944..=4958 | 5024 | 5025 | 5027..=5037 => (Shape::Rule, 0),
-        5146 | 5147 | 5150..=5155 | 5158 | 5159 => (Shape::Packet, 0),
-        5156 | 5157 => (Shape::Packet, 1),
-        5148 | 5149 => (Shape::Dos, 0),
-        4646 | 4650..=4653 | 4655 | 4960..=4963 | 4965 | 4976..=4984 | 5453 | 5478..=5480
-        | 5483..=5485 => (Shape::Ipsec, 0),
-        5451 | 5452 => (Shape::Ipsec, 1),
-        4709..=4712 | 5040..=5048 | 5049 => (Shape::IpsecPolicy, 0),
-        5440..=5444 | 5446..=5450 => (Shape::WfpObject, 0),
-        5456..=5468 | 5471..=5474 | 5477 => (Shape::PaStore, 0),
-        _ => return None,
-    })
-}
-
 /// Shape plus the manifest template version to guard against, if any.
-fn schema_shape(family: &str, event_id: Option<i64>) -> (Shape, Option<i64>) {
+fn schema_shape(family: &str, audit: Option<Audit>) -> (Shape, Option<i64>) {
     if family == "security_audit" {
-        return match event_id.and_then(audit_shape) {
-            Some((shape, version)) => (shape, Some(version)),
+        return match audit {
+            Some(audit) => (audit.shape, Some(audit.version)),
             None => (Shape::None, None),
         };
     }
@@ -797,25 +873,29 @@ fn wfp_object(payload: &Map<String, Value>) -> Option<(&'static str, &'static st
     None
 }
 
+/// The Security-channel audit entry of a row; other families have none.
+fn audit_of(family: &str, event_id: Option<i64>) -> Option<Audit> {
+    (family == "security_audit")
+        .then(|| event_id.and_then(security_audit))
+        .flatten()
+}
+
 fn classify(
     family: &'static str,
+    audit: Option<Audit>,
     event_id: Option<i64>,
     raw_id: &str,
     payload_family: &'static str,
 ) -> Definition {
-    if family == "security_audit" {
-        if let Some((event_type, description, scope, subcategory)) =
-            event_id.and_then(documented_audit)
-        {
-            return Definition {
-                event_type: event_type.to_string(),
-                description: description.to_string(),
-                state: "confirmed_documented",
-                basis: "Microsoft 감사 하위 범주 문서(MPSSVC 규칙 수준 정책 변경·기타 시스템 이벤트·필터링 플랫폼 연결/패킷 삭제/정책 변경·IPsec 주/빠른/확장 모드·IPsec 드라이버)",
-                scope,
-                subcategory: Some(subcategory),
-            };
-        }
+    if let Some(doc) = audit.and_then(|audit| audit.doc) {
+        return Definition {
+            event_type: doc.event_type.to_string(),
+            description: doc.description.to_string(),
+            state: "confirmed_documented",
+            basis: "Microsoft 감사 하위 범주 문서(MPSSVC 규칙 수준 정책 변경·기타 시스템 이벤트·필터링 플랫폼 연결/패킷 삭제/정책 변경·IPsec 주/빠른/확장 모드·IPsec 드라이버)",
+            scope: doc.scope,
+            subcategory: Some(doc.subcategory),
+        };
     }
     // 2010 carries InterfaceGuid/InterfaceName/OldProfile/NewProfile: the
     // event's subject is confirmed by its own schema, the values are not.
@@ -1099,37 +1179,79 @@ fn set_profiles(record: &mut Record, payload: &Map<String, Value>) {
     }
 }
 
-fn set_single_ports(
-    record: &mut Record,
-    local: &Option<(&'static str, String)>,
-    remote: &Option<(&'static str, String)>,
-) {
-    record.set(
-        "local_port_raw",
-        opt(local
-            .as_ref()
-            .map(|(_, text)| text.as_str())
-            .filter(|text| !text.is_empty())),
-    );
-    record.set(
-        "remote_port_raw",
-        opt(remote
-            .as_ref()
-            .map(|(_, text)| text.as_str())
-            .filter(|text| !text.is_empty())),
-    );
-    record.set(
-        "local_port",
-        number(local.as_ref().and_then(|(_, text)| text.trim().parse().ok())),
-    );
-    record.set(
-        "remote_port",
-        number(remote.as_ref().and_then(|(_, text)| text.trim().parse().ok())),
-    );
-    record.set(
-        "single_port_basis",
-        opt(local.as_ref().or(remote.as_ref()).map(|(name, _)| *name)),
-    );
+/// One observed value and the payload field it came from. An empty field
+/// holds no value, so it names no basis either.
+type Observed = Option<(&'static str, String)>;
+
+fn observed(payload: &Map<String, Value>, names: &[&'static str]) -> Observed {
+    text_of(payload, names).filter(|(_, text)| !text.is_empty())
+}
+
+/// Each side keeps its own source field, so a remote value is never
+/// credited to a local field name.
+fn set_single_addresses(record: &mut Record, local: &Observed, remote: &Observed) {
+    for (column, basis_column, side) in [
+        ("local_address", "local_address_basis", local),
+        ("remote_address", "remote_address_basis", remote),
+    ] {
+        record.set(column, opt(side.as_ref().map(|(_, text)| text.as_str())));
+        record.set(basis_column, opt(side.as_ref().map(|(name, _)| *name)));
+    }
+}
+
+fn set_single_ports(record: &mut Record, local: &Observed, remote: &Observed) {
+    for (raw_column, column, basis_column, side) in [
+        ("local_port_raw", "local_port", "local_port_basis", local),
+        ("remote_port_raw", "remote_port", "remote_port_basis", remote),
+    ] {
+        record.set(raw_column, opt(side.as_ref().map(|(_, text)| text.as_str())));
+        record.set(
+            column,
+            number(side.as_ref().and_then(|(_, text)| text.trim().parse().ok())),
+        );
+        record.set(basis_column, opt(side.as_ref().map(|(name, _)| *name)));
+    }
+}
+
+/// Endpoint values one shape mapped. The address and port child rows repeat
+/// exactly these, so they never disagree with the main row.
+struct Endpoints {
+    /// Rule definition lists.
+    local_addresses: Option<String>,
+    remote_addresses: Option<String>,
+    local_ports: Option<String>,
+    remote_ports: Option<String>,
+    /// Single observed values and what they were observed as.
+    local_address: Observed,
+    remote_address: Observed,
+    local_port: Observed,
+    remote_port: Observed,
+    single_attribution: &'static str,
+    /// Filtering-platform packet endpoints.
+    source_address: Option<String>,
+    dest_address: Option<String>,
+    source_port: Option<String>,
+    dest_port: Option<String>,
+}
+
+impl Default for Endpoints {
+    fn default() -> Self {
+        Self {
+            local_addresses: None,
+            remote_addresses: None,
+            local_ports: None,
+            remote_ports: None,
+            local_address: None,
+            remote_address: None,
+            local_port: None,
+            remote_port: None,
+            single_attribution: "observed_connection",
+            source_address: None,
+            dest_address: None,
+            source_port: None,
+            dest_port: None,
+        }
+    }
 }
 
 fn text_cell(payload: &Map<String, Value>, names: &[&'static str]) -> Cell {
@@ -1228,7 +1350,8 @@ fn record(ctx: &Ctx, parsed: &Parsed<'_>) -> Result<Record> {
     let raw_id = rf(row, "EventID");
     let event_id = raw_id.parse::<i64>().ok();
     let family = parsed.event_family;
-    let definition = classify(family, event_id, raw_id, parsed.family);
+    let audit = audit_of(family, event_id);
+    let definition = classify(family, audit, event_id, raw_id, parsed.family);
 
     let mut record = ctx.record(&SPEC);
     record.timestamp(&parsed.timestamp, "이벤트 기록 시각");
@@ -1247,7 +1370,10 @@ fn record(ctx: &Ctx, parsed: &Parsed<'_>) -> Result<Record> {
     record.set("event_family", value(family));
     record.set("event_scope", value(definition.scope));
     record.set("audit_subcategory", opt(definition.subcategory));
-    let (shape, manifest_version) = schema_shape(family, event_id);
+    // Negotiation stage follows the documented subcategory, whatever the
+    // template: 5049 is a Main Mode audit with a policy-object payload.
+    record.set("ipsec_mode", opt(ipsec_mode(definition.scope)));
+    let (shape, manifest_version) = schema_shape(family, audit);
     let event_version = rf(row, "Version").parse::<i64>().ok();
     record.set("field_schema_basis", value(field_schema_basis(family, shape)));
     record.set("field_schema_source", opt(field_schema_source(family, shape)));
@@ -1398,35 +1524,105 @@ fn record(ctx: &Ctx, parsed: &Parsed<'_>) -> Result<Record> {
     // `Shape::None` means no template was available for this event id: then
     // nothing is mapped and every recorded name survives in
     // `FirewallEventFields` instead of being guessed into a meaning.
-    let packet_audit = matches!(
+    let endpoints = map_shape(&mut record, payload, shape);
+    // A connection/packet audit names the process it observed; any other
+    // application path is the target a rule was written for.
+    let observed_process = matches!(
         definition.scope,
         "connection_audit" | "packet_drop_audit" | "listen_bind_audit"
     );
-    let app_role = if packet_audit { "connection_app" } else { "target_app" };
+    let (app_path, modifying_app) = map_apps(ctx, &mut record, payload, shape, observed_process);
 
-    let mut local_addresses: Option<String> = None;
-    let mut remote_addresses: Option<String> = None;
-    let mut local_ports: Option<String> = None;
-    let mut remote_ports: Option<String> = None;
-    let mut local_single: Option<(&'static str, String)> = None;
-    let mut remote_single: Option<(&'static str, String)> = None;
-    let mut single_local: Option<String> = None;
-    let mut single_remote: Option<String> = None;
-    let mut single_attribution = "observed_connection";
-    let mut source_address: Option<String> = None;
-    let mut dest_address: Option<String> = None;
-    let mut source_port: Option<String> = None;
-    let mut dest_port: Option<String> = None;
-    let mut app_path: Option<String> = None;
-    let mut modifying_app: Option<String> = None;
+    record.set("event_id", number(event_id));
+    for (column, key) in [
+        ("provider", "Provider"),
+        ("channel", "Channel"),
+        ("computer", "Computer"),
+        ("event_record_id", "EventRecordID"),
+        ("level_name", "LevelName"),
+        ("keywords_raw", "Keywords"),
+        ("process_id", "ProcessID"),
+        ("thread_id", "ThreadID"),
+        ("activity_id", "ActivityID"),
+        ("related_activity_id", "RelatedActivityID"),
+        ("facts_status", "_status"),
+        ("facts_error", "_error"),
+        ("record_key", "_record_key"),
+        ("source_file", "_source_file"),
+    ] {
+        record.set(column, value(rf(row, key)));
+    }
+    // A recorded but empty payload is evidence: facts keep SQL NULL as an
+    // absent key, so only a missing key becomes NULL here.
+    record.set(
+        "event_data_raw",
+        row.get("EventData")
+            .cloned()
+            .map(Cell::Text)
+            .unwrap_or(Cell::Null),
+    );
+    let search = search_text(&record, &definition, raw_id);
+    record.set("search_text", Cell::Text(search));
 
+    // Children: payload fields, addresses, ports and application paths.
+    for (name, path, raw, kind) in &parsed.fields {
+        record.child(
+            "FirewallEventFields",
+            vec![value(name), value(path), value(raw), value(kind)],
+        );
+    }
+    endpoint_children(&mut record, &endpoints);
+    let app_role = if observed_process { "connection_app" } else { "target_app" };
+    for (role, raw) in [
+        (app_role, app_path.as_deref()),
+        ("modifying_app", modifying_app.as_deref()),
+    ] {
+        let Some(raw) = raw else { continue };
+        let (resolved, basis) = resolve(ctx, raw);
+        record.child(
+            "FirewallAppPaths",
+            vec![
+                value(role),
+                value(raw),
+                resolved,
+                value(basis),
+                value(path_kind(raw)),
+                Cell::Null,
+            ],
+        );
+    }
+
+    // An absent or empty payload holds no evidence, so the source names the
+    // record only. Undecoded text (processing error/unparsed) is evidence.
+    let payload_evidence = !matches!(parsed.payload_state, "absent" | "empty");
+    let source = ctx
+        .facts
+        .source_from_record_key(
+            rf(row, "_record_key"),
+            payload_evidence.then_some("EventData"),
+            Some(rf(row, "_source_file")),
+            Some(definition.event_type.as_str()),
+        )?
+        .ok_or_else(|| {
+            anyhow!(
+                "방화벽 이벤트의 facts 출처를 찾지 못했습니다: {}",
+                rf(row, "_record_key")
+            )
+        })?;
+    record.source(Some(source));
+    Ok(record)
+}
+
+/// Typed columns of one manifest template family.
+fn map_shape(record: &mut Record, payload: &Map<String, Value>, shape: Shape) -> Endpoints {
+    let mut endpoints = Endpoints::default();
     match shape {
         Shape::Rule => {
-            set_direction(&mut record, payload);
-            let action = set_pair(&mut record, payload, "action_raw", "action_value", &["Action"]);
+            set_direction(record, payload);
+            let action = set_pair(record, payload, "action_raw", "action_value", &["Action"]);
             record.set("action", opt(action.and_then(action_label)));
-            set_protocol(&mut record, payload, &["Protocol"]);
-            set_profiles(&mut record, payload);
+            set_protocol(record, payload, &["Protocol"]);
+            set_profiles(record, payload);
             for (column, names) in [
                 ("rule_attribute", &["RuleAttr"][..]),
                 ("rejection_reason", &["ReasonForRejection"][..]),
@@ -1437,25 +1633,18 @@ fn record(ctx: &Ctx, parsed: &Parsed<'_>) -> Result<Record> {
 
             // R03/R14: rule lists and single observed values are different
             // columns.
-            local_addresses = present(payload, &["LocalAddresses"]);
-            remote_addresses = present(payload, &["RemoteAddresses"]);
-            record.set("local_addresses", opt(local_addresses.as_deref()));
-            record.set("remote_addresses", opt(remote_addresses.as_deref()));
-            let single_address =
-                text_of(payload, &["LocalAddress", "RemoteAddress", "RemoteIp", "IpAddress"]);
-            single_local = present(payload, &["LocalAddress"]);
-            single_remote = present(payload, &["RemoteAddress", "RemoteIp", "IpAddress"]);
-            record.set("local_address", opt(single_local.as_deref()));
-            record.set("remote_address", opt(single_remote.as_deref()));
-            record.set(
-                "single_address_basis",
-                opt(single_address.as_ref().map(|(name, _)| *name)),
-            );
+            endpoints.local_addresses = present(payload, &["LocalAddresses"]);
+            endpoints.remote_addresses = present(payload, &["RemoteAddresses"]);
+            record.set("local_addresses", opt(endpoints.local_addresses.as_deref()));
+            record.set("remote_addresses", opt(endpoints.remote_addresses.as_deref()));
+            endpoints.local_address = observed(payload, &["LocalAddress"]);
+            endpoints.remote_address = observed(payload, &["RemoteAddress", "RemoteIp", "IpAddress"]);
+            set_single_addresses(record, &endpoints.local_address, &endpoints.remote_address);
             record.set(
                 "address_attribution",
                 opt(match (
-                    local_addresses.is_some() || remote_addresses.is_some(),
-                    single_address.is_some(),
+                    endpoints.local_addresses.is_some() || endpoints.remote_addresses.is_some(),
+                    endpoints.local_address.is_some() || endpoints.remote_address.is_some(),
                 ) {
                     (true, _) => Some("rule_definition"),
                     (false, true) => Some("observed_connection"),
@@ -1463,50 +1652,48 @@ fn record(ctx: &Ctx, parsed: &Parsed<'_>) -> Result<Record> {
                 }),
             );
 
-            local_ports = present(payload, &["LocalPorts"]);
-            remote_ports = present(payload, &["RemotePorts"]);
-            record.set("local_ports", opt(local_ports.as_deref()));
-            record.set("remote_ports", opt(remote_ports.as_deref()));
-            local_single = text_of(payload, &["LocalPort", "Port"]);
-            remote_single = text_of(payload, &["RemotePort"]);
-            set_single_ports(&mut record, &local_single, &remote_single);
+            endpoints.local_ports = present(payload, &["LocalPorts"]);
+            endpoints.remote_ports = present(payload, &["RemotePorts"]);
+            record.set("local_ports", opt(endpoints.local_ports.as_deref()));
+            record.set("remote_ports", opt(endpoints.remote_ports.as_deref()));
+            endpoints.local_port = observed(payload, &["LocalPort", "Port"]);
+            endpoints.remote_port = observed(payload, &["RemotePort"]);
+            set_single_ports(record, &endpoints.local_port, &endpoints.remote_port);
         }
         Shape::Packet => {
-            set_direction(&mut record, payload);
-            set_protocol(&mut record, payload, &["Protocol"]);
-            source_address = present(payload, &["SourceAddress"]);
-            dest_address = present(payload, &["DestAddress"]);
-            source_port = present(payload, &["SourcePort"]);
-            dest_port = present(payload, &["DestPort"]);
-            record.set("source_address", opt(source_address.as_deref()));
-            record.set("dest_address", opt(dest_address.as_deref()));
-            record.set("source_port_raw", opt(source_port.as_deref()));
-            record.set("dest_port_raw", opt(dest_port.as_deref()));
-            record.set(
-                "source_port",
-                number(source_port.as_deref().and_then(|text| text.trim().parse().ok())),
-            );
-            record.set(
-                "dest_port",
-                number(dest_port.as_deref().and_then(|text| text.trim().parse().ok())),
-            );
+            set_direction(record, payload);
+            set_protocol(record, payload, &["Protocol"]);
+            endpoints.source_address = present(payload, &["SourceAddress"]);
+            endpoints.dest_address = present(payload, &["DestAddress"]);
+            endpoints.source_port = present(payload, &["SourcePort"]);
+            endpoints.dest_port = present(payload, &["DestPort"]);
+            record.set("source_address", opt(endpoints.source_address.as_deref()));
+            record.set("dest_address", opt(endpoints.dest_address.as_deref()));
+            record.set("source_port_raw", opt(endpoints.source_port.as_deref()));
+            record.set("dest_port_raw", opt(endpoints.dest_port.as_deref()));
+            for (column, raw) in [
+                ("source_port", endpoints.source_port.as_deref()),
+                ("dest_port", endpoints.dest_port.as_deref()),
+            ] {
+                record.set(column, number(raw.and_then(|text| text.trim().parse().ok())));
+            }
             record.set(
                 "endpoint_attribution",
-                opt((source_address.is_some()
-                    || dest_address.is_some()
-                    || source_port.is_some()
-                    || dest_port.is_some())
+                opt((endpoints.source_address.is_some()
+                    || endpoints.dest_address.is_some()
+                    || endpoints.source_port.is_some()
+                    || endpoints.dest_port.is_some())
                 .then_some("observed_packet_endpoint")),
             );
             set_pair(
-                &mut record,
+                record,
                 payload,
                 "filter_run_time_id_raw",
                 "filter_run_time_id",
                 &["FilterRTID"],
             );
             set_pair(
-                &mut record,
+                record,
                 payload,
                 "layer_run_time_id_raw",
                 "layer_run_time_id",
@@ -1515,7 +1702,7 @@ fn record(ctx: &Ctx, parsed: &Parsed<'_>) -> Result<Record> {
             record.set("layer_name_raw", opt(present(payload, &["LayerName"]).as_deref()));
             // The audited process, never the service that wrote the record.
             set_pair(
-                &mut record,
+                record,
                 payload,
                 "payload_process_id_raw",
                 "payload_process_id",
@@ -1557,25 +1744,19 @@ fn record(ctx: &Ctx, parsed: &Parsed<'_>) -> Result<Record> {
             );
         }
         Shape::Ipsec => {
-            record.set("ipsec_mode", opt(ipsec_mode(definition.scope)));
             // The security association's own endpoints: neither a rule
             // address nor an observed packet endpoint.
-            single_local = present(payload, &["LocalAddress"]);
-            single_remote = present(payload, &["RemoteAddress"]);
-            single_attribution = "observed_security_association";
-            record.set("local_address", opt(single_local.as_deref()));
-            record.set("remote_address", opt(single_remote.as_deref()));
-            record.set(
-                "single_address_basis",
-                opt(field_of(payload, &["LocalAddress", "RemoteAddress"]).map(|(name, _)| name)),
-            );
-            if single_local.is_some() || single_remote.is_some() {
-                record.set("address_attribution", value(single_attribution));
+            endpoints.local_address = observed(payload, &["LocalAddress"]);
+            endpoints.remote_address = observed(payload, &["RemoteAddress"]);
+            endpoints.single_attribution = "observed_security_association";
+            set_single_addresses(record, &endpoints.local_address, &endpoints.remote_address);
+            if endpoints.local_address.is_some() || endpoints.remote_address.is_some() {
+                record.set("address_attribution", value(endpoints.single_attribution));
             }
-            local_single = text_of(payload, &["LocalPort", "LocalKeyModPort"]);
-            remote_single = text_of(payload, &["RemotePort", "RemoteKeyModPort"]);
-            set_single_ports(&mut record, &local_single, &remote_single);
-            set_protocol(&mut record, payload, &["IpProtocol"]);
+            endpoints.local_port = observed(payload, &["LocalPort", "LocalKeyModPort"]);
+            endpoints.remote_port = observed(payload, &["RemotePort", "RemoteKeyModPort"]);
+            set_single_ports(record, &endpoints.local_port, &endpoints.remote_port);
+            set_protocol(record, payload, &["IpProtocol"]);
             for (column, names) in [
                 (
                     "local_principal",
@@ -1598,11 +1779,11 @@ fn record(ctx: &Ctx, parsed: &Parsed<'_>) -> Result<Record> {
             );
             record.set("quick_mode_sa_id", number(int_field(payload, &["QuickModeSaId"])));
             // 5483/5484 name the failure `Error`, not `ErrorCode`.
-            set_pair(&mut record, payload, "error_code_raw", "error_code", &["Error"]);
-            ipsec_details(&mut record, payload);
+            set_pair(record, payload, "error_code_raw", "error_code", &["Error"]);
+            ipsec_details(record, payload);
         }
         Shape::IpsecPolicy => {
-            set_profiles(&mut record, payload);
+            set_profiles(record, payload);
             if let Some((kind, id, name)) = policy_object(payload) {
                 record.set("policy_object_kind", value(kind));
                 record.set("policy_object_id", opt(present(payload, &[id]).as_deref()));
@@ -1611,14 +1792,14 @@ fn record(ctx: &Ctx, parsed: &Parsed<'_>) -> Result<Record> {
         }
         Shape::WfpObject => {
             set_pair(
-                &mut record,
+                record,
                 payload,
                 "payload_process_id_raw",
                 "payload_process_id",
                 &["ProcessId"],
             );
             record.set("layer_name_raw", opt(present(payload, &["LayerName"]).as_deref()));
-            wfp_object_change(&mut record, payload);
+            wfp_object_change(record, payload);
         }
         Shape::PaStore => {
             record.set("pastore_policy", opt(present(payload, &["Policy"]).as_deref()));
@@ -1626,142 +1807,116 @@ fn record(ctx: &Ctx, parsed: &Parsed<'_>) -> Result<Record> {
                 "quick_mode_filter",
                 opt(present(payload, &["QuickModeFilter"]).as_deref()),
             );
-            set_pair(&mut record, payload, "error_code_raw", "error_code", &["Error"]);
+            set_pair(record, payload, "error_code_raw", "error_code", &["Error"]);
         }
         Shape::None => {}
     }
+    endpoints
+}
 
-    // R13/A07: target application and modifying application stay apart.
-    if matches!(shape, Shape::Rule | Shape::Packet) {
-        let app = text_of(payload, &["ApplicationPath", "Application", "Application Path"]);
-        record.set(
-            "app_path_state",
-            value(match app.as_ref().map(|(_, text)| text.as_str()) {
-                None => "absent",
-                Some("") => "empty",
-                Some(_) => "recorded",
-            }),
-        );
-        app_path = app
-            .as_ref()
-            .map(|(_, text)| text.clone())
-            .filter(|text| !text.is_empty());
-        record.set("app_path", opt(app_path.as_deref()));
-        record.set(
-            "app_path_attribution",
-            opt(app_path.as_ref().map(|_| {
-                if packet_audit {
-                    "observed_connection_process"
-                } else {
-                    "rule_target"
-                }
-            })),
-        );
-        modifying_app = present(payload, &["ModifyingApplication"]);
-        record.set("modifying_app", opt(modifying_app.as_deref()));
-        for (column, raw) in [
-            ("app_path_resolved", app_path.as_deref()),
-            ("modifying_app_resolved", modifying_app.as_deref()),
-        ] {
-            let resolved = raw.map(|raw| resolve(ctx, raw).0).unwrap_or(Cell::Null);
-            record.set(column, resolved);
-        }
-    } else {
+/// R13/A07: target application and modifying application stay apart.
+/// Returns the recorded application path and modifying application.
+fn map_apps(
+    ctx: &Ctx,
+    record: &mut Record,
+    payload: &Map<String, Value>,
+    shape: Shape,
+    observed_process: bool,
+) -> (Option<String>, Option<String>) {
+    if !matches!(shape, Shape::Rule | Shape::Packet) {
         record.set("app_path_state", value("not_mapped"));
+        return (None, None);
     }
-
-    record.set("event_id", number(event_id));
-    for (column, key) in [
-        ("provider", "Provider"),
-        ("channel", "Channel"),
-        ("computer", "Computer"),
-        ("event_record_id", "EventRecordID"),
-        ("level_name", "LevelName"),
-        ("keywords_raw", "Keywords"),
-        ("process_id", "ProcessID"),
-        ("thread_id", "ThreadID"),
-        ("activity_id", "ActivityID"),
-        ("related_activity_id", "RelatedActivityID"),
-        ("facts_status", "_status"),
-        ("facts_error", "_error"),
-        ("record_key", "_record_key"),
-        ("source_file", "_source_file"),
-    ] {
-        record.set(column, value(rf(row, key)));
-    }
-    // A recorded but empty payload is evidence: facts keep SQL NULL as an
-    // absent key, so only a missing key becomes NULL here.
+    let app = text_of(payload, &["ApplicationPath", "Application", "Application Path"]);
     record.set(
-        "event_data_raw",
-        row.get("EventData")
-            .cloned()
-            .map(Cell::Text)
-            .unwrap_or(Cell::Null),
+        "app_path_state",
+        value(match app.as_ref().map(|(_, text)| text.as_str()) {
+            None => "absent",
+            Some("") => "empty",
+            Some(_) => "recorded",
+        }),
     );
+    let app_path = app.map(|(_, text)| text).filter(|text| !text.is_empty());
+    record.set("app_path", opt(app_path.as_deref()));
+    record.set(
+        "app_path_attribution",
+        opt(app_path.as_ref().map(|_| {
+            if observed_process {
+                "observed_connection_process"
+            } else {
+                "rule_target"
+            }
+        })),
+    );
+    let modifying_app = present(payload, &["ModifyingApplication"]);
+    record.set("modifying_app", opt(modifying_app.as_deref()));
+    for (column, raw) in [
+        ("app_path_resolved", app_path.as_deref()),
+        ("modifying_app_resolved", modifying_app.as_deref()),
+    ] {
+        let resolved = raw.map(|raw| resolve(ctx, raw).0).unwrap_or(Cell::Null);
+        record.set(column, resolved);
+    }
+    (app_path, modifying_app)
+}
 
-    // R10: every contract field, rule_id and account_sid included.
-    let mut search: Vec<String> = vec![definition.event_type.clone(), definition.description.clone()];
-    for cell in [
-        record.get("rule_name"),
-        record.get("rule_id"),
-        record.get("app_path"),
-        record.get("app_path_resolved"),
-        record.get("service"),
-        record.get("local_ports"),
-        record.get("remote_ports"),
-        record.get("local_addresses"),
-        record.get("remote_addresses"),
-        record.get("local_address"),
-        record.get("remote_address"),
-        record.get("source_address"),
-        record.get("dest_address"),
-        record.get("remote_user_sid"),
-        record.get("remote_machine_sid"),
-        record.get("profiles"),
-        record.get("modifying_app"),
-        record.get("modifying_app_resolved"),
-        record.get("modifying_user_raw"),
-        record.get("account"),
-        record.get("account_sid"),
-        record.get("interface_name"),
-        record.get("interface_guid"),
-        record.get("setting_value_string"),
-        record.get("detail"),
-        record.get("provider"),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        if let Cell::Text(text) = cell {
-            search.push(text.clone());
+/// R10: every contract field, rule_id and account_sid included.
+fn search_text(record: &Record, definition: &Definition, raw_id: &str) -> String {
+    let mut search: Vec<&str> = vec![&definition.event_type, &definition.description];
+    for column in [
+        "rule_name",
+        "rule_id",
+        "app_path",
+        "app_path_resolved",
+        "service",
+        "local_ports",
+        "remote_ports",
+        "local_addresses",
+        "remote_addresses",
+        "local_address",
+        "remote_address",
+        "source_address",
+        "dest_address",
+        "remote_user_sid",
+        "remote_machine_sid",
+        "profiles",
+        "modifying_app",
+        "modifying_app_resolved",
+        "modifying_user_raw",
+        "account",
+        "account_sid",
+        "interface_name",
+        "interface_guid",
+        "setting_value_string",
+        "detail",
+        "provider",
+    ] {
+        if let Some(Cell::Text(text)) = record.get(column) {
+            search.push(text);
         }
     }
     if !raw_id.is_empty() {
-        search.push(raw_id.to_string());
+        search.push(raw_id);
     }
-    record.set("search_text", Cell::Text(search.join(" ")));
+    search.join(" ")
+}
 
-    // Children: payload fields, addresses, ports and application paths.
-    for (name, path, raw, kind) in &parsed.fields {
-        record.child(
-            "FirewallEventFields",
-            vec![value(name), value(path), value(raw), value(kind)],
-        );
+/// One child row per address/port entry, attributed like the main row.
+fn endpoint_children(record: &mut Record, endpoints: &Endpoints) {
+    let single = endpoints.single_attribution;
+    fn text(side: &Observed) -> Option<&str> {
+        side.as_ref().map(|(_, text)| text.as_str())
     }
     for (role, raw, attribution) in [
-        ("local", local_addresses.clone(), "rule_definition"),
-        ("remote", remote_addresses.clone(), "rule_definition"),
-        ("local", single_local.clone(), single_attribution),
-        ("remote", single_remote.clone(), single_attribution),
-        ("source", source_address.clone(), "observed_packet_endpoint"),
-        (
-            "destination",
-            dest_address.clone(),
-            "observed_packet_endpoint",
-        ),
+        ("local", endpoints.local_addresses.as_deref(), "rule_definition"),
+        ("remote", endpoints.remote_addresses.as_deref(), "rule_definition"),
+        ("local", text(&endpoints.local_address), single),
+        ("remote", text(&endpoints.remote_address), single),
+        ("source", endpoints.source_address.as_deref(), "observed_packet_endpoint"),
+        ("destination", endpoints.dest_address.as_deref(), "observed_packet_endpoint"),
     ] {
         let Some(raw) = raw else { continue };
-        for entry in entries(&raw) {
+        for entry in entries(raw) {
             record.child(
                 "FirewallAddresses",
                 vec![
@@ -1774,29 +1929,15 @@ fn record(ctx: &Ctx, parsed: &Parsed<'_>) -> Result<Record> {
         }
     }
     for (role, raw, attribution) in [
-        ("local", local_ports.clone(), "rule_definition"),
-        ("remote", remote_ports.clone(), "rule_definition"),
-        (
-            "local",
-            local_single
-                .as_ref()
-                .map(|(_, text)| text.clone())
-                .filter(|text| !text.is_empty()),
-            single_attribution,
-        ),
-        (
-            "remote",
-            remote_single
-                .as_ref()
-                .map(|(_, text)| text.clone())
-                .filter(|text| !text.is_empty()),
-            single_attribution,
-        ),
-        ("source", source_port.clone(), "observed_packet_endpoint"),
-        ("destination", dest_port.clone(), "observed_packet_endpoint"),
+        ("local", endpoints.local_ports.as_deref(), "rule_definition"),
+        ("remote", endpoints.remote_ports.as_deref(), "rule_definition"),
+        ("local", text(&endpoints.local_port), single),
+        ("remote", text(&endpoints.remote_port), single),
+        ("source", endpoints.source_port.as_deref(), "observed_packet_endpoint"),
+        ("destination", endpoints.dest_port.as_deref(), "observed_packet_endpoint"),
     ] {
         let Some(raw) = raw else { continue };
-        for entry in entries(&raw) {
+        for entry in entries(raw) {
             let (kind, start, end) = port_entry(entry);
             record.child(
                 "FirewallPorts",
@@ -1811,41 +1952,6 @@ fn record(ctx: &Ctx, parsed: &Parsed<'_>) -> Result<Record> {
             );
         }
     }
-    for (role, raw) in [
-        (app_role, app_path.as_deref()),
-        ("modifying_app", modifying_app.as_deref()),
-    ] {
-        let Some(raw) = raw else { continue };
-        let (resolved, basis) = resolve(ctx, raw);
-        record.child(
-            "FirewallAppPaths",
-            vec![
-                value(role),
-                value(raw),
-                resolved,
-                value(basis),
-                value(path_kind(raw)),
-                Cell::Null,
-            ],
-        );
-    }
-
-    let source = ctx
-        .facts
-        .source_from_record_key(
-            rf(row, "_record_key"),
-            Some("EventData"),
-            Some(rf(row, "_source_file")),
-            Some(definition.event_type.as_str()),
-        )?
-        .ok_or_else(|| {
-            anyhow!(
-                "방화벽 이벤트의 facts 출처를 찾지 못했습니다: {}",
-                rf(row, "_record_key")
-            )
-        })?;
-    record.source(Some(source));
-    Ok(record)
 }
 
 // ---------------------------------------------------------------------------
@@ -1911,10 +2017,8 @@ pub(super) fn build(ctx: &Ctx, cache: &EventLogOverviewCache) -> Result<usize> {
         let timestamp = rf(row, "timestamp").to_string();
         let tracked = relevant_log(&table);
         let family = event_family(provider, rf(row, "ProviderGuid"), channel);
-        let audit_scope = (family == "security_audit")
-            .then(|| event_id.and_then(documented_audit))
-            .flatten()
-            .map(|(_, _, scope, _)| scope);
+        let audit = audit_of(family, event_id);
+        let audit_scope = audit.and_then(|audit| audit.doc).map(|doc| doc.scope);
         if tracked {
             let entry = scope.entry(table.clone()).or_default();
             if entry.source_file.is_none() {
@@ -1948,17 +2052,14 @@ pub(super) fn build(ctx: &Ctx, cache: &EventLogOverviewCache) -> Result<usize> {
 
         // Every event of every firewall-provider channel is kept, known or
         // not; so is every event of the dedicated WFP/IKE channels. From the
-        // Security log only the documented firewall, filtering platform and
-        // IPsec audits are taken, plus the filtering-platform connection ids
-        // that Microsoft lists without an own page.
+        // Security log only the audits of the `security_audit` table are
+        // taken, including the filtering-platform ids Microsoft lists
+        // without an own page.
         let firewall_provider_event = !matches!(
             family,
             "security_audit" | "wfp_operational" | "ike_operational" | "other_provider"
         );
-        let security_keep = family == "security_audit"
-            && event_id.is_some_and(|id| {
-                documented_audit(id).is_some() || CONNECTION_AUDIT_IDS.contains(&id)
-            });
+        let security_keep = audit.is_some();
         let keep = firewall_provider_event || (tracked && !security_log(&table)) || security_keep;
         if !keep {
             continue;
@@ -2088,86 +2189,31 @@ fn field_values<'a>(fields: &'a [(String, String, String, &'static str)]) -> BTr
 // ---------------------------------------------------------------------------
 
 fn observations(ctx: &Ctx, db: &DerivedDb, mut scope: BTreeMap<String, LogScope>) -> Result<()> {
-    let path = ctx.out_dir.join("EVENTLOG/EventLogInputs.sqlite");
-    let mut discovered = false;
+    let inputs = LogInputs::read(ctx, relevant_log)?;
     let mut seen: HashSet<String> = HashSet::new();
-    if path.exists() {
-        let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        discovered = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM EventLogInputs WHERE status='discovery_complete')",
-            [],
-            |row| row.get(0),
+    for input in &inputs.logs {
+        let table = input.log_name.as_str();
+        seen.insert(table.to_ascii_lowercase());
+        let source = inputs.source(ctx, input)?;
+        let stats = scope.remove(table).unwrap_or_default();
+        insert_observation(
+            ctx,
+            db,
+            table,
+            input.source_file.as_deref(),
+            input.facts_db.as_deref(),
+            input.facts_table.as_deref(),
+            input.collection_state(),
+            input.input_rows,
+            input.parsed().then_some(&stats),
+            input.error.as_deref(),
+            Some((
+                source.dataset.as_str(),
+                source.db.as_str(),
+                source.table.as_str(),
+                source.rowid,
+            )),
         )?;
-        let mut query = conn.prepare(
-            "SELECT rowid,source_file,facts_db,facts_table,status,row_count,error FROM EventLogInputs
-             WHERE status<>'discovery_complete' ORDER BY rowid",
-        )?;
-        let mut rows = query.query([])?;
-        while let Some(row) = rows.next()? {
-            let file: Option<String> = row.get(1)?;
-            let table: String = row
-                .get::<_, Option<String>>(3)?
-                .filter(|table| !table.is_empty())
-                .unwrap_or_else(|| {
-                    file.as_deref()
-                        .unwrap_or("")
-                        .rsplit(['/', '\\'])
-                        .next()
-                        .unwrap_or("")
-                        .rsplit_once('.')
-                        .map(|(stem, _)| stem)
-                        .unwrap_or("")
-                        .to_string()
-                });
-            if !relevant_log(&table) {
-                continue;
-            }
-            seen.insert(table.to_ascii_lowercase());
-            let status: String = row.get(4)?;
-            let input_rows = row
-                .get::<_, Option<String>>(5)?
-                .and_then(|count| count.parse::<i64>().ok());
-            let state = match (status.as_str(), input_rows) {
-                ("read_failed", _) => "read_failed",
-                ("parsed", Some(0)) => "collected_empty",
-                ("parsed", Some(_)) => "collected",
-                _ => "unknown",
-            };
-            let source = ctx
-                .facts
-                .source_from_row(
-                    &path,
-                    "EventLogInputs",
-                    row.get(0)?,
-                    file.as_deref(),
-                    Some("collection_observation"),
-                )?
-                .ok_or_else(|| anyhow!("EventLogInputs 출처를 찾지 못했습니다"))?;
-            let stats = scope.remove(table.as_str()).unwrap_or_default();
-            let parsed = status == "parsed";
-            insert_observation(
-                ctx,
-                db,
-                &table,
-                file.as_deref(),
-                row.get::<_, Option<String>>(2)?
-                    .filter(|value| !value.is_empty())
-                    .as_deref(),
-                row.get::<_, Option<String>>(3)?
-                    .filter(|value| !value.is_empty())
-                    .as_deref(),
-                state,
-                input_rows,
-                parsed.then_some(&stats),
-                row.get::<_, Option<String>>(6)?.as_deref(),
-                Some((
-                    source.dataset.as_str(),
-                    source.db.as_str(),
-                    source.table.as_str(),
-                    source.rowid,
-                )),
-            )?;
-        }
     }
     for (table, stats) in &scope {
         seen.insert(table.to_ascii_lowercase());
@@ -2197,7 +2243,7 @@ fn observations(ctx: &Ctx, db: &DerivedDb, mut scope: BTreeMap<String, LogScope>
             None,
             None,
             None,
-            if discovered { "not_collected" } else { "unknown" },
+            inputs.absent_state(),
             None,
             None,
             None,
@@ -2438,7 +2484,8 @@ CREATE TABLE FirewallHistory (
   remote_addresses TEXT,
   local_address TEXT,
   remote_address TEXT,
-  single_address_basis TEXT,
+  local_address_basis TEXT,
+  remote_address_basis TEXT,
   address_attribution TEXT,
   local_ports TEXT,
   remote_ports TEXT,
@@ -2446,7 +2493,8 @@ CREATE TABLE FirewallHistory (
   remote_port INTEGER,
   local_port_raw TEXT,
   remote_port_raw TEXT,
-  single_port_basis TEXT,
+  local_port_basis TEXT,
+  remote_port_basis TEXT,
   profiles_raw TEXT,
   profiles_mask INTEGER,
   profiles TEXT,
@@ -2788,7 +2836,7 @@ CREATE TABLE source_records (
 );
 CREATE INDEX idx_source_lookup ON source_records(source_db, source_table, source_rowid, source_field);
 CREATE TABLE _wina_derived_version(name TEXT NOT NULL PRIMARY KEY, version INTEGER NOT NULL);
-INSERT INTO _wina_derived_version VALUES('overview_contract',1),('firewall_history',3);
+INSERT INTO _wina_derived_version VALUES('overview_contract',1),('firewall_history',4);
 "#;
 
 const MAIN: &[&str] = &[
@@ -2841,7 +2889,8 @@ const MAIN: &[&str] = &[
     "remote_addresses",
     "local_address",
     "remote_address",
-    "single_address_basis",
+    "local_address_basis",
+    "remote_address_basis",
     "address_attribution",
     "local_ports",
     "remote_ports",
@@ -2849,7 +2898,8 @@ const MAIN: &[&str] = &[
     "remote_port",
     "local_port_raw",
     "remote_port_raw",
-    "single_port_basis",
+    "local_port_basis",
+    "remote_port_basis",
     "profiles_raw",
     "profiles_mask",
     "profiles",
@@ -3578,6 +3628,20 @@ mod tests {
         let absent = "SELECT %s FROM FirewallHistory WHERE event_id=2059";
         assert_eq!(text(&conn, &absent.replace("%s", "payload_state")), Some("absent".into()));
         assert_eq!(text(&conn, &absent.replace("%s", "event_data_raw")), None);
+        // Only a payload that holds evidence is named as the source field.
+        for (event_id, field) in [(2082, Some("EventData")), (2011, None), (2059, None)] {
+            assert_eq!(
+                text(
+                    &conn,
+                    &format!(
+                        "SELECT s.source_field FROM source_records s JOIN FirewallHistory h USING(record_id)
+                         WHERE h.event_id={event_id}"
+                    )
+                ),
+                field.map(String::from),
+                "source_field of {event_id}"
+            );
+        }
 
         // Recorded-but-empty differs from an absent field.
         assert_eq!(
@@ -4000,10 +4064,16 @@ mod tests {
         assert_eq!(text(&conn, &main.replace("%s", "source_address")), None);
         assert_eq!(text(&conn, &main.replace("%s", "local_addresses")), None);
         assert_eq!(number(&conn, &main.replace("%s", "local_port")), Some(500));
-        assert_eq!(
-            text(&conn, &main.replace("%s", "single_port_basis")),
-            Some("LocalKeyModPort".into())
-        );
+        // Each side names the payload field its own value came from.
+        for (column, field) in [
+            ("local_address_basis", "LocalAddress"),
+            ("remote_address_basis", "RemoteAddress"),
+            ("local_port_basis", "LocalKeyModPort"),
+            ("remote_port_basis", "RemoteKeyModPort"),
+        ] {
+            assert_eq!(text(&conn, &main.replace("%s", column)), Some(field.into()), "{column}");
+        }
+        assert_eq!(number(&conn, &main.replace("%s", "remote_port")), Some(500));
         assert_eq!(text(&conn, &main.replace("%s", "keying_module")), Some("IKEv1".into()));
         assert_eq!(text(&conn, &main.replace("%s", "local_principal")), Some("WIN$".into()));
         assert_eq!(text(&conn, &main.replace("%s", "remote_principal")), Some("PEER$".into()));
@@ -4143,6 +4213,29 @@ mod tests {
             number(&conn, "SELECT ipsec_event_count FROM FirewallObservations WHERE log_name='Security'"),
             Some(5)
         );
+    }
+
+    // 5049 is filed under IPsec Main Mode, but its template is a policy
+    // object (ProfileChanged + SA id/name): it keeps both facts.
+    #[test]
+    fn ipsec_sa_deletion_keeps_its_main_mode_stage() {
+        let fx = Fixture::new("sadelete");
+        fx.facts("Security", 1);
+        let conn = fx.run(vec![sec(
+            1,
+            "5049",
+            "2026-01-01 00:00:01.000",
+            r#"{"ProfileChanged":"Domain","IpSecSecurityAssociationId":"7","IpSecSecurityAssociationName":"sa"}"#,
+        )]);
+        let row = "SELECT %s FROM FirewallHistory WHERE event_id=5049";
+        assert_eq!(text(&conn, &row.replace("%s", "event_scope")), Some("ipsec_main_mode".into()));
+        assert_eq!(text(&conn, &row.replace("%s", "ipsec_mode")), Some("main_mode".into()));
+        assert_eq!(
+            text(&conn, &row.replace("%s", "policy_object_kind")),
+            Some("security_association".into())
+        );
+        assert_eq!(text(&conn, &row.replace("%s", "policy_object_id")), Some("7".into()));
+        assert_eq!(text(&conn, &row.replace("%s", "profiles_raw")), Some("Domain".into()));
     }
 
     // The ConnectionSecurity channel is its own family: collected-but-empty is

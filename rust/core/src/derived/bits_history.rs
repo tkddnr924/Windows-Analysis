@@ -12,6 +12,7 @@ use rusqlite::{params, Connection, OpenFlags};
 mod queue;
 
 use super::schema::{ChildSpec, DbSpec};
+use super::eventlog_inputs::LogInputs;
 use super::{int_opt, Cell, Ctx, DerivedDb, SourceRef};
 use crate::overview::EventLogOverviewCache;
 use crate::sqlite::Row;
@@ -207,7 +208,6 @@ CREATE TABLE "BitsObservations" (
   "collection_state" TEXT,
   "input_row_count" INTEGER,
   "event_count" INTEGER,
-  "incorporated_count" INTEGER,
   "corrupted_count" INTEGER,
   "untimed_count" INTEGER,
   "first_observed_time" TEXT,
@@ -228,7 +228,6 @@ CREATE TABLE "BitsEventCoverage" (
   "event_id_raw" TEXT,
   "status" TEXT,
   "event_count" INTEGER,
-  "incorporated_count" INTEGER,
   "first_observed_time" TEXT,
   "last_observed_time" TEXT,
   "observation_state" TEXT,
@@ -323,7 +322,8 @@ CREATE TABLE "BitsQueueJobs" (
   "other_time2_raw" TEXT,
   "metadata_padding_hex" TEXT,
   "metadata_state" TEXT,
-  "trailing_length" INTEGER,
+  "transfer_trailing_length" INTEGER,
+  "metadata_trailing_length" INTEGER,
   "parse_status" TEXT,
   "parse_method" TEXT,
   "parse_error" TEXT,
@@ -422,7 +422,7 @@ CREATE TABLE "source_records" (
 );
 CREATE INDEX idx_source_lookup ON source_records(source_db, source_table, source_rowid, source_field);
 CREATE TABLE _wina_derived_version (name TEXT NOT NULL PRIMARY KEY, version INTEGER NOT NULL);
-INSERT INTO _wina_derived_version(name,version) VALUES ('overview_contract',1),('bits_history',3);
+INSERT INTO _wina_derived_version(name,version) VALUES ('overview_contract',1),('bits_history',4);
 "#;
 
 const MAIN: &[&str] = &[
@@ -593,7 +593,6 @@ const OBSERVATIONS: &[&str] = &[
     "collection_state",
     "input_row_count",
     "event_count",
-    "incorporated_count",
     "corrupted_count",
     "untimed_count",
     "first_observed_time",
@@ -614,7 +613,6 @@ const COVERAGE: &[&str] = &[
     "event_id_raw",
     "status",
     "event_count",
-    "incorporated_count",
     "first_observed_time",
     "last_observed_time",
     "observation_state",
@@ -708,7 +706,8 @@ const QUEUE_JOBS: &[&str] = &[
     "other_time2_raw",
     "metadata_padding_hex",
     "metadata_state",
-    "trailing_length",
+    "transfer_trailing_length",
+    "metadata_trailing_length",
     "parse_status",
     "parse_method",
     "parse_error",
@@ -1171,8 +1170,9 @@ struct JobAgg {
 
 #[derive(Default)]
 struct LogStats {
+    // BitsHistory keeps corrupted_chunk rows (facts_status), so event_count
+    // includes them and equals that log's BitsHistory rows; corrupted is a subset.
     rows: i64,
-    incorporated: i64,
     corrupted: i64,
     untimed: i64,
     first: Option<String>,
@@ -1183,7 +1183,6 @@ struct LogStats {
 #[derive(Default)]
 struct Coverage {
     count: i64,
-    incorporated: i64,
     first: Option<String>,
     last: Option<String>,
 }
@@ -1612,7 +1611,6 @@ pub(super) fn build(ctx: &Ctx, events: &EventLogOverviewCache) -> Result<usize> 
 
         let stats = logs.entry(log.clone()).or_default();
         stats.rows += 1;
-        stats.incorporated += 1;
         if g(row, "_status") == "corrupted_chunk" {
             stats.corrupted += 1;
         }
@@ -1629,7 +1627,6 @@ pub(super) fn build(ctx: &Ctx, events: &EventLogOverviewCache) -> Result<usize> 
 
         let seen = coverage.entry((log, event_id)).or_default();
         seen.count += 1;
-        seen.incorporated += 1;
         observe(&mut seen.first, &mut seen.last, time);
     }
 
@@ -1699,90 +1696,36 @@ fn write_observations(
     db: &mut DerivedDb,
     mut logs: BTreeMap<String, LogStats>,
 ) -> Result<()> {
-    let path = ctx.out_dir.join("EVENTLOG/EventLogInputs.sqlite");
-    let mut discovered = false;
-    let mut manifest_logs = false;
-    if path.exists() {
-        let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        discovered = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM EventLogInputs WHERE status='discovery_complete')",
-            [],
-            |row| row.get(0),
+    let inputs = LogInputs::read(ctx, starts_bits)?;
+    let mut manifest_logs = !inputs.logs.is_empty();
+    for input in &inputs.logs {
+        let reference = inputs.source(ctx, input)?;
+        let stats = logs.remove(&input.log_name).unwrap_or_default();
+        let parsed = input.parsed();
+        db.insert_child(
+            "BitsObservations",
+            &[
+                t(&uuid::Uuid::new_v4().to_string()),
+                t(ctx.host_id),
+                t(ctx.dataset_id),
+                t(&input.log_name),
+                opt(input.source_file.as_deref()),
+                opt(input.facts_db.as_deref()),
+                opt(input.facts_table.as_deref()),
+                t(input.collection_state()),
+                int_opt(input.input_rows),
+                int_opt(parsed.then_some(stats.rows)),
+                int_opt(parsed.then_some(stats.corrupted)),
+                int_opt(parsed.then_some(stats.untimed)),
+                opt(stats.first.as_deref()),
+                opt(stats.last.as_deref()),
+                opt(input.error.as_deref()),
+                t(&reference.dataset),
+                t(&reference.db),
+                t(&reference.table),
+                Cell::Int(reference.rowid),
+            ],
         )?;
-        let mut rows = Vec::new();
-        {
-            let mut stmt = conn.prepare(
-                "SELECT rowid,source_file,facts_db,facts_table,status,row_count,error \
-                 FROM EventLogInputs WHERE status<>'discovery_complete' ORDER BY rowid",
-            )?;
-            let mut cursor = stmt.query([])?;
-            while let Some(row) = cursor.next()? {
-                rows.push((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, Option<String>>(5)?,
-                    row.get::<_, Option<String>>(6)?,
-                ));
-            }
-        }
-        for (rowid, file, facts_db, facts_table, status, row_count, error) in rows {
-            let table = facts_table.clone().filter(|value| !value.is_empty()).unwrap_or_else(|| {
-                file.as_deref()
-                    .unwrap_or("")
-                    .rsplit(['/', '\\'])
-                    .next()
-                    .unwrap_or("")
-                    .rsplit_once('.')
-                    .map(|(stem, _)| stem)
-                    .unwrap_or("")
-                    .to_string()
-            });
-            if !starts_bits(&table) {
-                continue;
-            }
-            manifest_logs = true;
-            let input_rows = row_count.as_deref().and_then(parse_i64);
-            let state = match (status.as_str(), input_rows) {
-                ("read_failed", _) => "read_failed",
-                ("parsed", Some(0)) => "collected_empty",
-                ("parsed", Some(_)) => "collected",
-                _ => "unknown",
-            };
-            let reference = ctx
-                .facts
-                .source_from_row(&path, "EventLogInputs", rowid, file.as_deref(), Some("수집 관측"))?
-                .ok_or_else(|| anyhow!("EventLogInputs 원본 참조를 찾지 못했습니다"))?;
-            let stats = logs.remove(&table).unwrap_or_default();
-            let parsed = status == "parsed";
-            db.insert_child(
-                "BitsObservations",
-                &[
-                    t(&uuid::Uuid::new_v4().to_string()),
-                    t(ctx.host_id),
-                    t(ctx.dataset_id),
-                    t(&table),
-                    opt(file.as_deref()),
-                    opt(facts_db.as_deref()),
-                    opt(facts_table.as_deref()),
-                    t(state),
-                    int_opt(input_rows),
-                    int_opt(parsed.then_some(stats.rows)),
-                    int_opt(parsed.then_some(stats.incorporated)),
-                    int_opt(parsed.then_some(stats.corrupted)),
-                    int_opt(parsed.then_some(stats.untimed)),
-                    opt(stats.first.as_deref()),
-                    opt(stats.last.as_deref()),
-                    opt(error.as_deref()),
-                    t(&reference.dataset),
-                    t(&reference.db),
-                    t(&reference.table),
-                    Cell::Int(reference.rowid),
-                ],
-            )?;
-        }
     }
     for (table, stats) in logs {
         manifest_logs = true;
@@ -1802,7 +1745,6 @@ fn write_observations(
                 t("unknown"),
                 Cell::Null,
                 count(stats.rows),
-                count(stats.incorporated),
                 count(stats.corrupted),
                 count(stats.untimed),
                 opt(stats.first.as_deref()),
@@ -1826,8 +1768,7 @@ fn write_observations(
                 Cell::Null,
                 Cell::Null,
                 Cell::Null,
-                t(if discovered { "not_collected" } else { "unknown" }),
-                Cell::Null,
+                t(inputs.absent_state()),
                 Cell::Null,
                 Cell::Null,
                 Cell::Null,
@@ -1866,7 +1807,6 @@ fn write_coverage(
                 t(event_id),
                 t(kind_of(event_id).status),
                 count(seen.count),
-                count(seen.incorporated),
                 opt(seen.first.as_deref()),
                 opt(seen.last.as_deref()),
                 t("observed"),
@@ -1888,7 +1828,6 @@ fn write_coverage(
                     num(Some(*event_id)),
                     t(event_id),
                     t(kind_of(event_id).status),
-                    count(0),
                     count(0),
                     Cell::Null,
                     Cell::Null,

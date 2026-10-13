@@ -6,21 +6,20 @@ import MftListFilterModal from "@/components/MftListFilterModal";
 
 import { useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import type { FileReference, MftListOptions, MftRecordsPage, MftVolume } from "@/lib/types";
+import type { FileReference, MftListOptions, MftVolume } from "@/lib/types";
 import { MFT_PATH_STATUS_LABELS } from "@/lib/artifactViews";
 import { volumeLabels } from "@/lib/mftVolumeLabels";
-import { DEFAULT_LIST_FILTERS, MFT_TIME_FIELDS, describeFilters, toListOptions, type ListFilters } from "@/lib/mftListFilters";
+import { DEFAULT_LIST_FILTERS, MFT_TIME_FIELDS, describeFilters, filtersNarrowed, resetFilters, toListOptions, type ListFilters } from "@/lib/mftListFilters";
 import { artifactChipTone } from "./MasterTimeline";
 import CircularProgress from "@mui/material/CircularProgress";
 import IconButton from "@mui/material/IconButton";
 import useMediaQuery from "@mui/material/useMediaQuery";
 import KeyboardArrowDownOutlinedIcon from "@mui/icons-material/KeyboardArrowDownOutlined";
 import KeyboardArrowRightOutlinedIcon from "@mui/icons-material/KeyboardArrowRightOutlined";
-import CloseOutlinedIcon from "@mui/icons-material/CloseOutlined";
 import FolderOpenOutlinedIcon from "@mui/icons-material/FolderOpenOutlined";
 import FolderOutlinedIcon from "@mui/icons-material/FolderOutlined";
 import InsertDriveFileOutlinedIcon from "@mui/icons-material/InsertDriveFileOutlined";
-import SearchOutlinedIcon from "@mui/icons-material/SearchOutlined";
+import HelpOutlineOutlinedIcon from "@mui/icons-material/HelpOutlineOutlined";
 import AccountTreeOutlinedIcon from "@mui/icons-material/AccountTreeOutlined";
 import ViewListOutlinedIcon from "@mui/icons-material/ViewListOutlined";
 import RowDetailPanel from "./RowDetailPanel";
@@ -79,20 +78,6 @@ function refsFor(refs: RefMap, row: Row, accountFilter: Set<string> | null): Fil
   return all.filter((reference) => !reference.row.account || accountFilter.has(reference.row.account));
 }
 
-function referenceTags(refs: RefMap, row: Row, accountFilter: Set<string> | null): { account: string; kind: string }[] {
-  const seen = new Set<string>();
-  const tags: { account: string; kind: string }[] = [];
-  for (const reference of refsFor(refs, row, accountFilter)) {
-    const account = reference.row.account ?? "";
-    const kind = reference.row.event_type ?? "";
-    const key = `${account}|${kind}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    tags.push({ account, kind });
-  }
-  return tags;
-}
-
 // Reference kind → short code + artifact palette key (MasterTimeline chips).
 const KIND_ORDER = ["Jumplist", "Shellbag", "ScheduledTasks", "ServiceHistory", "WerReports", "FirewallHistory"];
 const REFERENCE_KIND: Record<string, { code: string; tone: string }> = {
@@ -105,7 +90,7 @@ const REFERENCE_KIND: Record<string, { code: string; tone: string }> = {
 };
 
 /** One compact chip per reference kind; kind, count and accounts in the tooltip. */
-function ReferenceChips({ refs, row, accountFilter }: { refs: RefMap; row: Row; accountFilter: Set<string> | null }) {
+function ReferenceChips({ refs, row, accountFilter, empty = null }: { refs: RefMap; row: Row; accountFilter: Set<string> | null; empty?: string | null }) {
   const kinds = new Map<string, { count: number; accounts: Set<string> }>();
   for (const reference of refsFor(refs, row, accountFilter)) {
     const kind = reference.row.event_type || "경로 참조";
@@ -114,7 +99,7 @@ function ReferenceChips({ refs, row, accountFilter }: { refs: RefMap; row: Row; 
     entry.accounts.add(reference.row.account || "미상");
     kinds.set(kind, entry);
   }
-  if (!kinds.size) return null;
+  if (!kinds.size) return empty;
   return (
     <span style={{ display: "inline-flex", alignItems: "center", gap: 3, flexShrink: 0 }}>
       {/* Fixed kind order so the same chips line up across rows. */}
@@ -140,6 +125,13 @@ function dirFlag(r: Row): boolean | null {
 }
 function isDir(r: Row): boolean {
   return dirFlag(r) === true;
+}
+/** File, folder (open/closed) or unknown kind — NULL is never drawn as a file. */
+function KindIcon({ row, open = false, size }: { row: Row; open?: boolean; size: number }) {
+  const flag = dirFlag(row);
+  if (flag === true) return open ? <FolderOpenOutlinedIcon aria-hidden="true" sx={{ flexShrink: 0, fontSize: size, color: "var(--accent)" }} /> : <FolderOutlinedIcon aria-hidden="true" sx={{ flexShrink: 0, fontSize: size, color: "var(--text-faint)" }} />;
+  if (flag === null) return <span title="종류 미확인" style={{ display: "inline-flex", flexShrink: 0 }}><HelpOutlineOutlinedIcon aria-label="종류 미확인" sx={{ fontSize: size - 1, color: "var(--text-faint)" }} /></span>;
+  return <InsertDriveFileOutlinedIcon aria-hidden="true" sx={{ flexShrink: 0, fontSize: size - 1, color: "var(--text-faint)" }} />;
 }
 /** Released record (in_use=0) — not a deletion time or recoverability claim. */
 function isUnused(r: Row): boolean {
@@ -260,6 +252,12 @@ export default function MftView({ dbPath, isRowBookmarked, onToggleBookmark, isR
   }, []);
 
   const [search, setSearch] = useState("");
+  // Tree search and the list query share one debounced value.
+  const [debouncedSearch, setDebouncedSearch] = useState("");
+  useEffect(() => {
+    const timer = setTimeout(() => setDebouncedSearch(search.trim()), 250);
+    return () => clearTimeout(timer);
+  }, [search]);
   const [viewMode, setViewMode] = useState<"tree" | "list">("tree");
   const [results, setResults] = useState<Row[] | null>(null);
   const [searching, setSearching] = useState(false);
@@ -309,6 +307,8 @@ export default function MftView({ dbPath, isRowBookmarked, onToggleBookmark, isR
   const [listTotal, setListTotal] = useState<number | null>(null);
   const [listLoading, setListLoading] = useState(false);
   const [listError, setListError] = useState<string | null>(null);
+  // Follow-up page failure: keep loaded rows, offer a retry below them.
+  const [listMoreFailed, setListMoreFailed] = useState(false);
   // 재귀 목록 필터 — 한 상태로 관리(lib/mftListFilters), 모달 「적용」 시 반영.
   const [listFilters, setListFilters] = useState<ListFilters>(DEFAULT_LIST_FILTERS);
   const listSeq = useRef(0);
@@ -429,7 +429,7 @@ export default function MftView({ dbPath, isRowBookmarked, onToggleBookmark, isR
   useEffect(() => {
     if (viewMode !== "tree" || !volumeArg) return;
     const seq = ++searchSeq.current;
-    const q = search.trim();
+    const q = debouncedSearch;
     if (q.length < 2) {
       setResults(null);
       setSearching(false);
@@ -438,26 +438,23 @@ export default function MftView({ dbPath, isRowBookmarked, onToggleBookmark, isR
     }
     setSearching(true);
     setSearchError(null);
-    const t = setTimeout(() => {
-      window.api.mftSearch(dbPath, q, 500, volumeArg).then((rows) => {
-        if (seq === searchSeq.current) {
-          setResults(rows);
-          setSearching(false);
-        }
-      }).catch(() => {
-        if (seq === searchSeq.current) {
-          setResults([]);
-          setSearching(false);
-          setSearchError("파일 시스템 검색 결과를 읽지 못했습니다.");
-        }
-      });
-    }, 250);
-    return () => clearTimeout(t);
-  }, [search, dbPath, viewMode, volumeArg]);
+    window.api.mftSearch(dbPath, q, 500, volumeArg).then((rows) => {
+      if (seq === searchSeq.current) {
+        setResults(rows);
+        setSearching(false);
+      }
+    }).catch(() => {
+      if (seq === searchSeq.current) {
+        setResults([]);
+        setSearching(false);
+        setSearchError("파일 시스템 검색 결과를 읽지 못했습니다.");
+      }
+    });
+  }, [debouncedSearch, dbPath, viewMode, volumeArg]);
 
   // The recursive list owns its own bounded SQLite page. It intentionally
   // does not reuse tree search results, which are capped and may omit paths.
-  const listQuery = search.trim().length >= 2 ? search.trim() : "";
+  const listQuery = debouncedSearch.length >= 2 ? debouncedSearch : "";
   const listOptions = useMemo<MftListOptions>(() => toListOptions(listFilters, volumeArg), [listFilters, volumeArg]);
   // Filter dialog preview: same query as the list, one row, total only.
   const countListFor = useCallback(
@@ -470,6 +467,7 @@ export default function MftView({ dbPath, isRowBookmarked, onToggleBookmark, isR
     const seq = ++listSeq.current;
     setListLoading(true);
     setListError(null);
+    setListMoreFailed(false);
     setListRows([]);
     setListTotal(null);
     window.api.mftRecordsPage(dbPath, listQuery, 0, LIST_FETCH_SIZE, listOptions).then((page) => {
@@ -489,14 +487,16 @@ export default function MftView({ dbPath, isRowBookmarked, onToggleBookmark, isR
     if (listRows.length >= MAX_RESIDENT_LIST_ROWS) return;
     const seq = listSeq.current;
     setListLoading(true);
+    setListMoreFailed(false);
     window.api.mftRecordsPage(dbPath, listQuery, listRows.length, LIST_FETCH_SIZE, listOptions).then((page) => {
       if (seq !== listSeq.current) return;
       setListRows((previous) => [...previous, ...(page.rows as Row[])]);
       setListTotal(page.total);
+      setListError(null);
       setListLoading(false);
     }).catch(() => {
       if (seq !== listSeq.current) return;
-      setListError("파일 시스템 레코드 목록을 읽지 못했습니다.");
+      setListMoreFailed(true);
       setListLoading(false);
     });
   }, [dbPath, listQuery, listOptions, listLoading, listRows.length, listTotal]);
@@ -564,7 +564,7 @@ export default function MftView({ dbPath, isRowBookmarked, onToggleBookmark, isR
       <div className={`mft-content mft-content--${viewMode}`} style={{ flex: 1, minHeight: 0, display: "grid", gap: 10, padding: 14, background: "var(--bg)", gridTemplateColumns: stackedInspector ? "minmax(0, 1fr)" : "minmax(0, 7fr) minmax(300px, 3fr)", gridTemplateRows: stackedInspector ? "minmax(300px, 1fr) minmax(260px, .75fr)" : undefined }}>
         <aside aria-label={viewMode === "tree" ? "파일 탐색기" : "재귀 파일 시스템 목록"} style={{ minWidth: 0, minHeight: 0, overflow: "hidden", padding: viewMode === "tree" ? "8px 10px 14px" : "0", border: "1px solid var(--border)", borderRadius: "var(--radius)", background: "var(--bg-panel)", display: "flex", flexDirection: "column" }}>
           {viewMode === "list" ? (
-            <MftRecordList rows={listRows} total={listTotal} loading={listLoading} error={listError} query={listQuery} isBookmarked={isRowBookmarked} selectedRowid={selectedRowid} selectedRow={selected} refs={pathRefs.map} accountFilter={selAccounts} onSelect={setSelected} onLoadMore={loadMoreList} filters={listFilters} onFilters={setListFilters} countFor={countListFor} />
+            <MftRecordList rows={listRows} total={listTotal} loading={listLoading} error={listError} moreFailed={listMoreFailed} query={listQuery} isBookmarked={isRowBookmarked} selectedRowid={selectedRowid} selectedRow={selected} refs={pathRefs.map} accountFilter={selAccounts} onSelect={setSelected} onLoadMore={loadMoreList} filters={listFilters} onFilters={setListFilters} countFor={countListFor} />
           ) : <>
             <div style={{ flex: 1, minHeight: 0, overflow: "auto" }}>
               {results !== null ? (
@@ -578,6 +578,7 @@ export default function MftView({ dbPath, isRowBookmarked, onToggleBookmark, isR
                 <div style={{ padding: "16px 8px", color: "var(--danger)", fontSize: 12.5 }}>{rootError}</div>
               ) : (
                 <>
+                  {root.rows.length === 0 && root.total === 0 && <div role="status" style={{ padding: "12px 8px", color: "var(--warning)", fontSize: 12.5 }}>최상위 레코드를 확인하지 못했습니다.</div>}
                   {root.rows.map((r) => (
                     <TreeNode
                       key={r.entry + "-" + r.__rowid}
@@ -661,11 +662,12 @@ export default function MftView({ dbPath, isRowBookmarked, onToggleBookmark, isR
   );
 }
 
-function MftRecordList({ rows, total, loading, error, query, isBookmarked, selectedRowid, selectedRow, refs, accountFilter, onSelect, onLoadMore, filters, onFilters, countFor }: {
+function MftRecordList({ rows, total, loading, error, moreFailed, query, isBookmarked, selectedRowid, selectedRow, refs, accountFilter, onSelect, onLoadMore, filters, onFilters, countFor }: {
   rows: Row[];
   total: number | null;
   loading: boolean;
   error: string | null;
+  moreFailed: boolean;
   query: string;
   isBookmarked: (row: Row) => boolean;
   selectedRowid: number | null;
@@ -692,23 +694,24 @@ function MftRecordList({ rows, total, loading, error, query, isBookmarked, selec
   const capped = rows.length >= MAX_RESIDENT_LIST_ROWS;
   // lazy 로딩: 스크롤이 끝 30행 안쪽에 닿으면 다음 배치를 이어서 불러온다.
   useEffect(() => {
-    if (loading || total === null || rows.length >= total || capped) return;
+    if (loading || moreFailed || total === null || rows.length >= total || capped) return;
     if (lastVisibleIndex >= rows.length - 30) onLoadMore();
-  }, [lastVisibleIndex, loading, rows.length, total, capped, onLoadMore]);
+  }, [lastVisibleIndex, loading, moreFailed, rows.length, total, capped, onLoadMore]);
   useEffect(() => { scrollRef.current?.scrollTo({ top: 0 }); }, [query, filters]);
   const summary = describeFilters(filters);
+  const narrowed = filtersNarrowed(filters);
   const sortLabel = sortKey === "path" ? "경로" : sortKey === "name" ? "파일 이름" : sortKey === "size" ? "크기" : MFT_TIME_SORTS[sortKey]?.short ?? sortKey;
   const chip: React.CSSProperties = { display: "inline-flex", alignItems: "center", minHeight: 24, padding: "0 9px", fontSize: 11.5, borderRadius: 999, border: "1px solid var(--border)", background: "var(--bg-elevated)", color: "var(--text-dim)", cursor: "pointer", whiteSpace: "nowrap", maxWidth: 360, overflow: "hidden", textOverflow: "ellipsis" };
 
   return <section aria-label="MFT 재귀 목록" style={{ display: "flex", flexDirection: "column", flex: 1, minHeight: 0 }}>
     <header style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", flexShrink: 0, padding: "8px 12px", borderBottom: "1px solid var(--border)" }}>
-      <button type="button" onClick={() => setFilterOpen(true)} aria-haspopup="dialog" style={{ display: "inline-flex", alignItems: "center", gap: 6, minHeight: 30, padding: "0 12px", fontSize: 12, fontWeight: 650, border: `1px solid ${summary.length ? "var(--accent)" : "var(--border)"}`, borderRadius: "var(--radius)", background: summary.length ? "var(--accent-subtle)" : "var(--bg-elevated)", color: summary.length ? "var(--accent)" : "var(--text)", cursor: "pointer" }}>
+      <button type="button" onClick={() => setFilterOpen(true)} aria-haspopup="dialog" style={{ display: "inline-flex", alignItems: "center", gap: 6, minHeight: 30, padding: "0 12px", fontSize: 12, fontWeight: 650, border: `1px solid ${narrowed ? "var(--accent)" : "var(--border)"}`, borderRadius: "var(--radius)", background: narrowed ? "var(--accent-subtle)" : "var(--bg-elevated)", color: narrowed ? "var(--accent)" : "var(--text)", cursor: "pointer" }}>
         <FilterListOutlinedIcon sx={{ fontSize: 16 }} />필터{summary.length ? ` (${summary.length})` : ""}
       </button>
       {/* Active conditions; a click reopens the dialog. */}
       {summary.map((text) => <button key={text} type="button" onClick={() => setFilterOpen(true)} title={text} style={chip}>{text}</button>)}
       <span style={{ ...chip, cursor: "default", background: "transparent", borderColor: "var(--border-subtle)", color: "var(--text-faint)" }}>정렬 {sortLabel} {sortDesc ? "↓" : "↑"}</span>
-      {summary.length > 0 && <button type="button" onClick={() => onFilters({ ...DEFAULT_LIST_FILTERS, sortKey: filters.sortKey, sortDesc: filters.sortDesc, timeKeys: filters.timeKeys })} style={{ minHeight: 24, padding: "0 9px", fontSize: 11.5, border: "none", background: "transparent", color: "var(--text-dim)", cursor: "pointer", textDecoration: "underline" }}>초기화</button>}
+      {narrowed && <button type="button" onClick={() => onFilters(resetFilters(filters))} style={{ minHeight: 24, padding: "0 9px", fontSize: 11.5, border: "none", background: "transparent", color: "var(--text-dim)", cursor: "pointer", textDecoration: "underline" }}>초기화</button>}
       <span style={{ display: "inline-flex", alignItems: "center", gap: 8, marginLeft: "auto" }}>
         {capped && <span role="status" style={{ color: "var(--warning)", fontSize: 11.5, fontWeight: 650, whiteSpace: "nowrap" }}>목록 상한 {MAX_RESIDENT_LIST_ROWS.toLocaleString()}건 · 필터로 좁혀 보세요</span>}
         <span style={{ color: "var(--text-faint)", fontSize: 11.5, fontVariantNumeric: "tabular-nums", whiteSpace: "nowrap" }}>
@@ -725,23 +728,23 @@ function MftRecordList({ rows, total, loading, error, query, isBookmarked, selec
           const row = rows[virtualRow.index];
           const bookmarked = isBookmarked(row);
           const selected = selectedRowid !== null && Number(row.__rowid) === selectedRowid;
-          const tags = referenceTags(refs, row, accountFilter).slice(0, 2);
           const path = row.path || row.file_name || "경로 정보 없음";
           const isFolder = isDir(row);
           return <div key={virtualRow.key} className={bookmarked ? `dfir-bookmarked-row${selected ? " dfir-bookmarked-row--selected" : ""}` : undefined} style={{ position: "absolute", top: 0, left: 0, width: "100%", height: LIST_ROW_HEIGHT, transform: `translateY(${virtualRow.start}px)`, borderBottom: "1px solid var(--border-subtle)", background: selected ? "var(--bg-selected)" : "transparent" }}>
             <button type="button" onClick={() => onSelect(row)} title={path} aria-label={`${row.file_name || path} MFT 정보 보기`} style={{ display: "grid", gridTemplateColumns: grid, gap: 10, alignItems: "center", width: "100%", height: "100%", padding: "0 12px", border: 0, background: "transparent", color: "inherit", cursor: "pointer", textAlign: "left" }}>
               <span style={{ minWidth: 0, display: "grid", gridTemplateRows: "18px 16px", gap: 2 }}>
-                <span style={{ minWidth: 0, display: "flex", alignItems: "center", gap: 6, color: "var(--text)", fontSize: 12.5, fontWeight: 650 }}>{isFolder && <FolderOutlinedIcon sx={{ flexShrink: 0, fontSize: 14, color: "var(--text-faint)" }} />}<span title={row.file_name || "(이름 없음)"} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{row.file_name || "(이름 없음)"}</span><RowBadges row={row} /></span>
+                <span style={{ minWidth: 0, display: "flex", alignItems: "center", gap: 6, color: "var(--text)", fontSize: 12.5, fontWeight: 650 }}>{isFolder ? <FolderOutlinedIcon sx={{ flexShrink: 0, fontSize: 14, color: "var(--text-faint)" }} /> : dirFlag(row) === null && <KindIcon row={row} size={15} />}<span title={row.file_name || "(이름 없음)"} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{row.file_name || "(이름 없음)"}</span><RowBadges row={row} /></span>
                 <span title={path} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text-faint)", fontSize: 10.5, fontFamily: "var(--mono)" }}>{path}</span>
               </span>
               <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: row[timeColumn.column] ? "var(--text-time)" : "var(--text-faint)", fontSize: 12, fontFamily: "var(--mono)", fontVariantNumeric: "tabular-nums" }}>{row[timeColumn.column] || "시간 정보 없음"}</span>
               <span style={{ textAlign: "right", color: "var(--text-dim)", fontSize: 12, fontFamily: "var(--mono)", fontVariantNumeric: "tabular-nums" }}>{isFolder ? "" : fmtSize(row.file_size)}</span>
-              <span style={{ minWidth: 0, overflow: "hidden", display: "flex", alignItems: "center", color: "var(--text-faint)", fontSize: 11 }}>{tags.length ? <ReferenceChips refs={refs} row={row} accountFilter={accountFilter} /> : "—"}</span>
+              <span style={{ minWidth: 0, overflow: "hidden", display: "flex", alignItems: "center", color: "var(--text-faint)", fontSize: 11 }}><ReferenceChips refs={refs} row={row} accountFilter={accountFilter} empty="—" /></span>
             </button>
           </div>;
         })}</div>
       </div>
     </div>}
+    {moreFailed && rows.length > 0 && !error && <button type="button" onClick={onLoadMore} disabled={loading} style={{ flexShrink: 0, margin: "6px 12px", minHeight: 27, padding: "2px 10px", border: "1px solid var(--danger)", borderRadius: "var(--radius)", background: "var(--bg-elevated)", color: "var(--danger)", cursor: "pointer", fontSize: 11.5 }}>{loading ? "불러오는 중…" : `이어받기 실패 — 다시 시도 (${rows.length.toLocaleString()}/${(total ?? rows.length).toLocaleString()})`}</button>}
   </section>;
 }
 function TreeNode({
@@ -817,9 +820,7 @@ function TreeNode({
             title={dir ? "MFT 정보 보기 및 폴더 접기/펼치기" : "MFT 정보 보기"}
             style={{ display: "flex", alignItems: "center", gap: 5, flex: "1 1 0", minWidth: 0, minHeight: 24, padding: 0, border: 0, background: "transparent", color: "inherit", cursor: "pointer", textAlign: "left" }}
           >
-            {dir
-              ? (open ? <FolderOpenOutlinedIcon aria-hidden="true" sx={{ flexShrink: 0, fontSize: 17, color: "var(--accent)" }} /> : <FolderOutlinedIcon aria-hidden="true" sx={{ flexShrink: 0, fontSize: 17, color: "var(--text-faint)" }} />)
-              : <InsertDriveFileOutlinedIcon aria-hidden="true" sx={{ flexShrink: 0, fontSize: 16, color: "var(--text-faint)" }} />}
+            <KindIcon row={row} open={open} size={17} />
             <span style={{ flex: "1 1 0", minInlineSize: "8ch", minWidth: 0, fontSize: 13, color: "var(--text)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{row.file_name || "(이름 없음)"}</span>
             <RowBadges row={row} />
             <ReferenceChips refs={refs} row={row} accountFilter={accountFilter} />
@@ -904,7 +905,7 @@ function SearchResults({ rows, searching, error, isBookmarked, selectedRowid, on
           >
             <div style={{ minWidth: 0 }}>
               <div style={{ minWidth: 0, display: "flex", alignItems: "center", gap: 6 }}>
-              {isDir(r) ? <FolderOutlinedIcon aria-hidden="true" sx={{ flexShrink: 0, fontSize: 16, color: "var(--text-faint)" }} /> : <InsertDriveFileOutlinedIcon aria-hidden="true" sx={{ flexShrink: 0, fontSize: 15, color: "var(--text-faint)" }} />}
+              <KindIcon row={r} size={16} />
               <span style={{ flex: "1 1 0", minInlineSize: "8ch", minWidth: 0, fontSize: 12.5, color: "var(--text)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{r.file_name || "(이름 없음)"}</span>
               <RowBadges row={r} size={9.5} />
               <ReferenceChips refs={refs} row={r} accountFilter={accountFilter} />

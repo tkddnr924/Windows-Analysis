@@ -36,8 +36,9 @@ export interface PipelineRun {
   /** Queue entries are independent per immutable backend run id. */
   runs: PipelineRunItem[];
   start: (opts: StartOpts) => Promise<void>;
-  /** Cancels one immutable run; omit the id only for the legacy focused run. */
-  cancel: (runId?: string) => Promise<void>;
+  /** Cancels one immutable run; omit the id only for the legacy focused run.
+   * Resolves false (UI unchanged) when the backend did not cancel. */
+  cancel: (runId?: string) => Promise<boolean>;
   dismiss: () => void;
 }
 
@@ -306,17 +307,18 @@ export function usePipelineRun(onDone?: () => void): PipelineRun {
   // Parsing runs in a child process, so cancel kills it outright — the work
   // stops immediately, not at the next poll point. The pending runHost()
   // promise still resolves afterwards; cancelledRef keeps it from flipping the
-  // UI back to "완료".
-  async function cancel(runId?: string) {
+  // UI back to "완료". The UI only flips once the backend confirms the cancel.
+  async function cancel(runId?: string): Promise<boolean> {
     const targetRunId = runId ?? currentRunRef.current;
-    void window.api.cancelPipeline(targetRunId ?? undefined);
+    const cancelled = await window.api.cancelPipeline(targetRunId ?? undefined).catch(() => false);
+    if (!cancelled) return false;
     if (targetRunId) {
       cancelledRunsRef.current.add(targetRunId);
       setRuns((previous) => previous.map((run) => run.runId === targetRunId
         ? { ...run, status: "cancelled", currentArtifact: null }
         : run));
     }
-    if (targetRunId && targetRunId !== currentRunRef.current) return;
+    if (targetRunId && targetRunId !== currentRunRef.current) return true;
     clearRunning();
     setRunningHostId(null);
     setCurrentArtifact(null);
@@ -324,6 +326,7 @@ export function usePipelineRun(onDone?: () => void): PipelineRun {
     setCompletedHostId(null);
     setFailedArtifacts([]);
     setDismissed(true);
+    return true;
   }
 
   function dismiss() {
@@ -331,7 +334,8 @@ export function usePipelineRun(onDone?: () => void): PipelineRun {
     setRunComplete(false);
   }
 
-  const hadError = logs.some((l) => l.line.includes("failed:") || l.line.includes("Traceback"));
+  // Derived from tracked failures — the log ring buffer can evict "failed:" lines.
+  const hadError = failedArtifacts.length > 0;
   const percent = runComplete
     ? 100
     : runningHostId && totalSteps > 0

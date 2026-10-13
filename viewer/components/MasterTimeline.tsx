@@ -6,12 +6,12 @@ import CircularProgress from "@mui/material/CircularProgress";
 import Tooltip from "@mui/material/Tooltip";
 import BookmarkBorderIcon from "@mui/icons-material/BookmarkBorder";
 import BookmarkIcon from "@mui/icons-material/Bookmark";
-import BugReportOutlinedIcon from "@mui/icons-material/BugReportOutlined";
 import HourglassEmptyOutlinedIcon from "@mui/icons-material/HourglassEmptyOutlined";
 import type { FetchLinkedRows, TimelineEntry, TimelineFacets, TimelinePageRow, TimelineQuery } from "@/lib/types";
 import { RecordScopeContext } from "@/lib/recordScope";
-import { rangeActive as globalRangeActive, type TimeRange } from "@/lib/timeRange";
+import { rangeActive as globalRangeActive, rangeBounds, type TimeRange } from "@/lib/timeRange";
 import { EXECUTION_SOURCE_LABELS, BROWSER_KIND_LABEL } from "@/lib/timelineKeys";
+import { groupCheckState, toggleGroupChild, toggleGroupParent, type FilterGroupNext } from "@/lib/timelineFilterGroup";
 import ReportProblemOutlinedIcon from "@mui/icons-material/ReportProblemOutlined";
 import TaskOutlinedIcon from "@mui/icons-material/TaskOutlined";
 import BoltOutlinedIcon from "@mui/icons-material/BoltOutlined";
@@ -19,7 +19,6 @@ import LanguageOutlinedIcon from "@mui/icons-material/LanguageOutlined";
 import DescriptionOutlinedIcon from "@mui/icons-material/DescriptionOutlined";
 import EventNoteOutlinedIcon from "@mui/icons-material/EventNoteOutlined";
 import TimelineOutlinedIcon2 from "@mui/icons-material/TimelineOutlined";
-import SortOutlinedIcon from "@mui/icons-material/SortOutlined";
 import TimelineOutlinedIcon from "@mui/icons-material/TimelineOutlined";
 import ViewListOutlinedIcon from "@mui/icons-material/ViewListOutlined";
 import { resolveArtifactView } from "@/lib/artifactViews";
@@ -28,7 +27,6 @@ import type { AccountDirectory } from "@/lib/accountIdentity";
 import PaginationControls from "@/components/PaginationControls";
 import { HeaderSearchInput, SortDropdown, ViewHeader } from "@/components/FilterControls";
 
-const ROW_HEIGHT = 52;
 const PAGE_SIZE = 10;
 // Bookmark context stays neutral, distinct from navigation blue and from
 // severity colours used by investigative evidence.
@@ -282,6 +280,9 @@ export default function MasterTimeline({ hostDir, onNavigate, onFetchLinkedRows,
   const [search, setSearch] = useState("");
   const [debouncedSearch, setDebouncedSearch] = useState("");
   const [facets, setFacets] = useState<TimelineFacets | null>(null);
+  // 패싯 실패는 메뉴 안에서만 알린다 — 페이지 조회 결과와 섞지 않는다.
+  const [facetError, setFacetError] = useState<string | null>(null);
+  const [facetNonce, setFacetNonce] = useState(0);
   const [pageData, setPageData] = useState<{ rows: TimelineEntry[]; total: number }>({ rows: [], total: 0 });
   const [loading, setLoading] = useState(true);
   // 페이지·패싯 조회 실패를 "데이터 없음"으로 보여주면 증거 부재로 오인된다.
@@ -298,24 +299,44 @@ export default function MasterTimeline({ hostDir, onNavigate, onFetchLinkedRows,
   // 아티팩트 필터 메뉴용 패싯(그룹·소스·건수) — 호스트당 1회.
   useEffect(() => {
     let cancelled = false;
+    setFacetError(null);
     void window.api
       .masterTimelineFacets(hostDir)
       .then((f) => {
         if (!cancelled) setFacets(f);
       })
       .catch((error) => {
-        if (!cancelled) setQueryError(error instanceof Error ? error.message : String(error));
+        if (!cancelled) setFacetError(error instanceof Error ? error.message : String(error));
       });
     return () => {
       cancelled = true;
     };
-  }, [hostDir, reloadNonce]);
+  }, [hostDir, facetNonce]);
 
   const globalActive = globalRangeActive(globalTimeRange);
+  const rangeStart = globalActive ? rangeBounds(globalTimeRange).start : "";
+  const rangeEnd = globalActive ? rangeBounds(globalTimeRange).end : "";
+  // 기간 입력도 디바운스 — 키 입력마다 전체 재조회하지 않는다.
+  const [debouncedRange, setDebouncedRange] = useState({ start: rangeStart, end: rangeEnd });
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setDebouncedRange((previous) => (previous.start === rangeStart && previous.end === rangeEnd ? previous : { start: rangeStart, end: rangeEnd }));
+    }, 250);
+    return () => clearTimeout(timer);
+  }, [rangeStart, rangeEnd]);
+
   // Set은 렌더마다 새 참조라 deps로 못 쓴다 — 정렬된 문자열 키로 안정화한다.
   const hiddenTablesKey = [...hiddenTables].sort().join(",");
   const hiddenExecKey = [...hiddenExecutionSources].sort().join(",");
   const hiddenBrowserKey = [...hiddenBrowserKinds].sort().join(",");
+
+  // 조건이 바뀌면 렌더 중에 첫 페이지로 돌린다 — 옛 page로 조회가 나가지 않는다.
+  const filterKey = JSON.stringify([sortDir, hiddenTablesKey, hiddenExecKey, hiddenBrowserKey, onlySuspicious, debouncedSearch, debouncedRange.start, debouncedRange.end]);
+  const [pageFilterKey, setPageFilterKey] = useState(filterKey);
+  if (pageFilterKey !== filterKey) {
+    setPageFilterKey(filterKey);
+    setPage(0);
+  }
 
   // 필터·정렬·검색·페이지·기간이 바뀔 때마다 백엔드에서 그 페이지만 조회한다.
   useEffect(() => {
@@ -327,8 +348,8 @@ export default function MasterTimeline({ hostDir, onNavigate, onFetchLinkedRows,
       hiddenExecSources: [...hiddenExecutionSources],
       hiddenBrowserKinds: [...hiddenBrowserKinds],
       onlySuspicious,
-      start: globalActive ? globalTimeRange.start : "",
-      end: globalActive ? globalTimeRange.end : "",
+      start: debouncedRange.start,
+      end: debouncedRange.end,
       sortDesc: sortDir === "desc",
       offset: page * PAGE_SIZE,
       limit: PAGE_SIZE,
@@ -351,7 +372,7 @@ export default function MasterTimeline({ hostDir, onNavigate, onFetchLinkedRows,
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hostDir, page, sortDir, hiddenTablesKey, hiddenExecKey, hiddenBrowserKey, onlySuspicious, debouncedSearch, globalActive, globalTimeRange.start, globalTimeRange.end, reloadNonce]);
+  }, [hostDir, page, sortDir, hiddenTablesKey, hiddenExecKey, hiddenBrowserKey, onlySuspicious, debouncedSearch, debouncedRange, reloadNonce]);
 
   // EventLog is a single analyst-facing artifact even though it is stored as
   // several per-source tables (Security, System, Application, ...).
@@ -427,65 +448,19 @@ export default function MasterTimeline({ hostDir, onNavigate, onFetchLinkedRows,
     setHiddenBrowserKinds(new Set(browserKinds.map(([kind]) => kind)));
   }
 
-  function toggleExecutionGroup() {
-    const tableHidden = hiddenTables.has("ExecutionHistory");
-    const allSourcesVisible = !tableHidden && executionSources.every((source) => !hiddenExecutionSources.has(source));
-    if (allSourcesVisible) {
-      setHiddenTables((previous) => new Set(previous).add("ExecutionHistory"));
-      return;
-    }
+  const executionGroup = { tableHidden: hiddenTables.has("ExecutionHistory"), hidden: hiddenExecutionSources };
+  const browserKindKeys = browserKinds.map(([kind]) => kind);
+  const browserGroup = { tableHidden: hiddenTables.has("BrowserActivity"), hidden: hiddenBrowserKinds };
+
+  // 실행이력·브라우저 그룹은 같은 규칙(테이블 숨김 + 하위 키 숨김)으로 토글한다.
+  function applyGroup(table: string, next: FilterGroupNext, setHidden: (hidden: Set<string>) => void) {
     setHiddenTables((previous) => {
-      const next = new Set(previous);
-      next.delete("ExecutionHistory");
-      return next;
+      const tables = new Set(previous);
+      if (next.tableHidden) tables.add(table);
+      else tables.delete(table);
+      return tables;
     });
-    setHiddenExecutionSources((previous) => {
-      const next = new Set(previous);
-      executionSources.forEach((source) => next.delete(source));
-      return next;
-    });
-  }
-
-  function toggleExecutionSource(source: string) {
-    const tableHidden = hiddenTables.has("ExecutionHistory");
-    if (tableHidden) {
-      setHiddenTables((previous) => {
-        const next = new Set(previous);
-        next.delete("ExecutionHistory");
-        return next;
-      });
-      setHiddenExecutionSources(new Set(executionSources.filter((candidate) => candidate !== source)));
-      return;
-    }
-    setHiddenExecutionSources((previous) => {
-      const next = new Set(previous);
-      if (next.has(source)) next.delete(source);
-      else next.add(source);
-      return next;
-    });
-  }
-
-  function toggleBrowserKind(kind: string) {
-    const tableHidden = hiddenTables.has("BrowserActivity");
-    if (tableHidden) {
-      setHiddenTables((previous) => {
-        const next = new Set(previous);
-        next.delete("BrowserActivity");
-        return next;
-      });
-      setHiddenBrowserKinds((previous) => {
-        const next = new Set(previous);
-        next.delete(kind);
-        return next;
-      });
-      return;
-    }
-    setHiddenBrowserKinds((previous) => {
-      const next = new Set(previous);
-      if (next.has(kind)) next.delete(kind);
-      else next.add(kind);
-      return next;
-    });
+    setHidden(next.hidden);
   }
 
   // 결과는 백엔드에서 이미 검색·필터·정렬·페이지된 경량 행이다(전량 상주 없음).
@@ -496,10 +471,6 @@ export default function MasterTimeline({ hostDir, onNavigate, onFetchLinkedRows,
   const pageRows = rows;
   const pageStart = total === 0 ? 0 : safePage * PAGE_SIZE + 1;
   const pageEnd = Math.min(total, safePage * PAGE_SIZE + PAGE_SIZE);
-  // 필터·정렬·검색·기간이 바뀌면 첫 페이지로 — 쿼리 effect도 같은 값에 반응한다.
-  useEffect(() => {
-    setPage(0);
-  }, [sortDir, hiddenTablesKey, hiddenExecKey, hiddenBrowserKey, globalActive, globalTimeRange.start, globalTimeRange.end, onlySuspicious, debouncedSearch]);
 
   // 첫 조회(표시할 데이터가 아직 없음)에만 전체 화면 로딩을 띄운다. 페이지
   // 이동·필터 변경 등 재조회는 기존 목록을 유지한 채 살짝 어둡게만 한다.
@@ -554,6 +525,12 @@ export default function MasterTimeline({ hostDir, onNavigate, onFetchLinkedRows,
                       <button type="button" onClick={hideAllArtifacts} style={{ fontSize: 11.5, background: "transparent", border: "none", color: "var(--text-dim)", cursor: "pointer", fontWeight: 650 }}>전체 해제</button>
                     </div>
                   </div>
+                  {facetError && (
+                    <div role="alert" style={{ display: "flex", alignItems: "center", gap: 8, padding: "7px 4px 0", fontSize: 12, color: "var(--danger)" }}>
+                      <span title={facetError} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>아티팩트 목록을 불러오지 못했습니다</span>
+                      <button type="button" onClick={() => setFacetNonce((value) => value + 1)} style={{ marginLeft: "auto", fontSize: 11.5, background: "transparent", border: "none", color: "var(--accent)", cursor: "pointer", fontWeight: 650 }}>다시 시도</button>
+                    </div>
+                  )}
                   <div style={{ display: "grid", gap: 2, paddingTop: 7 }}>
                     {artifactControls.map(({ label, category, tables }) => {
                       const tone = artifactChipTone(category, tables[0]);
@@ -561,10 +538,8 @@ export default function MasterTimeline({ hostDir, onNavigate, onFetchLinkedRows,
                       const isBrowserActivity = tables.length === 1 && tables[0] === "BrowserActivity";
                       if (!isExecutionHistory) {
                         if (isBrowserActivity && browserKinds.length > 0) {
-                          const tableHidden = hiddenTables.has("BrowserActivity");
-                          const visibleKindCount = browserKinds.filter(([kind]) => !hiddenBrowserKinds.has(kind)).length;
-                          const checked = !tableHidden && visibleKindCount === browserKinds.length;
-                          const indeterminate = visibleKindCount > 0 && visibleKindCount < browserKinds.length;
+                          const tableHidden = browserGroup.tableHidden;
+                          const { checked, indeterminate } = groupCheckState(browserGroup, browserKindKeys);
                           return (
                             <div
                               key={label}
@@ -579,19 +554,7 @@ export default function MasterTimeline({ hostDir, onNavigate, onFetchLinkedRows,
                                 checked={checked}
                                 indeterminate={indeterminate}
                                 tone={tone}
-                                onChange={() => {
-                                  if (!tableHidden && checked) {
-                                    setHiddenTables((previous) => new Set(previous).add("BrowserActivity"));
-                                    setHiddenBrowserKinds(new Set(browserKinds.map(([kind]) => kind)));
-                                  } else {
-                                    setHiddenTables((previous) => {
-                                      const next = new Set(previous);
-                                      next.delete("BrowserActivity");
-                                      return next;
-                                    });
-                                    setHiddenBrowserKinds(new Set());
-                                  }
-                                }}
+                                onChange={() => applyGroup("BrowserActivity", toggleGroupParent(browserGroup, browserKindKeys), setHiddenBrowserKinds)}
                               />
                               <div style={{ display: "grid", gap: 2, minWidth: 0, margin: "0 2px 4px 12px", paddingLeft: 8, borderLeft: `2px solid color-mix(in srgb, ${tone.border} 45%, var(--border))` }}>
                                 {browserKinds.map(([kind, count]) => (
@@ -601,7 +564,7 @@ export default function MasterTimeline({ hostDir, onNavigate, onFetchLinkedRows,
                                     checked={!tableHidden && !hiddenBrowserKinds.has(kind)}
                                     tone={tone}
                                     depth={1}
-                                    onChange={() => toggleBrowserKind(kind)}
+                                    onChange={() => applyGroup("BrowserActivity", toggleGroupChild(browserGroup, browserKindKeys, kind), setHiddenBrowserKinds)}
                                   />
                                 ))}
                               </div>
@@ -644,10 +607,8 @@ export default function MasterTimeline({ hostDir, onNavigate, onFetchLinkedRows,
                         return <ArtifactFilterCheckbox key={label} label={label} checked={visible} tone={tone} onChange={() => toggleTables(tables)} />;
                       }
 
-                      const tableHidden = hiddenTables.has("ExecutionHistory");
-                      const visibleSourceCount = tableHidden ? 0 : executionSources.filter((source) => !hiddenExecutionSources.has(source)).length;
-                      const checked = executionSources.length > 0 && visibleSourceCount === executionSources.length;
-                      const indeterminate = visibleSourceCount > 0 && !checked;
+                      const tableHidden = executionGroup.tableHidden;
+                      const { checked, indeterminate } = groupCheckState(executionGroup, executionSources);
                       return (
                         <div key={label} style={{ display: "grid", gap: 4 }}>
                           <ArtifactFilterCheckbox
@@ -655,7 +616,7 @@ export default function MasterTimeline({ hostDir, onNavigate, onFetchLinkedRows,
                             checked={checked}
                             indeterminate={indeterminate}
                             tone={tone}
-                            onChange={toggleExecutionGroup}
+                            onChange={() => applyGroup("ExecutionHistory", toggleGroupParent(executionGroup, executionSources), setHiddenExecutionSources)}
                           />
                           <div style={{ display: "grid", gap: 4, borderLeft: "2px solid var(--border)", marginLeft: 2, paddingLeft: 8, paddingBottom: 2 }}>
                             {executionSources.map((source) => (
@@ -665,7 +626,7 @@ export default function MasterTimeline({ hostDir, onNavigate, onFetchLinkedRows,
                                 checked={!tableHidden && !hiddenExecutionSources.has(source)}
                                 tone={tone}
                                 depth={1}
-                                onChange={() => toggleExecutionSource(source)}
+                                onChange={() => applyGroup("ExecutionHistory", toggleGroupChild(executionGroup, executionSources, source), setHiddenExecutionSources)}
                                 style={{
                                   border: "1px solid var(--border-subtle)",
                                   borderRadius: "var(--radius)",

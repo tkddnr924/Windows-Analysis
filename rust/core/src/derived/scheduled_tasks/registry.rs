@@ -186,20 +186,25 @@ pub(super) fn populate(ctx: &Ctx, db: &DerivedDb, index: &DefinitionIndex) -> Re
                 }
             };
             let normalized = uri.as_deref().map(normalize_task_path);
-            let (matched, mut status) = match &normalized {
+            let (mut matched, mut status) = match &normalized {
                 Some(path) => super::match_definition(index, path),
                 None => (None, "task_path_unknown".to_string()),
             };
             let mut basis = "taskcache_uri_vs_definition_path";
+            // Structural axis kept apart so a definition match is never hidden.
+            let mut tree_state = None;
             if *scope == "tree" {
                 let id = value("Id").unwrap_or_default().to_ascii_uppercase();
                 if id.is_empty() {
                     // A tree node without an Id is a folder, not a task.
+                    matched = None;
                     status = "tree_folder_node".into();
                     basis = "tree key has no Id value";
-                } else if !task_guids.contains_key(&id) {
-                    status = "tree_without_tasks_key".into();
-                    basis = "tree Id has no TaskCache\\Tasks key in this hive";
+                    tree_state = Some("folder_node");
+                } else if task_guids.contains_key(&id) {
+                    tree_state = Some("tasks_key_present");
+                } else {
+                    tree_state = Some("tasks_key_missing");
                 }
             }
             let primary = entry
@@ -224,8 +229,8 @@ pub(super) fn populate(ctx: &Ctx, db: &DerivedDb, index: &DefinitionIndex) -> Re
                 "INSERT INTO TaskRegistryEntries(entry_id,host_id,dataset_id,scope,guid,registry_path,key_last_write,
                  tree_path,task_uri,task_path_normalized,security_descriptor,hash_hex,id_value,index_value,schema_value,
                  version_value,triggers_hex,actions_hex,dynamic_info_hex,user_sid,matched_record_id,match_status,match_basis,
-                 source_dataset_id,source_db,source_table,source_rowid,source_file)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28)",
+                 tree_node_state,source_dataset_id,source_db,source_table,source_rowid,source_file)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29)",
                 params![
                     uuid::Uuid::new_v4().to_string(),
                     ctx.host_id,
@@ -250,6 +255,7 @@ pub(super) fn populate(ctx: &Ctx, db: &DerivedDb, index: &DefinitionIndex) -> Re
                     matched,
                     status,
                     basis,
+                    tree_state,
                     source.as_ref().map(|source| source.dataset.clone()),
                     source.as_ref().map(|source| source.db.clone()),
                     source.as_ref().map(|source| source.table.clone()),

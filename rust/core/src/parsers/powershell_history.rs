@@ -50,22 +50,22 @@ fn splitlines(text: &str) -> Vec<String> {
     parts.into_iter().map(|s| s.to_string()).collect()
 }
 
-pub fn parse_console_history(paths: &[PathBuf]) -> Result<Vec<Row>> {
+/// Parsed lines plus files that could not be read (path, reason).
+pub struct ConsoleHistory {
+    pub rows: Vec<Row>,
+    pub unreadable: Vec<(PathBuf, String)>,
+}
+
+pub fn parse_console_history(paths: &[PathBuf]) -> Result<ConsoleHistory> {
     let mut rows = Vec::new();
+    let mut unreadable = Vec::new();
     for path in paths {
         let source = path.to_string_lossy().to_string();
         let user = user_from_path(path);
         let text = match std::fs::read(path) {
             Ok(b) => String::from_utf8_lossy(&b).into_owned(),
             Err(e) => {
-                let mut r = Row::new();
-                r.insert("line_number".into(), String::new());
-                r.insert("command".into(), String::new());
-                r.insert("user".into(), user.clone());
-                r.insert("_source_file".into(), source.clone());
-                r.insert("_status".into(), "unreadable_file".into());
-                r.insert("_error".into(), e.to_string());
-                rows.push(r);
+                unreadable.push((path.clone(), e.to_string()));
                 continue;
             }
         };
@@ -78,5 +78,19 @@ pub fn parse_console_history(paths: &[PathBuf]) -> Result<Vec<Row>> {
             rows.push(r);
         }
     }
-    Ok(rows)
+    Ok(ConsoleHistory { rows, unreadable })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unreadable_file_is_reported_not_an_empty_row() {
+        let missing = std::env::temp_dir().join("wina-ps-missing-dir/ConsoleHost_history.txt");
+        let parsed = parse_console_history(std::slice::from_ref(&missing)).unwrap();
+        assert!(parsed.rows.is_empty());
+        assert_eq!(parsed.unreadable.len(), 1);
+        assert_eq!(parsed.unreadable[0].0, missing);
+    }
 }

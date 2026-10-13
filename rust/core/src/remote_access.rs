@@ -57,6 +57,16 @@ fn field(ed: &Map<String, Value>, names: &[&str]) -> String {
     String::new()
 }
 
+/// Peer address as stored: IPv4-mapped IPv6 folds to its IPv4 address and
+/// other IPs take their canonical text so one peer has one spelling. Anything
+/// that is not an IP (host name, zone-scoped IPv6) stays as recorded.
+fn peer_address(host: &str) -> String {
+    let host = host.trim();
+    host.parse::<std::net::IpAddr>()
+        .map(|ip| ip.to_canonical().to_string())
+        .unwrap_or_else(|_| host.to_string())
+}
+
 /// "ip:port", "[ipv6]:port" or a bare address. A bare IPv6 (several colons,
 /// no brackets) keeps every colon.
 fn split_host_port(raw: &str) -> (String, String) {
@@ -142,18 +152,20 @@ fn spec_for(provider: &str, eid: &str) -> Option<Spec> {
             "authentication",
             "RDP 네트워크 인증 성공",
         ),
-        (LSM, "21") => s("inbound", "성공", "logon", "RDP 세션 로그온"),
-        (LSM, "22") => s("inbound", "정보", "shell", "RDP 셸 시작"),
-        (LSM, "23") => s("inbound", "정보", "logoff", "RDP 세션 로그오프"),
-        (LSM, "24") => s("inbound", "정보", "disconnect", "RDP 세션 연결 끊김"),
-        (LSM, "25") => s("inbound", "성공", "reconnect", "RDP 세션 재연결"),
+        // LSM also records console sessions: inbound only with remote address
+        // evidence (fill_lsm) or carried remote session scope (relations).
+        (LSM, "21") => s("unknown", "성공", "logon", "RDP 세션 로그온"),
+        (LSM, "22") => s("unknown", "정보", "shell", "RDP 셸 시작"),
+        (LSM, "23") => s("unknown", "정보", "logoff", "RDP 세션 로그오프"),
+        (LSM, "24") => s("unknown", "정보", "disconnect", "RDP 세션 연결 끊김"),
+        (LSM, "25") => s("unknown", "성공", "reconnect", "RDP 세션 재연결"),
         (LSM, "39") => s(
-            "inbound",
+            "unknown",
             "정보",
             "disconnect",
             "RDP 세션 연결 끊김(다른 세션에 의해)",
         ),
-        (LSM, "40") => s("inbound", "정보", "disconnect", "RDP 세션 연결 끊김"),
+        (LSM, "40") => s("unknown", "정보", "disconnect", "RDP 세션 연결 끊김"),
         (AX, "1024") => s("outbound", "정보", "transport", "RDP 아웃바운드 연결 시도"),
         (AX, "1025") => s("outbound", "성공", "transport", "RDP 아웃바운드 연결됨"),
         (AX, "1026") => s("outbound", "정보", "disconnect", "RDP 아웃바운드 연결 끊김"),
@@ -208,16 +220,11 @@ fn common(src: &Row) -> Row {
     let source_file = g(src, "_source_file");
     set(&mut row, "source_file", source_file);
     set(&mut row, "_source_file", source_file);
-    let key = g(src, "_record_key");
-    set(
-        &mut row,
-        "source_scope",
-        key.rsplit_once("::").map(|(t, _)| t).unwrap_or(key),
-    );
     row
 }
 
 /// Placeholder GUIDs (all zeroes, with or without braces) identify nothing.
+/// The single rule for GUID identifiers: correlation trusts its output.
 fn genuine_guid(value: &str) -> bool {
     uuid::Uuid::parse_str(value.trim()).is_ok_and(|id| !id.is_nil())
 }
@@ -261,7 +268,7 @@ fn set_scope_address(row: &mut Row, address: &str, console: bool) {
         row.insert("direction".into(), "unknown".into());
     } else if !address.is_empty() {
         row.insert("access_scope".into(), "remote".into());
-        set(row, "remote_address", address);
+        set(row, "remote_address", peer_address(address));
     }
 }
 
@@ -352,7 +359,7 @@ fn fill_security(row: &mut Row, eid: &str, ed: &Map<String, Value>) {
     row.insert("access_scope".into(), "remote".into());
     let address = clean(field(ed, &["IpAddress"]));
     set(row, "remote_address_raw", address.as_str());
-    set(row, "remote_address", address);
+    set(row, "remote_address", peer_address(&address));
     // Port 0 is a recorded value, "-" is no value.
     set(row, "remote_port", clean(field(ed, &["IpPort"])));
 }
@@ -375,6 +382,9 @@ fn fill_lsm(row: &mut Row, ed: &Map<String, Value>) {
     set(row, "reason", clean(field(ed, &["Reason"])));
     set(row, "source_session", clean(field(ed, &["Source"])));
     set_scope_address(row, &clean(field(ed, &["Address"])), false);
+    if g(row, "access_scope") == "remote" {
+        row.insert("direction".into(), "inbound".into());
+    }
 }
 
 fn fill_rcm(row: &mut Row, ed: &Map<String, Value>) {
@@ -395,7 +405,7 @@ fn fill_core(row: &mut Row, eid: &str, ed: &Map<String, Value>) {
             let (host, port) = split_host_port(&raw);
             if !host.is_empty() {
                 row.insert("access_scope".into(), "remote".into());
-                set(row, "remote_address", host);
+                set(row, "remote_address", peer_address(&host));
                 set(row, "remote_port", port);
             }
         }
@@ -553,7 +563,7 @@ mod tests {
     // --- common fields -----------------------------------------------------
 
     #[test]
-    fn common_fields_come_from_facts_and_source_scope_is_the_table_prefix() {
+    fn common_fields_come_from_facts() {
         let rows = classify_rows(vec![lsm(
             "21",
             r#"{"EventXML": {"User": "WIN-GGCIBKR6A2I\\Administrator", "SessionID": 1, "Address": "LOCAL"}}"#,
@@ -578,7 +588,6 @@ mod tests {
         assert_eq!(g(r, "record_key"), "LSMTABLE::7");
         assert_eq!(g(r, "source_file"), "/case/EVENTLOG/Logs/LSM.evtx");
         assert_eq!(g(r, "_source_file"), "/case/EVENTLOG/Logs/LSM.evtx");
-        assert_eq!(g(r, "source_scope"), "LSMTABLE");
         assert_eq!(
             g(r, "event_data"),
             r#"{"EventXML": {"User": "WIN-GGCIBKR6A2I\\Administrator", "SessionID": 1, "Address": "LOCAL"}}"#
@@ -713,6 +722,8 @@ mod tests {
         )]);
         let r = &rows[0];
         assert_eq!(g(r, "access_scope"), "remote");
+        // RD-05: only proven remote address evidence makes LSM inbound.
+        assert_eq!(g(r, "direction"), "inbound");
         assert_eq!(g(r, "stage"), "reconnect");
         assert_eq!(g(r, "remote_address"), "59.19.252.187");
         assert_eq!(g(r, "remote_address_raw"), "59.19.252.187");
@@ -735,7 +746,8 @@ mod tests {
             assert_eq!(rows.len(), 1, "event {eid}");
             assert_eq!(g(&rows[0], "stage"), stage, "event {eid}");
             assert_eq!(g(&rows[0], "result"), result, "event {eid}");
-            assert_eq!(g(&rows[0], "direction"), "inbound", "event {eid}");
+            // RD-05: no address evidence, so the direction stays unknown.
+            assert_eq!(g(&rows[0], "direction"), "unknown", "event {eid}");
         }
     }
 
@@ -814,7 +826,6 @@ mod tests {
         assert_eq!(g(r, "workstation_name"), "WIN-GGCIBKR6A2I");
         assert!(!r.contains_key("remote_computer"));
         assert!(!r.contains_key("session_id"));
-        assert!(!r.contains_key("local_address"));
     }
 
     #[test]
@@ -920,7 +931,7 @@ mod tests {
             assert!(!r.contains_key("stage"));
             assert!(!r.contains_key("access_scope"));
             assert!(!r.contains_key("result"));
-            assert_eq!(g(r, "source_scope"), "Security");
+            assert_eq!(g(r, "record_key"), "Security::4924");
         }
     }
 
@@ -1087,6 +1098,27 @@ mod tests {
     }
 
     #[test]
+    fn ipv4_mapped_peers_fold_to_the_ipv4_address_and_keep_the_raw_token() {
+        let s4624 = S4624_T10.replace("59.19.252.187", "::ffff:59.19.252.187");
+        let rows = classify_rows(vec![
+            sec("4624", &s4624),
+            rcm(
+                "1149",
+                r#"{"EventXML": {"Param1": "a", "Param3": "::FFFF:10.0.0.9"}}"#,
+            ),
+            core("131", r#"{"ClientIP": "[::ffff:10.0.0.5]:3389"}"#),
+            core("131", r#"{"ClientIP": "FE80::1"}"#),
+        ]);
+        assert_eq!(g(&rows[0], "remote_address"), "59.19.252.187");
+        assert_eq!(g(&rows[0], "remote_address_raw"), "::ffff:59.19.252.187");
+        assert_eq!(g(&rows[1], "remote_address"), "10.0.0.9");
+        assert_eq!(g(&rows[1], "remote_address_raw"), "::FFFF:10.0.0.9");
+        assert_eq!(g(&rows[2], "remote_address"), "10.0.0.5");
+        assert_eq!(g(&rows[2], "remote_port"), "3389");
+        assert_eq!(g(&rows[3], "remote_address"), "fe80::1");
+    }
+
+    #[test]
     fn core_135_is_a_transport_warning_not_an_rdp_failure() {
         let rows = classify_rows(vec![core(
             "135",
@@ -1192,9 +1224,8 @@ mod tests {
         assert_eq!(g(&rows[1], "access_scope"), "unknown");
         assert_eq!(g(&rows[2], "stage"), "disconnect");
         assert_eq!(g(&rows[3], "remote_address"), "10.1.1.9");
-        // Process scope is available for correlation; no connection id exists.
+        // Process scope is available for correlation.
         assert_eq!(g(&rows[0], "process_id"), "4242");
-        assert!(!rows[0].contains_key("connection_id"));
     }
 
     #[test]

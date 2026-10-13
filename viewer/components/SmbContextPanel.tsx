@@ -2,7 +2,8 @@
 // SMB 관련 기록 (docs-09 A02/A03) — 저장된 SmbRelations로 접속 기록 아래에 관련 기록을
 // 묶고, 연결되지 않은 기록(NTLM 검증·경계 등)은 단독 행으로 시간순 표시한다.
 import LinkOutlinedIcon from "@mui/icons-material/LinkOutlined";
-import { formatEvidenceTimestamp } from "@/lib/timeRange";
+import { evidenceTime } from "@/components/EventCards";
+import { resultColor } from "@/lib/eventCards";
 import { CONTEXT_KIND_LABELS, RELATION_LABELS, type ContextItem } from "@/lib/smbHistory";
 
 type Row = Record<string, string>;
@@ -15,8 +16,6 @@ const KIND_COLOR: Record<string, string> = {
   logon_instance_end: "var(--text-dim)",
   log_cleared: "var(--danger)",
 };
-const RESULT_COLOR: Record<string, string> = { 성공: "var(--success)", 실패: "var(--danger)" };
-const time = (value: string | undefined) => (value ? formatEvidenceTimestamp(value) : "시각 미상");
 const colorOf = (kind: string) => KIND_COLOR[kind] ?? "var(--text-faint)";
 
 function Badge({ color, children }: { color: string; children: React.ReactNode }) {
@@ -33,7 +32,7 @@ function Step({ color, label, row, last, onOpen }: { color: string; label: strin
       <span aria-hidden="true" style={{ position: "absolute", left: 18, top: "50%", width: 9, height: 9, marginTop: -4.5, borderRadius: "50%", background: color, boxShadow: `0 0 0 3px color-mix(in srgb, ${color} 20%, transparent)` }} />
       {!last && <span aria-hidden="true" style={{ position: "absolute", left: 22, top: "calc(50% + 7px)", height: "calc(100% - 4px)", width: 1, background: "var(--border)" }} />}
       <Badge color={color}>{label}</Badge>
-      <span style={{ fontFamily: "var(--mono)", fontSize: 12.5, color: row.timestamp ? "var(--text-time)" : "var(--text-faint)" }}>{time(row.timestamp)}</span>
+      <span style={{ fontFamily: "var(--mono)", fontSize: 12.5, color: row.timestamp ? "var(--text-time)" : "var(--text-faint)" }}>{evidenceTime(row.timestamp)}</span>
     </button>
   );
 }
@@ -77,10 +76,10 @@ export default function SmbContextPanel({ items, accountText, onOpen }: {
             onMouseLeave={(e) => { e.currentTarget.style.background = "var(--bg-panel)"; }}
             style={{ display: "flex", alignItems: "center", gap: 10, minHeight: 38, padding: "6px 14px", border: "1px solid var(--border)", borderRadius: "var(--radius)", background: "var(--bg-panel)", color: "var(--text)", cursor: "pointer", textAlign: "left", fontSize: 12.5 }}>
             <Badge color={color}>{CONTEXT_KIND_LABELS[row.event_type] ?? row.description}</Badge>
-            <span style={{ fontFamily: "var(--mono)", fontSize: 12.5, color: row.timestamp ? "var(--text-time)" : "var(--text-faint)", width: 176, flexShrink: 0 }}>{time(row.timestamp)}</span>
+            <span style={{ fontFamily: "var(--mono)", fontSize: 12.5, color: row.timestamp ? "var(--text-time)" : "var(--text-faint)", width: 176, flexShrink: 0 }}>{evidenceTime(row.timestamp)}</span>
             {row.workstation_name && <span style={{ fontFamily: "var(--mono)", color: "var(--text-dim)" }}>{row.workstation_name}</span>}
             {account && <span style={{ color: "var(--text-dim)" }}>{account}</span>}
-            {RESULT_COLOR[row.result] && <span style={{ marginLeft: "auto", fontSize: 11.5, fontWeight: 700, color: RESULT_COLOR[row.result] }}>{row.result}</span>}
+            {row.result && <span style={{ marginLeft: "auto", fontSize: 11.5, fontWeight: 700, color: resultColor(row.result) }}>{row.result}</span>}
           </button>
         );
       })}

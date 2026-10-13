@@ -630,13 +630,6 @@ fn list_cases() -> ListCasesResult {
 }
 
 #[tauri::command]
-fn create_case(name: String) -> Result<Case, String> {
-    let cd = cases_dir();
-    let c = case_store::create_case(&name, &case_store::now(), &cd).map_err(|e| e.to_string())?;
-    Ok(gui_case(&c, &cd))
-}
-
-#[tauri::command]
 fn create_host(case_id: String, name: String, target_dir: String) -> Result<Host, String> {
     let cd = cases_dir();
     let h = case_store::create_host(&case_id, &name, &target_dir, &case_store::now(), &cd)
@@ -657,14 +650,6 @@ fn rename_host(case_id: String, host_id: String, name: String) -> Result<Host, S
 
 fn valid_id(id: &str) -> bool {
     !id.is_empty() && id != "." && id != ".." && !id.contains(['/', '\\']) && !id.contains("..")
-}
-
-#[tauri::command]
-fn delete_case(case_id: String) -> bool {
-    // CASE_* folders no longer exist. Refuse this legacy broad-delete command
-    // rather than risking removal of the direct host-store root.
-    let _ = case_id;
-    false
 }
 
 #[tauri::command]
@@ -692,6 +677,7 @@ fn delete_host_dir_and_bookmarks(case_dir: &Path, host_id: &str) -> bool {
     // rows live under a host directory. Delete only annotations tied to the removed host
     // after its output directory has been removed. `hostName` is deliberately
     // not used: several registered hosts can share a display name.
+    let _guard = lock_bookmarks();
     let bookmarks = match read_bookmarks_path(case_dir) {
         Ok(bookmarks) => bookmarks,
         Err(_) => return false,
@@ -829,11 +815,14 @@ fn record_child_exit(log_path: &Path, exit_code: Option<i32>) {
 /// cannot mistake a source failure for success.  The durable report carries
 /// the finer terminal state; read only that tiny manifest here rather than
 /// inferring meaning from the child exit code.
-fn terminal_pipeline_status(host_dir: &Path, exit_code: Option<i32>) -> &'static str {
+fn terminal_pipeline_status(host_dir: &Path, run_id: &str, exit_code: Option<i32>) -> &'static str {
     if exit_code == Some(0) {
         return "complete";
     }
-    let is_partial = std::fs::read_to_string(host_dir.join("parse_report.json"))
+    // Trust only this run's immutable manifest; a crash before reporting
+    // must not inherit a prior run's status from parse_report.json.
+    let manifest = pipeline::parse_run_log_path(host_dir, run_id).with_extension("json");
+    let is_partial = std::fs::read_to_string(manifest)
         .ok()
         .and_then(|payload| serde_json::from_str::<serde_json::Value>(&payload).ok())
         .and_then(|report| {
@@ -898,11 +887,17 @@ fn pipeline_result(
 /// GUI cancellation kills the worker deliberately, so the worker cannot write
 /// its own final manifest. Persist an explicit terminal record in the parent
 /// instead of leaving a prior successful report/status visible after reload.
-fn write_cancelled_terminal_state(case_id: &str, host_id: &str, run_id: &str) {
-    write_cancelled_terminal_state_at(&cases_dir(), case_id, host_id, run_id);
+fn write_cancelled_terminal_state(case_id: &str, host_id: &str, run_id: &str, child_started: bool) {
+    write_cancelled_terminal_state_at(&cases_dir(), case_id, host_id, run_id, child_started);
 }
 
-fn write_cancelled_terminal_state_at(cases: &Path, case_id: &str, host_id: &str, run_id: &str) {
+fn write_cancelled_terminal_state_at(
+    cases: &Path,
+    case_id: &str,
+    host_id: &str,
+    run_id: &str,
+    child_started: bool,
+) {
     if !valid_id(case_id) || !valid_id(host_id) || !valid_id(run_id) {
         return;
     }
@@ -926,6 +921,10 @@ fn write_cancelled_terminal_state_at(cases: &Path, case_id: &str, host_id: &str,
         let _ = std::fs::create_dir_all(parent);
     }
     let _ = std::fs::write(run_manifest, &payload);
+    // No worker ran: prior results and report stay valid.
+    if !child_started {
+        return;
+    }
     let temporary = host_dir.join("parse_report.json.cancelled-staging");
     if std::fs::write(&temporary, payload).is_ok() {
         let _ = std::fs::rename(temporary, host_dir.join("parse_report.json"));
@@ -1098,7 +1097,7 @@ async fn run_host(
                 let app = app.clone();
                 let run_id = event_run_id.clone();
                 let host_id = event_host_id.clone();
-                std::thread::spawn(move || {
+                Some(std::thread::spawn(move || {
                     use std::io::BufRead;
                     for line in std::io::BufReader::new(r).lines().map_while(Result::ok) {
                         if line.is_empty() {
@@ -1106,25 +1105,34 @@ async fn run_host(
                         }
                         emit_pipeline_event(&app, &run_id, &host_id, "running", stream, line);
                     }
-                });
+                }))
+            } else {
+                None
             }
         };
-    pump(
-        &app,
-        child
-            .stdout
-            .take()
-            .map(|o| Box::new(o) as Box<dyn std::io::Read + Send>),
-        "stdout",
-    );
-    pump(
-        &app,
-        child
-            .stderr
-            .take()
-            .map(|e| Box::new(e) as Box<dyn std::io::Read + Send>),
-        "stderr",
-    );
+    // Joined before any terminal event so a late "running" line cannot
+    // overwrite the final status on the receiver.
+    let pumps: Vec<std::thread::JoinHandle<()>> = [
+        pump(
+            &app,
+            child
+                .stdout
+                .take()
+                .map(|o| Box::new(o) as Box<dyn std::io::Read + Send>),
+            "stdout",
+        ),
+        pump(
+            &app,
+            child
+                .stderr
+                .take()
+                .map(|e| Box::new(e) as Box<dyn std::io::Read + Send>),
+            "stderr",
+        ),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
 
     // A targeted cancel can race process creation. If it did, terminate the
     // newly-created child before publishing it as a running task.
@@ -1145,6 +1153,7 @@ async fn run_host(
         let killed = child.kill().is_ok();
         let _ = child.wait();
         record_forced_gui_cancel(&log_path, killed);
+        join_output_pumps(pumps).await;
         emit_pipeline_event(
             &app,
             &run_id,
@@ -1180,27 +1189,36 @@ async fn run_host(
 
     // Poll for exit so cancel_pipeline can still reach the child while it runs.
     loop {
+        // Outer None: cancel took the entry out of the map after killing it.
         let exit = {
             let mut scheduler = state
                 .0
                 .lock()
                 .map_err(|_| "pipeline scheduler unavailable")?;
-            match scheduler.running.get_mut(&run_id) {
-                Some(running) => running.child.try_wait().ok().flatten().map(|status| {
+            scheduler.running.get_mut(&run_id).map(|running| {
+                running.child.try_wait().ok().flatten().map(|status| {
                     let exit_code = status.code();
                     let log_path = running.log_path.clone();
                     (exit_code, log_path)
-                }),
-                // A cancel takes the entry out of the map after killing it.
-                None => {
-                    return Ok(pipeline_result(
-                        &run_id,
-                        &options.host_id,
-                        "cancelled",
-                        None,
-                    ))
-                }
-            }
+                })
+            })
+        };
+        let Some(exit) = exit else {
+            join_output_pumps(pumps).await;
+            emit_pipeline_event(
+                &app,
+                &run_id,
+                &options.host_id,
+                "cancelled",
+                "lifecycle",
+                "[LIFECYCLE] cancellation requested",
+            );
+            return Ok(pipeline_result(
+                &run_id,
+                &options.host_id,
+                "cancelled",
+                None,
+            ));
         };
         if let Some((exit_code, log_path)) = exit {
             if let Ok(mut scheduler) = state.0.lock() {
@@ -1209,7 +1227,8 @@ async fn run_host(
                 scheduler.case_ids.remove(&run_id);
             }
             record_child_exit(&log_path, exit_code);
-            let terminal = terminal_pipeline_status(&host_dir, exit_code);
+            join_output_pumps(pumps).await;
+            let terminal = terminal_pipeline_status(&host_dir, &run_id, exit_code);
             // 발행이 일어난 실행(complete/partial)은 이 호스트의 테이블을 다시
             // 썼다 — 이전 북마크의 rowid 참조가 무효라 삭제한다.
             if terminal == "complete" || terminal == "partial" {
@@ -1246,6 +1265,17 @@ async fn run_host(
     }
 }
 
+/// Wait until stdout/stderr pumps have forwarded every buffered line.
+async fn join_output_pumps(pumps: Vec<std::thread::JoinHandle<()>>) {
+    tauri::async_runtime::spawn_blocking(move || {
+        for pump in pumps {
+            let _ = pump.join();
+        }
+    })
+    .await
+    .ok();
+}
+
 async fn tokio_sleep(ms: u64) {
     // Small helper so the poll loop yields instead of blocking an async worker.
     tauri::async_runtime::spawn_blocking(move || {
@@ -1279,7 +1309,7 @@ fn cancel_pipeline(
         run_id.into_iter().collect()
     };
     let mut changed = false;
-    let mut cancelled_contexts = Vec::<(String, String, String)>::new();
+    let mut cancelled_contexts = Vec::<(String, String, String, bool)>::new();
     for id in target_ids.into_iter().collect::<HashSet<_>>() {
         if scheduler.queued.remove(&id) || scheduler.reserving.remove(&id) {
             scheduler.cancelled.insert(id.clone());
@@ -1294,7 +1324,7 @@ fn cancel_pipeline(
                 "[LIFECYCLE] cancelled while queued",
             );
             if !case_id.is_empty() && !host_id.is_empty() {
-                cancelled_contexts.push((id.clone(), case_id, host_id));
+                cancelled_contexts.push((id.clone(), case_id, host_id, false));
             }
             changed = true;
         }
@@ -1304,23 +1334,16 @@ fn cancel_pipeline(
             record_forced_gui_cancel(&running.log_path, killed);
             let host_id = scheduler.host_ids.remove(&id).unwrap_or_default();
             let case_id = scheduler.case_ids.remove(&id).unwrap_or_default();
-            emit_pipeline_event(
-                &app,
-                &id,
-                &host_id,
-                "cancelled",
-                "lifecycle",
-                "[LIFECYCLE] cancellation requested",
-            );
+            // run_host emits the terminal event after draining output pumps.
             if !case_id.is_empty() && !host_id.is_empty() {
-                cancelled_contexts.push((id.clone(), case_id, host_id));
+                cancelled_contexts.push((id.clone(), case_id, host_id, true));
             }
             changed = true;
         }
     }
     drop(scheduler);
-    for (id, case_id, host_id) in cancelled_contexts {
-        write_cancelled_terminal_state(&case_id, &host_id, &id);
+    for (id, case_id, host_id, child_started) in cancelled_contexts {
+        write_cancelled_terminal_state(&case_id, &host_id, &id, child_started);
     }
     changed
 }
@@ -1348,24 +1371,23 @@ fn has_internal_pipeline_path_component(path: &Path) -> bool {
 }
 
 #[tauri::command]
-fn list_categories(host_dir: String) -> Vec<CategoryEntry> {
+fn list_categories(host_dir: String) -> Result<Vec<CategoryEntry>, String> {
     let mut out = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(&host_dir) {
-        for e in rd.flatten() {
-            if e.path().is_dir() {
-                let name = e.file_name().to_string_lossy().to_string();
-                if is_internal_pipeline_directory(&name) {
-                    continue;
-                }
-                out.push(CategoryEntry {
-                    full_path: e.path().to_string_lossy().to_string(),
-                    name,
-                });
+    let rd = std::fs::read_dir(&host_dir).map_err(|error| error.to_string())?;
+    for e in rd.flatten() {
+        if e.path().is_dir() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if is_internal_pipeline_directory(&name) {
+                continue;
             }
+            out.push(CategoryEntry {
+                full_path: e.path().to_string_lossy().to_string(),
+                name,
+            });
         }
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
-    out
+    Ok(out)
 }
 
 fn valid_saving_token(token: &str) -> bool {
@@ -1554,7 +1576,7 @@ fn timeline_db_building_path(host_dir: &str, token: &str) -> PathBuf {
 /// 이유는 검색 문자열을 만들 때 프런트가 쓰던 값 순서와 같아야 하기 때문이다.
 fn read_source_rows_by_rowid(
     refs: &[(String, String, i64)],
-) -> std::collections::HashMap<(String, i64), Vec<(String, Value)>> {
+) -> std::collections::HashMap<(String, String, i64), Vec<(String, Value)>> {
     let mut by_file: std::collections::HashMap<(String, String), Vec<i64>> =
         std::collections::HashMap::new();
     for (path, table, rowid) in refs {
@@ -1598,7 +1620,7 @@ fn read_source_rows_by_rowid(
                     }
                     values.push((name.clone(), value));
                 }
-                out.insert((path.clone(), rowid), values);
+                out.insert((path.clone(), table.clone(), rowid), values);
             }
         }
     }
@@ -1653,7 +1675,9 @@ struct TimelineInsertRow {
 }
 
 struct TimelineBuildSession {
-    conn: rusqlite::Connection,
+    /// Taken (closed) by finish/abort under the lock, so a worker still
+    /// holding the Arc cannot keep the file open across rename/remove.
+    conn: Option<rusqlite::Connection>,
     host_dir: String,
     building_path: PathBuf,
     pending: usize,
@@ -1726,7 +1750,7 @@ fn timeline_build_begin_impl(
             token.to_string(),
             std::sync::Arc::new((
                 Mutex::new(TimelineBuildSession {
-                    conn,
+                    conn: Some(conn),
                     host_dir: host_dir.to_string(),
                     building_path: building,
                     pending: 0,
@@ -1780,6 +1804,8 @@ fn timeline_build_insert_impl(
             let mut session = worker.0.lock().map_err(|_| "빌드 세션 잠금 실패".to_string())?;
             let tx = session
                 .conn
+                .as_mut()
+                .ok_or_else(|| "타임라인 빌드 세션이 이미 닫혔습니다".to_string())?
                 .transaction()
                 .map_err(|e| format!("타임라인 트랜잭션 실패: {e}"))?;
             {
@@ -1790,7 +1816,7 @@ fn timeline_build_insert_impl(
                     .map_err(|e| format!("타임라인 insert 준비 실패: {e}"))?;
                 for r in &rows {
                     let blob = sources
-                        .get(&(r.full_path.clone(), r.rowid_src))
+                        .get(&(r.full_path.clone(), r.source_table.clone(), r.rowid_src))
                         .map(|values| timeline_search_blob(&r.source_table, &r.category, values))
                         .unwrap_or_default();
                     stmt.execute(rusqlite::params![
@@ -1860,16 +1886,20 @@ fn timeline_build_finish_impl(host_dir: &str, token: &str) -> Result<(), String>
             .ok()
             .and_then(|s| s.get(token).cloned())
             .ok_or_else(|| "타임라인 빌드 세션이 없습니다".to_string())?;
-        let session = handle.0.lock().map_err(|_| "빌드 세션 잠금 실패".to_string())?;
-        session
+        let mut session = handle.0.lock().map_err(|_| "빌드 세션 잠금 실패".to_string())?;
+        let conn = session
             .conn
-            .execute_batch(
-                "CREATE INDEX ix_ts ON master_timeline(ts); CREATE INDEX ix_group ON master_timeline(artifact_group);",
-            )
-            .map_err(|e| format!("타임라인 인덱스 생성 실패: {e}"))?;
+            .take()
+            .ok_or_else(|| "타임라인 빌드 세션이 이미 닫혔습니다".to_string())?;
+        conn.execute_batch(
+            "CREATE INDEX ix_ts ON master_timeline(ts); CREATE INDEX ix_group ON master_timeline(artifact_group);",
+        )
+        .map_err(|e| format!("타임라인 인덱스 생성 실패: {e}"))?;
+        // Close the file before rename (Windows has no FILE_SHARE_DELETE).
+        conn.close()
+            .map_err(|(_, e)| format!("타임라인 DB 닫기 실패: {e}"))?;
         session.building_path.clone()
     };
-    // 세션 제거 → conn drop(파일 닫힘) → 원자 rename.
     if let Ok(mut sessions) = timeline_build_sessions().lock() {
         sessions.remove(token);
     }
@@ -1877,11 +1907,24 @@ fn timeline_build_finish_impl(host_dir: &str, token: &str) -> Result<(), String>
         .map_err(|e| format!("타임라인 DB 확정 실패: {e}"))
 }
 
-fn timeline_build_abort_impl(host_dir: &str, token: &str) {
-    if let Ok(mut sessions) = timeline_build_sessions().lock() {
-        sessions.remove(token);
+fn timeline_build_abort_impl(host_dir: &str, token: &str) -> Result<(), String> {
+    let handle = timeline_build_sessions()
+        .lock()
+        .ok()
+        .and_then(|s| s.get(token).cloned());
+    if let Some(handle) = handle {
+        let mut session = handle.0.lock().map_err(|_| "빌드 세션 잠금 실패".to_string())?;
+        if session.host_dir != host_dir {
+            return Err("타임라인 빌드 세션의 호스트 경로가 일치하지 않습니다".to_string());
+        }
+        drop(session.conn.take());
+        drop(session);
+        if let Ok(mut sessions) = timeline_build_sessions().lock() {
+            sessions.remove(token);
+        }
     }
     let _ = std::fs::remove_file(timeline_db_building_path(host_dir, token));
+    Ok(())
 }
 
 #[tauri::command]
@@ -1947,10 +1990,10 @@ async fn master_timeline_build_finish(host_dir: String, token: String) -> Result
 
 #[tauri::command]
 async fn master_timeline_build_abort(host_dir: String, token: String) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        timeline_build_abort_impl(&host_dir, &token);
-        Ok(())
-    })
+    if !valid_saving_token(&token) {
+        return Err("타임라인 빌드 토큰이 잘못되었습니다".to_string());
+    }
+    tauri::async_runtime::spawn_blocking(move || timeline_build_abort_impl(&host_dir, &token))
     .await
     .map_err(|e| format!("타임라인 빌드 작업이 중단되었습니다: {e}"))?
 }
@@ -2234,7 +2277,7 @@ fn timeline_page_impl(host_dir: &str, query: TimelineQuery) -> Result<TimelinePa
     let sources = read_source_rows_by_rowid(&refs);
     let mut rows = rows;
     for row in &mut rows {
-        if let Some(values) = sources.get(&(row.full_path.clone(), row.rowid_src)) {
+        if let Some(values) = sources.get(&(row.full_path.clone(), row.source_table.clone(), row.rowid_src)) {
             row.row = values.iter().cloned().collect();
         }
     }
@@ -2280,12 +2323,18 @@ struct ResultFileEntry {
     row_count: i64,
     /// True for _OVERVIEW contract DBs; false for raw parser facts.
     derived: bool,
+    /// Set when the file or table could not be read; never shown as 0 rows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    read_error: Option<String>,
 }
 
 fn find_result_files(dir: &Path, base: &Path, out: &mut Vec<ResultFileEntry>) {
     let rd = match std::fs::read_dir(dir) {
         Ok(r) => r,
-        Err(_) => return,
+        Err(error) => {
+            out.push(unreadable_result_entry(dir, base, error.to_string()));
+            return;
+        }
     };
     for e in rd.flatten() {
         let p = e.path();
@@ -2302,15 +2351,25 @@ fn find_result_files(dir: &Path, base: &Path, out: &mut Vec<ResultFileEntry>) {
         if p.extension().map(|x| x != "sqlite").unwrap_or(true) {
             continue;
         }
-        if std::fs::metadata(&p)
-            .map(|m| m.len() <= EMPTY_SQLITE_MAX_BYTES)
-            .unwrap_or(true)
-        {
-            continue;
+        match std::fs::metadata(&p) {
+            Ok(meta) if meta.len() <= EMPTY_SQLITE_MAX_BYTES => continue,
+            Ok(_) => {}
+            Err(error) => {
+                out.push(unreadable_result_entry(&p, base, error.to_string()));
+                continue;
+            }
         }
-        let conn = match open_ro(&p.to_string_lossy()) {
+        // Opening is lazy; reading the schema proves the file is a database.
+        let conn = match open_ro(&p.to_string_lossy()).and_then(|conn| {
+            conn.query_row("SELECT COUNT(*) FROM sqlite_master", [], |r| r.get::<_, i64>(0))
+                .map_err(|e| e.to_string())?;
+            Ok(conn)
+        }) {
             Ok(c) => c,
-            Err(_) => continue,
+            Err(error) => {
+                out.push(unreadable_result_entry(&p, base, error));
+                continue;
+            }
         };
         let file_name = p
             .file_stem()
@@ -2327,9 +2386,12 @@ fn find_result_files(dir: &Path, base: &Path, out: &mut Vec<ResultFileEntry>) {
         // A contract DB contributes one sidebar entry: source_records and child
         // tables are detail-only, not separate result files.
         for t in visible_table_names(&conn, &p) {
-            let count: i64 = conn
+            let (count, read_error) = match conn
                 .query_row(&format!("SELECT COUNT(*) FROM {}", q(&t)), [], |r| r.get(0))
-                .unwrap_or(0);
+            {
+                Ok(count) => (count, None),
+                Err(error) => (0, Some(error.to_string())),
+            };
             out.push(ResultFileEntry {
                 name: t.clone(),
                 file_name: file_name.clone(),
@@ -2338,8 +2400,26 @@ fn find_result_files(dir: &Path, base: &Path, out: &mut Vec<ResultFileEntry>) {
                 full_path: p.to_string_lossy().to_string(),
                 row_count: count,
                 derived,
+                read_error,
             });
         }
+    }
+}
+
+fn unreadable_result_entry(path: &Path, base: &Path, error: String) -> ResultFileEntry {
+    let file_name = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    ResultFileEntry {
+        name: file_name.clone(),
+        file_name,
+        table_name: String::new(),
+        relative_path: path.strip_prefix(base).unwrap_or(path).to_string_lossy().to_string(),
+        full_path: path.to_string_lossy().to_string(),
+        row_count: 0,
+        derived: false,
+        read_error: Some(error),
     }
 }
 
@@ -2369,10 +2449,10 @@ async fn list_result_files(category_dir: String) -> Vec<ResultFileEntry> {
     .unwrap_or_default()
 }
 
-/// The 21 derived result files of docs-01. Used only to decide whether a file
-/// is a contract result; other `_OVERVIEW` files (raw facts such as
+/// The derived contract result files of docs-01. Used only to decide whether a
+/// file is a contract result; other `_OVERVIEW` files (raw facts such as
 /// MFT_Records.sqlite) are out of scope.
-const DERIVED_OVERVIEW_FILES: [&str; 23] = [
+const DERIVED_OVERVIEW_FILES: [&str; 24] = [
     "Metadata",
     "ExecutionHistory",
     "PowerShellHistory",
@@ -2396,6 +2476,7 @@ const DERIVED_OVERVIEW_FILES: [&str; 23] = [
     "RecycleBin",
     "JumpListEntries",
     "TimelineActivities",
+    "RegistryExplorer",
 ];
 
 /// Reports whether stored results follow the common contract (overview_contract=1).
@@ -2438,130 +2519,6 @@ async fn overview_contract_status(host_dir: String) -> OverviewContractStatus {
     tauri::async_runtime::spawn_blocking(move || overview_contract_status_blocking(host_dir))
         .await
         .unwrap_or_default()
-}
-
-/// One source file represented in a parsed result table. `recovery` is the
-/// parser's own marker (for registry artifacts, e.g. live/deleted recovery),
-/// never a guessed state from the viewer.
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ResultProvenance {
-    source_file: String,
-    recovery: String,
-}
-
-/// Reads the parser-recorded source paths without materialising or aggregating
-/// the table. This intentionally avoids `COUNT`: an Amcache table can contain
-/// millions of rows and the dashboard needs the source identity, not another
-/// expensive statistical pass.
-///
-/// A contract DB's primary table has no `_source_file` column — the origins are
-/// rows in source_records, so the verified collection files are returned from
-/// there without duplicates. Every origin is shown; no representative is picked
-/// (docs-24 §4). `recovery` is a registry-parser marker and stays empty here.
-#[tauri::command]
-fn result_provenance(
-    full_path: String,
-    table_name: String,
-) -> Result<Vec<ResultProvenance>, String> {
-    let conn = open_ro(&full_path)?;
-    let tables = table_names(&conn);
-    if !tables.iter().any(|name| name == &table_name) {
-        return Ok(Vec::new());
-    }
-    let columns = table_columns(&conn, &table_name);
-    if !columns.iter().any(|column| column == "_source_file") {
-        if !tables.iter().any(|name| name == "source_records") {
-            return Ok(Vec::new());
-        }
-        let sql = "SELECT DISTINCT source_file FROM \"source_records\" \
-                   WHERE source_file IS NOT NULL AND source_file <> '' \
-                   ORDER BY source_file LIMIT 20";
-        let mut stmt = conn.prepare(sql).map_err(|error| error.to_string())?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok(ResultProvenance {
-                    source_file: row.get(0)?,
-                    recovery: String::new(),
-                })
-            })
-            .map_err(|error| error.to_string())?
-            .filter_map(Result::ok)
-            .collect();
-        return Ok(rows);
-    }
-    let recovery = if columns.iter().any(|column| column == "_recovery") {
-        "COALESCE(NULLIF(_recovery, ''), 'live')"
-    } else {
-        "'live'"
-    };
-    let sql = format!(
-        "SELECT _source_file, {recovery} FROM {} WHERE _source_file IS NOT NULL AND _source_file <> '' LIMIT 1",
-        q(&table_name),
-    );
-    let mut stmt = conn.prepare(&sql).map_err(|error| error.to_string())?;
-    let rows = stmt
-        .query_map([], |row| {
-            Ok(ResultProvenance {
-                source_file: row.get(0)?,
-                recovery: row.get(1)?,
-            })
-        })
-        .map_err(|error| error.to_string())?
-        .filter_map(Result::ok)
-        .collect();
-    Ok(rows)
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ArtifactInputFile {
-    name: String,
-    kind: String,
-    detail: String,
-}
-
-/// Lists an Amcache hive and its sibling transaction logs from a parser-recorded
-/// source path. It never re-walks the full evidence folder while the dashboard
-/// is open, which keeps the detail accordion responsive for large collections.
-#[tauri::command]
-fn artifact_input_files(source_file: String) -> Vec<ArtifactInputFile> {
-    let hive = PathBuf::from(source_file);
-    let hive_name = hive
-        .file_name()
-        .map(|name| name.to_string_lossy().to_string());
-    if hive_name
-        .as_deref()
-        .map(|name| !name.eq_ignore_ascii_case("Amcache.hve"))
-        .unwrap_or(true)
-    {
-        return Vec::new();
-    }
-    let mut inputs = vec![ArtifactInputFile {
-        name: hive_name.unwrap_or_else(|| "Amcache.hve".to_string()),
-        kind: "hive".to_string(),
-        detail: "레지스트리 하이브에서 할당된(live) 레코드를 파싱합니다.".to_string(),
-    }];
-    if let Some(parent) = hive.parent() {
-        if let Ok(entries) = std::fs::read_dir(parent) {
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if name.to_ascii_lowercase().starts_with("amcache.hve.log") {
-                    inputs.push(ArtifactInputFile {
-                        name,
-                        kind: "transactionLog".to_string(),
-                        // 이 목록은 현재 디렉터리 재탐색 결과라 "적용 여부"를
-                        // 단정하면 안 된다 — 실제 적용/폴백 실적은 실행 시
-                        // parse_report.json의 amcacheHives에 기록된다.
-                        detail: "하이브와 함께 발견된 트랜잭션 로그 — 실제 적용 여부는 파싱 보고서(amcacheHives)에 기록됩니다."
-                            .to_string(),
-                    });
-                }
-            }
-        }
-    }
-    inputs.sort_by(|left, right| left.name.cmp(&right.name));
-    inputs
 }
 
 /// Parse-time manifest written by the pipeline. It lets the dashboard render
@@ -3192,9 +3149,7 @@ struct BrowserDomainPage {
 fn browser_domains_blocking(full_path: String, filter: BrowserFilter, offset: i64, limit: i64, ascending: bool) -> Result<BrowserDomainPage, String> {
     let conn = open_ro(&full_path)?;
     let mut domains = browser_visit_domains(&conn, &filter)?;
-    if ascending {
-        domains.reverse();
-    }
+    order_domains(&mut domains, ascending);
     let total = i64::try_from(domains.len()).unwrap_or(i64::MAX);
     let domains = domains
         .into_iter()
@@ -3202,6 +3157,14 @@ fn browser_domains_blocking(full_path: String, filter: BrowserFilter, offset: i6
         .take(usize::try_from(limit.clamp(1, 100)).unwrap_or(100))
         .collect();
     Ok(BrowserDomainPage { domains, total })
+}
+
+/// Visit count follows the requested direction; ties stay domain A→Z.
+fn order_domains(domains: &mut [BrowserDomainStat], ascending: bool) {
+    if ascending {
+        // Stable sort keeps the domain A→Z order among equal counts.
+        domains.sort_by_key(|domain| domain.visit_count);
+    }
 }
 
 #[tauri::command]
@@ -3903,10 +3866,10 @@ fn linked_result_rows_blocking(
     let mut params = vec![match_value];
     if !search.trim().is_empty() {
         clauses.push(format!(
-            "LOWER(COALESCE({}, '')) LIKE '%' || LOWER(?) || '%'",
+            "LOWER(COALESCE({}, '')) LIKE LOWER(?) ESCAPE '\\'",
             q(search_column)
         ));
-        params.push(search.trim().to_owned());
+        params.push(like_contains(&search));
     }
     let where_clause = clauses.join(" AND ");
     let count_params: Vec<&dyn rusqlite::ToSql> = params
@@ -4020,70 +3983,6 @@ struct ColumnValue {
     count: i64,
 }
 
-#[tauri::command]
-async fn list_column_values(
-    full_path: String,
-    column: String,
-    table_name: Option<String>,
-) -> Vec<ColumnValue> {
-    // 필터 드롭다운의 고유값 집계는 대형 테이블 GROUP BY 풀스캔이다 — 메인
-    // 스레드 밖에서 수행한다.
-    tauri::async_runtime::spawn_blocking(move || {
-        list_column_values_blocking(full_path, column, table_name)
-    })
-    .await
-    .unwrap_or_default()
-}
-
-fn list_column_values_blocking(
-    full_path: String,
-    column: String,
-    table_name: Option<String>,
-) -> Vec<ColumnValue> {
-    let conn = match open_ro(&full_path) {
-        Ok(c) => c,
-        Err(_) => return vec![],
-    };
-    let table = match table_name.or_else(|| first_table(&conn, Path::new(&full_path))) {
-        Some(t) => t,
-        None => return vec![],
-    };
-    // Body BLOBs are not filter candidates: never GROUP BY raw bytes.
-    if !payload_columns(&conn, &table).contains(&column) {
-        return vec![];
-    }
-    // 필터 드롭다운은 최빈값 상위 N개만 필요하다. 고카디널리티 컬럼(MFT path,
-    // timestamp 등)은 고유값이 수십만이라 전량을 IPC로 실으면 웹뷰 메모리가
-    // 커지므로 상위 빈도만 잘라 보낸다 — 그 밖의 값은 검색으로 찾는다.
-    const LIST_COLUMN_VALUES_MAX: usize = 2000;
-    let sql = format!(
-        "SELECT {c} AS value, COUNT(*) AS count FROM {t} GROUP BY {c} ORDER BY count DESC LIMIT {lim}",
-        c = q(&column),
-        t = q(&table),
-        lim = LIST_COLUMN_VALUES_MAX,
-    );
-    let mut stmt = match conn.prepare(&sql) {
-        Ok(s) => s,
-        Err(_) => return vec![],
-    };
-    let rows = stmt.query_map([], |r| {
-        let value = match r.get_ref(0) {
-            Ok(ValueRef::Text(t)) => String::from_utf8_lossy(t).into_owned(),
-            Ok(ValueRef::Integer(i)) => i.to_string(),
-            Ok(ValueRef::Real(f)) => f.to_string(),
-            _ => String::new(),
-        };
-        Ok(ColumnValue {
-            value,
-            count: r.get(1)?,
-        })
-    });
-    match rows {
-        Ok(it) => it.filter_map(|x| x.ok()).collect(),
-        Err(_) => vec![],
-    }
-}
-
 /// Display-facing derived table (docs-01 §18). The file-system screens read
 /// only this; raw MFT_Records is never a display fallback (docs-24 §0).
 const FILE_SYSTEM_TABLE: &str = "FileSystemEntries";
@@ -4096,9 +3995,9 @@ fn file_system_table(conn: &Connection) -> Result<String, String> {
     }
 }
 
-/// Records whose stored parent link is not verified (docs-04 §0): never
+/// Records whose stored parent link is not checked (docs-04 §0): never
 /// attached under a folder, listed in the separate "unlinked" bucket.
-const UNLINKED_PARENT: &str = "(parent_status IS NULL OR parent_status NOT IN ('verified', 'root'))";
+const UNLINKED_PARENT: &str = "(parent_status IS NULL OR parent_status NOT IN ('verified', 'deleted_parent', 'root'))";
 
 /// Volume scope for a query. `entry`/`parent_entry` are meaningful only inside
 /// one volume_id (docs-01 §18), so the chosen volume is applied as a condition.
@@ -4141,8 +4040,10 @@ async fn mft_children(
 
 /// One folder page of the explorer tree, from the stored link verification
 /// (docs-04 §0/§4): a child belongs to a folder only when `parent_status` is
-/// `verified` and its `parent_seq` equals the folder's `seq`. The tree never
-/// re-derives or loosens that link (no NULL-tolerant match).
+/// `verified` and its `parent_seq` equals the folder's `seq`, or it is
+/// `deleted_parent` (the folder was freed, which raised its seq by one) and
+/// its `parent_seq` is the folder's `seq - 1`. The tree never re-derives or
+/// loosens that link (no NULL-tolerant match).
 ///
 /// `parent_seq` None with a parent means the volume root: its seq is read
 /// from the record stored as `parent_status = 'root'`. `parent_entry` None
@@ -4209,9 +4110,11 @@ fn mft_children_blocking(
             binds.push(Box::new(parent));
             let n = binds.len();
             binds.push(Box::new(seq));
+            let s = binds.len();
             conditions.push(format!(
-                "parent_entry = ?{n} AND entry <> ?{n} AND parent_seq = ?{} AND parent_status = 'verified'",
-                binds.len()
+                "parent_entry = ?{n} AND entry <> ?{n} AND parent_seq IN (?{s}, ?{s} - 1) \
+                 AND ((parent_status = 'verified' AND parent_seq = ?{s}) \
+                 OR (parent_status = 'deleted_parent' AND parent_seq = ?{s} - 1))"
             ));
         }
         None => conditions.push(UNLINKED_PARENT.to_string()),
@@ -4636,7 +4539,7 @@ fn usn_groups_page_blocking(full_path: String, options: UsnGroupOptions, offset:
     let renames = query_rows(
         &conn,
         &format!(
-            "SELECT * FROM UsnRenameEvents WHERE old_group_id IN ({id_only}) OR new_group_id IN ({id_only})
+            "SELECT * FROM UsnRenameEvents WHERE group_id IN ({id_only})
              ORDER BY COALESCE(old_usn_sort, new_usn_sort), rename_id"
         ),
         id_refs.as_slice(),
@@ -4670,15 +4573,10 @@ fn usn_groups_page_blocking(full_path: String, options: UsnGroupOptions, offset:
         }
     }
     for event in renames {
-        let old = event.get("old_group_id").and_then(Value::as_str).and_then(|id| position.get(id)).copied();
-        let new = event.get("new_group_id").and_then(Value::as_str).and_then(|id| position.get(id)).copied();
+        let index = event.get("group_id").and_then(Value::as_str).and_then(|id| position.get(id)).copied();
         let candidates = event.get("rename_id").and_then(Value::as_str).and_then(|id| candidates_by_rename.remove(id)).unwrap_or_default();
-        let entry = UsnRenameEntry { event, candidates };
-        if let Some(index) = old {
-            groups[index].renames.push(entry.clone());
-        }
-        if let Some(index) = new.filter(|index| Some(*index) != old) {
-            groups[index].renames.push(entry);
+        if let Some(index) = index {
+            groups[index].renames.push(UsnRenameEntry { event, candidates });
         }
     }
     Ok(UsnGroupsPage { groups, total })
@@ -5467,7 +5365,7 @@ fn mft_records_page_blocking(
         clauses.push("path_status IS NOT NULL AND path_status <> 'complete'".to_string());
     }
     if options.resident_only.unwrap_or(false) {
-        clauses.push("data_status = 'resident'".to_string());
+        clauses.push("data_status IN ('resident', 'resident_empty')".to_string());
     }
     if options.si_before_fn.unwrap_or(false) {
         clauses.push("si_created IS NOT NULL AND fn_created IS NOT NULL AND si_created < fn_created".to_string());
@@ -5552,35 +5450,6 @@ fn mft_records_page_blocking(
         .map_err(|error| format!("MFT 레코드 페이지를 읽지 못했습니다: {error}"))?;
     decorate_source_refs(&conn, Path::new(&full_path), &mut rows)?;
     Ok(MftRecordsPage { rows, total })
-}
-
-/// One detail row. With `volume_id` the row is returned only when it belongs to
-/// that volume, so a rowid from another volume context opens nothing.
-#[tauri::command]
-fn mft_row(
-    full_path: String,
-    rowid: i64,
-    volume_id: Option<String>,
-) -> Option<Map<String, Value>> {
-    let conn = open_ro(&full_path).ok()?;
-    let table = file_system_table(&conn).ok()?;
-    let columns = payload_columns(&conn, &table);
-    let projection = payload_projection(&columns)?;
-    let volume = volume_scope(&columns, volume_id);
-    let mut binds: Vec<&dyn rusqlite::ToSql> = vec![&rowid];
-    let mut conditions = vec!["rowid = ?1".to_string()];
-    if let Some(volume) = volume.as_ref() {
-        binds.push(volume);
-        conditions.push(format!("volume_id = ?{}", binds.len()));
-    }
-    let sql = format!(
-        "SELECT rowid AS __rowid, {projection} FROM {} WHERE {}",
-        q(&table),
-        conditions.join(" AND ")
-    );
-    let mut rows = query_rows(&conn, &sql, binds.as_slice()).ok()?;
-    decorate_source_refs(&conn, Path::new(&full_path), &mut rows).ok()?;
-    rows.into_iter().next()
 }
 
 /// One resident `$DATA` body. The only path that reads the bytes excluded from
@@ -5851,64 +5720,6 @@ fn decorate_source_refs(
         row.insert(SOURCE_REFS_KEY.to_string(), Value::from(serialized));
     }
     Ok(())
-}
-
-/// Evidence links of one result row: `source_records` of the same file, by
-/// `record_id`, in ordinal order. A row may have several origins and no
-/// representative is chosen. Raw tables without `source_records` return empty —
-/// they are the evidence, so no origin is invented.
-#[tauri::command]
-async fn read_record_sources(
-    full_path: String,
-    table_name: String,
-    rowid: i64,
-) -> Result<Vec<Map<String, Value>>, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        read_record_sources_blocking(full_path, table_name, rowid)
-    })
-    .await
-    .map_err(|error| format!("원본 근거 조회가 중단되었습니다: {error}"))?
-}
-
-fn read_record_sources_blocking(
-    full_path: String,
-    table_name: String,
-    rowid: i64,
-) -> Result<Vec<Map<String, Value>>, String> {
-    let path = PathBuf::from(&full_path);
-    let conn = open_ro(&full_path)?;
-    let tables = table_names(&conn);
-    if !tables.iter().any(|name| name == &table_name) {
-        return Ok(Vec::new());
-    }
-    if !tables.iter().any(|name| name == "source_records") {
-        return Ok(Vec::new());
-    }
-    let Some(record_id) = record_id_of(&conn, &table_name, rowid)? else {
-        return Ok(Vec::new());
-    };
-    let columns = payload_columns(&conn, "source_records");
-    let Some(projection) = payload_projection(&columns) else {
-        return Ok(Vec::new());
-    };
-    let sql = format!(
-        "SELECT {projection} FROM \"source_records\" WHERE record_id = ?1 ORDER BY ordinal"
-    );
-    let mut rows = query_rows(&conn, &sql, &[&record_id])?;
-    let host_root = host_root_of(&path);
-    for row in &mut rows {
-        let source_db = row
-            .get("source_db")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        let resolved = host_root
-            .as_deref()
-            .map(|root| resolve_source_db(root, &source_db))
-            .unwrap_or_default();
-        row.insert("source_full_path".to_string(), Value::from(resolved));
-    }
-    Ok(rows)
 }
 
 /// Child rows of one result row (ExecutionTimes, TaskActions, AiMessages, …).
@@ -6302,12 +6113,6 @@ fn search_case_blocking(
                     conditions.push(format!("{} <= ?{}", expr, params.len() + 1));
                     params.push(bound);
                 }
-                // Once this page has a continuation we still execute a tiny
-                // source-aware probe for every remaining table. That keeps
-                // unreadable/corrupt sources visible instead of hiding them
-                // behind an early pagination exit, without retaining their
-                // rows in memory.
-                let query_limit = if has_next { 1 } else { scan_target };
                 let sql = format!(
                     "SELECT rowid AS __rowid, CASE {} ELSE '' END AS __match_column, CASE {} ELSE '' END AS __match_value, {} AS __timestamp, {} AS __record_id FROM {} WHERE {} ORDER BY rowid LIMIT {}",
                     match_column,
@@ -6316,7 +6121,7 @@ fn search_case_blocking(
                     record_id_expr,
                     q(&table),
                     conditions.join(" AND "),
-                    query_limit,
+                    scan_target,
                 );
                 let rows = match query_rows(&conn, &sql, &params) {
                     Ok(rows) => rows,
@@ -6326,9 +6131,6 @@ fn search_case_blocking(
                     }
                 };
                 for row in rows {
-                    if has_next {
-                        continue;
-                    }
                     if skipped < offset {
                         skipped += 1;
                         continue;
@@ -6530,7 +6332,25 @@ fn write_analyst_addresses(host_dir: &Path, addresses: &[String]) -> Result<(), 
         return Err("호스트 폴더를 찾을 수 없습니다".to_string());
     }
     let text = serde_json::to_string_pretty(addresses).map_err(|error| error.to_string())?;
-    std::fs::write(host_dir.join(ANALYST_ADDRESSES_FILE), text).map_err(|error| format!("추가 IP를 저장하지 못했습니다: {error}"))
+    write_file_atomic(host_dir, ANALYST_ADDRESSES_FILE, text).map_err(|error| format!("추가 IP를 저장하지 못했습니다: {error}"))
+}
+
+/// Write `dir/name` via a temporary sibling + rename, so an interrupted write
+/// never leaves a truncated analyst file behind.
+fn write_file_atomic(dir: &Path, name: &str, contents: String) -> std::io::Result<()> {
+    let temporary = dir.join(format!(
+        ".{name}-{}-{}.tmp",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let result = std::fs::write(&temporary, contents).and_then(|()| std::fs::rename(&temporary, dir.join(name)));
+    if result.is_err() {
+        let _ = std::fs::remove_file(temporary);
+    }
+    result
 }
 
 fn clear_analyst_addresses(host_dir: &Path) {
@@ -6681,19 +6501,7 @@ fn write_bookmarks_path(case_dir: &Path, bookmarks: &[Value]) -> Result<(), Stri
     if !case_dir.is_dir() {
         return Err("북마크 저장 위치를 찾을 수 없습니다".to_string());
     }
-    let target = case_dir.join("bookmarks.json");
-    let temporary = case_dir.join(format!(
-        ".bookmarks-{}-{}.tmp",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ));
-    if let Err(error) =
-        std::fs::write(&temporary, serialized).and_then(|()| std::fs::rename(&temporary, &target))
-    {
-        let _ = std::fs::remove_file(temporary);
+    if let Err(error) = write_file_atomic(case_dir, "bookmarks.json", serialized) {
         return Err(format!("북마크 저장에 실패했습니다: {error}"));
     }
     Ok(())
@@ -6708,16 +6516,10 @@ fn remove_host_bookmarks(cases_dir: &Path, host_id: &str) -> usize {
     let Ok(bookmarks) = read_bookmarks_path(cases_dir) else {
         return 0;
     };
-    let needle = format!("/{host_id}/");
+    let host_dir = cases_dir.join(host_id);
     let kept: Vec<Value> = bookmarks
         .iter()
-        .filter(|bookmark| {
-            !bookmark
-                .get("fullPath")
-                .and_then(Value::as_str)
-                .map(|path| path.contains(&needle))
-                .unwrap_or(false)
-        })
+        .filter(|bookmark| !bookmark_belongs_to_host(bookmark, host_id, &host_dir))
         .cloned()
         .collect();
     let removed = bookmarks.len() - kept.len();
@@ -6735,8 +6537,15 @@ fn write_bookmarks(case_dir: &str, bookmarks: &[Value]) -> Result<(), String> {
     write_bookmarks_path(Path::new(case_dir), bookmarks)
 }
 
+// Each bookmark opens its result DB; keep that off the Tauri main thread.
 #[tauri::command]
-fn list_bookmarks(case_dir: String) -> Result<Vec<Value>, String> {
+async fn list_bookmarks(case_dir: String) -> Result<Vec<Value>, String> {
+    tauri::async_runtime::spawn_blocking(move || list_bookmarks_blocking(case_dir))
+        .await
+        .map_err(|error| format!("북마크 조회 작업이 중단되었습니다: {error}"))?
+}
+
+fn list_bookmarks_blocking(case_dir: String) -> Result<Vec<Value>, String> {
     let _guard = lock_bookmarks();
     let case_path = Path::new(&case_dir);
     if !case_path.is_dir() {
@@ -6813,7 +6622,13 @@ fn overview_record_exists(full_path: &str, table_name: &str, record_id: &str) ->
 }
 
 #[tauri::command]
-fn toggle_bookmark(case_dir: String, entry: BookmarkInput) -> Result<Vec<Value>, String> {
+async fn toggle_bookmark(case_dir: String, entry: BookmarkInput) -> Result<Vec<Value>, String> {
+    tauri::async_runtime::spawn_blocking(move || toggle_bookmark_blocking(case_dir, entry))
+        .await
+        .map_err(|error| format!("북마크 저장 작업이 중단되었습니다: {error}"))?
+}
+
+fn toggle_bookmark_blocking(case_dir: String, entry: BookmarkInput) -> Result<Vec<Value>, String> {
     let _guard = lock_bookmarks();
     let mut bookmarks = read_bookmarks(&case_dir)?;
     let field = entry.field.clone().unwrap_or_default();
@@ -6846,21 +6661,6 @@ fn toggle_bookmark(case_dir: String, entry: BookmarkInput) -> Result<Vec<Value>,
         b.insert("hostId".into(), Value::from(entry.host_id.unwrap_or_default()));
         b.insert("hostName".into(), Value::from(entry.host_name.unwrap_or_default()));
         bookmarks.push(Value::Object(b));
-    }
-    write_bookmarks(&case_dir, &bookmarks)?;
-    Ok(bookmarks)
-}
-
-#[tauri::command]
-fn update_bookmark_note(case_dir: String, id: String, note: String) -> Result<Vec<Value>, String> {
-    let _guard = lock_bookmarks();
-    let mut bookmarks = read_bookmarks(&case_dir)?;
-    for b in bookmarks.iter_mut() {
-        if b.get("id").and_then(|v| v.as_str()) == Some(id.as_str()) {
-            if let Some(obj) = b.as_object_mut() {
-                obj.insert("note".into(), Value::from(note.clone()));
-            }
-        }
     }
     write_bookmarks(&case_dir, &bookmarks)?;
     Ok(bookmarks)
@@ -6921,7 +6721,7 @@ fn run_as_parse_worker() -> Option<i32> {
     }
     let (case_id, host_id, cases_dir) = (&args[2], &args[3], std::path::PathBuf::from(&args[4]));
     let (only, run_log_id) = parse_worker_options(&args[5..]);
-    // Sink stays unset, so pipeline prints progress to stdout for the parent.
+    // The pipeline prints progress to stdout for the parent.
     match pipeline::run_host_with_log_id(case_id, host_id, &cases_dir, only, run_log_id.as_deref())
     {
         Ok(()) => Some(0),
@@ -7020,7 +6820,7 @@ mod bookmark_tests {
         let case_dir = temporary_case_dir("bookmark-toggle");
         let db = create_host(&case_dir, "host-a", &["r1"]);
         let dir = case_dir.to_string_lossy().to_string();
-        let added = toggle_bookmark(dir.clone(), entry(&db, "r1", None, "host-a")).unwrap();
+        let added = toggle_bookmark_blocking(dir.clone(), entry(&db, "r1", None, "host-a")).unwrap();
         assert_eq!(added.len(), 1);
         assert_eq!(added[0]["recordId"], "r1");
         assert_eq!(added[0]["tableName"], "Evidence");
@@ -7029,9 +6829,9 @@ mod bookmark_tests {
         assert!(added[0].get("rowid").is_none());
         assert!(added[0]["id"].as_str().unwrap().starts_with("v3:"));
         // A field bookmark on the same record is a separate target.
-        let both = toggle_bookmark(dir.clone(), entry(&db, "r1", Some("timestamp"), "host-a")).unwrap();
+        let both = toggle_bookmark_blocking(dir.clone(), entry(&db, "r1", Some("timestamp"), "host-a")).unwrap();
         assert_eq!(both.len(), 2);
-        let removed = toggle_bookmark(dir.clone(), entry(&db, "r1", None, "host-a")).unwrap();
+        let removed = toggle_bookmark_blocking(dir.clone(), entry(&db, "r1", None, "host-a")).unwrap();
         assert_eq!(removed.len(), 1);
         assert_eq!(removed[0]["field"], "timestamp");
         let _ = std::fs::remove_dir_all(case_dir);
@@ -7045,8 +6845,8 @@ mod bookmark_tests {
         let raw = case_dir.join("host-a").join("Raw.sqlite");
         Connection::open(&raw).unwrap().execute_batch("CREATE TABLE Evidence (record_id TEXT); INSERT INTO Evidence VALUES ('r1');").unwrap();
         let dir = case_dir.to_string_lossy().to_string();
-        assert!(toggle_bookmark(dir.clone(), entry(&raw.to_string_lossy(), "r1", None, "host-a")).is_err());
-        assert!(toggle_bookmark(dir.clone(), entry(&db, "nope", None, "host-a")).is_err());
+        assert!(toggle_bookmark_blocking(dir.clone(), entry(&raw.to_string_lossy(), "r1", None, "host-a")).is_err());
+        assert!(toggle_bookmark_blocking(dir.clone(), entry(&db, "nope", None, "host-a")).is_err());
         assert!(read_bookmarks(&dir).unwrap().is_empty());
         let _ = std::fs::remove_dir_all(case_dir);
     }
@@ -7059,8 +6859,8 @@ mod bookmark_tests {
         let case_dir = temporary_case_dir("bookmark-prune");
         let db = create_host(&case_dir, "host-a", &["r1", "r2"]);
         let dir = case_dir.to_string_lossy().to_string();
-        toggle_bookmark(dir.clone(), entry(&db, "r1", None, "host-a")).unwrap();
-        toggle_bookmark(dir.clone(), entry(&db, "r2", None, "host-a")).unwrap();
+        toggle_bookmark_blocking(dir.clone(), entry(&db, "r1", None, "host-a")).unwrap();
+        toggle_bookmark_blocking(dir.clone(), entry(&db, "r2", None, "host-a")).unwrap();
         let mut stored = read_bookmarks(&dir).unwrap();
         stored.push(serde_json::json!({"id": "legacy", "fullPath": db, "tableName": "Evidence", "rowid": 1, "hostId": "host-a", "note": "", "taggedAt": ""}));
         stored.push(serde_json::json!({"id": "gone-host", "fullPath": "/x/_OVERVIEW/Evidence.sqlite", "tableName": "Evidence", "recordId": "r9", "hostId": "removed-host", "note": "", "taggedAt": ""}));
@@ -7072,7 +6872,7 @@ mod bookmark_tests {
         // Simulate a re-parse that no longer has r2.
         Connection::open(&db).unwrap().execute("DELETE FROM Evidence WHERE record_id='r2'", []).unwrap();
 
-        let listed = list_bookmarks(dir.clone()).unwrap();
+        let listed = list_bookmarks_blocking(dir.clone()).unwrap();
         let kept = ids(&listed);
         assert_eq!(kept.len(), 2, "{kept:?}");
         assert!(kept.iter().any(|id| id == "unreadable"));
@@ -7092,7 +6892,7 @@ mod bookmark_tests {
                 let (dir, db) = (dir.clone(), db.clone());
                 std::thread::spawn(move || {
                     for step in 0..5 {
-                        toggle_bookmark(dir.clone(), entry(&db, &format!("r{}", worker * 5 + step), None, "host-a")).unwrap();
+                        toggle_bookmark_blocking(dir.clone(), entry(&db, &format!("r{}", worker * 5 + step), None, "host-a")).unwrap();
                     }
                 })
             })
@@ -7110,13 +6910,28 @@ mod bookmark_tests {
         let removed = create_host(&case_dir, "removed-host", &["r1"]);
         let retained = create_host(&case_dir, "retained-host", &["r1"]);
         let dir = case_dir.to_string_lossy().to_string();
-        toggle_bookmark(dir.clone(), entry(&removed, "r1", None, "removed-host")).unwrap();
-        toggle_bookmark(dir.clone(), entry(&retained, "r1", None, "retained-host")).unwrap();
+        toggle_bookmark_blocking(dir.clone(), entry(&removed, "r1", None, "removed-host")).unwrap();
+        toggle_bookmark_blocking(dir.clone(), entry(&retained, "r1", None, "retained-host")).unwrap();
         assert!(delete_host_dir_and_bookmarks(&case_dir, "removed-host"));
         assert!(!case_dir.join("removed-host").exists());
         let stored = read_bookmarks_path(&case_dir).unwrap();
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0]["hostId"], "retained-host");
+        let _ = std::fs::remove_dir_all(case_dir);
+    }
+
+    #[test]
+    fn reparse_removes_host_bookmarks_by_host_id_with_windows_paths() {
+        let case_dir = temporary_case_dir("bookmark-reparse-windows");
+        let bookmarks = vec![
+            serde_json::json!({"id": "a", "hostId": "host-a", "fullPath": r"C:\cases\c1\host-a\_OVERVIEW\Evidence.sqlite"}),
+            serde_json::json!({"id": "b", "hostId": "host-b", "fullPath": r"C:\cases\c1\host-b\_OVERVIEW\Evidence.sqlite"}),
+        ];
+        write_bookmarks_path(&case_dir, &bookmarks).unwrap();
+        assert_eq!(remove_host_bookmarks(&case_dir, "host-a"), 1);
+        let stored = read_bookmarks_path(&case_dir).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0]["hostId"], "host-b");
         let _ = std::fs::remove_dir_all(case_dir);
     }
 
@@ -7134,7 +6949,7 @@ mod bookmark_tests {
     fn malformed_bookmark_file_is_reported_instead_of_looking_empty() {
         let case_dir = temporary_case_dir("bookmark-malformed");
         std::fs::write(case_dir.join("bookmarks.json"), "{ not valid json").unwrap();
-        assert!(list_bookmarks(case_dir.to_string_lossy().to_string()).is_err());
+        assert!(list_bookmarks_blocking(case_dir.to_string_lossy().to_string()).is_err());
         let _ = std::fs::remove_dir_all(case_dir);
     }
 }
@@ -7564,7 +7379,47 @@ mod timeline_build_tests {
         }
         assert!(!building.exists(), "회수된 세션의 임시 DB 파일이 남았다");
 
-        timeline_build_abort_impl(&next, "tok-live");
+        timeline_build_abort_impl(&next, "tok-live").unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn finish_closes_db_even_while_a_worker_still_holds_the_session() {
+        let root = std::env::temp_dir().join(format!("wina-tl-finish-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let host = root.to_string_lossy().to_string();
+        timeline_build_begin_impl(&host, "tok-finish", "2026-01-01 00:00:00.000").unwrap();
+        // A worker thread that has not yet dropped its Arc clone.
+        let worker = timeline_build_sessions()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get("tok-finish")
+            .cloned()
+            .unwrap();
+        timeline_build_finish_impl(&host, "tok-finish").unwrap();
+        let session = worker.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(session.conn.is_none(), "finish left the DB open");
+        drop(session);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn abort_rejects_bad_token_and_other_hosts_session() {
+        let root = std::env::temp_dir().join(format!("wina-tl-abort-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::create_dir_all(root.join("b")).unwrap();
+        let a = root.join("a").to_string_lossy().to_string();
+        let b = root.join("b").to_string_lossy().to_string();
+        timeline_build_begin_impl(&a, "tok-owned", "2026-01-01 00:00:00.000").unwrap();
+        assert!(timeline_build_abort_impl(&b, "tok-owned").is_err());
+        assert!(timeline_build_sessions()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key("tok-owned"));
+        assert!(tauri::async_runtime::block_on(master_timeline_build_abort(a.clone(), "../x".into())).is_err());
+        timeline_build_abort_impl(&a, "tok-owned").unwrap();
         let _ = std::fs::remove_dir_all(&root);
     }
 }
@@ -7722,12 +7577,34 @@ mod pipeline_log_supervision_tests {
                 .as_nanos(),
         ));
         std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("parse_report.json"), r#"{"status":"partial"}"#).unwrap();
-        assert_eq!(terminal_pipeline_status(&root, Some(1)), "partial");
-        assert_eq!(terminal_pipeline_status(&root, Some(0)), "complete");
-        assert_eq!(terminal_pipeline_status(&root, Some(2)), "partial");
-        std::fs::write(root.join("parse_report.json"), r#"{"status":"error"}"#).unwrap();
-        assert_eq!(terminal_pipeline_status(&root, Some(1)), "error");
+        let manifest = pipeline::parse_run_log_path(&root, "this-run").with_extension("json");
+        std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        std::fs::write(&manifest, r#"{"runId":"this-run","status":"partial"}"#).unwrap();
+        assert_eq!(terminal_pipeline_status(&root, "this-run", Some(1)), "partial");
+        assert_eq!(terminal_pipeline_status(&root, "this-run", Some(0)), "complete");
+        assert_eq!(terminal_pipeline_status(&root, "this-run", Some(2)), "partial");
+        std::fs::write(&manifest, r#"{"runId":"this-run","status":"error"}"#).unwrap();
+        assert_eq!(terminal_pipeline_status(&root, "this-run", Some(1)), "error");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stale_partial_report_from_prior_run_is_not_this_runs_status() {
+        let root = std::env::temp_dir().join(format!(
+            "windows-analysis-stale-status-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("parse_report.json"),
+            r#"{"runId":"prior-run","status":"partial"}"#,
+        )
+        .unwrap();
+        assert_eq!(terminal_pipeline_status(&root, "crashed-run", Some(1)), "error");
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -7752,7 +7629,7 @@ mod pipeline_log_supervision_tests {
         )
         .unwrap();
 
-        write_cancelled_terminal_state_at(&root, &case.id, &host.id, "cancelled-run");
+        write_cancelled_terminal_state_at(&root, &case.id, &host.id, "cancelled-run", true);
 
         let report: Value =
             serde_json::from_slice(&std::fs::read(host_dir.join("parse_report.json")).unwrap())
@@ -7768,6 +7645,45 @@ mod pipeline_log_supervision_tests {
                 .last_run_status
                 .as_deref(),
             Some("cancelled")
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn queued_cancel_keeps_prior_report_and_host_status() {
+        let root = std::env::temp_dir().join(format!(
+            "windows-analysis-queued-cancel-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        ));
+        let case = case_store::create_case("case", "2026-08-23 01:02:03", &root).unwrap();
+        let host =
+            case_store::create_host(&case.id, "host", "/evidence", "2026-08-23 01:02:03", &root)
+                .unwrap();
+        let host_dir = case_store::host_dir(&root, &case.id, &host.id);
+        let prior = r#"{"status":"ok","published":true}"#;
+        std::fs::write(host_dir.join("parse_report.json"), prior).unwrap();
+        let prior_status = case_store::load_host(&case.id, &host.id, &root)
+            .unwrap()
+            .last_run_status;
+
+        write_cancelled_terminal_state_at(&root, &case.id, &host.id, "queued-run", false);
+
+        assert_eq!(
+            std::fs::read_to_string(host_dir.join("parse_report.json")).unwrap(),
+            prior
+        );
+        assert!(pipeline::parse_run_log_path(&host_dir, "queued-run")
+            .with_extension("json")
+            .is_file());
+        assert_eq!(
+            case_store::load_host(&case.id, &host.id, &root)
+                .unwrap()
+                .last_run_status,
+            prior_status
         );
         let _ = std::fs::remove_dir_all(root);
     }
@@ -8155,6 +8071,72 @@ mod overview_contract_tests {
 
         let status = overview_contract_status_blocking(root.to_string_lossy().to_string());
         assert!(status.contract_ok, "legacy: {:?}", status.legacy_files);
+        // A legacy RegistryExplorer (no contract marker) must be reported.
+        Connection::open(overview.join("RegistryExplorer.sqlite"))
+            .unwrap()
+            .execute_batch("CREATE TABLE RegistryKeys (path TEXT);")
+            .unwrap();
+        let status = overview_contract_status_blocking(root.to_string_lossy().to_string());
+        assert_eq!(status.legacy_files, vec!["_OVERVIEW/RegistryExplorer.sqlite"]);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn source_rows_from_two_tables_with_same_rowid_stay_separate() {
+        let root = temp_root("source-rows-tables");
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("two.sqlite");
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE A (v TEXT); CREATE TABLE B (v TEXT); \
+                 INSERT INTO A VALUES ('from-a'); INSERT INTO B VALUES ('from-b');",
+            )
+            .unwrap();
+        let path = db.to_string_lossy().to_string();
+        let sources = read_source_rows_by_rowid(&[
+            (path.clone(), "A".into(), 1),
+            (path.clone(), "B".into(), 1),
+        ]);
+        assert_eq!(sources.len(), 2);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unreadable_result_db_is_listed_with_read_error() {
+        let root = temp_root("unreadable-db");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("Broken.sqlite"), vec![b'x'; 4096]).unwrap();
+        let mut listed = Vec::new();
+        find_result_files(&root, &root, &mut listed);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].file_name, "Broken");
+        assert!(listed[0].read_error.is_some());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn linked_rows_search_treats_like_metacharacters_literally() {
+        let root = temp_root("linked-like");
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("linked.sqlite");
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE T (k TEXT, loaded_filename TEXT); \
+                 INSERT INTO T VALUES ('x', 'a_b.dll'); INSERT INTO T VALUES ('x', 'axb.dll'); \
+                 INSERT INTO T VALUES ('x', '100%.dll'); INSERT INTO T VALUES ('x', 'other.dll');",
+            )
+            .unwrap();
+        let path = db.to_string_lossy().to_string();
+        let page = |search: &str| {
+            linked_result_rows_blocking(path.clone(), "T".into(), "k".into(), "x".into(), search.into(), 0, 10)
+                .unwrap()
+                .row_count
+        };
+        assert_eq!(page("a_b"), 1);
+        assert_eq!(page("%"), 1);
+        assert_eq!(page("A_B"), 1);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -8207,7 +8189,7 @@ mod overview_contract_tests {
         assert!(names(MftListOptions { path_prefix: Some("\\a_txt".into()), ..Default::default() }).is_empty(), "LIKE metacharacters stay literal");
         assert_eq!(names(MftListOptions { size_min: Some(3), size_max: Some(9), ..Default::default() }), vec!["a.txt", "stale.log"]);
         assert_eq!(names(MftListOptions { path_incomplete: Some(true), ..Default::default() }), vec!["stale.log", "orphan.bin"]);
-        assert_eq!(names(MftListOptions { resident_only: Some(true), ..Default::default() }), vec!["a.txt"]);
+        assert_eq!(names(MftListOptions { resident_only: Some(true), ..Default::default() }), vec!["a.txt", "empty.txt"], "empty resident bodies count as resident");
         Connection::open(&db).unwrap().execute_batch(
             "UPDATE FileSystemEntries SET si_created='2020-01-01 00:00:00.000', fn_created='2021-01-01 00:00:00.000' WHERE record_id='r2';
              UPDATE FileSystemEntries SET si_created='2022-01-01 00:00:00.000', fn_created='2021-01-01 00:00:00.000' WHERE record_id='r6';",
@@ -8251,13 +8233,34 @@ mod overview_contract_tests {
         assert_eq!(volumes[1].get("source_relative").and_then(Value::as_str), Some("C/v2/$MFT"));
         assert_eq!(volumes[1].get("input_name").and_then(Value::as_str), Some("$MFT"));
 
-        // A rowid from another volume context opens nothing.
-        let other_volume_rowid = mft_search_blocking(full.clone(), "other".into(), Some("v2".into()), 10).unwrap()[0]
-            .get("__rowid")
-            .and_then(Value::as_i64)
-            .unwrap();
-        assert!(mft_row(full.clone(), other_volume_rowid, Some("v1".into())).is_none());
-        assert!(mft_row(full, other_volume_rowid, Some("v2".into())).is_some());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A child of a freed folder references the folder one sequence back
+    /// (`deleted_parent`): it is listed under that folder, never under the
+    /// root, and not in the unlinked bucket.
+    #[test]
+    fn mft_children_attach_deleted_parent_links() {
+        let root = temp_root("mft-deleted-parent");
+        let overview = root.join("_OVERVIEW");
+        std::fs::create_dir_all(&overview).unwrap();
+        let db = write_file_system_entries(&overview);
+        Connection::open(&db).unwrap().execute_batch(
+            "INSERT INTO FileSystemEntries (record_id, host_id, dataset_id, overview_name, path, file_name, is_directory, in_use, volume_id, entry, seq, parent_entry, parent_seq, parent_status, path_status) VALUES
+             ('d1', 'h', 'd', 'FileSystemEntries', '\\gone', 'gone', 1, 0, 'v1', 20, 3, 5, 5, 'verified', 'complete'),
+             ('d2', 'h', 'd', 'FileSystemEntries', '\\gone\\lost.txt', 'lost.txt', 0, 0, 'v1', 21, 1, 20, 2, 'deleted_parent', 'complete'),
+             ('d3', 'h', 'd', 'FileSystemEntries', '\\$Orphan\\old.txt', 'old.txt', 0, 0, 'v1', 22, 1, 20, 1, 'sequence_mismatch', 'sequence_mismatch'),
+             ('d4', 'h', 'd', 'FileSystemEntries', '\\$Orphan\\stray.txt', 'stray.txt', 0, 0, 'v1', 23, 1, 5, 4, 'sequence_mismatch', 'sequence_mismatch');",
+        ).unwrap();
+        let full = db.to_string_lossy().to_string();
+        let children = mft_children_blocking(full.clone(), Some(20), Some(3), Some("v1".into()), 0, 100).unwrap();
+        assert_eq!(row_names(&children.rows), vec!["lost.txt"]);
+        assert_eq!(children.total, 1);
+        // The root keeps only same-sequence verified children.
+        let rooted = mft_children_blocking(full.clone(), Some(5), None, Some("v1".into()), 0, 100).unwrap();
+        assert_eq!(row_names(&rooted.rows), vec!["dir", "gone", "a.txt", "empty.txt"]);
+        let unlinked = mft_children_blocking(full, None, None, Some("v1".into()), 0, 100).unwrap();
+        assert_eq!(row_names(&unlinked.rows), vec!["old.txt", "orphan.bin", "stale.log", "stray.txt"]);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -8272,7 +8275,7 @@ mod overview_contract_tests {
              CREATE TABLE UsnChangeGroups (group_id TEXT PRIMARY KEY, host_id TEXT, dataset_id TEXT, input_id TEXT, input_name TEXT, source_file TEXT, source_relative TEXT, record_version INTEGER, file_reference TEXT, file_reference_sort TEXT, first_parent_reference TEXT, last_parent_reference TEXT, first_file_name TEXT, last_file_name TEXT, distinct_file_name_count INTEGER, first_timestamp TEXT, last_timestamp TEXT, first_usn TEXT, first_usn_sort TEXT, last_usn TEXT, last_usn_sort TEXT, first_input_sequence INTEGER, last_input_sequence INTEGER, member_count INTEGER, event_type TEXT, reason_union_mask TEXT, reason_union TEXT, unknown_reason_mask TEXT, has_unknown_reason INTEGER, group_scope TEXT, grouping_basis TEXT, boundary_reason TEXT, close_observed INTEGER, is_display_summary INTEGER, operation_confirmed INTEGER);
              CREATE TABLE UsnReasonFlags (record_id TEXT, ordinal INTEGER, group_id TEXT, reason_flag TEXT, flag_bit TEXT, is_unknown INTEGER);
              CREATE TABLE UsnGroupMembers (group_id TEXT, ordinal INTEGER, record_id TEXT, input_id TEXT, input_sequence INTEGER, record_offset TEXT, timestamp TEXT, file_name TEXT, event_type TEXT, reason TEXT, reason_mask TEXT, usn TEXT, usn_sort TEXT);
-             CREATE TABLE UsnRenameEvents (rename_id TEXT PRIMARY KEY, host_id TEXT, dataset_id TEXT, input_id TEXT, input_name TEXT, record_version INTEGER, file_reference TEXT, file_reference_sort TEXT, status TEXT, ambiguity_reason TEXT, matching_basis TEXT, old_record_id TEXT, new_record_id TEXT, old_group_id TEXT, new_group_id TEXT, old_file_name TEXT, new_file_name TEXT, old_usn TEXT, old_usn_sort TEXT, new_usn TEXT, new_usn_sort TEXT, old_timestamp TEXT, new_timestamp TEXT, old_candidate_count INTEGER, new_candidate_count INTEGER);
+             CREATE TABLE UsnRenameEvents (rename_id TEXT PRIMARY KEY, host_id TEXT, dataset_id TEXT, input_id TEXT, input_name TEXT, record_version INTEGER, file_reference TEXT, file_reference_sort TEXT, status TEXT, ambiguity_reason TEXT, matching_basis TEXT, old_record_id TEXT, new_record_id TEXT, group_id TEXT, old_file_name TEXT, new_file_name TEXT, old_usn TEXT, old_usn_sort TEXT, new_usn TEXT, new_usn_sort TEXT, old_timestamp TEXT, new_timestamp TEXT, old_candidate_count INTEGER, new_candidate_count INTEGER);
              CREATE TABLE UsnRenameCandidates (rename_id TEXT, ordinal INTEGER, record_id TEXT, group_id TEXT, role TEXT, file_name TEXT, usn TEXT, usn_sort TEXT, timestamp TEXT, record_offset TEXT, input_sequence INTEGER, reason_mask TEXT);
              CREATE TABLE source_records (record_id TEXT NOT NULL, ordinal INTEGER NOT NULL, source_dataset_id TEXT NOT NULL, source_artifact TEXT NOT NULL, source_db TEXT NOT NULL, source_table TEXT NOT NULL, source_rowid INTEGER NOT NULL, source_field TEXT, source_record_key TEXT, source_file TEXT, source_label TEXT);",
         )
@@ -8337,10 +8340,10 @@ mod overview_contract_tests {
             }
         }
         conn.execute_batch(
-            "INSERT INTO UsnRenameEvents (rename_id, host_id, dataset_id, input_id, status, ambiguity_reason, matching_basis, old_record_id, new_record_id, old_group_id, new_group_id, old_file_name, new_file_name, old_candidate_count, new_candidate_count) VALUES
-               ('rn1', 'h', 'd', 'usn-1', 'paired', NULL, 'same_group_usn_order', 'm3', 'm4', 'g2', 'g2', 'old.doc', 'new.doc', 1, 2),
-               ('rn2', 'h', 'd', 'usn-3', 'ambiguous', 'multiple_old_names|multiple_old_parents', 'same_group_usn_order', NULL, 'm10', 'g5', 'g5', NULL, 'b.txt', 2, 1),
-               ('rn3', 'h', 'd', 'usn-3', 'missing_new', NULL, 'same_group_usn_order', 'm11', NULL, 'g6', NULL, 'gone.tmp', NULL, 1, 0);
+            "INSERT INTO UsnRenameEvents (rename_id, host_id, dataset_id, input_id, status, ambiguity_reason, matching_basis, old_record_id, new_record_id, group_id, old_file_name, new_file_name, old_candidate_count, new_candidate_count) VALUES
+               ('rn1', 'h', 'd', 'usn-1', 'paired', NULL, 'same_group_usn_order', 'm3', 'm4', 'g2', 'old.doc', 'new.doc', 1, 2),
+               ('rn2', 'h', 'd', 'usn-3', 'ambiguous', 'multiple_old_names|multiple_old_parents', 'same_group_usn_order', NULL, 'm10', 'g5', NULL, 'b.txt', 2, 1),
+               ('rn3', 'h', 'd', 'usn-3', 'missing_new', NULL, 'same_group_usn_order', 'm11', NULL, 'g6', 'gone.tmp', NULL, 1, 0);
              INSERT INTO UsnRenameCandidates (rename_id, ordinal, record_id, group_id, role, file_name, usn, timestamp, record_offset) VALUES
                ('rn1', 0, 'm3', 'g2', 'old', 'old.doc', '1', '2026-01-01 10:05:00.000', '100'),
                ('rn1', 1, 'm4', 'g2', 'new', 'new.doc', '2', '2026-01-01 10:05:00.500', '200'),
@@ -8698,36 +8701,6 @@ mod overview_contract_tests {
         assert!(absent.body_b64.is_none());
         assert_eq!(absent.data_status.as_deref(), Some("unavailable"), "stored state, not guessed");
 
-        // All evidence links are returned in ordinal order, and a source_db
-        // outside the host root never resolves to an openable path.
-        let facts = overview.join("MFT_Records.sqlite");
-        Connection::open(&facts)
-            .unwrap()
-            .execute_batch("CREATE TABLE MFT_Records (volume_id TEXT NOT NULL, _source_file TEXT NOT NULL)")
-            .unwrap();
-        let sources = read_record_sources_blocking(
-            full.clone(),
-            "FileSystemEntries".to_string(),
-            rowid_of("a.txt"),
-        )
-        .unwrap();
-        assert_eq!(sources.len(), 2);
-        assert_eq!(
-            sources[0].get("source_full_path").and_then(Value::as_str),
-            Some(facts.to_string_lossy().to_string().as_str())
-        );
-        assert_eq!(
-            sources[1].get("source_full_path").and_then(Value::as_str),
-            Some("")
-        );
-        // A raw table has no source_records: no origin is invented.
-        assert!(read_record_sources_blocking(
-            facts.to_string_lossy().to_string(),
-            "MFT_Records".to_string(),
-            1,
-        )
-        .unwrap()
-        .is_empty());
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -8932,6 +8905,16 @@ mod overview_contract_tests {
     }
 
     #[test]
+    fn ascending_domains_keep_domain_ties_alphabetical() {
+        let stat = |domain: &str, visit_count| BrowserDomainStat { domain: domain.into(), visit_count, url_count: 1 };
+        // browser_visit_domains order: visit_count DESC, domain ASC.
+        let mut domains = vec![stat("z.example", 5), stat("a.example", 1), stat("b.example", 1)];
+        order_domains(&mut domains, true);
+        let names: Vec<&str> = domains.iter().map(|d| d.domain.as_str()).collect();
+        assert_eq!(names, ["a.example", "b.example", "z.example"]);
+    }
+
+    #[test]
     fn browser_view_reads_only_the_overview_contract() {
         let root = temp_root("browser-overview");
         let db = write_browser_overview(&root).to_string_lossy().to_string();
@@ -9120,10 +9103,8 @@ fn main() {
         .manage(PipelineState::default())
         .invoke_handler(tauri::generate_handler![
             list_cases,
-            create_case,
             create_host,
             rename_host,
-            delete_case,
             delete_host,
             list_artifacts,
             run_host,
@@ -9142,8 +9123,6 @@ fn main() {
             overview_contract_status,
             account_directory,
             host_metadata,
-            result_provenance,
-            artifact_input_files,
             parse_report,
             parse_run_log,
             open_parse_run_log,
@@ -9156,7 +9135,6 @@ fn main() {
             list_analyst_addresses,
             add_analyst_address,
             remove_analyst_address,
-            list_column_values,
             mft_children,
             mft_search,
             usn_overview,
@@ -9169,15 +9147,12 @@ fn main() {
             registry_search,
             registry_quick_access,
             mft_records_page,
-            mft_row,
             mft_record_body,
             mft_volumes,
-            read_record_sources,
             read_record_children,
             search_case,
             list_bookmarks,
             toggle_bookmark,
-            update_bookmark_note,
             pick_folder,
             file_references,
             path_reference_accounts,

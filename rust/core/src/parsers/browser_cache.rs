@@ -536,36 +536,27 @@ fn entry_row(cache: &mut Cache, addr: u32, account: &str, source: &str) -> Optio
     Some(r)
 }
 
-fn account_of(path: &Path) -> String {
-    let parts: Vec<String> = path
-        .components()
-        .map(|c| c.as_os_str().to_string_lossy().to_string())
-        .collect();
-    for (i, p) in parts.iter().enumerate() {
-        if p.to_uppercase() == "BROWSER" && i + 1 < parts.len() {
-            return parts[i + 1].clone();
-        }
-    }
-    path.parent()
-        .and_then(|p| p.file_name())
-        .map(|n| n.to_string_lossy().to_string())
+/// Account label anchored like BrowserInput (BROWSER/<account> or
+/// Users/<account>/AppData); "" without that evidence.
+pub fn account_of(path: &Path) -> String {
+    crate::browser_input::BrowserInput::from_source(path, "cache", None)
+        .account_label
         .unwrap_or_default()
 }
 
-/// 수집 경로에서 브라우저를 판별한다 — 경로 세그먼트가 결정적일 때만 Some.
-/// 수집 레이아웃(BROWSER/<계정>/CHROME/…)과 원본 프로필 경로(Google\Chrome,
-/// Microsoft\Edge, Naver\Whale)의 세그먼트를 모두 커버한다. 단서가 없으면
-/// None — 호출부는 브라우저를 추측하지 않고 미상으로 처리한다(T8 확정).
+/// 수집 경로에서 브라우저를 판별한다 — 계정 컨테이너 이후 세그먼트가 결정적일
+/// 때만 Some(BrowserInput과 같은 앵커링). 단서가 없으면 None — 호출부는
+/// 브라우저를 추측하지 않고 미상으로 처리한다(T8 확정).
 pub fn browser_of(path: &Path) -> Option<&'static str> {
-    for part in path.components() {
-        match part.as_os_str().to_string_lossy().to_lowercase().as_str() {
-            "chrome" => return Some("Chrome"),
-            "edge" => return Some("Edge"),
-            "whale" => return Some("Whale"),
-            _ => {}
-        }
+    match crate::browser_input::BrowserInput::from_source(path, "", None)
+        .browser
+        .as_deref()
+    {
+        Some("Chrome") => Some("Chrome"),
+        Some("Edge") => Some("Edge"),
+        Some("Whale") => Some("Whale"),
+        _ => None,
     }
-    None
 }
 
 /// 후보 검증 결과 — 유효 캐시 index(출력명 배정)와, 캐시 레이아웃에 있었지만
@@ -757,6 +748,16 @@ mod tests {
         assert_eq!(browser_of(Path::new("BROWSER/a/CHROME/Default/History")), Some("Chrome"));
         assert_eq!(browser_of(Path::new("C:/Users/x/AppData/Local/Naver/Whale/User Data")), Some("Whale"));
         assert_eq!(browser_of(Path::new("BROWSER/a/History")), None);
+        // Outer directory names before the account container do not count.
+        assert_eq!(
+            browser_of(Path::new("/Users/examiner/Chrome/collection/BROWSER/Administrator/EDGE/Default/History")),
+            Some("Edge")
+        );
+        // Native profile path: account is the profile folder, not Cache_Data.
+        assert_eq!(
+            account_of(Path::new("C:/Users/x/AppData/Local/Google/Chrome/User Data/Default/Cache/Cache_Data/index")),
+            "x"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

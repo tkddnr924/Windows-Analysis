@@ -33,7 +33,7 @@ CREATE TABLE "Defender_MPDetection_Records" (
   "_source_file" TEXT NOT NULL,
   "line_number" INTEGER NOT NULL,
   "raw_line" TEXT NOT NULL,
-  "timestamp_raw" TEXT,
+  "timestamp_raw" TEXT NOT NULL,
   "timestamp" TEXT,
   "timestamp_state" TEXT NOT NULL,
   "source_timezone" TEXT,
@@ -79,7 +79,8 @@ pub(super) struct DetectionRow {
     pub source_file: String,
     pub line_number: i64,
     pub raw_line: String,
-    pub timestamp_raw: Option<String>,
+    /// Text before ` DETECTION ` on a trimmed line; never empty.
+    pub timestamp_raw: String,
     pub timestamp: Option<String>,
     pub timestamp_state: String,
     /// Where the recorded instant's zone came from; never an assumed +9.
@@ -297,9 +298,7 @@ fn scan(path: &Path) -> Scanned {
         };
         let time_raw = time_raw.trim();
         let converted = parse_log_time(time_raw);
-        let timestamp_state = if time_raw.is_empty() {
-            "absent"
-        } else if let Some(parsed) = &converted {
+        let timestamp_state = if let Some(parsed) = &converted {
             parsed.state()
         } else {
             unparsed += 1;
@@ -316,7 +315,7 @@ fn scan(path: &Path) -> Scanned {
             source_file: display.clone(),
             line_number: index as i64 + 1,
             raw_line: line.to_string(),
-            timestamp_raw: (!time_raw.is_empty()).then(|| time_raw.to_string()),
+            timestamp_raw: time_raw.to_string(),
             timestamp: converted.as_ref().map(|parsed| parsed.display.clone()),
             timestamp_state: timestamp_state.to_string(),
             source_timezone: converted.as_ref().map(|parsed| parsed.zone.to_string()),

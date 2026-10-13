@@ -11,8 +11,7 @@ interface Props {
   hostName: string;
   stepLabel: string;
   percent: number;
-  complete: boolean;
-  hadError: boolean;
+  failedCount: number;
   runningCount: number;
   queuedCount: number;
   /** Jump to the parsing screen (undefined = no navigation available here). */
@@ -22,17 +21,17 @@ interface Props {
 
 // A slim always-on-top bar so an in-progress (or just-finished) parse stays
 // visible after the user navigates away from the RunPipeline screen.
-export default function GlobalProgress({ hostName, stepLabel, percent, complete, hadError, runningCount, queuedCount, onOpen, onDismiss }: Props) {
+// Rendered only while runs are live or a finished run is undismissed.
+export default function GlobalProgress({ hostName, stepLabel, percent, failedCount, runningCount, queuedCount, onOpen, onDismiss }: Props) {
   const liveCount = runningCount + queuedCount;
   const hasLiveRuns = liveCount > 0;
-  const color = hasLiveRuns ? "var(--accent)" : hadError ? "var(--danger)" : complete ? "var(--success)" : "var(--accent)";
+  const hadError = failedCount > 0;
+  const color = hasLiveRuns ? "var(--accent)" : hadError ? "var(--danger)" : "var(--success)";
   const stateIcon = hasLiveRuns
     ? <CircularProgress size={18} thickness={4.5} aria-label="파싱 진행 중" sx={{ color }} />
-    : complete
-    ? hadError
+    : hadError
       ? <ReportProblemOutlinedIcon sx={{ fontSize: 18, color }} />
-      : <TaskAltIcon sx={{ fontSize: 18, color }} />
-    : <CircularProgress size={18} thickness={4.5} aria-label="파싱 진행 중" sx={{ color }} />;
+      : <TaskAltIcon sx={{ fontSize: 18, color }} />;
   return (
     <div
       style={{
@@ -60,6 +59,7 @@ export default function GlobalProgress({ hostName, stepLabel, percent, complete,
             <DesktopWindowsOutlinedIcon sx={{ fontSize: 15, color: "var(--text-dim)", flexShrink: 0 }} />
             <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>{hasLiveRuns ? `실행 ${runningCount}개 · 대기 ${queuedCount}개` : hostName || "호스트"}</span>
             <span style={{ color: "var(--text-faint)", fontWeight: 400, flexShrink: 0 }}>· {hasLiveRuns && liveCount > 1 ? "진행 화면에서 호스트별 상태 확인" : stepLabel}</span>
+            {!hasLiveRuns && hadError && <span style={{ color: "var(--danger)", fontWeight: 600, flexShrink: 0 }}>· 실패 {failedCount}개</span>}
           </div>
         </div>
         {!hasLiveRuns || liveCount === 1 ? <span style={{ fontSize: 15, fontWeight: 700, fontVariantNumeric: "tabular-nums", color }}>{percent}%</span> : null}

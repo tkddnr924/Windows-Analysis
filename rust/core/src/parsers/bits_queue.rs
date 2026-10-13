@@ -49,7 +49,8 @@ pub const XFER_HEADER: [u8; 16] = [
 /// containers (observed in the public Win10/Win11/Win8.1 samples). Framing
 /// never searches for it: a size of 3 or a three-character string produces the
 /// same bytes, so records are walked by their own field sizes.
-pub const FILE_TRAILER_MARKER: [u8; 4] = [0x03, 0x00, 0x00, 0x00];
+#[cfg(test)]
+const FILE_TRAILER_MARKER: [u8; 4] = [0x03, 0x00, 0x00, 0x00];
 /// ESE database signature at offset 4 (0x89ABCDEF little endian).
 pub const ESE_SIGNATURE: [u8; 4] = [0xEF, 0xCD, 0xAB, 0x89];
 
@@ -180,15 +181,6 @@ pub enum Container {
     Legacy,
 }
 
-impl Container {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Container::Ese => "ese_qmgr_db",
-            Container::Legacy => "legacy_qmgr_queue",
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueueFormat {
     Ese,
@@ -255,7 +247,10 @@ pub struct QueueJob {
     pub other_time2_raw: Option<u64>,
     pub metadata_padding_hex: Option<String>,
     pub metadata_state: &'static str,
-    pub trailing_length: Option<i64>,
+    /// Bytes past the declared GUID references in an ESE transfer section.
+    pub transfer_trailing_length: Option<i64>,
+    /// Bytes left after the parsed metadata fields.
+    pub metadata_trailing_length: Option<i64>,
     pub parse_status: &'static str,
     pub parse_method: &'static str,
     pub parse_error: Option<String>,
@@ -750,7 +745,7 @@ fn read_transfer_section(
                     .push(format_guid(&section[start..start + 16]));
             }
             if declared * 16 < section.len() {
-                job.trailing_length = Some((section.len() - declared * 16) as i64);
+                job.transfer_trailing_length = Some((section.len() - declared * 16) as i64);
             }
             return;
         }
@@ -786,7 +781,19 @@ fn read_transfer_section(
             _ => resync_file_record(section, cursor),
         };
         let Some((start, mut file, end)) = located else {
-            let (mut file, _) = read_file_record(section, cursor);
+            let (mut file, end) = read_file_record(section, cursor);
+            if end.is_some() {
+                // Fields parsed, but the bytes were rejected as a record above:
+                // keep the bytes, not values decoded from them.
+                file = QueueFile {
+                    parse_status: "failed",
+                    parse_method: "sequential",
+                    parse_error: Some(format!(
+                        "{cursor}바이트 지점부터 파일 레코드 구조(대상 경로·원본 URL)를 찾지 못했습니다"
+                    )),
+                    ..QueueFile::default()
+                };
+            }
             file.record_index = index;
             file.record_offset = Some((section_offset + cursor) as i64);
             file.record_length = (section.len() - cursor) as i64;
@@ -938,7 +945,7 @@ fn read_metadata(data: &[u8], job: &mut QueueJob) {
     };
     job.other_time2_raw = Some(other2);
     job.metadata_state = "parsed";
-    job.trailing_length = Some(reader.remaining() as i64);
+    job.metadata_trailing_length = Some(reader.remaining() as i64);
 }
 
 /// A truncated metadata value keeps everything read so far and records why
@@ -1127,6 +1134,7 @@ pub fn parse_legacy_queue(data: &[u8]) -> ParsedQueue {
     // Every chunk between delimiters is a record candidate, including the one
     // before the first delimiter; all-zero padding is not a record.
     let mut index = 0i64;
+    let mut file_index = 0i64;
     let mut cursor = 0usize;
     while cursor < region.len() {
         let start = if region[cursor..].starts_with(&delimiter) {
@@ -1148,7 +1156,8 @@ pub fn parse_legacy_queue(data: &[u8]) -> ParsedQueue {
         job.record_offset = Some((region_start + start) as i64);
         let job_id = job.job_id.clone();
         for file in &mut job.files {
-            file.record_index = index;
+            file.record_index = file_index;
+            file_index += 1;
             file.job_record_index = Some(index);
             file.job_id = job_id.clone();
         }
@@ -1760,6 +1769,25 @@ mod tests {
         assert!(job.parse_error.unwrap().contains('5'));
     }
 
+    /// Zero padding parses as empty strings; it is not a proven file record.
+    #[test]
+    fn zero_padding_transfer_section_is_not_a_parsed_file() {
+        let spec = JobSpec::default();
+        let mut body = control(&spec);
+        body.extend_from_slice(&XFER_HEADER);
+        body.extend_from_slice(&1u32.to_le_bytes());
+        body.extend_from_slice(&[0u8; 64]);
+        body.extend_from_slice(&XFER_HEADER);
+        body.extend(metadata(1, 2));
+        let job = parse_job_record(&body, Container::Legacy);
+        assert_eq!(job.files[0].dest_file, None);
+        assert_eq!(job.files.len(), 1);
+        assert_eq!(job.files[0].parse_status, "failed");
+        assert!(job.files[0].parse_error.is_some());
+        assert!(!job.files[0].blob.is_empty());
+        assert_eq!(job.parse_status, "partial");
+    }
+
     #[test]
     fn ese_job_records_file_reference_guids() {
         let reference = [
@@ -1813,6 +1841,44 @@ mod tests {
         assert_eq!(parsed.jobs[0].files[0].link_basis, "legacy_job_transfer_section");
         assert_eq!(parsed.file_record_count(), 1);
         assert_eq!(parsed.failed_record_count(), 0);
+    }
+
+    #[test]
+    fn legacy_queue_file_record_index_is_per_record() {
+        let (_, delimiter) = JOB_DELIMITERS[0];
+        let files = vec![
+            file_record(r"C:\dl\a.bin", "http://host.test/a", r"C:\dl\a.tmp", 1, 2),
+            file_record(r"C:\dl\b.bin", "http://host.test/b", r"C:\dl\b.tmp", 1, 2),
+        ];
+        let first = legacy_job(&JobSpec::default(), &files);
+        let second = legacy_job(&JobSpec::default(), &files[..1]);
+        let parsed = parse_legacy_queue(&legacy_queue(&[first, second], delimiter, 2));
+        let rows: Vec<(i64, Option<i64>, Option<i64>)> = parsed
+            .jobs
+            .iter()
+            .flat_map(|job| job.files.iter())
+            .map(|file| (file.record_index, file.job_record_index, file.file_index_in_job))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![(0, Some(0), Some(0)), (1, Some(0), Some(1)), (2, Some(1), Some(0))]
+        );
+    }
+
+    #[test]
+    fn ese_transfer_and_metadata_trailers_are_kept_apart() {
+        let spec = JobSpec::default();
+        let mut body = control(&spec);
+        body.extend_from_slice(&XFER_HEADER);
+        body.extend_from_slice(&1u32.to_le_bytes());
+        body.extend_from_slice(&[0x11; 16]);
+        body.extend_from_slice(&[0x22; 5]);
+        body.extend_from_slice(&XFER_HEADER);
+        body.extend(metadata(1, 2));
+        body.extend_from_slice(&[0x33; 3]);
+        let job = parse_job_record(&body, Container::Ese);
+        assert_eq!(job.transfer_trailing_length, Some(5));
+        assert_eq!(job.metadata_trailing_length, Some(3));
     }
 
     #[test]

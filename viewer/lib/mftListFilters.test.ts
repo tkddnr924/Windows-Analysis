@@ -1,12 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 // @ts-expect-error -- TypeScript uses bundler resolution while this test uses Node directly.
-import { DEFAULT_LIST_FILTERS, EXTENSION_PRESETS, NOISE_FOLDERS, activeFilterCount, activityOf, describeFilters, noiseExcluded, presetActive, timeBounds, timeKeysFor, toListOptions, withNoiseExcluded, withTimeKeys, withTimeMode } from "./mftListFilters.ts";
+import { DEFAULT_LIST_FILTERS, EXTENSION_PRESETS, NOISE_FOLDERS, activityOf, describeFilters, filtersNarrowed, noiseExcluded, presetActive, timeBounds, timeKeysFor, resetFilters, toListOptions, withNoiseExcluded, withTimeKeys, withTimeMode } from "./mftListFilters.ts";
 
 test("defaults list files only, sorted by path, without other conditions", () => {
   assert.deepEqual(toListOptions(DEFAULT_LIST_FILTERS, "v1"), { sortKey: "path", sortDesc: false, kind: "file", volumeId: "v1" });
-  assert.equal(activeFilterCount(DEFAULT_LIST_FILTERS), 0);
-  assert.deepEqual(describeFilters(DEFAULT_LIST_FILTERS), []);
+  // The default file-only kind still narrows the list, so it is always shown.
+  assert.deepEqual(describeFilters(DEFAULT_LIST_FILTERS), ["파일만"]);
+  assert.deepEqual(describeFilters({ ...DEFAULT_LIST_FILTERS, kind: "all" }), []);
+  assert.equal(filtersNarrowed(DEFAULT_LIST_FILTERS), false);
+  assert.equal(filtersNarrowed({ ...DEFAULT_LIST_FILTERS, kind: "all" }), true);
 });
 
 test("a period with only a start, only an end, or both", () => {
@@ -62,7 +65,7 @@ test("the update-noise switch adds and removes only its own folders", () => {
   assert.equal(noiseExcluded(on), true);
   assert.deepEqual(on.excludePaths, ["\\Windows\\Temp", ...NOISE_FOLDERS]);
   assert.deepEqual(withNoiseExcluded(on, false).excludePaths, ["\\Windows\\Temp"]);
-  assert.deepEqual(describeFilters(on), ["Windows 업데이트 폴더 제외", "제외: \\Windows\\Temp"]);
+  assert.deepEqual(describeFilters(on), ["파일만", "Windows 업데이트 폴더 제외", "제외: \\Windows\\Temp"]);
   assert.deepEqual(toListOptions({ ...DEFAULT_LIST_FILTERS, excludePaths: [" \\A ", "\\A", ""] }, "v").excludePaths, ["\\A"]);
 });
 
@@ -82,6 +85,10 @@ test("extension presets are recognised regardless of order and case", () => {
   const filters = { ...DEFAULT_LIST_FILTERS, extension: EXTENSION_PRESETS.archive.extensions.slice().reverse().join(", ").toUpperCase() };
   assert.equal(presetActive(filters, "archive"), true);
   assert.equal(presetActive(filters, "executable"), false);
-  assert.equal(activeFilterCount(filters), 1);
-  assert.deepEqual(describeFilters(filters), ["확장자: 압축"]);
+  assert.deepEqual(describeFilters(filters), ["파일만", "확장자: 압축"]);
+});
+
+test("reset keeps sort and period fields, clears every narrowing condition", () => {
+  const custom = { ...DEFAULT_LIST_FILTERS, sortKey: "fn_created", sortDesc: true, timeKeys: ["modified"], kind: "dir" as const, residentOnly: true, pattern: "x" };
+  assert.deepEqual(resetFilters(custom), { ...DEFAULT_LIST_FILTERS, sortKey: "fn_created", sortDesc: true, timeKeys: ["modified"] });
 });

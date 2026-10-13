@@ -68,6 +68,13 @@ test("latest protection per feature inside the period; same-time conflicts are n
   assert.equal(all[0].count, 2);
   const august = latestProtection(states, (timestamp: string) => timestamp < "2026-09-01");
   assert.deepEqual(august.map((entry: { feature: string; state: string | null }) => [entry.feature, entry.state]), [["realtime_protection", "on"]]);
+  // Same-time equal states: the stored Rust order (observation_ordinal) picks
+  // the latest record, not the order rows happened to be read in.
+  const tied = latestProtection([
+    { feature: "ioav", state: "on", timestamp: "2026-09-02 00:00:00.000", record_id: "late", observation_ordinal: "1" },
+    { feature: "ioav", state: "on", timestamp: "2026-09-02 00:00:00.000", record_id: "early", observation_ordinal: "0" },
+  ], always);
+  assert.equal(tied[0].recordId, "late");
 });
 
 test("activity summary counts within the period", () => {

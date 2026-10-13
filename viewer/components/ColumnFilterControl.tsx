@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { FilterMode, ColumnFilterValue } from "@/lib/types";
 
 const MODE_CYCLE: FilterMode[] = ["contains", "exclude", "exact"];
@@ -20,6 +20,10 @@ export default function ColumnFilterControl({ value, onChange }: ColumnFilterCon
   // the mode toggle before typing anything still "sticks" once you type.
   const [localMode, setLocalMode] = useState<FilterMode>(value?.mode ?? "contains");
   const mode = value?.mode ?? localMode;
+  // Keep an externally injected mode after its text is cleared.
+  useEffect(() => {
+    if (value?.mode) setLocalMode(value.mode);
+  }, [value?.mode]);
   const text = value?.value ?? "";
   const active = Boolean(text);
 

@@ -29,6 +29,7 @@ mod wer_reports;
 mod wer_dumps;
 mod artifact_paths;
 mod stream;
+mod eventlog_inputs;
 mod usn;
 mod path_candidates;
 
@@ -138,6 +139,25 @@ pub fn is_sid(value: &str) -> bool {
         && rest
             .split('-')
             .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// Security LogonId as one identity: absent, "-" and zero identify nothing
+/// (empty result); numeric forms normalise to lowercase hex so `0x7A3F21`
+/// and `0x7a3f21` match; anything else keeps its lowercased raw form.
+pub fn normalize_logon_id(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "-" {
+        return String::new();
+    }
+    let value = match trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X")) {
+        Some(hex) => u64::from_str_radix(hex, 16).ok(),
+        None => trimmed.parse::<u64>().ok(),
+    };
+    match value {
+        Some(0) => String::new(),
+        Some(value) => format!("0x{value:x}"),
+        None => trimmed.to_ascii_lowercase(),
+    }
 }
 
 /// Invalid JSON remains available in facts, not typed JSON columns.
@@ -869,20 +889,31 @@ fn validate_lineage(out_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Derived build outcome.
+#[derive(Debug)]
+pub struct DerivedBuild {
+    /// (schema name, primary-row count) in documented order.
+    pub tables: Vec<(String, usize)>,
+    /// Skipped unreadable inputs, prefixed by the builder name.
+    pub input_errors: Vec<String>,
+}
+
 /// Build all 24 schemas, including empty results; propagate generation failures.
 pub fn build_all(
     out_dir: &Path,
     target: &Path,
     host_id: &str,
     dataset_id: &str,
-) -> Result<Vec<(String, usize)>> {
+) -> Result<DerivedBuild> {
     let overview_dir = out_dir.join("_OVERVIEW");
     std::fs::create_dir_all(&overview_dir)?;
 
     // Other builders depend on stored metadata.
-    let metadata_rows = crate::metadata::build_metadata(out_dir, target, host_id, dataset_id)
+    let metadata = crate::metadata::build_metadata(out_dir, target, host_id, dataset_id)
         .context("Metadata 생성")?;
-    let mut report: Vec<(String, usize)> = vec![("Metadata".to_string(), metadata_rows)];
+    let input_errors: Vec<String> =
+        metadata.input_errors.into_iter().map(|error| format!("Metadata: {error}")).collect();
+    let mut report: Vec<(String, usize)> = vec![("Metadata".to_string(), metadata.rows)];
 
     let ctx = Ctx {
         out_dir,
@@ -894,13 +925,16 @@ pub fn build_all(
     };
 
     // Share event and registry scans across builders.
-    let events = crate::overview::EventLogOverviewCache::load(out_dir);
-    let registry = crate::overview::RegistryOverviewCache::load(out_dir);
+    let events = crate::overview::EventLogOverviewCache::load(out_dir).context("EventLog 입력 읽기")?;
+    let registry = crate::overview::RegistryOverviewCache::load(out_dir).context("Registry 입력 읽기")?;
+    // One WER collection feeds both WerReports and ExecutionHistory.
+    let wer = crate::wer_evidence::collect(out_dir, &events)?;
+    let wer_starts = crate::wer_evidence::execution_start_evidence(&wer);
 
-    for (name, rows) in builders::build_event_backed(&ctx, &events)? {
+    for (name, rows) in builders::build_event_backed(&ctx, &events, wer)? {
         report.push((name, rows));
     }
-    for (name, rows) in builders::build_registry_backed(&ctx, &registry, &events)? {
+    for (name, rows) in builders::build_registry_backed(&ctx, &registry, &events, wer_starts)? {
         report.push((name, rows));
     }
     // 전수 레지스트리 저장은 선별 판정 뒤에 만든다 — 퀵 접근 관계가
@@ -924,7 +958,7 @@ pub fn build_all(
     });
     debug_assert_eq!(report.len(), schema::SPECS.len());
     validate_lineage(out_dir)?;
-    Ok(report)
+    Ok(DerivedBuild { tables: report, input_errors })
 }
 
 #[cfg(test)]
@@ -1328,7 +1362,9 @@ mod tests {
     #[test]
     fn build_all_publishes_every_database_even_with_no_evidence() {
         let (out_dir, target) = fixture("empty");
-        let report = build_all(&out_dir, &target, "host-1", "ds-1").unwrap();
+        let build = build_all(&out_dir, &target, "host-1", "ds-1").unwrap();
+        assert!(build.input_errors.is_empty(), "{:?}", build.input_errors);
+        let report = build.tables;
         assert_eq!(report.len(), 24);
         for (index, spec) in schema::SPECS.iter().enumerate() {
             assert_eq!(report[index].0, spec.name, "보고 순서는 문서 순서다");
@@ -1349,6 +1385,37 @@ mod tests {
         let _ = std::fs::remove_dir_all(out_dir.parent().unwrap());
     }
 
+    /// A corrupt SRUM facts DB is reported as a Metadata input error while
+    /// healthy SRUM facts still contribute their DWM/UMFD accounts.
+    #[test]
+    fn build_all_reports_unreadable_srum_and_keeps_healthy_srum() {
+        let (out_dir, target) = fixture("srum-input-error");
+        facts_db(&out_dir, "SRUM/SRUM_Healthy.sqlite",
+            "CREATE TABLE SRUM_Healthy(user TEXT); INSERT INTO SRUM_Healthy VALUES ('S-1-5-90-0-3');");
+        // Readable schema, corrupt table page.
+        let corrupt = out_dir.join("SRUM/SRUM_Corrupt.sqlite");
+        let db = Connection::open(&corrupt).unwrap();
+        db.execute_batch("CREATE TABLE SRUM_Corrupt(user TEXT); INSERT INTO SRUM_Corrupt VALUES ('S-1-5-90-0-7');").unwrap();
+        let page_size: usize = db.query_row("PRAGMA page_size", [], |row| row.get(0)).unwrap();
+        drop(db);
+        let mut bytes = std::fs::read(&corrupt).unwrap();
+        bytes[page_size..2 * page_size].fill(0xFF);
+        std::fs::write(&corrupt, bytes).unwrap();
+
+        let build = build_all(&out_dir, &target, "host-1", "ds-1").unwrap();
+        assert_eq!(build.input_errors.len(), 1, "{:?}", build.input_errors);
+        assert!(build.input_errors[0].starts_with("Metadata: SRUM/SRUM_Corrupt.sqlite skipped: "), "{:?}", build.input_errors);
+        assert_eq!(build.tables.len(), 24);
+        let meta = open(&out_dir, "Metadata");
+        let key = |sid: &str| -> i64 {
+            meta.query_row("SELECT count(*) FROM metadata WHERE kind='virtual_account' AND key=?1", [sid], |row| row.get(0)).unwrap()
+        };
+        assert_eq!(key("s-1-5-90-0-3"), 1, "healthy SRUM must still contribute");
+        assert_eq!(key("s-1-5-90-0-7"), 0);
+        drop(meta);
+        let _ = std::fs::remove_dir_all(out_dir.parent().unwrap());
+    }
+
     #[test]
     fn file_system_entries_maps_typed_mft_facts() {
         let (out_dir, target) = fixture("mft");
@@ -1362,13 +1429,13 @@ mod tests {
              entry INTEGER, seq INTEGER, parent_entry INTEGER, si_created TEXT, si_modified TEXT, \
              si_mft_modified TEXT, si_accessed TEXT, owner_id TEXT, security_id TEXT, \
              fn_created TEXT, fn_modified TEXT, fn_mft_modified TEXT, fn_accessed TEXT, \
-             _source_file TEXT NOT NULL,parent_seq INTEGER,parent_status TEXT,path_status TEXT,data_status TEXT);\
+             _source_file TEXT NOT NULL,parent_seq INTEGER,parent_status TEXT,path_status TEXT,data_status TEXT,record_status TEXT);\
              INSERT INTO MFT_Records VALUES ('vol-1','SYSTEM',NULL,NULL,3,1,'0x0',\
              '\\Users\\a.txt','a.txt','txt',0,1,5,x'68656c6c6f',42,3,-1,\
              '2026-01-01 00:00:00.000','2026-01-02 03:04:05.678','2026-01-02 03:04:05.678',\
-             '2026-01-03 00:00:00.000','7','9',NULL,NULL,NULL,NULL,'C:\\$MFT',NULL,'unknown','unknown','resident');",
+             '2026-01-03 00:00:00.000','7','9',NULL,NULL,NULL,NULL,'C:\\$MFT',NULL,'unknown','unknown','resident','ok');",
         );
-        let report = build_all(&out_dir, &target, "host-1", "ds-1").unwrap();
+        let report = build_all(&out_dir, &target, "host-1", "ds-1").unwrap().tables;
         assert_eq!(
             report
                 .iter()
@@ -1530,7 +1597,7 @@ mod tests {
                 ..UsnRow::new("2026-02-03 10:11:12.000", "b.txt", "FILE_DELETE|CLOSE", "18446744073709551615", reference, "2147484160")
             }],
         );
-        let report = build_all(&out_dir, &target, "host-1", "ds-1").unwrap();
+        let report = build_all(&out_dir, &target, "host-1", "ds-1").unwrap().tables;
         assert_eq!(report.iter().find(|(name, _)| name == "UsnJournal").unwrap().1, 2);
         let conn = open(&out_dir, "UsnJournal");
         assert_usn_integrity(&conn);
@@ -1579,7 +1646,7 @@ mod tests {
             &conn,
             "SELECT version FROM _wina_derived_version WHERE name='usn_journal'",
         );
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
         let _ = std::fs::remove_dir_all(out_dir.parent().unwrap());
     }
 
@@ -2031,7 +2098,7 @@ mod tests {
         let b = target.join("b.txt");
         std::fs::write(&a, "foreach ($x in 1..2) {`\r\n  Add-Risk $x`\r\n}\r\nWrite-Output 'tick'``\r\nnext\r\nblank-tail`\r\n\r\nlast`\r\n").unwrap();
         std::fs::write(&b, "Get-Date\r\n").unwrap();
-        let raw = crate::parsers::powershell_history::parse_console_history(&[a, b]).unwrap();
+        let raw = crate::parsers::powershell_history::parse_console_history(&[a, b]).unwrap().rows;
         assert_eq!(raw.len(), 9, "empty physical lines can terminate a continued command");
         let path = facts_db(&out_dir, "POWERSHELL/PowerShell_ConsoleHistory.sqlite",
             "CREATE TABLE PowerShell_ConsoleHistory(line_number TEXT,command TEXT,user TEXT,_source_file TEXT);");

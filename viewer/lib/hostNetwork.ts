@@ -32,3 +32,39 @@ export function addressOwners(hosts: (HostRef & { ips: string[] })[], isLoopback
   for (const [ip, owners] of all) if (owners.length === 1) unique.set(ip, owners[0]);
   return { all, unique };
 }
+
+/** Four octets of a strict dotted IPv4 (each 0..255), else null. */
+function ipv4Octets(value: string): number[] | null {
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(value.trim());
+  if (!m) return null;
+  const octets = [Number(m[1]), Number(m[2]), Number(m[3]), Number(m[4])];
+  return octets.some((octet) => octet > 255) ? null : octets;
+}
+
+/** "/24" prefix "a.b.c" of a valid IPv4, else null. */
+export function ipv4Net(value: string): string | null {
+  const octets = ipv4Octets(value);
+  return octets ? octets.slice(0, 3).join(".") : null;
+}
+
+/** RFC1918 private IPv4. Malformed addresses are never private. */
+export function isPrivateIpv4(value: string): boolean {
+  const octets = ipv4Octets(value);
+  if (!octets) return false;
+  return octets[0] === 10
+    || (octets[0] === 192 && octets[1] === 168)
+    || (octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31);
+}
+
+/** Distinct /24 prefixes of the hosts' addresses, in host order. */
+export function hostNets(hosts: { ips: string[] }[]): string[] {
+  return [...new Set(hosts.flatMap((host) => host.ips.map(ipv4Net).filter((net): net is string => net !== null)))];
+}
+
+/** Internal peer: a host, local/loopback, RFC1918, or on a host /24. `peer` is the raw address, not the display label. */
+export function isInternalPeer(record: { peer: string; peerKind?: string; peerIsHost?: boolean }, nets: Set<string>): boolean {
+  if (record.peerIsHost || record.peerKind === "local" || record.peerKind === "loopback") return true;
+  if (isPrivateIpv4(record.peer)) return true;
+  const net = ipv4Net(record.peer);
+  return net !== null && nets.has(net);
+}

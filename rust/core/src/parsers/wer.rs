@@ -331,7 +331,7 @@ fn parse_report(path: &Path) -> Row {
     r.insert("ReportIdentifier".into(), get("ReportIdentifier"));
     r.insert("report".into(), py_json(&Value::Object(full)));
     r.insert("report_text".into(), text);
-    r.insert("entry_count".into(), entries.len().to_string());
+    r.insert("entry_count".into(), (entries.len() - unparsed).to_string());
     r.insert(
         "entries_json".into(),
         serde_json::to_string(&Value::Array(entries)).unwrap_or_default(),
@@ -469,6 +469,7 @@ mod tests {
         assert_eq!(row.get("byte_size"), Some(&size));
         assert_eq!(row.get("line_count").map(String::as_str), Some("15"));
         assert_eq!(row.get("unparsed_line_count").map(String::as_str), Some("2"));
+        assert_eq!(row.get("entry_count").map(String::as_str), Some("13"));
         // The complete decoded input is kept, not just the parsed pairs.
         assert_eq!(row.get("report_text").map(String::as_str), Some(text));
         let entries: Value = serde_json::from_str(row.get("entries_json").unwrap()).unwrap();

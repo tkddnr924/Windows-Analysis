@@ -218,7 +218,7 @@ impl<'a> SmbEvent<'a> {
             source: src,
             index: 0,
             timestamp: g(src, "timestamp"),
-            timestamp_kind: "event_time",
+            timestamp_kind: "이벤트 기록 시각",
             provider: g(src, "Provider"),
             channel: g(src, "Channel"),
             computer: g(src, "Computer"),
@@ -862,7 +862,9 @@ fn log_cleared_spec() -> Spec {
     }
 }
 
-fn apply_spec(event: &mut SmbEvent<'_>, spec: &Spec) {
+/// `audited`: the record carries Security audit keywords. SMBServer/SMBClient
+/// keywords are provider keywords, so no audit outcome is issued for them.
+fn apply_spec(event: &mut SmbEvent<'_>, spec: &Spec, audited: bool) {
     event.role = spec.role;
     event.event_kind = spec.event_kind;
     event.description = spec.description;
@@ -873,7 +875,7 @@ fn apply_spec(event: &mut SmbEvent<'_>, spec: &Spec) {
     event.protocol_basis = spec.protocol_basis;
     event.access_semantics = spec.access_semantics;
     event.boundary_kind = spec.boundary_kind;
-    event.audit_outcome = audit_outcome(event.keywords_raw);
+    event.audit_outcome = if audited { audit_outcome(event.keywords_raw) } else { "" };
     match spec.result {
         ResultRule::Fixed(result) => {
             event.result = result;
@@ -990,7 +992,7 @@ fn fill_security(event: &mut SmbEvent<'_>, eid: &str, ed: &Map<String, Value>) {
     }
 }
 
-fn fill_smb_provider(event: &mut SmbEvent<'_>, ed: &Map<String, Value>) {
+fn fill_smb_provider(event: &mut SmbEvent<'_>, ed: &Map<String, Value>, server: bool) {
     event.share_name = f(ed, &["ShareName"]);
     event.server_name_raw = f(ed, &["ServerName"]);
     event.object_name_raw = f(ed, &["ObjectName"]);
@@ -1006,20 +1008,19 @@ fn fill_smb_provider(event: &mut SmbEvent<'_>, ed: &Map<String, Value>) {
         apply_account(event, &name, &domain, "");
         event.account_raw = user;
     }
-    // Peer evidence: the client name on the server side, the target server on
-    // the client side. A reported name stays a name.
-    let raw_peer = {
-        let client = f(ed, &["ClientName"]);
-        if !client.is_empty() {
-            client
-        } else if !event.server_name_raw.is_empty() {
-            event.server_name_raw.clone()
-        } else {
-            event.share_name.clone()
-        }
+    // Peer evidence: ClientName on the server side (ServerName is this host),
+    // the target server or the share's host on the client side. A reported
+    // name stays a name; a wildcard host is not a peer.
+    let candidates = if server {
+        [f(ed, &["ClientName"]), String::new()]
+    } else {
+        [event.server_name_raw.clone(), event.share_name.clone()]
     };
-    if !raw_peer.is_empty() {
-        let token = peer_token(&raw_peer);
+    let peer = candidates.into_iter().find_map(|raw| {
+        let token = peer_token(&raw);
+        (!token.is_empty() && !token.contains(['*', '?'])).then_some((raw, token))
+    });
+    if let Some((raw_peer, token)) = peer {
         event.peer_name_raw = token.clone();
         let address = if ip_literal(&token) { token } else { String::new() };
         apply_address(event, &raw_peer, address);
@@ -1051,11 +1052,11 @@ fn classify_row<'a>(src: &'a Row) -> Option<SmbEvent<'a>> {
         smb_provider_spec(server, eid)
     };
     let mut event = SmbEvent::new(src);
-    apply_spec(&mut event, &spec);
+    apply_spec(&mut event, &spec, !(server || client));
     if security {
         fill_security(&mut event, eid, &ed);
     } else if server || client {
-        fill_smb_provider(&mut event, &ed);
+        fill_smb_provider(&mut event, &ed, server);
     }
     Some(event)
 }
@@ -1078,7 +1079,7 @@ pub fn classify<'a>(cache: &'a EventLogOverviewCache) -> SmbClassification<'a> {
         .iter()
         .filter(|event| event.role == SmbRole::Direct)
         .filter_map(|event| {
-            let logon_id = relations::normalize_logon_id(&event.logon_id);
+            let logon_id = crate::derived::normalize_logon_id(&event.logon_id);
             if logon_id.is_empty() {
                 return None;
             }
@@ -1091,7 +1092,7 @@ pub fn classify<'a>(cache: &'a EventLogOverviewCache) -> SmbClassification<'a> {
             if event.event_kind != "special_privileges_assigned" {
                 return true;
             }
-            let logon_id = relations::normalize_logon_id(&event.logon_id);
+            let logon_id = crate::derived::normalize_logon_id(&event.logon_id);
             !logon_id.is_empty()
                 && selected.contains(&(event.source_scope.as_str(), event.computer, logon_id))
         })
@@ -1183,7 +1184,6 @@ mod tests {
         account_sid_is_placeholder: bool,
         logon_id: String,
         logon_type: String,
-        logon_process: String,
         authentication_package: String,
         lm_package_name: String,
         workstation_name: String,
@@ -1243,7 +1243,6 @@ mod tests {
             account_sid_is_placeholder: e.account_sid_is_placeholder,
             logon_id: e.logon_id.clone(),
             logon_type: e.logon_type.clone(),
-            logon_process: e.logon_process.clone(),
             authentication_package: e.authentication_package.clone(),
             lm_package_name: e.lm_package_name.clone(),
             workstation_name: e.workstation_name.clone(),
@@ -1631,6 +1630,70 @@ mod tests {
         assert_eq!(e.role, "context");
         assert_eq!(e.result, "정보");
         assert_eq!(e.direction, "unknown");
+    }
+
+    /// RD-33: the time meaning uses the shared Korean vocabulary.
+    #[test]
+    fn timestamp_kind_uses_event_recorded_vocabulary() {
+        let cache = EventLogOverviewCache::from_rows_for_tests(vec![smb_row(
+            CLI,
+            "Microsoft-Windows-SmbClient/Security",
+            "31018",
+            "{}",
+            "SmbClientSecurity::3",
+        )]);
+        assert_eq!(classify(&cache).events[0].timestamp_kind, "이벤트 기록 시각");
+    }
+
+    /// RD-67: provider keywords are not audit keywords; no audit outcome is
+    /// issued for SMBClient/SMBServer records.
+    #[test]
+    fn provider_records_carry_no_audit_outcome() {
+        let mut row = smb_row(
+            CLI,
+            "Microsoft-Windows-SmbClient/Security",
+            "31018",
+            "{}",
+            "SmbClientSecurity::3",
+        );
+        row.insert("Keywords".into(), "0x200000000000080".into());
+        let (events, _) = classify_owned(vec![row]);
+        assert_eq!(events[0].audit_outcome, "");
+    }
+
+    /// RD-34: on the server side only ClientName names the peer; the server's
+    /// own name is never the peer.
+    #[test]
+    fn server_side_peer_comes_only_from_client_name() {
+        let data = r#"{"EventData":{"ServerName":"10.0.0.5","ShareName":"\\\\10.0.0.5\\IPC$"}}"#;
+        let (events, _) = classify_owned(vec![smb_row(
+            SRV,
+            "Microsoft-Windows-SMBServer/Security",
+            "551",
+            data,
+            "SMBServerSecurity::1",
+        )]);
+        let e = &events[0];
+        assert_eq!(e.peer_name_raw, "");
+        assert_eq!(e.remote_address, "");
+        assert_eq!(e.address_state, "unrecorded");
+    }
+
+    /// RD-34: a wildcard share host is not a peer.
+    #[test]
+    fn wildcard_share_host_is_not_a_peer() {
+        let data = r#"{"EventData":{"ShareName":"\\\\*\\IPC$"}}"#;
+        let (events, _) = classify_owned(vec![smb_row(
+            CLI,
+            "Microsoft-Windows-SmbClient/Security",
+            "31017",
+            data,
+            "SmbClientSecurity::1",
+        )]);
+        let e = &events[0];
+        assert_eq!(e.peer_name_raw, "");
+        assert_eq!(e.remote_address_raw, "");
+        assert_eq!(e.address_state, "unrecorded");
     }
 
     /// R07: an addressless SMBServer record is retained with its account and

@@ -7,7 +7,7 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use crate::overview::{jget, parse_eventdata, read_table_with_rowid, EventLogOverviewCache};
+use crate::overview::{basename_win, jget, parse_eventdata, read_table_with_rowid, EventLogOverviewCache};
 use crate::sqlite::Row;
 use crate::time::fmt_filetime;
 
@@ -375,14 +375,19 @@ pub fn duration_kr(start: &str, end: &str) -> String {
     parts.join(" ")
 }
 
-fn store_location(path: &str) -> &'static str {
-    let lower = path.to_ascii_lowercase();
-    if lower.contains("reportqueue") {
-        "ReportQueue"
-    } else if lower.contains("reportarchive") {
-        "ReportArchive"
-    } else {
-        "unknown"
+/// The WER store is the folder holding the report folder. Only that one
+/// component is compared, so folder names elsewhere in the path (such as the
+/// analyst's collection root) never classify the store.
+fn store_location(report_dir: &str) -> &'static str {
+    let mut components = report_dir
+        .split(['\\', '/'])
+        .filter(|part| !part.is_empty())
+        .rev();
+    components.next();
+    match components.next() {
+        Some(store) if store.eq_ignore_ascii_case("ReportQueue") => "ReportQueue",
+        Some(store) if store.eq_ignore_ascii_case("ReportArchive") => "ReportArchive",
+        _ => "unknown",
     }
 }
 
@@ -571,14 +576,18 @@ pub fn from_report_row(row: &Row, rowid: i64) -> anyhow::Result<WerRecord> {
     }
 
     record.timestamp = text_of(row, "timestamp");
-    let report: Value = serde_json::from_str(record.get("report")).unwrap_or(Value::Null);
+    // The parser always writes the body of a parsed row; a body that no longer
+    // parses is damaged facts, not a report without values.
+    let report: Value = serde_json::from_str(record.get("report")).map_err(|error| {
+        reparse_required(&format!("rowid {rowid}: report 해석 실패 ({error})"))
+    })?;
     for &(key, column) in REPORT_SCALARS {
         if let Some(value) = report.get(key).and_then(Value::as_str) {
             record.set(column, value);
         }
     }
-    // The promoted facts columns stay authoritative for the six scalars the
-    // parser lifted, so a body that failed to parse cannot empty them.
+    // The promoted facts columns stay authoritative for the scalars the
+    // parser lifted.
     for (key, column) in [
         ("EventType", "error_type"),
         ("AppName", "app_name"),
@@ -609,7 +618,7 @@ pub fn from_report_row(row: &Row, rowid: i64) -> anyhow::Result<WerRecord> {
     record.signatures = signatures_from_entries(entries, schema.as_ref())
         .ok_or_else(|| reparse_required(&format!("rowid {rowid}: entries_json 해석 실패")))?;
     record.set("signature_index_source", "raw_entries");
-    apply_schema(&mut record, schema, "signature_label");
+    apply_schema(&mut record, schema, "event_type");
 
     // Loaded modules are recorded paths of the faulting process image set.
     let modules: Vec<String> = record
@@ -634,14 +643,14 @@ pub fn from_report_row(row: &Row, rowid: i64) -> anyhow::Result<WerRecord> {
     let source_file = record.source_file.clone();
     if !source_file.is_empty() {
         record.path("report_file", &source_file, "collected_file_location");
-        let store = Path::new(&source_file)
+        // The collected file location is not a host path, so store_path stays
+        // for the 1001 StorePath; only the store folder name is read here.
+        let folder = Path::new(&source_file)
             .parent()
             .map(|parent| parent.to_string_lossy().to_string())
             .unwrap_or_default();
-        record.set("store_path", store.clone());
-        record.set("store_location", store_location(&source_file));
+        record.set("store_location", store_location(&folder));
         record.set("store_location_basis", "report_file_location");
-        record.path("store_path", &store, "collected_file_location");
     }
 
     if let Some((pid, start)) = guid_pid_and_start(record.get("app_session_guid")) {
@@ -760,6 +769,7 @@ fn event_payload(raw: &str, order: &[&str]) -> (serde_json::Map<String, Value>, 
     (map, format)
 }
 
+/// `basis` names the type field the schema was chosen from.
 fn apply_schema(record: &mut WerRecord, schema: Option<Schema>, basis: &'static str) {
     match schema {
         Some(schema) => {
@@ -923,13 +933,20 @@ pub fn from_event_row(row: &Row) -> Option<WerRecord> {
                     basis: "event_p_field",
                 });
             }
-            apply_schema(&mut record, schema, "signature_schema");
+            // P1 names the application only in a confirmed layout whose first
+            // role is the application; otherwise it stays a signature value.
+            let p1_is_app = schema
+                .as_ref()
+                .is_some_and(|schema| schema.roles.first() == Some(&"app_name"));
+            apply_schema(&mut record, schema, "event_name");
             // The 1001 payload records no application path; a module path is
             // never promoted into app_path.
             record.set("app_path_status", "not_recorded");
-            record.set("app_name", jget(&payload, "P1"));
-            if !record.get("app_name").is_empty() {
-                record.set("app_name_field", "P1");
+            if p1_is_app {
+                record.set("app_name", jget(&payload, "P1"));
+                if !record.get("app_name").is_empty() {
+                    record.set("app_name_field", "P1");
+                }
             }
             let store = record.get("store_path").to_string();
             if !store.is_empty() {
@@ -1012,7 +1029,7 @@ pub fn from_event_row(row: &Row) -> Option<WerRecord> {
 pub fn collect(out_dir: &Path, events: &EventLogOverviewCache) -> anyhow::Result<Vec<WerRecord>> {
     let facts = out_dir.join("WER").join("WER_Reports.sqlite");
     let mut records = Vec::new();
-    for row in read_table_with_rowid(&facts, "WER_Reports") {
+    for row in read_table_with_rowid(&facts, "WER_Reports")? {
         let rowid = row
             .get("__source_rowid")
             .and_then(|value| value.parse::<i64>().ok())
@@ -1025,22 +1042,16 @@ pub fn collect(out_dir: &Path, events: &EventLogOverviewCache) -> anyhow::Result
 
 /// Execution evidence for ExecutionHistory: a decoded process creation time
 /// from the report's own session value. Reporting time is not an exit time.
-pub fn execution_start_evidence(
-    out_dir: &Path,
-    events: &EventLogOverviewCache,
-) -> anyhow::Result<Vec<Row>> {
-    let rows = collect(out_dir, events)?
-        .into_iter()
+/// It reads the records already collected for WerReports, so both overviews
+/// share one collection.
+pub fn execution_start_evidence(records: &[WerRecord]) -> Vec<Row> {
+    records
+        .iter()
         .filter(|record| record.get("app_start_time_source") == "AppSessionGuid")
         .filter_map(|record| {
             let path = record.get("app_path").to_string();
             let name = match record.get("app_name") {
-                "" => path
-                    .replace('/', "\\")
-                    .rsplit('\\')
-                    .next()
-                    .unwrap_or_default()
-                    .to_string(),
+                "" => basename_win(&path),
                 name => name.to_string(),
             };
             if name.is_empty() {
@@ -1055,8 +1066,7 @@ pub fn execution_start_evidence(
                 ("record_key".to_string(), record.record_key.clone()),
             ]))
         })
-        .collect();
-    Ok(rows)
+        .collect()
 }
 
 #[cfg(test)]
@@ -1343,7 +1353,10 @@ mod tests {
         assert_eq!(record.get("error_type"), "MoAppCrash");
         assert_eq!(record.get("bucket_type"), "0");
         assert_eq!(record.get("response_text"), "사용할 수 없음");
-        assert_eq!(record.get("app_name"), "Microsoft.Windows.Search_1.14.18.19041_neutral_neutral_cw5n1h2txyewy");
+        // MoAppCrash is unmapped: P1 (a package name) stays a signature value.
+        assert_eq!(record.get("app_name"), "");
+        let p1 = record.signatures.iter().find(|s| s.p_field.as_deref() == Some("P1")).unwrap();
+        assert_eq!(p1.value.as_deref(), Some("Microsoft.Windows.Search_1.14.18.19041_neutral_neutral_cw5n1h2txyewy"));
         assert_eq!(record.get("store_path"), "\\\\?\\C:\\ProgramData\\Microsoft\\Windows\\WER\\ReportQueue\\AppCrash_x");
         assert_eq!(record.get("report_id"), "52b483f6-56c6-4c90-ab83-4f27efd26075");
         assert_eq!(record.get("report_status_raw"), "6");
@@ -1388,5 +1401,89 @@ mod tests {
             "{}"
         ))
         .is_none());
+    }
+
+    /// A parsed facts row whose report body no longer parses is damaged facts,
+    /// not a report without values.
+    #[test]
+    fn unparsable_report_body_requires_reparse() {
+        let mut row = report_row("APPCRASH", "", "[]");
+        row.insert("report".into(), "{\"EventType\": \"APPCRASH\"".into());
+        let error = from_report_row(&row, 6).err().expect("damaged body must not pass").to_string();
+        assert!(error.contains("다시 파싱"), "{error}");
+    }
+
+    /// The collected file location is not the host store path, and the store
+    /// is the folder holding the report folder — never a substring of the
+    /// analyst's collection path.
+    #[test]
+    fn store_location_comes_from_the_report_folder_parent() {
+        let mut row = report_row("APPCRASH", "", "[]");
+        row.insert(
+            "_source_file".into(),
+            "/cases/ReportQueue_export/WER/ReportArchive/AppCrash_app_1/Report.wer".into(),
+        );
+        let report = from_report_row(&row, 2).unwrap();
+        assert_eq!(report.get("store_path"), "");
+        assert_eq!(report.get("store_location"), "ReportArchive");
+        assert_eq!(report.get("store_location_basis"), "report_file_location");
+        assert!(!report.paths.iter().any(|p| p.role == "store_path"));
+        assert!(report.paths.iter().any(|p| p.role == "report_file"));
+
+        let payload = r#"{"EventName":"APPCRASH","P1":"app.exe","StorePath":"\\\\?\\C:\\ReportQueueTools\\WER\\ReportArchive\\AppCrash_app"}"#;
+        let event = from_event_row(&event_row("Windows Error Reporting", "1001", payload)).unwrap();
+        assert_eq!(event.get("store_location"), "ReportArchive");
+        let payload = r#"{"EventName":"APPCRASH","P1":"app.exe","StorePath":"C:\\Temp\\ReportArchive_copy"}"#;
+        let event = from_event_row(&event_row("Windows Error Reporting", "1001", payload)).unwrap();
+        assert_eq!(event.get("store_location"), "unknown");
+    }
+
+    /// The class basis names the field the schema was chosen from.
+    #[test]
+    fn error_class_basis_names_the_type_field() {
+        let report = from_report_row(&report_row("APPCRASH", "", "[]"), 1).unwrap();
+        assert_eq!(report.get("error_class_basis"), "event_type");
+        let payload = r#"{"EventName":"APPCRASH","P1":"app.exe"}"#;
+        let event = from_event_row(&event_row("Windows Error Reporting", "1001", payload)).unwrap();
+        assert_eq!(event.get("error_class_basis"), "event_name");
+    }
+
+    /// 1001 P1 is an application name only for a confirmed layout whose first
+    /// role is the application; codes never land in app_name.
+    #[test]
+    fn eventlog_1001_app_name_needs_a_confirmed_app_role() {
+        for payload in [
+            r#"{"EventName":"LiveKernelEvent","P1":"144","P2":"3"}"#,
+            r#"{"EventName":"AppxDeploymentFailureBlue","P1":"80070057"}"#,
+            r#"{"EventName":"StoreAgentScanForUpdatesFailure0","P1":"Update;","P2":"80070005"}"#,
+        ] {
+            let record = from_event_row(&event_row("Windows Error Reporting", "1001", payload)).unwrap();
+            assert_eq!(record.get("app_name"), "", "{payload}");
+            assert_eq!(record.get("app_name_field"), "", "{payload}");
+        }
+        let record = from_event_row(&event_row(
+            "Windows Error Reporting",
+            "1001",
+            r#"{"EventName":"APPCRASH","P1":"app.exe"}"#,
+        ))
+        .unwrap();
+        assert_eq!((record.get("app_name"), record.get("app_name_field")), ("app.exe", "P1"));
+    }
+
+    /// ExecutionHistory reads the already collected records; it never runs a
+    /// second collection.
+    #[test]
+    fn execution_start_evidence_uses_collected_records() {
+        let guid = r#", "AppSessionGuid": "000011e8-0000-000a-6189-bef9f6f7dc01""#;
+        let mut row = report_row("APPCRASH", guid, "[]");
+        row.insert("AppName".into(), String::new());
+        let records = vec![
+            from_report_row(&row, 3).unwrap(),
+            from_report_row(&report_row("APPCRASH", "", "[]"), 4).unwrap(),
+        ];
+        let rows = execution_start_evidence(&records);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["program_name"], "app.exe");
+        assert_eq!(rows[0]["record_key"], "WER_Reports::WER_Reports::3");
     }
 }

@@ -85,16 +85,7 @@ pub(crate) fn prepare_inputs(out_dir: &Path, target: &Path, dataset_id: &str) ->
 
     // --- Volatile/tasks.json -------------------------------------------------
     let found = crate::finder::by_name(target, &["tasks.json"]);
-    if found.paths.is_empty() {
-        inputs.push((
-            "collector_tasks_json".into(),
-            String::new(),
-            "not_collected".into(),
-            None,
-            None,
-            target.to_string_lossy().to_string(),
-        ));
-    }
+    push_scan_outcome(&mut inputs, "collector_tasks_json", target, found.paths.is_empty(), &found.errors);
     for source in &found.paths {
         let display = source.to_string_lossy().to_string();
         let raw = match std::fs::read(source) {
@@ -195,17 +186,8 @@ pub(crate) fn prepare_inputs(out_dir: &Path, target: &Path, dataset_id: &str) ->
     }
 
     // --- Collected task executables (TASKS*/Exec) ----------------------------
-    let exec_dirs = collected_exec_dirs(target);
-    if exec_dirs.is_empty() {
-        inputs.push((
-            "collected_task_executables".into(),
-            String::new(),
-            "not_collected".into(),
-            None,
-            None,
-            target.to_string_lossy().to_string(),
-        ));
-    }
+    let (exec_dirs, exec_scan_errors) = collected_exec_dirs(target);
+    push_scan_outcome(&mut inputs, "collected_task_executables", target, exec_dirs.is_empty(), &exec_scan_errors);
     for dir in exec_dirs {
         let display = dir.to_string_lossy().to_string();
         let (files, errors) = crate::finder::walk_files(&dir);
@@ -268,15 +250,42 @@ pub(crate) fn prepare_inputs(out_dir: &Path, target: &Path, dataset_id: &str) ->
     Ok(vec![SUPPLEMENTAL_DB.to_string()])
 }
 
+/// Discovery outcome: nothing found is `not_collected` only when the walk had
+/// no errors; walk errors are always kept as a `scan_failed` row.
+fn push_scan_outcome(
+    inputs: &mut Vec<(String, String, String, Option<i64>, Option<String>, String)>,
+    kind: &str,
+    target: &Path,
+    nothing_found: bool,
+    errors: &[String],
+) {
+    if !nothing_found && errors.is_empty() {
+        return;
+    }
+    inputs.push((
+        kind.into(),
+        String::new(),
+        if errors.is_empty() { "not_collected" } else { "scan_failed" }.into(),
+        None,
+        (!errors.is_empty()).then(|| errors.join(" | ")),
+        target.to_string_lossy().to_string(),
+    ));
+}
+
 /// Directories the collector uses for task executable copies: an `Exec` folder
-/// directly under a `TASKS*` collection root.
-fn collected_exec_dirs(target: &Path) -> Vec<PathBuf> {
+/// directly under a `TASKS*` collection root. Walk errors are returned too.
+fn collected_exec_dirs(target: &Path) -> (Vec<PathBuf>, Vec<String>) {
     let mut found = Vec::new();
-    for entry in walkdir::WalkDir::new(target)
-        .max_depth(4)
-        .into_iter()
-        .filter_map(Result::ok)
-    {
+    let mut errors = Vec::new();
+    for entry in walkdir::WalkDir::new(target).max_depth(4) {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                let path = error.path().map(|path| path.display().to_string()).unwrap_or_default();
+                errors.push(format!("{path}: {error}"));
+                continue;
+            }
+        };
         if !entry.file_type().is_dir() {
             continue;
         }
@@ -295,7 +304,7 @@ fn collected_exec_dirs(target: &Path) -> Vec<PathBuf> {
         }
     }
     found.sort();
-    found
+    (found, errors)
 }
 
 fn text(row: &crate::sqlite::Row, key: &str) -> Option<String> {
@@ -308,7 +317,7 @@ pub(super) fn populate(ctx: &Ctx, db: &DerivedDb, index: &DefinitionIndex) -> Re
         return Ok(());
     }
 
-    for row in overview::read_table_with_rowid(&path, LIVE_TABLE) {
+    for row in overview::read_table_with_rowid(&path, LIVE_TABLE)? {
         let rowid: i64 = row
             .get("__source_rowid")
             .and_then(|value| value.parse().ok())
@@ -368,7 +377,7 @@ pub(super) fn populate(ctx: &Ctx, db: &DerivedDb, index: &DefinitionIndex) -> Re
             .or_default()
             .push((position, command));
     }
-    for row in overview::read_table_with_rowid(&path, EXEC_TABLE) {
+    for row in overview::read_table_with_rowid(&path, EXEC_TABLE)? {
         let rowid: i64 = row
             .get("__source_rowid")
             .and_then(|value| value.parse().ok())
@@ -448,7 +457,7 @@ pub(super) fn input_observations(ctx: &Ctx, db: &DerivedDb) -> Result<()> {
     if !path.exists() {
         return Ok(());
     }
-    for row in overview::read_table_with_rowid(&path, INPUT_TABLE) {
+    for row in overview::read_table_with_rowid(&path, INPUT_TABLE)? {
         let rowid: i64 = row
             .get("__source_rowid")
             .and_then(|value| value.parse().ok())

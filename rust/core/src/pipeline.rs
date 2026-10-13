@@ -22,12 +22,6 @@ use crate::sqlite::{write_fixed_table, write_table, Row};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-// Global progress sink (Send). When set (by the GUI), progress lines route here
-// instead of stdout; unset (CLI) prints to stdout. Global + Send so worker
-// threads (parallel registry parsing) reach the same sink.
-pub type LogSink = Box<dyn FnMut(&str) + Send>;
-static LOG_SINK: Mutex<Option<LogSink>> = Mutex::new(None);
-
 /// Immutable per-run text logs are retained outside artifact output folders so
 /// a full reparse can clear derived SQLite without erasing prior diagnostics.
 pub const PARSE_LOG_DIRECTORY: &str = "parse_logs";
@@ -71,69 +65,160 @@ pub fn parse_run_log_path(host_dir: &Path, run_id: &str) -> std::path::PathBuf {
         .join(format!("{}.txt", safe_run_id(run_id)))
 }
 
-fn artifact_output_categories(only: Option<&HashSet<String>>) -> HashSet<&'static str> {
-    let Some(only) = only else {
-        return HashSet::new();
-    };
-    let mut categories = HashSet::new();
-    for artifact in only {
-        match artifact.as_str() {
-            "Amcache" => {
-                categories.insert("AMCACHE");
-            }
-            "EventLog" => {
-                categories.insert("EVENTLOG");
-            }
-            "Registry" => {
-                categories.insert("REGISTRY");
-            }
-            "UsnJrnl" => {
-                categories.insert("FILESYSTEM");
-            }
-            "MFT" => {
-                categories.insert("_OVERVIEW");
-            }
-            "JumpList" => {
-                categories.insert("JUMPLIST");
-            }
-            "SRUM" => {
-                categories.insert("SRUM");
-            }
-            "TaskScheduler" => {
-                categories.insert("TASKSCHEDULER");
-            }
-            "RdpCache" => {
-                categories.insert("RDPCACHE");
-            }
-            "BrowserHistory" | "BrowserCache" | "IEWebCache" | "IEIndexDat" => {
-                categories.insert("BROWSER");
-            }
-            "Prefetch" => {
-                categories.insert("PREFETCH");
-            }
-            "PowerShell" => {
-                categories.insert("POWERSHELL");
-            }
-            "WER" => {
-                categories.insert("WER");
-            }
-            "WmiRepository" => {
-                categories.insert("WMI");
-            }
-            "Timeline" => {
-                categories.insert("TIMELINE");
-            }
-            "RecycleBin" => {
-                categories.insert("RECYCLEBIN");
-            }
-            _ => {}
+/// Raw output category of each parser. BROWSER is shared by four parsers;
+/// MFT writes its raw table into `_OVERVIEW`, whose other files are derived.
+fn artifact_category(artifact: &str) -> Option<&'static str> {
+    Some(match artifact {
+        "Amcache" => "AMCACHE",
+        "EventLog" => "EVENTLOG",
+        "Registry" => "REGISTRY",
+        "UsnJrnl" => "FILESYSTEM",
+        "MFT" => "_OVERVIEW",
+        "JumpList" => "JUMPLIST",
+        "SRUM" => "SRUM",
+        "TaskScheduler" => "TASKSCHEDULER",
+        "RdpCache" => "RDPCACHE",
+        "BrowserHistory" | "BrowserCache" | "IEWebCache" | "IEIndexDat" => "BROWSER",
+        "Prefetch" => "PREFETCH",
+        "PowerShell" => "POWERSHELL",
+        "WER" => "WER",
+        "WmiRepository" => "WMI",
+        "Timeline" => "TIMELINE",
+        "RecycleBin" => "RECYCLEBIN",
+        _ => return None,
+    })
+}
+
+/// Categories every run rebuilds from the stage. Overview builders replace
+/// files here even during a scoped run, so they are never hard-linked.
+const RECOMPUTED_CATEGORIES: &[&str] = &["_OVERVIEW", "SUPPLEMENTAL"];
+
+/// What a scoped run drops so its selected parsers start from no previous
+/// outputs while unselected parsers keep theirs.
+#[derive(Debug, Default)]
+struct ScopedReset {
+    /// Categories written only by selected parsers: staged empty, replaced live.
+    owned: HashSet<&'static str>,
+    /// Categories selected parsers share with unselected ones: staged as copies.
+    shared: HashSet<&'static str>,
+    /// Previous outputs of selected parsers inside `shared` categories.
+    files: Vec<PathBuf>,
+}
+
+impl ScopedReset {
+    /// Live category directories replaced wholesale by this run.
+    fn clears(&self, category: &str) -> bool {
+        self.owned.contains(category) || RECOMPUTED_CATEGORIES.contains(&category)
+    }
+}
+
+fn scoped_reset(live_dir: &Path, only: &HashSet<String>) -> Result<ScopedReset> {
+    let mut reset = ScopedReset::default();
+    let mut owners = Vec::new();
+    for &artifact in ARTIFACT_NAMES.iter().filter(|name| only.contains(**name)) {
+        let Some(category) = artifact_category(artifact) else {
+            continue;
+        };
+        let shared = ARTIFACT_NAMES.iter().any(|other| {
+            !only.contains(*other) && artifact_category(other) == Some(category)
+        });
+        if !shared {
+            reset.owned.insert(category);
+            continue;
+        }
+        reset.shared.insert(category);
+        // Nothing published in the category means nothing to attribute.
+        let published = match std::fs::read_dir(live_dir.join(category)) {
+            Ok(mut entries) => entries.next().is_some(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error.into()),
+        };
+        if published {
+            owners.push((artifact, category));
         }
     }
-    // Overview builders replace files in this directory even during a scoped
-    // run, so it must never be hard-linked to the published output.
-    categories.insert("_OVERVIEW");
-    categories.insert("SUPPLEMENTAL");
-    categories
+    if owners.is_empty() {
+        return Ok(reset);
+    }
+    let previous = previous_artifact_outputs(live_dir)?;
+    for (artifact, category) in owners {
+        // Never guess ownership from file names: unknown means full reparse.
+        let outputs = previous.get(artifact).with_context(|| {
+            format!(
+                "{artifact}: no published parse report records its previous {category} outputs; run a full reparse"
+            )
+        })?;
+        for output in outputs {
+            let relative = PathBuf::from(output);
+            let mut parts = relative.components();
+            let inside = matches!(parts.next(), Some(std::path::Component::Normal(first)) if first == category)
+                && parts.next().is_some()
+                && parts.all(|part| matches!(part, std::path::Component::Normal(_)));
+            if !inside {
+                anyhow::bail!(
+                    "{artifact}: recorded output {output} is outside {category}; run a full reparse"
+                );
+            }
+            reset.files.push(relative);
+        }
+    }
+    Ok(reset)
+}
+
+/// Outputs each artifact had in the latest report that published (`ok` or
+/// `partial`). Later scoped runs omit unselected artifacts, so every per-run
+/// manifest is consulted, plus `parse_report.json` for older hosts.
+fn previous_artifact_outputs(
+    live_dir: &Path,
+) -> Result<std::collections::HashMap<String, Vec<String>>> {
+    let mut reports = Vec::new();
+    match std::fs::read_dir(live_dir.join(PARSE_LOG_DIRECTORY)) {
+        Ok(entries) => {
+            for entry in entries {
+                let path = entry?.path();
+                if path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("json")) {
+                    reports.push(path);
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    reports.push(live_dir.join("parse_report.json"));
+    let mut latest = std::collections::HashMap::<String, (String, Vec<String>)>::new();
+    for path in reports {
+        let raw = match std::fs::read(&path) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let report: serde_json::Value = serde_json::from_slice(&raw)
+            .with_context(|| format!("unreadable parse report {}", path.display()))?;
+        if !matches!(report["status"].as_str(), Some("ok" | "partial")) {
+            continue;
+        }
+        let run_at = report["runAt"].as_str().unwrap_or_default();
+        for artifact in report["artifacts"].as_array().into_iter().flatten() {
+            let Some(name) = artifact["name"].as_str() else {
+                continue;
+            };
+            if latest.get(name).is_some_and(|(seen, _)| seen.as_str() >= run_at) {
+                continue;
+            }
+            let mut outputs: Vec<String> = ["outputs", "publishedOutputs"]
+                .iter()
+                .flat_map(|key| artifact[*key].as_array().into_iter().flatten())
+                .filter_map(|value| value.as_str().map(str::to_string))
+                .collect();
+            outputs.sort();
+            outputs.dedup();
+            latest.insert(name.to_string(), (run_at.to_string(), outputs));
+        }
+    }
+    Ok(latest
+        .into_iter()
+        .map(|(name, (_, outputs))| (name, outputs))
+        .collect())
 }
 
 fn copy_tree(source: &Path, destination: &Path, copy_data: bool) -> Result<()> {
@@ -162,9 +247,10 @@ fn copy_tree(source: &Path, destination: &Path, copy_data: bool) -> Result<()> {
 /// 결과를 남기면 서로 다른 시점의 facts와 _OVERVIEW가 섞여 화면 간 모순이
 /// 생긴다. 전체 실행은 모든 결과 카테고리를, 범위 실행은 해당 아티팩트의
 /// 카테고리(+항상 재생성되는 _OVERVIEW)만 지우고 이번 실행 산출물만 발행한다.
+/// Scoped runs remove only the selected parsers' recorded files from
+/// categories they share with unselected parsers (BROWSER).
 /// 취소된 실행은 발행 단계에 오지 않으므로 이전 결과가 유지된다.
-fn clear_previous_results(live_dir: &Path, only: Option<&HashSet<String>>) -> Result<()> {
-    let scoped = only.map(|only| artifact_output_categories(Some(only)));
+fn clear_previous_results(live_dir: &Path, scoped: Option<&ScopedReset>) -> Result<()> {
     for entry in std::fs::read_dir(live_dir)? {
         let entry = entry?;
         if !entry.path().is_dir() {
@@ -178,12 +264,13 @@ fn clear_previous_results(live_dir: &Path, only: Option<&HashSet<String>>) -> Re
         {
             continue;
         }
-        if let Some(scoped) = &scoped {
-            if !scoped.contains(name.as_str()) {
-                continue;
-            }
+        if scoped.is_some_and(|scoped| !scoped.clears(&name)) {
+            continue;
         }
         std::fs::remove_dir_all(entry.path())?;
+    }
+    if let Some(scoped) = scoped {
+        remove_recorded_outputs(live_dir, &scoped.files)?;
     }
     // v1.3.11 이하가 남긴 구 JSON 타임라인 캐시 — 더 이상 만들지도 읽지도
     // 않는다(통합 타임라인은 sqlite 단일 경로). 지운 facts와 어긋난 대용량
@@ -194,11 +281,23 @@ fn clear_previous_results(live_dir: &Path, only: Option<&HashSet<String>>) -> Re
     Ok(())
 }
 
+fn remove_recorded_outputs(root: &Path, files: &[PathBuf]) -> Result<()> {
+    for file in files {
+        match std::fs::remove_file(root.join(file)) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.into()),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// `_OVERVIEW` 안에 파서가 직접 기록하는 원본(raw) 산출물. write_ov 파생이
 /// 아니므로 파생 리셋에서 지우면 안 된다 — status=="ok" 발행은 seal본
 /// (`.artifact-committed`)을 건너뛰고 스테이징 트리를 그대로 발행하므로,
 /// 여기서 지워진 파일은 어디서도 복구되지 않은 채 보고서에만 published로
 /// 남는다(전체 실행에서 파일 시스템 뷰가 비는 실제 사고 원인).
+/// A scoped run that selects MFT stages `_OVERVIEW` empty instead (MFT owns
+/// it alone; see `scoped_reset`), so no previous copy survives a re-run.
 const OVERVIEW_PARSER_OUTPUTS: &[&str] = &["MFT_Records.sqlite"];
 
 /// 범위 재파싱 스테이지에는 이전 실행의 _OVERVIEW 복사본이 들어 있다.
@@ -234,36 +333,46 @@ fn reset_stage_overview(ov: &Path) -> Result<()> {
 fn prepare_staging_output(
     live_dir: &Path,
     run_id: &str,
-    only: Option<&HashSet<String>>,
+    scoped: Option<&ScopedReset>,
 ) -> Result<PathBuf> {
-    let stage = live_dir
-        .join(PARSE_STAGING_DIRECTORY)
-        .join(safe_run_id(run_id));
-    if stage.exists() {
-        std::fs::remove_dir_all(&stage)?;
+    let staging_root = live_dir.join(PARSE_STAGING_DIRECTORY);
+    let stage = staging_root.join(safe_run_id(run_id));
+    // One run per host (GUI scheduler): anything else here is an orphan of a
+    // killed or crashed run, including `.previous`/`.partial-previous` backups.
+    if staging_root.exists() {
+        for entry in std::fs::read_dir(&staging_root)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                std::fs::remove_dir_all(&path)?;
+            } else {
+                std::fs::remove_file(&path)?;
+            }
+        }
     }
     std::fs::create_dir_all(&stage)?;
-    if only.is_none() {
+    let Some(scoped) = scoped else {
         return Ok(stage);
-    }
-    let copied_data = artifact_output_categories(only);
+    };
     for entry in std::fs::read_dir(live_dir)? {
         let entry = entry?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
+        // Selected parsers start from an empty category of their own.
         if !entry.path().is_dir()
             || name == PARSE_LOG_DIRECTORY
             || name == PARSE_STAGING_DIRECTORY
             || name == PARSE_COMMITTED_DIRECTORY
+            || scoped.owned.contains(name.as_ref())
         {
             continue;
         }
         copy_tree(
             &entry.path(),
             &stage.join(name.as_ref()),
-            copied_data.contains(name.as_ref()),
+            scoped.shared.contains(name.as_ref()) || RECOMPUTED_CATEGORIES.contains(&name.as_ref()),
         )?;
     }
+    remove_recorded_outputs(&stage, &scoped.files)?;
     Ok(stage)
 }
 
@@ -731,18 +840,8 @@ fn write_terminal_report(live_dir: &Path, run_id: &str, report: &ParseReport) ->
     Ok(())
 }
 
-/// Install (or clear) the progress sink.
-pub fn set_log_sink(sink: Option<LogSink>) {
-    *LOG_SINK.lock().unwrap() = sink;
-}
-
 fn emit(msg: &str) {
-    if let Ok(mut g) = LOG_SINK.lock() {
-        match g.as_mut() {
-            Some(f) => f(msg),
-            None => println!("{}", msg),
-        }
-    }
+    println!("{}", msg);
     append_current_log_output(msg);
 }
 
@@ -906,7 +1005,7 @@ fn entry_add_input_count(entry: &mut ParseArtifactReport, source: &Path, count: 
     }
 }
 
-fn panic_details(payload: Box<dyn std::any::Any + Send>) -> String {
+pub(crate) fn panic_details(payload: Box<dyn std::any::Any + Send>) -> String {
     let message = payload
         .downcast_ref::<&str>()
         .map(|value| (*value).to_string())
@@ -1718,11 +1817,16 @@ fn parse_srum_artifact(
         match run_unit_or_skip_reason(&p.display().to_string(), &[&out], || {
             srum::parse_srum_stream(p, &out)
         })? {
-            Ok(tables) => {
-                let record_count = tables.iter().map(|(_, count)| *count).sum();
+            Ok(parsed) => {
+                let record_count = parsed.tables.iter().map(|(_, count)| *count).sum();
                 entry_record_input_count(entry, p, record_count);
-                for (t, n) in tables {
+                for (t, n) in &parsed.tables {
                     emit(&format!("[+] {} rows -> {} [{}]", n, out.display(), t));
+                }
+                if !parsed.skipped.is_empty() {
+                    let reason = parsed.skipped.join("; ");
+                    emit(&format!("[!] {}: {reason}", p.display()));
+                    entry_record_input_error(entry, p, &reason);
                 }
                 outputs.push(relative);
             }
@@ -2015,7 +2119,9 @@ fn parse_browser_history_artifact(
     // 계정 하나의 History가 손상돼도 그 계정만 건너뛴다(파싱 실패 == 손상
     // 아티팩트). 이미 저장 완료된 다른 계정 결과는 그대로 발행된다.
     for (p, sides) in planned {
-        let acct = browser_account(p);
+        let acct = Some(browser_cache::account_of(p))
+            .filter(|a| !a.is_empty())
+            .unwrap_or_else(|| "browser".into());
         // 브라우저 판별: 경로 세그먼트 → 내용(내부 스킴) → 미상. 미상이면
         // 브라우저를 주장하지 않고 종전처럼 계정명만 쓴다 — 같은 계정에
         // 여러 History가 있을 때 어느 브라우저인지 산출물 이름에 남기기
@@ -2028,30 +2134,26 @@ fn parse_browser_history_artifact(
         let name = uniq_name(&base, &mut taken);
         let relative = format!("BROWSER/{}.sqlite", name);
         let out = out_dir.join(&relative);
-        let unit = run_unit_or_skip(&p.display().to_string(), &[&out], || -> Result<(usize, bool)> {
+        let unit = run_unit_or_skip(&p.display().to_string(), &[&out], || -> Result<browser_history::HistoryParse> {
             // 테이블 단위 스트리밍 기록 — 전체 행을 메모리에 쌓지 않는다.
-            let (record_count, wrote) = browser_history::parse_history_stream(p, &sides, &out)?;
-            if wrote {
+            let parsed = browser_history::parse_history_stream(p, &sides, &out)?;
+            if parsed.wrote {
                 crate::browser_input::write_input(&out,
                     &crate::browser_input::BrowserInput::from_source(p, "history", browser))?;
-                emit(&format!("[+] {} rows -> {}", record_count, out.display()));
+                emit(&format!("[+] {} rows -> {}", parsed.rows, out.display()));
             }
-            Ok((record_count, wrote))
+            Ok(parsed)
         })?;
-        if let Some((record_count, wrote)) = unit {
-            entry_record_input_count(entry, p, record_count);
+        if let Some(parsed) = unit {
+            let wrote = parsed.wrote;
+            entry_record_input_count(entry, p, parsed.rows);
+            if !parsed.table_errors.is_empty() {
+                let reason = format!("테이블 읽기 실패: {}", parsed.table_errors.join("; "));
+                emit(&format!("[!] {}: {reason}", p.display()));
+                entry_record_input_error(entry, p, &reason);
+            }
             if wrote {
-                // 결과 DB ↔ 수집 원본 경로 1:1 매핑을 산출물 안에 보존한다 —
-                // 유입 흐름이 캐시 행의 프로필 루트와 대조해 같은 브라우저
-                // 프로필의 History만 정확히 고를 근거 (다중 프로필 혼입 차단).
                 if let Ok(conn) = rusqlite::Connection::open(&out) {
-                    let _ = conn.execute_batch(
-                        "DROP TABLE IF EXISTS \"_wina_source\";\n                         CREATE TABLE \"_wina_source\" (source_path TEXT);",
-                    );
-                    let _ = conn.execute(
-                        "INSERT INTO \"_wina_source\" VALUES (?1)",
-                        [p.to_string_lossy().to_string()],
-                    );
                     // 방문 이동 그래프의 요구식 조회(id·부모·자식·URL 탐색)용
                     // 인덱스 — idx_mft_children과 같은 파싱 시점 인덱스 선례.
                     // 대상 테이블이 없는 산출물(스키마 변형)에서는 실패해도
@@ -2140,7 +2242,7 @@ fn parse_ie_webcache_artifact(
         let name = uniq_name(&format!("{acct}_IE_WebCache"), &mut taken);
         let relative = format!("BROWSER/{name}.sqlite");
         let out = out_dir.join(&relative);
-        let unit = run_unit_or_skip(&p.display().to_string(), &[&out], || -> Result<usize> {
+        let unit = run_unit_or_skip(&p.display().to_string(), &[&out], || -> Result<(usize, usize)> {
             // 파서가 방문 기록 → 다운로드 순서를 보장하므로(컨테이너 2단계
             // 순회), 같은 SQLite 파일에 writer를 순차로 열어 다운로드도
             // 스트리밍 기록한다 — 다운로드 행을 메모리 배열에 모으지 않는다.
@@ -2152,7 +2254,7 @@ fn parse_ie_webcache_artifact(
             )?);
             let mut downloads: Option<crate::sqlite::StreamWriter> = None;
             let mut total = 0usize;
-            ie_webcache::parse_webcache(p, &acct, &mut |event| match event {
+            let counts = ie_webcache::parse_webcache(p, &acct, &mut |event| match event {
                 ie_webcache::WebCacheEvent::History(row) => history
                     .as_mut()
                     .expect("history rows arrive before downloads")
@@ -2182,9 +2284,14 @@ fn parse_ie_webcache_artifact(
                 crate::browser_input::write_input(&out,
                     &crate::browser_input::BrowserInput::from_source(p, "ie_webcache", Some("IE")))?;
             }
-            Ok(total)
+            Ok((total, counts.skipped_records))
         })?;
-        match unit {
+        if let Some((_, skipped)) = unit.filter(|(_, skipped)| *skipped > 0) {
+            let reason = format!("읽기 실패 레코드 {skipped}건");
+            emit(&format!("[!] {}: {reason}", p.display()));
+            entry_record_input_error(entry, p, &reason);
+        }
+        match unit.map(|(count, _)| count) {
             Some(0) => {
                 let _ = std::fs::remove_file(&out);
             }
@@ -2287,19 +2394,23 @@ fn parse_powershell_artifact(
     if !paths.is_empty() {
         let relative = format!("POWERSHELL/{}.sqlite", powershell_history::PS_TABLE);
         let out = out_dir.join(&relative);
-        let unit = run_unit_or_skip("PowerShell", &[&out], || -> Result<Vec<Row>> {
-            let rows = powershell_history::parse_console_history(paths)?;
+        let unit = run_unit_or_skip("PowerShell", &[&out], || -> Result<powershell_history::ConsoleHistory> {
+            let parsed = powershell_history::parse_console_history(paths)?;
             write_table(
                 &out,
                 powershell_history::PS_TABLE,
-                &rows,
+                &parsed.rows,
                 powershell_history::PS_FIELD_ORDER,
             )?;
-            Ok(rows)
+            Ok(parsed)
         })?;
-        if let Some(rows) = unit {
-            entry_record_rows_by_source(entry, &rows);
-            emit(&format!("[+] {} rows -> {}", rows.len(), out.display()));
+        if let Some(parsed) = unit {
+            entry_record_rows_by_source(entry, &parsed.rows);
+            for (path, reason) in &parsed.unreadable {
+                emit(&format!("[!] {}: 읽기 실패: {reason}", path.display()));
+                entry_record_input_error(entry, path, &format!("읽기 실패: {reason}"));
+            }
+            emit(&format!("[+] {} rows -> {}", parsed.rows.len(), out.display()));
             outputs.push(relative);
         }
     }
@@ -2473,8 +2584,17 @@ pub fn run_host_with_log_id(
         artifacts: Vec::new(),
         overview: Vec::new(),
     };
-    let out_dir = match prepare_staging_output(&live_dir, &run_id, only.as_ref()) {
-        Ok(stage) => stage,
+    // Ownership is resolved before staging so an unknown owner fails safe.
+    let staged = only
+        .as_ref()
+        .map(|only| scoped_reset(&live_dir, only))
+        .transpose()
+        .and_then(|scoped| {
+            let stage = prepare_staging_output(&live_dir, &run_id, scoped.as_ref())?;
+            Ok((stage, scoped))
+        });
+    let (out_dir, scoped) = match staged {
+        Ok(staged) => staged,
         Err(error) => {
             let run_at = chrono::Local::now()
                 .format("%Y-%m-%d %H:%M:%S%.3f")
@@ -2649,23 +2769,37 @@ pub fn run_host_with_log_id(
     // it would blank the whole host analysis even when the other artifacts
     // parsed cleanly. Only a cancel skips it, because a cancelled run may have
     // stopped mid-artifact and left the staging tree incomplete.
+    let mut overview_reset_failed = false;
     if !cancelled() {
         emit("=== _OVERVIEW ===");
         append_current_log_lifecycle("overview_started");
         let ov = out_dir.join("_OVERVIEW");
-        reset_stage_overview(&ov)?;
-        let overview_result = (|| {
+        // A stage that cannot be reset would mix generations: fail the run but
+        // still write the terminal report, host status and cleanup below.
+        let reset_result = reset_stage_overview(&ov);
+        overview_reset_failed = reset_result.is_err();
+        let overview_result = reset_result.and_then(|()| {
             let ancillary = crate::derived::prepare_ancillary_facts(&out_dir, &target, &dataset_id)?;
             sealed_outputs.extend(seal_artifact_outputs(&out_dir, "Supplemental", &ancillary)?);
             crate::derived::build_all(&out_dir, &target, host_id, &dataset_id)
-        })();
+        });
         match overview_result {
-            Ok(tables) => {
-                for (name, row_count) in tables {
+            Ok(build) => {
+                for (name, row_count) in build.tables {
                     emit(&format!("[+] {row_count} rows -> {}", ov.join(format!("{name}.sqlite")).display()));
                     report.overview.push(OverviewTableReport { name, row_count });
                 }
-                append_current_log_lifecycle("overview_finished status=completed");
+                // Skipped unreadable inputs keep the overview but make the run partial.
+                for error in &build.input_errors {
+                    had_error = true;
+                    report.errors.push(format!("_OVERVIEW: {error}"));
+                    emit(&format!("[!] _OVERVIEW input skipped: {error}"));
+                }
+                append_current_log_lifecycle(if build.input_errors.is_empty() {
+                    "overview_finished status=completed"
+                } else {
+                    "overview_finished status=partial"
+                });
             }
             Err(error) => {
                 had_error = true;
@@ -2706,6 +2840,8 @@ pub fn run_host_with_log_id(
 
     let mut status = if cancelled() {
         "cancelled"
+    } else if overview_reset_failed {
+        "error"
     } else if had_error {
         "partial"
     } else {
@@ -2718,10 +2854,20 @@ pub fn run_host_with_log_id(
     // The latest terminal lifecycle report is safe to publish even when the
     // staged evidence was rejected: it contains no derived rows and makes the
     // failure/cancel state visible without exposing half-written SQLite files.
-    if status == "ok" {
-        if let Err(error) = clear_previous_results(&live_dir, only.as_ref()) {
+    // 실패 아티팩트의 이전 결과도 함께 지운다 — 남은 것은 항상 이번 실행
+    // 한 시점의 산출물뿐이다(실패 = 손상·오수집 원본 판정, 보고서에 기록).
+    // A prior result that cannot be removed would mix generations under the
+    // new status, so the run becomes an error and nothing is published.
+    if status == "ok" || status == "partial" {
+        if let Err(error) = clear_previous_results(&live_dir, scoped.as_ref()) {
+            status = "error";
+            report.status = status.to_string();
             report.errors.push(format!("clear previous results: {error}"));
+            emit(&format!("[!] clear previous results failed: {error}"));
+            append_current_log_lifecycle(&format!("clear_previous_results_failed error={error}"));
         }
+    }
+    if status == "ok" {
         match publish_staging_output(&live_dir, &out_dir, &run_id) {
             Ok(()) => {
                 record_published_outputs(&mut report, &sealed_outputs);
@@ -2739,11 +2885,6 @@ pub fn run_host_with_log_id(
         }
     }
     if status == "partial" {
-        // 실패 아티팩트의 이전 결과도 함께 지운다 — 남은 것은 항상 이번 실행
-        // 한 시점의 산출물뿐이다(실패 = 손상·오수집 원본 판정, 보고서에 기록).
-        if let Err(error) = clear_previous_results(&live_dir, only.as_ref()) {
-            report.errors.push(format!("clear previous results: {error}"));
-        }
         // Publish every sealed file, including the freshly-built `_OVERVIEW`
         // correlation tables and the MFT raw table. A partial run still derives
         // a valid overview from the artifacts that staged successfully, so the
@@ -2817,23 +2958,6 @@ pub fn run_host_with_log_id(
         anyhow::bail!("pipeline completed with failed artifacts or terminal output errors");
     }
     Ok(())
-}
-
-/// Account folder under BROWSER (…/BROWSER/<account>/CHROME/Default/History).
-fn browser_account(path: &Path) -> String {
-    let parts: Vec<String> = path
-        .components()
-        .map(|c| c.as_os_str().to_string_lossy().to_string())
-        .collect();
-    for (i, part) in parts.iter().enumerate() {
-        if part.eq_ignore_ascii_case("BROWSER") && i + 1 < parts.len() {
-            return parts[i + 1].clone();
-        }
-    }
-    path.parent()
-        .and_then(|p| p.file_name())
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "browser".into())
 }
 
 #[cfg(test)]
@@ -3263,10 +3387,13 @@ mod persistent_log_tests {
         let registry = live.join("REGISTRY");
         std::fs::create_dir_all(&registry).unwrap();
         std::fs::write(registry.join("Registry.sqlite"), b"published-before").unwrap();
-        let mut only = HashSet::new();
-        only.insert("Registry".to_string());
+        let only = HashSet::from(["Registry".to_string()]);
+        let scoped = scoped_reset(&live, &only).unwrap();
 
-        let failed_stage = prepare_staging_output(&live, "failed-run", Some(&only)).unwrap();
+        // Registry owns REGISTRY alone, so its stage starts empty.
+        let failed_stage = prepare_staging_output(&live, "failed-run", Some(&scoped)).unwrap();
+        assert!(!failed_stage.join("REGISTRY").exists());
+        std::fs::create_dir_all(failed_stage.join("REGISTRY")).unwrap();
         std::fs::write(
             failed_stage.join("REGISTRY/Registry.sqlite"),
             b"partial-new",
@@ -3278,7 +3405,8 @@ mod persistent_log_tests {
             b"published-before"
         );
 
-        let success_stage = prepare_staging_output(&live, "success-run", Some(&only)).unwrap();
+        let success_stage = prepare_staging_output(&live, "success-run", Some(&scoped)).unwrap();
+        std::fs::create_dir_all(success_stage.join("REGISTRY")).unwrap();
         std::fs::write(
             success_stage.join("REGISTRY/Registry.sqlite"),
             b"published-after",
@@ -3290,6 +3418,23 @@ mod persistent_log_tests {
             b"published-after"
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn new_stage_sweeps_orphans_of_killed_runs() {
+        let root = temporary_directory("staging-orphans");
+        let live = root.join("host");
+        let staging = live.join(PARSE_STAGING_DIRECTORY);
+        std::fs::create_dir_all(staging.join("killed-run/_OVERVIEW")).unwrap();
+        std::fs::create_dir_all(staging.join("killed-run.previous/REGISTRY")).unwrap();
+        std::fs::create_dir_all(staging.join("killed-run.partial-previous")).unwrap();
+        let stage = prepare_staging_output(&live, "next-run", None).unwrap();
+        let left: Vec<_> = std::fs::read_dir(&staging)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        let _ = std::fs::remove_dir_all(root);
+        assert_eq!(left, vec![stage.file_name().unwrap().to_owned()]);
     }
 
     #[test]
@@ -3376,7 +3521,8 @@ mod persistent_log_tests {
         std::fs::write(live.join("_OVERVIEW/MFT_Records.sqlite"), b"committed-mft").unwrap();
         let mut only = HashSet::new();
         only.insert("TaskScheduler".to_string());
-        let stage = prepare_staging_output(&live, "scoped-ov", Some(&only)).unwrap();
+        let scoped = scoped_reset(&live, &only).unwrap();
+        let stage = prepare_staging_output(&live, "scoped-ov", Some(&scoped)).unwrap();
         assert!(stage.join("_OVERVIEW/ScheduledTasks.sqlite").exists());
         reset_stage_overview(&stage.join("_OVERVIEW")).unwrap();
         assert!(!stage.join("_OVERVIEW/ScheduledTasks.sqlite").exists());
@@ -3435,7 +3581,7 @@ mod persistent_log_tests {
         std::fs::write(live.join("_OVERVIEW/TargetInfo.sqlite"), b"old").unwrap();
         let mut only = HashSet::new();
         only.insert("Registry".to_string());
-        clear_previous_results(&live, Some(&only)).unwrap();
+        clear_previous_results(&live, Some(&scoped_reset(&live, &only).unwrap())).unwrap();
         // 대상 아티팩트 카테고리와 항상 재생성되는 _OVERVIEW만 지워지고,
         // 범위 밖 카테고리는 유지된다.
         assert!(!live.join("REGISTRY").exists());
@@ -3706,6 +3852,260 @@ mod persistent_log_tests {
         assert!(report["completedArtifacts"]
             .as_array()
             .is_none_or(|entries| !entries.iter().any(|entry| entry == "Prefetch")));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn scoped_browser_fixture(label: &str) -> (PathBuf, String, String, PathBuf, PathBuf) {
+        let root = temporary_directory(label);
+        let cases_dir = root.join("cases");
+        let profile = root.join("target/Users/alice/AppData/Local/Microsoft/Edge/User Data/Default");
+        std::fs::create_dir_all(&profile).unwrap();
+        let history = profile.join("History");
+        rusqlite::Connection::open(&history)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE urls (id INTEGER PRIMARY KEY, url TEXT);
+                 INSERT INTO urls VALUES (1, 'https://fresh.example/');",
+            )
+            .unwrap();
+        let case = case_store::create_case("case", "2026-10-13 00:00:00", &cases_dir).unwrap();
+        let host = case_store::create_host(
+            &case.id,
+            "host",
+            &root.join("target").to_string_lossy(),
+            "2026-10-13 00:00:00",
+            &cases_dir,
+        )
+        .unwrap();
+        let live = case_store::host_dir(&cases_dir, &case.id, &host.id);
+        // Previous publication: this History's output carrying a table the
+        // current parser no longer writes, an output whose History is gone,
+        // and BrowserCache's own file in the same category.
+        let name = format!(
+            "{}_{}",
+            browser_cache::account_of(&history),
+            browser_cache::browser_of(&history).unwrap()
+        );
+        let browser = live.join("BROWSER");
+        std::fs::create_dir_all(&browser).unwrap();
+        rusqlite::Connection::open(browser.join(format!("{name}.sqlite")))
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE urls (id TEXT, url TEXT);
+                 INSERT INTO urls VALUES ('1', 'https://stale.example/');
+                 CREATE TABLE _wina_source (source_file TEXT);",
+            )
+            .unwrap();
+        let bob = browser.join("bob_Edge.sqlite");
+        rusqlite::Connection::open(&bob)
+            .unwrap()
+            .execute_batch("CREATE TABLE urls (id TEXT, url TEXT);")
+            .unwrap();
+        crate::browser_input::write_input(
+            &bob,
+            &crate::browser_input::BrowserInput::from_source(
+                Path::new("/evidence/Users/bob/AppData/Local/Microsoft/Edge/User Data/Default/History"),
+                "history",
+                None,
+            ),
+        )
+        .unwrap();
+        let cache = browser.join("alice_Edge_Cache.sqlite");
+        crate::sqlite::StreamWriter::create(
+            &cache,
+            browser_cache::CACHE_TABLE,
+            browser_cache::CACHE_FIELD_ORDER,
+            browser_cache::CACHE_FIELD_ORDER,
+        )
+        .unwrap()
+        .finish()
+        .unwrap();
+        crate::browser_input::write_input(
+            &cache,
+            &crate::browser_input::BrowserInput::from_source(
+                Path::new("/evidence/Users/alice/AppData/Local/Microsoft/Edge/User Data/Default/Cache/Cache_Data/index"),
+                "cache",
+                None,
+            ),
+        )
+        .unwrap();
+        crate::derived::stamp_facts_generation(&bob, "prior-generation").unwrap();
+        crate::derived::stamp_facts_generation(&cache, "prior-generation").unwrap();
+        (root, case.id, host.id, live, browser.join(format!("{name}.sqlite")))
+    }
+
+    #[test]
+    fn scoped_browser_history_rerun_drops_only_its_previous_outputs() {
+        let _serial = PIPELINE_LOG_TEST_LOCK.lock();
+        CANCEL.store(false, Ordering::Relaxed);
+        let (root, case_id, host_id, live, current) = scoped_browser_fixture("scoped-browser-stale");
+        let current_relative = format!(
+            "BROWSER/{}",
+            current.file_name().unwrap().to_string_lossy()
+        );
+        let previous = serde_json::json!({
+            "runId": "previous", "runAt": "2026-10-13 16:13:18.000", "status": "ok",
+            "published": true,
+            "artifacts": [
+                {"name": "BrowserHistory", "status": "completed",
+                 "outputs": [current_relative, "BROWSER/bob_Edge.sqlite"],
+                 "publishedOutputs": [current_relative, "BROWSER/bob_Edge.sqlite"]},
+                {"name": "BrowserCache", "status": "completed",
+                 "outputs": ["BROWSER/alice_Edge_Cache.sqlite"],
+                 "publishedOutputs": ["BROWSER/alice_Edge_Cache.sqlite"]}
+            ]
+        });
+        std::fs::write(live.join("parse_report.json"), previous.to_string()).unwrap();
+        let cases_dir = root.join("cases");
+        let only = HashSet::from(["BrowserHistory".to_string()]);
+
+        let result = run_host_with_log_id(&case_id, &host_id, &cases_dir, Some(only), Some("scoped-browser"));
+        let report = std::fs::read_to_string(live.join("parse_report.json")).unwrap();
+        assert!(result.is_ok(), "{report}");
+
+        let db = rusqlite::Connection::open(&current).unwrap();
+        let tables: Vec<String> = db
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(!tables.iter().any(|table| table == "_wina_source"), "{tables:?}");
+        let urls: Vec<String> = db
+            .prepare("SELECT url FROM urls")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(urls, ["https://fresh.example/"]);
+        drop(db);
+        assert!(!live.join("BROWSER/bob_Edge.sqlite").exists());
+        assert!(live.join("BROWSER/alice_Edge_Cache.sqlite").is_file());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn scoped_browser_rerun_without_ownership_record_fails_and_keeps_live() {
+        let _serial = PIPELINE_LOG_TEST_LOCK.lock();
+        CANCEL.store(false, Ordering::Relaxed);
+        let (root, case_id, host_id, live, current) = scoped_browser_fixture("scoped-browser-unknown");
+        let cases_dir = root.join("cases");
+        let only = HashSet::from(["BrowserHistory".to_string()]);
+
+        let result = run_host_with_log_id(&case_id, &host_id, &cases_dir, Some(only), Some("scoped-unknown"));
+
+        assert!(result.is_err());
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(live.join("parse_report.json")).unwrap()).unwrap();
+        assert_eq!(report["status"], "error");
+        assert!(report["errors"][0].as_str().unwrap().contains("BrowserHistory"), "{report}");
+        // Nothing was guessed away from the published tree.
+        assert!(current.is_file());
+        assert!(live.join("BROWSER/bob_Edge.sqlite").is_file());
+        assert!(live.join("BROWSER/alice_Edge_Cache.sqlite").is_file());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// An unreadable SRUM facts DB skipped by Metadata must surface in the
+    /// terminal report and make the run partial, not silently `ok`.
+    #[test]
+    fn unreadable_srum_facts_db_makes_run_partial_with_reported_error() {
+        let _serial = PIPELINE_LOG_TEST_LOCK.lock();
+        CANCEL.store(false, Ordering::Relaxed);
+        let root = temporary_directory("srum-metadata-error");
+        let cases_dir = root.join("cases");
+        let target_dir = root.join("target");
+        std::fs::create_dir_all(&target_dir).unwrap();
+        let case = case_store::create_case("case", "2026-10-13 00:00:00", &cases_dir).unwrap();
+        let host = case_store::create_host(
+            &case.id,
+            "host",
+            &target_dir.to_string_lossy(),
+            "2026-10-13 00:00:00",
+            &cases_dir,
+        )
+        .unwrap();
+        let host_dir = case_store::host_dir(&cases_dir, &case.id, &host.id);
+        // Retained SRUM output copied into the scoped stage: the schema is
+        // readable, but the user table's page is corrupt.
+        let srum = host_dir.join("SRUM/SRUM_Corrupt.sqlite");
+        std::fs::create_dir_all(srum.parent().unwrap()).unwrap();
+        let db = rusqlite::Connection::open(&srum).unwrap();
+        db.execute_batch("CREATE TABLE SRUM_Corrupt(user TEXT); INSERT INTO SRUM_Corrupt VALUES ('S-1-5-90-0-7');").unwrap();
+        let page_size: usize = db.query_row("PRAGMA page_size", [], |row| row.get(0)).unwrap();
+        drop(db);
+        let mut bytes = std::fs::read(&srum).unwrap();
+        bytes[page_size..2 * page_size].fill(0xFF);
+        std::fs::write(&srum, bytes).unwrap();
+        let only = HashSet::from(["Prefetch".to_string()]);
+
+        let result = run_host_with_log_id(&case.id, &host.id, &cases_dir, Some(only), Some("srum-metadata-error"));
+
+        assert!(result.is_err(), "a skipped Metadata input must not report success");
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(host_dir.join("parse_report.json")).unwrap()).unwrap();
+        assert_eq!(report["status"], "partial");
+        let errors: Vec<&str> = report["errors"]
+            .as_array()
+            .map(|errors| errors.iter().filter_map(|e| e.as_str()).collect())
+            .unwrap_or_default();
+        assert!(
+            errors.iter().any(|e| e.starts_with("_OVERVIEW: Metadata: ") && e.contains("SRUM/SRUM_Corrupt.sqlite")),
+            "{errors:?}"
+        );
+        // The overview is still built from the remaining inputs.
+        assert!(report["overview"]
+            .as_array()
+            .is_some_and(|tables| tables.iter().any(|t| t["name"] == "Metadata")));
+        assert_eq!(
+            case_store::load_host(&case.id, &host.id, &cases_dir).unwrap().last_run_status.as_deref(),
+            Some("partial")
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A prior result that cannot be removed must not be reported as `ok`:
+    /// stale and fresh outputs would mix under a successful status.
+    #[cfg(unix)]
+    #[test]
+    fn failed_clear_of_previous_results_is_an_error_not_ok() {
+        use std::os::unix::fs::PermissionsExt;
+        let _serial = PIPELINE_LOG_TEST_LOCK.lock();
+        CANCEL.store(false, Ordering::Relaxed);
+        let root = temporary_directory("clear-failure");
+        let cases_dir = root.join("cases");
+        let target_dir = root.join("target");
+        std::fs::create_dir_all(&target_dir).unwrap();
+        let case = case_store::create_case("case", "2026-08-23 01:02:03", &cases_dir).unwrap();
+        let host = case_store::create_host(
+            &case.id,
+            "host",
+            &target_dir.to_string_lossy(),
+            "2026-08-23 01:02:03",
+            &cases_dir,
+        )
+        .unwrap();
+        let host_dir = case_store::host_dir(&cases_dir, &case.id, &host.id);
+        // A prior PREFETCH result whose file cannot be unlinked.
+        let locked = host_dir.join("PREFETCH/locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::write(locked.join("Prefetch.sqlite"), b"prior").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let only = HashSet::from(["Prefetch".to_string()]);
+
+        let result = run_host_with_log_id(&case.id, &host.id, &cases_dir, Some(only), Some("clear-failure"));
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(result.is_err(), "a failed clear must fail the run");
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(host_dir.join("parse_report.json")).unwrap())
+                .unwrap();
+        assert_eq!(report["status"], "error");
+        assert!(report["errors"]
+            .as_array()
+            .is_some_and(|errors| errors.iter().any(|e| e.as_str().is_some_and(|e| e.contains("clear previous results")))));
         let _ = std::fs::remove_dir_all(root);
     }
 

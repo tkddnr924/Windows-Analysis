@@ -18,30 +18,34 @@ pub(super) fn open_ro(path: &Path) -> Result<Connection> {
         .with_context(|| format!("원본 열기: {}", path.display()))
 }
 
-pub(super) fn fact_files(out_dir: &Path, category: &str, table: &str) -> Vec<PathBuf> {
+/// Sorted facts DBs of a category that hold `table`. A missing folder or
+/// table is no evidence; listing/open failures are errors.
+pub(super) fn fact_files(out_dir: &Path, category: &str, table: &str) -> Result<Vec<PathBuf>> {
     let dir = out_dir.join(category);
-    let mut files: Vec<PathBuf> = match std::fs::read_dir(&dir) {
-        Ok(entries) => entries
-            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-            .filter(|path| path.extension().map(|ext| ext == "sqlite").unwrap_or(false))
-            .collect(),
-        Err(_) => return Vec::new(),
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error).with_context(|| format!("원본 목록: {}", dir.display())),
     };
+    let mut files = Vec::new();
+    for entry in entries {
+        let path = entry.with_context(|| format!("원본 목록: {}", dir.display()))?.path();
+        if path.extension().is_some_and(|ext| ext == "sqlite") && has_table(&path, table)? {
+            files.push(path);
+        }
+    }
     files.sort();
-    files.retain(|path| has_table(path, table));
-    files
+    Ok(files)
 }
 
-fn has_table(path: &Path, table: &str) -> bool {
-    let Ok(conn) = open_ro(path) else {
-        return false;
-    };
-    conn.query_row(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
-        [table],
-        |_| Ok(()),
-    )
-    .is_ok()
+fn has_table(path: &Path, table: &str) -> Result<bool> {
+    open_ro(path)?
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+            [table],
+            |row| row.get(0),
+        )
+        .with_context(|| format!("원본 테이블 확인: {}", path.display()))
 }
 
 pub(super) fn cell_of(value: ValueRef<'_>) -> Cell {
@@ -106,8 +110,8 @@ fn wmi_object_type(kind: &str) -> &'static str {
 fn wmi_subscriptions(ctx: &Ctx) -> Result<usize> {
     let spec = spec_of("WmiSubscriptions");
     let mut db = DerivedDb::create(&ctx.overview_dir(), "WmiSubscriptions")?;
-    for path in fact_files(ctx.out_dir, "WMI", crate::parsers::wmi_repository::WMI_TABLE) {
-        for row in crate::overview::read_table_with_rowid(&path, crate::parsers::wmi_repository::WMI_TABLE) {
+    for path in fact_files(ctx.out_dir, "WMI", crate::parsers::wmi_repository::WMI_TABLE)? {
+        for row in crate::overview::read_table_with_rowid(&path, crate::parsers::wmi_repository::WMI_TABLE)? {
             let get = |key: &str| row.get(key).map(String::as_str).unwrap_or("");
             let object_type = wmi_object_type(get("kind"));
             let consumer_type = get("consumer_type");
@@ -155,7 +159,7 @@ const MFT_SELECT: &str = "SELECT rowid, volume_id, volume_label, volume_serial, 
      ntfs_major_version, ntfs_minor_version, volume_flags, path, file_name, extension, \
      is_directory, in_use, file_size, data, entry, seq, parent_entry, si_created, si_modified, \
      si_mft_modified, si_accessed, owner_id, security_id, fn_created, fn_modified, \
-     fn_mft_modified, fn_accessed, _source_file, parent_seq, parent_status, path_status, data_status FROM \"MFT_Records\"";
+     fn_mft_modified, fn_accessed, _source_file, parent_seq, parent_status, path_status, data_status, record_status FROM \"MFT_Records\"";
 
 fn file_system_entries(ctx: &Ctx) -> Result<usize> {
     let spec = spec_of("FileSystemEntries");
@@ -241,7 +245,7 @@ fn file_system_entries(ctx: &Ctx) -> Result<usize> {
             );
         }
         let source_file = str_of(row.get_ref(28)?);
-        for (offset, name) in ["parent_seq", "parent_status", "path_status", "data_status"].iter().enumerate() {
+        for (offset, name) in ["parent_seq", "parent_status", "path_status", "data_status", "record_status"].iter().enumerate() {
             rec.set(name, raw_cell_of(row.get_ref(29 + offset)?));
         }
         rec.set("source_file", text_raw(&source_file));
@@ -280,8 +284,8 @@ fn recycle_bin(ctx: &Ctx) -> Result<usize> {
     let spec = spec_of("RecycleBin");
     let mut db = DerivedDb::create(&ctx.overview_dir(), "RecycleBin")?;
     let table = crate::parsers::recyclebin::TABLE;
-    for path in fact_files(ctx.out_dir, "RECYCLEBIN", table) {
-        for row in crate::overview::read_table_with_rowid(&path, table) {
+    for path in fact_files(ctx.out_dir, "RECYCLEBIN", table)? {
+        for row in crate::overview::read_table_with_rowid(&path, table)? {
             let get = |key: &str| row.get(key).map(String::as_str).unwrap_or("");
             let account_sid = get("account_sid");
             let mut rec = ctx.record(spec);
@@ -327,8 +331,8 @@ fn jump_list_entries(ctx: &Ctx) -> Result<usize> {
     let spec = spec_of("JumpListEntries");
     let mut db = DerivedDb::create(&ctx.overview_dir(), "JumpListEntries")?;
     let table = "JumpList_Entries";
-    for path in fact_files(ctx.out_dir, "JUMPLIST", table) {
-        for row in crate::overview::read_table_with_rowid(&path, table) {
+    for path in fact_files(ctx.out_dir, "JUMPLIST", table)? {
+        for row in crate::overview::read_table_with_rowid(&path, table)? {
             let get = |key: &str| row.get(key).map(String::as_str).unwrap_or("");
             let mut rec = ctx.record(spec);
             let timestamp_source = get("timestamp_source");
@@ -386,8 +390,8 @@ fn timeline_activities(ctx: &Ctx) -> Result<usize> {
     let spec = spec_of("TimelineActivities");
     let mut db = DerivedDb::create(&ctx.overview_dir(), "TimelineActivities")?;
     let table = "Timeline_Activities";
-    for path in fact_files(ctx.out_dir, "TIMELINE", table) {
-        for row in crate::overview::read_table_with_rowid(&path, table) {
+    for path in fact_files(ctx.out_dir, "TIMELINE", table)? {
+        for row in crate::overview::read_table_with_rowid(&path, table)? {
             let get = |key: &str| row.get(key).map(String::as_str).unwrap_or("");
             let mut rec = ctx.record(spec);
             // The parser takes StartTime, else LastModifiedTime.

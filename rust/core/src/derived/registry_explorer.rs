@@ -4,7 +4,7 @@ use std::path::Path;
 
 use anyhow::{anyhow, Context, Result};
 use rusqlite::types::ValueRef;
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 
 use super::schema::{REGISTRY_HIVES_TABLE, REGISTRY_QUICK_TARGETS_TABLE};
 use super::{facts_dataset_id, Cell, Ctx, DerivedDb, SourceRef};
@@ -304,7 +304,7 @@ fn write_hive(ctx: &Ctx, db: &mut DerivedDb, input: &HiveInput) -> Result<HiveRe
     let mut source_file = input.source_file.clone();
     if source_file.is_none() {
         if let Some((conn, _)) = &opened {
-            source_file = conn
+            let lookup = conn
                 .query_row(
                     &format!(
                         "SELECT _source_file FROM {} WHERE _source_file <> '' LIMIT 1",
@@ -313,7 +313,12 @@ fn write_hive(ctx: &Ctx, db: &mut DerivedDb, input: &HiveInput) -> Result<HiveRe
                     [],
                     |row| row.get::<_, Option<String>>(0),
                 )
-                .unwrap_or(None);
+                .optional();
+            match lookup {
+                Ok(found) => source_file = found.flatten(),
+                // Entries still load; keep why the original path is unknown.
+                Err(error) => load_error = Some(format!("_source_file: {error}")),
+            }
         }
     }
 
@@ -1268,7 +1273,7 @@ mod tests {
             ],
         );
 
-        let report = build_all(&out_dir, &target, "host-1", "ds-1").unwrap();
+        let report = build_all(&out_dir, &target, "host-1", "ds-1").unwrap().tables;
         let rows_written = report
             .iter()
             .find(|(name, _)| name == DB_NAME)
@@ -1515,8 +1520,8 @@ mod tests {
         let conn = Connection::open(&path).unwrap();
         conn.execute_batch(
             "CREATE TABLE Registry(last_write TEXT,key_path TEXT,value_name TEXT,value_type TEXT,
-             value_data TEXT,_recovery TEXT,_source_file TEXT);
-             INSERT INTO Registry VALUES ('2026-01-01 00:00:00.000','\\ROOT\\A','N','REG_SZ','v','live','SOFTWARE');",
+             value_data TEXT,_recovery TEXT,_source_file TEXT,value_data_hex TEXT);
+             INSERT INTO Registry VALUES ('2026-01-01 00:00:00.000','\\ROOT\\A','N','REG_SZ','v','live','SOFTWARE','7600');",
         )
         .unwrap();
         drop(conn);
@@ -1525,6 +1530,33 @@ mod tests {
         let error = build_all(&out_dir, &target, "host-1", "ds-1").unwrap_err();
         let message = format!("{error:#}");
         assert!(message.contains("entry_kind"), "{message}");
+        let _ = std::fs::remove_dir_all(out_dir.parent().unwrap());
+    }
+
+    #[test]
+    fn facts_source_file_lookup_failure_is_recorded() {
+        let (out_dir, target) = fixture_dirs("source-file-error");
+        let path = out_dir.join("REGISTRY").join("SOFTWARE.sqlite");
+        dup_hive(&out_dir, "SOFTWARE.sqlite", "C:\\Windows\\System32\\config\\SOFTWARE");
+        crate::metadata::build_metadata(&out_dir, &target, "host", "ds").unwrap();
+        Connection::open(&path).unwrap()
+            .execute_batch("ALTER TABLE Registry DROP COLUMN _source_file;").unwrap();
+        let ctx = Ctx {
+            out_dir: out_dir.as_path(),
+            target: target.as_path(),
+            host_id: "host",
+            dataset_id: "ds",
+            facts: FactsIndex::load(&out_dir).unwrap(),
+            meta: MetaLookup::load(&out_dir).unwrap(),
+        };
+        build(&ctx).unwrap();
+        let conn = open_explorer(&out_dir);
+        let (status, error): (String, Option<String>) = conn.query_row(
+            "SELECT load_status, load_error FROM RegistryHives", [], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(status, "loaded");
+        assert!(error.as_deref().is_some_and(|e| e.contains("_source_file")), "{error:?}");
+        drop(conn);
         let _ = std::fs::remove_dir_all(out_dir.parent().unwrap());
     }
 

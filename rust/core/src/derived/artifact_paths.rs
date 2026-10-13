@@ -13,6 +13,16 @@ fn local_key(path: &str) -> Option<(String, String)> {
     (shape.kind == "drive_absolute").then_some((shape.drive, shape.key))
 }
 
+/// Expected task XML location for a task URI under a system root.
+fn task_store_path(root: &str, uri: &str) -> String {
+    let mut path = String::with_capacity(root.len() + 16 + uri.len());
+    path.push_str(root.trim_end_matches(['\\', '/']));
+    path.push_str(r"\System32\Tasks\");
+    path.extend(uri.trim_start_matches(['\\', '/']).chars()
+        .map(|ch| if ch == '/' { '\\' } else { ch }));
+    path
+}
+
 fn row_text<'a>(row: &'a rusqlite::Row<'_>, index: usize) -> Result<&'a str> {
     match row.get_ref(index)? {
         ValueRef::Null => Ok(""),
@@ -54,26 +64,25 @@ fn write_query(
              source_field,source_record_key,source_file,source_label
          FROM source_records WHERE record_id=?1 ORDER BY ordinal",
     )?;
-    let task_root = if origin_table == "ScheduledTasks" && child_table.is_none() {
+    let task_store = origin_table == "ScheduledTasks" && child_table.is_none();
+    let task_root = if task_store {
         ctx.meta.resolve_path("%SystemRoot%", None)
     } else {
         Cell::Null
     };
     while let Some(row) = rows.next()? {
-        let raw = row_text(row, 5)?;
+        let task_raw = if task_store { Some(task_store_path("%SystemRoot%", row_text(row, 5)?)) } else { None };
+        let raw = match &task_raw {
+            Some(path) => path.as_str(),
+            None => row_text(row, 5)?,
+        };
         if raw.is_empty() {
             continue;
         }
         let normalized = row_text(row, 6)?;
         let stored_resolved = row_text(row, 7)?;
         let expanded = if let Cell::Text(root) = &task_root {
-            let uri = row_text(row, 4)?;
-            let mut path = String::with_capacity(root.len() + 16 + uri.len());
-            path.push_str(root.trim_end_matches(['\\', '/']));
-            path.push_str(r"\System32\Tasks\");
-            path.extend(uri.trim_start_matches(['\\', '/']).chars()
-                .map(|ch| if ch == '/' { '\\' } else { ch }));
-            Cell::Text(path)
+            Cell::Text(task_store_path(root, row_text(row, 4)?))
         } else {
             Cell::Null
         };
@@ -153,8 +162,7 @@ pub(super) fn write(ctx: &Ctx, db: &mut DerivedDb) -> Result<()> {
         &executions,
     )?;
     write_query(ctx, db, "ScheduledTasks", None,
-        r#"SELECT record_id,NULL,'uri','scheduled_task_definition_file',uri,
-             '%SystemRoot%\System32\Tasks\'||ltrim(replace(uri,'/','\'),'\'),
+        r#"SELECT record_id,NULL,'uri','scheduled_task_definition_file',uri,uri,
              NULL,NULL,'xml_uri_expected_task_store',timestamp,timestamp_kind,account,account_sid
          FROM ScheduledTasks WHERE host_id=?1 AND dataset_id=?2
            AND evidence_kind='task_definition' AND source_format='xml' AND uri IS NOT NULL AND uri<>''
@@ -281,6 +289,14 @@ mod tests {
         for path in ["agent.exe", "C:agent.exe", "\\Device\\HarddiskVolume1\\agent.exe",
             "\\Windows\\agent.exe", "\\\\server\\share\\agent.exe", "%USERPROFILE%\\agent.exe"] {
             assert_eq!(local_key(path), None, "{path}");
+        }
+    }
+
+    #[test]
+    fn path_candidates_strip_extended_length_prefixes() {
+        let plain = local_key("C:\\Windows\\agent.exe");
+        for path in ["\\\\?\\C:\\Windows\\agent.exe", "\\\\.\\C:\\Windows\\agent.exe", "\\??\\C:\\Windows\\agent.exe"] {
+            assert_eq!(local_key(path), plain, "{path}");
         }
     }
 }

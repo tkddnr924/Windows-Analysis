@@ -444,7 +444,23 @@ pub fn parse_task_xml(text: &str) -> Result<ParsedTaskXml> {
         String::new(),
     );
     if let Some(principals) = principals {
-        for element in principals.children().filter(|n| n.is_element()) {
+        let elements: Vec<roxmltree::Node> = principals.children().filter(|n| n.is_element()).collect();
+        // The principal that runs the actions is the one Actions@Context names;
+        // without it, the first one carrying an account.
+        let context = actions_el
+            .and_then(|actions| actions.attribute("Context"))
+            .unwrap_or("")
+            .trim();
+        let has_account = |element: &roxmltree::Node| {
+            !child_text(*element, "UserId").is_empty() || !child_text(*element, "GroupId").is_empty()
+        };
+        let chosen = elements
+            .iter()
+            .find(|element| !context.is_empty() && element.attribute("id").map(str::trim) == Some(context))
+            .or_else(|| elements.iter().find(|element| has_account(element)))
+            .or_else(|| elements.first())
+            .copied();
+        for element in elements {
             let user = child_text(element, "UserId");
             let group = child_text(element, "GroupId");
             let privileges: Vec<Value> = child(element, "RequiredPrivileges")
@@ -467,7 +483,7 @@ pub fn parse_task_xml(text: &str) -> Result<ParsedTaskXml> {
                 "required_privileges": privileges,
                 "raw": node_raw(content, element, element.tag_name().name()),
             });
-            if run_as.is_empty() {
+            if Some(element) == chosen {
                 if !user.is_empty() {
                     run_as = user.clone();
                     run_as_element = "UserId".into();
@@ -894,41 +910,46 @@ fn parse_job(path: &Path, b: &[u8]) -> Result<Row> {
     };
 
     // 가변부: 헤더가 가리키는 AppName 길이 워드 오프셋부터 문자열 5개 연속.
+    // An offset outside the variable part has no strings behind it: decoding
+    // header bytes would invent a command, so all chained fields stay empty.
     let app_off = job_u16(b, 0x14) as usize;
-    if app_off < JOB_FIXED_LEN || app_off >= b.len() {
-        faults.add(
-            0x14,
-            &format!("Application Name 오프셋 0x{app_off:X}가 파일 범위 밖입니다"),
-        );
-    }
-    let start = app_off.min(b.len());
-    let (application, next) = job_lpstring(b, start, &mut faults, "AppName");
-    let (parameters, next) = job_lpstring(b, next, &mut faults, "Parameters");
-    let (working_dir, next) = job_lpstring(b, next, &mut faults, "WorkingDirectory");
-    let (author, next) = job_lpstring(b, next, &mut faults, "Author");
-    let (comment, after_comment) = job_lpstring(b, next, &mut faults, "Comment");
+    let (application, parameters, working_dir, author, comment, user_data, reserved_data) =
+        if app_off < JOB_FIXED_LEN || app_off >= b.len() {
+            faults.add(
+                0x14,
+                &format!("Application Name 오프셋 0x{app_off:X}가 파일 범위 밖입니다"),
+            );
+            Default::default()
+        } else {
+            let (application, next) = job_lpstring(b, app_off, &mut faults, "AppName");
+            let (parameters, next) = job_lpstring(b, next, &mut faults, "Parameters");
+            let (working_dir, next) = job_lpstring(b, next, &mut faults, "WorkingDirectory");
+            let (author, next) = job_lpstring(b, next, &mut faults, "Author");
+            let (comment, after_comment) = job_lpstring(b, next, &mut faults, "Comment");
 
-    // User Data / Reserved Data: length-prefixed byte blobs after Comment.
-    let mut cursor = after_comment;
-    let blob = |label: &str, faults: &mut JobFaults, cursor: &mut usize| -> String {
-        if *cursor + 2 > b.len() {
-            faults.add(*cursor, &format!("{label} 길이 워드가 파일 끝을 넘습니다"));
-            *cursor = b.len();
-            return String::new();
-        }
-        let size = job_u16(b, *cursor) as usize;
-        let start = *cursor + 2;
-        let end = start + size;
-        if end > b.len() {
-            faults.add(start, &format!("{label} {size}바이트가 파일 끝을 넘습니다"));
-            *cursor = b.len();
-            return crate::hex::hex_lower(&b[start.min(b.len())..]);
-        }
-        *cursor = end;
-        crate::hex::hex_lower(&b[start..end])
-    };
-    let user_data = blob("User Data", &mut faults, &mut cursor);
-    let reserved_data = blob("Reserved Data", &mut faults, &mut cursor);
+            // User Data / Reserved Data: length-prefixed byte blobs after Comment.
+            let mut cursor = after_comment;
+            let blob = |label: &str, faults: &mut JobFaults, cursor: &mut usize| -> String {
+                if *cursor + 2 > b.len() {
+                    faults.add(*cursor, &format!("{label} 길이 워드가 파일 끝을 넘습니다"));
+                    *cursor = b.len();
+                    return String::new();
+                }
+                let size = job_u16(b, *cursor) as usize;
+                let start = *cursor + 2;
+                let end = start + size;
+                if end > b.len() {
+                    faults.add(start, &format!("{label} {size}바이트가 파일 끝을 넘습니다"));
+                    *cursor = b.len();
+                    return crate::hex::hex_lower(&b[start.min(b.len())..]);
+                }
+                *cursor = end;
+                crate::hex::hex_lower(&b[start..end])
+            };
+            let user_data = blob("User Data", &mut faults, &mut cursor);
+            let reserved_data = blob("Reserved Data", &mut faults, &mut cursor);
+            (application, parameters, working_dir, author, comment, user_data, reserved_data)
+        };
 
     // 트리거 배열: 헤더의 Trigger Offset이 count u16을 가리킨다.
     let trig_off = job_u16(b, 0x16) as usize;
@@ -995,10 +1016,11 @@ fn parse_job(path: &Path, b: &[u8]) -> Result<Row> {
             "end_time": json_opt(&end),
             "end_time_raw": json_opt(&end),
             "enabled": Value::Bool(rg_flags & JOB_TRIGGER_FLAG_DISABLED == 0),
+            // MS-TSCH TASK_TRIGGER: MinutesDuration DWORD @0x14, MinutesInterval DWORD @0x18.
             "repetition": json!({
-                "interval_minutes": job_u16(b, o + 0x18),
-                "duration_minutes": job_u16(b, o + 0x1A),
-                "raw": crate::hex::hex_lower(&b[o + 0x18..o + 0x1C]),
+                "interval_minutes": job_u32(b, o + 0x18),
+                "duration_minutes": job_u32(b, o + 0x14),
+                "raw": crate::hex::hex_lower(&b[o + 0x14..o + 0x1C]),
             }),
             "raw": raw,
         }));
@@ -1454,6 +1476,39 @@ mod job_tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[test]
+    fn out_of_range_app_offset_decodes_no_strings() {
+        let dir = temp_dir("app-offset");
+        let mut job = synthetic_job(0, 2004);
+        put_u16(&mut job, 0x14, 0x02);
+        let path = dir.join("Bad.job");
+        std::fs::write(&path, &job).unwrap();
+        let row = parse_file(&path);
+        assert_eq!(row.get("_status").map(String::as_str), Some(STATUS_PARTIAL));
+        assert!(row.get("_error").unwrap().contains("Application Name"));
+        for key in ["actions", "author", "description"] {
+            assert_eq!(row.get(key).map(String::as_str).unwrap_or(""), "", "{key}");
+        }
+        assert!(!row.get("trigger_types").unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn job_trigger_repetition_reads_the_dword_fields() {
+        let dir = temp_dir("repetition");
+        let mut job = synthetic_job(0, 2004);
+        let trig = job.len() - JOB_TRIGGER_LEN;
+        put_u32(&mut job, trig + 0x14, 1440); // MinutesDuration
+        put_u32(&mut job, trig + 0x18, 70_000); // MinutesInterval
+        let path = dir.join("Rep.job");
+        std::fs::write(&path, &job).unwrap();
+        let row = parse_file(&path);
+        let trigs: Value = serde_json::from_str(row.get("triggers_json").unwrap()).unwrap();
+        assert_eq!(trigs[0]["repetition"]["duration_minutes"], 1440);
+        assert_eq!(trigs[0]["repetition"]["interval_minutes"], 70_000);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// R07: 유효한 작업 XML은 파일명이 .job이어도 XML로 파싱한다.
     #[test]
     fn xml_named_job_is_parsed_as_xml() {
@@ -1777,6 +1832,25 @@ mod xml_tests {
         let principals: Value = serde_json::from_str(row.get("principals_json").unwrap()).unwrap();
         assert_eq!(principals[0]["group_id"], "S-1-5-32-545");
         assert!(principals[0]["user_id"].is_null());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn actions_context_selects_the_principal() {
+        let dir = temp_dir("context");
+        let xml = r#"<Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo><URI>\Ctx</URI></RegistrationInfo>
+  <Principals>
+    <Principal id="Author"><UserId>S-1-5-21-1-2-3-1001</UserId><RunLevel>HighestAvailable</RunLevel><LogonType>Password</LogonType></Principal>
+    <Principal id="Users"><GroupId>S-1-5-32-545</GroupId></Principal>
+  </Principals>
+  <Actions Context="Users"><Exec><Command>u.exe</Command></Exec></Actions>
+</Task>"#;
+        let row = parse_file(&write_task(&dir, "Ctx", xml));
+        assert_eq!(row.get("run_as").map(String::as_str), Some("S-1-5-32-545"));
+        assert_eq!(row.get("run_as_element").map(String::as_str), Some("GroupId"));
+        assert_eq!(row.get("run_level").map(String::as_str).unwrap_or(""), "");
+        assert_eq!(row.get("logon_type").map(String::as_str).unwrap_or(""), "");
         let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -3,8 +3,6 @@
 // 저장 요약(action_summary·trigger_type_summary·review_signals·parse_status)으로 그린다.
 // 목록에서 자식 표를 조회하지 않는다(R01/R13/R15).
 import { useContext, useEffect, useMemo, useState, type CSSProperties } from "react";
-import BookmarkBorderOutlinedIcon from "@mui/icons-material/BookmarkBorderOutlined";
-import BookmarkOutlinedIcon from "@mui/icons-material/BookmarkOutlined";
 import CategoryOutlinedIcon from "@mui/icons-material/CategoryOutlined";
 import KeyboardArrowDownOutlinedIcon from "@mui/icons-material/KeyboardArrowDownOutlined";
 import PersonOutlineIcon from "@mui/icons-material/PersonOutlineOutlined";
@@ -12,15 +10,17 @@ import TaskOutlinedIcon from "@mui/icons-material/TaskOutlined";
 import VisibilityOutlinedIcon from "@mui/icons-material/VisibilityOutlined";
 import RowDetailPanel from "./RowDetailPanel";
 import PaginationControls from "@/components/PaginationControls";
+import { BookmarkButton, IconTile, NoMatch, isBookmarked, loadErrorNote, useCompanionTables, type Bookmarks } from "@/components/EventCards";
 import { HeaderSearchInput, MultiSelectDropdown, SelectDropdown, SortDropdown, ViewHeader } from "@/components/FilterControls";
 import { inRange, rangeActive, EMPTY_TIME_RANGE, type TimeRange } from "@/lib/timeRange";
 import type { CsvData, FetchLinkedRows } from "@/lib/types";
 import { resolveAccountDisplay, type AccountDirectory } from "@/lib/accountIdentity";
 import { RecordScopeContext } from "@/lib/recordScope";
 import { DEFAULT_TASK_FILTER, REVIEW_SIGNAL_LABELS, filterTasks, resolvedActionSummaries, hasReview, isParseProblem, reviewSignalList, splitByTime, taskAccountKey, taskCounts, type TaskFilter } from "@/lib/scheduledTasks";
+import { optionsOf, pageWindow, rowidOf } from "@/lib/eventCards";
 
 const TABLE = "ScheduledTasks";
-const PAGE = 10;
+const COMPANIONS = ["TaskActions"];
 
 interface Props {
   data: CsvData;
@@ -33,7 +33,6 @@ interface Props {
 }
 
 type Row = Record<string, string>;
-const rowidOf = (row: Row) => Number((row as Record<string, unknown>).__rowid);
 
 function Signal({ children, tone = "neutral", title }: { children: React.ReactNode; tone?: "neutral" | "warning" | "danger" | "success"; title?: string }) {
   const color = tone === "danger" ? "var(--danger)" : tone === "warning" ? "var(--warning)" : tone === "success" ? "var(--success)" : "var(--text-dim)";
@@ -59,20 +58,13 @@ export default function ScheduledTasksView({ data, onNavigate, onFetchLinkedRows
   const [selected, setSelected] = useState<Row | null>(null);
   const [untimedOpen, setUntimedOpen] = useState(false);
   const [untimedPage, setUntimedPage] = useState(0);
+  const bookmarks: Bookmarks = { bookmarkedRowids, onToggleBookmark };
   const update = (patch: Partial<TaskFilter>) => setFilter((previous) => ({ ...previous, ...patch }));
   // One read of TaskActions for resolved command paths (docs-24); the stored
   // raw summary stays the fallback and hover text.
   const scope = useContext(RecordScopeContext);
-  const [actionLines, setActionLines] = useState<Map<string, { text: string; raw: string }>>(new Map());
-  useEffect(() => {
-    setActionLines(new Map());
-    if (!scope?.fullPath) return;
-    let alive = true;
-    window.api.readResultFile(scope.fullPath, "TaskActions")
-      .then((result) => { if (alive) setActionLines(resolvedActionSummaries(result.rows)); })
-      .catch(() => {});
-    return () => { alive = false; };
-  }, [scope?.fullPath, data]);
+  const companion = useCompanionTables(scope?.fullPath, COMPANIONS);
+  const actionLines = useMemo(() => resolvedActionSummaries(companion.tables.TaskActions?.rows ?? []), [companion.tables.TaskActions]);
 
   const rangeOn = rangeActive(timeRange);
   const inPeriod = useMemo(() => (timestamp: string) => inRange(timestamp, timeRange), [timeRange]);
@@ -85,35 +77,15 @@ export default function ScheduledTasksView({ data, onNavigate, onFetchLinkedRows
     // Stored representative name first (docs-11 R14), then the directory.
     return row.account || (key && resolveAccountDisplay(key, accountDirectory)) || row.run_as || key;
   };
-  const kindOptions = useMemo(() => {
-    const tally = new Map<string, number>();
-    for (const row of data.rows) tally.set(row.event_type ?? "", (tally.get(row.event_type ?? "") ?? 0) + 1);
-    return [...tally.entries()].map(([value, count]) => ({ value, label: value || "(없음)", count }));
-  }, [data.rows]);
-  const accountOptions = useMemo(() => {
-    const byKey = new Map<string, { label: string; count: number }>();
-    for (const row of data.rows) {
-      const key = taskAccountKey(row);
-      const entry = byKey.get(key) ?? { label: key ? (row.account || resolveAccountDisplay(key, accountDirectory) || row.run_as || key) : "(계정 없음)", count: 0 };
-      entry.count += 1;
-      byKey.set(key, entry);
-    }
-    return [...byKey.entries()].sort(([, a], [, b]) => a.label.localeCompare(b.label)).map(([value, entry]) => ({ value, label: entry.label, count: entry.count }));
-  }, [data.rows, accountDirectory]);
+  const kindOptions = useMemo(() => optionsOf(data.rows, (row) => row.event_type ?? ""), [data.rows]);
+  const accountOptions = useMemo(() => optionsOf(data.rows, taskAccountKey, (key, row) => row.account || resolveAccountDisplay(key, accountDirectory) || row.run_as || key, "(계정 없음)"), [data.rows, accountDirectory]);
 
   useEffect(() => { setPage(0); setUntimedPage(0); }, [filter, rangeOn, timeRange, sortDir]);
-  const pageCount = Math.max(1, Math.ceil(timed.length / PAGE));
-  const safePage = Math.min(page, pageCount - 1);
-  const pageRows = timed.slice(safePage * PAGE, (safePage + 1) * PAGE);
-  const pageStart = timed.length ? safePage * PAGE + 1 : 0;
-  const pageEnd = Math.min((safePage + 1) * PAGE, timed.length);
-  const untimedPages = Math.max(1, Math.ceil(untimed.length / PAGE));
-  const safeUntimedPage = Math.min(untimedPage, untimedPages - 1);
+  const list = pageWindow(timed.length, page);
+  const untimedList = pageWindow(untimed.length, untimedPage);
 
   const renderRow = (row: Row) => {
-    const rowid = rowidOf(row);
-    const bookmarked = bookmarkedRowids?.has(rowid) ?? false;
-    const canBookmark = onToggleBookmark && Number.isFinite(rowid);
+    const bookmarked = isBookmarked(row, bookmarks);
     const tone = toneOf(row);
     const isEvent = Boolean(row.event_id);
     const signals = reviewSignalList(row);
@@ -127,9 +99,7 @@ export default function ScheduledTasksView({ data, onNavigate, onFetchLinkedRows
         onMouseEnter={(event) => { if (!bookmarked) event.currentTarget.style.background = "var(--bg-hover)"; }}
         onMouseLeave={(event) => { if (!bookmarked) event.currentTarget.style.background = "var(--bg-panel)"; }}>
         <button type="button" onClick={(event) => { event.stopPropagation(); setSelected(row); }} aria-label={`${row.task_name || row.event_type} 상세 보기`} style={{ flex: 1, display: "flex", alignItems: "center", gap: 12, minWidth: 0, padding: 0, border: 0, background: "transparent", color: "inherit", textAlign: "left", cursor: "pointer" }}>
-          <span aria-hidden="true" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 34, height: 34, flexShrink: 0, borderRadius: "var(--radius)", background: `color-mix(in srgb, ${tone} 15%, transparent)` }}>
-            <TaskOutlinedIcon sx={{ fontSize: 17, color: tone }} />
-          </span>
+          <IconTile icon={TaskOutlinedIcon} tone={tone} />
           <span style={{ flex: 1, minWidth: 0, display: "grid", gap: 3 }}>
             <span style={{ display: "flex", alignItems: "center", gap: 7, minWidth: 0 }}>
               <span title={row.task_path || row.task_name} style={cellStyle({ color: "var(--text)", fontSize: 13.5, fontWeight: 700 })}>{row.task_name || row.event_type}</span>
@@ -149,14 +119,14 @@ export default function ScheduledTasksView({ data, onNavigate, onFetchLinkedRows
           {account && <span title={[row.run_as_sid || row.account_sid, row.run_as].filter(Boolean).join(" · ")} style={cellStyle({ width: 150, flexShrink: 0, color: "var(--text-dim)", fontSize: 12 })}>{account}</span>}
           <time title={row.timestamp_kind || undefined} style={cellStyle({ width: 176, flexShrink: 0, textAlign: "right", color: row.timestamp ? "var(--text-time)" : "var(--text-faint)", fontSize: 12, fontFamily: "var(--mono)" })}>{row.timestamp || ""}</time>
         </button>
-        {canBookmark && <button type="button" className={bookmarked ? "dfir-bookmark-control" : undefined} onClick={(event) => { event.stopPropagation(); onToggleBookmark(rowid); }} aria-label={bookmarked ? "북마크 해제" : "북마크"} title={bookmarked ? "북마크 해제" : "북마크"} style={{ flexShrink: 0, width: 28, height: 28, display: "grid", placeItems: "center", border: 0, background: "transparent", color: bookmarked ? "var(--bookmark-control)" : "var(--text-faint)", cursor: "pointer" }}>{bookmarked ? <BookmarkOutlinedIcon sx={{ fontSize: 18 }} /> : <BookmarkBorderOutlinedIcon sx={{ fontSize: 18 }} />}</button>}
+        <BookmarkButton row={row} bookmarks={bookmarks} size={18} />
       </div>
     );
   };
 
   return (
     <div className="dfir-view" style={{ flex: 1, minHeight: 0, minWidth: 0, display: "flex", flexDirection: "column", background: "var(--bg)" }}>
-      <ViewHeader icon={TaskOutlinedIcon} title="작업 스케줄러" meta={`${filtered.length.toLocaleString()} / ${counts.total.toLocaleString()}건`}>
+      <ViewHeader icon={TaskOutlinedIcon} title="작업 스케줄러" meta={`${filtered.length.toLocaleString()} / ${counts.total.toLocaleString()}건`} right={loadErrorNote(companion.failed)}>
         <HeaderSearchInput value={filter.search} onChange={(search) => update({ search })} placeholder="작업 · 명령 · 인수 · 트리거 · 설명 · 계정 · SID" ariaLabel="작업 스케줄러 검색" width={300} />
         <MultiSelectDropdown icon={<CategoryOutlinedIcon sx={{ fontSize: 15 }} />} label="종류" ariaLabel="기록 종류" options={kindOptions} selected={filter.kinds} onChange={(kinds) => update({ kinds })} />
         <MultiSelectDropdown icon={<PersonOutlineIcon sx={{ fontSize: 15 }} />} label="계정" ariaLabel="계정" options={accountOptions} selected={filter.accounts} onChange={(accounts) => update({ accounts })} />
@@ -199,23 +169,23 @@ export default function ScheduledTasksView({ data, onNavigate, onFetchLinkedRows
             </button>
             {untimedOpen && (
               <div style={{ borderTop: "1px solid var(--border-subtle)", padding: "10px 10px 2px" }}>
-                {untimed.slice(safeUntimedPage * PAGE, (safeUntimedPage + 1) * PAGE).map(renderRow)}
-                {untimed.length > PAGE && (
+                {untimed.slice(untimedList.start, untimedList.end).map(renderRow)}
+                {untimedList.pageCount > 1 && (
                   <div style={{ display: "flex", justifyContent: "center", padding: "2px 0 8px" }}>
-                    <PaginationControls ariaLabel="시간 정보 없음 작업 페이지" page={safeUntimedPage} pageCount={untimedPages} onChange={setUntimedPage} summary={`(${(safeUntimedPage * PAGE + 1).toLocaleString()}–${Math.min((safeUntimedPage + 1) * PAGE, untimed.length).toLocaleString()} / ${untimed.length.toLocaleString()})`} />
+                    <PaginationControls ariaLabel="시간 정보 없음 작업 페이지" page={untimedList.page} pageCount={untimedList.pageCount} onChange={setUntimedPage} summary={untimedList.summary} />
                   </div>
                 )}
               </div>
             )}
           </div>
         )}
-        {pageRows.map(renderRow)}
-        {!pageRows.length && !untimed.length && <div role="status" style={{ padding: 44, textAlign: "center", color: "var(--text-faint)", fontSize: 13 }}>{data.rows.length === 0 ? "기록 없음" : "일치하는 기록 없음"}</div>}
+        {timed.slice(list.start, list.end).map(renderRow)}
+        {!timed.length && !untimed.length && <NoMatch total={data.rows.length} />}
       </section>
 
       <footer className="scheduler-footer" style={{ flexShrink: 0, display: "grid", gridTemplateColumns: "minmax(0, 1fr) auto minmax(0, 1fr)", alignItems: "center", minHeight: 46, gap: 12, padding: "0 20px", borderTop: "1px solid var(--border)", color: "var(--text-faint)", fontSize: 11.5 }}>
-        <span style={cellStyle()}>{timed.length ? `${pageStart.toLocaleString()}–${pageEnd.toLocaleString()} / ${timed.length.toLocaleString()}` : ""}</span>
-        <PaginationControls ariaLabel="작업 스케줄러 페이지" page={safePage} pageCount={pageCount} onChange={setPage} />
+        <span style={cellStyle()}>{timed.length ? `${(list.start + 1).toLocaleString()}–${list.end.toLocaleString()} / ${timed.length.toLocaleString()}` : ""}</span>
+        <PaginationControls ariaLabel="작업 스케줄러 페이지" page={list.page} pageCount={list.pageCount} onChange={setPage} />
         <span className="scheduler-footer-spacer" aria-hidden="true" />
       </footer>
 

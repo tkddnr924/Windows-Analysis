@@ -5,9 +5,9 @@
 use std::collections::BTreeMap;
 
 use anyhow::{anyhow, Result};
-use rusqlite::{Connection, OpenFlags};
 
 use super::schema::{ChildSpec, DbSpec};
+use super::eventlog_inputs::LogInputs;
 use super::{int_opt, int_val, text, text_opt, Cell, Ctx, DerivedDb, SourceRef};
 use crate::overview::{classify_path, jget, parse_eventdata, EventLogOverviewCache};
 
@@ -198,7 +198,7 @@ impl Fields {
 
 /// Decode SCM binary data (UTF-16LE service identity) without guessing at
 /// bytes that are not text.
-fn decode_binary(hex: &str) -> (Option<String>, &'static str) {
+pub(super) fn decode_binary(hex: &str) -> (Option<String>, &'static str) {
     let hex = hex.trim();
     if hex.is_empty() {
         return (None, "absent");
@@ -233,7 +233,7 @@ fn decode_binary(hex: &str) -> (Option<String>, &'static str) {
 
 /// 7036 records "<name>/<state code>" in its binary data; split only that
 /// exact shape.
-fn split_binary_token(decoded: &str, event_id: &str) -> (String, Option<String>) {
+pub(super) fn split_binary_token(decoded: &str, event_id: &str) -> (String, Option<String>) {
     if event_id != "7036" {
         return (decoded.to_string(), None);
     }
@@ -859,7 +859,6 @@ pub(super) fn build(ctx: &Ctx, events: &EventLogOverviewCache) -> Result<usize> 
         record.set("state", text(&state));
         record.set("start_type_before", text(&start_before));
         record.set("start_type_after", text(&start_after));
-        record.set("start_type_before_raw", text(&start_before));
         record.set("start_type_after_raw", text(if is_audit { &start_after_raw } else { &start_after }));
         record.set("service_type", text(&service_type));
         record.set("service_type_raw", text(if is_audit { &service_type_raw } else { &service_type }));
@@ -1265,104 +1264,48 @@ fn write_coverage(
 /// Collection scope per log: an uncollected or empty log is not evidence that
 /// the events never happened.
 fn write_logs(ctx: &Ctx, db: &mut DerivedDb, logs: &BTreeMap<String, LogStat>) -> Result<()> {
-    let inputs = ctx.out_dir.join("EVENTLOG/EventLogInputs.sqlite");
+    let inputs = LogInputs::read(ctx, relevant_log)?;
     let mut remaining: BTreeMap<&str, &LogStat> =
         logs.iter().map(|(name, stat)| (name.as_str(), stat)).collect();
-    let mut discovered = false;
     let mut seen: Vec<String> = Vec::new();
-    if inputs.is_file() {
-        let conn = Connection::open_with_flags(&inputs, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        discovered = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM EventLogInputs WHERE status='discovery_complete')",
-            [],
-            |row| row.get(0),
-        )?;
-        let rows: Vec<(i64, Option<String>, Option<String>, Option<String>, String, Option<String>, Option<String>)> = {
-            let mut query = conn.prepare(
-                "SELECT rowid,source_file,facts_db,facts_table,status,row_count,error FROM EventLogInputs
-                 WHERE status<>'discovery_complete' ORDER BY rowid",
-            )?;
-            let mapped = query.query_map([], |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
-                ))
-            })?;
-            mapped.collect::<rusqlite::Result<Vec<_>>>()?
+    for input in &inputs.logs {
+        let table = input.log_name.as_str();
+        seen.push(table.to_lowercase());
+        let source = inputs.source(ctx, input)?;
+        let stat = remaining.remove(table);
+        let parsed = input.parsed();
+        // A parsed log with no matching rows observed zero, not unknown.
+        let counted = |value: Option<i64>| {
+            if parsed { int_val(value.unwrap_or(0)) } else { Cell::Null }
         };
-        for (rowid, file, facts_db, facts_table, status, row_count, error) in rows {
-            let table = facts_table.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| {
-                file.as_deref()
-                    .unwrap_or("")
-                    .rsplit(['/', '\\'])
-                    .next()
-                    .unwrap_or("")
-                    .rsplit_once('.')
-                    .map(|(stem, _)| stem)
-                    .unwrap_or("")
-                    .to_string()
-            });
-            if !relevant_log(&table) {
-                continue;
-            }
-            seen.push(table.to_lowercase());
-            let input_rows = row_count.and_then(|value| value.parse::<i64>().ok());
-            let state = match (status.as_str(), input_rows) {
-                ("read_failed", _) => "read_failed",
-                ("parsed", Some(0)) => "collected_empty",
-                ("parsed", Some(_)) => "collected",
-                _ => "unknown",
-            };
-            let source = ctx
-                .facts
-                .source_from_row(
-                    &inputs,
-                    "EventLogInputs",
-                    rowid,
-                    file.as_deref(),
-                    Some("collection_observation"),
-                )?
-                .ok_or_else(|| anyhow!("EventLogInputs 원본 좌표를 찾지 못했습니다"))?;
-            let stat = remaining.remove(table.as_str());
-            let parsed = status == "parsed";
-            // A parsed log with no matching rows observed zero, not unknown.
-            let counted = |value: Option<i64>| {
-                if parsed { int_val(value.unwrap_or(0)) } else { Cell::Null }
-            };
-            let facts_generation = ctx.facts.by_stem(&table)
-                .map(|facts| ctx.facts.generation(facts)).transpose()?;
-            db.insert_child(
-                "ServiceLogObservations",
-                &[
-                    text(&uuid::Uuid::new_v4().to_string()),
-                    text(ctx.host_id),
-                    text(ctx.dataset_id),
-                    text(&table),
-                    text_opt(file.as_deref()),
-                    text_opt(facts_db.as_deref().filter(|s| !s.is_empty())),
-                    text_opt(facts_table.as_deref().filter(|s| !s.is_empty())),
-                    text_opt(facts_generation.as_deref()),
-                    text(state),
-                    int_opt(input_rows),
-                    counted(stat.map(|s| s.rows)),
-                    counted(stat.map(|s| s.service_rows)),
-                    counted(stat.map(|s| s.corrupted)),
-                    counted(stat.map(|s| s.untimed)),
-                    text(stat.map(|s| s.span.first.as_str()).unwrap_or("")),
-                    text(stat.map(|s| s.span.last.as_str()).unwrap_or("")),
-                    text_opt(error.as_deref()),
-                    text(&source.dataset),
-                    text(&source.db),
-                    text(&source.table),
-                    int_val(source.rowid),
-                ],
-            )?;
-        }
+        let facts_generation = ctx.facts.by_stem(table)
+            .map(|facts| ctx.facts.generation(facts)).transpose()?;
+        db.insert_child(
+            "ServiceLogObservations",
+            &[
+                text(&uuid::Uuid::new_v4().to_string()),
+                text(ctx.host_id),
+                text(ctx.dataset_id),
+                text(table),
+                text_opt(input.source_file.as_deref()),
+                text_opt(input.facts_db.as_deref()),
+                text_opt(input.facts_table.as_deref()),
+                text_opt(facts_generation.as_deref()),
+                text(input.collection_state()),
+                int_opt(input.input_rows),
+                counted(stat.map(|s| s.rows)),
+                counted(stat.map(|s| s.service_rows)),
+                counted(stat.map(|s| s.corrupted)),
+                counted(stat.map(|s| s.untimed)),
+                text(stat.map(|s| s.span.first.as_str()).unwrap_or("")),
+                text(stat.map(|s| s.span.last.as_str()).unwrap_or("")),
+                text_opt(input.error.as_deref()),
+                text(&source.dataset),
+                text(&source.db),
+                text(&source.table),
+                int_val(source.rowid),
+            ],
+        )?;
     }
     for (table, stat) in &remaining {
         seen.push(table.to_lowercase());
@@ -1410,7 +1353,7 @@ fn write_logs(ctx: &Ctx, db: &mut DerivedDb, logs: &BTreeMap<String, LogStat>) -
                 Cell::Null,
                 Cell::Null,
                 Cell::Null,
-                text(if discovered { "not_collected" } else { "unknown" }),
+                text(inputs.absent_state()),
                 Cell::Null,
                 Cell::Null,
                 Cell::Null,
@@ -1504,7 +1447,6 @@ CREATE TABLE "ServiceHistory" (
   "state" TEXT,
   "start_type_before" TEXT,
   "start_type_after" TEXT,
-  "start_type_before_raw" TEXT,
   "start_type_after_raw" TEXT,
   "service_type" TEXT,
   "service_type_raw" TEXT,
@@ -1738,7 +1680,7 @@ CREATE TABLE "ServiceMetadataReferences" (
   UNIQUE(host_id, dataset_id, metadata_id, reference_kind)
 );
 CREATE TABLE _wina_derived_version (name TEXT NOT NULL PRIMARY KEY, version INTEGER NOT NULL);
-INSERT INTO _wina_derived_version(name,version) VALUES ('overview_contract',1),('service_history',3);
+INSERT INTO _wina_derived_version(name,version) VALUES ('overview_contract',1),('service_history',4);
 "#;
 
 const MAIN: &[&str] = &[
@@ -1788,7 +1730,6 @@ const MAIN: &[&str] = &[
     "state",
     "start_type_before",
     "start_type_after",
-    "start_type_before_raw",
     "start_type_after_raw",
     "service_type",
     "service_type_raw",
@@ -2001,6 +1942,7 @@ mod tests {
     use super::*;
     use crate::derived::{stamp_facts_generation, FactsIndex, MetaLookup};
     use crate::sqlite::Row;
+    use rusqlite::Connection;
     use std::path::PathBuf;
 
     struct Case {

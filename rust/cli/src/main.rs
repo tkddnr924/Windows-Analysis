@@ -26,23 +26,51 @@ fn now() -> String {
     chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
-/// Minimal --key value parser (values may follow the flag).
-fn flags(args: &[String]) -> std::collections::HashMap<String, String> {
-    let mut m = std::collections::HashMap::new();
+type Flags = std::collections::HashMap<String, Option<String>>;
+
+/// Minimal --key value parser; a flag with no following value maps to None.
+fn flags(args: &[String]) -> Flags {
+    let mut m = Flags::new();
     let mut i = 0;
     while i < args.len() {
         if let Some(k) = args[i].strip_prefix("--") {
             let v = if i + 1 < args.len() && !args[i + 1].starts_with("--") {
                 i += 1;
-                args[i].clone()
+                Some(args[i].clone())
             } else {
-                String::new()
+                None
             };
             m.insert(k.to_string(), v);
         }
         i += 1;
     }
     m
+}
+
+/// Value of a flag that requires one: absent -> None, present but empty -> error.
+fn value<'a>(f: &'a Flags, key: &str) -> Result<Option<&'a str>> {
+    match f.get(key) {
+        None => Ok(None),
+        Some(Some(v)) if !v.trim().is_empty() => Ok(Some(v.as_str())),
+        Some(_) => bail!("--{key} requires a value"),
+    }
+}
+
+/// `--only a,b` artifact subset; None means every artifact.
+fn only_artifacts(f: &Flags) -> Result<Option<HashSet<String>>> {
+    let Some(list) = value(f, "only")? else {
+        return Ok(None);
+    };
+    let set: HashSet<String> = list
+        .split(',')
+        .map(str::trim)
+        .filter(|x| !x.is_empty())
+        .map(str::to_string)
+        .collect();
+    if set.is_empty() {
+        bail!("--only requires at least one artifact name");
+    }
+    Ok(Some(set))
 }
 
 fn main() -> Result<()> {
@@ -63,22 +91,22 @@ fn main() -> Result<()> {
         );
         return Ok(());
     }
-    let cases_dir = PathBuf::from(
-        f.get("cases-dir")
-            .ok_or_else(|| anyhow::anyhow!("--cases-dir required"))?,
-    )
-    .canonicalize()
-    .unwrap_or_else(|_| PathBuf::from(f.get("cases-dir").unwrap()));
+    let cases_dir = value(&f, "cases-dir")?
+        .ok_or_else(|| anyhow::anyhow!("--cases-dir required"))?;
+    let cases_dir = PathBuf::from(cases_dir)
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(cases_dir));
 
     if f.contains_key("list-cases") {
         let cases = case_store::list_cases(&cases_dir)?;
         println!("{}", serde_json::to_string(&cases)?);
-    } else if let Some(name) = f.get("create-case") {
+    } else if f.contains_key("create-case") {
+        let name = value(&f, "create-case")?.unwrap_or_default();
         let c = case_store::create_case(name, &now(), &cases_dir)?;
         println!("{}", serde_json::to_string(&c)?);
-    } else if let Some(case_id) = f.get("create-host") {
-        let (name, target) = (f.get("name"), f.get("target"));
-        let (name, target) = match (name, target) {
+    } else if f.contains_key("create-host") {
+        let case_id = value(&f, "create-host")?.unwrap_or_default();
+        let (name, target) = match (value(&f, "name")?, value(&f, "target")?) {
             (Some(n), Some(t)) => (n, t),
             _ => bail!("--create-host requires --name and --target"),
         };
@@ -88,14 +116,11 @@ fn main() -> Result<()> {
             .to_string();
         let h = case_store::create_host(case_id, name, &target, &now(), &cases_dir)?;
         println!("{}", serde_json::to_string(&h)?);
-    } else if let Some(case_id) = f.get("run-host") {
-        let host = f
-            .get("host")
+    } else if f.contains_key("run-host") {
+        let case_id = value(&f, "run-host")?.unwrap_or_default();
+        let host = value(&f, "host")?
             .ok_or_else(|| anyhow::anyhow!("--run-host requires --host"))?;
-        let only: Option<HashSet<String>> = f
-            .get("only")
-            .filter(|s| !s.is_empty())
-            .map(|s| s.split(',').map(|x| x.to_string()).collect());
+        let only = only_artifacts(&f)?;
         run_host(case_id, host, &cases_dir, only)?;
     } else {
         bail!("one of --create-case, --create-host, --run-host, --list-cases, --list-artifacts is required");
@@ -166,11 +191,14 @@ fn debug_parse(args: &[String]) -> Result<()> {
             eprintln!("JumpList: {} entries", r.len());
         }
         "parse-srum" => {
-            let t = parse_srum_stream(&inp, &out)?;
-            for (n, c) in &t {
+            let parsed = parse_srum_stream(&inp, &out)?;
+            for (n, c) in &parsed.tables {
                 eprintln!("  {} : {} rows", n, c);
             }
-            eprintln!("SRUM: {} tables", t.len());
+            for note in &parsed.skipped {
+                eprintln!("  skipped: {note}");
+            }
+            eprintln!("SRUM: {} tables", parsed.tables.len());
         }
         "parse-wer" => {
             let r = parse_wer(&inp)?;
@@ -179,8 +207,11 @@ fn debug_parse(args: &[String]) -> Result<()> {
         }
         "parse-history" => {
             let sides = wina_core::parsers::timeline::wal_siblings(&inp);
-            let (rows, _) = parse_history_stream(&inp, &sides, &out)?;
-            eprintln!("BrowserHistory: {} rows", rows);
+            let parsed = parse_history_stream(&inp, &sides, &out)?;
+            eprintln!("BrowserHistory: {} rows", parsed.rows);
+            for error in &parsed.table_errors {
+                eprintln!("BrowserHistory: table skipped: {error}");
+            }
         }
         "parse-rdpcache" => {
             let r = parse_rdpcache(&inp)?;
@@ -191,4 +222,28 @@ fn debug_parse(args: &[String]) -> Result<()> {
     }
     wina_core::derived::stamp_facts_generation(&out, &uuid::Uuid::new_v4().to_string())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(list: &[&str]) -> Flags {
+        flags(&list.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn valueless_only_is_rejected_not_full_run() {
+        assert!(only_artifacts(&args(&["--run-host", "c", "--only", "--host", "h"])).is_err());
+        assert!(only_artifacts(&args(&["--only", ","])).is_err());
+        assert_eq!(only_artifacts(&args(&["--host", "h"])).unwrap(), None);
+        let set = only_artifacts(&args(&["--only", "Registry,Amcache"])).unwrap().unwrap();
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn valueless_cases_dir_is_rejected() {
+        assert!(value(&args(&["--cases-dir", "--list-cases"]), "cases-dir").is_err());
+        assert_eq!(value(&args(&["--cases-dir", "x"]), "cases-dir").unwrap(), Some("x"));
+    }
 }

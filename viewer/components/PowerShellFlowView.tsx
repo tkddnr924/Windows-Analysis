@@ -35,11 +35,11 @@ function firstLine(value: string, limit = 220): string {
   return line.length > limit ? `${line.slice(0, limit)}…` : line;
 }
 
+// Session events always carry one of these (see allSessions filter).
 function eventEvidence(event: PsEvent): { label: string; value: string } {
   if (event.scriptBlock) return { label: "스크립트", value: firstLine(event.scriptBlock) };
   if (event.command) return { label: "명령", value: firstLine(event.command) };
-  if (event.hostApplication) return { label: "HostApplication", value: firstLine(event.hostApplication) };
-  return { label: "기록", value: "표시할 실행 문자열이 없습니다." };
+  return { label: "HostApplication", value: firstLine(event.hostApplication) };
 }
 
 interface PowerShellFlowViewProps {
@@ -88,7 +88,8 @@ export default function PowerShellFlowView({
   // 목록 IPC의 script_block/host_application은 앞 1,000자 미리보기 — 그 뒤의
   // IOC까지 놓치지 않도록, 검색어가 있으면 서버에서 원문 컬럼을 매칭한 rowid
   // 집합을 받아 화면 필터에 합류시킨다.
-  const [serverMatches, setServerMatches] = useState<Set<number> | null>(null);
+  // Tagged with its query so a stale response never joins a newer search.
+  const [serverMatches, setServerMatches] = useState<{ query: string; rowids: Set<number> } | null>(null);
   const searchSeq = useRef(0);
   useEffect(() => {
     const needle = query.trim();
@@ -99,8 +100,8 @@ export default function PowerShellFlowView({
     }
     const timer = setTimeout(() => {
       window.api.powershellSearchRowids(dbPath, needle)
-        .then((rowids) => { if (seq === searchSeq.current) setServerMatches(new Set(rowids)); })
-        .catch(() => { if (seq === searchSeq.current) setServerMatches(new Set()); });
+        .then((rowids) => { if (seq === searchSeq.current) setServerMatches({ query: needle, rowids: new Set(rowids) }); })
+        .catch(() => { if (seq === searchSeq.current) setServerMatches({ query: needle, rowids: new Set() }); });
     }, 250);
     return () => clearTimeout(timer);
   }, [query, dbPath]);
@@ -111,6 +112,7 @@ export default function PowerShellFlowView({
     () => groupBySessionId((data.rows as Record<string, string>[]).map(toPsEvent).filter((event) => event.timestamp && inRange(event.timestamp, timeRange) && (event.scriptBlock || event.command || event.hostApplication))),
     [data.rows, timeRange],
   );
+  const activeMatches = serverMatches && serverMatches.query === query.trim() ? serverMatches.rowids : null;
   const kinds = useMemo(() => {
     const present = new Set([
       ...allSessions.flatMap((session) => session.events.map((event) => event.kind)),
@@ -128,11 +130,11 @@ export default function PowerShellFlowView({
         if (kindFilter && (row.event_type ?? "") !== kindFilter) return false;
         if (hiddenAccounts.has(row.account ?? "")) return false;
         if (!needle) return true;
-        if (serverMatches?.has(Number((row as Record<string, unknown>).__rowid))) return true;
+        if (activeMatches?.has(Number((row as Record<string, unknown>).__rowid))) return true;
         return [row.account, row.command, row.event_type].some((value) => (value ?? "").toLowerCase().includes(needle));
       })
       .sort((a, b) => (a.account ?? "").localeCompare(b.account ?? "") || (Number(a.line_number) || 0) - (Number(b.line_number) || 0));
-  }, [data.rows, kindFilter, hiddenAccounts, query, serverMatches]);
+  }, [data.rows, kindFilter, hiddenAccounts, query, activeMatches]);
   const sessions = useMemo(() => {
     const needle = query.trim().toLowerCase();
     return allSessions.flatMap((session) => {
@@ -140,13 +142,13 @@ export default function PowerShellFlowView({
         if (kindFilter && event.kind !== kindFilter) return false;
         if (hiddenAccounts.has(event.account)) return false;
         if (!needle) return true;
-        if (serverMatches?.has(event.rowid)) return true;
+        if (activeMatches?.has(event.rowid)) return true;
         return [event.account, event.process, event.processId, event.command, event.scriptBlock, event.hostApplication]
           .some((value) => value.toLowerCase().includes(needle));
       });
       return events.length ? [{ ...session, events, start: events[0].timestamp, end: events[events.length - 1].timestamp }] : [];
     });
-  }, [allSessions, hiddenAccounts, kindFilter, query, serverMatches]);
+  }, [allSessions, hiddenAccounts, kindFilter, query, activeMatches]);
   const eventCount = useMemo(() => sessions.reduce((count, session) => count + session.events.length, 0), [sessions]);
   const allAccounts = useMemo(
     () => [...new Set(allSessions.flatMap((session) => session.events.map((event) => event.account)))].sort((a, b) => a.localeCompare(b)),
@@ -154,7 +156,10 @@ export default function PowerShellFlowView({
   );
   // 세션 목록도 다른 뷰처럼 10건씩 페이지네이션 — 필터·검색이 바뀌면 첫 페이지로.
   const PS_PAGE_SIZE = 10;
-  useEffect(() => setPage(0), [hiddenAccounts, kindFilter, query, serverMatches]);
+  useEffect(() => {
+    setPage(0);
+    setEventPages({});
+  }, [hiddenAccounts, kindFilter, query, activeMatches, timeRange]);
   const pageCount = Math.max(1, Math.ceil(sessions.length / PS_PAGE_SIZE));
   const safePage = Math.min(page, pageCount - 1);
   const pageSessions = sessions.slice(safePage * PS_PAGE_SIZE, safePage * PS_PAGE_SIZE + PS_PAGE_SIZE);
@@ -170,7 +175,17 @@ export default function PowerShellFlowView({
     }
     return [...groups.entries()];
   }, [untimed]);
-  const consoleRows = consoleAccount === null ? null : consoleByAccount.find(([account]) => account === consoleAccount)?.[1] ?? null;
+  // The modal shows the account's whole history file, not the filtered subset.
+  const consoleRows = useMemo(() => {
+    if (consoleAccount === null) return null;
+    return (data.rows as Record<string, string>[])
+      .filter((row) => !(row.timestamp ?? "").trim() && (row.account ?? "") === consoleAccount)
+      .sort((a, b) => (Number(a.line_number) || 0) - (Number(b.line_number) || 0));
+  }, [data.rows, consoleAccount]);
+  const consoleListed = consoleAccount !== null && consoleByAccount.some(([account]) => account === consoleAccount);
+  useEffect(() => {
+    if (consoleAccount !== null && !consoleListed) setConsoleAccount(null);
+  }, [consoleAccount, consoleListed]);
 
   function toggle(sessionKey: string) {
     setExpanded((previous) => {

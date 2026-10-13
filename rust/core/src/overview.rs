@@ -8,63 +8,72 @@ use std::path::Path;
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OpenFlags};
 
+use crate::sam::{le_u16, le_u32, le_u64, unhex};
 use crate::sqlite::Row;
 
-/// Read an entire table as Vec<Row> (TEXT cells; NULL -> absent key). Returns
-/// empty if the DB/table is missing.
-pub fn read_table(db: &Path, table: &str) -> Vec<Row> {
+/// Read an entire table as Vec<Row> (TEXT cells; NULL -> absent key). A
+/// missing DB or table is no evidence (empty); open, prepare and row-scan
+/// failures are errors, never a silently shortened table.
+pub fn read_table(db: &Path, table: &str) -> anyhow::Result<Vec<Row>> {
     read_table_inner(db, table, false, None)
 }
 
 /// Read a table together with each SQLite rowid. 파생은 이 rowid로 원본 행을
 /// 가리키는 근거(source_records)를 만든다 — 추가 컬럼(`__source_rowid`)은
 /// 내부 식별용이며 분석가에게 보여 주는 데이터가 아니다.
-pub fn read_table_with_rowid(db: &Path, table: &str) -> Vec<Row> {
+pub fn read_table_with_rowid(db: &Path, table: &str) -> anyhow::Result<Vec<Row>> {
     read_table_inner(db, table, true, None)
 }
 
-fn read_table_inner(db: &Path, table: &str, include_rowid: bool, fields: Option<&[&str]>) -> Vec<Row> {
+fn read_table_inner(
+    db: &Path,
+    table: &str,
+    include_rowid: bool,
+    fields: Option<&[&str]>,
+) -> anyhow::Result<Vec<Row>> {
+    use anyhow::Context;
     if !db.exists() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
-    let con = match Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY) {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
-    };
+    let at = || format!("{}: {table}", db.display());
+    let con = Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY).with_context(at)?;
+    let present: bool = con
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type IN ('table','view') AND name=?1 COLLATE NOCASE)",
+            [table],
+            |row| row.get(0),
+        )
+        .with_context(at)?;
+    if !present {
+        return Ok(Vec::new());
+    }
     let query = if include_rowid {
         format!("SELECT rowid AS \"__source_rowid\", * FROM \"{}\"", table)
     } else {
         format!("SELECT * FROM \"{}\"", table)
     };
-    let mut stmt = match con.prepare(&query) {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
-    };
+    let mut stmt = con.prepare(&query).with_context(at)?;
     let cols: Vec<(usize, String)> = stmt.column_names().iter().enumerate()
         .filter(|(_, name)| fields.is_none_or(|fields| fields.contains(name)))
         .map(|(index, name)| (index, (*name).to_string()))
         .collect();
     let mut out = Vec::new();
-    let mut q = match stmt.query([]) {
-        Ok(q) => q,
-        Err(_) => return Vec::new(),
-    };
-    while let Ok(Some(r)) = q.next() {
+    let mut q = stmt.query([]).with_context(at)?;
+    while let Some(r) = q.next().with_context(at)? {
         let mut row = Row::new();
         for (i, c) in &cols {
-            let v = match r.get_ref(*i) {
-                Ok(ValueRef::Null) => continue,
-                Ok(ValueRef::Text(t)) => String::from_utf8_lossy(t).into_owned(),
-                Ok(ValueRef::Integer(n)) => n.to_string(),
-                Ok(ValueRef::Real(f)) => f.to_string(),
-                Ok(ValueRef::Blob(b)) => crate::hex::hex_lower(b),
-                Err(_) => continue,
+            let v = match r.get_ref(*i).with_context(at)? {
+                ValueRef::Null => continue,
+                ValueRef::Text(t) => String::from_utf8_lossy(t).into_owned(),
+                ValueRef::Integer(n) => n.to_string(),
+                ValueRef::Real(f) => f.to_string(),
+                ValueRef::Blob(b) => crate::hex::hex_lower(b),
             };
             row.insert(c.clone(), v);
         }
         out.push(row);
     }
-    out
+    Ok(out)
 }
 
 /// True for a live registry row (not a recovered-deleted entry). The Rust
@@ -76,59 +85,24 @@ fn is_live(r: &Row) -> bool {
     r.get("_recovery").map(|v| v == "live").unwrap_or(true)
 }
 
-/// Read every table in a DB (used for per-account browser History etc.).
-pub fn read_all_tables(db: &Path) -> Vec<(String, Vec<Row>)> {
-    if !db.exists() {
-        return Vec::new();
+/// Sorted `*.sqlite` files of a category folder; a missing folder is empty,
+/// any other listing failure is an error.
+fn sqlite_files(dir: &Path) -> anyhow::Result<Vec<std::path::PathBuf>> {
+    use anyhow::Context;
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error).with_context(|| dir.display().to_string()),
+    };
+    let mut files = Vec::new();
+    for entry in entries {
+        let path = entry.with_context(|| dir.display().to_string())?.path();
+        if path.extension().is_some_and(|x| x == "sqlite") {
+            files.push(path);
+        }
     }
-    let con = match Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY) {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
-    };
-    let names: Vec<String> = {
-        let mut s = match con.prepare("SELECT name FROM sqlite_master WHERE type='table'") {
-            Ok(s) => s,
-            Err(_) => return Vec::new(),
-        };
-        let it = s
-            .query_map([], |r| r.get::<_, String>(0))
-            .map(|m| m.filter_map(|x| x.ok()).collect::<Vec<_>>())
-            .unwrap_or_default();
-        it
-    };
-    names
-        .into_iter()
-        .map(|t| {
-            let rows = read_table(db, &t);
-            (t, rows)
-        })
-        .collect()
-}
-
-// --- RdpCache ("RDP 캐시") — the reconstructed "fragment" rows only ---
-pub const RC_KEYS: &[&str] = &[
-    "kind",
-    "account",
-    "source_file",
-    "fragment_index",
-    "tile_count",
-    "width",
-    "height",
-    "rows",
-    "cols",
-    "image",
-    "_status",
-    "_source_file",
-];
-
-pub fn build_rdp_cache(out_dir: &Path) -> Vec<Row> {
-    read_table(
-        &out_dir.join("RDPCACHE").join("RdpBitmapCache.sqlite"),
-        "RdpBitmapCache",
-    )
-    .into_iter()
-    .filter(|r| r.get("kind").map(|k| k == "fragment").unwrap_or(false))
-    .collect()
+    files.sort();
+    Ok(files)
 }
 
 // --- Event-log access helpers (shared by Defender + correlate builders) ---
@@ -136,18 +110,9 @@ pub fn build_rdp_cache(out_dir: &Path) -> Vec<Row> {
 /// All rows from every EventLog table whose stem (filename, lowercased)
 /// contains `needle`. Rows keep the table's rowid order. Mirrors Python's
 /// iteration over all_results["EventLog"] filtered by stem substring.
-pub fn read_eventlog(out_dir: &Path, needle: &str) -> Vec<Row> {
-    let dir = out_dir.join("EVENTLOG");
+pub fn read_eventlog(out_dir: &Path, needle: &str) -> anyhow::Result<Vec<Row>> {
     let mut out = Vec::new();
-    let mut files: Vec<_> = match std::fs::read_dir(&dir) {
-        Ok(rd) => rd
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().map(|x| x == "sqlite").unwrap_or(false))
-            .collect(),
-        Err(_) => return out,
-    };
-    files.sort();
-    for p in files {
+    for p in sqlite_files(&out_dir.join("EVENTLOG"))? {
         let stem = p
             .file_stem()
             .map(|s| s.to_string_lossy().to_string())
@@ -155,9 +120,9 @@ pub fn read_eventlog(out_dir: &Path, needle: &str) -> Vec<Row> {
         if stem == "EventLogInputs" || !stem.to_lowercase().contains(needle) {
             continue;
         }
-        out.extend(read_table(&p, &stem));
+        out.extend(read_table(&p, &stem)?);
     }
-    out
+    Ok(out)
 }
 
 /// EventLog 행 공유 캐시 — SMB/RDP/PowerShell/Defender 빌더가 같은 이벤트
@@ -167,10 +132,10 @@ pub struct EventLogOverviewCache {
 }
 
 impl EventLogOverviewCache {
-    pub fn load(out_dir: &Path) -> Self {
-        Self {
-            rows: read_eventlog(out_dir, ""),
-        }
+    pub fn load(out_dir: &Path) -> anyhow::Result<Self> {
+        Ok(Self {
+            rows: read_eventlog(out_dir, "")?,
+        })
     }
 
     pub fn rows(&self) -> &[Row] {
@@ -277,25 +242,18 @@ fn account_prefix(stem: &str) -> Option<&str> {
 }
 
 // PowerShell history
-fn read_registry_all(out_dir: &Path) -> Vec<Row> {
-    let dir = out_dir.join("REGISTRY");
-    let mut files: Vec<_> = match std::fs::read_dir(&dir) {
-        Ok(rd) => rd
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().map(|x| x == "sqlite").unwrap_or(false))
-            .filter(|p| !is_regback_output(p))
-            .collect(),
-        Err(_) => return Vec::new(),
-    };
-    files.sort();
+fn read_registry_all(out_dir: &Path) -> anyhow::Result<Vec<Row>> {
     let mut out = Vec::new();
-    for p in files {
-        out.extend(read_table(&p, "Registry").into_iter().filter(is_live));
+    for p in sqlite_files(&out_dir.join("REGISTRY"))? {
+        if is_regback_output(&p) {
+            continue;
+        }
+        out.extend(read_table(&p, "Registry")?.into_iter().filter(is_live));
     }
-    out
+    Ok(out)
 }
 
-fn basename_win(path: &str) -> String {
+pub(crate) fn basename_win(path: &str) -> String {
     if path.is_empty() {
         return String::new();
     }
@@ -355,12 +313,8 @@ impl LocalAccounts {
             } else if low.ends_with("\\sam\\domains\\account")
                 && r.get("value_name").map(|v| v == "V").unwrap_or(false)
             {
-                // The V value ends with the domain's three sub-authorities.
-                let v = unhex(&r.get("value_data").cloned().unwrap_or_default());
-                if v.len() >= 12 {
-                    let tail = &v[v.len() - 12..];
-                    let part = |i: usize| u32::from_le_bytes([tail[i], tail[i + 1], tail[i + 2], tail[i + 3]]);
-                    machine_sid = format!("S-1-5-21-{}-{}-{}", part(0), part(4), part(8));
+                if let Some(sid) = crate::sam::machine_sid_from_v(r.get("value_data").map_or("", String::as_str)) {
+                    machine_sid = sid;
                 }
             }
         }
@@ -600,47 +554,6 @@ fn opt_int(v: Option<&serde_json::Value>) -> Option<i64> {
     }
 }
 
-/// PowerShell evidence fields; unknown optional values stay absent.
-pub const PS_KEYS: &[&str] = &[
-    "timestamp",
-    "account",
-    "process",
-    "process_id",
-    "command",
-    "script_block",
-    "host_application",
-    "kind",
-    "event_id",
-    "provider",
-    "script_path",
-    "record_key",
-    "script_block_status",
-    // Explicit script and session identifiers.
-    "script_block_id",
-    "session_id",
-    "runspace_id",
-    // Original event context.
-    "account_sid",
-    "context_info",
-    "error_message",
-    "event_data",
-    "event_channel",
-    "event_record_id",
-    "event_level",
-    // Script reassembly evidence.
-    "script_block_expected_parts",
-    "script_block_observed_parts",
-    "script_block_missing",
-    "script_block_conflicts",
-    "script_block_anomalies",
-    "script_block_parts",
-    // Console history has order, not timestamps.
-    "line_number",
-    "console_history_status",
-    "console_lines",
-    "_source_file",
-];
-
 #[allow(clippy::too_many_arguments)] // PowerShellHistory 행 고정 필드 세트
 fn ps_row(
     timestamp: &str,
@@ -675,15 +588,11 @@ fn ps_row(
     r
 }
 
-pub fn build_powershell_history(out_dir: &Path) -> Vec<Row> {
-    build_powershell_history_with_events(out_dir, &EventLogOverviewCache::load(out_dir))
-}
-
 pub fn build_powershell_history_with_events(
     out_dir: &Path,
     events: &EventLogOverviewCache,
-) -> Vec<Row> {
-    let registry = read_registry_all(out_dir);
+) -> anyhow::Result<Vec<Row>> {
+    let registry = read_registry_all(out_dir)?;
     let umap = user_map(&registry);
     let locals = LocalAccounts::load(&registry);
     drop(registry);
@@ -1277,7 +1186,7 @@ pub fn build_powershell_history_with_events(
 
     // PSReadLine serializes embedded newlines as a trailing backtick plus EOL.
     let console_db = out_dir.join("POWERSHELL").join("PowerShell_ConsoleHistory.sqlite");
-    let mut console_rows = read_table_with_rowid(&console_db, "PowerShell_ConsoleHistory");
+    let mut console_rows = read_table_with_rowid(&console_db, "PowerShell_ConsoleHistory")?;
     let physical_line = |r: &Row| r.get("line_number").and_then(|v| v.parse::<i64>().ok());
     console_rows.sort_by(|a, b| {
         a.get("_source_file").cmp(&b.get("_source_file"))
@@ -1351,7 +1260,7 @@ pub fn build_powershell_history_with_events(
         }
         rows.push(row);
     }
-    rows
+    Ok(rows)
 }
 
 // --- TargetInfo ("TargetInfo") — system / accounts / networks / interfaces ---
@@ -1454,56 +1363,6 @@ fn ti_row(pairs: &[(&str, String)]) -> Row {
     r
 }
 
-fn le_u16(b: &[u8], off: usize) -> u16 {
-    if off + 2 > b.len() {
-        0
-    } else {
-        u16::from_le_bytes([b[off], b[off + 1]])
-    }
-}
-fn le_u32(b: &[u8], off: usize) -> u32 {
-    if off + 4 > b.len() {
-        0
-    } else {
-        u32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
-    }
-}
-fn le_u64(b: &[u8], off: usize) -> u64 {
-    if off + 8 > b.len() {
-        0
-    } else {
-        let mut a = [0u8; 8];
-        a.copy_from_slice(&b[off..off + 8]);
-        u64::from_le_bytes(a)
-    }
-}
-
-fn unhex(s: &str) -> Vec<u8> {
-    let s = s.trim();
-    if !s.len().is_multiple_of(2) {
-        return Vec::new();
-    }
-    let mut out = Vec::with_capacity(s.len() / 2);
-    let b = s.as_bytes();
-    let hv = |c: u8| -> Option<u8> {
-        match c {
-            b'0'..=b'9' => Some(c - b'0'),
-            b'a'..=b'f' => Some(c - b'a' + 10),
-            b'A'..=b'F' => Some(c - b'A' + 10),
-            _ => None,
-        }
-    };
-    let mut i = 0;
-    while i + 1 < b.len() {
-        match (hv(b[i]), hv(b[i + 1])) {
-            (Some(h), Some(l)) => out.push(h << 4 | l),
-            _ => return Vec::new(),
-        }
-        i += 2;
-    }
-    out
-}
-
 /// FILETIME (100-ns since 1601) -> KST; "" for 0/unset.
 fn filetime(value: u64) -> String {
     if value == 0 {
@@ -1568,12 +1427,12 @@ impl RegistryOverviewHive {
     /// 새겨 둔다 — rf_* 판정 함수들이 시그니처 변경 없이 매칭 행에서 증거
     /// 키를 파생 행으로 옮겨 담아, 개요 북마크가 원본 Registry 레코드로
     /// 승격될 수 있게 한다.
-    fn load(database: std::path::PathBuf) -> Self {
+    fn load(database: std::path::PathBuf) -> anyhow::Result<Self> {
         // Correlations do not need the Explorer's raw payloads or cell metadata.
         let mut rows: Vec<Row> = read_table_inner(&database, "Registry", true, Some(&[
             "__source_rowid", "last_write", "key_path", "value_name", "value_type",
             "value_data", "_recovery", "_source_file",
-        ]))
+        ]))?
             .into_iter()
             .filter(is_live)
             .collect();
@@ -1583,14 +1442,14 @@ impl RegistryOverviewHive {
                 row.insert("__record_key".into(), key);
             }
         }
-        Self {
+        Ok(Self {
             name: database
                 .file_stem()
                 .map(|stem| stem.to_string_lossy().to_string())
                 .unwrap_or_default(),
             rows,
             database,
-        }
+        })
     }
 }
 
@@ -1612,34 +1471,25 @@ pub struct RegistryOverviewCache {
 }
 
 impl RegistryOverviewCache {
-    pub fn load(out_dir: &Path) -> Self {
-        let dir = out_dir.join("REGISTRY");
-        let mut files: Vec<_> = match std::fs::read_dir(&dir) {
-            Ok(rd) => rd
-                .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-                .filter(|path| {
-                    path.extension()
-                        .is_some_and(|extension| extension == "sqlite")
-                })
-                .filter(|path| !is_regback_output(path))
-                // Full Explorer discovery must not broaden legacy analysis rules.
-                .filter(|path| {
-                    let Some(stem) = path.file_stem() else { return false };
-                    let stem = stem.to_string_lossy();
-                    let stem = strip_uniq_suffix(&stem);
-                    crate::parsers::registry::REG_FILENAMES.iter()
-                        .any(|name| stem.eq_ignore_ascii_case(name))
-                        || crate::parsers::registry::REG_SUFFIXES.iter().any(|suffix| {
-                            stem.get(stem.len().saturating_sub(suffix.len())..)
-                                .is_some_and(|end| end.eq_ignore_ascii_case(suffix))
-                        })
-                })
-                .collect(),
-            Err(_) => return Self { hives: Vec::new() },
-        };
-        files.sort();
-        let hives = files.into_iter().map(RegistryOverviewHive::load).collect();
-        Self { hives }
+    pub fn load(out_dir: &Path) -> anyhow::Result<Self> {
+        let hives = sqlite_files(&out_dir.join("REGISTRY"))?
+            .into_iter()
+            .filter(|path| !is_regback_output(path))
+            // Full Explorer discovery must not broaden legacy analysis rules.
+            .filter(|path| {
+                let Some(stem) = path.file_stem() else { return false };
+                let stem = stem.to_string_lossy();
+                let stem = strip_uniq_suffix(&stem);
+                crate::parsers::registry::REG_FILENAMES.iter()
+                    .any(|name| stem.eq_ignore_ascii_case(name))
+                    || crate::parsers::registry::REG_SUFFIXES.iter().any(|suffix| {
+                        stem.get(stem.len().saturating_sub(suffix.len())..)
+                            .is_some_and(|end| end.eq_ignore_ascii_case(suffix))
+                    })
+            })
+            .map(RegistryOverviewHive::load)
+            .collect::<anyhow::Result<_>>()?;
+        Ok(Self { hives })
     }
 
     fn rows(&self, name: &str) -> &[Row] {
@@ -1728,19 +1578,6 @@ const OS_VALUES: &[&str] = &[
     "RegisteredOwner",
     "InstallDate",
 ];
-const ACB: &[(u16, &str)] = &[
-    (0x0001, "Disabled"),
-    (0x0002, "HomeDirRequired"),
-    (0x0004, "PwNotRequired"),
-    (0x0008, "TempDuplicate"),
-    (0x0010, "Normal"),
-    (0x0020, "MNSLogon"),
-    (0x0040, "DomainTrust"),
-    (0x0080, "WorkstationTrust"),
-    (0x0100, "ServerTrust"),
-    (0x0200, "PwNoExpire"),
-    (0x0400, "AutoLocked"),
-];
 
 fn ti_system_info(software: &[Row], system: &[Row]) -> Vec<Row> {
     let mut rows = Vec::new();
@@ -1809,63 +1646,8 @@ fn ti_system_info(software: &[Row], system: &[Row]) -> Vec<Row> {
     rows
 }
 
-fn sam_f(b: &[u8]) -> Option<HashMap<&'static str, String>> {
-    if b.len() < 0x44 {
-        return None;
-    }
-    let acb = le_u16(b, 0x38);
-    let mut m = HashMap::new();
-    m.insert("rid", le_u32(b, 0x30).to_string());
-    m.insert("last_login", filetime(le_u64(b, 0x08)));
-    m.insert("password_last_set", filetime(le_u64(b, 0x18)));
-    m.insert("last_failed_login", filetime(le_u64(b, 0x28)));
-    m.insert("login_count", le_u16(b, 0x42).to_string());
-    m.insert("failed_login_count", le_u16(b, 0x40).to_string());
-    m.insert(
-        "disabled",
-        if acb & 0x0001 != 0 {
-            "예".into()
-        } else {
-            "아니오".into()
-        },
-    );
-    m.insert(
-        "account_flags",
-        ACB.iter()
-            .filter(|(bit, _)| acb & bit != 0)
-            .map(|(_, n)| *n)
-            .collect::<Vec<_>>()
-            .join(", "),
-    );
-    Some(m)
-}
-
-fn sam_v(b: &[u8]) -> (String, String) {
-    if b.len() < 0xCC {
-        return (String::new(), String::new());
-    }
-    let field = |idx: usize| -> String {
-        let base = idx * 12;
-        let off = le_u32(b, base) as usize;
-        let length = le_u32(b, base + 4) as usize;
-        let start = 0xCC + off;
-        let end = (start + length).min(b.len());
-        if start >= b.len() {
-            return String::new();
-        }
-        let raw = &b[start..end];
-        // UTF-16LE decode (lossy)
-        let u16s: Vec<u16> = raw
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
-            .collect();
-        String::from_utf16_lossy(&u16s)
-    };
-    (field(1), field(2))
-}
-
 fn special_accounts(software: &[Row]) -> HashMap<String, String> {
-    let mark = "\\microsoft\\windows nt\\currentversion\\winlogon\\specialaccounts\\userlist";
+    let mark = crate::sam::SPECIAL_ACCOUNTS_USERLIST_SUFFIX;
     let mut out = HashMap::new();
     for r in software {
         let kp = r.get("key_path").cloned().unwrap_or_default();
@@ -1884,17 +1666,9 @@ fn special_accounts(software: &[Row]) -> HashMap<String, String> {
     out
 }
 
-fn well_known_sid(sid: &str) -> Option<&'static str> {
-    match sid {
-        "S-1-5-18" => Some("LocalSystem"),
-        "S-1-5-19" => Some("LocalService"),
-        "S-1-5-20" => Some("NetworkService"),
-        _ => None,
-    }
-}
-
 fn ti_accounts(sam: &[Row], software: &[Row]) -> Vec<Row> {
     let hidden = special_accounts(software);
+    // Local SIDs need the SAM machine SID; ProfileList may list domain SIDs.
     let mut prefix = String::new();
     let mut profile_keys: Vec<String> = Vec::new();
     let mut profiles: HashMap<String, String> = HashMap::new();
@@ -1916,11 +1690,6 @@ fn ti_accounts(sam: &[Row], software: &[Row]) -> Vec<Row> {
                 sid.clone(),
                 r.get("value_data").cloned().unwrap_or_default(),
             );
-            if sid.starts_with("S-1-5-21-") && prefix.is_empty() {
-                if let Some(p) = sid.rfind('-') {
-                    prefix = sid[..p].to_string();
-                }
-            }
         }
     }
 
@@ -1932,6 +1701,12 @@ fn ti_accounts(sam: &[Row], software: &[Row]) -> Vec<Row> {
     for r in sam {
         let kp = r.get("key_path").cloned().unwrap_or_default();
         let low = kp.to_lowercase();
+        if low.ends_with("\\sam\\domains\\account") && r.get("value_name").is_some_and(|v| v == "V") {
+            if let Some(sid) = crate::sam::machine_sid_from_v(r.get("value_data").map_or("", String::as_str)) {
+                prefix = sid;
+            }
+            continue;
+        }
         let nmark = "\\sam\\domains\\account\\users\\names\\";
         if let Some(i) = low.find(nmark) {
             let tail = &kp[i + nmark.len()..];
@@ -1975,8 +1750,9 @@ fn ti_accounts(sam: &[Row], software: &[Row]) -> Vec<Row> {
     for rid_hex in &user_keys {
         let (fb, vb, record_key) = users.get(rid_hex).unwrap();
         let rid = u32::from_str_radix(rid_hex, 16).unwrap_or(0);
-        let f = sam_f(fb);
-        let (username, full_name) = sam_v(vb);
+        let f = crate::sam::sam_f(fb);
+        let username = crate::sam::sam_v_field(vb, 1).unwrap_or_default();
+        let full_name = crate::sam::sam_v_field(vb, 2).unwrap_or_default();
         let sid = if !prefix.is_empty() {
             format!("{}-{}", prefix, rid)
         } else {
@@ -1992,13 +1768,8 @@ fn ti_accounts(sam: &[Row], software: &[Row]) -> Vec<Row> {
             Some(sp) if sp == "0" || sp == "0x0" => "예 (로그온 화면 숨김)".into(),
             Some(sp) => format!("UserList 값 {}", sp),
         };
-        let g = |k: &str| {
-            f.as_ref()
-                .and_then(|m| m.get(k))
-                .cloned()
-                .unwrap_or_default()
-        };
-        let last_login = g("last_login");
+        let f_text = |pick: fn(&crate::sam::SamF) -> String| f.as_ref().map(pick).unwrap_or_default();
+        let last_login = f_text(|f| filetime(f.last_login));
         if !sid.is_empty() {
             emitted.insert(sid.clone());
         }
@@ -2011,16 +1782,16 @@ fn ti_accounts(sam: &[Row], software: &[Row]) -> Vec<Row> {
             ("username", username),
             ("full_name", full_name),
             ("rid", rid.to_string()),
-            ("rid_sam", g("rid")),
+            ("rid_sam", f_text(|f| f.rid.to_string())),
             ("home_directory", path.clone()),
             ("created", created.clone()),
             ("last_login", last_login.clone()),
-            ("password_last_set", g("password_last_set")),
-            ("last_failed_login", g("last_failed_login")),
-            ("login_count", g("login_count")),
-            ("failed_login_count", g("failed_login_count")),
-            ("disabled", g("disabled")),
-            ("account_flags", g("account_flags")),
+            ("password_last_set", f_text(|f| filetime(f.password_last_set))),
+            ("last_failed_login", f_text(|f| filetime(f.last_failed_login))),
+            ("login_count", f_text(|f| f.login_count.to_string())),
+            ("failed_login_count", f_text(|f| f.failed_login_count.to_string())),
+            ("disabled", f_text(|f| if f.disabled() { "예" } else { "아니오" }.into())),
+            ("account_flags", f_text(|f| crate::sam::acb_flag_names(f.acb).collect::<Vec<_>>().join(", "))),
             ("special_account", special),
             (
                 "timestamp",
@@ -2038,7 +1809,7 @@ fn ti_accounts(sam: &[Row], software: &[Row]) -> Vec<Row> {
             continue;
         }
         let path = profiles.get(sid).cloned().unwrap_or_default();
-        let uname = well_known_sid(sid)
+        let uname = crate::sam::well_known_account(sid)
             .map(|s| s.to_string())
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| {
@@ -2224,11 +1995,6 @@ fn ti_network_interfaces(system: &[Row]) -> Vec<Row> {
     rows
 }
 
-pub fn build_target_info(out_dir: &Path) -> Vec<Row> {
-    let registry = RegistryOverviewCache::load(out_dir);
-    build_target_info_with_registry(&registry)
-}
-
 pub fn build_target_info_with_registry(registry: &RegistryOverviewCache) -> Vec<Row> {
     let software = registry.rows("SOFTWARE");
     let system = registry.rows("SYSTEM");
@@ -2288,25 +2054,13 @@ fn read_category_all_with_rowid(
     out_dir: &Path,
     category: &str,
     table: &str,
-) -> Vec<(std::path::PathBuf, Row)> {
-    let dir = out_dir.join(category);
-    let mut files: Vec<_> = match std::fs::read_dir(&dir) {
-        Ok(rd) => rd
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().map(|x| x == "sqlite").unwrap_or(false))
-            .collect(),
-        Err(_) => return Vec::new(),
-    };
-    files.sort();
+) -> anyhow::Result<Vec<(std::path::PathBuf, Row)>> {
     let mut out = Vec::new();
-    for p in files {
-        out.extend(
-            read_table_with_rowid(&p, table)
-                .into_iter()
-                .map(|row| (p.clone(), row)),
-        );
+    for p in sqlite_files(&out_dir.join(category))? {
+        let rows = read_table_with_rowid(&p, table)?;
+        out.extend(rows.into_iter().map(|row| (p.clone(), row)));
     }
-    out
+    Ok(out)
 }
 
 fn source_record_key(db: &Path, table: &str, row: &Row) -> String {
@@ -2335,9 +2089,9 @@ fn rot13(s: &str) -> String {
 
 const UA_MARKERS: &[&str] = &["UEME_CTLSESSION", "UEME_CTLCUACount:ctor"];
 
-fn eh_from_amcache(out_dir: &Path) -> Vec<Row> {
+fn eh_from_amcache(out_dir: &Path) -> anyhow::Result<Vec<Row>> {
     let mut rows = Vec::new();
-    for (db, r) in read_category_all_with_rowid(out_dir, "AMCACHE", "Amcache_Programs") {
+    for (db, r) in read_category_all_with_rowid(out_dir, "AMCACHE", "Amcache_Programs")? {
         let g = |k: &str| r.get(k).cloned().unwrap_or_default();
         rows.push(eh_row(&[
             ("timestamp", g("timestamp")),
@@ -2348,7 +2102,7 @@ fn eh_from_amcache(out_dir: &Path) -> Vec<Row> {
             ("record_key", source_record_key(&db, "Amcache_Programs", &r)),
         ]));
     }
-    for (db, r) in read_category_all_with_rowid(out_dir, "AMCACHE", "Amcache_Files") {
+    for (db, r) in read_category_all_with_rowid(out_dir, "AMCACHE", "Amcache_Files")? {
         let g = |k: &str| r.get(k).cloned().unwrap_or_default();
         rows.push(eh_row(&[
             ("timestamp", g("timestamp")),
@@ -2360,22 +2114,15 @@ fn eh_from_amcache(out_dir: &Path) -> Vec<Row> {
             ("record_key", source_record_key(&db, "Amcache_Files", &r)),
         ]));
     }
-    rows
+    Ok(rows)
 }
 
-fn eh_from_userassist(out_dir: &Path) -> Vec<Row> {
+fn eh_from_userassist(out_dir: &Path) -> anyhow::Result<Vec<Row>> {
     let mut rows = Vec::new();
-    let dir = out_dir.join("REGISTRY");
-    let mut files: Vec<_> = match std::fs::read_dir(&dir) {
-        Ok(rd) => rd
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().map(|x| x == "sqlite").unwrap_or(false))
-            .filter(|p| !is_regback_output(p))
-            .collect(),
-        Err(_) => return rows,
-    };
-    files.sort();
-    for p in files {
+    for p in sqlite_files(&out_dir.join("REGISTRY"))? {
+        if is_regback_output(&p) {
+            continue;
+        }
         let raw_stem = p
             .file_stem()
             .map(|s| s.to_string_lossy().to_string())
@@ -2387,7 +2134,7 @@ fn eh_from_userassist(out_dir: &Path) -> Vec<Row> {
             continue;
         }
         let user = account_prefix(stem).unwrap_or(stem).to_string();
-        for r in read_table_with_rowid(&p, "Registry")
+        for r in read_table_with_rowid(&p, "Registry")?
             .into_iter()
             .filter(is_live)
         {
@@ -2426,13 +2173,13 @@ fn eh_from_userassist(out_dir: &Path) -> Vec<Row> {
             ]));
         }
     }
-    rows
+    Ok(rows)
 }
 
-fn eh_from_srum(out_dir: &Path) -> Vec<Row> {
+fn eh_from_srum(out_dir: &Path) -> anyhow::Result<Vec<Row>> {
     let mut order: Vec<(String, String)> = Vec::new();
     let mut earliest: HashMap<(String, String), (String, String)> = HashMap::new();
-    for (db, r) in read_category_all_with_rowid(out_dir, "SRUM", "SRUM_ApplicationResourceUsage") {
+    for (db, r) in read_category_all_with_rowid(out_dir, "SRUM", "SRUM_ApplicationResourceUsage")? {
         let app = r.get("app").cloned().unwrap_or_default();
         if app.is_empty() || app.to_lowercase().starts_with("svc.") {
             continue;
@@ -2464,7 +2211,7 @@ fn eh_from_srum(out_dir: &Path) -> Vec<Row> {
             }
         }
     }
-    order
+    Ok(order
         .into_iter()
         .map(|key| {
             let (ts, record_key) = earliest.get(&key).cloned().unwrap_or_default();
@@ -2486,7 +2233,7 @@ fn eh_from_srum(out_dir: &Path) -> Vec<Row> {
                 ("record_key", record_key),
             ])
         })
-        .collect()
+        .collect())
 }
 
 fn eh_from_bam_registry(registry: &RegistryOverviewCache) -> Vec<Row> {
@@ -2530,9 +2277,9 @@ fn eh_from_bam_registry(registry: &RegistryOverviewCache) -> Vec<Row> {
     rows
 }
 
-fn eh_from_prefetch(out_dir: &Path) -> Vec<Row> {
+fn eh_from_prefetch(out_dir: &Path) -> anyhow::Result<Vec<Row>> {
     let db = out_dir.join("PREFETCH").join("Prefetch_Execution.sqlite");
-    read_table_with_rowid(&db, "Prefetch_Execution")
+    Ok(read_table_with_rowid(&db, "Prefetch_Execution")?
         .into_iter()
         .map(|r| {
             let g = |k: &str| r.get(k).cloned().unwrap_or_default();
@@ -2559,50 +2306,38 @@ fn eh_from_prefetch(out_dir: &Path) -> Vec<Row> {
                 ),
             ])
         })
-        .collect()
-}
-
-
-/// ExecutionHistory content version; older results require regeneration.
-/// 3 adds process-creation and Shell-Core events in the typed builder.
-/// 4 derives WER paths only from role-confirmed evidence.
-pub const EXECUTION_HISTORY_DERIVED_VERSION: i64 = 4;
-
-pub fn build_execution_history(out_dir: &Path) -> anyhow::Result<Vec<Row>> {
-    let registry = RegistryOverviewCache::load(out_dir);
-    let events = EventLogOverviewCache::load(out_dir);
-    build_execution_history_with_registry(out_dir, &registry, &events)
+        .collect())
 }
 
 pub fn build_execution_history_with_registry(
     out_dir: &Path,
     registry: &RegistryOverviewCache,
-    events: &EventLogOverviewCache,
+    wer_starts: Vec<Row>,
 ) -> anyhow::Result<Vec<Row>> {
     let mut rows = Vec::new();
-    rows.extend(eh_from_amcache(out_dir));
-    rows.extend(eh_from_userassist(out_dir));
-    rows.extend(eh_from_srum(out_dir));
+    rows.extend(eh_from_amcache(out_dir)?);
+    rows.extend(eh_from_userassist(out_dir)?);
+    rows.extend(eh_from_srum(out_dir)?);
     rows.extend(eh_from_bam_registry(registry));
     // ShimCache(AppCompatCache)는 여기 넣지 않는다 — 항목의 FILETIME은 대상
     // 파일의 수정 시각이지 실행 시각이 아니므로 실행 이력·타임라인 증거로
     // 부적합(v0.9.35 확정 결정). RegistryFindings(기타 레지스트리/ShimCache)
     // 에서 그 단서와 함께 표시한다.
-    rows.extend(eh_from_prefetch(out_dir));
-    rows.extend(eh_from_timeline(out_dir));
-    rows.extend(crate::wer_evidence::execution_start_evidence(out_dir, events)?);
+    rows.extend(eh_from_prefetch(out_dir)?);
+    rows.extend(eh_from_timeline(out_dir)?);
+    rows.extend(wer_starts);
     Ok(rows)
 }
 
 /// Windows Timeline의 실행/열기(ActivityType 5) 활동을 실행 이력에 합류시킨다.
 /// 포커스(6)·클립보드 등 나머지 유형은 실행 기록이 아니므로 원본 테이블
 /// (TIMELINE/Timeline_Activities)에서만 본다.
-fn eh_from_timeline(out_dir: &Path) -> Vec<Row> {
+fn eh_from_timeline(out_dir: &Path) -> anyhow::Result<Vec<Row>> {
     let mut rows = Vec::new();
     let db = out_dir
         .join("TIMELINE")
         .join("Timeline_Activities.sqlite");
-    for r in read_table_with_rowid(&db, "Timeline_Activities") {
+    for r in read_table_with_rowid(&db, "Timeline_Activities")? {
         if r.get("activity_type").map(String::as_str) != Some("5") {
             continue;
         }
@@ -2623,7 +2358,7 @@ fn eh_from_timeline(out_dir: &Path) -> Vec<Row> {
             ("record_key", source_record_key(&db, "Timeline_Activities", &r)),
         ]));
     }
-    rows
+    Ok(rows)
 }
 
 // --- RegistryFindings ("레지스트리 특이사항") ---
@@ -2750,8 +2485,9 @@ fn parse_shimcache_win7(data: &[u8]) -> ShimcacheParse {
         } else {
             (le_u32(data, o + 4) as usize, le_u64(data, o + 8))
         };
-        if path_len >= 2 && path_off >= SHIM_NT61_HEADER && path_off + path_len <= data.len() {
-            let u16s: Vec<u16> = data[path_off..path_off + path_len]
+        let path_bytes = path_off.checked_add(path_len).and_then(|end| data.get(path_off..end));
+        if let Some(bytes) = path_bytes.filter(|_| path_len >= 2 && path_off >= SHIM_NT61_HEADER) {
+            let u16s: Vec<u16> = bytes
                 .chunks_exact(2)
                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
                 .collect();
@@ -4678,10 +4414,26 @@ pub(crate) struct PathShape {
 /// Only local absolute paths become MFT-relative candidate keys.
 pub(crate) fn classify_path(raw: &str) -> PathShape {
     let mut low = raw.to_lowercase();
+    // Win32 file/device namespaces and NT `\??\` wrap ordinary drive/UNC paths.
+    for prefix in ["\\\\?\\", "\\\\.\\", "\\??\\", "//?/", "//./"] {
+        if let Some(rest) = low.strip_prefix(prefix) {
+            let rest = match rest.strip_prefix("unc\\").or_else(|| rest.strip_prefix("unc/")) {
+                Some(share) => format!("\\\\{share}"),
+                None if rest.as_bytes().get(1) == Some(&b':') => rest.to_string(),
+                None => break,
+            };
+            low = rest;
+            break;
+        }
+    }
     let b = low.as_bytes();
     let sep = |c: u8| c == b'\\' || c == b'/';
     if b.len() >= 2 && sep(b[0]) && sep(b[1]) {
         return PathShape { key: low, kind: "unc", drive: String::new() };
+    }
+    if low.starts_with("\\device\\") || low.starts_with("/device/") {
+        // Volume device paths need volume-to-drive evidence before MFT matching.
+        return PathShape { key: volume_relative_key(low), kind: "device_volume", drive: String::new() };
     }
     if b.len() >= 2 && b[1] == b':' && b[0].is_ascii_alphabetic() {
         let drive = format!("{}:", (b[0] as char).to_ascii_uppercase());
@@ -4798,10 +4550,10 @@ fn shellbag_path_row(bag: crate::shellbag::Shellbag) -> Row {
 /// 파싱 단계에서 미리 조합해 derived로 저장한다 — 화면 진입마다 원본 전수
 /// 스캔·Shellbag 재구성을 하지 않기 위한 협약 이행. 뷰어는 이 테이블을
 /// 표시 중인 경로 배치로만 조회한다.
-pub fn build_path_references(out_dir: &Path, registry: &RegistryOverviewCache) -> Vec<Row> {
+pub fn build_path_references(out_dir: &Path, registry: &RegistryOverviewCache) -> anyhow::Result<Vec<Row>> {
     let mut rows = Vec::new();
     let jumplist = out_dir.join("JUMPLIST").join("JumpList_Entries.sqlite");
-    for r in read_table_with_rowid(&jumplist, "JumpList_Entries") {
+    for r in read_table_with_rowid(&jumplist, "JumpList_Entries")? {
         if let Some(row) = jumplist_path_row(&r) {
             rows.push(row);
         }
@@ -4831,6 +4583,7 @@ pub fn build_path_references(out_dir: &Path, registry: &RegistryOverviewCache) -
                 continue;
             }
             bag_rows.push(crate::shellbag::BagRow {
+                hive: hive.name.clone(),
                 key_path,
                 value_name,
                 data,
@@ -4842,12 +4595,7 @@ pub fn build_path_references(out_dir: &Path, registry: &RegistryOverviewCache) -
     for bag in crate::shellbag::reconstruct(bag_rows) {
         rows.push(shellbag_path_row(bag));
     }
-    rows
-}
-
-pub fn build_registry_findings(out_dir: &Path) -> Vec<Row> {
-    let registry = RegistryOverviewCache::load(out_dir);
-    build_registry_findings_with_registry(&registry)
+    Ok(rows)
 }
 
 /// MSI InstallDate("20260808")를 "2026-08-08 00:00:00.000"으로. 날짜만 있고
@@ -4969,6 +4717,47 @@ pub fn build_registry_findings_with_registry(registry: &RegistryOverviewCache) -
 mod tests {
     use super::*;
 
+    /// Facts DB whose table spans many leaf pages, with one middle leaf
+    /// overwritten so the scan fails part-way (open and prepare still work).
+    fn corrupt_mid_table_db(label: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!("wina-rd04-{label}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("Facts.sqlite");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "PRAGMA page_size=4096; CREATE TABLE Facts(v TEXT);
+             WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM c WHERE i<2000)
+             INSERT INTO Facts SELECT printf('%0200d', i) FROM c;",
+        )
+        .unwrap();
+        drop(conn);
+        let mut bytes = std::fs::read(&db).unwrap();
+        let page = bytes.len() / 4096 / 2;
+        let offset = page * 4096;
+        assert_eq!(bytes[offset], 0x0D, "middle page must be a table leaf");
+        bytes[offset..offset + 8].fill(0xFF);
+        std::fs::write(&db, bytes).unwrap();
+        (root, db)
+    }
+
+    // RD-04: a scan error part-way through must not look like a short table;
+    // it reaches the builders (and so parse_report) as an error.
+    #[test]
+    fn row_scan_error_is_not_a_silent_short_read() {
+        let (root, db) = corrupt_mid_table_db("scan");
+        let error = read_table(&db, "Facts").expect_err("rows were silently truncated");
+        assert!(format!("{error:#}").contains("Facts"), "{error:#}");
+        assert!(read_table_with_rowid(&db, "Facts").is_err());
+        // Missing DB or table is no evidence, not a failure.
+        assert!(read_table(&db, "Absent").unwrap().is_empty());
+        assert!(read_table(&root.join("none.sqlite"), "Facts").unwrap().is_empty());
+        // The shared event cache carries the failure to every event builder.
+        std::fs::create_dir_all(root.join("EVENTLOG")).unwrap();
+        std::fs::rename(&db, root.join("EVENTLOG/Facts.sqlite")).unwrap();
+        assert!(EventLogOverviewCache::load(&root).is_err());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn missing_registry_settings_keep_confirmed_target_paths_without_inventing_values() {
         let root = Row::from([("key_path".into(), r"\ROOT".into())]);
@@ -5036,6 +4825,20 @@ mod tests {
         assert_eq!(vol.kind, "volume_relative");
         assert_eq!(vol.key, "\\users\\alice");
         assert!(vol.drive.is_empty());
+    }
+
+    #[test]
+    fn strips_win32_and_nt_prefixes_before_classifying() {
+        for raw in ["\\\\?\\C:\\Windows\\x.exe", "\\\\.\\C:\\Windows\\x.exe", "\\??\\C:\\Windows\\x.exe"] {
+            let c = classify_path(raw);
+            assert_eq!((c.kind, c.key.as_str(), c.drive.as_str()), ("drive_absolute", "\\windows\\x.exe", "C:"), "{raw}");
+        }
+        let unc = classify_path("\\\\?\\UNC\\Srv\\Share\\f.txt");
+        assert_eq!((unc.kind, unc.key.as_str()), ("unc", "\\\\srv\\share\\f.txt"));
+        // No volume-to-drive mapping evidence: not a volume-relative key.
+        let dev = classify_path("\\Device\\HarddiskVolume1\\Windows\\x.exe");
+        assert_eq!(dev.kind, "device_volume");
+        assert!(dev.drive.is_empty());
     }
 
     #[test]
@@ -5201,7 +5004,7 @@ mod tests {
         ).unwrap();
         drop(conn);
 
-        let rows = build_powershell_history(&root);
+        let rows = build_powershell_history_with_events(&root, &EventLogOverviewCache::load(&root).unwrap()).unwrap();
         assert_eq!(rows.len(), 1);
         let row = &rows[0];
         assert_eq!(
@@ -5285,7 +5088,7 @@ mod tests {
         ).unwrap();
         drop(conn);
 
-        let rows = build_powershell_history(&root);
+        let rows = build_powershell_history_with_events(&root, &EventLogOverviewCache::load(&root).unwrap()).unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].get("kind").map(String::as_str), Some("콘솔 히스토리"));
         assert_eq!(rows[0].get("timestamp").map(String::as_str), Some(""));
@@ -5323,7 +5126,7 @@ mod tests {
         ).unwrap();
         drop(conn);
 
-        let rows = build_powershell_history(&root);
+        let rows = build_powershell_history_with_events(&root, &EventLogOverviewCache::load(&root).unwrap()).unwrap();
         assert_eq!(rows.len(), 1);
         let row = &rows[0];
         assert_eq!(row.get("kind").map(String::as_str), Some("엔진 시작"));
@@ -5388,7 +5191,7 @@ mod tests {
         }
         drop(conn);
 
-        let registry = RegistryOverviewCache::load(&root);
+        let registry = RegistryOverviewCache::load(&root).unwrap();
         let findings = build_registry_findings_with_registry(&registry);
         let pending: Vec<_> = findings
             .iter()
@@ -5437,7 +5240,7 @@ mod tests {
         }
         drop(conn);
 
-        let registry = RegistryOverviewCache::load(&root);
+        let registry = RegistryOverviewCache::load(&root).unwrap();
         let findings = build_registry_findings_with_registry(&registry);
         let archives: Vec<_> = findings
             .iter()
@@ -5579,7 +5382,7 @@ mod tests {
         }
         drop(conn);
 
-        let registry = RegistryOverviewCache::load(&root);
+        let registry = RegistryOverviewCache::load(&root).unwrap();
         let findings = build_registry_findings_with_registry(&registry);
         let status_of = |value: &str| {
             findings
@@ -5638,7 +5441,7 @@ mod tests {
         insert("sb-total", 2, 3, "T2", "PowerShell::11");
         drop(conn);
 
-        let rows = build_powershell_history(&root);
+        let rows = build_powershell_history_with_events(&root, &EventLogOverviewCache::load(&root).unwrap()).unwrap();
         let status_of = |needle: &str| -> Option<String> {
             rows.iter()
                 .find(|row| {
@@ -5785,7 +5588,7 @@ mod tests {
         ps_insert(&conn, "4100", "17", "356", &data, "PowerShell.evtx");
         drop(conn);
 
-        let rows = build_powershell_history(&root);
+        let rows = build_powershell_history_with_events(&root, &EventLogOverviewCache::load(&root).unwrap()).unwrap();
         assert_eq!(rows.len(), 1);
         let row = &rows[0];
         // Level 3 = 경고 — 수준을 무시하고 전부 "오류"라고 쓰지 않는다.
@@ -5854,7 +5657,7 @@ mod tests {
         ps_insert(&conn, "4103", "2", "356", &blank, "PowerShell.evtx");
         drop(conn);
 
-        let rows = build_powershell_history(&root);
+        let rows = build_powershell_history_with_events(&root, &EventLogOverviewCache::load(&root).unwrap()).unwrap();
         assert_eq!(rows.len(), 2);
         // 400자 자르기·첫 줄 자르기 없이 원문 그대로여야 한다.
         assert_eq!(rows[0].get("command"), Some(&payload));
@@ -5895,7 +5698,7 @@ mod tests {
         ps_insert_classic(&conn, "800", "280", &data);
         drop(conn);
 
-        let rows = build_powershell_history(&root);
+        let rows = build_powershell_history_with_events(&root, &EventLogOverviewCache::load(&root).unwrap()).unwrap();
         assert_eq!(rows.len(), 1);
         let row = &rows[0];
         assert_eq!(row.get("host_application").map(String::as_str), Some(host));
@@ -5935,18 +5738,18 @@ mod tests {
         std::fs::create_dir_all(&registry_dir).unwrap();
         for (hive, key, name, value_type, value) in registry {
             let reg = Connection::open(registry_dir.join(format!("{hive}.sqlite"))).unwrap();
-            reg.execute("CREATE TABLE IF NOT EXISTS Registry (key_path TEXT, value_name TEXT, value_type TEXT, value_data TEXT, last_write TEXT, _recovery TEXT, _source_file TEXT)", []).unwrap();
-            reg.execute("INSERT INTO Registry VALUES (?1, ?2, ?3, ?4, '2026-01-01 00:00:00.000', 'live', ?5)", rusqlite::params![key, name, value_type, value, hive]).unwrap();
+            reg.execute("CREATE TABLE IF NOT EXISTS Registry (key_path TEXT, value_name TEXT, value_type TEXT, value_data TEXT, last_write TEXT, _recovery TEXT, _source_file TEXT, value_data_hex TEXT)", []).unwrap();
+            reg.execute("INSERT INTO Registry (key_path, value_name, value_type, value_data, last_write, _recovery, _source_file) VALUES (?1, ?2, ?3, ?4, '2026-01-01 00:00:00.000', 'live', ?5)", rusqlite::params![key, name, value_type, value, hive]).unwrap();
         }
-        let rows = build_powershell_history(&root);
+        let rows = build_powershell_history_with_events(&root, &EventLogOverviewCache::load(&root).unwrap()).unwrap();
         let _ = std::fs::remove_dir_all(root);
         rows.into_iter().next().unwrap()
     }
 
     const COMPUTER: (&str, &str, &str, &str, &str) = ("SYSTEM", "\\ROOT\\ControlSet001\\Control\\ComputerName\\ComputerName", "ComputerName", "REG_SZ", "WIN-HOST");
     const SAM_ADMIN: (&str, &str, &str, &str, &str) = ("SAM", "\\ROOT\\SAM\\Domains\\Account\\Users\\Names\\Administrator", "(default)", "500", "");
-    // Account V tail = sub-authorities 1, 2, 3 (little-endian u32).
-    const SAM_DOMAIN: (&str, &str, &str, &str, &str) = ("SAM", "\\ROOT\\SAM\\Domains\\Account", "V", "REG_BINARY", "00000000010000000200000003000000");
+    // Account V tail = SID S-1-5-21-1-2-3.
+    const SAM_DOMAIN: (&str, &str, &str, &str, &str) = ("SAM", "\\ROOT\\SAM\\Domains\\Account", "V", "REG_BINARY", "00000000010400000000000515000000010000000200000003000000");
     const CORP_PROFILE_500: (&str, &str, &str, &str, &str) = ("SOFTWARE", "\\ROOT\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList\\S-1-5-21-9-9-9-500", "ProfileImagePath", "REG_EXPAND_SZ", "C:\\Users\\Administrator");
 
     #[test]
@@ -5991,7 +5794,7 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let rows = build_powershell_history(&root);
+        let rows = build_powershell_history_with_events(&root, &EventLogOverviewCache::load(&root).unwrap()).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get("command"), Some(&command));
         assert_eq!(rows[0].get("line_number").map(String::as_str), Some("17"));
@@ -6032,7 +5835,7 @@ mod tests {
         ps_insert(&conn, "4104", "5", "356", &single, "PowerShell.evtx");
         drop(conn);
 
-        let rows = build_powershell_history(&root);
+        let rows = build_powershell_history_with_events(&root, &EventLogOverviewCache::load(&root).unwrap()).unwrap();
         let block = ps_row_of(&rows, "block-1");
         // 충돌 조각의 승자는 증명 대상이 아니다 — 확인된 1번 조각이 앞에 오고
         // 충돌한 3번의 양쪽 원본이 모두 남아 있으면 된다.
@@ -6128,7 +5931,7 @@ mod tests {
         ps_insert(&conn, "4104", "5", "100", &anon, "PowerShell.evtx");
         drop(conn);
 
-        let rows = build_powershell_history(&root);
+        let rows = build_powershell_history_with_events(&root, &EventLogOverviewCache::load(&root).unwrap()).unwrap();
         assert_eq!(rows.len(), 5);
         let bodies: Vec<&str> = rows
             .iter()
@@ -6160,7 +5963,7 @@ mod tests {
         ps_insert(&conn, "4104", "2", "356", &second, "PowerShell.evtx");
         drop(conn);
 
-        let rows = build_powershell_history(&root);
+        let rows = build_powershell_history_with_events(&root, &EventLogOverviewCache::load(&root).unwrap()).unwrap();
         assert_eq!(rows.len(), 1);
         let row = &rows[0];
         assert_eq!(
@@ -6226,7 +6029,7 @@ mod tests {
         }
         drop(conn);
 
-        let registry = RegistryOverviewCache::load(&root);
+        let registry = RegistryOverviewCache::load(&root).unwrap();
         let findings = build_registry_findings_with_registry(&registry);
         let task_rows: Vec<_> = findings
             .iter()
@@ -6304,7 +6107,7 @@ mod tests {
             }
         }
 
-        let registry = RegistryOverviewCache::load(&root);
+        let registry = RegistryOverviewCache::load(&root).unwrap();
         let findings = build_registry_findings_with_registry(&registry);
         // MSI 설치 자체는 rf_msi_installs가 한 번 표시한다.
         let msi: Vec<_> = findings
@@ -6374,7 +6177,7 @@ mod tests {
             .unwrap();
         }
 
-        let registry = RegistryOverviewCache::load(&root);
+        let registry = RegistryOverviewCache::load(&root).unwrap();
         let findings = build_registry_findings_with_registry(&registry);
         assert!(
             findings.iter().any(|row| {
@@ -6432,7 +6235,7 @@ mod tests {
         }
         drop(conn);
 
-        let registry = RegistryOverviewCache::load(&root);
+        let registry = RegistryOverviewCache::load(&root).unwrap();
         let findings = build_registry_findings_with_registry(&registry);
         let boot = findings
             .iter()
@@ -6492,7 +6295,7 @@ mod tests {
         }
         drop(conn);
 
-        let registry = RegistryOverviewCache::load(&root);
+        let registry = RegistryOverviewCache::load(&root).unwrap();
         let findings = build_registry_findings_with_registry(&registry);
         let task = findings
             .iter()
@@ -6537,7 +6340,7 @@ mod tests {
         }
         drop(conn);
 
-        let registry = RegistryOverviewCache::load(&root);
+        let registry = RegistryOverviewCache::load(&root).unwrap();
         let findings = build_registry_findings_with_registry(&registry);
         let msi: Vec<_> = findings
             .iter()
@@ -6603,7 +6406,7 @@ mod tests {
         }
         drop(conn);
 
-        let registry = RegistryOverviewCache::load(&root);
+        let registry = RegistryOverviewCache::load(&root).unwrap();
         let findings = build_registry_findings_with_registry(&registry);
         let shares: Vec<_> = findings
             .iter()
@@ -6679,7 +6482,7 @@ mod tests {
         }
         drop(conn);
 
-        let registry = RegistryOverviewCache::load(&root);
+        let registry = RegistryOverviewCache::load(&root).unwrap();
         let findings = build_registry_findings_with_registry(&registry);
         let shim: Vec<_> = findings
             .iter()
@@ -6739,7 +6542,7 @@ mod tests {
         }
         drop(conn);
 
-        let registry = RegistryOverviewCache::load(&root);
+        let registry = RegistryOverviewCache::load(&root).unwrap();
         let findings = build_registry_findings_with_registry(&registry);
         let shim: Vec<_> = findings
             .iter()
@@ -6823,6 +6626,45 @@ mod tests {
     }
 
     #[test]
+    fn ti_accounts_takes_machine_sid_from_sam_not_profile_list() {
+        let reg = |kp: &str, name: &str, data: &str| -> Row {
+            [("key_path", kp), ("value_name", name), ("value_data", data)]
+                .into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        };
+        let pl = "\\ROOT\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList\\";
+        // Domain profile listed first must not define the local prefix.
+        let software = vec![
+            reg(&format!("{pl}S-1-5-21-7-8-9-1105"), "ProfileImagePath", "C:\\Users\\corp"),
+            reg(&format!("{pl}S-1-5-21-11-22-33-1001"), "ProfileImagePath", "C:\\Users\\analyst"),
+        ];
+        let mut tail = vec![1u8, 4, 0, 0, 0, 0, 0, 5];
+        for sub in [21u32, 11, 22, 33] {
+            tail.extend(sub.to_le_bytes());
+        }
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let user = reg("\\ROOT\\SAM\\Domains\\Account\\Users\\000003E9", "F", "");
+        let account = reg("\\ROOT\\SAM\\Domains\\Account", "V", &hex(&tail));
+        let sid_of = |rows: Vec<Row>| rows.iter()
+            .find(|r| r.get("source_artifact").map(String::as_str) == Some("SAM"))
+            .and_then(|r| r.get("name").cloned());
+        assert_eq!(
+            sid_of(ti_accounts(&[account, user.clone()], &software)).as_deref(),
+            Some("S-1-5-21-11-22-33-1001")
+        );
+        // Without SAM machine SID evidence the SID stays empty.
+        assert_eq!(sid_of(ti_accounts(&[user], &software)).as_deref(), Some(""));
+    }
+
+    #[test]
+    fn shimcache_win7_x64_rejects_wrapping_path_offset() {
+        let mut blob = shim_blob_win7(&[("\\??\\C:\\tools\\a.exe", 1)], true);
+        blob[0x80 + 8..0x80 + 16].copy_from_slice(&(u64::MAX - 1).to_le_bytes());
+        let parsed = parse_shimcache(&blob);
+        assert!(parsed.entries.is_empty());
+        assert!(parsed.unsupported.is_some());
+    }
+
+    #[test]
     fn shimcache_parses_win8_tags_with_flag_gap() {
         const FT: u64 = 130_100_000_000_000_000;
         // 8.0('00ts')과 8.1('10ts') 모두 FILETIME이 플래그 8바이트 뒤에 있다 —
@@ -6891,7 +6733,7 @@ mod tests {
             }
         }
 
-        let registry = RegistryOverviewCache::load(&root);
+        let registry = RegistryOverviewCache::load(&root).unwrap();
         let rows = build_target_info_with_registry(&registry);
         let iface = rows
             .iter()
@@ -6994,7 +6836,7 @@ mod tests {
         databases.sort();
         let legacy_hives = databases
             .into_iter()
-            .map(RegistryOverviewHive::load)
+            .map(|database| RegistryOverviewHive::load(database).unwrap())
             .collect::<Vec<_>>();
         let legacy_system = legacy_hives
             .iter()
@@ -7031,7 +6873,7 @@ mod tests {
                'a','unrelated.exe','2026-01-03 00:00:00.000','live','evidence/Amcache.hve');",
         ).unwrap();
         drop(extra);
-        let registry = RegistryOverviewCache::load(&root);
+        let registry = RegistryOverviewCache::load(&root).unwrap();
         let findings = build_registry_findings_with_registry(&registry);
         assert_eq!(findings, legacy);
         // Lsa 확장(rf_lsa_packages)이 rf_credential_protection 내부와 빌더
@@ -7067,11 +6909,6 @@ mod tests {
         assert_eq!(
             run_mru.get("record_key").map(String::as_str),
             Some("analyst_NTUSER.DAT::Registry::1")
-        );
-        assert_eq!(
-            build_target_info(&root),
-            build_target_info_with_registry(&registry),
-            "sharing the overview cache must not alter TargetInfo rows"
         );
         let mut raw_identity = registry
             .hives()

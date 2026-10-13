@@ -33,25 +33,7 @@
 use std::collections::HashMap;
 
 use super::{SmbEvent, SmbRelation, SmbRole};
-
-/// Logon IDs that identify nothing: absent, "-", or zero. Known numeric forms
-/// are normalised so `0x7A3F21` and `0x7a3f21` are one identity; anything else
-/// keeps its lowercased raw form and is compared literally.
-pub(super) fn normalize_logon_id(raw: &str) -> String {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() || trimmed == "-" {
-        return String::new();
-    }
-    let value = match trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X")) {
-        Some(hex) => u64::from_str_radix(hex, 16).ok(),
-        None => trimmed.parse::<u64>().ok(),
-    };
-    match value {
-        Some(0) => String::new(),
-        Some(value) => format!("0x{value:x}"),
-        None => trimmed.to_ascii_lowercase(),
-    }
-}
+use crate::derived::normalize_logon_id;
 
 /// A proven logon lifetime: the opening record plus everything observed while
 /// it was open (the closing logoff included).

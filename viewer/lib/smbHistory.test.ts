@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 // @ts-expect-error -- TypeScript uses bundler resolution while this test uses Node directly.
-import { DEFAULT_SMB_FILTER, buildContextItems, buildSmbGroups, groupShares, smbResultCounts } from "./smbHistory.ts";
+import { DEFAULT_SMB_FILTER, buildContextItems, buildSmbGroups, groupShares, smbFacetCounts } from "./smbHistory.ts";
 
 type Ev = Record<string, string>;
 const ev = (record_id: string, timestamp: string, extra: Ev = {}): Ev => ({ record_id, timestamp, result: "성공", direction: "inbound", remote_address: "10.0.0.5", ...extra });
@@ -59,9 +59,24 @@ test("result counts follow every other condition; shares list distinct stored na
     ev("b", "2026-01-01 10:01:00.000", { result: "실패", share_name: "\\\\*\\IPC$" }),
     ev("c", "2026-01-01 10:02:00.000", { direction: "outbound", result: "", share_name: "\\\\srv\\data" }),
   ];
-  assert.deepEqual(smbResultCounts(events, { ...DEFAULT_SMB_FILTER, results: ["성공"], directions: ["inbound"] }, always), { 성공: 1, 실패: 1 });
+  assert.deepEqual(smbFacetCounts(events, { ...DEFAULT_SMB_FILTER, results: ["성공"], directions: ["inbound"] }, "results", always), { 성공: 1, 실패: 1 });
   const [group] = buildSmbGroups(events, DEFAULT_SMB_FILTER, always);
   assert.deepEqual(groupShares(group), ["\\\\*\\IPC$", "\\\\srv\\data"]);
+});
+
+test("direction and account counts follow the other conditions and the period; stored unknown direction is counted", () => {
+  const events = [
+    ev("a", "2026-01-01 10:00:00.000", { account_key: "k1" }),
+    ev("b", "2026-01-01 10:01:00.000", { direction: "unknown", account_key: "k1" }),
+    ev("c", "2026-01-01 10:02:00.000", { direction: "outbound", result: "실패", account_key: "k2" }),
+    ev("d", "2026-02-01 10:00:00.000", { account_key: "k1" }),
+    ev("e", "", { account_key: "" }),
+  ];
+  const january = (timestamp: string) => timestamp.startsWith("2026-01");
+  // Direction selection does not hide other directions; result + period do.
+  assert.deepEqual(smbFacetCounts(events, { ...DEFAULT_SMB_FILTER, results: ["성공"], directions: ["inbound"] }, "directions", january, true), { inbound: 1, unknown: 1 });
+  assert.deepEqual(smbFacetCounts(events, { ...DEFAULT_SMB_FILTER, directions: ["outbound"] }, "accounts", always), { k2: 1 });
+  assert.deepEqual(smbFacetCounts(events, DEFAULT_SMB_FILTER, "accounts", always), { k1: 3, k2: 1, "": 1 });
 });
 
 test("context tab: stored relations attach context rows under their SMB record; the rest stay single, time ordered", () => {

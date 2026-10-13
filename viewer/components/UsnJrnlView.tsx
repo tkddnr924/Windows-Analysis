@@ -137,10 +137,13 @@ export default function UsnJrnlView({ dbPath, timeRange, isRowBookmarked, onTogg
   const [eventType, setEventType] = useState(ALL);
   const [flags, setFlags] = useState<string[]>([]);
   const [order, setOrder] = useState<"asc" | "desc">("asc");
-  const [page, setPage] = useState(0);
+  // Page is tied to the filter set it was chosen under; a new set starts at 0
+  // in the same render, so no request goes out with a stale offset.
+  const [pageState, setPageState] = useState<{ key: string; page: number }>({ key: "", page: 0 });
   const [data, setData] = useState<UsnGroupsPage | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [optionsError, setOptionsError] = useState<string | null>(null);
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set());
   const [detail, setDetail] = useState<Row | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -153,6 +156,7 @@ export default function UsnJrnlView({ dbPath, timeRange, isRowBookmarked, onTogg
       if (!alive) return;
       setOverview(result);
       setInputId((current) => current || result.inputs[0]?.input_id || ALL);
+      if (!result.inputs.length) setLoading(false);
     }).catch((e) => { if (alive) setError(String(e)); });
     return () => { alive = false; };
   }, [dbPath]);
@@ -160,7 +164,13 @@ export default function UsnJrnlView({ dbPath, timeRange, isRowBookmarked, onTogg
   useEffect(() => {
     if (!inputId) return;
     let alive = true;
-    window.api.usnOverview(dbPath, inputId).then((result) => { if (alive) setOverview(result); }).catch(() => {});
+    setOptionsError(null);
+    window.api.usnOverview(dbPath, inputId).then((result) => { if (alive) setOverview(result); }).catch((e) => {
+      if (!alive) return;
+      // Never keep the previous input's options.
+      setOverview((current) => current && { ...current, eventTypes: [], reasonFlags: [] });
+      setOptionsError(String(e));
+    });
     return () => { alive = false; };
   }, [dbPath, inputId]);
 
@@ -171,8 +181,10 @@ export default function UsnJrnlView({ dbPath, timeRange, isRowBookmarked, onTogg
 
   const start = toBound(timeRange?.start ?? "", "start");
   const end = toBound(timeRange?.end ?? "", "end");
-  const flagsKey = flags.join("\u0000");
-  useEffect(() => { setPage(0); setExpanded(new Set()); }, [debouncedSearch, eventType, flagsKey, order, start, end, inputId, dbPath]);
+  const filterKey = JSON.stringify([dbPath, inputId, debouncedSearch, eventType, flags, order, start, end]);
+  const page = pageState.key === filterKey ? pageState.page : 0;
+  const setPage = (next: number) => setPageState({ key: filterKey, page: next });
+  useEffect(() => { setExpanded(new Set()); }, [filterKey]);
 
   useEffect(() => {
     if (!inputId) return;
@@ -200,9 +212,9 @@ export default function UsnJrnlView({ dbPath, timeRange, isRowBookmarked, onTogg
         setError(String(e));
         setLoading(false);
       });
-    // flagsKey stands for flags.
+    // filterKey stands for every filter value read above.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [dbPath, inputId, debouncedSearch, eventType, flagsKey, start, end, order, page]);
+  }, [filterKey, page]);
 
   const inputLabels = useMemo(
     () => volumeLabels((overview?.inputs ?? []).map((input) => ({ volume_id: input.input_id, volume_label: null, drive_letter: null, input_name: input.input_name, source_relative: input.source_relative, record_count: String(input.record_count) }))),
@@ -227,6 +239,7 @@ export default function UsnJrnlView({ dbPath, timeRange, isRowBookmarked, onTogg
         meta={`묶음 ${total.toLocaleString()}건`}
         right={<span style={{ color: "var(--text-faint)", fontSize: 11.5 }}>{start || end ? "기간 필터 적용 (구성 기록 시각)" : "전체 기간"}</span>}
       >
+        {optionsError && <span role="status" title={optionsError} style={{ color: "var(--warning)", fontSize: 11.5 }}>필터 옵션을 읽지 못했습니다</span>}
         <HeaderSearchInput value={search} onChange={setSearch} placeholder="파일명·변경 이유 검색" ariaLabel="USN 저널 검색" width={260} />
         <SelectDropdown
           icon={<StorageOutlinedIcon sx={{ fontSize: 15 }} />}
@@ -262,7 +275,7 @@ export default function UsnJrnlView({ dbPath, timeRange, isRowBookmarked, onTogg
         </div>
       ) : !loading && !groups.length ? (
         <div role="status" style={{ minHeight: 180, display: "grid", placeItems: "center", color: "var(--text-faint)", fontSize: 13 }}>
-          검색·유형·변경 이유·기간 조건에 맞는 변경 묶음이 없습니다
+          {overview && !overview.inputs.length ? "저장된 변경 묶음이 없습니다" : "검색·유형·변경 이유·기간 조건에 맞는 변경 묶음이 없습니다"}
         </div>
       ) : (
         <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", opacity: loading ? 0.55 : 1, transition: "opacity .12s ease" }}>

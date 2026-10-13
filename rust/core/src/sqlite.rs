@@ -129,83 +129,10 @@ pub fn write_table(
     Ok(())
 }
 
-/// Like `write_table`, but the column set is given explicitly (used for a
-/// generic table copy where an all-NULL source column must still exist in the
-/// output). Columns are emitted in `preferred_order` order then the remaining
-/// given columns sorted — matching the Python writer. Absent keys bind NULL.
-pub fn write_table_cols(
-    db_path: &Path,
-    table_name: &str,
-    rows: &[Row],
-    all_columns: &[String],
-    preferred_order: &[&str],
-) -> Result<()> {
-    if let Some(parent) = db_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut conn = Connection::open(db_path)?;
-    conn.pragma_update(None, "journal_mode", "OFF").ok();
-    conn.pragma_update(None, "synchronous", "OFF").ok();
-    conn.execute(&format!("DROP TABLE IF EXISTS {}", quote_ident(table_name)), [])?;
-    if rows.is_empty() {
-        return Ok(());
-    }
-    let mut keys: BTreeMap<String, ()> = BTreeMap::new();
-    for c in all_columns {
-        keys.insert(c.clone(), ());
-    }
-    let mut columns: Vec<String> = Vec::new();
-    for p in preferred_order {
-        if keys.contains_key(*p) {
-            columns.push((*p).to_string());
-        }
-    }
-    for k in keys.keys() {
-        if !columns.iter().any(|c| c == k) {
-            columns.push(k.clone());
-        }
-    }
-    let cols_sql = columns
-        .iter()
-        .map(|c| format!("{} TEXT", quote_ident(c)))
-        .collect::<Vec<_>>()
-        .join(", ");
-    conn.execute(
-        &format!("CREATE TABLE {} ({})", quote_ident(table_name), cols_sql),
-        [],
-    )?;
-    let placeholders = vec!["?"; columns.len()].join(", ");
-    let quoted = columns
-        .iter()
-        .map(|c| quote_ident(c))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let insert_sql = format!(
-        "INSERT INTO {} ({}) VALUES ({})",
-        quote_ident(table_name),
-        quoted,
-        placeholders
-    );
-    let tx = conn.transaction()?;
-    {
-        let mut stmt = tx.prepare(&insert_sql)?;
-        for r in rows {
-            let vals: Vec<Option<&str>> = columns
-                .iter()
-                .map(|c| r.get(c).map(|s| s.as_str()))
-                .collect();
-            stmt.execute(rusqlite::params_from_iter(vals))?;
-        }
-    }
-    tx.commit()?;
-    Ok(())
-}
-
 /// Streaming table writer for parsers whose column universe is known up front
 /// (MFT, registry, USN, evtx, per-table SRUM). Rows are buffered and flushed to
 /// SQLite in batches so memory stays bounded no matter how many records — the
-/// whole result never lives in RAM at once. Column order and NULL-for-absent
-/// semantics match `write_table_cols`, so output is identical.
+/// whole result never lives in RAM at once. Absent keys bind NULL.
 pub struct StreamWriter {
     conn: Connection,
     columns: Vec<String>,

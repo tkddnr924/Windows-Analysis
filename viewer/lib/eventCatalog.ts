@@ -29,8 +29,14 @@ export const LOGON_TYPE_LABELS: Record<string, string> = {
   "11": "캐시된 자격 증명",
 };
 
+// Closed set so synonyms (e.g. 지속성 vs 영속성) can't split the 구분 filter.
+type EventCategory =
+  | "Kerberos" | "PowerShell" | "RDP" | "SMB" | "WMI" | "객체 접근" | "계정" | "공유" | "권한" | "그룹"
+  | "네트워크" | "다운로드" | "레지스트리" | "로그온" | "방화벽" | "서비스" | "시스템" | "실행" | "안티포렌식"
+  | "영속성" | "오류" | "원격" | "원격 관리" | "인증" | "자격증명" | "탐지" | "파일" | "프로세스";
+
 interface EventCatalogEntry {
-  category: string;
+  category: EventCategory;
   label: string;
 }
 
@@ -83,17 +89,17 @@ const EVENT_CATALOG: Record<string, EventCatalogEntry> = {
   "Microsoft-Windows-Bits-Client|5": { category: "네트워크", label: "BITS 작업 취소" },
   "Microsoft-Windows-Bits-Client|61": { category: "네트워크", label: "BITS 전송 오류" },
   "Microsoft-Windows-Security-Auditing|4616": { category: "시스템", label: "시스템 시간 변경" },
-  "Microsoft-Windows-Security-Auditing|4699": { category: "지속성", label: "예약 작업 삭제" },
+  "Microsoft-Windows-Security-Auditing|4699": { category: "영속성", label: "예약 작업 삭제" },
   "Microsoft-Windows-Security-Auditing|4703": { category: "권한", label: "토큰 권한 조정" },
   "Microsoft-Windows-Security-Auditing|4725": { category: "계정", label: "계정 비활성화" },
   "Microsoft-Windows-Security-Auditing|4733": { category: "계정", label: "로컬 그룹 구성원 제거" },
   "Microsoft-Windows-Security-Auditing|4735": { category: "계정", label: "로컬 그룹 변경" },
   "Microsoft-Windows-Security-Auditing|5142": { category: "공유", label: "네트워크 공유 추가" },
   "Microsoft-Windows-Security-Auditing|5144": { category: "공유", label: "네트워크 공유 삭제" },
-  "Microsoft-Windows-TaskScheduler|100": { category: "지속성", label: "예약 작업 시작" },
-  "Microsoft-Windows-TaskScheduler|102": { category: "지속성", label: "예약 작업 완료" },
-  "Microsoft-Windows-TaskScheduler|107": { category: "지속성", label: "트리거로 작업 실행" },
-  "Microsoft-Windows-TaskScheduler|110": { category: "지속성", label: "사용자가 작업 실행" },
+  "Microsoft-Windows-TaskScheduler|100": { category: "영속성", label: "예약 작업 시작" },
+  "Microsoft-Windows-TaskScheduler|102": { category: "영속성", label: "예약 작업 완료" },
+  "Microsoft-Windows-TaskScheduler|107": { category: "영속성", label: "트리거로 작업 실행" },
+  "Microsoft-Windows-TaskScheduler|110": { category: "영속성", label: "사용자가 작업 실행" },
   "Microsoft-Windows-Windows Firewall With Advanced Security|2004": { category: "방화벽", label: "방화벽 규칙 추가" },
   "Microsoft-Windows-Windows Firewall With Advanced Security|2005": { category: "방화벽", label: "방화벽 규칙 변경" },
   "Microsoft-Windows-Windows Firewall With Advanced Security|2006": { category: "방화벽", label: "방화벽 규칙 삭제" },

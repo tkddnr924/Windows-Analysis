@@ -13,6 +13,20 @@ pub fn hex_lower(bytes: &[u8]) -> String {
     unsafe { String::from_utf8_unchecked(out) }
 }
 
+/// Binary SID -> "S-1-5-..."; None when shorter than the fixed 8-byte header.
+pub(crate) fn format_binary_sid(data: &[u8]) -> Option<String> {
+    if data.len() < 8 {
+        return None;
+    }
+    let authority = data[2..8].iter().fold(0u64, |a, &b| (a << 8) | b as u64);
+    let mut out = format!("S-{}-{authority}", data[0]);
+    for sub in data[8..].chunks_exact(4).take(data[1] as usize) {
+        out.push('-');
+        out.push_str(&u32::from_le_bytes([sub[0], sub[1], sub[2], sub[3]]).to_string());
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::hex_lower;

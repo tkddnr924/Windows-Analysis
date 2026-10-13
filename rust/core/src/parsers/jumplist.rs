@@ -133,59 +133,31 @@ fn unicode_link_info_target(data: &[u8]) -> Option<String> {
     if header_size < 0x24 {
         return None;
     }
-
-    let local_offset = read_u32_le(data, link_info_offset + 0x1c)? as usize;
-    let suffix_offset = read_u32_le(data, link_info_offset + 0x20)? as usize;
-    let local = if local_offset == 0 {
-        String::new()
-    } else {
-        read_utf16z(
-            data,
-            link_info_offset.checked_add(local_offset)?,
-            link_info_end,
-        )?
-    };
-    let suffix = if suffix_offset == 0 {
-        String::new()
-    } else {
-        read_utf16z(
-            data,
-            link_info_offset.checked_add(suffix_offset)?,
-            link_info_end,
-        )?
-    };
-    if local.is_empty() && suffix.is_empty() {
-        return None;
-    }
-    if suffix.is_empty() || local.ends_with(&suffix) {
-        Some(local)
-    } else {
-        Some(format!("{local}{suffix}"))
-    }
+    link_info_path(data, link_info_offset, link_info_end, (0x1c, 0x20), read_utf16z)
 }
 
 fn ansi_link_info_target(data: &[u8]) -> Option<String> {
     let (link_info_offset, link_info_end, _) = link_info_bounds(data)?;
-    let local_offset = read_u32_le(data, link_info_offset + 0x10)? as usize;
-    let suffix_offset = read_u32_le(data, link_info_offset + 0x18)? as usize;
-    let local = if local_offset == 0 {
-        String::new()
-    } else {
-        read_ansi_z(
-            data,
-            link_info_offset.checked_add(local_offset)?,
-            link_info_end,
-        )?
+    link_info_path(data, link_info_offset, link_info_end, (0x10, 0x18), read_ansi_z)
+}
+
+/// Read LocalBasePath + CommonPathSuffix at the given LinkInfo field offsets
+/// and join them; a local path that already ends with the suffix is kept.
+fn link_info_path(
+    data: &[u8],
+    link_info_offset: usize,
+    link_info_end: usize,
+    (local_field, suffix_field): (usize, usize),
+    read: fn(&[u8], usize, usize) -> Option<String>,
+) -> Option<String> {
+    let read_at = |field: usize| -> Option<String> {
+        match read_u32_le(data, link_info_offset + field)? as usize {
+            0 => Some(String::new()),
+            offset => read(data, link_info_offset.checked_add(offset)?, link_info_end),
+        }
     };
-    let suffix = if suffix_offset == 0 {
-        String::new()
-    } else {
-        read_ansi_z(
-            data,
-            link_info_offset.checked_add(suffix_offset)?,
-            link_info_end,
-        )?
-    };
+    let local = read_at(local_field)?;
+    let suffix = read_at(suffix_field)?;
     if local.is_empty() && suffix.is_empty() {
         return None;
     }
@@ -234,7 +206,7 @@ type LnkFields = (String, String, String, String, String, String, String);
 
 fn parse_lnk(data: &[u8], tmp: &Path) -> Result<LnkFields> {
     std::fs::File::create(tmp)?.write_all(data)?;
-    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ShellLink::open(tmp)));
+    let res = quiet_panics(|| ShellLink::open(tmp));
     let sl = match res {
         Ok(Ok(sl)) => sl,
         Ok(Err(e)) => return Err(anyhow::anyhow!("{:?}", e)),
@@ -315,7 +287,7 @@ struct DestEntry {
 /// AutomaticDestinations의 DestList 스트림 — 엔트리별 마지막 사용 시각·사용
 /// 횟수·호스트명을 담는 실제 사용 기록. 키는 LNK 스트림 이름과 같은
 /// 소문자 16진 엔트리 번호. 헤더 32바이트, 엔트리는 버전 1(Win7/8)이면
-/// 경로 길이 @112, 버전 3/4(Win10+)이면 @120 + 경로 뒤 4바이트 패딩.
+/// 경로 길이 @112, 버전 3/4(Win10+)이면 @128 + 경로 뒤 4바이트 패딩.
 /// 손상 지점을 만나면 그때까지 읽은 엔트리만 반환한다.
 fn parse_destlist(data: &[u8]) -> std::collections::HashMap<String, DestEntry> {
     let mut map = std::collections::HashMap::new();
@@ -323,7 +295,7 @@ fn parse_destlist(data: &[u8]) -> std::collections::HashMap<String, DestEntry> {
         return map;
     }
     let version = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-    let (path_len_off, trailer) = if version >= 3 { (120usize, 4usize) } else { (112, 0) };
+    let (path_len_off, trailer) = if version >= 3 { (128usize, 4usize) } else { (112, 0) };
     let mut pos = 32usize;
     while pos + path_len_off + 2 <= data.len() {
         let entry_number = read_u32_le(data, pos + 88).unwrap_or(0);
@@ -502,14 +474,33 @@ pub fn jumplist_sources(root: &Path) -> crate::finder::Found {
     crate::finder::Found { paths, errors }
 }
 
+thread_local! {
+    static QUIET_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` catching panics; the report is suppressed only for this thread so
+/// panics in concurrently running artifacts keep their default output.
+fn quiet_panics<T>(f: impl FnOnce() -> T) -> std::thread::Result<T> {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if !QUIET_PANIC.with(std::cell::Cell::get) {
+                prev(info);
+            }
+        }));
+    });
+    let was = QUIET_PANIC.with(|q| q.replace(true));
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    QUIET_PANIC.with(|q| q.set(was));
+    res
+}
+
 /// Parse already-discovered destination files.
 pub fn parse_jumplists_from(sources: &[std::path::PathBuf]) -> Vec<Row> {
-    // The lnk crate panics on some malformed shell links; we catch those per
-    // entry. Silence the default panic hook so caught panics don't flood the
-    // log, then restore it.
-    let prev_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
-    let rows: Vec<Row> = sources
+    // The lnk crate panics on some malformed shell links; parse_lnk catches
+    // those per entry and silences only its own thread (see quiet_panics).
+    sources
         .par_iter()
         .flat_map(|path| {
             let mut local_rows = Vec::new();
@@ -525,9 +516,7 @@ pub fn parse_jumplists_from(sources: &[std::path::PathBuf]) -> Vec<Row> {
             }
             local_rows
         })
-        .collect();
-    std::panic::set_hook(prev_hook);
-    rows
+        .collect()
 }
 
 pub fn parse_jumplists_with_sources(root: &Path) -> Result<(Vec<std::path::PathBuf>, Vec<Row>)> {
@@ -543,6 +532,18 @@ pub fn parse_jumplists(root: &Path) -> Result<Vec<Row>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quiet_panics_silences_only_the_calling_thread() {
+        let caught = quiet_panics(|| {
+            let other = std::thread::spawn(|| QUIET_PANIC.with(std::cell::Cell::get));
+            assert!(!other.join().unwrap(), "other threads keep panic output");
+            assert!(QUIET_PANIC.with(std::cell::Cell::get));
+            panic!("malformed lnk");
+        });
+        assert!(caught.is_err());
+        assert!(!QUIET_PANIC.with(std::cell::Cell::get));
+    }
 
     /// The same destination file collected twice (e.g. JUMPLIST\<user> and
     /// LNK\<user>\Recent) is one input; a different file with the same name stays.
@@ -563,22 +564,24 @@ mod tests {
     }
 
     fn destlist_bytes(version: u32) -> Vec<u8> {
-        // 헤더 32바이트 + 엔트리 1개(엔트리 번호 0x1a, 경로 "C:\\a.txt").
-        let (path_len_off, trailer) = if version >= 3 { (120, 4) } else { (112, 0) };
-        let path: Vec<u16> = "C:\\a.txt".encode_utf16().collect();
-        let mut data = vec![0u8; 32 + path_len_off + 2 + path.len() * 2 + trailer];
+        // Header + two entries; layout measured on Win10 v4 DestList (path size @128).
+        let (path_len_off, trailer) = if version >= 3 { (128, 4) } else { (112, 0) };
+        let mut data = vec![0u8; 32];
         data[0..4].copy_from_slice(&version.to_le_bytes());
-        let e = 32;
-        data[e + 72..e + 72 + 7].copy_from_slice(b"HOST-01");
-        data[e + 88..e + 92].copy_from_slice(&0x1au32.to_le_bytes());
-        data[e + 96..e + 100].copy_from_slice(&7.0f32.to_bits().to_le_bytes());
-        data[e + 100..e + 108].copy_from_slice(&131_500_000_000_000_000i64.to_le_bytes());
-        data[e + path_len_off..e + path_len_off + 2]
-            .copy_from_slice(&(path.len() as u16).to_le_bytes());
-        let mut pos = e + path_len_off + 2;
-        for unit in path {
-            data[pos..pos + 2].copy_from_slice(&unit.to_le_bytes());
-            pos += 2;
+        data[4..8].copy_from_slice(&2u32.to_le_bytes());
+        for (number, path) in [(0x1au32, "C:\\a.txt"), (0x1bu32, "C:\\b.txt")] {
+            let path: Vec<u16> = path.encode_utf16().collect();
+            let mut e = vec![0u8; path_len_off + 2 + path.len() * 2 + trailer];
+            e[72..79].copy_from_slice(b"HOST-01");
+            e[88..92].copy_from_slice(&number.to_le_bytes());
+            e[96..100].copy_from_slice(&7.0f32.to_bits().to_le_bytes());
+            e[100..108].copy_from_slice(&131_500_000_000_000_000i64.to_le_bytes());
+            e[path_len_off..path_len_off + 2].copy_from_slice(&(path.len() as u16).to_le_bytes());
+            for (i, unit) in path.iter().enumerate() {
+                let at = path_len_off + 2 + i * 2;
+                e[at..at + 2].copy_from_slice(&unit.to_le_bytes());
+            }
+            data.extend(e);
         }
         data
     }
@@ -587,10 +590,13 @@ mod tests {
     fn destlist_entries_parse_for_win7_and_win10_layouts() {
         for version in [1u32, 3, 4] {
             let map = parse_destlist(&destlist_bytes(version));
-            let entry = map.get("1a").unwrap_or_else(|| panic!("v{version} entry"));
-            assert_eq!(entry.hostname, "HOST-01");
-            assert_eq!(entry.access_count, "7");
-            assert!(!entry.access_time.is_empty(), "v{version} access time");
+            assert_eq!(map.len(), 2, "v{version} entry count");
+            for key in ["1a", "1b"] {
+                let entry = map.get(key).unwrap_or_else(|| panic!("v{version} entry {key}"));
+                assert_eq!(entry.hostname, "HOST-01");
+                assert_eq!(entry.access_count, "7");
+                assert!(!entry.access_time.is_empty(), "v{version} access time");
+            }
         }
         assert!(parse_destlist(b"tiny").is_empty());
     }

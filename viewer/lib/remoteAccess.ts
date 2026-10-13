@@ -1,6 +1,9 @@
 // Remote access history helpers (docs-08). Groups follow stored segments only;
-// rows without a segment are never joined by time or address. No runtime
-// imports (Node tests).
+// rows without a segment are never joined by time or address. Sibling imports
+// carry `.ts` for Node tests.
+
+// @ts-expect-error -- TypeScript uses bundler resolution while Node tests need the extension.
+import { groupEvents, inScope, type EventGroup } from "./eventOrder.ts";
 
 type Cells = Record<string, string | undefined>;
 
@@ -29,70 +32,50 @@ export function accountKeyOf(event: Cells): string {
 
 const SEARCH_FIELDS = ["remote_address", "remote_address_raw", "remote_computer", "account", "account_raw", "account_upn", "account_sid", "target_user_sid", "description"];
 
-function matchesExceptResult(event: Cells, filter: RemoteFilter): boolean {
-  if (filter.directions.length && !filter.directions.includes(event.direction ?? "")) return false;
-  if (filter.scopes.length && !filter.scopes.includes(event.access_scope ?? "")) return false;
-  if (filter.logonTypes.length && !filter.logonTypes.includes(event.logon_type ?? "")) return false;
-  if (filter.accounts.length && !filter.accounts.includes(accountKeyOf(event))) return false;
-  const needle = filter.search.trim().toLowerCase();
-  if (needle && !SEARCH_FIELDS.some((field) => (event[field] ?? "").toLowerCase().includes(needle))) return false;
-  return true;
-}
+export type RemoteFacet = "results" | "directions" | "scopes" | "logonTypes" | "accounts";
 
-function matches(event: Cells, filter: RemoteFilter): boolean {
-  return (!filter.results.length || filter.results.includes(event.result ?? "")) && matchesExceptResult(event, filter);
-}
-
-/** Untimed events count only when no period is set (docs-08 R12). */
-function inScope(event: Cells, inPeriod: (timestamp: string) => boolean, periodSet: boolean): boolean {
-  if (!event.timestamp) return !periodSet;
-  return inPeriod(event.timestamp);
-}
-
-const byTime = (left: Cells, right: Cells) => {
-  const a = left.timestamp ?? "";
-  const b = right.timestamp ?? "";
-  if (!a !== !b) return a ? -1 : 1;
-  return a < b ? -1 : a > b ? 1 : (left.record_id ?? "").localeCompare(right.record_id ?? "");
+export const FACET_VALUE: Record<RemoteFacet, (event: Cells) => string> = {
+  results: (event) => event.result ?? "",
+  directions: (event) => event.direction ?? "",
+  scopes: (event) => event.access_scope ?? "",
+  logonTypes: (event) => event.logon_type ?? "",
+  accounts: accountKeyOf,
 };
+const FACETS: RemoteFacet[] = ["results", "directions", "scopes", "logonTypes", "accounts"];
 
-export interface RemoteGroup<E extends Cells, S> {
-  /** "segment:<id>" or "record:<id>" — stable within one result generation. */
-  key: string;
-  segment: S | null;
-  /** Every in-scope event of the group, time order. */
-  events: E[];
-  /** record_ids that match the event conditions. */
-  matched: Set<string>;
-}
-
-/** Groups with at least one matching event; each keeps its whole in-scope context. */
-export function buildGroups<E extends Cells, S>(events: E[], segments: Map<string, S>, filter: RemoteFilter, inPeriod: (timestamp: string) => boolean, periodSet = false): RemoteGroup<E, S>[] {
-  const groups = new Map<string, RemoteGroup<E, S>>();
-  for (const event of events) {
-    if (!inScope(event, inPeriod, periodSet)) continue;
-    const segmentId = event.segment_id;
-    const key = segmentId ? `segment:${segmentId}` : `record:${event.record_id}`;
-    let group = groups.get(key);
-    if (!group) {
-      group = { key, segment: segmentId ? segments.get(segmentId) ?? null : null, events: [], matched: new Set() };
-      groups.set(key, group);
-    }
-    group.events.push(event);
-    if (matches(event, filter)) group.matched.add(event.record_id ?? "");
+/** Every condition except `skip`. */
+function matches(event: Cells, filter: RemoteFilter, skip: RemoteFacet | null = null): boolean {
+  for (const facet of FACETS) {
+    if (facet !== skip && filter[facet].length && !filter[facet].includes(FACET_VALUE[facet](event))) return false;
   }
-  const kept = [...groups.values()].filter((group) => group.matched.size > 0);
-  for (const group of kept) group.events.sort(byTime);
-  return kept.sort((left, right) => byTime(left.events[0], right.events[0]) || left.key.localeCompare(right.key));
+  const needle = filter.search.trim().toLowerCase();
+  return !needle || SEARCH_FIELDS.some((field) => (event[field] ?? "").toLowerCase().includes(needle));
 }
 
-/** Events per result under every other condition (shows what the result filter hides). */
-export function resultCounts(events: Cells[], filter: RemoteFilter, inPeriod: (timestamp: string) => boolean, periodSet = false): Record<string, number> {
+export interface RemoteGroup<E extends Cells, S> extends EventGroup<E> {
+  /** key: "segment:<id>" or "record:<id>" — stable within one result generation. */
+  segment: S | null;
+}
+
+/** Groups with at least one matching event; each keeps its whole in-scope context (untimed only without a period, R12). */
+export function buildGroups<E extends Cells, S>(events: E[], segments: Map<string, S>, filter: RemoteFilter, inPeriod: (timestamp: string) => boolean, periodSet = false): RemoteGroup<E, S>[] {
+  return groupEvents<E, RemoteGroup<E, S>>(events, {
+    inPeriod,
+    periodSet,
+    keyOf: (event) => (event.segment_id ? `segment:${event.segment_id}` : `record:${event.record_id}`),
+    create: (key, event) => ({ key, segment: event.segment_id ? segments.get(event.segment_id) ?? null : null, events: [], matched: new Set() }),
+    matches: (event) => matches(event, filter),
+  });
+}
+
+/** Events per stored value of one facet under every other condition and the
+ *  period (shows what that facet's selection hides). */
+export function facetCounts(events: Cells[], filter: RemoteFilter, facet: RemoteFacet, inPeriod: (timestamp: string) => boolean, periodSet = false): Record<string, number> {
   const counts: Record<string, number> = {};
   for (const event of events) {
-    if (!inScope(event, inPeriod, periodSet) || !matchesExceptResult(event, filter)) continue;
-    const result = event.result ?? "";
-    counts[result] = (counts[result] ?? 0) + 1;
+    if (!inScope(event, inPeriod, periodSet) || !matches(event, filter, facet)) continue;
+    const value = FACET_VALUE[facet](event);
+    counts[value] = (counts[value] ?? 0) + 1;
   }
   return counts;
 }
@@ -129,12 +112,5 @@ export const STAGE_LABELS: Record<string, string> = {
 };
 export const SCOPE_LABELS: Record<string, string> = { remote: "원격", local: "로컬", unknown: "미확인" };
 export const DIRECTION_LABELS: Record<string, string> = { inbound: "인바운드", outbound: "아웃바운드", unknown: "방향 미확인" };
-export const ID_SPACE_LABELS: Record<string, string> = { lsm_session: "LSM 세션", security_logon: "Security 로그온", rcm_session: "RCM 세션", client_connection: "클라이언트 연결" };
-export const BOUND_KIND_LABELS: Record<string, string> = {
-  session_logon: "세션 로그온",
-  session_logoff: "세션 로그오프",
-  session_disconnect: "세션 끊김",
-  logon_instance_start: "로그온 시작",
-  logon_instance_end: "로그온 종료",
-};
+export const ID_SPACE_LABELS: Record<string, string> = { lsm_session: "LSM 세션", security_logon: "Security 로그온", rdp_client_connection: "클라이언트 연결" };
 export const label = (labels: Record<string, string>, value: string | undefined) => (value ? labels[value] ?? value : "");
