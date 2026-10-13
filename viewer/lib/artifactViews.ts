@@ -1716,34 +1716,77 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
   // 서비스 이력 파생(_OVERVIEW/ServiceHistory) — System 채널 Service Control
   // Manager 이벤트를 서비스 단위로 모은다. 원본(EventLog)이 이미 타임라인에
   // 편입돼 있으므로 여기서는 편입하지 않는다(중복 방지).
+  // docs-12: SCM/4697 events; common account (record writer) ≠ service run
+  // account (R01/A06). Paths: stored resolved first, raw kept (docs-24).
   ServiceHistory: {
     customView: "service",
-    title: (r) => r.service_name || r.description || "(서비스 정보 없음)",
-    subtitle: (r) => r.image_path || "",
+    title: (r) => (r.group_key_kind === "record" ? r.event_type || r.description : r.group_display_name || r.service_name || r.service_key || r.event_type || ""),
+    subtitle: (r) => r.image_path_resolved || r.image_path || "",
     visibleColumns: ["timestamp", "service_name", "image_path", "description", "state", "result"],
     priorityColumns: ["timestamp", "service_name", "image_path", "description", "state", "result"],
     sections: [
       { heading: "서비스", fields: [
         { key: "service_name", label: "서비스 이름" },
-        { key: "service_key", label: "서비스 짧은 이름" },
-        { key: "image_path", label: "실행 파일 경로", kind: "path" },
-        { key: "image_path_resolved", label: "실행 파일 경로 (환경변수 해석)", kind: "path" },
+        { key: "service_key", label: "서비스 키" },
+        { key: "service_key_candidate", label: "서비스 키 후보", compute: (r) => (r.service_key_candidate && r.service_key_candidate !== r.service_key ? r.service_key_candidate : "") },
+        { key: "image_path_resolved", label: "실행 경로", kind: "path" },
+        { key: "image_path", label: "실행 경로 원문", kind: "code", compute: (r) => (r.image_path && r.image_path !== r.image_path_resolved ? r.image_path : "") },
+        { key: "executable_path", label: "실행 파일", kind: "path" },
+        { key: "command_arguments", label: "인수", kind: "code" },
         { key: "service_account", label: "실행 계정", kind: "account" },
         { key: "service_account_sid", label: "실행 계정 SID", kind: "accountSid" },
         { key: "service_type", label: "서비스 유형" },
+        { key: "driver_list_raw", label: "드라이버 목록", kind: "code" },
       ]},
       { heading: "기록", fields: [
         { key: "event_type", label: "기록 종류" },
+        { key: "timestamp_kind", label: "대표 시각 의미" },
         { key: "description", label: "설명" },
         { key: "state", label: "상태" },
         { key: "start_type_before", label: "이전 시작 유형" },
         { key: "start_type_after", label: "시작 유형" },
-        { key: "detail", label: "상세" },
         { key: "result", label: "결과" },
+        { key: "detail", label: "상세" },
+        { key: "stop_reason", label: "중지 사유" },
+        { key: "dependency_service", label: "의존 서비스" },
+        { key: "timeout_ms", label: "시간 제한(ms)" },
+      ]},
+      { heading: "오류 · 복구", fields: [
+        { key: "error_code_raw", label: "오류 코드" },
+        { key: "error_code_hex", label: "오류 코드(16진)" },
+        { key: "error_code_symbol", label: "오류 이름" },
+        { key: "termination_count", label: "종료 횟수" },
+        { key: "recovery_delay_ms", label: "복구 지연(ms)" },
+        { key: "recovery_action_text", label: "복구 조치" },
+        { key: "recovery_action_raw", label: "복구 조치 원문", compute: (r) => (r.recovery_action_raw && r.recovery_action_raw !== r.recovery_action_text ? r.recovery_action_raw : "") },
+      ]},
+      { heading: "기록 주체", fields: [
+        { key: "account", label: "계정", kind: "account" },
+        { key: "account_sid", label: "SID", kind: "accountSid" },
+        { key: "subject_user_name", label: "Subject 이름" },
+        { key: "subject_user_sid", label: "Subject SID", kind: "accountSid" },
+        { key: "subject_domain", label: "Subject 도메인" },
+        { key: "subject_logon_id", label: "Subject LogonId" },
+      ]},
+      { heading: "원본 이벤트", fields: [
         { key: "event_id", label: "이벤트 ID" },
         { key: "provider", label: "공급자" },
+        { key: "channel", label: "채널" },
+        { key: "computer", label: "컴퓨터" },
+        { key: "event_record_id", label: "EventRecordID" },
+        { key: "level_name", label: "수준" },
+        { key: "source_file", label: "원본 파일", kind: "path" },
+      ]},
+      { heading: "원문", collapsible: { defaultExpanded: false }, fields: [
+        { key: "event_data_raw", label: "EventData", kind: "code" },
+        { key: "binary_text", label: "Binary 해독", kind: "code" },
       ]},
     ],
+    childTables: [{
+      table: "ServiceEventFields",
+      heading: "이벤트 필드",
+      summary: (r) => `${r.field_name} = ${r.field_value ?? ""}`,
+    }],
   },
 
   BitsHistory: {

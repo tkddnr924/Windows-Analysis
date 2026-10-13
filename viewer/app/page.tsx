@@ -1222,6 +1222,7 @@ export default function Home() {
                   bookmarkedRowids={activeBookmarkedRowids}
                   onToggleBookmark={(rowid) => handleToggleActiveRowBookmark(rowid)}
                   timeRange={timeRange}
+                  accountDirectory={currentAccountDirectory}
                 />
               ) : getArtifactView(activeTab.file.name)?.customView === "smb" ? (
                 <SmbHistoryView
