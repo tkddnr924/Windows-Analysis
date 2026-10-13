@@ -21,7 +21,7 @@ import WarningAmberOutlinedIcon from "@mui/icons-material/WarningAmberOutlined";
 import WifiOutlinedIcon from "@mui/icons-material/WifiOutlined";
 import InfoOutlinedIcon from "@mui/icons-material/InfoOutlined";
 import { acbFlagNames, yesNo } from "@/lib/accountFields";
-import type { AccountEventPage, AccountEventQuery, CsvData, Bookmark, DBRow, HostMetadata } from "@/lib/types";
+import type { AccountEventPage, AccountEventQuery, CsvData, DBRow, HostMetadata } from "@/lib/types";
 import type { FetchLinkedRows } from "@/lib/types";
 import { RecordScopeContext } from "@/lib/recordScope";
 import { hostDirOfResultPath } from "@/lib/resultTables";
@@ -48,9 +48,6 @@ interface TargetInfoViewProps {
    *  field) points at. */
   isRowBookmarked?: (row: Row, field?: string) => boolean;
   onToggleBookmark?: (rowid: number, field: string) => void;
-  /** Account EventLog rows come from a raw source table, not TargetInfo. */
-  eventBookmarks?: Bookmark[];
-  onToggleEventBookmark?: (fullPath: string, tableName: string, rowid: number) => void;
   accountDirectory?: AccountDirectory;
 }
 
@@ -205,7 +202,7 @@ interface NetworkProfile {
   timestamp: string;
 }
 
-export default function TargetInfoView({ data, loadAccountEvents, timeRange, onNavigate, onFetchLinkedRows, isRowBookmarked, onToggleBookmark, eventBookmarks, onToggleEventBookmark, accountDirectory }: TargetInfoViewProps) {
+export default function TargetInfoView({ data, loadAccountEvents, timeRange, onNavigate, onFetchLinkedRows, isRowBookmarked, onToggleBookmark, accountDirectory }: TargetInfoViewProps) {
   // 북마크는 원본 레코드에 붙으므로 행이 실어 온 원본 좌표로 맞춘다.
   const bmRowids = useMemo(
     () => new Set((data.rows as Row[]).filter((row) => isRowBookmarked?.(row)).map((row) => Number((row as Record<string, unknown>).__rowid))),
@@ -377,7 +374,7 @@ export default function TargetInfoView({ data, loadAccountEvents, timeRange, onN
   // Clicking an account opens a full page (not a modal) — account detail plus
   // the EventLog activity for its SID.
   if (selectedAccount) {
-    return <AccountDetailPage account={selectedAccount} onBack={() => setSelectedAccount(null)} loadEvents={loadAccountEvents} timeRange={timeRange} onNavigate={onNavigate} onFetchLinkedRows={onFetchLinkedRows} isRowBookmarked={isRowBookmarked} onToggleBookmark={onToggleBookmark} eventBookmarks={eventBookmarks} onToggleEventBookmark={onToggleEventBookmark} accountDirectory={accountDirectory} />;
+    return <AccountDetailPage account={selectedAccount} onBack={() => setSelectedAccount(null)} loadEvents={loadAccountEvents} timeRange={timeRange} onNavigate={onNavigate} onFetchLinkedRows={onFetchLinkedRows} isRowBookmarked={isRowBookmarked} onToggleBookmark={onToggleBookmark} accountDirectory={accountDirectory} />;
   }
 
   const accounts = [...users, ...services];
@@ -713,7 +710,7 @@ function eventSummary(row: Row): string {
   return parts.join(" · ");
 }
 
-function AccountDetailPage({ account, onBack, loadEvents, timeRange, onNavigate, onFetchLinkedRows, isRowBookmarked, onToggleBookmark, eventBookmarks, onToggleEventBookmark, accountDirectory }: { account: Account; onBack: () => void; loadEvents?: (query: AccountEventQuery) => Promise<AccountEventPage>; timeRange: TimeRange; onNavigate?: (targetFile: string, targetColumn: string, value: string) => void; onFetchLinkedRows?: FetchLinkedRows; isRowBookmarked?: (row: Row, field?: string) => boolean; onToggleBookmark?: (rowid: number, field: string) => void; eventBookmarks?: Bookmark[]; onToggleEventBookmark?: (fullPath: string, tableName: string, rowid: number) => void; accountDirectory?: AccountDirectory }) {
+function AccountDetailPage({ account, onBack, loadEvents, timeRange, onNavigate, onFetchLinkedRows, isRowBookmarked, onToggleBookmark, accountDirectory }: { account: Account; onBack: () => void; loadEvents?: (query: AccountEventQuery) => Promise<AccountEventPage>; timeRange: TimeRange; onNavigate?: (targetFile: string, targetColumn: string, value: string) => void; onFetchLinkedRows?: FetchLinkedRows; isRowBookmarked?: (row: Row, field?: string) => boolean; onToggleBookmark?: (rowid: number, field: string) => void; accountDirectory?: AccountDirectory }) {
   const [events, setEvents] = useState<AccountEventPage | null>(null);
   const [eventsAccountKey, setEventsAccountKey] = useState("");
   const [loading, setLoading] = useState(false);
@@ -738,20 +735,6 @@ function AccountDetailPage({ account, onBack, loadEvents, timeRange, onNavigate,
     onToggleBookmark
       ? { active: isRowBookmarked?.(account.row, field) ?? false, onToggle: () => onToggleBookmark(account.rowid, field) }
       : undefined;
-  const eventBookmarkKeys = useMemo(() => new Set((eventBookmarks ?? [])
-    .filter((bookmark) => !bookmark.field)
-    .map((bookmark) => `${bookmark.fullPath}\u0000${bookmark.tableName}\u0000${bookmark.rowid}`)), [eventBookmarks]);
-  const eventSource = (row: Row) => {
-    const fullPath = row._source_full_path || "";
-    const tableName = row._source_table_name || "";
-    const rowid = Number(row.__rowid);
-    return fullPath && tableName && Number.isFinite(rowid) ? { fullPath, tableName, rowid } : null;
-  };
-  const isEventBookmarked = (row: Row) => {
-    const source = eventSource(row);
-    return Boolean(source && eventBookmarkKeys.has(`${source.fullPath}\u0000${source.tableName}\u0000${source.rowid}`));
-  };
-
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
       // RowDetailPanel owns Escape while a raw EventLog detail is open. Do
@@ -906,15 +889,13 @@ function AccountDetailPage({ account, onBack, loadEvents, timeRange, onNavigate,
             const eid = r.EventID || "";
             const catalogNote = lookupEventCatalog(r.Provider, eid)?.label || (EVENT_LABELS[eid] && EVENT_LABELS[eid] !== `Event ${eid}` ? EVENT_LABELS[eid] : "");
             const summary = eventSummary(r);
-            const bookmarked = isEventBookmarked(r);
             return (
               <button
                 type="button"
                 key={`${r._record_key || r.EventRecordID || r.timestamp}|${i}`}
-                className={bookmarked ? "dfir-bookmarked-row" : undefined}
                 onClick={() => setSelectedEvent(r)}
-                onMouseEnter={(e) => { if (!bookmarked) e.currentTarget.style.background = "var(--bg-hover)"; }}
-                onMouseLeave={(e) => { if (!bookmarked) e.currentTarget.style.background = "transparent"; }}
+                onMouseEnter={(e) => { e.currentTarget.style.background = "var(--bg-hover)"; }}
+                onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; }}
                 style={{ borderRadius: "var(--radius)", display: "flex", alignItems: "center", gap: 10, width: "100%", minHeight: 50, padding: "7px 4px", background: "transparent", border: "none", borderBottom: i < pagedEvents.length - 1 ? "1px solid var(--border-subtle)" : "none", color: "inherit", cursor: "pointer", fontFamily: "inherit", textAlign: "left", transition: "background .15s ease" }}
               >
                 <span aria-hidden="true" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 30, height: 30, flexShrink: 0, borderRadius: "var(--radius)", background: "rgba(174, 189, 255, 0.14)" }}>
@@ -944,9 +925,8 @@ function AccountDetailPage({ account, onBack, loadEvents, timeRange, onNavigate,
 
       {selectedEvent && (
         <RowDetailPanel
-          // Source identity stays in account-query state for exact bookmark
-          // operations; it is transport metadata, not analyst-facing EventLog
-          // evidence and must not appear in the common full-fields panel.
+          // Source identity is transport metadata of the account query, not
+          // analyst-facing EventLog evidence; keep it out of the full fields.
           row={Object.fromEntries(Object.entries(selectedEvent).filter(([key]) => key !== "_source_full_path" && key !== "_source_table_name" && key !== "__rowid"))}
           columns={Object.keys(selectedEvent).filter((key) => key !== "_source_full_path" && key !== "_source_table_name" && key !== "__rowid")}
           focusedColumn={null}
@@ -955,13 +935,6 @@ function AccountDetailPage({ account, onBack, loadEvents, timeRange, onNavigate,
           onNavigate={onNavigate ?? (() => {})}
           onFetchLinkedRows={onFetchLinkedRows}
           accountDirectory={accountDirectory}
-          isBookmarked={isEventBookmarked(selectedEvent)}
-          onToggleBookmark={(() => {
-            const source = eventSource(selectedEvent);
-            return source && onToggleEventBookmark
-              ? () => onToggleEventBookmark(source.fullPath, source.tableName, source.rowid)
-              : undefined;
-          })()}
         />
       )}
     </div>

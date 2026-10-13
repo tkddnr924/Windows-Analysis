@@ -14,13 +14,6 @@ export interface RecordScope {
   tableName: string;
   /** Opens a source record in the result view; omitted = display only. */
   openRecord?: (fullPath: string, tableName: string, rowid: number) => void;
-  /**
-   * Bookmarks a source record. Bookmarks only ever target raw evidence rows,
-   * so when a derived row has several origins the analyst picks one here — the
-   * UI never chooses a representative origin.
-   */
-  bookmarkSource?: (fullPath: string, tableName: string, rowid: number) => void;
-  isSourceBookmarked?: (fullPath: string, tableName: string, rowid: number) => boolean;
 }
 
 export const RecordScopeContext = createContext<RecordScope | null>(null);

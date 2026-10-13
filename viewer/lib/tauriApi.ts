@@ -75,6 +75,7 @@ function makeApi(): ElectronApi {
     timelineSourcePage: (fullPath, tableName, offset, limit) => invoke<TimelineSourcePage>("timeline_source_page", { fullPath, tableName: tableName ?? null, offset, limit }).then(table),
     linkedResultRows: (fullPath, tableName, matchColumn, matchValue, search, offset, limit) => invoke<LinkedRowsPage>("linked_result_rows", { fullPath, tableName, matchColumn, matchValue, search, offset, limit }).then(table),
     resultRow: (fullPath, tableName, rowid) => invoke<ResultRow>("result_row", { fullPath, tableName, rowid }).then((result) => { if (result.row) cells(result.row); return result; }),
+    resultRowByRecordId: (fullPath, tableName, recordId) => invoke<ResultRow>("result_row_by_record_id", { fullPath, tableName, recordId }).then((result) => { if (result.row) cells(result.row); return result; }),
     browserScope: (fullPath) => invoke<BrowserInputInfo[]>("browser_scope", { fullPath }),
     browserSummary: (fullPath, filter) => invoke<BrowserSummary>("browser_summary", { fullPath, filter }).then((summary) => { rows(summary.downloads); return summary; }),
     browserDomains: (fullPath, filter, offset, limit, ascending) => invoke<BrowserDomainPage>("browser_domains", { fullPath, filter, offset, limit, ascending }),

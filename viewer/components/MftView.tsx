@@ -6,7 +6,7 @@ import MftListFilterModal from "@/components/MftListFilterModal";
 
 import { useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import type { Bookmark, FileReference, MftListOptions, MftRecordsPage, MftVolume } from "@/lib/types";
+import type { FileReference, MftListOptions, MftRecordsPage, MftVolume } from "@/lib/types";
 import { MFT_PATH_STATUS_LABELS } from "@/lib/artifactViews";
 import { volumeLabels } from "@/lib/mftVolumeLabels";
 import { DEFAULT_LIST_FILTERS, MFT_TIME_FIELDS, describeFilters, toListOptions, type ListFilters } from "@/lib/mftListFilters";
@@ -25,7 +25,6 @@ import AccountTreeOutlinedIcon from "@mui/icons-material/AccountTreeOutlined";
 import ViewListOutlinedIcon from "@mui/icons-material/ViewListOutlined";
 import RowDetailPanel from "./RowDetailPanel";
 import { RecordScopeContext } from "@/lib/recordScope";
-import { isRecordBookmarked, parseSourceRefs } from "@/lib/sourceRefs";
 
 // 파일 시스템 정보는 화면용 파생 테이블(_OVERVIEW/FileSystemEntries)에서
 // 읽는다. 수십만~백만 행 규모라 폴더는 지연 로딩하고, 검색·목록은 SQLite를
@@ -52,17 +51,12 @@ const MFT_TIME_SORTS = MFT_TIME_FIELDS;
 
 interface Props {
   dbPath: string;
-  /** Bookmark identities of the current host — matched against the source
-   *  record each row points at. Bookmarks live on the raw facts row
-   *  (MFT_Records); this screen only shares their display state. */
-  bookmarkKeys: Set<string>;
+  /** docs-20: FileSystemEntries rows are bookmarked by their record_id. */
+  isRowBookmarked: (row: Row, field?: string) => boolean;
   onToggleBookmark: (rowid: number, field: string) => void;
-  /** All bookmarks for the case (any table) — lets the JumpList/Shellbag detail
-   *  modal show whether a reference's timestamp is already bookmarked. */
-  allBookmarks: Bookmark[];
-  /** Toggle a bookmark on an arbitrary (source sqlite, table, row, field) —
-   *  used for JumpList reference timestamps. */
-  onBookmarkRef: (fullPath: string, tableName: string, rowid: number, field: string) => void;
+  /** Stored PathReferences row of a JumpList/Shellbag reference. */
+  isReferenceBookmarked: (row: Row) => boolean;
+  onToggleReferenceBookmark?: (row: Row) => void;
 }
 
 
@@ -176,7 +170,7 @@ function fmtSize(v: string | null | undefined): string {
   return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }
 
-export default function MftView({ dbPath, bookmarkKeys, onToggleBookmark, allBookmarks, onBookmarkRef }: Props) {
+export default function MftView({ dbPath, isRowBookmarked, onToggleBookmark, isReferenceBookmarked, onToggleReferenceBookmark }: Props) {
   // Coordinates of what this screen shows; the detail panel reads
   // source_records with them. The outer "open source record" action is kept.
   const outerScope = useContext(RecordScopeContext);
@@ -507,17 +501,6 @@ export default function MftView({ dbPath, bookmarkKeys, onToggleBookmark, allBoo
     });
   }, [dbPath, listQuery, listOptions, listLoading, listRows.length, listTotal]);
 
-  // Bookmarks live on the raw facts record (MFT_Records), so each display row
-  // matches its state through the source coordinates it carries.
-  const isRowBookmarked = useCallback(
-    (row: Row, field?: string) => isRecordBookmarked(
-      bookmarkKeys,
-      { fullPath: dbPath, tableName: "FileSystemEntries", rowid: Number(row.__rowid) },
-      parseSourceRefs(row.__source_refs),
-      field,
-    ),
-    [bookmarkKeys, dbPath],
-  );
   const stackedInspector = useMediaQuery("(max-width: 960px)");
   const detailPanel = selected ? (
     <RowDetailPanel
@@ -668,8 +651,8 @@ export default function MftView({ dbPath, bookmarkKeys, onToggleBookmark, allBoo
             fileBaseName="PathReferences"
             onClose={() => setReferenceDetail(null)}
             onNavigate={() => {}}
-            isBookmarked={referenceDetail.rowid >= 0 && allBookmarks.some((bookmark) => bookmark.fullPath === referenceDetail.fullPath && bookmark.rowid === referenceDetail.rowid)}
-            onToggleBookmark={referenceDetail.rowid >= 0 ? () => onBookmarkRef(referenceDetail.fullPath, referenceDetail.tableName, referenceDetail.rowid, "") : undefined}
+            isBookmarked={isReferenceBookmarked(referenceDetail.row)}
+            onToggleBookmark={onToggleReferenceBookmark ? () => onToggleReferenceBookmark(referenceDetail.row) : undefined}
           />
         </RecordScopeContext.Provider>
       )}

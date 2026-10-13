@@ -1,5 +1,4 @@
 import type { Tag } from "./tagging";
-import type { SourceRef } from "./sourceRefs";
 
 export interface CsvData {
   columns: string[];
@@ -329,26 +328,20 @@ export interface ParseEligibility {
   reason: string;
 }
 
-/** An analyst annotation on one row, persisted in the direct host-store root
- * `cases/bookmarks.json`. */
+/** An analyst annotation on one _OVERVIEW record (docs-20), persisted in
+ * `cases/bookmarks.json`. Re-parsing a host removes its bookmarks. */
 export interface Bookmark {
   id: string;
+  /** `_OVERVIEW/<table>.sqlite` of the record. */
   fullPath: string;
   tableName: string;
-  rowid: number;
+  recordId: string;
   note: string;
   taggedAt: string;
-  /** For rows that carry several timestamps (e.g. an $MFT record's SI/FN
-   * Created/Modified/...), which one this bookmark marks — so the same row can
-   * be bookmarked on each time independently. Absent for whole-row bookmarks. */
+  /** Selected time field (e.g. si_created); absent for whole-row bookmarks. */
   field?: string;
-  /** Event time carried over from the overview row this bookmark was promoted
-   * from. Raw source records (e.g. Registry) may lack the execution timestamp,
-   * so the bookmark timeline prefers this when present. */
+  /** Time shown when the bookmark was set (field value or row timestamp). */
   eventTime?: string;
-  /** Which direct host this bookmark's row belongs to (bookmarks are shared
-   * across registered hosts). Optional for backward compatibility
-   * with bookmarks saved before host attribution existed. */
   hostId?: string;
   hostName?: string;
 }
@@ -356,7 +349,7 @@ export interface Bookmark {
 export interface BookmarkInput {
   fullPath: string;
   tableName: string;
-  rowid: number;
+  recordId: string;
   field?: string;
   eventTime?: string;
   hostId?: string;
@@ -646,10 +639,6 @@ export interface FileReference {
   matchBasis: string;
   /** Stored PathReferences row (all columns). */
   row: Record<string, string>;
-  /** First raw origin — only the existing bookmark key; rowid < 0 = none. */
-  fullPath: string;
-  tableName: string;
-  rowid: number;
 }
 
 /** Recursive file list filters (docs-04 §3). */
@@ -829,6 +818,7 @@ export interface ElectronApi {
   timelineSourcePage(fullPath: string, tableName: string | undefined, offset: number, limit: number): Promise<TimelineSourcePage>;
   linkedResultRows(fullPath: string, tableName: string, matchColumn: string, matchValue: string, search: string, offset: number, limit: number): Promise<LinkedRowsPage>;
   resultRow(fullPath: string, tableName: string, rowid: number): Promise<ResultRow>;
+  resultRowByRecordId(fullPath: string, tableName: string, recordId: string): Promise<ResultRow>;
   browserScope(fullPath: string): Promise<BrowserInputInfo[]>;
   browserSummary(fullPath: string, filter: BrowserFilter): Promise<BrowserSummary>;
   browserDomains(fullPath: string, filter: BrowserFilter, offset: number, limit: number, ascending: boolean): Promise<BrowserDomainPage>;
@@ -898,7 +888,6 @@ export interface SearchHit {
   timestamp: string;
   /** 파생 레코드 ID(record_id). 원본 근거는 readRecordSources로 조회한다. */
   recordId: string;
-  sourceRefs: SourceRef[];
 }
 
 export interface SearchCasePage {

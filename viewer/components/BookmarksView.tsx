@@ -9,28 +9,7 @@ import DeleteOutlineOutlinedIcon from "@mui/icons-material/DeleteOutlineOutlined
 import RefreshOutlinedIcon from "@mui/icons-material/RefreshOutlined";
 import TimelineOutlinedIcon from "@mui/icons-material/TimelineOutlined";
 import AccountTreeOutlinedIcon from "@mui/icons-material/AccountTreeOutlined";
-import BoltOutlinedIcon from "@mui/icons-material/BoltOutlined";
 import ComputerOutlinedIcon from "@mui/icons-material/ComputerOutlined";
-import CloudDownloadOutlinedIcon from "@mui/icons-material/CloudDownloadOutlined";
-import DescriptionOutlinedIcon from "@mui/icons-material/DescriptionOutlined";
-import DesktopWindowsOutlinedIcon from "@mui/icons-material/DesktopWindowsOutlined";
-import DeviceHubOutlinedIcon from "@mui/icons-material/DeviceHubOutlined";
-import DnsOutlinedIcon from "@mui/icons-material/DnsOutlined";
-import EventNoteOutlinedIcon from "@mui/icons-material/EventNoteOutlined";
-import FolderOpenOutlinedIcon from "@mui/icons-material/FolderOpenOutlined";
-import HistoryOutlinedIcon from "@mui/icons-material/HistoryOutlined";
-import InfoOutlinedIcon from "@mui/icons-material/InfoOutlined";
-import InsertDriveFileOutlinedIcon from "@mui/icons-material/InsertDriveFileOutlined";
-import LanguageOutlinedIcon from "@mui/icons-material/LanguageOutlined";
-import ManageSearchOutlinedIcon from "@mui/icons-material/ManageSearchOutlined";
-import MiscellaneousServicesOutlinedIcon from "@mui/icons-material/MiscellaneousServicesOutlined";
-import PhotoLibraryOutlinedIcon from "@mui/icons-material/PhotoLibraryOutlined";
-import ReportProblemOutlinedIcon from "@mui/icons-material/ReportProblemOutlined";
-import SecurityOutlinedIcon from "@mui/icons-material/SecurityOutlined";
-import ShieldOutlinedIcon from "@mui/icons-material/ShieldOutlined";
-import SpeedOutlinedIcon from "@mui/icons-material/SpeedOutlined";
-import TaskOutlinedIcon from "@mui/icons-material/TaskOutlined";
-import TerminalOutlinedIcon from "@mui/icons-material/TerminalOutlined";
 import CircularProgress from "@mui/material/CircularProgress";
 import type { Bookmark, FetchLinkedRows, Host, ResultRow } from "@/lib/types";
 import { getArtifactView, resolveArtifactView } from "@/lib/artifactViews";
@@ -41,6 +20,7 @@ import PaginationControls from "@/components/PaginationControls";
 import { resolveUserDisplay, type AccountDirectory } from "@/lib/accountIdentity";
 import { RecordScopeContext } from "@/lib/recordScope";
 import { pathBelongsToHost, visuallyHidden } from "@/lib/viewShared";
+import OverviewTableIcon from "@/components/OverviewTableIcon";
 
 interface BookmarksViewProps {
   bookmarks: Bookmark[];
@@ -96,14 +76,9 @@ function usePagedEntries<T>(entries: T[]): { rows: T[]; page: number; pageCount:
 }
 
 
+/** Host folder of `<host>/_OVERVIEW/<table>.sqlite`. */
 function hostDirFromResultPath(fullPath: string): string | undefined {
-  const normalized = fullPath.replace(/\\/g, "/");
-  const match = normalized.match(/^(.*)\/(?:ANALYSIS_OVERVIEW|BROWSER)\//i);
-  return match?.[1];
-}
-
-function bookmarkKey(bookmark: Bookmark): string {
-  return `${bookmark.fullPath}\u0000${bookmark.tableName}#${bookmark.rowid}`;
+  return fullPath.replace(/\\/g, "/").match(/^(.*)\/_OVERVIEW\//i)?.[1];
 }
 
 
@@ -127,92 +102,25 @@ function fieldLabel(field: string): string {
 const EVIDENCE_TIMESTAMP = /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?$/;
 
 /**
- * Whole-row Registry bookmarks have no generic `timestamp` field.  Their
- * `last_write` is a key-level Registry timestamp, so it is useful for the
- * bookmark time axis but must never be presented as an application/BAM run.
- * A field bookmark deliberately keeps its selected field as the only source
- * of time; falling back would change the analyst's selection.
+ * docs-20: a field bookmark keeps its own field value; a whole-row bookmark
+ * keeps the time saved when it was set, else the row's timestamp. The label is
+ * the field meaning, else the stored timestamp_kind.
  */
-function resolveBookmarkEventTime(
-  bookmark: Bookmark,
-  row: Record<string, string>,
-  spec: ReturnType<typeof getArtifactView>,
-): { value: string; label?: string } {
+function resolveBookmarkEventTime(bookmark: Bookmark, row: Record<string, string>): { value: string; label?: string } {
   if (bookmark.field) return { value: row[bookmark.field] || "", label: fieldLabel(bookmark.field) };
-
-  // 개요 행에서 승격되며 저장된 사건 시각이 있으면 그것이 분석가가 본 시각이다.
-  if (bookmark.eventTime && EVIDENCE_TIMESTAMP.test(bookmark.eventTime)) {
-    return { value: bookmark.eventTime };
-  }
-
-  const defaultTime = row[spec?.timelineField ?? "timestamp"] || row.timestamp || "";
-  if (defaultTime) return { value: defaultTime };
-
-  if (bookmark.tableName === "Registry" && EVIDENCE_TIMESTAMP.test(row.last_write || "")) {
-    return { value: row.last_write, label: "레지스트리 키 마지막 기록 시각" };
-  }
-  return { value: "" };
-}
-
-/**
- * 북마크 항목의 아티팩트 아이콘. 장식이 아니라 어떤 증거에서 온 항목인지
- * 식별하는 표식이며, 같은 아티팩트는 사이드바·뷰 헤더와 같은 글리프를 쓴다.
- * 키는 마스터 타임라인의 아티팩트 칩과 같은 규칙으로 정한다 — `_OVERVIEW`는
- * 시각적 정체성이 아니므로 테이블 이름을, 그 밖에는 카테고리 폴더를 쓴다.
- */
-const ARTIFACT_ICONS: Record<string, typeof BoltOutlinedIcon> = {
-  // 카테고리(원본 증거 폴더)
-  EVENTLOG: EventNoteOutlinedIcon,
-  REGISTRY: ManageSearchOutlinedIcon,
-  BROWSER: LanguageOutlinedIcon,
-  JUMPLIST: InsertDriveFileOutlinedIcon,
-  RDPCACHE: PhotoLibraryOutlinedIcon,
-  AMCACHE: BoltOutlinedIcon,
-  PREFETCH: BoltOutlinedIcon,
-  SRUM: SpeedOutlinedIcon,
-  POWERSHELL: TerminalOutlinedIcon,
-  TASKSCHEDULER: TaskOutlinedIcon,
-  WER: ReportProblemOutlinedIcon,
-  WMI: DeviceHubOutlinedIcon,
-  FILESYSTEM: FolderOpenOutlinedIcon,
-  TIMELINE: AccountTreeOutlinedIcon,
-  // 파생 개요 테이블
-  EXECUTIONHISTORY: BoltOutlinedIcon,
-  POWERSHELLHISTORY: TerminalOutlinedIcon,
-  SERVICEHISTORY: MiscellaneousServicesOutlinedIcon,
-  SCHEDULEDTASKS: TaskOutlinedIcon,
-  REMOTEDESKTOPHISTORY: DesktopWindowsOutlinedIcon,
-  SMBHISTORY: DnsOutlinedIcon,
-  BITSHISTORY: CloudDownloadOutlinedIcon,
-  FIREWALLHISTORY: SecurityOutlinedIcon,
-  BROWSERACTIVITY: LanguageOutlinedIcon,
-  REGISTRYFINDINGS: ManageSearchOutlinedIcon,
-  DEFENDER: ShieldOutlinedIcon,
-  WERREPORTS: ReportProblemOutlinedIcon,
-  MFTRECORDS: FolderOpenOutlinedIcon,
-  FILESYSTEMENTRIES: FolderOpenOutlinedIcon,
-  RECYCLEBIN: DeleteOutlineOutlinedIcon,
-  USNJOURNAL: HistoryOutlinedIcon,
-  TARGETINFO: InfoOutlinedIcon,
-};
-
-function artifactIconFor(bookmark: Bookmark): typeof BoltOutlinedIcon {
-  const segments = bookmark.fullPath.replace(/\\/g, "/").split("/").filter(Boolean);
-  const category = (segments[segments.length - 2] ?? "").toUpperCase();
-  const table = bookmark.tableName.replace(/[^a-z0-9]/gi, "").toUpperCase();
-  if (category && category !== "_OVERVIEW") return ARTIFACT_ICONS[category] ?? DescriptionOutlinedIcon;
-  return ARTIFACT_ICONS[table] ?? DescriptionOutlinedIcon;
+  if (bookmark.eventTime && EVIDENCE_TIMESTAMP.test(bookmark.eventTime)) return { value: bookmark.eventTime, label: row.timestamp_kind || undefined };
+  return { value: row.timestamp || "", label: row.timestamp_kind || undefined };
 }
 
 function eventTitle(entry: BookmarkEntry): string {
-  if (!entry.row) return entry.load?.status === "error" ? "원본 행을 불러오지 못했습니다" : "원본 행을 확인하는 중입니다";
+  if (!entry.row) return entry.load?.status === "error" ? "기록을 불러오지 못했습니다" : "기록을 확인하는 중입니다";
   // 사건 제목(timelineTitle)이 있으면 우선 — "EventLog"/"JumpList" 같은
   // 증거 유형명 대신 실제 관찰 내용을 보여준다.
   return entry.spec?.timelineTitle?.(entry.row) || entry.spec?.title(entry.row) || "등록된 분석 항목";
 }
 
 function eventSubtitle(entry: BookmarkEntry): string {
-  if (!entry.row) return entry.load?.status === "error" ? "일시적인 조회 오류입니다. 다시 시도할 수 있습니다." : "원본 증거 행을 조회하고 있습니다.";
+  if (!entry.row) return entry.load?.status === "error" ? "일시적인 조회 오류입니다. 다시 시도할 수 있습니다." : "";
   return entry.spec?.subtitle?.(entry.row) || "";
 }
 
@@ -221,9 +129,8 @@ function ControlButton({ active, onClick, children, ariaLabel }: { active: boole
 }
 
 function RowStatus({ entry }: { entry: BookmarkEntry }) {
-  if (!entry.load) return <span style={{ display: "inline-flex", alignItems: "center", gap: 6, color: "var(--text-faint)", fontSize: 11.5 }}><CircularProgress size={12} thickness={5} aria-label="원본 행 확인 중" />원본 행 확인 중</span>;
-  if (entry.load.status === "error") return <span role="status" style={{ color: "var(--danger)", fontSize: 11.5 }}>원본 행 조회 실패</span>;
-  if (!entry.row) return <span role="status" style={{ color: "var(--warning)", fontSize: 11.5 }}>원본 행을 찾을 수 없음</span>;
+  if (!entry.load) return <span style={{ display: "inline-flex", alignItems: "center", gap: 6, color: "var(--text-faint)", fontSize: 11.5 }}><CircularProgress size={12} thickness={5} aria-label="기록 확인 중" />기록 확인 중</span>;
+  if (entry.load.status === "error") return <span role="status" style={{ color: "var(--danger)", fontSize: 11.5 }}>기록 조회 실패</span>;
   return null;
 }
 
@@ -256,7 +163,7 @@ export default function BookmarksView({ bookmarks, hosts, hostIpMap, currentHost
   const [viewMode, setViewMode] = useState<"timeline" | "sequence">("timeline");
 
   useEffect(() => {
-    const missing = [...new Map(bookmarks.filter((bookmark) => rowCache[bookmarkKey(bookmark)] === undefined).map((bookmark) => [bookmarkKey(bookmark), bookmark])).values()];
+    const missing = bookmarks.filter((bookmark) => rowCache[bookmark.id] === undefined);
     if (missing.length === 0) return;
     let cancelled = false;
     const resolved: [string, RowLoad][] = [];
@@ -265,8 +172,9 @@ export default function BookmarksView({ bookmarks, hosts, hostIpMap, currentHost
       while (!cancelled) {
         const bookmark = missing[nextIndex++];
         if (!bookmark) return;
-        try { resolved.push([bookmarkKey(bookmark), { status: "ready", data: await window.api.resultRow(bookmark.fullPath, bookmark.tableName, bookmark.rowid) }]); }
-        catch { resolved.push([bookmarkKey(bookmark), { status: "error" }]); }
+        // docs-20: the _OVERVIEW record itself, by record_id.
+        try { resolved.push([bookmark.id, { status: "ready", data: await window.api.resultRowByRecordId(bookmark.fullPath, bookmark.tableName, bookmark.recordId) }]); }
+        catch { resolved.push([bookmark.id, { status: "error" }]); }
       }
     };
     void Promise.all(Array.from({ length: Math.min(MAX_CONCURRENT_ROW_LOOKUPS, missing.length) }, worker)).then(() => {
@@ -279,11 +187,11 @@ export default function BookmarksView({ bookmarks, hosts, hostIpMap, currentHost
   }, [bookmarks, lookupAttempt]);
 
   const entries = useMemo<BookmarkEntry[]>(() => bookmarks.map((bookmark) => {
-    const load = rowCache[bookmarkKey(bookmark)];
+    const load = rowCache[bookmark.id];
     const row = load?.status === "ready" ? load.data.row ?? undefined : undefined;
     const columns = load?.status === "ready" ? load.data.columns : [];
     const spec = resolveArtifactView(bookmark.tableName, columns) ?? getArtifactView(bookmark.tableName);
-    const time = row ? resolveBookmarkEventTime(bookmark, row, spec) : { value: "" };
+    const time = row ? resolveBookmarkEventTime(bookmark, row) : { value: "" };
     return { bookmark, columns, load, row, spec, eventTime: time.value, eventTimeLabel: time.label, host: hostForBookmark(bookmark, hosts) };
   }), [bookmarks, hosts, rowCache]);
 
@@ -291,8 +199,8 @@ export default function BookmarksView({ bookmarks, hosts, hostIpMap, currentHost
     // 북마크는 분석가가 직접 고른 증거다 — 기간 필터(사고 시점)와 무관하게
     // 항상 전부 표시한다.
     const timed = entries.filter((entry) => Boolean(entry.eventTime));
-    const undated = entries.filter((entry) => entry.load?.status === "ready" && !entry.eventTime);
-    const unresolved = entries.filter((entry) => !entry.load || entry.load.status === "error");
+    const undated = entries.filter((entry) => entry.row && !entry.eventTime);
+    const unresolved = entries.filter((entry) => !entry.row);
     const compare = (left: BookmarkEntry, right: BookmarkEntry) => sortDir === "asc" ? left.eventTime.localeCompare(right.eventTime) : right.eventTime.localeCompare(left.eventTime);
     return { timedEntries: timed.sort(compare), undatedEntries: undated, unresolvedEntries: unresolved };
   }, [entries, sortDir, timeRange]);
@@ -327,7 +235,7 @@ export default function BookmarksView({ bookmarks, hosts, hostIpMap, currentHost
     <main className="dfir-view" aria-labelledby="analysis-info-title" style={{ display: "flex", flexDirection: "column", flex: 1, minHeight: 0, minWidth: 0 }}>
       <ViewHeader icon={BookmarkBorderOutlinedIcon} title="분석 정보" titleId="analysis-info-title" meta={`${bookmarks.length.toLocaleString()}건 · 북마크 전체`} right={<><div style={{ display: "flex", gap: 4 }} role="group" aria-label="정렬 순서"><ControlButton active={sortDir === "asc"} onClick={() => setSortDir("asc")} ariaLabel="시간 오름차순 정렬">오래된순</ControlButton><ControlButton active={sortDir === "desc"} onClick={() => setSortDir("desc")} ariaLabel="시간 내림차순 정렬">최근순</ControlButton></div><div style={{ display: "flex", gap: 4 }} role="group" aria-label="분석 정보 표시 방식"><ControlButton active={viewMode === "timeline"} onClick={() => setViewMode("timeline")} ariaLabel="시간 원장 보기"><TimelineOutlinedIcon sx={{ fontSize: 15, verticalAlign: "-3px", marginRight: "4px" }} />시간 원장</ControlButton><ControlButton active={viewMode === "sequence"} onClick={() => setViewMode("sequence")} ariaLabel="호스트 흐름 보기"><AccountTreeOutlinedIcon sx={{ fontSize: 15, verticalAlign: "-3px", marginRight: "4px" }} />호스트 흐름</ControlButton></div></>} />
 
-      {failedCount > 0 && <div role="alert" style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0, padding: "7px 14px", borderBottom: "1px solid color-mix(in srgb, var(--danger) 42%, var(--border))", background: "color-mix(in srgb, var(--danger) 7%, var(--bg-panel))", color: "var(--text)", fontSize: 12 }}>원본 행 {failedCount}건을 불러오지 못했습니다.<button type="button" onClick={retryFailedRows} style={{ display: "inline-flex", alignItems: "center", gap: 4, marginLeft: "auto", minHeight: 26, padding: "2px 8px", border: "1px solid var(--border)", borderRadius: "var(--radius)", background: "transparent", color: "var(--text-dim)", cursor: "pointer", fontSize: 11.5 }}><RefreshOutlinedIcon sx={{ fontSize: 14 }} />다시 시도</button></div>}
+      {failedCount > 0 && <div role="alert" style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0, padding: "7px 14px", borderBottom: "1px solid color-mix(in srgb, var(--danger) 42%, var(--border))", background: "color-mix(in srgb, var(--danger) 7%, var(--bg-panel))", color: "var(--text)", fontSize: 12 }}>기록 {failedCount}건을 불러오지 못했습니다.<button type="button" onClick={retryFailedRows} style={{ display: "inline-flex", alignItems: "center", gap: 4, marginLeft: "auto", minHeight: 26, padding: "2px 8px", border: "1px solid var(--border)", borderRadius: "var(--radius)", background: "transparent", color: "var(--text-dim)", cursor: "pointer", fontSize: 11.5 }}><RefreshOutlinedIcon sx={{ fontSize: 14 }} />다시 시도</button></div>}
       {emptyForRange ? <div role="status" style={{ display: "grid", placeItems: "center", flex: 1, minHeight: 0, color: "var(--text-faint)", fontSize: 12.5 }}>기간 필터 내 시간 정보가 있는 북마크가 없습니다.</div> : viewMode === "timeline" ? <TimelineLedger entries={timedEntries} undatedEntries={undatedEntries} unresolvedEntries={unresolvedEntries} currentHostId={currentHostId} onOpen={openDetail} onRemove={onRemove} /> : <HostFlowLedger entries={sequenceEntries} undatedEntries={undatedEntries} unresolvedEntries={unresolvedEntries} currentHostId={currentHostId} onOpen={openDetail} onRemove={onRemove} accountDirectoryForHost={accountDirectoryForHost} />}
       {detail && (
         // Coordinates of the bookmarked row, so the panel reads its evidence.
@@ -341,7 +249,7 @@ export default function BookmarksView({ bookmarks, hosts, hostIpMap, currentHost
 
 function TimelineLedger({ entries, undatedEntries, unresolvedEntries, currentHostId, onOpen, onRemove }: { entries: BookmarkEntry[]; undatedEntries: BookmarkEntry[]; unresolvedEntries: BookmarkEntry[]; currentHostId: string | null; onOpen: (entry: BookmarkEntry) => void; onRemove: (bookmark: Bookmark) => void }) {
   const paged = usePagedEntries(entries);
-  return <section aria-label="북마크 시간 원장" style={{ flex: 1, minHeight: 0, overflow: "auto", padding: "12px 14px 4px" }}><div style={{ minWidth: 760 }}>{paged.rows.map((entry) => <TimelineRow key={entry.bookmark.id} entry={entry} currentHostId={currentHostId} onOpen={onOpen} onRemove={onRemove} />)}{entries.length > 0 && <div style={{ padding: "6px 0 2px" }}><PaginationControls ariaLabel="북마크 시간 원장 페이지" page={paged.page} pageCount={paged.pageCount} onChange={paged.setPage} summary={paged.summary} /></div>}{undatedEntries.length > 0 && <LedgerGroup label="시간 정보 없음" entries={undatedEntries} currentHostId={currentHostId} onOpen={onOpen} onRemove={onRemove} bordered={entries.length > 0} />}{unresolvedEntries.length > 0 && <LedgerGroup label="원본 행 확인 필요" entries={unresolvedEntries} currentHostId={currentHostId} onOpen={onOpen} onRemove={onRemove} bordered={entries.length > 0 || undatedEntries.length > 0} />}</div></section>;
+  return <section aria-label="북마크 시간 원장" style={{ flex: 1, minHeight: 0, overflow: "auto", padding: "12px 14px 4px" }}><div style={{ minWidth: 760 }}>{paged.rows.map((entry) => <TimelineRow key={entry.bookmark.id} entry={entry} currentHostId={currentHostId} onOpen={onOpen} onRemove={onRemove} />)}{entries.length > 0 && <div style={{ padding: "6px 0 2px" }}><PaginationControls ariaLabel="북마크 시간 원장 페이지" page={paged.page} pageCount={paged.pageCount} onChange={paged.setPage} summary={paged.summary} /></div>}{undatedEntries.length > 0 && <LedgerGroup label="시간 정보 없음" entries={undatedEntries} currentHostId={currentHostId} onOpen={onOpen} onRemove={onRemove} bordered={entries.length > 0} />}{unresolvedEntries.length > 0 && <LedgerGroup label="확인 필요" entries={unresolvedEntries} currentHostId={currentHostId} onOpen={onOpen} onRemove={onRemove} bordered={entries.length > 0 || undatedEntries.length > 0} />}</div></section>;
 }
 
 function LedgerGroup({ label, entries, currentHostId, onOpen, onRemove, bordered }: { label: string; entries: BookmarkEntry[]; currentHostId: string | null; onOpen: (entry: BookmarkEntry) => void; onRemove: (bookmark: Bookmark) => void; bordered: boolean }) {
@@ -350,7 +258,6 @@ function LedgerGroup({ label, entries, currentHostId, onOpen, onRemove, bordered
 }
 
 function TimelineRow({ entry, currentHostId, onOpen, onRemove }: { entry: BookmarkEntry; currentHostId: string | null; onOpen: (entry: BookmarkEntry) => void; onRemove: (bookmark: Bookmark) => void }) {
-  const isRegistryLastWrite = entry.eventTimeLabel === "레지스트리 키 마지막 기록 시각";
   const isCurrentHost = entry.host.id === currentHostId;
   const hostColor = isCurrentHost ? "var(--accent)" : "var(--text-dim)";
   // 이 뷰는 모든 행이 북마크라 노란 배경 강조가 구분 정보를 주지 못한다 —
@@ -370,7 +277,7 @@ function TimelineRow({ entry, currentHostId, onOpen, onRemove }: { entry: Bookma
     </span>
     <span style={{ flexShrink: 0, width: 176, textAlign: "right", minWidth: 0 }}>
       <time style={{ display: "block", fontFamily: "var(--mono)", fontSize: 12.5, color: entry.eventTime ? "var(--text-time)" : "var(--text-faint)", whiteSpace: "nowrap" }}>{entry.eventTime ? formatEvidenceTimestamp(entry.eventTime) : "시간 정보 없음"}</time>
-      {isRegistryLastWrite && <span style={{ display: "block", marginTop: 2, color: "var(--text-faint)", fontSize: 10.5, whiteSpace: "nowrap" }}>레지스트리 키 마지막 기록 시각</span>}
+      {entry.eventTimeLabel && <span style={{ display: "block", marginTop: 2, color: "var(--text-faint)", fontSize: 10.5, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{entry.eventTimeLabel}</span>}
     </span>
     <button type="button" onClick={() => onRemove(entry.bookmark)} aria-label={`${eventTitle(entry)} 북마크 제거`} style={{ flexShrink: 0, display: "grid", placeItems: "center", width: 30, height: 30, border: "1px solid transparent", borderRadius: "var(--radius)", background: "transparent", color: "var(--text-faint)", cursor: "pointer" }}><DeleteOutlineOutlinedIcon sx={{ fontSize: 16 }} /></button>
   </article>;
@@ -463,7 +370,7 @@ function HostFlowLedger({ entries, undatedEntries, unresolvedEntries, currentHos
       </>}
       {unresolvedEntries.length > 0 && <>
         {pagedUnresolved.rows.map((entry) => <TimelineRow key={entry.bookmark.id} entry={entry} currentHostId={currentHostId} onOpen={onOpen} onRemove={onRemove} />)}
-        <div style={{ padding: "6px 14px 2px" }}><PaginationControls ariaLabel="원본 행 확인 필요 페이지" page={pagedUnresolved.page} pageCount={pagedUnresolved.pageCount} onChange={pagedUnresolved.setPage} summary={pagedUnresolved.summary} /></div>
+        <div style={{ padding: "6px 14px 2px" }}><PaginationControls ariaLabel="확인 필요 페이지" page={pagedUnresolved.page} pageCount={pagedUnresolved.pageCount} onChange={pagedUnresolved.setPage} summary={pagedUnresolved.summary} /></div>
       </>}
     </div>}
   </div></section>;
@@ -495,18 +402,17 @@ function SequenceCanvasEvent({ entry, index, participants, onOpen, accountDirect
   const top = 48 + index * 64;
   // 방향 색은 그래프와 동일: 인바운드 오렌지 / 아웃바운드 퍼플 / 루프백 청록.
   const lineColor = hasDirectedPeer ? (entry.direction === "inbound" ? "#f2a86f" : "#9b7ef8") : entry.isLoopback ? "#5bc8c0" : "var(--text-faint)";
-  const ArtifactIcon = artifactIconFor(entry.bookmark);
-  return <div role="listitem" style={{ position: "absolute", top: top - 26, left: 0, right: 0, height: 58, borderRadius: "var(--radius)", transition: "background .15s ease" }}
+  return <div role="listitem" style={{ position: "absolute", top: top - 30, left: 0, right: 0, height: 62, borderRadius: "var(--radius)", transition: "background .15s ease" }}
     onMouseEnter={(event) => { event.currentTarget.style.background = "var(--bg-hover)"; }}
     onMouseLeave={(event) => { event.currentTarget.style.background = "transparent"; }}>
     <button type="button" onClick={() => onOpen(entry)} aria-label={[formatEvidenceTimestamp(entry.eventTime), connectorText, `${eventTitle(entry)} 상세 보기`].filter(Boolean).join(" · ")} style={{ position: "absolute", inset: 0, width: "100%", padding: 0, border: "none", background: "transparent", color: "inherit", cursor: "pointer", textAlign: "left" }}>
-      {hasDirectedPeer ? <span aria-hidden="true" style={{ position: "absolute", left: `${lineLeft}%`, top: 26, width: `${lineWidth}%`, borderTop: `2px solid ${lineColor}`, color: lineColor }}>
+      {hasDirectedPeer ? <span aria-hidden="true" style={{ position: "absolute", left: `${lineLeft}%`, top: 30, width: `${lineWidth}%`, borderTop: `2px solid ${lineColor}`, color: lineColor }}>
         <span style={{ position: "absolute", left: -4, top: -5, width: 8, height: 8, borderRadius: "50%", background: movesRight ? lineColor : "var(--bg-panel)", border: `2px solid ${lineColor}`, boxSizing: "border-box" }} />
         <span style={{ position: "absolute", right: -4, top: -5, width: 8, height: 8, borderRadius: "50%", background: movesRight ? "var(--bg-panel)" : lineColor, border: `2px solid ${lineColor}`, boxSizing: "border-box" }} />
         {movesRight ? <ArrowForwardOutlinedIcon sx={{ position: "absolute", right: -9, top: -10, fontSize: 18, background: "var(--bg-panel)", borderRadius: "50%" }} /> : <ArrowBackOutlinedIcon sx={{ position: "absolute", left: -9, top: -10, fontSize: 18, background: "var(--bg-panel)", borderRadius: "50%" }} />}
-      </span> : entry.isLoopback ? <span aria-hidden="true" style={{ position: "absolute", left: `calc(${start}% - 9px)`, top: 18, width: 16, height: 15, border: `2px solid ${lineColor}`, borderTop: "none", borderRadius: "0 0 10px 10px", background: "var(--bg-panel)" }} /> : <span aria-hidden="true" style={{ position: "absolute", left: `calc(${start}% - 5px)`, top: 21, width: 10, height: 10, border: "2px solid var(--text-faint)", borderRadius: "50%", background: "var(--bg-panel)" }} />}
-      <span aria-hidden="true" style={{ position: "absolute", left: `${labelLeft}%`, top: 0, display: "inline-flex", alignItems: "center", gap: 6, maxWidth: "min(320px, 44%)", padding: "3px 10px", overflow: "hidden", whiteSpace: "nowrap", background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: "var(--radius)", color: hasDirectedPeer ? "var(--text)" : "var(--text-dim)", fontSize: 12, fontWeight: 650, boxShadow: "0 1px 3px rgba(0,0,0,.3)" }}>
-        <ArtifactIcon sx={{ fontSize: 15, flexShrink: 0, color: "var(--text-faint)" }} />
+      </span> : entry.isLoopback ? <span aria-hidden="true" style={{ position: "absolute", left: `calc(${start}% - 9px)`, top: 22, width: 16, height: 15, border: `2px solid ${lineColor}`, borderTop: "none", borderRadius: "0 0 10px 10px", background: "var(--bg-panel)" }} /> : <span aria-hidden="true" style={{ position: "absolute", left: `calc(${start}% - 5px)`, top: 25, width: 10, height: 10, border: "2px solid var(--text-faint)", borderRadius: "50%", background: "var(--bg-panel)" }} />}
+      <span aria-hidden="true" style={{ position: "absolute", left: `${labelLeft}%`, top: 4, display: "inline-flex", alignItems: "center", gap: 6, maxWidth: "min(320px, 44%)", padding: "3px 10px", overflow: "hidden", whiteSpace: "nowrap", background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: "var(--radius)", color: hasDirectedPeer ? "var(--text)" : "var(--text-dim)", fontSize: 12, fontWeight: 650, boxShadow: "0 1px 3px rgba(0,0,0,.3)" }}>
+        <OverviewTableIcon name={entry.bookmark.tableName} size={15} />
         <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>{eventLabel}</span>
       </span>
       {connectorText && <span style={visuallyHidden}>{connectorText}</span>}

@@ -32,11 +32,11 @@ import CircularProgress from "@mui/material/CircularProgress";
 import { streamBuildTimeline, TimelineBuildAborted, TIMELINE_LOGIC_VERSION } from "@/lib/masterTimeline";
 import { getArtifactView } from "@/lib/artifactViews";
 import { EMPTY_TIME_RANGE, type TimeRange } from "@/lib/timeRange";
-import { bookmarkRefKeys, isRecordBookmarked, parseSourceRefs, type SourceRef } from "@/lib/sourceRefs";
+import { bookmarkKey, bookmarkKeys } from "@/lib/bookmarks";
 import { accountDirectoryFromEntries, type AccountDirectory } from "@/lib/accountIdentity";
 import { RecordScopeContext } from "@/lib/recordScope";
 import { isLoopbackAddress } from "@/lib/remoteAccess";
-import type { AccountEventPage, AccountEventQuery, Bookmark, Case, Host, CategoryEntry, CsvData, RecordSource, ResultFileEntry, TimelineEntry, SearchHit } from "@/lib/types";
+import type { AccountEventPage, AccountEventQuery, Bookmark, Case, Host, CategoryEntry, CsvData, ResultFileEntry, TimelineEntry, SearchHit } from "@/lib/types";
 
 interface TabState {
   file: ResultFileEntry;
@@ -66,9 +66,6 @@ const parentDir = (dir: string): string => dir.slice(0, Math.max(dir.lastIndexOf
 const accountDirectoryKey = (host: Pick<Host, "id" | "dir" | "lastRunAt">): string =>
   `${host.id}\u0000${host.dir.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase()}\u0000${host.lastRunAt ?? ""}`;
 
-// Bookmark state is matched only on the source coordinates a row carries
-// (__source_refs): never on a derived record_id and never by guessing from a
-// result file name. Key building and comparison live in lib/sourceRefs.ts.
 
 function resultFileStem(fullPath: string): string {
   return fullPath.replace(/\\/g, "/").split("/").pop()?.replace(/\.sqlite$/i, "") || "";
@@ -656,71 +653,44 @@ export default function Home() {
     }
   }
 
-  // Keyed by (fullPath, tableName, rowid) so any view holding those three —
-  // the data table or the master timeline — can toggle a bookmark the same way.
-  async function handleToggleBookmark(fullPath: string, tableName: string, rowid: number, field?: string, eventTime?: string) {
-    if (!selectedHost) return;
+  // docs-20: a bookmark names one _OVERVIEW record (record_id, optional time
+  // field) of the host it belongs to. Raw tables are not bookmark targets.
+  async function toggleRecordBookmark(host: Host | null | undefined, fullPath: string, tableName: string, row: Record<string, string> | null | undefined, field?: string) {
+    if (!host) return;
+    const recordId = row?.record_id;
+    if (!row || !recordId) {
+      setBookmarkError("분석 결과 행만 북마크할 수 있습니다.");
+      return;
+    }
+    const eventTime = (field ? row[field] : row.timestamp) || undefined;
     try {
-      const result = await window.api.toggleBookmark(parentDir(selectedHost.dir), { fullPath, tableName, rowid, field, eventTime, hostId: selectedHost.id, hostName: selectedHost.name });
+      const result = await window.api.toggleBookmark(parentDir(host.dir), { fullPath, tableName, recordId, field, eventTime, hostId: host.id, hostName: host.name });
       setBookmarks(result);
       setBookmarkError(null);
-    } catch {
-      setBookmarkError("북마크를 저장하지 못했습니다. 분석 저장소 권한을 확인하세요.");
+    } catch (error) {
+      setBookmarkError(typeof error === "string" ? error : "북마크를 저장하지 못했습니다. 분석 저장소 권한을 확인하세요.");
     }
   }
 
-  // Bookmarks only ever annotate raw evidence records. A derived contract row
-  // is not a valid target (the backend rejects it), so read its source_records
-  // and store the bookmark on the source row. With several origins the analyst
-  // picks one in the detail panel's source list — no origin is guessed here.
-  // Raw tables have no source_records, so an empty list means "this row is the
-  // evidence" and it is bookmarked as is.
-  async function handleToggleSourceAwareBookmark(
-    row: Record<string, string> | undefined,
-    fullPath: string,
-    tableName: string,
-    rowid: number,
-    field?: string,
-  ) {
-    if (!selectedHost) return;
-    // 승격 저장 시 개요 행의 사건 시각을 북마크에 함께 남긴다 — 원시 레코드
-    // (Registry 등)에는 실행 시각 컬럼이 없어, 없으면 북마크 시간축이
-    // last_write 같은 다른 시각으로 밀려 분석가가 기대한 위치에 안 보인다.
-    const overviewTime = row?.timestamp || "";
-    let sources: RecordSource[];
-    try {
-      sources = await window.api.readRecordSources(fullPath, tableName, rowid);
-    } catch {
-      setBookmarkError("원본 근거를 확인하지 못해 북마크를 저장하지 못했습니다.");
-      return;
-    }
-    if (sources.length === 0) {
-      await handleToggleBookmark(fullPath, tableName, rowid, field, overviewTime || undefined);
-      return;
-    }
-    // 같은 원본 행을 가리키는 필드별 근거는 한 대상이다.
-    const targets = new Map<string, RecordSource>();
-    for (const source of sources) targets.set(`${source.source_db}\u0000${source.source_table}\u0000${source.source_rowid}`, source);
-    if (targets.size > 1) {
-      setBookmarkError("여러 원본에 연결된 기록은 현재 북마크를 지원하지 않습니다.");
-      return;
-    }
-    const [target] = [...targets.values()];
-    if (!target.source_full_path) {
-      setBookmarkError("원본 결과 파일을 찾지 못해 북마크를 저장하지 못했습니다.");
-      return;
-    }
-    await handleToggleBookmark(target.source_full_path, target.source_table, Number(target.source_rowid), field, overviewTime || undefined);
-  }
-
+  // Views report the active table's rowid; paged views keep no rows, so the
+  // row (for its record_id) is read back when it is not in memory.
   async function handleToggleActiveRowBookmark(rowid: number, field?: string) {
     if (!activeTab) return;
-    const row = activeTab.data?.rows.find((entry) => Number((entry as Record<string, unknown>).__rowid) === rowid);
-    await handleToggleSourceAwareBookmark(row, activeTab.file.fullPath, activeTab.file.tableName, rowid, field);
+    const { fullPath, tableName } = activeTab.file;
+    let row: Record<string, string> | null | undefined = activeTab.data?.rows.find((entry) => Number((entry as Record<string, unknown>).__rowid) === rowid);
+    if (!row?.record_id) {
+      try {
+        row = (await window.api.resultRow(fullPath, tableName, rowid)).row;
+      } catch {
+        setBookmarkError("행을 읽지 못해 북마크를 저장하지 못했습니다.");
+        return;
+      }
+    }
+    await toggleRecordBookmark(selectedHost, fullPath, tableName, row, field);
   }
 
   async function handleToggleTimelineBookmark(entry: TimelineEntry) {
-    await handleToggleSourceAwareBookmark(entry.row, entry.fullPath, entry.table, entry.rowid);
+    await toggleRecordBookmark(selectedHost, entry.fullPath, entry.table, entry.row);
   }
 
   async function handleRemoveBookmark(bookmark: Bookmark) {
@@ -729,7 +699,7 @@ export default function Home() {
       const result = await window.api.toggleBookmark(parentDir(selectedHost.dir), {
         fullPath: bookmark.fullPath,
         tableName: bookmark.tableName,
-        rowid: bookmark.rowid,
+        recordId: bookmark.recordId,
         field: bookmark.field,
       });
       setBookmarks(result);
@@ -774,58 +744,19 @@ export default function Home() {
     setPendingFilter({ column: "__rowid", value: String(h.rowid) });
   }
 
-  // Evidence a search hit points at; the backend attaches it when no row is
-  // embedded (host-root-verified paths only).
-  function searchHitRefs(hit: SearchHit): SourceRef[] {
-    return hit.sourceRefs ?? [];
-  }
-
   function isSearchHitBookmarked(hit: SearchHit): boolean {
-    // Search spans hosts, so compare against every bookmark in the case. The
-    // coordinates are backend-verified absolute paths, so no host guessing.
-    return isRecordBookmarked(allBookmarkRefKeys, { fullPath: hit.fullPath, tableName: hit.tableName, rowid: hit.rowid }, searchHitRefs(hit));
+    // Search spans hosts, so compare against every bookmark in the case.
+    return allBookmarkKeys.has(bookmarkKey(hit.tableName, hit.recordId));
   }
 
-  // Search results can belong to any registered host. Persist the exact raw
-  // record against that hit's host/case, rather than the currently selected
-  // host, so the common detail panel and analysis-info view stay synchronized.
+  // A search hit belongs to its own host, not necessarily the selected one.
   async function handleToggleSearchHitBookmark(h: SearchHit) {
-    const target =
-      selectedCase?.hosts.find((host) => host.id === h.hostId) ??
-      (!h.hostId ? selectedCase?.hosts.find((host) => {
-        const sourcePath = h.fullPath.replace(/\\/g, "/").replace(/\/+$/, "");
-        const hostPath = host.dir.replace(/\\/g, "/").replace(/\/+$/, "");
-        return sourcePath === hostPath || sourcePath.startsWith(`${hostPath}/`);
-      }) : undefined);
+    const target = selectedCase?.hosts.find((host) => host.id === h.hostId);
     if (!target) {
       setBookmarkError("검색 결과의 호스트를 찾을 수 없어 북마크를 저장하지 못했습니다.");
       return;
     }
-    try {
-      // With several origins the analyst picks the record in the detail panel's
-      // source list; the result list never guesses a representative origin.
-      const refs = searchHitRefs(h);
-      if (refs.length > 1) {
-        setBookmarkError("여러 원본에 연결된 기록은 현재 북마크를 지원하지 않습니다.");
-        return;
-      }
-      const [ref] = refs;
-      const fullPath = ref?.fullPath ?? h.fullPath;
-      const tableName = ref?.tableName ?? h.tableName;
-      const rowid = ref?.rowid ?? h.rowid;
-      const result = await window.api.toggleBookmark(parentDir(target.dir), {
-        fullPath,
-        tableName,
-        rowid,
-        field: undefined,
-        hostId: target.id,
-        hostName: target.name,
-      });
-      setBookmarks(result);
-      setBookmarkError(null);
-    } catch {
-      setBookmarkError("북마크를 저장하지 못했습니다. 분석 저장소 권한을 확인하세요.");
-    }
+    await toggleRecordBookmark(target, h.fullPath, h.tableName, { record_id: h.recordId, timestamp: h.timestamp });
   }
 
   const activeTab = tabs.find((t) => keyOf(t.file) === activePath) ?? null;
@@ -841,51 +772,31 @@ export default function Home() {
     () => bookmarks.filter((bookmark) => !bookmark.hostId || bookmark.hostId === selectedHost?.id),
     [bookmarks, selectedHost?.id],
   );
-  // Bookmark identities — compared only by source coordinates (file, table, rowid, field).
-  const hostBookmarkRefKeys = useMemo(() => bookmarkRefKeys(bookmarksForCurrentHost), [bookmarksForCurrentHost]);
-  const allBookmarkRefKeys = useMemo(() => bookmarkRefKeys(bookmarks), [bookmarks]);
-  // A list row is starred when its own coordinates are bookmarked or one of the
-  // source records it points at is (shared overview/search/timeline state).
+  // Bookmark identities (docs-20): table + record_id + field.
+  const hostBookmarkKeys = useMemo(() => bookmarkKeys(bookmarksForCurrentHost), [bookmarksForCurrentHost]);
+  const allBookmarkKeys = useMemo(() => bookmarkKeys(bookmarks), [bookmarks]);
   const activeBookmarkedRowids = useMemo(() => {
     if (!activeTab?.data) return undefined;
-    const file = activeTab.file;
+    const tableName = activeTab.file.tableName;
     return new Set(
       activeTab.data.rows
-        .filter((row) => {
-          const rowid = Number((row as Record<string, unknown>).__rowid);
-          if (!Number.isSafeInteger(rowid)) return false;
-          return isRecordBookmarked(hostBookmarkRefKeys, { fullPath: file.fullPath, tableName: file.tableName, rowid }, parseSourceRefs(row.__source_refs));
-        })
+        .filter((row) => row.record_id && hostBookmarkKeys.has(bookmarkKey(tableName, row.record_id)))
         .map((row) => Number((row as Record<string, unknown>).__rowid)),
     );
-  }, [activeTab, hostBookmarkRefKeys]);
-  // AI conversation rows bookmark like other overview rows: through their
-  // own coordinates and source refs (bookmark redesign: viewer-20).
+  }, [activeTab, hostBookmarkKeys]);
   const aiConversationsFile = overviewFiles?.find((file) => file.tableName === "AiConversations") ?? null;
   const isAiRowBookmarked = useCallback(
-    (row: Record<string, string>) => {
-      const rowid = Number((row as Record<string, unknown>).__rowid);
-      if (!aiConversationsFile || !Number.isSafeInteger(rowid)) return false;
-      return isRecordBookmarked(hostBookmarkRefKeys, { fullPath: aiConversationsFile.fullPath, tableName: aiConversationsFile.tableName, rowid }, parseSourceRefs(row.__source_refs));
-    },
-    [aiConversationsFile, hostBookmarkRefKeys],
+    (row: Record<string, string>) => Boolean(aiConversationsFile && row.record_id && hostBookmarkKeys.has(bookmarkKey(aiConversationsFile.tableName, row.record_id))),
+    [aiConversationsFile, hostBookmarkKeys],
   );
-  // Bookmark state and toggle for one raw record — shared by the detail panel's
-  // source list and the AI conversation modal.
-  const isRawRecordBookmarked = useCallback(
-    (fullPath: string, tableName: string, rowid: number) =>
-      bookmarksForCurrentHost.some((bookmark) => bookmark.fullPath === fullPath && bookmark.tableName === tableName && bookmark.rowid === rowid && !bookmark.field),
-    [bookmarksForCurrentHost],
+  // FileSystemEntries detail: the stored PathReferences row of a reference.
+  const pathReferencesFile = overviewFiles?.find((file) => file.tableName === "PathReferences") ?? null;
+  const isPathReferenceBookmarked = useCallback(
+    (row: Record<string, string>) => Boolean(row.record_id && hostBookmarkKeys.has(bookmarkKey("PathReferences", row.record_id))),
+    [hostBookmarkKeys],
   );
-  const bookmarkRawRecordRef = useRef<(fullPath: string, tableName: string, rowid: number) => void>(() => {});
-  bookmarkRawRecordRef.current = (fullPath: string, tableName: string, rowid: number) => {
-    void handleToggleBookmark(fullPath, tableName, rowid);
-  };
-  const bookmarkRawRecord = useCallback((fullPath: string, tableName: string, rowid: number) => {
-    bookmarkRawRecordRef.current(fullPath, tableName, rowid);
-  }, []);
   const isTimelineEntryBookmarked = (entry: TimelineEntry) =>
-    isRecordBookmarked(hostBookmarkRefKeys, { fullPath: entry.fullPath, tableName: entry.table, rowid: entry.rowid }, parseSourceRefs(entry.row.__source_refs));
+    Boolean(entry.row.record_id && hostBookmarkKeys.has(bookmarkKey(entry.table, entry.row.record_id)));
   // Opens a source record in place from the detail panel's source list. Paths
   // are backend-verified inside the host root; the row is filtered by rowid.
   const openRecordRef = useRef<(fullPath: string, tableName: string, rowid: number) => void>(() => {});
@@ -903,34 +814,22 @@ export default function Home() {
     openRecordRef.current(fullPath, tableName, rowid);
   }, []);
   // The result table currently open: the shared detail panel reads
-  // source_records with these coordinates and opens/bookmarks source rows.
+  // source_records with these coordinates and opens source rows.
   // Virtual tabs override the coordinates and inherit the actions.
   const recordScope = useMemo(
     () => ({
       fullPath: activeTab?.file.fullPath ?? "",
       tableName: activeTab?.file.tableName ?? "",
       openRecord,
-      bookmarkSource: bookmarkRawRecord,
-      isSourceBookmarked: isRawRecordBookmarked,
     }),
-    [activeTab?.file.fullPath, activeTab?.file.tableName, openRecord, bookmarkRawRecord, isRawRecordBookmarked],
+    [activeTab?.file.fullPath, activeTab?.file.tableName, openRecord],
   );
-  // Server-paginated views (file system, USN, browser) keep no rows in the tab,
-  // and bookmarks live on the raw source record — match each row through the
-  // source coordinates it carries. `field` selects a per-timestamp bookmark.
+  // Server-paginated views (file system, USN, browser) keep no rows in the
+  // tab; each row is matched by its record_id. `field` = per-timestamp bookmark.
   const isActiveRowBookmarked = useCallback(
-    (row: Record<string, string>, field?: string) => {
-      if (!activeTab) return false;
-      const rowid = Number((row as Record<string, unknown>).__rowid);
-      if (!Number.isSafeInteger(rowid)) return false;
-      return isRecordBookmarked(
-        hostBookmarkRefKeys,
-        { fullPath: activeTab.file.fullPath, tableName: activeTab.file.tableName, rowid },
-        parseSourceRefs(row.__source_refs),
-        field,
-      );
-    },
-    [activeTab, hostBookmarkRefKeys],
+    (row: Record<string, string>, field?: string) =>
+      Boolean(activeTab && row.record_id && hostBookmarkKeys.has(bookmarkKey(activeTab.file.tableName, row.record_id, field))),
+    [activeTab, hostBookmarkKeys],
   );
 
   // A parse keeps running in the Electron main process even after we leave the
@@ -1125,10 +1024,10 @@ export default function Home() {
               (getArtifactView(activeTab.file.name)?.customView === "mft" ? (
                 <MftView
                   dbPath={activeTab.file.fullPath}
-                  bookmarkKeys={hostBookmarkRefKeys}
+                  isRowBookmarked={isActiveRowBookmarked}
                   onToggleBookmark={(rowid, field) => handleToggleActiveRowBookmark(rowid, field)}
-                  allBookmarks={bookmarks}
-                  onBookmarkRef={(fullPath, tableName, rowid, field) => handleToggleBookmark(fullPath, tableName, rowid, field)}
+                  isReferenceBookmarked={isPathReferenceBookmarked}
+                  onToggleReferenceBookmark={pathReferencesFile ? (row) => { void toggleRecordBookmark(selectedHost, pathReferencesFile.fullPath, pathReferencesFile.tableName, row); } : undefined}
                 />
               ) : getArtifactView(activeTab.file.name)?.customView === "targetInfo" ? (
                 <TargetInfoView
@@ -1140,8 +1039,6 @@ export default function Home() {
                   onFetchLinkedRows={fetchLinkedRows}
                   isRowBookmarked={isActiveRowBookmarked}
                   onToggleBookmark={(rowid, field) => handleToggleActiveRowBookmark(rowid, field)}
-                  eventBookmarks={bookmarks}
-                  onToggleEventBookmark={(fullPath, tableName, rowid) => handleToggleBookmark(fullPath, tableName, rowid)}
                 />
               ) : getArtifactView(activeTab.file.name)?.customView === "executionHistory" ? (
                 <ExecutionHistoryView
@@ -1193,9 +1090,9 @@ export default function Home() {
                   hostDir={selectedHost?.dir ?? ""}
                   timeRange={timeRange}
                   isRowBookmarked={isActiveRowBookmarked}
-                  onToggleBookmark={(row) => { void handleToggleSourceAwareBookmark(row, activeTab.file.fullPath, activeTab.file.tableName, Number((row as Record<string, unknown>).__rowid)); }}
+                  onToggleBookmark={(row) => { void toggleRecordBookmark(selectedHost, activeTab.file.fullPath, activeTab.file.tableName, row); }}
                   isAiRowBookmarked={isAiRowBookmarked}
-                  onToggleAiBookmark={aiConversationsFile ? (row) => { void handleToggleSourceAwareBookmark(row, aiConversationsFile.fullPath, aiConversationsFile.tableName, Number((row as Record<string, unknown>).__rowid)); } : undefined}
+                  onToggleAiBookmark={aiConversationsFile ? (row) => { void toggleRecordBookmark(selectedHost, aiConversationsFile.fullPath, aiConversationsFile.tableName, row); } : undefined}
                 />
               ) : getArtifactView(activeTab.file.name)?.customView === "firewall" ? (
                 <FirewallView

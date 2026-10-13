@@ -3986,6 +3986,32 @@ async fn result_row(
         .map_err(|error| format!("행 조회 작업이 중단되었습니다: {error}"))?
 }
 
+/// docs-20: a bookmarked _OVERVIEW row by its record_id (rowids are not kept).
+fn result_row_by_record_id_blocking(
+    full_path: String,
+    table_name: String,
+    record_id: String,
+) -> Result<ResultRow, String> {
+    let conn = open_ro(&full_path)?;
+    let sql = format!("SELECT rowid FROM {} WHERE record_id = ?1 LIMIT 1", q(&table_name));
+    match conn.query_row(&sql, [&record_id], |row| row.get::<_, i64>(0)) {
+        Ok(rowid) => result_row_blocking(full_path, table_name, rowid),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(ResultRow { columns: payload_columns(&conn, &table_name), row: None }),
+        Err(error) => Err(format!("행 조회에 실패했습니다: {error}")),
+    }
+}
+
+#[tauri::command]
+async fn result_row_by_record_id(
+    full_path: String,
+    table_name: String,
+    record_id: String,
+) -> Result<ResultRow, String> {
+    tauri::async_runtime::spawn_blocking(move || result_row_by_record_id_blocking(full_path, table_name, record_id))
+        .await
+        .map_err(|error| format!("행 조회 작업이 중단되었습니다: {error}"))?
+}
+
 #[derive(Serialize)]
 struct ColumnValue {
     value: String,
@@ -6057,13 +6083,8 @@ struct SearchHit {
     match_column: String,
     match_value: String,
     timestamp: String,
-    /// Derived row id. Opening the raw row and bookmarking resolve it through
-    /// source_records; it is not itself a bookmark key.
+    /// Derived row id; also the bookmark key with table_name (docs-20).
     record_id: String,
-    /// Raw evidence identities this hit points at. Search results carry no row
-    /// body, so bookmark state needs this list. Empty for raw hits, where the
-    /// caller uses (full_path, table_name, rowid) directly.
-    source_refs: Vec<SourcePointer>,
 }
 
 #[derive(Serialize)]
@@ -6345,50 +6366,8 @@ fn search_case_blocking(
                             .and_then(|value| value.as_str())
                             .unwrap_or_default()
                             .to_string(),
-                        source_refs: Vec::new(),
                     });
                 }
-            }
-        }
-    }
-    // Search hits carry no row body, so attach only the evidence identities,
-    // batched per file. Stored source_records are read; raw DBs are never
-    // reopened and recomposed.
-    let mut by_file: BTreeMap<String, Vec<usize>> = BTreeMap::new();
-    for (index, hit) in hits.iter().enumerate() {
-        if !hit.record_id.is_empty() {
-            by_file
-                .entry(hit.full_path.clone())
-                .or_default()
-                .push(index);
-        }
-    }
-    for (path, indexes) in by_file {
-        let Ok(conn) = open_ro(&path) else {
-            continue;
-        };
-        let ids: Vec<String> = indexes
-            .iter()
-            .map(|index| hits[*index].record_id.clone())
-            .collect();
-        let pointers = match source_pointers_for(&conn, Path::new(&path), &ids) {
-            Ok(pointers) => pointers,
-            Err(_) => {
-                // Unreadable evidence links are reported, not shown as "none".
-                source_failures.push(format!(
-                    "{}: 원본 연결",
-                    Path::new(&path)
-                        .file_stem()
-                        .map(|stem| stem.to_string_lossy().to_string())
-                        .unwrap_or_default()
-                ));
-                continue;
-            }
-        };
-        for index in indexes {
-            let key = hits[index].record_id.clone();
-            if let Some(refs) = pointers.get(&key) {
-                hits[index].source_refs = refs.clone();
             }
         }
     }
@@ -6432,9 +6411,6 @@ struct FileReference {
     file_record_id: String,
     match_basis: String,
     row: Map<String, Value>,
-    full_path: String,
-    table_name: String,
-    rowid: i64,
 }
 
 /// References for the file records currently on screen, via the stored
@@ -6469,8 +6445,6 @@ fn file_references_blocking(
     if !tables.iter().any(|name| name == "PathReferenceCandidates") {
         return Err("교차 참조 후보 테이블이 없는 이전 결과입니다. 호스트를 다시 파싱하세요.".to_string());
     }
-    let has_sources = tables.iter().any(|name| name == "source_records");
-    let host_root = normalize_bookmark_path(Path::new(host_dir));
     let volume = volume_id.map(str::trim).filter(|value| !value.is_empty());
     let mut out = Vec::new();
     // SQLite bind limit: chunk the requested ids.
@@ -6491,26 +6465,6 @@ fn file_references_blocking(
              ORDER BY c.file_record_id, p.timestamp IS NULL, p.timestamp, p.record_id"
         );
         let rows = query_rows(&conn, &sql, &params)?;
-        // First raw origin per reference, only as the existing bookmark key.
-        let mut first_source: BTreeMap<String, (String, String, i64)> = BTreeMap::new();
-        let record_ids: Vec<String> = rows
-            .iter()
-            .filter_map(|row| row.get("record_id").and_then(Value::as_str).map(str::to_string))
-            .collect();
-        if has_sources && !record_ids.is_empty() {
-            let source_placeholders = vec!["?"; record_ids.len()].join(", ");
-            let source_sql = format!(
-                "SELECT record_id, source_db, source_table, source_rowid FROM \"source_records\" \
-                 WHERE record_id IN ({source_placeholders}) ORDER BY record_id, ordinal DESC"
-            );
-            let source_params: Vec<&dyn rusqlite::ToSql> = record_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
-            for source in query_rows(&conn, &source_sql, &source_params)? {
-                let text = |key: &str| source.get(key).and_then(Value::as_str).unwrap_or("").to_string();
-                let rowid = source.get("source_rowid").and_then(Value::as_i64).unwrap_or(-1);
-                // Ordinal is descending, so the value kept last is ordinal 0.
-                first_source.insert(text("record_id"), (resolve_source_db(&host_root, &text("source_db")), text("source_table"), rowid));
-            }
-        }
         for mut row in rows {
             let mut take = |key: &str| match row.remove(key) {
                 Some(Value::String(value)) => value,
@@ -6518,12 +6472,7 @@ fn file_references_blocking(
             };
             let file_record_id = take("__file_record_id");
             let match_basis = take("__match_basis");
-            let record_id = row.get("record_id").and_then(Value::as_str).unwrap_or("").to_string();
-            let (full_path, table_name, rowid) = first_source
-                .get(&record_id)
-                .cloned()
-                .unwrap_or_else(|| (String::new(), String::new(), -1));
-            out.push(FileReference { file_record_id, match_basis, row, full_path, table_name, rowid });
+            out.push(FileReference { file_record_id, match_basis, row });
         }
     }
     Ok(out)
@@ -6627,19 +6576,17 @@ fn bookmark_targets_missing_host(bookmark: &Value, case_dir: &Path) -> bool {
     !case_dir.join(host_id).join("host.json").is_file()
 }
 
-/// New bookmark IDs include the exact source table as well as the SQLite path
-/// and row. Each variable-length component is URL-safe base64, so the `:`
-/// separators cannot occur inside a component. Existing IDs are intentionally
-/// left untouched: they remain readable/removable/editable through their
-/// stored ID, while every newly created bookmark has collision-free identity.
-fn bookmark_id_v2(full_path: &str, table_name: &str, rowid: i64, field: &str) -> String {
+/// Bookmark identity (docs-20): the _OVERVIEW result file, its table, the
+/// record_id and an optional field. Components are URL-safe base64 so `:`
+/// cannot occur inside one.
+fn bookmark_id_v3(full_path: &str, table_name: &str, record_id: &str, field: &str) -> String {
     use base64::Engine as _;
     let encode = |value: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(value);
     format!(
-        "v2:{}:{}:{}:{}",
+        "v3:{}:{}:{}:{}",
         encode(full_path),
         encode(table_name),
-        rowid,
+        encode(record_id),
         encode(field)
     )
 }
@@ -6737,7 +6684,7 @@ fn list_bookmarks(case_dir: String) -> Result<Vec<Value>, String> {
     let bookmarks = read_bookmarks_path(case_path)?;
     let retained: Vec<Value> = bookmarks
         .iter()
-        .filter(|bookmark| !bookmark_targets_missing_host(bookmark, case_path))
+        .filter(|bookmark| !bookmark_targets_missing_host(bookmark, case_path) && bookmark_record_present(bookmark))
         .cloned()
         .collect();
     if retained.len() != bookmarks.len() {
@@ -6746,16 +6693,40 @@ fn list_bookmarks(case_dir: String) -> Result<Vec<Value>, String> {
     Ok(retained)
 }
 
+/// docs-20: whether a stored bookmark still names an existing _OVERVIEW
+/// record. Legacy raw-coordinate entries (no recordId), a missing result file
+/// and a missing record (re-parse) are not; a result that cannot be read right
+/// now keeps its bookmark.
+fn bookmark_record_present(bookmark: &Value) -> bool {
+    let text = |key: &str| bookmark.get(key).and_then(Value::as_str).unwrap_or_default();
+    let (full_path, table_name, record_id) = (text("fullPath"), text("tableName"), text("recordId"));
+    if record_id.is_empty() || table_name.is_empty() {
+        return false;
+    }
+    if !Path::new(full_path).is_file() {
+        return false;
+    }
+    let Ok(conn) = open_ro(full_path) else {
+        return true;
+    };
+    let sql = format!("SELECT 1 FROM {} WHERE record_id = ?1 LIMIT 1", q(table_name));
+    match conn.query_row(&sql, [record_id], |_| Ok(())) {
+        Ok(()) => true,
+        Err(rusqlite::Error::QueryReturnedNoRows) => false,
+        Err(_) => true,
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BookmarkInput {
+    /// `_OVERVIEW/<table>.sqlite` of the bookmarked record.
     full_path: String,
     table_name: String,
-    rowid: i64,
+    record_id: String,
     #[serde(default)]
     field: Option<String>,
-    /// 개요 행에서 승격된 북마크의 사건 시각. 원시 레코드(Registry 등)에는
-    /// 실행 시각이 없어 last_write 같은 엉뚱한 시각으로 배치되는 것을 막는다.
+    /// Time shown when the bookmark was set (field value or row timestamp).
     #[serde(default)]
     event_time: Option<String>,
     #[serde(default)]
@@ -6764,20 +6735,20 @@ struct BookmarkInput {
     host_name: Option<String>,
 }
 
-/// Whether a bookmark target is a derived row (a contract DB's primary table).
-/// A derived record_id is reissued per result generation, so it cannot stand in
-/// for the raw bookmark key: the analyst picks the raw row/field from the detail
-/// evidence list (docs-24 §5). Already stored bookmarks, including removal, are
-/// unaffected by this check.
-fn is_derived_contract_target(full_path: &str, table_name: &str) -> bool {
+/// docs-20: only an existing record of a contract DB's primary table can be
+/// bookmarked; raw tables are evidence reached through source_records.
+fn overview_record_exists(full_path: &str, table_name: &str, record_id: &str) -> bool {
     let Ok(conn) = open_ro(full_path) else {
         return false;
     };
     if overview_contract_version(&conn) != Some(OVERVIEW_CONTRACT_VERSION) {
         return false;
     }
-    primary_table_name(Path::new(full_path))
-        .is_some_and(|primary| primary.eq_ignore_ascii_case(table_name))
+    if !primary_table_name(Path::new(full_path)).is_some_and(|primary| primary.eq_ignore_ascii_case(table_name)) {
+        return false;
+    }
+    let sql = format!("SELECT 1 FROM {} WHERE record_id = ?1 LIMIT 1", q(table_name));
+    conn.query_row(&sql, [record_id], |_| Ok(())).is_ok()
 }
 
 #[tauri::command]
@@ -6788,24 +6759,21 @@ fn toggle_bookmark(case_dir: String, entry: BookmarkInput) -> Result<Vec<Value>,
     let idx = bookmarks.iter().position(|b| {
         b.get("fullPath").and_then(|v| v.as_str()) == Some(entry.full_path.as_str())
             && b.get("tableName").and_then(|v| v.as_str()) == Some(entry.table_name.as_str())
-            && b.get("rowid").and_then(|v| v.as_i64()) == Some(entry.rowid)
+            && b.get("recordId").and_then(|v| v.as_str()) == Some(entry.record_id.as_str())
             && b.get("field").and_then(|v| v.as_str()).unwrap_or("") == field
     });
     if let Some(i) = idx {
         bookmarks.remove(i);
     } else {
-        if is_derived_contract_target(&entry.full_path, &entry.table_name) {
-            return Err(
-                "분석 결과 행은 직접 북마크하지 않습니다. 상세의 원본 근거에서 원본 행을 선택해 북마크하세요."
-                    .to_string(),
-            );
+        if !overview_record_exists(&entry.full_path, &entry.table_name, &entry.record_id) {
+            return Err("분석 결과 행만 북마크할 수 있습니다.".to_string());
         }
-        let id = bookmark_id_v2(&entry.full_path, &entry.table_name, entry.rowid, &field);
+        let id = bookmark_id_v3(&entry.full_path, &entry.table_name, &entry.record_id, &field);
         let mut b = Map::new();
         b.insert("id".into(), Value::from(id));
         b.insert("fullPath".into(), Value::from(entry.full_path));
         b.insert("tableName".into(), Value::from(entry.table_name));
-        b.insert("rowid".into(), Value::from(entry.rowid));
+        b.insert("recordId".into(), Value::from(entry.record_id));
         if !field.is_empty() {
             b.insert("field".into(), Value::from(field));
         }
@@ -6814,14 +6782,8 @@ fn toggle_bookmark(case_dir: String, entry: BookmarkInput) -> Result<Vec<Value>,
         }
         b.insert("note".into(), Value::from(""));
         b.insert("taggedAt".into(), Value::from(now_iso()));
-        b.insert(
-            "hostId".into(),
-            Value::from(entry.host_id.unwrap_or_default()),
-        );
-        b.insert(
-            "hostName".into(),
-            Value::from(entry.host_name.unwrap_or_default()),
-        );
+        b.insert("hostId".into(), Value::from(entry.host_id.unwrap_or_default()));
+        b.insert("hostName".into(), Value::from(entry.host_name.unwrap_or_default()));
         bookmarks.push(Value::Object(b));
     }
     write_bookmarks(&case_dir, &bookmarks)?;
@@ -6955,62 +6917,121 @@ mod bookmark_tests {
         directory
     }
 
-    fn create_host_directory(case_dir: &Path, host_id: &str) {
+    /// Host with `_OVERVIEW/Evidence.sqlite` (contract DB) holding `records`.
+    fn create_host(case_dir: &Path, host_id: &str, records: &[&str]) -> String {
         let host_dir = case_dir.join(host_id);
-        std::fs::create_dir_all(&host_dir).unwrap();
+        std::fs::create_dir_all(host_dir.join("_OVERVIEW")).unwrap();
         std::fs::write(host_dir.join("host.json"), "{}").unwrap();
-    }
-
-    fn bookmark(id: &str, full_path: impl Into<String>, host_id: Option<&str>) -> Value {
-        let mut value = serde_json::json!({
-            "id": id,
-            "fullPath": full_path.into(),
-            "tableName": "Evidence",
-            "rowid": 1,
-            "note": "",
-            "taggedAt": "2026-01-01T00:00:00.000Z",
-        });
-        if let Some(host_id) = host_id {
-            value
-                .as_object_mut()
-                .unwrap()
-                .insert("hostId".into(), Value::from(host_id));
+        let path = host_dir.join("_OVERVIEW").join("Evidence.sqlite");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE Evidence (record_id TEXT, timestamp TEXT, detail TEXT);\
+             CREATE TABLE _wina_derived_version (name TEXT, version INTEGER);\
+             INSERT INTO _wina_derived_version VALUES ('overview_contract', 1);",
+        )
+        .unwrap();
+        for record in records {
+            conn.execute("INSERT INTO Evidence VALUES (?1, '2026-01-01 00:00:00.000', 'x')", [record]).unwrap();
         }
-        value
+        path.to_string_lossy().to_string()
     }
 
-    fn entry(table_name: &str) -> BookmarkInput {
+    fn entry(full_path: &str, record_id: &str, field: Option<&str>, host_id: &str) -> BookmarkInput {
         BookmarkInput {
-            full_path: "/evidence/combined.sqlite".to_string(),
-            table_name: table_name.to_string(),
-            rowid: 42,
-            field: None,
-            event_time: None,
-            host_id: Some("host-a".to_string()),
-            host_name: Some("HOST-A".to_string()),
+            full_path: full_path.to_string(),
+            table_name: "Evidence".to_string(),
+            record_id: record_id.to_string(),
+            field: field.map(str::to_string),
+            event_time: Some("2026-01-01 00:00:00.000".to_string()),
+            host_id: Some(host_id.to_string()),
+            host_name: Some(host_id.to_uppercase()),
         }
+    }
+
+    fn ids(values: &[Value]) -> Vec<String> {
+        values.iter().filter_map(|value| value.get("id").and_then(Value::as_str).map(str::to_owned)).collect()
+    }
+
+    /// docs-20: a bookmark names one _OVERVIEW record (and optional field);
+    /// toggling the same target removes it.
+    #[test]
+    fn toggle_adds_and_removes_an_overview_record_bookmark() {
+        let case_dir = temporary_case_dir("bookmark-toggle");
+        let db = create_host(&case_dir, "host-a", &["r1"]);
+        let dir = case_dir.to_string_lossy().to_string();
+        let added = toggle_bookmark(dir.clone(), entry(&db, "r1", None, "host-a")).unwrap();
+        assert_eq!(added.len(), 1);
+        assert_eq!(added[0]["recordId"], "r1");
+        assert_eq!(added[0]["tableName"], "Evidence");
+        assert_eq!(added[0]["hostId"], "host-a");
+        assert_eq!(added[0]["eventTime"], "2026-01-01 00:00:00.000");
+        assert!(added[0].get("rowid").is_none());
+        assert!(added[0]["id"].as_str().unwrap().starts_with("v3:"));
+        // A field bookmark on the same record is a separate target.
+        let both = toggle_bookmark(dir.clone(), entry(&db, "r1", Some("timestamp"), "host-a")).unwrap();
+        assert_eq!(both.len(), 2);
+        let removed = toggle_bookmark(dir.clone(), entry(&db, "r1", None, "host-a")).unwrap();
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0]["field"], "timestamp");
+        let _ = std::fs::remove_dir_all(case_dir);
+    }
+
+    /// Raw tables and records that do not exist are not bookmark targets.
+    #[test]
+    fn raw_tables_and_missing_records_are_rejected() {
+        let case_dir = temporary_case_dir("bookmark-reject");
+        let db = create_host(&case_dir, "host-a", &["r1"]);
+        let raw = case_dir.join("host-a").join("Raw.sqlite");
+        Connection::open(&raw).unwrap().execute_batch("CREATE TABLE Evidence (record_id TEXT); INSERT INTO Evidence VALUES ('r1');").unwrap();
+        let dir = case_dir.to_string_lossy().to_string();
+        assert!(toggle_bookmark(dir.clone(), entry(&raw.to_string_lossy(), "r1", None, "host-a")).is_err());
+        assert!(toggle_bookmark(dir.clone(), entry(&db, "nope", None, "host-a")).is_err());
+        assert!(read_bookmarks(&dir).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(case_dir);
+    }
+
+    /// Re-parse replaces record ids: listing drops bookmarks whose record is
+    /// gone, whose file is gone, legacy raw-coordinate entries and missing
+    /// hosts; an unreadable result keeps its bookmark.
+    #[test]
+    fn listing_prunes_bookmarks_whose_record_no_longer_exists() {
+        let case_dir = temporary_case_dir("bookmark-prune");
+        let db = create_host(&case_dir, "host-a", &["r1", "r2"]);
+        let dir = case_dir.to_string_lossy().to_string();
+        toggle_bookmark(dir.clone(), entry(&db, "r1", None, "host-a")).unwrap();
+        toggle_bookmark(dir.clone(), entry(&db, "r2", None, "host-a")).unwrap();
+        let mut stored = read_bookmarks(&dir).unwrap();
+        stored.push(serde_json::json!({"id": "legacy", "fullPath": db, "tableName": "Evidence", "rowid": 1, "hostId": "host-a", "note": "", "taggedAt": ""}));
+        stored.push(serde_json::json!({"id": "gone-host", "fullPath": "/x/_OVERVIEW/Evidence.sqlite", "tableName": "Evidence", "recordId": "r9", "hostId": "removed-host", "note": "", "taggedAt": ""}));
+        let unreadable = case_dir.join("host-a").join("_OVERVIEW").join("Broken.sqlite");
+        std::fs::write(&unreadable, vec![0_u8; 128]).unwrap();
+        stored.push(serde_json::json!({"id": "unreadable", "fullPath": unreadable.to_string_lossy(), "tableName": "Broken", "recordId": "r1", "hostId": "host-a", "note": "", "taggedAt": ""}));
+        stored.push(serde_json::json!({"id": "missing-file", "fullPath": case_dir.join("host-a").join("_OVERVIEW").join("Gone.sqlite").to_string_lossy(), "tableName": "Gone", "recordId": "r1", "hostId": "host-a", "note": "", "taggedAt": ""}));
+        write_bookmarks(&dir, &stored).unwrap();
+        // Simulate a re-parse that no longer has r2.
+        Connection::open(&db).unwrap().execute("DELETE FROM Evidence WHERE record_id='r2'", []).unwrap();
+
+        let listed = list_bookmarks(dir.clone()).unwrap();
+        let kept = ids(&listed);
+        assert_eq!(kept.len(), 2, "{kept:?}");
+        assert!(kept.iter().any(|id| id == "unreadable"));
+        assert!(listed.iter().any(|value| value["recordId"] == "r1" && value["tableName"] == "Evidence"));
+        assert_eq!(read_bookmarks(&dir).unwrap(), listed);
+        let _ = std::fs::remove_dir_all(case_dir);
     }
 
     #[test]
     fn concurrent_bookmark_toggles_preserve_every_record() {
-        let case_dir = std::env::temp_dir().join(format!(
-            "wina-bookmark-race-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos(),
-        ));
-        std::fs::create_dir_all(&case_dir).unwrap();
+        let case_dir = temporary_case_dir("bookmark-race");
+        let records: Vec<String> = (0..40).map(|index| format!("r{index}")).collect();
+        let db = create_host(&case_dir, "host-a", &records.iter().map(String::as_str).collect::<Vec<_>>());
         let dir = case_dir.to_string_lossy().to_string();
         let handles: Vec<_> = (0..8)
             .map(|worker| {
-                let dir = dir.clone();
+                let (dir, db) = (dir.clone(), db.clone());
                 std::thread::spawn(move || {
                     for step in 0..5 {
-                        let mut item = entry("Registry");
-                        item.rowid = (worker * 100 + step) as i64;
-                        toggle_bookmark(dir.clone(), item).unwrap();
+                        toggle_bookmark(dir.clone(), entry(&db, &format!("r{}", worker * 5 + step), None, "host-a")).unwrap();
                     }
                 })
             })
@@ -7018,235 +7039,33 @@ mod bookmark_tests {
         for handle in handles {
             handle.join().unwrap();
         }
-        let stored = read_bookmarks(&dir).unwrap();
-        assert_eq!(stored.len(), 40, "겹친 토글이 서로의 저장을 덮어쓰면 안 된다");
-        std::fs::remove_dir_all(case_dir).unwrap();
-    }
-
-    #[test]
-    fn bookmark_identity_keeps_same_rowid_in_different_tables_independent() {
-        let case_dir = std::env::temp_dir().join(format!(
-            "windows-analysis-bookmark-identity-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos(),
-        ));
-        std::fs::create_dir_all(&case_dir).unwrap();
-        create_host_directory(&case_dir, "host-a");
-        let case_dir = case_dir.to_string_lossy().to_string();
-
-        // Pre-v2 bookmarks did not include a table in their ID. Preserve them
-        // as-is so existing annotations remain available and editable.
-        let legacy_id = "/evidence/combined.sqlite#21";
-        write_bookmarks(
-            &case_dir,
-            &[serde_json::json!({
-                "id": legacy_id,
-                "fullPath": "/evidence/combined.sqlite",
-                "tableName": "LegacyEvidence",
-                "rowid": 21,
-                "note": "legacy note",
-                "taggedAt": "2026-01-01T00:00:00.000Z",
-            })],
-        )
-        .unwrap();
-
-        let first = toggle_bookmark(case_dir.clone(), entry("BrowserActivity")).unwrap();
-        assert_eq!(first.len(), 2);
-
-        // A source SQLite can contain multiple tables, each with rowid 42.
-        // Toggling one table must not remove a bookmark for the other table.
-        let second = toggle_bookmark(case_dir.clone(), entry("OtherEvidence")).unwrap();
-        assert_eq!(second.len(), 3);
-        let bookmark_id_for = |table_name: &str| {
-            second
-                .iter()
-                .find(|bookmark| {
-                    bookmark.get("tableName").and_then(Value::as_str) == Some(table_name)
-                })
-                .and_then(|bookmark| bookmark.get("id").and_then(Value::as_str))
-                .expect("bookmark should exist")
-                .to_string()
-        };
-        let browser_id = bookmark_id_for("BrowserActivity");
-        let other_id = bookmark_id_for("OtherEvidence");
-        assert_ne!(browser_id, other_id);
-        assert!(browser_id.starts_with("v2:"));
-
-        // Updating a note addresses one full bookmark identity, not every
-        // same-rowid record in the source SQLite.
-        let updated =
-            update_bookmark_note(case_dir.clone(), browser_id, "browser note".to_string()).unwrap();
-        assert_eq!(
-            updated
-                .iter()
-                .find(|bookmark| bookmark.get("tableName").and_then(Value::as_str)
-                    == Some("BrowserActivity"))
-                .and_then(|bookmark| bookmark.get("note"))
-                .and_then(Value::as_str),
-            Some("browser note"),
-        );
-        assert_eq!(
-            updated
-                .iter()
-                .find(|bookmark| bookmark.get("tableName").and_then(Value::as_str)
-                    == Some("OtherEvidence"))
-                .and_then(|bookmark| bookmark.get("note"))
-                .and_then(Value::as_str),
-            Some(""),
-        );
-
-        let after_browser_toggle =
-            toggle_bookmark(case_dir.clone(), entry("BrowserActivity")).unwrap();
-        assert_eq!(after_browser_toggle.len(), 2);
-        assert_eq!(
-            after_browser_toggle
-                .iter()
-                .find(|bookmark| bookmark.get("tableName").and_then(Value::as_str)
-                    == Some("OtherEvidence"))
-                .and_then(|bookmark| bookmark.get("id"))
-                .and_then(Value::as_str),
-            Some(other_id.as_str()),
-        );
-        assert!(after_browser_toggle
-            .iter()
-            .any(|bookmark| bookmark.get("id").and_then(Value::as_str) == Some(legacy_id)));
-        assert_eq!(list_bookmarks(case_dir.clone()).unwrap().len(), 2);
-
+        assert_eq!(read_bookmarks(&dir).unwrap().len(), 40, "겹친 토글이 서로의 저장을 덮어쓰면 안 된다");
         let _ = std::fs::remove_dir_all(case_dir);
     }
 
     #[test]
     fn deleting_host_removes_only_its_case_bookmarks() {
         let case_dir = temporary_case_dir("bookmark-host-delete");
-        create_host_directory(&case_dir, "removed-host");
-        create_host_directory(&case_dir, "retained-host");
-
-        let removed_path = case_dir
-            .join("view")
-            .join("..")
-            .join("removed-host")
-            .join("EVENTLOG")
-            .join("Security.sqlite")
-            .to_string_lossy()
-            .to_string();
-        let retained_path = case_dir
-            .join("retained-host")
-            .join("EVENTLOG")
-            .join("Security.sqlite")
-            .to_string_lossy()
-            .to_string();
-        let outside_path = std::env::temp_dir()
-            .join("unattributed.sqlite")
-            .to_string_lossy()
-            .to_string();
-        write_bookmarks_path(
-            &case_dir,
-            &[
-                // Modern annotation: host identity is enough even when the
-                // source file itself has already gone away.
-                bookmark(
-                    "removed-by-id",
-                    "/missing/source.sqlite",
-                    Some("removed-host"),
-                ),
-                // Legacy annotation: match its normalised source directory.
-                bookmark("removed-by-path", removed_path, None),
-                bookmark(
-                    "retained-by-id",
-                    retained_path.clone(),
-                    Some("retained-host"),
-                ),
-                // Host identity wins over a stale/misrecorded source path.
-                bookmark(
-                    "retained-conflicting-path",
-                    case_dir
-                        .join("removed-host")
-                        .join("old.sqlite")
-                        .to_string_lossy(),
-                    Some("retained-host"),
-                ),
-                bookmark("retained-legacy", retained_path, None),
-                bookmark("outside-legacy", outside_path, None),
-            ],
-        )
-        .unwrap();
-
+        let removed = create_host(&case_dir, "removed-host", &["r1"]);
+        let retained = create_host(&case_dir, "retained-host", &["r1"]);
+        let dir = case_dir.to_string_lossy().to_string();
+        toggle_bookmark(dir.clone(), entry(&removed, "r1", None, "removed-host")).unwrap();
+        toggle_bookmark(dir.clone(), entry(&retained, "r1", None, "retained-host")).unwrap();
         assert!(delete_host_dir_and_bookmarks(&case_dir, "removed-host"));
         assert!(!case_dir.join("removed-host").exists());
-        let ids: Vec<String> = read_bookmarks_path(&case_dir)
-            .unwrap()
-            .iter()
-            .filter_map(|value| value.get("id").and_then(Value::as_str).map(str::to_owned))
-            .collect();
-        assert_eq!(
-            ids,
-            [
-                "retained-by-id",
-                "retained-conflicting-path",
-                "retained-legacy",
-                "outside-legacy"
-            ]
-        );
-
+        let stored = read_bookmarks_path(&case_dir).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0]["hostId"], "retained-host");
         let _ = std::fs::remove_dir_all(case_dir);
     }
 
     #[test]
-    fn listing_bookmarks_prunes_only_entries_attributable_to_missing_hosts() {
-        let case_dir = temporary_case_dir("bookmark-stale-prune");
-        create_host_directory(&case_dir, "retained-host");
-        let retained_path = case_dir
-            .join("retained-host")
-            .join("REGISTRY")
-            .join("Registry.sqlite")
-            .to_string_lossy()
-            .to_string();
-        let stale_path = case_dir
-            .join("view")
-            .join("..")
-            .join("removed-host")
-            .join("REGISTRY")
-            .join("Registry.sqlite")
-            .to_string_lossy()
-            .to_string();
-        let outside_path = std::env::temp_dir()
-            .join("unattributed.sqlite")
-            .to_string_lossy()
-            .to_string();
-        write_bookmarks_path(
-            &case_dir,
-            &[
-                bookmark(
-                    "retained-by-id",
-                    retained_path.clone(),
-                    Some("retained-host"),
-                ),
-                // Do not infer a missing source row as a deleted host. The
-                // host still exists, so this remains the analyst's bookmark.
-                bookmark("retained-legacy", retained_path, None),
-                bookmark(
-                    "stale-by-id",
-                    "/missing/source.sqlite",
-                    Some("removed-host"),
-                ),
-                bookmark("stale-legacy", stale_path, None),
-                // Source paths outside this case are not safe to attribute.
-                bookmark("outside-legacy", outside_path, None),
-            ],
-        )
-        .unwrap();
-
-        let listed = list_bookmarks(case_dir.to_string_lossy().to_string()).unwrap();
-        let ids: Vec<String> = listed
-            .iter()
-            .filter_map(|value| value.get("id").and_then(Value::as_str).map(str::to_owned))
-            .collect();
-        assert_eq!(ids, ["retained-by-id", "retained-legacy", "outside-legacy"]);
-        assert_eq!(read_bookmarks_path(&case_dir).unwrap(), listed);
-
+    fn analysis_view_reads_a_row_by_record_id() {
+        let case_dir = temporary_case_dir("bookmark-row");
+        let db = create_host(&case_dir, "host-a", &["r1", "r2"]);
+        let row = result_row_by_record_id_blocking(db.clone(), "Evidence".into(), "r2".into()).unwrap();
+        assert_eq!(row.row.as_ref().and_then(|row| row.get("record_id")).and_then(Value::as_str), Some("r2"));
+        assert!(result_row_by_record_id_blocking(db, "Evidence".into(), "nope".into()).unwrap().row.is_none());
         let _ = std::fs::remove_dir_all(case_dir);
     }
 
@@ -7254,10 +7073,7 @@ mod bookmark_tests {
     fn malformed_bookmark_file_is_reported_instead_of_looking_empty() {
         let case_dir = temporary_case_dir("bookmark-malformed");
         std::fs::write(case_dir.join("bookmarks.json"), "{ not valid json").unwrap();
-
-        let result = list_bookmarks(case_dir.to_string_lossy().to_string());
-        assert!(result.is_err());
-
+        assert!(list_bookmarks(case_dir.to_string_lossy().to_string()).is_err());
         let _ = std::fs::remove_dir_all(case_dir);
     }
 }
@@ -8786,7 +8602,6 @@ mod overview_contract_tests {
         assert_eq!(refs[0].file_record_id, "r2");
         assert_eq!(refs[0].match_basis, "path_and_drive");
         assert_eq!(refs[0].row.get("access_count").and_then(Value::as_i64), Some(8), "INTEGER stays typed");
-        assert_eq!(refs[0].rowid, -1, "no raw origin, no bookmark key");
         assert_eq!(file_references_blocking(&host, "d", None, &["r2".to_string()]).unwrap().len(), 2);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -8855,51 +8670,13 @@ mod overview_contract_tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    #[test]
-    fn derived_rows_are_not_bookmark_targets_but_raw_rows_still_are() {
-        let root = temp_root("bookmark");
-        let overview = root.join("_OVERVIEW");
-        std::fs::create_dir_all(&overview).unwrap();
-        let db = write_file_system_entries(&overview);
-        let case_dir = root.to_string_lossy().to_string();
-        let entry = |full_path: &Path, table: &str| BookmarkInput {
-            full_path: full_path.to_string_lossy().to_string(),
-            table_name: table.to_string(),
-            rowid: 2,
-            field: None,
-            event_time: None,
-            host_id: Some("host-1".to_string()),
-            host_name: Some("HOST-1".to_string()),
-        };
-
-        // A derived row gets a new record_id per generation, so it is not a
-        // bookmark target; the analyst picks the raw evidence instead.
-        assert!(toggle_bookmark(case_dir.clone(), entry(&db, "FileSystemEntries")).is_err());
-
-        // Raw facts rows stay bookmarkable.
-        let facts = overview.join("MFT_Records.sqlite");
-        Connection::open(&facts)
-            .unwrap()
-            .execute_batch(
-                "CREATE TABLE MFT_Records (volume_id TEXT NOT NULL, _source_file TEXT NOT NULL);
-                 INSERT INTO MFT_Records VALUES ('v1','C:\\$MFT');
-                 INSERT INTO MFT_Records VALUES ('v1','C:\\$MFT')",
-            )
-            .unwrap();
-        let saved = toggle_bookmark(case_dir.clone(), entry(&facts, "MFT_Records")).unwrap();
-        assert_eq!(saved.len(), 1);
-        // Stored bookmarks can still be removed.
-        let cleared = toggle_bookmark(case_dir, entry(&facts, "MFT_Records")).unwrap();
-        assert!(cleared.is_empty());
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    /// Regression for the shared bookmark key across raw, overview and search.
-    /// It checks identity sharing, not column wiring: duplicate evidence for the
+    /// Page rows carry their raw evidence identities (used by the master
+    /// timeline to show a shared source once).
+    /// Duplicate evidence for the
     /// same raw row collapses, distinct artifacts are all kept, and origins
     /// outside the host root are dropped.
     #[test]
-    fn page_rows_carry_deduped_raw_source_identities_shared_with_search() {
+    fn page_rows_carry_deduped_raw_source_identities() {
         let root = temp_root("refs");
         let overview = root.join("_OVERVIEW");
         std::fs::create_dir_all(&overview).unwrap();
@@ -8986,22 +8763,6 @@ mod overview_contract_tests {
             .iter()
             .all(|row| !row.contains_key(SOURCE_REFS_KEY)));
 
-        // Search carries the same identity: the derived hit's evidence is the
-        // raw row's (path, table, rowid). Raw facts are not search results
-        // (docs-19), so bookmark state is matched on these pointers.
-        let hosts = vec![SearchHost {
-            id: "host-1".to_string(),
-            name: "HOST-1".to_string(),
-            dir: root.to_string_lossy().to_string(),
-        }];
-        let found = search_case_blocking("a.txt".to_string(), hosts, 0, 50, None, None, None);
-        let derived_hit = found
-            .hits
-            .iter()
-            .find(|hit| hit.table_name == "FileSystemEntries")
-            .expect("derived hit");
-        assert!(found.hits.iter().all(|hit| hit.table_name != "Security"));
-        assert_eq!(derived_hit.source_refs, expected);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -9330,6 +9091,7 @@ fn main() {
             read_result_file_page,
             linked_result_rows,
             result_row,
+            result_row_by_record_id,
             list_column_values,
             mft_children,
             mft_search,
@@ -9394,4 +9156,5 @@ fn main() {
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
+
 
