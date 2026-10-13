@@ -10,6 +10,7 @@ import { STAGE_LABELS } from "./remoteAccess";
 import { RELATION_LABELS as SMB_RELATION_LABELS } from "./smbHistory";
 import { RDP_STATUS_LABELS } from "./rdpCache";
 import { REVIEW_SIGNAL_LABELS } from "./scheduledTasks";
+import { ruleDisplayName } from "./firewallHistory";
 import { CHANGE_LABELS as DEFENDER_CHANGE_LABELS, RESULT_LABELS as DEFENDER_RESULT_LABELS } from "./defenderActivity";
 
 const SMB_DIRECTION_VALUE_LABELS: Record<string, string> = { inbound: "인바운드", outbound: "아웃바운드", unknown: "방향 미확인" };
@@ -1904,41 +1905,80 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
     }],
   },
 
+  // docs-14: stored FirewallHistory columns; unconfirmed event meanings stay as stored.
   FirewallHistory: {
     customView: "firewall",
-    title: (r) => r.rule_name || r.detail || "(규칙 이름 없음)",
-    subtitle: (r) => r.detail || "",
-    visibleColumns: ["timestamp", "event_type", "rule_name", "direction", "action", "app_path", "account"],
-    priorityColumns: ["timestamp", "event_type", "rule_name", "direction", "action", "app_path", "account", "detail"],
+    title: (r) => (r.rule_name ? ruleDisplayName(r.rule_name) : r.event_type || ""),
+    subtitle: (r) => r.app_path_resolved || r.app_path || r.service || "",
+    badges: [{ key: "event_type", kind: "badge" }],
+    visibleColumns: ["timestamp", "event_type", "rule_name", "direction", "action", "protocol", "app_path", "account"],
+    priorityColumns: ["timestamp", "event_type", "rule_name", "direction", "action", "protocol", "app_path", "account"],
     sections: [
       { heading: "규칙", fields: [
-        { key: "rule_name", label: "규칙 이름" },
+        { key: "rule_name", label: "규칙 이름", compute: (r) => (r.rule_name && ruleDisplayName(r.rule_name) !== r.rule_name ? ruleDisplayName(r.rule_name) : r.rule_name) },
+        { key: "rule_name_raw", label: "규칙 이름 원문", kind: "code", compute: (r) => (r.rule_name && ruleDisplayName(r.rule_name) !== r.rule_name ? r.rule_name : "") },
         { key: "rule_id", label: "규칙 ID" },
+        { key: "embedded_context", label: "규칙 그룹" },
         { key: "direction", label: "방향" },
         { key: "action", label: "동작" },
         { key: "protocol", label: "프로토콜" },
         { key: "protocol_number", label: "프로토콜 번호" },
-        { key: "local_address", label: "로컬 주소" },
-        { key: "remote_address", label: "원격 주소" },
-        { key: "local_ports", label: "로컬 포트" },
-        { key: "remote_ports", label: "원격 포트" },
+        { key: "local_addresses", label: "로컬 주소", kind: "code" },
+        { key: "remote_addresses", label: "원격 주소", kind: "code" },
+        { key: "local_ports", label: "로컬 포트", kind: "code" },
+        { key: "remote_ports", label: "원격 포트", kind: "code" },
         { key: "profiles", label: "적용 프로필" },
-        { key: "app_path", label: "대상 프로그램", kind: "path" },
-        { key: "app_path_resolved", label: "대상 프로그램 (환경변수 해석)", kind: "path" },
+        { key: "profiles_raw", label: "프로필 원문", compute: (r) => (r.profiles_unmapped_bits && r.profiles_unmapped_bits !== "0" ? r.profiles_raw : "") },
+        { key: "rule_active", label: "활성" },
+        { key: "edge_traversal", label: "에지 통과" },
+        { key: "origin", label: "출처" },
+        { key: "rule_status", label: "규칙 상태" },
+      ]},
+      { heading: "대상", fields: [
+        { key: "app_path_resolved", label: "대상 앱", kind: "path" },
+        { key: "app_path", label: "대상 앱 원문", kind: "path", compute: (r) => (r.app_path && r.app_path !== r.app_path_resolved ? r.app_path : "") },
         { key: "service", label: "대상 서비스" },
+        { key: "policy_app_id", label: "앱 ID" },
+      ]},
+      { heading: "접속 · 알림", fields: [
+        { key: "local_address", label: "로컬 주소" },
+        { key: "local_port", label: "로컬 포트" },
+        { key: "remote_address", label: "상대 주소" },
+        { key: "remote_port", label: "상대 포트" },
+        { key: "source_address", label: "출발 주소" },
+        { key: "source_port", label: "출발 포트" },
+        { key: "dest_address", label: "도착 주소" },
+        { key: "dest_port", label: "도착 포트" },
+      ]},
+      { heading: "설정 · 프로필", fields: [
+        { key: "interface_name", label: "인터페이스" },
+        { key: "interface_guid", label: "인터페이스 GUID" },
+        { key: "old_profile", label: "이전 프로필" },
+        { key: "new_profile", label: "새 프로필" },
+        { key: "setting_type", label: "설정 종류" },
+        { key: "setting_value_string", label: "설정 값" },
+        { key: "setting_value_raw", label: "설정 값 원문", kind: "code" },
+        { key: "store_type", label: "Store Type" },
+        { key: "policy_change", label: "정책 변경" },
+        { key: "error_code", label: "오류 코드", compute: (r) => (r.error_code && r.error_code !== "0" ? r.error_code : "") },
       ]},
       { heading: "변경 주체", fields: [
         { key: "account", label: "계정", kind: "account" },
         { key: "account_sid", label: "계정 SID", kind: "accountSid" },
-        { key: "modifying_app", label: "변경 프로그램", kind: "path" },
+        { key: "modifying_app_resolved", label: "변경 앱", kind: "path", compute: (r) => r.modifying_app_resolved || r.modifying_app },
+        { key: "subject_user_name", label: "Subject 이름" },
+        { key: "subject_user_sid", label: "Subject SID", kind: "accountSid" },
+        { key: "subject_logon_id", label: "Subject LogonId" },
       ]},
-      { heading: "상세", fields: [
-        { key: "event_type", label: "유형" },
-        { key: "detail", label: "설명" },
-        { key: "event_id", label: "이벤트 ID" },
-        { key: "provider", label: "공급자" },
+      { heading: "원문", collapsible: { defaultExpanded: false }, fields: [
+        { key: "event_data_raw", label: "EventData", kind: "code" },
       ]},
     ],
+    childTables: [{
+      table: "FirewallRuleChanges",
+      heading: "직전 규칙 기록 대비 변경",
+      summary: (r) => `${r.field_name}: ${r.previous_value ?? ""} → ${r.new_value ?? ""}`,
+    }],
   },
   PowerShellHistory: {
     customView: "powershellFlow",
