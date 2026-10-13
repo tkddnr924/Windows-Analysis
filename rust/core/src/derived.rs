@@ -32,6 +32,7 @@ mod stream;
 mod eventlog_inputs;
 mod usn;
 mod path_candidates;
+mod parallel;
 
 /// Materialize direct evidence before deriving rows that reference it.
 pub use ancillary::prepare_ancillary_facts;
@@ -823,8 +824,21 @@ fn validate_source_table(
     Ok(())
 }
 
+// Tables are checked independently, so they run on the builder workers.
 fn validate_lineage(out_dir: &Path) -> Result<()> {
-    for spec in schema::SPECS {
+    let tasks = schema::SPECS
+        .iter()
+        .map(|spec| parallel::Task {
+            name: spec.name,
+            after: &[],
+            run: Box::new(move || validate_spec(out_dir, spec).map(|()| Vec::new())),
+        })
+        .collect();
+    parallel::run_graph(tasks, parallel::default_workers()).map(|_| ())
+}
+
+fn validate_spec(out_dir: &Path, spec: &'static DbSpec) -> Result<()> {
+    {
         let path = out_dir.join("_OVERVIEW").join(format!("{}.sqlite", spec.name));
         let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         let source_tables = {
@@ -898,6 +912,9 @@ pub struct DerivedBuild {
     pub input_errors: Vec<String>,
 }
 
+/// Measured slowest builders (IDC case), started first.
+const LONG_BUILDERS: &[&str] = &["RegistryFindings", "RegistryExplorer", "UsnJournal", "FileSystemEntries", "PowerShellHistory"];
+
 /// Build all 24 schemas, including empty results; propagate generation failures.
 pub fn build_all(
     out_dir: &Path,
@@ -931,24 +948,18 @@ pub fn build_all(
     let wer = crate::wer_evidence::collect(out_dir, &events)?;
     let wer_starts = crate::wer_evidence::execution_start_evidence(&wer);
 
-    for (name, rows) in builders::build_event_backed(&ctx, &events, wer)? {
-        report.push((name, rows));
-    }
-    for (name, rows) in builders::build_registry_backed(&ctx, &registry, &events, wer_starts)? {
-        report.push((name, rows));
-    }
-    // 전수 레지스트리 저장은 선별 판정 뒤에 만든다 — 퀵 접근 관계가
-    // RegistryFindings의 원본 좌표를 그대로 읽어 연결하기 때문이다.
-    report.push((
-        registry_explorer::DB_NAME.to_string(),
-        registry_explorer::build(&ctx)?,
-    ));
+    let mut tasks = builders::tasks(&ctx, &events, &registry, wer, wer_starts);
+    tasks.extend(stream::tasks(&ctx));
+    tasks.push(parallel::Task {
+        name: "PathCandidates",
+        after: &["FileSystemEntries", "PathReferences"],
+        run: Box::new(|| path_candidates::build(&ctx).map(|()| Vec::new())),
+    });
+    // Start the longest builders first; the rest fill the remaining workers.
+    tasks.sort_by_key(|task| LONG_BUILDERS.iter().position(|name| *name == task.name).unwrap_or(usize::MAX));
+    report.extend(parallel::run_graph(tasks, parallel::default_workers())?);
     drop(events);
     drop(registry);
-    for (name, rows) in stream::build_streaming(&ctx)? {
-        report.push((name, rows));
-    }
-    path_candidates::build(&ctx)?;
 
     report.sort_by_key(|(name, _)| {
         schema::SPECS

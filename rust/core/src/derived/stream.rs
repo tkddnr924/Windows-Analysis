@@ -6,6 +6,7 @@ use anyhow::{Context as _, Result};
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OpenFlags};
 
+use super::parallel::{table, Task};
 use super::schema::{self, DbSpec};
 use super::{flag, int, nz, text, text_raw, Cell, Ctx, DerivedDb};
 
@@ -82,16 +83,17 @@ pub(super) fn str_of(value: ValueRef<'_>) -> String {
     }
 }
 
-pub(super) fn build_streaming(ctx: &Ctx) -> Result<Vec<(String, usize)>> {
-    Ok(vec![
-        ("AiConversations".into(), super::ai_conversations::build(ctx)?),
-        ("WmiSubscriptions".into(), wmi_subscriptions(ctx)?),
-        ("FileSystemEntries".into(), file_system_entries(ctx)?),
-        ("UsnJournal".into(), super::usn::build(ctx)?),
-        ("RecycleBin".into(), recycle_bin(ctx)?),
-        ("JumpListEntries".into(), jump_list_entries(ctx)?),
-        ("TimelineActivities".into(), timeline_activities(ctx)?),
-    ])
+/// File-backed builders; none reads another overview table.
+pub(super) fn tasks<'s>(ctx: &'s Ctx) -> Vec<Task<'s>> {
+    vec![
+        table("UsnJournal", &[], move || super::usn::build(ctx)),
+        table("FileSystemEntries", &[], move || file_system_entries(ctx)),
+        table("AiConversations", &[], move || super::ai_conversations::build(ctx)),
+        table("WmiSubscriptions", &[], move || wmi_subscriptions(ctx)),
+        table("RecycleBin", &[], move || recycle_bin(ctx)),
+        table("JumpListEntries", &[], move || jump_list_entries(ctx)),
+        table("TimelineActivities", &[], move || timeline_activities(ctx)),
+    ]
 }
 
 // ---------------------------------------------------------------------------

@@ -3,6 +3,7 @@
 use anyhow::Result;
 
 use super::ancillary;
+use super::parallel::{table, Task};
 use super::schema::{self, DbSpec};
 use super::{
     int, json_text, nz, text, text_raw, Cell, Ctx, DerivedDb, SourceRef,
@@ -84,26 +85,39 @@ fn sid_of(raw: &str) -> Option<&str> {
 // Event-backed overviews
 // ---------------------------------------------------------------------------
 
-pub(super) fn build_event_backed(
-    ctx: &Ctx,
-    events: &EventLogOverviewCache,
+/// Event- and registry-backed builders with their read dependencies on
+/// other overview tables (artifact_paths.rs, registry_explorer.rs).
+pub(super) fn tasks<'s>(
+    ctx: &'s Ctx,
+    events: &'s EventLogOverviewCache,
+    registry: &'s RegistryOverviewCache,
     wer: Vec<crate::wer_evidence::WerRecord>,
-) -> Result<Vec<(String, usize)>> {
-    Ok(vec![
-        ("ScheduledTasks".into(), super::scheduled_tasks::build(ctx, events)?),
-        ("ServiceHistory".into(), super::service_history::build(ctx, events)?),
-        ("SmbHistory".into(), super::smb_history::build(ctx, events)?),
-        (
-            "RemoteDesktopHistory".into(),
-            super::remote_access::build(ctx, events)?,
+    wer_starts: Vec<Row>,
+) -> Vec<Task<'s>> {
+    vec![
+        table("RegistryFindings", &[], move || registry_findings(ctx, registry)),
+        // Quick-access links read stored RegistryFindings coordinates.
+        table("RegistryExplorer", &["RegistryFindings"], move || super::registry_explorer::build(ctx)),
+        table("PowerShellHistory", &[], move || powershell_history(ctx, events)),
+        table("ServiceHistory", &[], move || super::service_history::build(ctx, events)),
+        table("BrowserActivity", &[], move || super::browser_activity::build(ctx)),
+        table("Defender", &[], move || super::defender::build(ctx, events)),
+        table("TargetInfo", &[], move || target_info(ctx, registry, events)),
+        table("ExecutionHistory", &[], move || execution_history(ctx, registry, events, wer_starts)),
+        table("ScheduledTasks", &[], move || super::scheduled_tasks::build(ctx, events)),
+        table("SmbHistory", &[], move || super::smb_history::build(ctx, events)),
+        table("RemoteDesktopHistory", &[], move || super::remote_access::build(ctx, events)),
+        table("BitsHistory", &[], move || super::bits_history::build(ctx, events)),
+        table("FirewallHistory", &[], move || super::firewall_history::build(ctx, events)),
+        table("WerReports", &[], move || super::wer_reports::build(ctx, wer)),
+        table("RdpCache", &[], move || rdp_cache(ctx)),
+        // Origins and execution candidates are read from these stored tables.
+        table(
+            "PathReferences",
+            &["ExecutionHistory", "ScheduledTasks", "ServiceHistory", "FirewallHistory", "WerReports"],
+            move || path_references(ctx, registry),
         ),
-        ("BitsHistory".into(), super::bits_history::build(ctx, events)?),
-        ("FirewallHistory".into(), super::firewall_history::build(ctx, events)?),
-        ("PowerShellHistory".into(), powershell_history(ctx, events)?),
-        ("WerReports".into(), super::wer_reports::build(ctx, wer)?),
-        ("Defender".into(), super::defender::build(ctx, events)?),
-        ("RdpCache".into(), rdp_cache(ctx)?),
-    ])
+    ]
 }
 
 // --- PowerShellHistory ------------------------------------------------------
@@ -247,21 +261,6 @@ fn rdp_cache(ctx: &Ctx) -> Result<usize> {
 // ---------------------------------------------------------------------------
 // Registry- and file-backed overviews
 // ---------------------------------------------------------------------------
-
-pub(super) fn build_registry_backed(
-    ctx: &Ctx,
-    registry: &RegistryOverviewCache,
-    events: &EventLogOverviewCache,
-    wer_starts: Vec<Row>,
-) -> Result<Vec<(String, usize)>> {
-    Ok(vec![
-        ("ExecutionHistory".into(), execution_history(ctx, registry, events, wer_starts)?),
-        ("RegistryFindings".into(), registry_findings(ctx, registry)?),
-        ("TargetInfo".into(), target_info(ctx, registry, events)?),
-        ("PathReferences".into(), path_references(ctx, registry)?),
-        ("BrowserActivity".into(), super::browser_activity::build(ctx)?),
-    ])
-}
 
 // --- ExecutionHistory -------------------------------------------------------
 
