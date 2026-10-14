@@ -18,7 +18,7 @@ export interface RemoteFilter {
   search: string;
 }
 
-// 성공 + remote scope by default; local/unknown stay selectable (R01, R08).
+// 성공 + remote scope by default; unknown scope shows under 전체. Console sessions are not stored.
 export const DEFAULT_FILTER: RemoteFilter = { results: ["성공"], directions: [], scopes: ["remote"], logonTypes: [], accounts: [], search: "" };
 
 /** Account chip identity: lower-case domain\name (same account whether the

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 // @ts-expect-error -- TypeScript uses bundler resolution while this test uses Node directly.
-import { RESULT_COLOR, facetOptions, optionsOf, pageWindow, resultColor, timeSpan, valueLabels } from "./eventCards.ts";
+import { RESULT_COLOR, facetOptions, optionsOf, pageWindow, resultColor, timeSpan, valueLabels, withKnownValues } from "./eventCards.ts";
 
 type Row = Record<string, string>;
 
@@ -40,6 +40,14 @@ test("facet options list every stored value and selection; counts come from the 
     { value: "outbound", label: "OUTBOUND", count: 0, color: undefined },
     { value: "unknown", label: "UNKNOWN", count: 0, color: undefined },
   ]);
+});
+
+test("fixed vocabulary values stay selectable after being deselected, with their labels", () => {
+  const known = { remote: "원격", local: "로컬", unknown: "미확인" };
+  const labels = withKnownValues(valueLabels([{ s: "local" }, { s: "custom" }], (row: Row) => row.s, (value: string) => known[value as keyof typeof known] ?? value), known);
+  const values = (selected: string[]) => facetOptions(labels, { local: 36 }, selected).map((option: { value: string; label: string; count: number }) => `${option.label}:${option.count}`);
+  assert.deepEqual(values(["remote"]), values([]));
+  assert.deepEqual(values([]), ["custom:0", "로컬:36", "미확인:0", "원격:0"]);
 });
 
 test("page window clamps the page and summarises the slice", () => {

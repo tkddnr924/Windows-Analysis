@@ -54,7 +54,7 @@ type VirtualTab = "timeline" | "bookmarks" | "connections" | "search" | null;
 // A browsable unit is a (file, table) pair — a single .sqlite can hold several
 // tables now, so identity is the path + table name.
 const keyOf = (f: ResultFileEntry): string => `${f.fullPath}\u0000${f.tableName}`;
-// A host dir is cases/<host>; its parent is the direct host-store root.
+// A host dir is windows_analysis_cases/<host>; its parent is the direct host-store root.
 // Bookmarks live there so they remain shared across registered hosts.
 // 원본(전용 뷰 없는) 테이블의 페이지 로딩 청크 크기.
 const RAW_TABLE_CHUNK = 20000;
@@ -80,7 +80,7 @@ export default function Home() {
   const [casesLoading, setCasesLoading] = useState(true);
   // The backend exposes one internal root collection for compatibility. The
   // analyst never chooses a CASE: host folders are stored directly under
-  // cases/<hostId>, then opened from the host ledger.
+  // windows_analysis_cases/<hostId>, then opened from the host ledger.
   const [selectedCase, setSelectedCase] = useState<Case | null>(null);
   const [selectedHost, setSelectedHost] = useState<Host | null>(null);
   const [categories, setCategories] = useState<CategoryEntry[]>([]);
@@ -238,7 +238,7 @@ export default function Home() {
     setNetNonce((n) => n + 1);
   });
 
-  // Open a host for browsing: raw results stay in cases/<host>/ and bookmarks
+  // Open a host for browsing: raw results stay in windows_analysis_cases/<host>/ and bookmarks
   // are loaded from the shared direct-store root.
   // _OVERVIEW 파일 목록은 조회가 비싸다(테이블별 COUNT, MFT 수백만 행 포함).
   // 호스트를 열 때 한 번만 읽어 사이드바와 기본 뷰 선택이 공유한다.

@@ -3,7 +3,7 @@ target/
 
 # Parsed case output — real extracted forensic data (browser data, account
 # fields, etc.); never belongs in version control.
-cases/
+windows_analysis_cases/
 
 # The collected sample under analysis — never commit.
 Target/

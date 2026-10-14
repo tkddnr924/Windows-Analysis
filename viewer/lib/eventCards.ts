@@ -45,6 +45,14 @@ export function valueLabels<R>(rows: R[], pick: (row: R) => string, label: (valu
   return labels;
 }
 
+/** Adds a facet's fixed vocabulary so a value with no stored rows (e.g. a
+ *  default selection) does not vanish once deselected. */
+export function withKnownValues(labels: Map<string, string>, known: Record<string, string>): Map<string, string> {
+  const merged = new Map(labels);
+  for (const [value, label] of Object.entries(known)) if (!merged.has(value)) merged.set(value, label);
+  return merged;
+}
+
 /** Options for every stored value plus current selections; counts come from the
  *  set narrowed by every other condition (0 when none remain). */
 export function facetOptions(labels: Map<string, string>, counts: Record<string, number>, selected: readonly string[], colors?: Record<string, string>): CountOption[] {

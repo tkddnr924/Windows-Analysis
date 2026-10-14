@@ -926,4 +926,34 @@ mod tests {
         assert_eq!(distinct, rows);
         assert!(label.contains("account_name") && label.contains("remote_address"));
     }
+
+    // PC1 shape: LSM 21/22/23 for console session 1 with Address LOCAL
+    // (Security shows LogonType 11/7 there, never 10).
+    #[test]
+    fn console_sessions_are_not_stored_while_remote_sessions_are() {
+        let fixture = Fixture::new(5);
+        let conn = fixture.run(vec![
+            lsm(1, "21", "2026-07-01 07:36:01.150", r#"{"EventXML":{"User":"NAMYANG\\2505002","SessionID":1,"Address":"LOCAL"}}"#),
+            lsm(2, "22", "2026-07-01 07:36:01.347", r#"{"EventXML":{"User":"NAMYANG\\2505002","SessionID":1,"Address":"LOCAL"}}"#),
+            lsm(3, "23", "2026-07-01 16:47:15.463", r#"{"EventXML":{"User":"NAMYANG\\2505002","SessionID":1}}"#),
+            lsm(4, "21", "2026-07-02 09:00:00.000", r#"{"EventXML":{"User":"CORP\\alice","SessionID":3,"Address":"10.0.0.5"}}"#),
+            lsm(5, "23", "2026-07-02 10:00:00.000", r#"{"EventXML":{"User":"CORP\\alice","SessionID":3}}"#),
+        ]);
+        let stored: Vec<(i64, String)> = conn
+            .prepare("SELECT event_id, access_scope FROM RemoteDesktopHistory ORDER BY timestamp")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(stored, vec![(21, "remote".to_string()), (23, "remote".to_string())]);
+        let (segments, orphans): (i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), SUM(first_record_id IS NULL) FROM RemoteAccessSegments",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((segments, orphans), (1, 0));
+    }
 }

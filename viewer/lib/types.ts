@@ -158,7 +158,7 @@ export interface Host {
   id: string;
   name: string;
   targetDir: string;
-  /** cases/<hostId>/ — holds this host's parsed output. */
+  /** windows_analysis_cases/<hostId>/ — holds this host's parsed output. */
   dir: string;
   createdAt: string;
   lastRunAt: string | null;
@@ -174,7 +174,7 @@ export interface Case {
   id: string;
   name: string;
   createdAt: string;
-  /** cases/ (root host store) */
+  /** windows_analysis_cases/ (root host store) */
   dir: string;
   hosts: Host[];
 }
@@ -318,7 +318,7 @@ export interface ParseEligibility {
 }
 
 /** An analyst annotation on one _OVERVIEW record (docs-20), persisted in
- * `cases/bookmarks.json`. Re-parsing a host removes its bookmarks. */
+ * `windows_analysis_cases/bookmarks.json`. Re-parsing a host removes its bookmarks. */
 export interface Bookmark {
   id: string;
   /** `_OVERVIEW/<table>.sqlite` of the record. */
@@ -745,7 +745,7 @@ export interface ElectronApi {
   /** Omit runId only for the explicit cancel-all action. */
   cancelPipeline(runId?: string, cancelAll?: boolean): Promise<boolean>;
   onPipelineLog(callback: (entry: PipelineLogEntry) => void): () => void;
-  /** hostDir = a host's direct cases/<hostId>/ folder. */
+  /** hostDir = a host's direct windows_analysis_cases/<hostId>/ folder. */
   listCategories(hostDir: string): Promise<CategoryEntry[]>;
   /** sqlite 타임라인 스트리밍 빌드 — begin → (insert · drain)* → finish/abort. */
   masterTimelineBuildBegin(hostDir: string, token: string, builtForRunAt: string): Promise<void>;

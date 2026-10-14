@@ -15,7 +15,7 @@ import type { CsvData, FetchLinkedRows } from "@/lib/types";
 import { EMPTY_TIME_RANGE, inRange, type TimeRange } from "@/lib/timeRange";
 import { resolveAccountDisplay, type AccountDirectory } from "@/lib/accountIdentity";
 import { DEFAULT_FILTER, DIRECTION_LABELS, FACET_VALUE, ID_SPACE_LABELS, SCOPE_LABELS, STAGE_LABELS, buildGroups, facetCounts, hostCandidates, label, type RemoteFacet, type RemoteFilter } from "@/lib/remoteAccess";
-import { DIRECTION_COLOR, RESULT_COLOR, facetOptions, resultColor, rowidOf, timeSpan, valueLabels } from "@/lib/eventCards";
+import { DIRECTION_COLOR, RESULT_COLOR, facetOptions, resultColor, rowidOf, timeSpan, valueLabels, withKnownValues } from "@/lib/eventCards";
 import RowDetailPanel from "./RowDetailPanel";
 
 type Row = Record<string, string>;
@@ -39,6 +39,12 @@ interface Props {
 }
 
 const COMPANIONS = ["RemoteAccessSegments"];
+// Stored results are already display text.
+const RESULT_LABELS = Object.fromEntries(Object.keys(RESULT_COLOR).map((value) => [value, value]));
+// Direction/scope options are fixed (2026-10-13): "unknown" is shown only under 「전체」.
+// Console (LOCAL) sessions are not stored (2026-10-14), so scope offers 원격 only.
+const DIRECTION_OPTIONS = { inbound: DIRECTION_LABELS.inbound, outbound: DIRECTION_LABELS.outbound };
+const SCOPE_OPTIONS = { remote: SCOPE_LABELS.remote };
 
 export default function RemoteAccessView({ fileName, dbPath, data, hostDir, ipHosts = {}, onNavigate, onFetchLinkedRows, bookmarkedRowids, onToggleBookmark, timeRange = EMPTY_TIME_RANGE, accountDirectory }: Props) {
   const [filter, setFilter] = useState<RemoteFilter>(DEFAULT_FILTER);
@@ -56,9 +62,9 @@ export default function RemoteAccessView({ fileName, dbPath, data, hostDir, ipHo
   const matchedEvents = groups.reduce((sum, group) => sum + group.matched.size, 0);
   // Options are the stored values (plus current selections); counts follow every other condition and the period.
   const labels = useMemo(() => ({
-    results: valueLabels(data.rows, FACET_VALUE.results),
-    directions: valueLabels(data.rows, FACET_VALUE.directions, (value) => label(DIRECTION_LABELS, value)),
-    scopes: valueLabels(data.rows, FACET_VALUE.scopes, (value) => label(SCOPE_LABELS, value)),
+    results: withKnownValues(valueLabels(data.rows, FACET_VALUE.results), RESULT_LABELS),
+    directions: new Map(Object.entries(DIRECTION_OPTIONS)),
+    scopes: new Map(Object.entries(SCOPE_OPTIONS)),
     logonTypes: valueLabels(data.rows, FACET_VALUE.logonTypes),
     accounts: valueLabels(data.rows, FACET_VALUE.accounts, (value, row) => [resolveAccountDisplay(row.account ?? "", accountDirectory) || row.account || value, row.account_domain].filter(Boolean).join(" · "), "(계정 없음)"),
   }), [data.rows, accountDirectory]);
@@ -82,7 +88,6 @@ export default function RemoteAccessView({ fileName, dbPath, data, hostDir, ipHo
           const segment = group.segment;
           const first = group.events[0];
           const direction = segment?.direction ?? first.direction ?? "";
-          const scope = segment?.access_scope ?? first.access_scope ?? "";
           const address = segment?.remote_address || group.events.find((event) => event.remote_address)?.remote_address || "";
           const candidates = hostCandidates(address, ipHosts);
           const accountRaw = segment?.account || group.events.find((event) => event.account)?.account || "";
@@ -130,7 +135,6 @@ export default function RemoteAccessView({ fileName, dbPath, data, hostDir, ipHo
                 </>} />
               <PillRow>
                 {(direction === "inbound" || direction === "outbound") && <Pill color={dirColor}>{label(DIRECTION_LABELS, direction)}</Pill>}
-                {scope === "local" && <Pill>{label(SCOPE_LABELS, scope)}</Pill>}
                 {[...matchedByResult.entries()].map(([result, count]) => <Pill key={result} color={resultColor(result)}>{result || "(없음)"} {count}</Pill>)}
                 {Number(segment?.reconnect_count) > 0 && <Pill>재연결 {segment?.reconnect_count}</Pill>}
                 {Number(segment?.disconnect_count) > 0 && <Pill>끊김 {segment?.disconnect_count}</Pill>}

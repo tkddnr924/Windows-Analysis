@@ -5,7 +5,6 @@ import CloudDownloadOutlinedIcon from "@mui/icons-material/CloudDownloadOutlined
 import DeleteOutlineOutlinedIcon from "@mui/icons-material/DeleteOutlineOutlined";
 import DescriptionOutlinedIcon from "@mui/icons-material/DescriptionOutlined";
 import DesktopWindowsOutlinedIcon from "@mui/icons-material/DesktopWindowsOutlined";
-import DeviceHubOutlinedIcon from "@mui/icons-material/DeviceHubOutlined";
 import DnsOutlinedIcon from "@mui/icons-material/DnsOutlined";
 import FolderOpenOutlinedIcon from "@mui/icons-material/FolderOpenOutlined";
 import ForumOutlinedIcon from "@mui/icons-material/ForumOutlined";
@@ -50,7 +49,6 @@ const ICONS: Record<string, React.ElementType> = {
   PathReferences: LinkOutlinedIcon,
   Metadata: StorageOutlinedIcon,
   AiConversations: ForumOutlinedIcon,
-  WmiSubscriptions: DeviceHubOutlinedIcon,
 };
 
 export default function OverviewTableIcon({ name, size = 18, color = "var(--text-faint)" }: { name: string; size?: number; color?: string }) {

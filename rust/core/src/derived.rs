@@ -282,7 +282,6 @@ fn artifact_for_category(category: &str, stem: &str) -> String {
         "PREFETCH" => "Prefetch",
         "POWERSHELL" => "PowerShell",
         "WER" => "WER",
-        "WMI" => "WmiRepository",
         "TIMELINE" => "Timeline",
         "RECYCLEBIN" => "RecycleBin",
         // Supplemental tables identify their actual artifact at the call site.
@@ -1027,7 +1026,7 @@ mod tests {
 
     #[test]
     fn every_documented_database_has_a_spec() {
-        assert_eq!(schema::SPECS.len(), 24);
+        assert_eq!(schema::SPECS.len(), 23);
         for spec in schema::SPECS {
             assert!(!spec.columns.is_empty(), "{} 컬럼 없음", spec.name);
             // metadata는 호스트 사실, RegistryExplorer는 하이브 트리라서
@@ -1425,7 +1424,7 @@ mod tests {
         let build = build_all(&out_dir, &target, "host-1", "ds-1").unwrap();
         assert!(build.input_errors.is_empty(), "{:?}", build.input_errors);
         let report = build.tables;
-        assert_eq!(report.len(), 24);
+        assert_eq!(report.len(), 23);
         for (index, spec) in schema::SPECS.iter().enumerate() {
             assert_eq!(report[index].0, spec.name, "보고 순서는 문서 순서다");
             let conn = open(&out_dir, spec.name);
@@ -1465,7 +1464,7 @@ mod tests {
         let build = build_all(&out_dir, &target, "host-1", "ds-1").unwrap();
         assert_eq!(build.input_errors.len(), 1, "{:?}", build.input_errors);
         assert!(build.input_errors[0].starts_with("Metadata: SRUM/SRUM_Corrupt.sqlite skipped: "), "{:?}", build.input_errors);
-        assert_eq!(build.tables.len(), 24);
+        assert_eq!(build.tables.len(), 23);
         let meta = open(&out_dir, "Metadata");
         let key = |sid: &str| -> i64 {
             meta.query_row("SELECT count(*) FROM metadata WHERE kind='virtual_account' AND key=?1", [sid], |row| row.get(0)).unwrap()

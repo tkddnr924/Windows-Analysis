@@ -15,7 +15,7 @@ use crate::finder;
 use crate::parsers::{
     amcache, browser_cache, browser_history, eventlog, ie_indexdat, ie_webcache, jumplist, mft,
     powershell_history, prefetch, rdpcache, recyclebin, registry, srum, taskscheduler, timeline, usnjrnl,
-    wer, wmi_repository,
+    wer,
 };
 use crate::sqlite::{write_fixed_table, write_table, Row};
 
@@ -82,7 +82,6 @@ fn artifact_category(artifact: &str) -> Option<&'static str> {
         "Prefetch" => "PREFETCH",
         "PowerShell" => "POWERSHELL",
         "WER" => "WER",
-        "WmiRepository" => "WMI",
         "Timeline" => "TIMELINE",
         "RecycleBin" => "RECYCLEBIN",
         _ => return None,
@@ -875,7 +874,6 @@ pub const ARTIFACT_NAMES: &[&str] = &[
     "PowerShell",
     "Prefetch",
     "WER",
-    "WmiRepository",
     "Timeline",
     "RecycleBin",
 ];
@@ -1175,7 +1173,6 @@ fn discover_artifact_files(name: &str, target: &Path) -> finder::Found {
         "PowerShell" => finder::by_name(target, &["ConsoleHost_history.txt"]),
         "Prefetch" => finder::by_extension(target, &[".pf"]),
         "WER" => wer::wer_sources(target),
-        "WmiRepository" => wmi_repository::wmi_sources(target),
         "Timeline" => timeline::timeline_sources(target),
         "RecycleBin" => recyclebin::recyclebin_sources(target),
         _ => finder::Found::default(),
@@ -2028,52 +2025,6 @@ fn parse_timeline_artifact(
     Ok(outputs)
 }
 
-fn parse_wmi_repository_artifact(
-    paths: &[PathBuf],
-    out_dir: &Path,
-    entry: &mut ParseArtifactReport,
-) -> Result<Vec<String>> {
-    entry_record_inputs(entry, paths);
-    let mut outputs = Vec::new();
-    if paths.is_empty() {
-        return Ok(outputs);
-    }
-    let relative = "WMI/WMI_Persistence.sqlite".to_string();
-    let out = out_dir.join(&relative);
-    // 발견 즉시 스트리밍 기록 — 원본 전체 바이트나 전체 행을 메모리에 두지
-    // 않는다. 파일별 실패는 사유와 함께 보고서 입력에 남는다.
-    type Unit = (usize, Vec<wmi_repository::WmiFileReport>);
-    let unit = run_unit_or_skip("WmiRepository", &[&out], || -> Result<Unit> {
-        let mut writer = crate::sqlite::StreamWriter::create(
-            &out,
-            wmi_repository::WMI_TABLE,
-            wmi_repository::WMI_FIELD_ORDER,
-            wmi_repository::WMI_FIELD_ORDER,
-        )?;
-        let reports = wmi_repository::parse_wmi_stream(paths, &mut |row| writer.push(row))?;
-        Ok((writer.finish()?, reports))
-    })?;
-    if let Some((total, reports)) = unit {
-        for report in reports {
-            entry_record_input_count(entry, &report.path, report.rows);
-            if let Some(reason) = report.error {
-                emit(&format!(
-                    "[*] WMI 저장소 읽기 실패 — 건너뜀: {} ({reason})",
-                    report.path.display()
-                ));
-                entry_record_input_error(entry, &report.path, &reason);
-            }
-        }
-        if total == 0 {
-            let _ = std::fs::remove_file(&out);
-        } else {
-            emit(&format!("[+] {} rows -> {}", total, out.display()));
-            outputs.push(relative);
-        }
-    }
-    Ok(outputs)
-}
-
 fn parse_wer_artifact(
     paths: &[PathBuf],
     out_dir: &Path,
@@ -2462,7 +2413,6 @@ fn parse_artifact_sources(
         "PowerShell" => parse_powershell_artifact(paths, out_dir, &mut outcome.entry),
         "Prefetch" => parse_prefetch_artifact(paths, out_dir, &mut outcome.entry),
         "WER" => parse_wer_artifact(paths, out_dir, &mut outcome.entry),
-        "WmiRepository" => parse_wmi_repository_artifact(paths, out_dir, &mut outcome.entry),
         "Timeline" => parse_timeline_artifact(paths, out_dir, &mut outcome.entry),
         "RecycleBin" => parse_recyclebin_artifact(paths, out_dir, outcome),
         other => anyhow::bail!("unknown artifact {other}"),

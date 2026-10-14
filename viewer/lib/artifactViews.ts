@@ -550,64 +550,6 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
       ]},
     ],
   },
-  // WMI Repository (OBJECTS.DATA) 원본 facts — 시그니처 스캔 결과. 전용 뷰는
-  // 삭제했고 원본 데이터 목록·검색·북마크 상세에서 이 규칙으로 표시한다.
-  WMI_Persistence: {
-    title: (r) => r.name || "(WMI)",
-    subtitle: (r) => r.kind || "",
-    priorityColumns: ["kind", "name", "consumer_type", "filter_name", "consumer_name", "query", "query_language", "namespace", "details"],
-    sections: [
-      { heading: "구독 구성", fields: [
-        { key: "kind", label: "구분", kind: "badge" },
-        { key: "filter_name", label: "필터 이름" },
-        { key: "consumer_name", label: "컨슈머 이름" },
-        { key: "consumer_type", label: "컨슈머 유형" },
-      ]},
-      { heading: "필터 조건", fields: [
-        { key: "query", label: "WQL 쿼리", kind: "code" },
-        { key: "query_language", label: "쿼리 언어" },
-        { key: "namespace", label: "네임스페이스" },
-      ]},
-      { heading: "컨슈머 값", fields: [
-        { key: "details", label: "세부 값", kind: "code" },
-      ]},
-    ],
-  },
-  // WMI 이벤트 구독 파생(_OVERVIEW/WmiSubscriptions) — 필터·컨슈머·바인딩.
-  // 리포지터리에는 시각이 없어 timestamp는 NULL이고 타임라인에 넣지 않는다.
-  // 전용 뷰는 2026-10-07 사용자 확정으로 삭제했고, 이 표시 규칙은 검색 결과·
-  // 북마크 등 공통 상세에서 계속 쓴다.
-  WmiSubscriptions: {
-    title: (r) => r.filter_name || r.consumer_name || r.object_path || "(WMI)",
-    subtitle: (r) => r.object_type || "",
-    priorityColumns: ["object_type", "filter_name", "consumer_name", "consumer_type", "query", "namespace", "command"],
-    sections: [
-      { heading: "구독 구성", fields: [
-        { key: "object_type", label: "구분", kind: "badge" },
-        { key: "namespace", label: "네임스페이스" },
-        { key: "object_path", label: "객체 경로" },
-        { key: "filter_name", label: "필터 이름" },
-        { key: "consumer_name", label: "컨슈머 이름" },
-        { key: "consumer_type", label: "컨슈머 클래스" },
-        { key: "creator_sid", label: "생성자 SID", kind: "accountSid" },
-      ]},
-      { heading: "필터 조건", fields: [
-        { key: "query", label: "WQL 쿼리", kind: "code" },
-        { key: "query_language", label: "쿼리 언어" },
-        { key: "event_namespace", label: "이벤트 네임스페이스" },
-      ]},
-      { heading: "컨슈머 동작", fields: [
-        { key: "command", label: "명령", kind: "code" },
-        { key: "command_resolved", label: "명령 (환경변수 해석)", kind: "code" },
-        { key: "script_text", label: "스크립트", kind: "code" },
-        { key: "script_engine", label: "스크립트 엔진" },
-      ]},
-      { heading: "바인딩", fields: [
-        { key: "filter_ref", label: "바인딩 필터 경로" },
-        { key: "consumer_ref", label: "바인딩 컨슈머 경로" },
-      ]},
-    ],
-  },
   // $MFT 원본 facts(28개 필드) — 화면용 탐색기는 파생 FileSystemEntries를
   // 쓰고, 이 표는 원본 레코드 열람용으로 남는다. 플래그는 0/1이고 미확인은
   // NULL이다(Y/N 아님).
@@ -1758,7 +1700,7 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
         { key: "subject_domain", label: "Subject 도메인" },
         { key: "subject_logon_id", label: "Subject LogonId" },
       ]},
-      { heading: "원본 이벤트", fields: [
+      { heading: "원문", collapsible: { defaultExpanded: false }, fields: [
         { key: "event_id", label: "이벤트 ID" },
         { key: "provider", label: "공급자" },
         { key: "channel", label: "채널" },
@@ -1766,17 +1708,10 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
         { key: "event_record_id", label: "EventRecordID" },
         { key: "level_name", label: "수준" },
         { key: "source_file", label: "원본 파일", kind: "path" },
-      ]},
-      { heading: "원문", collapsible: { defaultExpanded: false }, fields: [
         { key: "event_data_raw", label: "EventData", kind: "code" },
         { key: "binary_text", label: "Binary 해독", kind: "code" },
       ]},
     ],
-    childTables: [{
-      table: "ServiceEventFields",
-      heading: "이벤트 필드",
-      summary: (r) => `${r.field_name} = ${r.field_value ?? ""}`,
-    }],
   },
 
   // docs-15: stored BitsHistory columns; job groups by stored job_group_key.

@@ -1259,110 +1259,6 @@ const TARGET_INFO_CHILDREN: &[ChildSpec] = &[
 ];
 
 
-const WMI_SUBSCRIPTIONS_DDL: &str = r#"PRAGMA foreign_keys=ON;
-CREATE TABLE "WmiSubscriptions" (
-  "record_id" TEXT NOT NULL,
-  "host_id" TEXT NOT NULL,
-  "dataset_id" TEXT NOT NULL,
-  "timestamp" TEXT,
-  "overview_name" TEXT NOT NULL,
-  "account" TEXT,
-  "account_sid" TEXT,
-  "timestamp_kind" TEXT,
-  "event_type" TEXT,
-  "description" TEXT,
-  "object_type" TEXT,
-  "namespace" TEXT,
-  "object_path" TEXT,
-  "filter_name" TEXT,
-  "query" TEXT,
-  "query_language" TEXT,
-  "event_namespace" TEXT,
-  "consumer_name" TEXT,
-  "consumer_type" TEXT,
-  "command" TEXT,
-  "command_resolved" TEXT,
-  "script_text" TEXT,
-  "script_engine" TEXT,
-  "filter_ref" TEXT,
-  "consumer_ref" TEXT,
-  "creator_sid" TEXT,
-  PRIMARY KEY(record_id),
-  CHECK(overview_name = 'WmiSubscriptions'),
-  CHECK(timestamp IS NULL OR timestamp_kind IS NOT NULL)
-);
-CREATE INDEX "idx_WmiSubscriptions_time" ON "WmiSubscriptions"(timestamp, record_id);
-CREATE INDEX "idx_WmiSubscriptions_account" ON "WmiSubscriptions"(account_sid, timestamp);
-CREATE TABLE "source_records" (
-  "record_id" TEXT NOT NULL,
-  "ordinal" INTEGER NOT NULL,
-  "source_dataset_id" TEXT NOT NULL,
-  "source_artifact" TEXT NOT NULL,
-  "source_db" TEXT NOT NULL,
-  "source_table" TEXT NOT NULL,
-  "source_rowid" INTEGER NOT NULL,
-  "source_field" TEXT,
-  "source_record_key" TEXT,
-  "source_file" TEXT,
-  "source_label" TEXT,
-  PRIMARY KEY(record_id, ordinal),
-  CHECK(ordinal >= 0),
-  FOREIGN KEY(record_id) REFERENCES "WmiSubscriptions"("record_id") ON DELETE CASCADE
-);
-CREATE INDEX idx_source_lookup ON source_records(source_db, source_table, source_rowid, source_field);
-
-CREATE TABLE _wina_derived_version (name TEXT NOT NULL PRIMARY KEY, version INTEGER NOT NULL);
-INSERT INTO _wina_derived_version(name,version) VALUES ('overview_contract',1);
-"#;
-
-const WMI_SUBSCRIPTIONS_COLUMNS: &[&str] = &[
-    "record_id",
-    "host_id",
-    "dataset_id",
-    "timestamp",
-    "overview_name",
-    "account",
-    "account_sid",
-    "timestamp_kind",
-    "event_type",
-    "description",
-    "object_type",
-    "namespace",
-    "object_path",
-    "filter_name",
-    "query",
-    "query_language",
-    "event_namespace",
-    "consumer_name",
-    "consumer_type",
-    "command",
-    "command_resolved",
-    "script_text",
-    "script_engine",
-    "filter_ref",
-    "consumer_ref",
-    "creator_sid",
-];
-
-const WMI_SUBSCRIPTIONS_SOURCE_RECORDS_COLUMNS: &[&str] = &[
-    "record_id",
-    "ordinal",
-    "source_dataset_id",
-    "source_artifact",
-    "source_db",
-    "source_table",
-    "source_rowid",
-    "source_field",
-    "source_record_key",
-    "source_file",
-    "source_label",
-];
-
-const WMI_SUBSCRIPTIONS_CHILDREN: &[ChildSpec] = &[
-    ChildSpec { table: "source_records", columns: WMI_SUBSCRIPTIONS_SOURCE_RECORDS_COLUMNS },
-];
-
-
 const FILE_SYSTEM_ENTRIES_DDL: &str = r#"PRAGMA foreign_keys=ON;
 CREATE TABLE "FileSystemEntries" (
   "record_id" TEXT NOT NULL,
@@ -2390,13 +2286,6 @@ pub const SPECS: &[DbSpec] = &[
         columns: TARGET_INFO_COLUMNS,
         children: TARGET_INFO_CHILDREN,
         ddl: TARGET_INFO_DDL,
-    },
-    DbSpec {
-        name: "WmiSubscriptions",
-        table: "WmiSubscriptions",
-        columns: WMI_SUBSCRIPTIONS_COLUMNS,
-        children: WMI_SUBSCRIPTIONS_CHILDREN,
-        ddl: WMI_SUBSCRIPTIONS_DDL,
     },
     DbSpec {
         name: "FileSystemEntries",

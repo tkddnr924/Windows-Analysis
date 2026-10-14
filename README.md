@@ -8,7 +8,7 @@
 
 ![platform](https://img.shields.io/badge/Windows-지원-1f6feb)
 ![platform](https://img.shields.io/badge/macOS-지원-1f6feb)
-![version](https://img.shields.io/badge/version-1.4.0-555555)
+![version](https://img.shields.io/badge/version-1.4.1-555555)
 ![offline](https://img.shields.io/badge/네트워크_전송-없음-2ea043)
 ![storage](https://img.shields.io/badge/결과_저장-cases_폴더-2ea043)
 
@@ -32,7 +32,7 @@
 | 실행 흔적 | Prefetch(`.pf`), Amcache, UserAssist, BAM, SRUM(`SRUDB.dat`), 작업 스케줄러 |
 | 사용자 활동 | 점프리스트(`*.automaticDestinations-ms`·`*.customDestinations-ms`, 내부 LNK 포함), ShellBag, RDP 비트맵 캐시, PowerShell 콘솔 기록, Windows 타임라인 |
 | 브라우저 | Chromium 계열(Chrome·Edge·Whale) 방문·다운로드·캐시 본문, IE `WebCacheV01.dat`·`index.dat` |
-| 기타 | WMI 저장소(영구 구독), WER 오류 보고서, Defender 로그 |
+| 기타 | WER 오류 보고서, Defender 로그 |
 
 깨진 파일은 읽을 수 있는 레코드까지 파싱하고, 실패한 파일은 무엇이 왜 실패했는지 목록으로 남깁니다. 하나가 실패해도 나머지 파싱은 계속됩니다.
 
@@ -89,12 +89,12 @@
 ## 데이터 취급
 
 - 수집한 원본 파일은 읽기만 합니다. 원본을 수정하거나 이동하지 않습니다.
-- 분석 결과와 앱이 만드는 모든 파일은 실행 파일 옆 `cases/` 안에만 생깁니다. 폴더를 지우면 흔적이 함께 사라집니다.
+- 분석 결과와 앱이 만드는 모든 파일은 실행 파일 옆 `windows_analysis_cases/` 안에만 생깁니다. 폴더를 지우면 흔적이 함께 사라집니다.
 - 외부로 데이터를 전송하지 않습니다. 네트워크 통신 기능이 없습니다.
 - 삭제된 레코드는 복구하지 않습니다. 현재 유효한 데이터만 근거로 씁니다.
 
 ```
-cases/
+windows_analysis_cases/
 └── WORKSTATION-01/          호스트 하나
     ├── REGISTRY/  EVENTLOG/  FILESYSTEM/  BROWSER/  ...   원본 그대로의 파싱 결과
     ├── _OVERVIEW/                                         분석 화면용 가공 결과

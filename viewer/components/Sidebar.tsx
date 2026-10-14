@@ -49,7 +49,6 @@ const ARTIFACT_CATEGORY: Record<string, string> = {
   BrowserCache: "BROWSER",
   IEWebCache: "BROWSER",
   IEIndexDat: "BROWSER",
-  WmiRepository: "WMI",
 };
 
 function categoryForArtifact(name: string): string {
@@ -564,9 +563,8 @@ export default function Sidebar({
   // USN 저널은 화면용 파생(_OVERVIEW/UsnJournal)을 연다 — 원본 facts
   // (FILESYSTEM/UsnJrnl_Records)는 원본 데이터 목록에 그대로 남는다.
   const usnEntry = effectiveOverviewFiles?.find((file) => file.fileName === "UsnJournal") ?? null;
-  // WMI 전용 뷰 삭제(2026-10-07 사용자 확정) 이후 _OVERVIEW/WmiSubscriptions를
-  // 여는 승격 항목은 없다. 원본 데이터 목록은 파싱한 아티팩트 산출물을 모두
-  // 보여 준다(_OVERVIEW 파생은 위 분석 메뉴의 정해진 뷰로만 연다).
+  // 원본 데이터 목록은 파싱한 아티팩트 산출물을 모두 보여 준다(_OVERVIEW
+  // 파생은 위 분석 메뉴의 정해진 뷰로만 연다).
   const rawCategories = categories.filter((c) => c.name !== "_OVERVIEW");
 
   // Every artifact that ran, mapped to its category, in run order — so the

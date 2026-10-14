@@ -89,68 +89,10 @@ pub(super) fn tasks<'s>(ctx: &'s Ctx) -> Vec<Task<'s>> {
         table("UsnJournal", &[], move || super::usn::build(ctx)),
         table("FileSystemEntries", &[], move || file_system_entries(ctx)),
         table("AiConversations", &[], move || super::ai_conversations::build(ctx)),
-        table("WmiSubscriptions", &[], move || wmi_subscriptions(ctx)),
         table("RecycleBin", &[], move || recycle_bin(ctx)),
         table("JumpListEntries", &[], move || jump_list_entries(ctx)),
         table("TimelineActivities", &[], move || timeline_activities(ctx)),
     ]
-}
-
-// ---------------------------------------------------------------------------
-// WmiSubscriptions
-// ---------------------------------------------------------------------------
-
-fn wmi_object_type(kind: &str) -> &'static str {
-    match kind {
-        "이벤트 필터" => "filter",
-        "이벤트 컨슈머" => "consumer",
-        "바인딩" => "binding",
-        _ => "",
-    }
-}
-
-fn wmi_subscriptions(ctx: &Ctx) -> Result<usize> {
-    let spec = spec_of("WmiSubscriptions");
-    let mut db = DerivedDb::create(&ctx.overview_dir(), "WmiSubscriptions")?;
-    for path in fact_files(ctx.out_dir, "WMI", crate::parsers::wmi_repository::WMI_TABLE)? {
-        for row in crate::overview::read_table_with_rowid(&path, crate::parsers::wmi_repository::WMI_TABLE)? {
-            let get = |key: &str| row.get(key).map(String::as_str).unwrap_or("");
-            let object_type = wmi_object_type(get("kind"));
-            let consumer_type = get("consumer_type");
-            let details = get("details");
-            let mut rec = ctx.record(spec);
-            // Repository records do not establish registration timestamps.
-            rec.set("event_type", text(object_type));
-            rec.set("object_type", text(object_type));
-            rec.set("namespace", text(get("namespace")));
-            rec.set("filter_name", text(get("filter_name")));
-            rec.set("query", text_raw(get("query")));
-            rec.set("query_language", text(get("query_language")));
-            rec.set("consumer_name", text(get("consumer_name")));
-            rec.set("consumer_type", text(consumer_type));
-            // Unlabeled, possibly truncated tokens cannot prove commands or scripts.
-            let description = match (nz(get("name")), nz(details)) {
-                (Some(name), Some(details)) => format!("{name} | {details}"),
-                (Some(name), None) => name.to_string(),
-                (None, Some(details)) => details.to_string(),
-                (None, None) => String::new(),
-            };
-            rec.set("description", text_raw(&description));
-            rec.source(ctx.facts.source_from_record_key(
-                &format!(
-                    "{}::{}::{}",
-                    super::stem_of(&path),
-                    crate::parsers::wmi_repository::WMI_TABLE,
-                    get("__source_rowid")
-                ),
-                None,
-                nz(get("_source_file")),
-                Some("WMI 저장소 레코드"),
-            )?);
-            db.write(rec)?;
-        }
-    }
-    db.finish()
 }
 
 // ---------------------------------------------------------------------------

@@ -24,5 +24,4 @@ export const OVERVIEW_TABLE_NAMES: Record<string, string> = {
   PathReferences: "경로 참조",
   Metadata: "호스트 메타데이터",
   AiConversations: "AI 대화",
-  WmiSubscriptions: "WMI 이벤트 구독",
 };

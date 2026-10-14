@@ -18,4 +18,3 @@ pub mod timeline;
 pub mod usnjrnl;
 pub mod wer;
 pub mod wer_dump;
-pub mod wmi_repository;

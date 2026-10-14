@@ -62,14 +62,16 @@ fn cases_dir() -> PathBuf {
         return PathBuf::from(d);
     }
     if is_dev_build() {
-        return dev_repo_path("cases");
+        return dev_repo_path(CASES_DIR_NAME);
     }
-    // Packaged: a `cases` folder next to the app executable.
+    // Packaged: a case folder next to the app executable.
     std::env::current_exe()
         .ok()
-        .and_then(|p| p.parent().map(|d| d.join("cases")))
-        .unwrap_or_else(|| dev_repo_path("cases"))
+        .and_then(|p| p.parent().map(|d| d.join(CASES_DIR_NAME)))
+        .unwrap_or_else(|| dev_repo_path(CASES_DIR_NAME))
 }
+
+const CASES_DIR_NAME: &str = "windows_analysis_cases";
 
 /// WebView2 user data folder.
 ///
@@ -2452,7 +2454,7 @@ async fn list_result_files(category_dir: String) -> Vec<ResultFileEntry> {
 /// The derived contract result files of docs-01. Used only to decide whether a
 /// file is a contract result; other `_OVERVIEW` files (raw facts such as
 /// MFT_Records.sqlite) are out of scope.
-const DERIVED_OVERVIEW_FILES: [&str; 24] = [
+const DERIVED_OVERVIEW_FILES: [&str; 23] = [
     "Metadata",
     "ExecutionHistory",
     "PowerShellHistory",
@@ -2469,7 +2471,6 @@ const DERIVED_OVERVIEW_FILES: [&str; 24] = [
     "WerReports",
     "RdpCache",
     "TargetInfo",
-    "WmiSubscriptions",
     "FileSystemEntries",
     "UsnJournal",
     "PathReferences",

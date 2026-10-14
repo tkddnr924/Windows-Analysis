@@ -57,6 +57,10 @@ const AGG_FIELDS: [&str; 16] = [
 /// a confirmed logon instance.
 const UNCONFIRMED_4647: &str = "unconfirmed_4647";
 
+/// Console (LOCAL) logons are not remote access and are not stored
+/// (2026-10-14 user decision).
+pub(crate) const CONSOLE_SESSION: &str = "console_session";
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum IdSpace {
     LsmSession,
@@ -145,6 +149,8 @@ struct SegmentBuild {
     split_reason: &'static str,
     time_unknown: bool,
     members: Vec<usize>,
+    /// Direct (pre-carry) AGG_FIELDS of each member, parallel to `members`.
+    direct: Vec<Row>,
     /// (index, event_id, timestamp, start_kind) of a proven start event.
     start: Option<(usize, String, String, &'static str)>,
     /// (index, event_id, timestamp, end_kind) of a proven end event.
@@ -166,6 +172,7 @@ impl SegmentBuild {
             split_reason,
             time_unknown: false,
             members: Vec::new(),
+            direct: Vec::new(),
             start: None,
             end: None,
             truncated: None,
@@ -178,6 +185,15 @@ impl SegmentBuild {
     /// Record direct evidence of a member. Must run before any effective fill
     /// so a carried value is never echoed back as direct evidence.
     fn observe_direct(&mut self, row: &Row) {
+        let mut snapshot = Row::new();
+        for name in AGG_FIELDS {
+            put(&mut snapshot, name, field(row, name));
+        }
+        self.absorb(&snapshot);
+        self.direct.push(snapshot);
+    }
+
+    fn absorb(&mut self, row: &Row) {
         for (slot, name) in AGG_FIELDS.iter().enumerate() {
             let value = field(row, name);
             if value.is_empty()
@@ -200,6 +216,40 @@ impl SegmentBuild {
             "disconnect" => self.disconnects += 1,
             _ => {}
         }
+    }
+
+    /// Drop console members (already marked excluded) and rebuild every
+    /// aggregate from the remaining ones. False when nothing remains.
+    fn drop_console(&mut self, rows: &[Row]) -> bool {
+        let gone = |index: usize| field(&rows[index], "exclude_reason") == CONSOLE_SESSION;
+        if !self.members.iter().any(|&index| gone(index)) {
+            return true;
+        }
+        let kept: Vec<(usize, Row)> = self
+            .members
+            .drain(..)
+            .zip(self.direct.drain(..))
+            .filter(|(index, _)| !gone(*index))
+            .collect();
+        self.agg = vec![(String::new(), false); AGG_FIELDS.len()];
+        self.reconnects = 0;
+        self.disconnects = 0;
+        for (index, snapshot) in kept {
+            self.absorb(&snapshot);
+            self.count_stage(&rows[index]);
+            self.members.push(index);
+            self.direct.push(snapshot);
+        }
+        if self.start.as_ref().is_some_and(|(index, ..)| gone(*index)) {
+            self.start = None;
+        }
+        if self.end.as_ref().is_some_and(|(index, ..)| gone(*index)) {
+            self.end = None;
+        }
+        if self.truncated.as_ref().is_some_and(|(index, _)| gone(*index)) {
+            self.truncated = None;
+        }
+        !self.members.is_empty()
     }
 
     fn emit(&self, rows: &[Row]) -> Row {
@@ -590,6 +640,9 @@ fn carry_into(
         carry.access_scope = Some((index, own_scope));
     }
 
+    // Console rows are not stored, so they never donate identity to the
+    // remote rows that survive.
+    let console = field(&rows[index], "access_scope") == "local";
     let own_account: Vec<String> = ACCOUNT_FIELDS
         .iter()
         .map(|name| field(&rows[index], name).to_string())
@@ -622,7 +675,9 @@ fn carry_into(
         if carry.principal_domain.is_empty() {
             carry.principal_domain.clone_from(&own_account[3]);
         }
-        carry.account = Some((index, own_account));
+        if !console {
+            carry.account = Some((index, own_account));
+        }
     }
 
     let own_sid = field(&rows[index], "target_user_sid").to_string();
@@ -654,7 +709,9 @@ fn carry_into(
         if carry.principal_sid.is_empty() {
             carry.principal_sid.clone_from(&own_sid);
         }
-        carry.sid = Some((index, own_sid));
+        if !console {
+            carry.sid = Some((index, own_sid));
+        }
     }
 }
 
@@ -828,6 +885,22 @@ pub(crate) fn correlate(rows: &mut [Row]) -> Correlation {
         walk_scope(rows, scope, &controls, &mut builds, &mut relations);
     }
 
+    // Exclusion runs after carry so the session's logoff/shell rows that only
+    // inherit LOCAL scope go too; segments keep their remote members only.
+    for row in rows.iter_mut() {
+        if field(row, "access_scope") == "local" && field(row, "_exclude") != "1" {
+            set(row, "_exclude", "1");
+            set(row, "exclude_reason", CONSOLE_SESSION);
+        }
+    }
+    builds.retain_mut(|build| build.drop_console(rows));
+    relations.retain(|relation| {
+        ["from_index", "to_index"].iter().all(|key| {
+            field(relation, key)
+                .parse::<usize>()
+                .map_or(true, |index| field(&rows[index], "exclude_reason") != CONSOLE_SESSION)
+        })
+    });
     let mut segments: Vec<Row> = builds.iter().map(|build| build.emit(rows)).collect();
     segments.sort_by(|a, b| {
         let first = |r: &Row| {
@@ -1145,6 +1218,79 @@ mod tests {
         assert_eq!(field(&c.segments[1], "end_bound"), "unobserved");
     }
 
+    // Remote logon, console reattach (25 LOCAL), then remote again in one
+    // session: only remote members and their counts survive.
+    #[test]
+    fn console_members_leave_a_remote_session_with_remote_counts_only() {
+        let mut rows = vec![
+            lsm("2026-09-29 00:10:00", "21", "3", "10.0.0.5", "corp\\alice"),
+            lsm("2026-09-29 00:20:00", "24", "3", "", ""),
+            lsm_local("2026-09-29 00:30:00", "25", "3", "corp\\alice"),
+            lsm("2026-09-29 00:40:00", "24", "3", "", ""),
+            lsm("2026-09-29 00:50:00", "25", "3", "10.0.0.6", "corp\\alice"),
+            lsm("2026-09-29 01:00:00", "23", "3", "", ""),
+        ];
+        let c = correlate(&mut rows);
+        let console: Vec<usize> = (0..rows.len())
+            .filter(|&i| field(&rows[i], "exclude_reason") == CONSOLE_SESSION)
+            .collect();
+        assert!(console.contains(&2));
+        assert_eq!(c.segments.len(), 1);
+        let session = &c.segments[0];
+        let survivors = rows.len() - console.len();
+        assert_eq!(field(session, "event_count"), survivors.to_string());
+        assert_eq!(field(session, "access_scope"), "remote");
+        assert_eq!(field(session, "start_event_index"), "0");
+        for (key, stage) in [("reconnect_count", "reconnect"), ("disconnect_count", "disconnect")] {
+            let expected = (0..rows.len())
+                .filter(|i| !console.contains(i) && field(&rows[*i], "stage") == stage)
+                .count();
+            assert_eq!(field(session, key), expected.to_string(), "{key}");
+        }
+        assert!(c.relations.iter().all(|r| {
+            [field(r, "from_index"), field(r, "to_index")]
+                .iter()
+                .all(|i| !console.contains(&i.parse().unwrap()))
+        }));
+    }
+
+    #[test]
+    fn all_console_session_leaves_no_segment_or_relation() {
+        let mut rows = vec![
+            lsm_local("2026-09-29 00:10:00", "21", "1", "corp\\alice"),
+            lsm("2026-09-29 00:10:01", "22", "1", "", ""),
+            lsm("2026-09-29 09:00:00", "23", "1", "", ""),
+        ];
+        let c = correlate(&mut rows);
+        assert!(rows.iter().all(|r| field(r, "exclude_reason") == CONSOLE_SESSION));
+        assert!(c.segments.is_empty());
+        assert!(c.relations.is_empty());
+    }
+
+    // A surviving remote row never takes identity from a removed console row.
+    #[test]
+    fn console_rows_never_donate_identity_to_remote_rows() {
+        let mut rows = vec![
+            lsm_local("2026-09-29 00:10:00", "21", "3", "corp\\bob"),
+            lsm("2026-09-29 00:20:00", "25", "3", "10.0.0.6", ""),
+            lsm("2026-09-29 00:30:00", "21", "4", "10.0.0.5", "corp\\alice"),
+            lsm_local("2026-09-29 00:40:00", "25", "4", "corp\\alice"),
+            lsm("2026-09-29 00:50:00", "25", "4", "10.0.0.6", ""),
+        ];
+        let c = correlate(&mut rows);
+        assert_eq!(rows[1].get("account_key"), None);
+        assert_eq!(rows[4]["account_key"], "corp\\alice");
+        let cited = |to: &str| -> Vec<String> {
+            c.relations
+                .iter()
+                .filter(|r| field(r, "to_index") == to && field(r, "field") == "account_key")
+                .map(|r| field(r, "from_index").to_string())
+                .collect()
+        };
+        assert!(cited("1").is_empty());
+        assert_eq!(cited("4"), vec!["2".to_string()]);
+    }
+
     #[test]
     fn client_connection_start_is_the_attempt_or_the_established_event() {
         let id = "11111111-2222-3333-4444-555555555555";
@@ -1217,39 +1363,6 @@ mod tests {
         assert_eq!(c.segments.len(), 2);
         assert_eq!(field(&c.segments[0], "id_space"), "lsm_session");
         assert_eq!(field(&c.segments[1], "id_space"), "security_logon");
-    }
-
-    #[test]
-    fn local_session_carries_local_scope_and_neutralises_direction() {
-        let mut rows = vec![
-            lsm_local("2026-09-29 00:10:00", "21", "4", "pc1\\bob"),
-            lsm("2026-09-29 00:20:00", "23", "4", "", ""),
-        ];
-        let c = correlate(&mut rows);
-        assert_eq!(rows[1]["access_scope"], "local");
-        assert_eq!(rows[1].get("remote_address"), None);
-        assert_eq!(
-            rows[1].get("remote_address_raw"),
-            None,
-            "raw payload values are never filled by correlation"
-        );
-        assert_eq!(rows[0]["remote_address_raw"], "LOCAL");
-        assert_eq!(rows[1]["account_key"], "pc1\\bob");
-        assert_eq!(
-            rows[1]["direction"], "unknown",
-            "carried LOCAL evidence must not stay an inbound remote success"
-        );
-        assert_eq!(
-            rows[1]["result"], "성공",
-            "a genuine local success stays 성공"
-        );
-        assert!(has_carry(&c, 0, 1, "access_scope"));
-        // The unaddressed LSM row is already unknown (RD-05); local scope
-        // needs no direction rewrite and never yields an inbound one.
-        assert!(!c.relations.iter().any(|r| field(r, "field") == "direction"));
-        assert_eq!(field(&c.segments[0], "access_scope"), "local");
-        assert_eq!(field(&c.segments[0], "direction"), "unknown");
-        assert_eq!(c.segments[0].get("remote_address"), None);
     }
 
     // RD-05: an LSM record without its own address becomes inbound only when
