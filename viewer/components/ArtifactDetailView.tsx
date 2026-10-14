@@ -11,6 +11,7 @@ import ExpandMoreOutlinedIcon from "@mui/icons-material/ExpandMoreOutlined";
 import OpenInFullOutlinedIcon from "@mui/icons-material/OpenInFullOutlined";
 import { CopyButton, JsonToggleButton, valueControlButtonStyle } from "./ValueControls";
 import { prettyJsonOrNull, unescapeControlSequences } from "@/lib/jsonText";
+import { prettyXmlOrNull } from "@/lib/xmlPretty";
 import { fallbackLinkedRowTitle } from "@/lib/linkedRowTitle";
 import CategoryOutlinedIcon from "@mui/icons-material/CategoryOutlined";
 import PersonOutlineOutlinedIcon from "@mui/icons-material/PersonOutlineOutlined";
@@ -90,24 +91,28 @@ function formatDurationMs(value: string): string {
 // content full-screen (CodeModal) — the detail panel's box is small, and a
 // PowerShell ScriptBlock can be hundreds of lines. Used for `json`/`code`
 // fields and for any plain field whose value turns out to be JSON.
-function CodeOrJsonBlock({ raw, expandTitle }: { raw: string; expandTitle?: string }) {
-  const pretty = prettyJsonOrNull(raw);
+/** Stored code with copy, enlarge and (JSON/XML) indented view; copy keeps the raw value. */
+export function CodeOrJsonBlock({ raw, expandTitle, label }: { raw: string; expandTitle?: string; label?: string }) {
+  const prettyJson = prettyJsonOrNull(raw);
+  const prettyXml = prettyJson === null ? prettyXmlOrNull(raw) : null;
   const [beautified, setBeautified] = useState(true);
   const [expanded, setExpanded] = useState(false);
-  // Beautified view also expands control escapes; copy keeps the raw value.
-  const shown = pretty !== null && beautified ? unescapeControlSequences(pretty) : raw;
-  const isJson = pretty !== null;
+  // Beautified JSON also expands control escapes.
+  const pretty = prettyJson !== null ? unescapeControlSequences(prettyJson) : prettyXml;
+  const shown = pretty !== null && beautified ? pretty : raw;
+  const isJson = prettyJson !== null;
 
   return (
     <div>
       <div style={{ display: "flex", justifyContent: "flex-end", alignItems: "center", gap: 6, marginBottom: 4 }}>
-        {isJson && <JsonToggleButton beautified={beautified} onToggle={() => setBeautified((b) => !b)} />}
+        {label && <span style={{ marginRight: "auto", fontSize: 11.5, color: "var(--text-faint)" }}>{label}</span>}
+        {pretty !== null && <JsonToggleButton beautified={beautified} onToggle={() => setBeautified((b) => !b)} label={isJson ? "{ }" : "</>"} />}
         <CopyButton value={raw} />
         <button onClick={() => setExpanded(true)} title="크게 보기" aria-label="크게 보기" style={{ ...valueControlButtonStyle, width: 28, padding: 0, color: "var(--text-dim)" }}>
           <OpenInFullOutlinedIcon aria-hidden="true" sx={{ fontSize: 15 }} />
         </button>
       </div>
-      {expanded && <CodeModal code={shown} title={expandTitle ?? "코드 보기"} onClose={() => setExpanded(false)} />}
+      {expanded && <CodeModal code={shown} copyValue={raw} title={expandTitle ?? "코드 보기"} onClose={() => setExpanded(false)} />}
       <pre
         style={{
           margin: 0,

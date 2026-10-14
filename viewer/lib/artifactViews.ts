@@ -1008,18 +1008,6 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
         { key: "level_name", label: "수준" },
         { key: "keywords_raw", label: "Keywords" },
       ]},
-      { heading: "원본 · 파싱", fields: [
-        { key: "source_file", label: "원본 파일", kind: "path" },
-        { key: "source_format", label: "형식" },
-        { key: "encoding", label: "인코딩" },
-        { key: "decode_status", label: "디코딩" },
-        { key: "raw_size", label: "원문 크기" },
-        { key: "raw_sha256", label: "원문 SHA-256", kind: "hash" },
-        { key: "parse_status", label: "파싱 상태", compute: (r) => (r.parse_status && r.parse_status !== "parsed" && r.parse_status !== "ok" ? r.parse_status : "") },
-        { key: "parse_error", label: "파싱 오류" },
-        { key: "parse_error_location", label: "오류 위치" },
-        { key: "task_version", label: "작업 스키마 버전" },
-      ]},
       { heading: "작업 원문", collapsible: { defaultExpanded: false }, fields: [
         { key: "raw_content", label: "작업 XML/원문", kind: "code" },
         { key: "event_data_raw", label: "EventData", kind: "code" },
@@ -1083,19 +1071,9 @@ const VIEWS: Record<string, ArtifactViewSpec> = {
         ],
       },
       {
-        table: "TaskSettings",
-        heading: "설정",
-        summary: (r) => `${r.setting_path || r.setting_name} = ${r.value_raw ?? ""}${r.value_source === "schema_default" ? " (스키마 기본값)" : ""}`,
-      },
-      {
         table: "TaskComRegistrations",
         heading: "COM 등록",
         summary: (r) => (r.match_status === "no_registration_found" ? `${r.class_id} · 등록 없음` : [r.class_id, r.server_kind, r.server_path_resolved || r.server_path_raw, r.registry_view, r.hive_scope].filter(Boolean).join(" · ")),
-      },
-      {
-        table: "TaskFileEvidence",
-        heading: "수집 파일 사본",
-        summary: (r) => [r.collected_path || r.collected_name, r.collected_size && `${r.collected_size} B`, r.collected_sha256, "파일명 일치"].filter(Boolean).join(" · "),
       },
       {
         table: "TaskRegistryEntries",

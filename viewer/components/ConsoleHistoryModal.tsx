@@ -3,9 +3,9 @@
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { Compartment, EditorState, RangeSetBuilder, StateEffect, StateField } from "@codemirror/state";
 import { Decoration, EditorView, WidgetType, drawSelection, highlightActiveLine, highlightActiveLineGutter, keymap, lineNumbers, type DecorationSet } from "@codemirror/view";
-import { HighlightStyle, StreamLanguage, syntaxHighlighting } from "@codemirror/language";
+import { StreamLanguage } from "@codemirror/language";
 import { powershellMode } from "@/lib/powershellMode";
-import { tags } from "@lezer/highlight";
+import { codeEditorLook } from "./codeEditor";
 import CheckIcon from "@mui/icons-material/Check";
 import ContentCopyOutlinedIcon from "@mui/icons-material/ContentCopyOutlined";
 import KeyboardArrowDownOutlinedIcon from "@mui/icons-material/KeyboardArrowDownOutlined";
@@ -17,33 +17,7 @@ import SelectionDecoder from "./SelectionDecoder";
 
 const STATUS_LABEL: Record<string, string> = { incomplete_continuation: "연결 미완료", missing_line: "줄 누락" };
 
-const highlight = HighlightStyle.define([
-  { tag: tags.keyword, color: "var(--accent)", fontWeight: "600" },
-  { tag: tags.standard(tags.variableName), color: "#eacb75" },
-  { tag: tags.attributeName, color: "#8fcaff" },
-  { tag: tags.special(tags.variableName), color: "#b7b0ff" },
-  { tag: tags.typeName, color: "#7fd1c7" },
-  { tag: tags.string, color: "var(--success)" },
-  { tag: tags.number, color: "#f0a36b" },
-  { tag: tags.comment, color: "var(--text-faint)", fontStyle: "italic" },
-  { tag: tags.operator, color: "var(--text-dim)" },
-]);
 
-const theme = EditorView.theme({
-  "&": { height: "100%", fontSize: "13px", backgroundColor: "var(--bg-input)", color: "var(--text)" },
-  "&.cm-focused": { outline: "none" },
-  ".cm-scroller": { fontFamily: "var(--mono)", lineHeight: "1.55" },
-  ".cm-content": { padding: "10px 0", caretColor: "var(--accent)" },
-  ".cm-gutters": { backgroundColor: "var(--bg-panel)", color: "var(--text-faint)", borderRight: "1px solid var(--border-subtle)" },
-  ".cm-lineNumbers .cm-gutterElement": { minWidth: "44px", padding: "0 10px 0 6px" },
-  ".cm-activeLine": { backgroundColor: "color-mix(in srgb, var(--accent) 7%, transparent)" },
-  ".cm-activeLineGutter": { backgroundColor: "color-mix(in srgb, var(--accent) 12%, transparent)", color: "var(--text)" },
-  ".cm-cursor": { borderLeftColor: "var(--accent)" },
-  "&.cm-focused .cm-selectionBackground, .cm-selectionBackground": { backgroundColor: "color-mix(in srgb, var(--accent) 30%, transparent)" },
-  ".cm-ps-match": { backgroundColor: "color-mix(in srgb, var(--warning) 28%, transparent)", borderRadius: "2px" },
-  ".cm-ps-match-current": { backgroundColor: "color-mix(in srgb, var(--warning) 60%, transparent)", outline: "1px solid var(--warning)" },
-  ".cm-ps-status": { marginLeft: "10px", padding: "0 6px", fontSize: "10.5px", fontWeight: "700", color: "var(--warning)", border: "1px solid var(--warning)", borderRadius: "var(--radius)" },
-}, { dark: true });
 
 // Search hits: all matches plus the current one, replaced as a set.
 const setMatches = StateEffect.define<{ matches: { from: number; to: number }[]; current: number }>();
@@ -126,8 +100,7 @@ export default function ConsoleHistoryModal({ account, rows, onClose }: { accoun
           highlightActiveLineGutter(),
           drawSelection(),
           StreamLanguage.define(powershellMode),
-          syntaxHighlighting(highlight),
-          theme,
+          codeEditorLook,
           matchField,
           statusField,
           wrapCompartment.current.of(wrapRef.current ? EditorView.lineWrapping : []),

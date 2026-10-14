@@ -12,7 +12,7 @@ import { RecordScopeContext } from "@/lib/recordScope";
 import type { DBRow, FetchLinkedRows } from "@/lib/types";
 import type { AccountDirectory } from "@/lib/accountIdentity";
 import { useModalDialog } from "@/lib/useModalDialog";
-import ArtifactDetailView from "./ArtifactDetailView";
+import ArtifactDetailView, { CodeOrJsonBlock } from "./ArtifactDetailView";
 
 interface RowDetailPanelProps {
   row: Record<string, string>;
@@ -179,7 +179,11 @@ export default function RowDetailPanel({ row, columns, focusedColumn, evidenceTi
             ) : (
               (child.fields ?? Object.keys(childRow).map((key): FieldSpec => ({ key })))
                 .filter((field) => childRow[field.key])
-                .map((field) => (
+                .map((field) => field.kind === "code" ? (
+                  <div key={field.key} style={{ padding: "6px 0 4px" }}>
+                    <CodeOrJsonBlock raw={childRow[field.key]} label={field.label ?? field.key} expandTitle={`${child.heading} · ${field.label ?? field.key}`} />
+                  </div>
+                ) : (
                   <div key={field.key} style={{ display: "grid", gridTemplateColumns: "minmax(96px, 30%) minmax(0, 1fr)", gap: 8, padding: "2px 0" }}>
                     <span style={{ fontSize: 11.5, color: "var(--text-faint)" }}>{field.label ?? field.key}</span>
                     <span style={{ fontSize: 12, color: "var(--text)", fontFamily: "var(--mono)", wordBreak: "break-all" }}>{field.valueLabels?.[childRow[field.key]] ?? childRow[field.key]}</span>

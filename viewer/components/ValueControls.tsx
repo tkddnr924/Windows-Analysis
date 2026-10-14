@@ -63,10 +63,10 @@ export function CopyButton({ value, label, variant = "boxed" }: { value: string;
   );
 }
 
-export function JsonToggleButton({ beautified, onToggle }: { beautified: boolean; onToggle: () => void }) {
+export function JsonToggleButton({ beautified, onToggle, label = "{ }" }: { beautified: boolean; onToggle: () => void; label?: string }) {
   return (
     <button onClick={onToggle} title={beautified ? "원본(압축) 보기" : "보기 좋게 정렬"} style={valueControlButtonStyle}>
-      {"{ }"}
+      {label}
     </button>
   );
 }
