@@ -1020,6 +1020,7 @@ fn build_host(facts: &Facts, writer: &mut Writer<'_>) -> Result<()> {
             .rows
             .iter()
             .any(|r| r.key_low.ends_with("\\polprdms") && !r.value_data.trim().is_empty());
+        let domain_sid = primary_domain_sid(hive);
         for row in &hive.rows {
             if !row.key_low.ends_with("\\polprdmn") {
                 continue;
@@ -1028,6 +1029,9 @@ fn build_host(facts: &Facts, writer: &mut Writer<'_>) -> Result<()> {
                 continue;
             };
             let key = if joined { "domain" } else { "workgroup" };
+            if let Some(sid) = domain_sid.as_ref().filter(|_| joined) {
+                host_field(&mut fields, key).1.insert("domain_sid".into(), sid.clone().into());
+            }
             host_field(&mut fields, key).0.push(
                 &name,
                 RANK_PRIMARY,
@@ -1065,9 +1069,25 @@ fn lsa_string(hex: &str) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
+// SECURITY Policy\PolPrDmS: binary SID of the joined primary domain.
+fn primary_domain_sid(hive: &Hive) -> Option<String> {
+    hive.rows
+        .iter()
+        .find(|r| r.key_low.ends_with("\\polprdms"))
+        .and_then(|r| crate::hex::format_binary_sid(&unhex(&r.value_data)))
+}
+
 // ---------------------------------------------------------------------------
 // Accounts
 // ---------------------------------------------------------------------------
+
+/// SID-keyed `DOMAIN\user` written by Windows for a domain logon.
+struct DomainNameRecord {
+    sid: String,
+    name: String,
+    label: &'static str,
+    src: SourceRef,
+}
 
 #[derive(Default, Clone)]
 struct ProfileEntry {
@@ -1109,6 +1129,10 @@ struct AccountFacts {
     groups: HashMap<String, Vec<(Option<String>, Option<String>)>>,
     /// Active ControlSet service names: candidates for S-1-5-80 virtual accounts.
     services: Vec<(String, SourceRef)>,
+    /// Group Policy cache and LogonUI SID-to-name records.
+    domain_names: Vec<DomainNameRecord>,
+    /// LogonUI display name keyed by uppercase SID.
+    display_names: HashMap<String, (String, SourceRef)>,
 }
 
 fn collect_accounts(facts: &Facts) -> AccountFacts {
@@ -1117,10 +1141,31 @@ fn collect_accounts(facts: &Facts) -> AccountFacts {
     let mut profiles: Vec<ProfileEntry> = Vec::new();
     let mut hidden: HashMap<String, (String, SourceRef)> = HashMap::new();
     let mut groups: HashMap<String, Vec<(Option<String>, Option<String>)>> = HashMap::new();
+    let mut domain_names: Vec<DomainNameRecord> = Vec::new();
+    let mut display_names: HashMap<String, (String, SourceRef)> = HashMap::new();
 
     // SOFTWARE profiles and hidden accounts.
     for hive in facts.of(HiveKind::Software) {
+        let mut logon: HashMap<&str, &RegRow> = HashMap::new();
         for row in &hive.rows {
+            // Group Policy\DataStore\<SID>\0 szName = DOMAIN\user.
+            if row.value_name == "szName" && row.key_low.ends_with("\\0") {
+                if let Some(i) = row.key_low.find("\\group policy\\datastore\\s-") {
+                    let tail = &row.key_path[i + "\\group policy\\datastore\\".len()..];
+                    let sid = tail.split('\\').next().unwrap_or("");
+                    if !row.value_data.trim().is_empty() {
+                        domain_names.push(DomainNameRecord {
+                            sid: sid.to_string(),
+                            name: row.value_data.trim().to_string(),
+                            label: "group_policy_cache",
+                            src: hive.source_ref(row, "value_data"),
+                        });
+                    }
+                }
+            }
+            if row.key_low.ends_with("\\authentication\\logonui") {
+                logon.insert(row.value_name.as_str(), row);
+            }
             if row.key_low.contains("\\profilelist\\s-") {
                 let sid = row.key_path.rsplit('\\').next().unwrap_or("").to_string();
                 if sid.is_empty() {
@@ -1160,6 +1205,24 @@ fn collect_accounts(facts: &Facts) -> AccountFacts {
                         hive.source_ref(row, "value_name"),
                     ),
                 );
+            }
+        }
+        // LogonUI names the last logged-on user only together with its SID.
+        if let (Some(sid), Some(user)) = (logon.get("LastLoggedOnUserSID"), logon.get("LastLoggedOnSAMUser")) {
+            let sid = sid.value_data.trim();
+            if !sid.is_empty() && !user.value_data.trim().is_empty() {
+                domain_names.push(DomainNameRecord {
+                    sid: sid.to_string(),
+                    name: user.value_data.trim().to_string(),
+                    label: "logonui",
+                    src: hive.source_ref(user, "value_data"),
+                });
+                if let Some(display) = logon.get("LastLoggedOnDisplayName").filter(|r| !r.value_data.trim().is_empty()) {
+                    display_names.insert(
+                        sid.to_uppercase(),
+                        (display.value_data.trim().to_string(), hive.source_ref(display, "value_data")),
+                    );
+                }
             }
         }
     }
@@ -1367,6 +1430,8 @@ fn collect_accounts(facts: &Facts) -> AccountFacts {
         hidden,
         groups,
         services,
+        domain_names,
+        display_names,
     }
 }
 
@@ -2437,6 +2502,52 @@ fn write_accounts(
         }
     }
 
+    // Domain accounts are absent from SAM; Windows' own SID-keyed records name them.
+    for row in by_sid.values_mut() {
+        if row.value.is_some() {
+            continue;
+        }
+        let sid = row.account_sid.clone().unwrap_or_default();
+        let records: Vec<&DomainNameRecord> = accounts
+            .domain_names
+            .iter()
+            .filter(|r| r.sid.eq_ignore_ascii_case(&sid))
+            .collect();
+        if records.is_empty() {
+            continue;
+        }
+        for record in &records {
+            row.add_ref(record.src.clone());
+        }
+        let mut names: Vec<&str> = Vec::new();
+        for record in &records {
+            if !names.iter().any(|n| n.eq_ignore_ascii_case(&record.name)) {
+                names.push(&record.name);
+            }
+        }
+        if names.len() > 1 {
+            row.details.insert(
+                "domain_name_candidates".into(),
+                serde_json::Value::Array(names.iter().map(|n| (*n).into()).collect()),
+            );
+            continue;
+        }
+        let name = names[0].to_string();
+        let mut labels: Vec<&str> = records.iter().map(|r| r.label).collect();
+        labels.sort_unstable();
+        labels.dedup();
+        row.domain = name.split_once('\\').map(|(domain, _)| domain.to_string());
+        row.value = Some(name.clone());
+        row.account_name = Some(name);
+        row.name_source = Some(labels.join("+"));
+        row.status = "resolved";
+        row.selection_reason = Some("도메인 로그온 SID→이름 레지스트리 기록 일치".into());
+        if let Some((display, src)) = accounts.display_names.get(&sid.to_uppercase()) {
+            row.full_name = Some(display.clone());
+            row.add_ref(src.clone());
+        }
+    }
+
     for key in order {
         let Some(mut row) = by_sid.remove(&key) else {
             continue;
@@ -3098,6 +3209,120 @@ mod tests {
                 (Some("S-1-5-32-545".into()), Some("Users".into())),
             ]
         );
+    }
+
+    // Shapes copied from the PC1_20261014_023944 SOFTWARE/SECURITY hives.
+    const DOMAIN_USER: &str = "S-1-5-21-3037839750-2636006196-3284199242-7583";
+
+    fn lsa_hex(text: &str) -> String {
+        let units: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let mut b = Vec::new();
+        b.extend_from_slice(&(units.len() as u16).to_le_bytes());
+        b.extend_from_slice(&(units.len() as u16 + 2).to_le_bytes());
+        b.extend_from_slice(&8u32.to_le_bytes());
+        b.extend(units);
+        b.extend_from_slice(&[0, 0]);
+        crate::hex::hex_lower(&b)
+    }
+
+    fn domain_fixture(tag: &str, gp_name: Option<&str>, logon_user: Option<&str>) -> Fixture {
+        let fx = Fixture::new(tag);
+        let dom_sid = "01040000000000051500000086c111b534431e9d4ae7c0c3".to_string();
+        let dom_name = lsa_hex("NAMYANG");
+        fx.hive("SECURITY", &[
+            ("\\ROOT\\Policy\\PolPrDmN", "(default)", "REG_NONE", dom_name.as_str()),
+            ("\\ROOT\\Policy\\PolPrDmS", "(default)", "REG_NONE", dom_sid.as_str()),
+        ]);
+        let mut software: Vec<(&str, &str, &str, String)> = base_software("C:\\Users\\ny").into_iter().collect();
+        let gp = format!("\\ROOT\\Microsoft\\Windows\\CurrentVersion\\Group Policy\\DataStore\\{DOMAIN_USER}\\0");
+        let logon = "\\ROOT\\Microsoft\\Windows\\CurrentVersion\\Authentication\\LogonUI";
+        let profile = format!("\\ROOT\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList\\{DOMAIN_USER}");
+        software.push((profile.as_str(), "ProfileImagePath", "REG_SZ", "C:\\Users\\2505002".to_string()));
+        if let Some(name) = gp_name {
+            software.push((gp.as_str(), "szName", "REG_SZ", name.to_string()));
+        }
+        if let Some(user) = logon_user {
+            software.push((logon, "LastLoggedOnUserSID", "REG_SZ", DOMAIN_USER.to_string()));
+            software.push((logon, "LastLoggedOnSAMUser", "REG_SZ", user.to_string()));
+            software.push((logon, "LastLoggedOnDisplayName", "REG_SZ", "박 상현".to_string()));
+        }
+        write_software(&fx, software);
+        fx
+    }
+
+    #[test]
+    fn domain_account_names_come_from_agreeing_registry_records() {
+        let fx = domain_fixture("domain-ok", Some("NAMYANG\\2505002"), Some("NAMYANG\\2505002"));
+        assert!(fx.build() > 0);
+        let conn = fx.db();
+        let row: (Option<String>, Option<String>, Option<String>, String, Option<String>, String) = conn
+            .query_row(
+                "SELECT value, domain, full_name, account_kind, name_source, resolution_status FROM metadata \
+                 WHERE kind='account' AND key=?1",
+                [DOMAIN_USER.to_lowercase()],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+            )
+            .unwrap();
+        assert_eq!(row.0.as_deref(), Some("NAMYANG\\2505002"));
+        assert_eq!(row.1.as_deref(), Some("NAMYANG"));
+        assert_eq!(row.2.as_deref(), Some("박 상현"));
+        assert_eq!(row.3, "domain");
+        assert_eq!(row.4.as_deref(), Some("group_policy_cache+logonui"));
+        assert_eq!(row.5, "resolved");
+        assert_eq!(fx.lookup().account(DOMAIN_USER), Some("NAMYANG\\2505002"));
+        // Joined primary domain from SECURITY policy.
+        let domain: (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT value, details_json FROM metadata WHERE kind='host' AND key='domain'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(domain.0.as_deref(), Some("NAMYANG"));
+        assert!(domain.1.unwrap_or_default().contains("S-1-5-21-3037839750-2636006196-3284199242"));
+        // A local profile without SAM or registry name records stays unnamed.
+        let local: Option<String> = conn
+            .query_row("SELECT value FROM metadata WHERE kind='account' AND rid=1001", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(local, None);
+    }
+
+    #[test]
+    fn conflicting_domain_account_records_stay_unresolved() {
+        let fx = domain_fixture("domain-conflict", Some("NAMYANG\\2505002"), Some("NAMYANG\\someone"));
+        assert!(fx.build() > 0);
+        let (value, details): (Option<String>, String) = fx
+            .db()
+            .query_row(
+                "SELECT value, details_json FROM metadata WHERE kind='account' AND key=?1",
+                [DOMAIN_USER.to_lowercase()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(value, None);
+        assert!(details.contains("NAMYANG\\\\someone") && details.contains("NAMYANG\\\\2505002"), "{details}");
+    }
+
+    #[test]
+    fn a_single_sid_keyed_registry_record_names_the_domain_account() {
+        for (tag, gp, logon, source, full) in [
+            ("domain-gp-only", Some("NAMYANG\\2505002"), None, "group_policy_cache", None),
+            ("domain-logon-only", None, Some("NAMYANG\\2505002"), "logonui", Some("박 상현")),
+        ] {
+            let fx = domain_fixture(tag, gp, logon);
+            assert!(fx.build() > 0);
+            let row: (Option<String>, Option<String>, Option<String>) = fx
+                .db()
+                .query_row(
+                    "SELECT value, name_source, full_name FROM metadata WHERE kind='account' AND key=?1",
+                    [DOMAIN_USER.to_lowercase()],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(row.0.as_deref(), Some("NAMYANG\\2505002"), "{tag}");
+            assert_eq!(row.1.as_deref(), Some(source), "{tag}");
+            assert_eq!(row.2.as_deref(), full, "{tag}");
+        }
     }
 
     #[test]

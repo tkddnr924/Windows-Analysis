@@ -840,7 +840,10 @@ export default function Home() {
   // but that screen (which has its own detailed panel).
   const runningPipelineCount = run.runs.filter((entry) => entry.status === "running").length;
   const queuedPipelineCount = run.runs.filter((entry) => entry.status === "queued").length;
-  const globalProgress = run.active ? (
+  // The open host's own run is already reflected on screen; show only other hosts' runs.
+  const progressHostId = run.runningHostId ?? run.completedHostId;
+  const ownRun = Boolean(selectedHost && progressHostId === selectedHost.id);
+  const globalProgress = run.active && !ownRun ? (
     <GlobalProgress
       hostName={run.runningHostName ?? ""}
       stepLabel={run.stepLabel}

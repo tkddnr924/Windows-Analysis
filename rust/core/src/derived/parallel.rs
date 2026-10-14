@@ -105,8 +105,13 @@ fn worker(state: &Mutex<State<'_>>, wake: &Condvar) {
             guard.running += 1;
             drop(guard);
             let name = task.name;
+            let started = std::time::Instant::now();
             // A panic must still release waiting workers, or the scope never ends.
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(task.run));
+            crate::pipeline::append_current_log_lifecycle(&format!(
+                "overview_task_finished name={name} ms={}",
+                started.elapsed().as_millis()
+            ));
             guard = state.lock();
             guard.running -= 1;
             match outcome {

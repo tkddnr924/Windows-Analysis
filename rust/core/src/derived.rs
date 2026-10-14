@@ -452,6 +452,12 @@ pub(crate) fn stem_of(path: &Path) -> String {
 
 /// Recreate a derived database using its canonical DDL.
 pub fn create_database(overview_dir: &Path, name: &str) -> Result<Connection> {
+    create_tables(overview_dir, name, false).map(|(conn, _)| conn)
+}
+
+/// Canonical DDL; with `defer_indexes`, CREATE INDEX statements are returned
+/// for a sorted build after the bulk insert instead of being executed.
+fn create_tables(overview_dir: &Path, name: &str, defer_indexes: bool) -> Result<(Connection, Vec<String>)> {
     let spec = schema::spec(name)
         .ok_or_else(|| anyhow!("알 수 없는 파생 DB 이름입니다: {name}"))?;
     std::fs::create_dir_all(overview_dir)
@@ -465,28 +471,59 @@ pub fn create_database(overview_dir: &Path, name: &str) -> Result<Connection> {
         .with_context(|| format!("파생 DB 생성: {}", path.display()))?;
     // Enforce intra-database parent/child references during generation.
     conn.pragma_update(None, "foreign_keys", "ON")?;
-    conn.execute_batch(spec.ddl)
+    let mut deferred = Vec::new();
+    let mut ddl = String::with_capacity(spec.ddl.len());
+    for statement in spec.ddl.split(';') {
+        let head = statement.trim_start();
+        if defer_indexes && (head.starts_with("CREATE INDEX") || head.starts_with("CREATE UNIQUE INDEX")) {
+            deferred.push(statement.trim().to_string());
+        } else {
+            ddl.push_str(statement);
+            ddl.push(';');
+        }
+    }
+    conn.execute_batch(&ddl)
         .with_context(|| format!("{name} DDL 실행"))?;
-    Ok(conn)
+    Ok((conn, deferred))
 }
 
 /// Write parents before children and source references.
 pub struct DerivedDb {
     spec: &'static DbSpec,
     conn: Connection,
+    path: PathBuf,
+    /// Secondary indexes built in `finish` (write-only builders).
+    deferred_indexes: Vec<String>,
     pending: usize,
     rows: usize,
 }
 
 impl DerivedDb {
     pub fn create(overview_dir: &Path, name: &str) -> Result<Self> {
+        Self::open(overview_dir, name, false)
+    }
+
+    /// For builders that never read back their own rows: secondary indexes
+    /// are built once after all inserts instead of per row.
+    pub fn create_bulk(overview_dir: &Path, name: &str) -> Result<Self> {
+        Self::open(overview_dir, name, true)
+    }
+
+    fn open(overview_dir: &Path, name: &str, defer_indexes: bool) -> Result<Self> {
         let spec = schema::spec(name)
             .ok_or_else(|| anyhow!("알 수 없는 파생 DB 이름입니다: {name}"))?;
-        let conn = create_database(overview_dir, name)?;
+        let (conn, deferred_indexes) = create_tables(overview_dir, name, defer_indexes)?;
+        // A failed run discards the staged file, so per-commit fsync buys nothing;
+        // `finish` syncs the completed file once.
+        conn.pragma_update(None, "journal_mode", "MEMORY")?;
+        conn.pragma_update(None, "synchronous", "OFF")?;
+        conn.pragma_update(None, "cache_size", -65_536)?;
         conn.execute_batch("BEGIN")?;
         Ok(Self {
             spec,
             conn,
+            path: overview_dir.join(format!("{name}.sqlite")),
+            deferred_indexes,
             pending: 0,
             rows: 0,
         })
@@ -563,7 +600,19 @@ impl DerivedDb {
     }
 
     pub fn finish(self) -> Result<usize> {
+        for index in &self.deferred_indexes {
+            self.conn
+                .execute_batch(index)
+                .with_context(|| format!("{} 인덱스 생성", self.spec.name))?;
+        }
         self.conn.execute_batch("COMMIT")?;
+        self.conn
+            .close()
+            .map_err(|(_, error)| error)
+            .with_context(|| format!("{} 닫기", self.spec.name))?;
+        std::fs::File::open(&self.path)
+            .and_then(|file| file.sync_all())
+            .with_context(|| format!("{} 디스크 기록", self.path.display()))?;
         Ok(self.rows)
     }
 }
@@ -1964,6 +2013,50 @@ mod tests {
             message.contains("record_offset") && message.contains("다시 파싱"),
             "실제: {message}"
         );
+        let _ = std::fs::remove_dir_all(out_dir.parent().unwrap());
+    }
+
+    #[test]
+    fn bulk_build_ends_with_the_canonical_schema_and_rows() {
+        let (out_dir, _) = fixture("bulk-schema");
+        let schema = |dir: &Path, name: &str| -> Vec<(String, String, Option<String>)> {
+            Connection::open(dir.join(format!("{name}.sqlite")))
+                .unwrap()
+                .prepare("SELECT type, name, sql FROM sqlite_master ORDER BY type, name")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        for name in ["FileSystemEntries", "UsnJournal"] {
+            let bulk = out_dir.join("bulk");
+            let canonical = out_dir.join("canonical");
+            let mut db = DerivedDb::create_bulk(&bulk, name).unwrap();
+            let spec = db.spec();
+            // UsnJournal rows need typed USN fields; its schema check suffices.
+            let count = if name == "FileSystemEntries" { 3 } else { 0 };
+            let ids: Vec<String> = (0..count).map(|_| {
+                let rec = Record::new(spec, "host", "ds");
+                let id = rec.record_id.clone();
+                db.write(rec).unwrap();
+                id
+            }).collect();
+            assert_eq!(db.finish().unwrap(), count);
+            drop(create_database(&canonical, name).unwrap());
+            assert_eq!(schema(&bulk, name), schema(&canonical, name), "{name}");
+            let conn = Connection::open(bulk.join(format!("{name}.sqlite"))).unwrap();
+            let check: String = conn.query_row("PRAGMA integrity_check", [], |r| r.get(0)).unwrap();
+            assert_eq!(check, "ok");
+            let stored = ids
+                .iter()
+                .filter(|id| {
+                    conn.query_row(&format!("SELECT 1 FROM \"{name}\" WHERE record_id=?1"), [id], |_| Ok(()))
+                        .is_ok()
+                })
+                .count();
+            assert_eq!(stored, count);
+        }
         let _ = std::fs::remove_dir_all(out_dir.parent().unwrap());
     }
 

@@ -165,7 +165,7 @@ const MFT_SELECT: &str = "SELECT rowid, volume_id, volume_label, volume_serial, 
 
 fn file_system_entries(ctx: &Ctx) -> Result<usize> {
     let spec = spec_of("FileSystemEntries");
-    let mut db = DerivedDb::create(&ctx.overview_dir(), "FileSystemEntries")?;
+    let mut db = DerivedDb::create_bulk(&ctx.overview_dir(), "FileSystemEntries")?;
     let facts = ctx.out_dir.join("_OVERVIEW").join("MFT_Records.sqlite");
     if !facts.exists() {
         return db.finish();

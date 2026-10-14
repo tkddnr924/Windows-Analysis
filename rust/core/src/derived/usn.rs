@@ -184,7 +184,7 @@ const FACTS_COLUMNS: &str = "rowid, timestamp, filename, reason, file_attributes
 
 pub(super) fn build(ctx: &Ctx) -> Result<usize> {
     let spec = spec_of("UsnJournal");
-    let mut db = DerivedDb::create(&ctx.overview_dir(), "UsnJournal")?;
+    let mut db = DerivedDb::create_bulk(&ctx.overview_dir(), "UsnJournal")?;
     let table = crate::parsers::usnjrnl::USN_TABLE;
     // Collected inputs are identified separately from physical volume identity.
     let mut inputs: HashMap<String, String> = HashMap::new();

@@ -593,7 +593,7 @@ fn append_current_log_output(message: &str) {
     }
 }
 
-fn append_current_log_lifecycle(message: &str) {
+pub(crate) fn append_current_log_lifecycle(message: &str) {
     let Ok(mut guard) = PERSISTENT_LOG.lock() else {
         return;
     };

@@ -608,7 +608,7 @@ function AccountRow({ account, bookmarked, onSelect }: { account: Account; bookm
       type="button"
       onClick={onSelect}
       title="자세히 보기"
-      aria-label={`${account.username || "이름 없는 계정"} 계정 상세 보기${bookmarked ? ", 북마크됨" : ""}`}
+      aria-label={`${account.username || account.sid} 계정 상세 보기${bookmarked ? ", 북마크됨" : ""}`}
       className={bookmarked ? "dfir-bookmarked-row" : undefined}
       style={{ borderRadius: "var(--radius)", width: "100%", display: "flex", alignItems: "center", gap: 12, minHeight: 62, marginBottom: 8, padding: "10px 14px", border: "1px solid var(--border)", background: "var(--bg-panel)", color: "inherit", cursor: "pointer", textAlign: "left", fontFamily: "inherit", transition: "background .15s ease, border-color .15s ease" }}
       onMouseEnter={(e) => { if (!bookmarked) e.currentTarget.style.background = "var(--bg-hover)"; }}
@@ -619,14 +619,14 @@ function AccountRow({ account, bookmarked, onSelect }: { account: Account; bookm
       </span>
       <span style={{ flex: 1, minWidth: 0, display: "grid", gap: 3 }}>
         <span style={{ display: "flex", alignItems: "center", gap: 7, minWidth: 0 }}>
-          <span title={account.username} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 13.5, fontWeight: 700, color: "var(--text)" }}>{account.username || "(이름 없음)"}</span>
+          <span title={account.username || account.sid} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 13.5, fontWeight: 700, color: "var(--text)", fontFamily: account.username ? undefined : "var(--mono)" }}>{account.username || account.sid}</span>
           <span style={{ flexShrink: 0, fontSize: 11.5, fontWeight: 700, color: "var(--bg-input)", background: accountColor, border: `1px solid ${accountColor}`, borderRadius: "var(--radius)", padding: "1px 8px", whiteSpace: "nowrap" }}>{account.isUser ? "사용자" : "시스템"}</span>
           {account.disabled === "예" && <span style={{ flexShrink: 0, fontSize: 11.5, fontWeight: 700, color: "var(--text-dim)", background: "var(--bg-input)", border: "1px solid var(--text-faint)", borderRadius: "var(--radius)", padding: "1px 8px", whiteSpace: "nowrap" }}>비활성</span>}
           {account.specialAccount.startsWith("예") && <span title={account.specialAccount} style={{ flexShrink: 0, fontSize: 11.5, fontWeight: 700, color: "var(--warning)", border: "1px solid var(--warning)", borderRadius: "var(--radius)", padding: "1px 8px", whiteSpace: "nowrap" }}>숨김</span>}
         </span>
         <span title={account.rawPath || undefined} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: account.path ? "var(--text-dim)" : "var(--text-faint)", fontSize: 12, fontFamily: "var(--mono)" }}>{account.path || "프로필 경로 없음"}</span>
       </span>
-      <span title={account.sid} style={{ width: 330, flexShrink: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text-dim)", fontSize: 12, fontFamily: "var(--mono)" }}>{account.sid}</span>
+      <span title={account.username ? account.sid : undefined} style={{ width: 330, flexShrink: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text-dim)", fontSize: 12, fontFamily: "var(--mono)" }}>{account.username ? account.sid : ""}</span>
       <span style={{ width: 172, flexShrink: 0, textAlign: "right", color: account.created ? "var(--text-time)" : "var(--text-faint)", fontSize: 12, fontFamily: "var(--mono)", whiteSpace: "nowrap" }}>{account.created || "생성 시간 없음"}</span>
       <ChevronRightOutlinedIcon sx={{ fontSize: 18, color: "var(--text-faint)", flexShrink: 0 }} />
     </button>
@@ -844,7 +844,7 @@ function AccountDetailPage({ account, onBack, loadEvents, timeRange, onNavigate,
   // The account row came from a result generation that was since replaced.
   const replaced = Boolean(visibleEvents?.replaced);
   const identityRows = [
-    ["계정명", account.username || "(이름 없음)", false],
+    ["계정명", account.username, false],
     ["계정 SID", account.sid, true],
     ["홈 디렉터리", account.homeDir, true],
   ] as const;
@@ -871,7 +871,7 @@ function AccountDetailPage({ account, onBack, loadEvents, timeRange, onNavigate,
           <ArrowBackOutlinedIcon sx={{ fontSize: 17 }} />
         </button>
         <ManageAccountsOutlinedIcon sx={{ fontSize: 18, color: "var(--accent)" }} aria-hidden="true" />
-        <strong style={{ fontSize: 15, color: "var(--text)", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>계정 상세 <span aria-hidden="true" style={{ color: "var(--text-faint)", padding: "0 2px" }}>|</span> {account.username || "(이름 없음)"}</strong>
+        <strong style={{ fontSize: 15, color: "var(--text)", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>계정 상세 <span aria-hidden="true" style={{ color: "var(--text-faint)", padding: "0 2px" }}>|</span> {account.username || account.sid}</strong>
         <span style={{ flexShrink: 0, fontSize: 11.5, fontWeight: 700, color: "var(--bg-input)", background: account.isUser ? "var(--accent)" : "#d0d0d0", border: `1px solid ${account.isUser ? "var(--accent)" : "#d0d0d0"}`, borderRadius: "var(--radius)", padding: "1px 8px" }}>{account.isUser ? "사용자" : "시스템"}</span>
         {account.disabled === "예" && <span style={{ flexShrink: 0, fontSize: 11.5, fontWeight: 700, padding: "1px 8px", border: "1px solid var(--text-faint)", borderRadius: "var(--radius)", color: "var(--text-dim)", background: "var(--bg-input)" }}>비활성</span>}
         {account.fullName && account.fullName !== account.username && <span style={{ color: "var(--text-faint)", fontSize: 12 }}>{account.fullName}</span>}
