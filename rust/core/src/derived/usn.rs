@@ -355,6 +355,8 @@ struct Candidate {
 }
 
 struct Group {
+    /// Row of this group in the staging table, for the closing update.
+    row: i64,
     group_id: String,
     file_reference: Option<String>,
     host_id: String,
@@ -395,18 +397,60 @@ impl Writer<'_> {
     }
 }
 
+/// Child tables filled by the grouping pass, parents first.
+const GROUP_TABLES: &[(&str, &[&str])] = &[
+    ("UsnChangeGroups", schema::USN_CHANGE_GROUPS_COLUMNS),
+    ("UsnGroupMembers", schema::USN_GROUP_MEMBERS_COLUMNS),
+    ("UsnReasonFlags", schema::USN_REASON_FLAGS_COLUMNS),
+    ("UsnRenameEvents", schema::USN_RENAME_EVENTS_COLUMNS),
+    ("UsnRenameCandidates", schema::USN_RENAME_CANDIDATES_COLUMNS),
+];
+
+fn stage_of(table: &str) -> String {
+    format!("{table}_stage")
+}
+
 fn group_records(db_path: &Path) -> Result<()> {
     let conn = Connection::open(db_path)
         .with_context(|| format!("UsnJournal 묶음 생성: {}", db_path.display()))?;
-    conn.pragma_update(None, "foreign_keys", "ON")?;
+    // Same write policy as DerivedDb: the staged file is discarded on failure.
+    conn.pragma_update(None, "journal_mode", "MEMORY")?;
+    conn.pragma_update(None, "synchronous", "OFF")?;
+    conn.pragma_update(None, "cache_size", -65_536)?;
+    conn.pragma_update(None, "mmap_size", 1_i64 << 31)?;
+    // Random-key index and foreign-key maintenance dominated this pass, so rows
+    // go to unindexed temp tables, are copied in primary-key order, and the
+    // secondary indexes and references are rebuilt and checked once.
+    let mut index_sql: Vec<(String, String)> = Vec::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT name, sql FROM sqlite_master WHERE type='index' AND sql IS NOT NULL \
+             AND (tbl_name IN ('UsnChangeGroups','UsnGroupMembers','UsnReasonFlags','UsnRenameEvents','UsnRenameCandidates') \
+                  OR name='idx_UsnJournal_group')",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+        for row in rows {
+            index_sql.push(row?);
+        }
+    }
     conn.execute_batch("BEGIN")?;
+    for (name, _) in &index_sql {
+        conn.execute_batch(&format!("DROP INDEX {}", crate::sqlite::quote_ident(name)))?;
+    }
+    for (table, _) in GROUP_TABLES {
+        conn.execute_batch(&format!(
+            "CREATE TEMP TABLE {} AS SELECT * FROM main.{} WHERE 0",
+            crate::sqlite::quote_ident(&stage_of(table)),
+            crate::sqlite::quote_ident(table)
+        ))?;
+    }
     let writer = Writer {
         conn: &conn,
-        group_sql: insert_sql("UsnChangeGroups", schema::USN_CHANGE_GROUPS_COLUMNS),
-        member_sql: insert_sql("UsnGroupMembers", schema::USN_GROUP_MEMBERS_COLUMNS),
-        flag_sql: insert_sql("UsnReasonFlags", schema::USN_REASON_FLAGS_COLUMNS),
-        rename_sql: insert_sql("UsnRenameEvents", schema::USN_RENAME_EVENTS_COLUMNS),
-        candidate_sql: insert_sql("UsnRenameCandidates", schema::USN_RENAME_CANDIDATES_COLUMNS),
+        group_sql: insert_sql(&stage_of("UsnChangeGroups"), schema::USN_CHANGE_GROUPS_COLUMNS),
+        member_sql: insert_sql(&stage_of("UsnGroupMembers"), schema::USN_GROUP_MEMBERS_COLUMNS),
+        flag_sql: insert_sql(&stage_of("UsnReasonFlags"), schema::USN_REASON_FLAGS_COLUMNS),
+        rename_sql: insert_sql(&stage_of("UsnRenameEvents"), schema::USN_RENAME_EVENTS_COLUMNS),
+        candidate_sql: insert_sql(&stage_of("UsnRenameCandidates"), schema::USN_RENAME_CANDIDATES_COLUMNS),
     };
     {
         let mut scan = conn.prepare(SCAN_SQL)?;
@@ -464,14 +508,44 @@ fn group_records(db_path: &Path) -> Result<()> {
             close_group(&writer, group, "input_end")?;
         }
     }
+    for (table, columns) in GROUP_TABLES {
+        let pk: Vec<String> = {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT name FROM pragma_table_info('{table}') WHERE pk > 0 ORDER BY pk"
+            ))?;
+            let names = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            names.collect::<rusqlite::Result<_>>()?
+        };
+        let list = columns.iter().map(|c| crate::sqlite::quote_ident(c)).collect::<Vec<_>>().join(",");
+        conn.execute_batch(&format!(
+            "INSERT INTO main.{table_q} ({list}) SELECT {list} FROM temp.{stage_q} ORDER BY {order}; DROP TABLE temp.{stage_q}",
+            table_q = crate::sqlite::quote_ident(table),
+            stage_q = crate::sqlite::quote_ident(&stage_of(table)),
+            order = pk.iter().map(|c| crate::sqlite::quote_ident(c)).collect::<Vec<_>>().join(","),
+        ))?;
+    }
     // Members carry the assignment, so the parent rows are linked in one pass
     // after the scan instead of being updated while they are read.
     conn.execute(
-        "UPDATE UsnJournal SET \
-         group_id = (SELECT m.group_id FROM UsnGroupMembers m WHERE m.record_id = UsnJournal.record_id), \
-         group_ordinal = (SELECT m.ordinal FROM UsnGroupMembers m WHERE m.record_id = UsnJournal.record_id)",
+        "UPDATE UsnJournal SET group_id = m.group_id, group_ordinal = m.ordinal \
+         FROM UsnGroupMembers m WHERE m.record_id = UsnJournal.record_id",
         [],
     )?;
+    for (_, sql) in &index_sql {
+        conn.execute_batch(sql)?;
+    }
+    let broken: i64 = conn.query_row(
+        "SELECT (SELECT count(*) FROM pragma_foreign_key_check('UsnChangeGroups')) \
+              + (SELECT count(*) FROM pragma_foreign_key_check('UsnGroupMembers')) \
+              + (SELECT count(*) FROM pragma_foreign_key_check('UsnReasonFlags')) \
+              + (SELECT count(*) FROM pragma_foreign_key_check('UsnRenameEvents')) \
+              + (SELECT count(*) FROM pragma_foreign_key_check('UsnRenameCandidates'))",
+        [],
+        |row| row.get(0),
+    )?;
+    if broken > 0 {
+        return Err(anyhow!("USN 묶음 참조 {broken}건이 연결되지 않았습니다"));
+    }
     let unlinked: i64 = conn.query_row(
         "SELECT count(*) FROM UsnJournal WHERE group_id IS NULL",
         [],
@@ -481,11 +555,18 @@ fn group_records(db_path: &Path) -> Result<()> {
         return Err(anyhow!("USN 레코드 {unlinked}건이 묶음에 연결되지 않았습니다"));
     }
     conn.execute_batch("COMMIT")?;
+    drop(writer);
+    conn.close().map_err(|(_, error)| error)?;
+    // synchronous=OFF: sync the finished file once, like DerivedDb::finish.
+    std::fs::File::open(db_path)
+        .and_then(|file| file.sync_all())
+        .with_context(|| format!("UsnJournal 디스크 기록: {}", db_path.display()))?;
     Ok(())
 }
 
 fn open_group(writer: &Writer<'_>, member: &Member) -> Result<Group> {
-    let group = Group {
+    let mut group = Group {
+        row: 0,
         group_id: uuid::Uuid::new_v4().to_string(),
         file_reference: member.file_reference.clone(),
         host_id: member.host_id.clone(),
@@ -548,6 +629,7 @@ fn open_group(writer: &Writer<'_>, member: &Member) -> Result<Group> {
             Cell::Int(0),
         ],
     )?;
+    group.row = writer.conn.last_insert_rowid();
     Ok(group)
 }
 
@@ -664,12 +746,14 @@ fn close_group(writer: &Writer<'_>, group: Group, boundary: &str) -> Result<()> 
     } else {
         text_opt(group.first_event_type.as_deref())
     };
-    writer.conn.execute(
-        "UPDATE UsnChangeGroups SET last_parent_reference=?1, last_file_name=?2, \
+    let mut update = writer.conn.prepare_cached(
+        "UPDATE temp.UsnChangeGroups_stage SET last_parent_reference=?1, last_file_name=?2, \
          distinct_file_name_count=?3, last_timestamp=?4, last_usn=?5, last_usn_sort=?6, \
          last_input_sequence=?7, member_count=?8, event_type=?9, reason_union_mask=?10, \
          reason_union=?11, unknown_reason_mask=?12, has_unknown_reason=?13, boundary_reason=?14, \
-         close_observed=?15 WHERE group_id=?16",
+         close_observed=?15 WHERE rowid=?16",
+    )?;
+    update.execute(
         rusqlite::params![
             group.last_parent_reference,
             group.last_file_name,
@@ -686,9 +770,10 @@ fn close_group(writer: &Writer<'_>, group: Group, boundary: &str) -> Result<()> 
             if group.mask_seen { Some(i64::from(unknown_mask != 0)) } else { None },
             boundary,
             i64::from(group.close_seen),
-            group.group_id,
+            group.row,
         ],
     )?;
+    drop(update);
     for segment in &group.segments {
         write_rename(writer, &group, segment)?;
     }

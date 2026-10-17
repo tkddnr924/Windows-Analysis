@@ -594,6 +594,7 @@ function Center({ children }: { children: React.ReactNode }) {
   return (
     <div
       style={{
+        flex: 1,
         minHeight: 220,
         display: "grid",
         placeItems: "center",

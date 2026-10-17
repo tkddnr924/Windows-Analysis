@@ -46,6 +46,8 @@ pub const OVERVIEW_CONTRACT_VERSION: i64 = 1;
 
 // Bound rollback-journal growth.
 const BATCH_ROWS: usize = 20_000;
+/// Memory-mapped read window for derived DBs (SQLite clamps to its max).
+const MMAP_SIZE: i64 = 1 << 31;
 
 // ---------------------------------------------------------------------------
 // Values
@@ -493,6 +495,8 @@ pub struct DerivedDb {
     path: PathBuf,
     /// Secondary indexes built in `finish` (write-only builders).
     deferred_indexes: Vec<String>,
+    /// INSERT statement text per table, built once instead of per row.
+    insert_sql: HashMap<String, String>,
     pending: usize,
     rows: usize,
 }
@@ -517,12 +521,17 @@ impl DerivedDb {
         conn.pragma_update(None, "journal_mode", "MEMORY")?;
         conn.pragma_update(None, "synchronous", "OFF")?;
         conn.pragma_update(None, "cache_size", -65_536)?;
+        // Index builds and read-backs rescan large tables (RegistryExplorer is
+        // GBs); mapped reads skip a pread copy per page. SQLite caps this at
+        // its compiled SQLITE_MAX_MMAP_SIZE (2 GB on macOS/Windows).
+        conn.pragma_update(None, "mmap_size", MMAP_SIZE)?;
         conn.execute_batch("BEGIN")?;
         Ok(Self {
             spec,
             conn,
             path: overview_dir.join(format!("{name}.sqlite")),
             deferred_indexes,
+            insert_sql: HashMap::new(),
             pending: 0,
             rows: 0,
         })
@@ -539,21 +548,33 @@ impl DerivedDb {
 
     fn insert(&mut self, table: &str, columns: &[&str], values: &[Cell]) -> Result<()> {
         debug_assert_eq!(columns.len(), values.len(), "{table} 컬럼 수 불일치");
-        let sql = format!(
-            "INSERT INTO {} ({}) VALUES ({})",
-            crate::sqlite::quote_ident(table),
-            columns
-                .iter()
-                .map(|c| crate::sqlite::quote_ident(c))
-                .collect::<Vec<_>>()
-                .join(","),
-            (1..=values.len())
-                .map(|i| format!("?{i}"))
-                .collect::<Vec<_>>()
-                .join(",")
-        );
+        if !self.insert_sql.contains_key(table) {
+            // The statement cache hashes this text on every get/return, so it
+            // stays short: the column list is omitted when it is the table's
+            // own column order.
+            let table_order: Vec<String> = self
+                .conn
+                .prepare("SELECT name FROM pragma_table_info(?1)")?
+                .query_map([table], |row| row.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            let placeholders = vec!["?"; values.len()].join(",");
+            let sql = if table_order.iter().map(String::as_str).eq(columns.iter().copied()) {
+                format!("INSERT INTO {} VALUES ({placeholders})", crate::sqlite::quote_ident(table))
+            } else {
+                format!(
+                    "INSERT INTO {} ({}) VALUES ({placeholders})",
+                    crate::sqlite::quote_ident(table),
+                    columns
+                        .iter()
+                        .map(|c| crate::sqlite::quote_ident(c))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                )
+            };
+            self.insert_sql.insert(table.to_string(), sql);
+        }
         {
-            let mut stmt = self.conn.prepare_cached(&sql)?;
+            let mut stmt = self.conn.prepare_cached(&self.insert_sql[table])?;
             stmt.execute(rusqlite::params_from_iter(values.iter()))
                 .with_context(|| format!("{table} 행 저장"))?;
         }
@@ -598,12 +619,19 @@ impl DerivedDb {
         Ok(())
     }
 
-    pub fn finish(self) -> Result<usize> {
-        for index in &self.deferred_indexes {
+    /// Build the deferred secondary indexes now, for a bulk builder that reads
+    /// its own rows back after the bulk insert.
+    pub fn build_deferred_indexes(&mut self) -> Result<()> {
+        for index in std::mem::take(&mut self.deferred_indexes) {
             self.conn
-                .execute_batch(index)
+                .execute_batch(&index)
                 .with_context(|| format!("{} 인덱스 생성", self.spec.name))?;
         }
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> Result<usize> {
+        self.build_deferred_indexes()?;
         self.conn.execute_batch("COMMIT")?;
         self.conn
             .close()
@@ -873,7 +901,12 @@ fn validate_source_table(
 }
 
 // Tables are checked independently, so they run on the builder workers.
+#[cfg(test)]
 fn validate_lineage(out_dir: &Path) -> Result<()> {
+    validate_lineage_reporting(out_dir, &|| {})
+}
+
+fn validate_lineage_reporting(out_dir: &Path, on_done: &(dyn Fn() + Sync)) -> Result<()> {
     let tasks = schema::SPECS
         .iter()
         .map(|spec| parallel::Task {
@@ -882,7 +915,7 @@ fn validate_lineage(out_dir: &Path) -> Result<()> {
             run: Box::new(move || validate_spec(out_dir, spec).map(|()| Vec::new())),
         })
         .collect();
-    parallel::run_graph(tasks, parallel::default_workers()).map(|_| ())
+    parallel::run_graph_reporting(tasks, parallel::default_workers(), on_done).map(|_| ())
 }
 
 fn validate_spec(out_dir: &Path, spec: &'static DbSpec) -> Result<()> {
@@ -963,6 +996,9 @@ pub struct DerivedBuild {
 /// Measured slowest builders (IDC case), started first.
 const LONG_BUILDERS: &[&str] = &["RegistryFindings", "RegistryExplorer", "UsnJournal", "FileSystemEntries", "PowerShellHistory"];
 
+/// Preparation steps reported before the builders start.
+const PREP_STEPS: usize = 5;
+
 /// Build all 24 schemas, including empty results; propagate generation failures.
 pub fn build_all(
     out_dir: &Path,
@@ -972,10 +1008,20 @@ pub fn build_all(
 ) -> Result<DerivedBuild> {
     let overview_dir = out_dir.join("_OVERVIEW");
     std::fs::create_dir_all(&overview_dir)?;
+    // Progress steps: input preparation, every builder (one per schema, with
+    // PathCandidates standing in for Metadata), every lineage check.
+    let total = PREP_STEPS + 2 * schema::SPECS.len();
+    let done = std::sync::atomic::AtomicUsize::new(0);
+    let step = || {
+        let finished = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        crate::pipeline::overview_progress(finished, total);
+    };
+    crate::pipeline::overview_progress(0, total);
 
     // Other builders depend on stored metadata.
     let metadata = crate::metadata::build_metadata(out_dir, target, host_id, dataset_id)
         .context("Metadata 생성")?;
+    step();
     let input_errors: Vec<String> =
         metadata.input_errors.into_iter().map(|error| format!("Metadata: {error}")).collect();
     let mut report: Vec<(String, usize)> = vec![("Metadata".to_string(), metadata.rows)];
@@ -988,12 +1034,16 @@ pub fn build_all(
         facts: FactsIndex::load(out_dir)?,
         meta: MetaLookup::load(out_dir)?,
     };
+    step();
 
     // Share event and registry scans across builders.
     let events = crate::overview::EventLogOverviewCache::load(out_dir).context("EventLog 입력 읽기")?;
+    step();
     let registry = crate::overview::RegistryOverviewCache::load(out_dir).context("Registry 입력 읽기")?;
+    step();
     // One WER collection feeds both WerReports and ExecutionHistory.
     let wer = crate::wer_evidence::collect(out_dir, &events)?;
+    step();
     let wer_starts = crate::wer_evidence::execution_start_evidence(&wer);
 
     let mut tasks = builders::tasks(&ctx, &events, &registry, wer, wer_starts);
@@ -1003,9 +1053,10 @@ pub fn build_all(
         after: &["FileSystemEntries", "PathReferences"],
         run: Box::new(|| path_candidates::build(&ctx).map(|()| Vec::new())),
     });
+    debug_assert_eq!(tasks.len(), schema::SPECS.len(), "progress total assumes one builder per schema");
     // Start the longest builders first; the rest fill the remaining workers.
     tasks.sort_by_key(|task| LONG_BUILDERS.iter().position(|name| *name == task.name).unwrap_or(usize::MAX));
-    report.extend(parallel::run_graph(tasks, parallel::default_workers())?);
+    report.extend(parallel::run_graph_reporting(tasks, parallel::default_workers(), &step)?);
     drop(events);
     drop(registry);
 
@@ -1016,7 +1067,7 @@ pub fn build_all(
             .unwrap_or(usize::MAX)
     });
     debug_assert_eq!(report.len(), schema::SPECS.len());
-    validate_lineage(out_dir)?;
+    validate_lineage_reporting(out_dir, &step)?;
     Ok(DerivedBuild { tables: report, input_errors })
 }
 

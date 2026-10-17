@@ -2407,9 +2407,6 @@ fn hive_user(fname: &str) -> String {
     if up == "SOFTWARE" {
         return "(시스템)".into();
     }
-    if up == "DEFAULT" {
-        return ".DEFAULT".into();
-    }
     account_prefix(fname).unwrap_or(fname).to_string()
 }
 
@@ -4952,7 +4949,6 @@ mod tests {
         assert_eq!(hive_user("Administrator_UsrClass.dat"), "Administrator");
         assert_eq!(hive_user("svcuser_NTUSER.DAT_2"), "svcuser");
         assert_eq!(hive_user("SOFTWARE"), "(시스템)");
-        assert_eq!(hive_user("DEFAULT"), ".DEFAULT");
         assert_eq!(hive_user("SYSTEM"), "SYSTEM");
         // 접두가 없는 예전 이름은 그대로 — 계정을 지어내지 않는다.
         assert_eq!(hive_user("NTUSER.DAT"), "NTUSER.DAT");

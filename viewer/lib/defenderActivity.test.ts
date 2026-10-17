@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 // @ts-expect-error -- TypeScript uses bundler resolution while this test uses Node directly.
-import { DEFAULT_DEFENDER_FILTER, buildDefenderItems, groupIndex, latestProtection, selectedSections, summarizeActivity } from "./defenderActivity.ts";
+import { DEFAULT_DEFENDER_FILTER, buildDefenderItems, groupIndex, latestProtection, protectionChanges, selectedSections, storedLatest, summarizeActivity } from "./defenderActivity.ts";
 
 type Row = Record<string, string>;
 const ev = (record_id: string, section: string, timestamp: string, extra: Row = {}): Row => ({ record_id, section, section_label: section, timestamp, event_type: section, ...extra });
@@ -52,6 +52,8 @@ test("period excludes outside and untimed rows; sections default to detections a
   assert.deepEqual(selectedSections(DEFAULT_DEFENDER_FILTER, ["health", "scan", "threat", "threat_action"]), ["threat", "threat_action"]);
   assert.deepEqual(selectedSections({ ...DEFAULT_DEFENDER_FILTER, sections: ["health"] }, ["health", "scan"]), ["health"]);
   assert.deepEqual(selectedSections({ ...DEFAULT_DEFENDER_FILTER, sections: [] }, ["health", "scan"]), ["health", "scan"]);
+  // A host without detections shows every section instead of an empty view.
+  assert.deepEqual(selectedSections(DEFAULT_DEFENDER_FILTER, ["health", "scan"]), ["health", "scan"]);
 });
 
 test("latest protection per feature inside the period; same-time conflicts are not decided", () => {
@@ -77,14 +79,51 @@ test("latest protection per feature inside the period; same-time conflicts are n
   assert.equal(tied[0].recordId, "late");
 });
 
+test("stored latest: confirmed state kept, tie undecided, never-decided feature dropped", () => {
+  const latest = storedLatest([
+    { feature: "realtime_protection", state: "on", certainty: "confirmed", tie_count: "1", observation_count: "7589", first_observed_time: "2025-04-27 16:25:18.095", last_observed_time: "2026-03-09 20:10:08.939", record_id: "" },
+    { feature: "ioav", state: "", certainty: "ambiguous_tie", tie_count: "2", observation_count: "3", last_observed_time: "2026-03-01 00:00:00.000" },
+    { feature: "malware_scanning", certainty: "undetermined", tie_count: "0", observation_count: "0" },
+  ]);
+  assert.deepEqual(latest.map((entry: { feature: string; state: string | null }) => [entry.feature, entry.state]), [["realtime_protection", "on"], ["ioav", null]]);
+  assert.equal(latest[0].count, 7589);
+  assert.equal(latest[1].tie, 2);
+});
+
+test("protection changes: stored transitions and an initial off only, inside the period", () => {
+  const states = [
+    { feature: "realtime_protection", state: "on", change_kind: "initial_observation", timestamp: "2026-03-01 00:00:00.000", record_id: "first" },
+    { feature: "realtime_protection", state: "on", change_kind: "unchanged", timestamp: "2026-03-09 20:10:08.939", record_id: "h0" },
+    { feature: "realtime_protection", state: "off", previous_state: "on", change_kind: "transition", timestamp: "2026-03-09 21:05:05.677", record_id: "e5001" },
+    { feature: "ioav", state: "off", previous_state: "on", change_kind: "transition", timestamp: "2026-03-09 21:10:09.260", record_id: "h1" },
+    { feature: "on_access", state: "off", previous_state: "on", change_kind: "transition", timestamp: "2026-03-09 21:10:09.260", record_id: "h1" },
+    { feature: "realtime_protection", state: "off", change_kind: "unchanged", timestamp: "2026-03-09 21:10:09.260", record_id: "h1" },
+    { feature: "behavior_monitoring", state: "off", change_kind: "initial_observation", timestamp: "2026-03-02 00:00:00.000", record_id: "boff" },
+    { feature: "ioav", state: "on", previous_state: "off", change_kind: "transition", timestamp: "", record_id: "untimed" },
+  ];
+  const changes = protectionChanges(states, always);
+  assert.deepEqual([...changes.keys()].sort(), ["boff", "e5001", "h1"]);
+  // Unchanged observations on the same record are not changes.
+  assert.deepEqual(changes.get("h1"), [{ feature: "ioav", state: "off" }, { feature: "on_access", state: "off" }]);
+  assert.deepEqual([...protectionChanges(states, (timestamp: string) => timestamp < "2026-03-09").keys()], ["boff"]);
+
+  // Focus shows only change records across sections, keeping other filters.
+  const records = [
+    ev("h0", "health", "2026-03-09 20:10:08.939"),
+    ev("e5001", "tampering", "2026-03-09 21:05:05.677"),
+    ev("h1", "health", "2026-03-09 21:10:09.260", { result: "success" }),
+    ev("d9", "threat", "2026-03-09 21:20:00.000"),
+  ];
+  const focus = new Set(changes.keys());
+  assert.deepEqual(keys(buildDefenderItems(records, new Map(), DEFAULT_DEFENDER_FILTER, always, false, "asc", focus)), ["record::e5001", "record::h1"]);
+  assert.deepEqual(keys(buildDefenderItems(records, new Map(), { ...DEFAULT_DEFENDER_FILTER, results: ["success"] }, always, false, "asc", focus)), ["record::h1"]);
+});
+
 test("activity summary counts within the period", () => {
   const summaryRows = [
     ev("s1", "scan", "2026-09-01 00:00:00.000", { event_type: "scan_started" }),
     ev("s2", "scan", "2026-09-01 00:01:00.000", { event_type: "scan_completed" }),
     ev("s3", "scan", "2026-09-02 00:00:00.000", { event_type: "scan_cancelled" }),
-    ev("g1", "signature", "2026-09-01 00:00:00.000", { event_type: "signature_updated", signature_version_current: "1.1" }),
-    ev("g2", "signature", "2026-09-03 00:00:00.000", { event_type: "signature_updated", signature_version_current: "1.2" }),
-    ev("g3", "signature", "2026-09-04 00:00:00.000", { event_type: "signature_update_failed", result: "failure" }),
     ev("h1", "history", "2026-09-05 00:00:00.000"),
     ev("c1", "tampering", "2026-09-06 00:00:00.000", { event_type: "configuration_changed", config_change_kind: "added", config_exclusion_kind: "Paths" }),
     ev("c2", "tampering", "2026-09-07 00:00:00.000", { event_type: "configuration_changed", config_change_kind: "removed", config_exclusion_kind: "Paths" }),
@@ -93,7 +132,6 @@ test("activity summary counts within the period", () => {
   ];
   const summary = summarizeActivity(summaryRows, (timestamp: string) => timestamp >= "2026-09-01", true);
   assert.deepEqual(summary.scan, { started: 1, completed: 1, cancelled: 1, failed: 0, last: "2026-09-02 00:00:00.000" });
-  assert.deepEqual(summary.signature, { updated: 2, failed: 1, version: "1.2", last: "2026-09-04 00:00:00.000" });
   assert.deepEqual(summary.history, { count: 1, last: "2026-09-05 00:00:00.000" });
   assert.deepEqual(summary.config, { count: 3, exclusionsAdded: 1, exclusionsRemoved: 1, last: "2026-09-08 00:00:00.000" });
 });

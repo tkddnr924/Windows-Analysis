@@ -27,7 +27,7 @@ test("review, hidden, non-Microsoft and parse-problem views follow stored column
     def("b", { is_microsoft: "0" }),
     def("c", { parse_status: "partial", parse_error: "0x40: truncated" }),
     def("d", { enabled: "0" }),
-    { record_id: "e", event_type: "작업 유지 관리 이벤트", parse_status: "ok", timestamp: "2026-01-01 00:00:00.000", is_microsoft: "" },
+    { record_id: "e", event_type: "작업 스케줄러 이벤트", parse_status: "ok", timestamp: "2026-01-01 00:00:00.000", is_microsoft: "" },
   ];
   const view = (show: string) => ids(filterTasks(rows, { ...DEFAULT_TASK_FILTER, show }, always, false));
   assert.deepEqual(view("review"), ["a"]);
@@ -39,7 +39,7 @@ test("review, hidden, non-Microsoft and parse-problem views follow stored column
   assert.equal(isParseProblem({ parse_status: "parse_failed" }), true);
   const counts = taskCounts(rows);
   assert.deepEqual([counts.review, counts.hidden, counts.user, counts.parse, counts.enabled, counts.disabled], [1, 1, 1, 1, 0, 1]);
-  assert.deepEqual(ids(filterTasks(rows, { ...DEFAULT_TASK_FILTER, kinds: ["작업 유지 관리 이벤트"] }, always, false)), ["e"]);
+  assert.deepEqual(ids(filterTasks(rows, { ...DEFAULT_TASK_FILTER, kinds: ["작업 스케줄러 이벤트"] }, always, false)), ["e"]);
   assert.deepEqual(ids(filterTasks(rows, { ...DEFAULT_TASK_FILTER, state: "disabled" }, always, false)), ["d"]);
 });
 

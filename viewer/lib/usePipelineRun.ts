@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import type { PipelineLogEntry } from "@/lib/types";
+import { OVERVIEW_WAIT, interpretLine, overallPercent } from "@/lib/pipelineProgress";
 
 export interface StartOpts {
   caseId: string;
@@ -51,6 +52,9 @@ export interface PipelineRunItem {
   runningArtifacts: string[];
   totalSteps: number;
   completedSteps: number;
+  /** Overview builder steps from "[종합 분석 진행] done/total". */
+  overviewDone: number;
+  overviewTotal: number;
   failedArtifacts: string[];
 }
 
@@ -60,28 +64,6 @@ export interface PipelineRunItem {
 // actual work already runs in the Electron main process; this just makes the
 // renderer-side state survive component unmounts.
 const MAX_LOG_LINES = 2000;
-
-// Parser progress protocol: "=== <phase> ===" section markers plus
-// per-artifact "[시작] X" / "[완료] X" lines — several artifacts parse in
-// parallel, so progress is tracked per artifact instead of per section.
-type LineSignal =
-  | { kind: "section"; name: string }
-  | { kind: "start"; name: string }
-  | { kind: "done"; name: string }
-  | { kind: "failure"; name: string }
-  | { kind: "none" };
-
-function interpretLine(line: string): LineSignal {
-  const section = line.match(/^=== (.+) ===$/);
-  if (section) return { kind: "section", name: section[1] };
-  const start = line.match(/^\[시작\] (\S+)/);
-  if (start) return { kind: "start", name: start[1] };
-  const done = line.match(/^\[완료\] (\S+)/);
-  if (done) return { kind: "done", name: done[1] };
-  const failure = line.match(/^\[!\]\s+(.+?)\s+failed:/);
-  if (failure) return { kind: "failure", name: failure[1].trim() };
-  return { kind: "none" };
-}
 
 function runningLabel(running: string[]): string | null {
   return running.length ? running.join(" · ") : null;
@@ -101,6 +83,7 @@ export function usePipelineRun(onDone?: () => void): PipelineRun {
   const [doneArtifacts, setDoneArtifacts] = useState<Set<string>>(new Set());
   const [totalSteps, setTotalSteps] = useState(0);
   const [completedSteps, setCompletedSteps] = useState(0);
+  const [overview, setOverview] = useState({ done: 0, total: 0 });
   const [runComplete, setRunComplete] = useState(false);
   const [completedHostId, setCompletedHostId] = useState<string | null>(null);
   const [failedArtifacts, setFailedArtifacts] = useState<string[]>([]);
@@ -137,10 +120,11 @@ export function usePipelineRun(onDone?: () => void): PipelineRun {
         let completed = run.completedSteps;
         let current = entry.status === "running" ? run.currentArtifact : null;
         let failed = run.failedArtifacts;
+        let { overviewDone, overviewTotal } = run;
         if (signal.kind === "section") {
-          if (signal.name === "_OVERVIEW") {
+          if (signal.name === "_OVERVIEW" || signal.name === OVERVIEW_WAIT) {
             running = [];
-            current = "_OVERVIEW";
+            current = signal.name;
           } else if (signal.name === "파일 확인") {
             current = "파일 확인";
           } else if (signal.name === "파싱") {
@@ -154,6 +138,9 @@ export function usePipelineRun(onDone?: () => void): PipelineRun {
           completed = Math.min(run.totalSteps, completed + 1);
           current = runningLabel(running);
           if (signal.kind === "failure" && !failed.includes(signal.name)) failed = [...failed, signal.name];
+        } else if (signal.kind === "overview") {
+          overviewDone = signal.done;
+          overviewTotal = signal.total;
         }
         if (
           entry.status === run.status
@@ -161,6 +148,8 @@ export function usePipelineRun(onDone?: () => void): PipelineRun {
           && running === run.runningArtifacts
           && completed === run.completedSteps
           && failed === run.failedArtifacts
+          && overviewDone === run.overviewDone
+          && overviewTotal === run.overviewTotal
         ) return previous;
         const next = previous.slice();
         next[index] = {
@@ -170,6 +159,8 @@ export function usePipelineRun(onDone?: () => void): PipelineRun {
           runningArtifacts: running,
           completedSteps: completed,
           failedArtifacts: failed,
+          overviewDone,
+          overviewTotal,
         };
         return next;
       });
@@ -186,9 +177,9 @@ export function usePipelineRun(onDone?: () => void): PipelineRun {
           : [...prev, entry],
       );
       if (signal.kind === "section") {
-        if (signal.name === "_OVERVIEW") {
+        if (signal.name === "_OVERVIEW" || signal.name === OVERVIEW_WAIT) {
           clearRunning();
-          setCurrentArtifact("_OVERVIEW");
+          setCurrentArtifact(signal.name);
         } else if (signal.name === "파일 확인") {
           setCurrentArtifact("파일 확인");
         } else if (signal.name === "파싱") {
@@ -210,6 +201,8 @@ export function usePipelineRun(onDone?: () => void): PipelineRun {
         if (signal.kind === "failure") {
           setFailedArtifacts((previous) => previous.includes(name) ? previous : [...previous, name]);
         }
+      } else if (signal.kind === "overview") {
+        setOverview({ done: signal.done, total: signal.total });
       }
     });
     return unsubscribe;
@@ -227,11 +220,12 @@ export function usePipelineRun(onDone?: () => void): PipelineRun {
     setCurrentArtifact(null);
     setDoneArtifacts(new Set());
     setCompletedSteps(0);
+    setOverview({ done: 0, total: 0 });
     setRunComplete(false);
     setCompletedHostId(null);
     setFailedArtifacts([]);
     setDismissed(false);
-    setTotalSteps((opts.only ? opts.only.length : opts.totalArtifacts) + 1);
+    setTotalSteps(opts.only ? opts.only.length : opts.totalArtifacts);
     // 같은 호스트의 종료된 이전 실행 항목은 버린다. 화면이 읽는 것은 호스트당
     // 진행 중 1건(activeRunForHost)과 최신 종료 1건(terminalRunForHost)뿐이라
     // 정보 손실이 없고, 재파싱을 반복하는 세션에서 항목이 무한히 쌓이는 것을
@@ -247,8 +241,10 @@ export function usePipelineRun(onDone?: () => void): PipelineRun {
         status: "queued",
         currentArtifact: null,
         runningArtifacts: [],
-        totalSteps: (opts.only ? opts.only.length : opts.totalArtifacts) + 1,
+        totalSteps: opts.only ? opts.only.length : opts.totalArtifacts,
         completedSteps: 0,
+        overviewDone: 0,
+        overviewTotal: 0,
         failedArtifacts: [],
       },
     ]);
@@ -338,12 +334,14 @@ export function usePipelineRun(onDone?: () => void): PipelineRun {
   const hadError = failedArtifacts.length > 0;
   const percent = runComplete
     ? 100
-    : runningHostId && totalSteps > 0
-      ? Math.min(99, Math.round((completedSteps / totalSteps) * 100))
+    : runningHostId
+      ? overallPercent({ currentArtifact, totalSteps, completedSteps, overviewDone: overview.done, overviewTotal: overview.total })
       : 0;
   const stepLabel = runComplete
     ? hadError ? "완료 (일부 오류)" : "완료"
-    : currentArtifact === "_OVERVIEW"
+    : currentArtifact === OVERVIEW_WAIT
+      ? "종합 분석 대기 중…"
+      : currentArtifact === "_OVERVIEW"
       ? "종합 분석 생성 중…"
       : currentArtifact === "파일 확인"
         ? "원본 파일 확인 중…"

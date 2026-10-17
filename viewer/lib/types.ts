@@ -740,6 +740,8 @@ export interface ElectronApi {
   /** Changes display metadata only; evidence and result paths remain immutable. */
   renameHost(caseId: string, hostId: string, name: string): Promise<Host>;
   deleteHost(caseId: string, hostId: string): Promise<boolean>;
+  /** Every host back to its pre-parse state (outputs, logs, bookmarks removed). */
+  resetHosts(caseId: string): Promise<void>;
   listArtifacts(): Promise<string[]>;
   runHost(options: RunHostOptions): Promise<PipelineResult>;
   /** Omit runId only for the explicit cancel-all action. */

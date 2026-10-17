@@ -88,11 +88,33 @@ function PickerPanel({ value, edge, onChange, style }: { value: string; edge: Ra
   const parsed = parsePickerValue(value);
   const initial = parsed?.date ?? localToday();
   const [view, setView] = useState({ year: Number(initial.slice(0, 4)), month: Number(initial.slice(5, 7)) - 1 });
+  // Header click drills up: days → months of a year → 12-year page.
+  const [level, setLevel] = useState<"day" | "month" | "year">("day");
   const shift = (delta: number) =>
     setView(({ year, month }) => {
       const index = year * 12 + month + delta;
       return { year: Math.floor(index / 12), month: index % 12 };
     });
+  const yearPage = view.year - (((view.year % 12) + 12) % 12);
+  const step = level === "day" ? 1 : level === "month" ? 12 : 144;
+  const stepLabel = level === "day" ? "달" : level === "month" ? "해" : "12년";
+  const title = level === "day"
+    ? `${view.year}-${String(view.month + 1).padStart(2, "0")}`
+    : level === "month" ? String(view.year) : `${yearPage}–${yearPage + 11}`;
+  const selectedYear = parsed ? Number(parsed.date.slice(0, 4)) : null;
+  const selectedMonth = parsed ? Number(parsed.date.slice(5, 7)) - 1 : null;
+  const cell = (active: boolean, current: boolean): CSSProperties => ({
+    height: 36,
+    padding: 0,
+    border: current && !active ? "1px solid var(--border)" : "1px solid transparent",
+    borderRadius: "var(--radius)",
+    background: active ? "var(--accent)" : "transparent",
+    color: active ? "var(--bg)" : "var(--text)",
+    fontFamily: "var(--mono)",
+    fontSize: 12,
+    fontWeight: active ? 700 : 500,
+    cursor: "pointer",
+  });
   const today = localToday();
   const time = parsed?.time ?? (edge === "start" ? "00:00:00" : "23:59:59");
   const [hour, minute, second] = time.split(":");
@@ -112,11 +134,37 @@ function PickerPanel({ value, edge, onChange, style }: { value: string; edge: Ra
   return (
     <div role="dialog" aria-label="날짜·시각 선택" style={{ ...style, width: PANEL_WIDTH, padding: 10, background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: "var(--radius)", boxShadow: "var(--shadow-panel)" }}>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
-        <button type="button" aria-label="이전 달" onClick={() => shift(-1)} style={navButton}><ChevronLeftIcon sx={{ fontSize: 18 }} /></button>
-        <span style={{ fontFamily: "var(--mono)", fontSize: 12.5, fontWeight: 700, color: "var(--text)" }}>{`${view.year}-${String(view.month + 1).padStart(2, "0")}`}</span>
-        <button type="button" aria-label="다음 달" onClick={() => shift(1)} style={navButton}><ChevronRightIcon sx={{ fontSize: 18 }} /></button>
+        <button type="button" aria-label={`이전 ${stepLabel}`} onClick={() => shift(-step)} style={navButton}><ChevronLeftIcon sx={{ fontSize: 18 }} /></button>
+        <button
+          type="button"
+          disabled={level === "year"}
+          aria-label={level === "day" ? "월 선택" : level === "month" ? "연도 선택" : undefined}
+          onClick={() => setLevel(level === "day" ? "month" : "year")}
+          style={{ padding: "3px 8px", border: "none", borderRadius: "var(--radius)", background: "transparent", fontFamily: "var(--mono)", fontSize: 12.5, fontWeight: 700, color: "var(--text)", cursor: level === "year" ? "default" : "pointer" }}
+        >
+          {title}
+        </button>
+        <button type="button" aria-label={`다음 ${stepLabel}`} onClick={() => shift(step)} style={navButton}><ChevronRightIcon sx={{ fontSize: 18 }} /></button>
       </div>
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 2 }}>
+      {level === "year" && (
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 4 }}>
+          {Array.from({ length: 12 }, (_, i) => yearPage + i).map((year) => (
+            <button key={year} type="button" onClick={() => { setView(({ month }) => ({ year, month })); setLevel("month"); }} style={cell(selectedYear === year, Number(today.slice(0, 4)) === year)}>
+              {year}
+            </button>
+          ))}
+        </div>
+      )}
+      {level === "month" && (
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 4 }}>
+          {Array.from({ length: 12 }, (_, month) => (
+            <button key={month} type="button" onClick={() => { setView(({ year }) => ({ year, month })); setLevel("day"); }} style={cell(selectedYear === view.year && selectedMonth === month, today.slice(0, 7) === `${view.year}-${String(month + 1).padStart(2, "0")}`)}>
+              {`${month + 1}월`}
+            </button>
+          ))}
+        </div>
+      )}
+      {level === "day" && <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 2 }}>
         {WEEKDAYS.map((day, i) => (
           <span key={day} style={{ textAlign: "center", fontSize: 10.5, fontWeight: 650, color: i === 0 ? "var(--danger)" : "var(--text-faint)", padding: "2px 0" }}>{day}</span>
         ))}
@@ -145,7 +193,7 @@ function PickerPanel({ value, edge, onChange, style }: { value: string; edge: Ra
             </button>
           );
         })}
-      </div>
+      </div>}
       <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 4, marginTop: 8, paddingTop: 8, borderTop: "1px solid var(--border)", color: "var(--text-faint)" }}>
         {timeField("hour", hour, "시")}:{timeField("minute", minute, "분")}:{timeField("second", second, "초")}
       </div>

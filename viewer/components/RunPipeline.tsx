@@ -5,6 +5,7 @@ import { useEffect, useId, useMemo, useRef, useState } from "react";
 import AddIcon from "@mui/icons-material/Add";
 import CancelOutlinedIcon from "@mui/icons-material/CancelOutlined";
 import DeleteOutlineIcon from "@mui/icons-material/DeleteOutlineOutlined";
+import RestartAltIcon from "@mui/icons-material/RestartAlt";
 import DescriptionOutlinedIcon from "@mui/icons-material/DescriptionOutlined";
 import DnsOutlinedIcon from "@mui/icons-material/DnsOutlined";
 import ErrorOutlineIcon from "@mui/icons-material/ErrorOutlineOutlined";
@@ -22,7 +23,8 @@ import CircularProgress from "@mui/material/CircularProgress";
 import type { Case, Host, ParseReport } from "@/lib/types";
 import { isHostReportSyncPending, selectVisibleHostReport, shouldLoadHostReport, type HostReportCacheEntry } from "@/lib/hostReportCache";
 import { allParseBlocked, canStartParse, parseBlockedLabel, type ParseEligibilityEntry } from "@/lib/parseEligibility";
-import type { PipelineRun, PipelineRunItem } from "@/lib/usePipelineRun";
+import { type PipelineRun, type PipelineRunItem } from "@/lib/usePipelineRun";
+import { hostProgress, type ProgressBar } from "@/lib/pipelineProgress";
 import { useModalDialog } from "@/lib/useModalDialog";
 
 interface RunPipelineProps {
@@ -133,33 +135,21 @@ function folderName(path: string): string {
   return trimmed.split(/[\\/]/).pop() ?? "";
 }
 
-function InlineParseProgress({
-  stepLabel,
-  percent,
-  completedSteps,
-  totalSteps,
-}: {
-  stepLabel: string;
-  percent: number;
-  completedSteps: number;
-  totalSteps: number;
-}) {
-  const color = "var(--accent)";
-  const label = stepLabel.replace(/…$/, "");
+function InlineParseProgress({ bar }: { bar: ProgressBar }) {
+  const color = bar.active ? "var(--accent)" : "var(--text-dim)";
+  const label = bar.label.replace(/…$/, "");
   return (
     <div style={{ padding: "4px 0 8px", display: "flex", flexDirection: "column", gap: 7 }}>
       <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: 12 }}>
         <span style={{ fontSize: 13, fontWeight: 600, color }}>
-          {label}<span className="parse-progress__dots" aria-label="진행 중">...</span>
+          {label}{bar.active && <span className="parse-progress__dots" aria-label="진행 중">...</span>}
         </span>
-        <span style={{ fontSize: 20, fontWeight: 700, fontVariantNumeric: "tabular-nums", color }}>{percent}%</span>
+        <span style={{ fontSize: 20, fontWeight: 700, fontVariantNumeric: "tabular-nums", color }}>{bar.percent}%</span>
       </div>
       <div className="parse-progress__track">
-        <div className="parse-progress__fill" style={{ width: `${percent}%`, background: color }} />
+        <div className="parse-progress__fill" style={{ width: `${bar.percent}%`, background: color }} />
       </div>
-      <span style={{ fontSize: 11.5, color: "var(--text-faint)" }}>
-        {totalSteps > 0 ? `${Math.min(completedSteps, totalSteps)} / ${totalSteps} 단계` : "파싱 준비 중"}
-      </span>
+      <span style={{ fontSize: 11.5, color: "var(--text-faint)" }}>{bar.detail}</span>
     </div>
   );
 }
@@ -172,8 +162,8 @@ function activeRunForHost(runs: PipelineRunItem[], hostId: string): PipelineRunI
     ?? [...runs].reverse().find((run) => run.hostId === hostId && run.status === "queued");
 }
 
-function terminalRunForHost(runs: PipelineRunItem[], hostId: string): PipelineRunItem | undefined {
-  return [...runs].reverse().find((run) => run.hostId === hostId
+function terminalRunForHost(runs: PipelineRunItem[], hostId: string, forgotten: ReadonlySet<string>): PipelineRunItem | undefined {
+  return [...runs].reverse().find((run) => run.hostId === hostId && !forgotten.has(run.runId)
     && (run.status === "complete" || run.status === "partial" || run.status === "error" || run.status === "cancelled"));
 }
 
@@ -327,6 +317,30 @@ function DeleteHostDialog({
   </div>;
 }
 
+function ResetHostsDialog({ count, resetting, error, onClose, onConfirm }: {
+  count: number;
+  resetting: boolean;
+  error: string | null;
+  onClose: () => void;
+  onConfirm: () => void;
+}) {
+  const titleId = useId();
+  const descriptionId = useId();
+  const dialogRef = useModalDialog(onClose);
+  return <div onClick={onClose} style={{ position: "fixed", inset: 0, zIndex: 1400, display: "grid", placeItems: "center", padding: 18, background: "rgba(0, 0, 0, 0.46)" }}>
+    <div ref={dialogRef} role="dialog" aria-modal="true" aria-labelledby={titleId} aria-describedby={descriptionId} tabIndex={-1} onClick={(event) => event.stopPropagation()} className="dfir-surface" style={{ width: "min(420px, 100%)", padding: 18 }}>
+      <h2 id={titleId} style={{ margin: "0 0 6px", fontSize: 15 }}>파싱 전 상태로 초기화할까요?</h2>
+      <p id={descriptionId} style={{ margin: "0 0 14px", color: "var(--text-dim)", fontSize: 12.5 }}>등록 호스트 {count.toLocaleString()}개의 분석 결과·파싱 로그·북마크를 삭제합니다. 호스트 등록(이름·증거 경로)과 원본 수집 데이터는 그대로 둡니다.</p>
+      {error && <div role="alert" style={{ margin: "0 0 9px", color: "var(--danger)", fontSize: 12 }}>{error}</div>}
+      <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 16 }}>
+        {/* Destructive: initial focus stays on cancel. */}
+        <button data-dialog-autofocus className="nm-btn" type="button" onClick={onClose} disabled={resetting} style={{ ...neutralButtonStyle, opacity: resetting ? .5 : 1 }}>취소</button>
+        <button className="nm-btn" type="button" onClick={onConfirm} disabled={resetting} style={{ ...dangerButtonStyle, opacity: resetting ? .5 : 1 }}><RestartAltIcon sx={{ fontSize: 16 }} />{resetting ? "초기화 중" : "초기화"}</button>
+      </div>
+    </div>
+  </div>;
+}
+
 /** Failed checks never grant permission to parse. */
 async function checkHostEligibility(caseId: string, hostId: string): Promise<ParseEligibilityEntry> {
   try {
@@ -354,6 +368,11 @@ export default function RunPipeline({ activeCase, onChanged, onOpenHost, run }: 
   const [runAllChecking, setRunAllChecking] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<Host | null>(null);
   const [deleting, setDeleting] = useState(false);
+  const [resetOpen, setResetOpen] = useState(false);
+  const [resetting, setResetting] = useState(false);
+  const [resetError, setResetError] = useState<string | null>(null);
+  // Finished in-session runs whose results a reset removed.
+  const [forgottenRuns, setForgottenRuns] = useState<ReadonlySet<string>>(new Set());
   const [actionError, setActionError] = useState<string | null>(null);
   const [hostQuery, setHostQuery] = useState("");
   const [hostPage, setHostPage] = useState(0);
@@ -368,7 +387,7 @@ export default function RunPipeline({ activeCase, onChanged, onOpenHost, run }: 
   const { runs } = run;
   const hasActiveRuns = runs.some((entry) => entry.status === "queued" || entry.status === "running");
   const runsByHost = useMemo(() => new Map(hosts.map((host) => [host.id, activeRunForHost(runs, host.id)])), [hosts, runs]);
-  const terminalRunsByHost = useMemo(() => new Map(hosts.map((host) => [host.id, terminalRunForHost(runs, host.id)])), [hosts, runs]);
+  const terminalRunsByHost = useMemo(() => new Map(hosts.map((host) => [host.id, terminalRunForHost(runs, host.id, forgottenRuns)])), [hosts, runs, forgottenRuns]);
 
   useEffect(() => {
     let cancelled = false;
@@ -419,7 +438,7 @@ export default function RunPipeline({ activeCase, onChanged, onOpenHost, run }: 
       host.lastRunAt,
       Boolean(activeRunForHost(runs, host.id)),
       reportsByHost[host.id]?.report?.runId,
-      terminalRunForHost(runs, host.id)?.runId,
+      terminalRunForHost(runs, host.id, forgottenRuns)?.runId,
     ));
     if (!stale.length) return () => { cancelled = true; };
     void Promise.all(stale.map(async (host) => {
@@ -438,7 +457,7 @@ export default function RunPipeline({ activeCase, onChanged, onOpenHost, run }: 
       })
       .catch(() => undefined);
     return () => { cancelled = true; };
-  }, [reportsByHost, runs, visibleHostRunStamp]);
+  }, [reportsByHost, runs, visibleHostRunStamp, forgottenRuns]);
 
   // Evidence may change while the window is inactive.
   useEffect(() => {
@@ -621,6 +640,23 @@ export default function RunPipeline({ activeCase, onChanged, onOpenHost, run }: 
     }
   }
 
+  async function handleReset() {
+    setResetting(true);
+    setResetError(null);
+    try {
+      await window.api.resetHosts(activeCase.id);
+      setResetOpen(false);
+    } catch (error) {
+      setResetError(errorMessage(error, "초기화하지 못했습니다."));
+    } finally {
+      // Partial failures still removed some results: refresh either way.
+      setForgottenRuns(new Set(runs.map((entry) => entry.runId)));
+      setEligibilityAttempt((attempt) => attempt + 1);
+      onChanged();
+      setResetting(false);
+    }
+  }
+
   // Artifact names provide the progress denominator, not a selection UI.
   const artifactsReady = !artifactLoading && !artifactError && artifacts.length > 0;
   const allParseDisabled = !artifactsReady || runAllChecking || allParseBlocked(hosts.map((host) => host.id), eligibility);
@@ -673,6 +709,7 @@ export default function RunPipeline({ activeCase, onChanged, onOpenHost, run }: 
           <span style={{ color: "var(--text-faint)", fontSize: 11.5 }}>{filteredHosts.length.toLocaleString()}개 표시</span>
           {runs.some((entry) => entry.status === "queued" || entry.status === "running") && <span aria-live="polite" style={{ display: "inline-flex", alignItems: "center", gap: 5, color: "var(--text-dim)", fontSize: 11.5, whiteSpace: "nowrap" }}><CircularProgress size={13} thickness={5} />{runs.filter((entry) => entry.status === "running").length}개 실행 · {runs.filter((entry) => entry.status === "queued").length}개 대기</span>}
           <input className="host-ledger-search" aria-label="호스트 또는 증거 경로 검색" value={hostQuery} onChange={(event) => { setHostQuery(event.target.value); setHostPage(0); }} placeholder="호스트·증거 경로 검색" style={{ width: 230, marginLeft: "auto", padding: "6px 9px", background: "var(--bg-input)", border: "1px solid var(--border)", borderRadius: "var(--radius)", color: "var(--text)", fontSize: 12 }} />
+          {!hasActiveRuns && hosts.length > 0 && <button className="nm-btn" type="button" onClick={() => { setResetError(null); setResetOpen(true); }} disabled={!hosts.some((host) => host.lastRunAt)} title="모든 호스트를 파싱 전 상태로 되돌림 (원본 수집 데이터는 유지)" style={{ ...neutralButtonStyle, padding: "5px 10px", fontSize: 12, color: "var(--danger)", opacity: hosts.some((host) => host.lastRunAt) ? 1 : 0.5 }}><RestartAltIcon sx={{ fontSize: 15 }} />초기화</button>}
           {hasActiveRuns ? <button className="nm-btn" type="button" onClick={handleCancel} style={{ ...dangerButtonStyle, padding: "5px 10px", fontSize: 12 }}><CancelOutlinedIcon sx={{ fontSize: 15 }} />전체 실행·대기 항목 중지</button> : hosts.length > 1 && <button className="nm-btn" type="button" onClick={() => void handleRunAll()} disabled={allParseDisabled} title={allParseHint} style={{ ...primaryButtonStyle, padding: "5px 10px", fontSize: 12, opacity: allParseDisabled ? 0.5 : 1 }}>{runAllChecking ? <CircularProgress size={13} thickness={5} aria-hidden="true" /> : <PlayArrowIcon sx={{ fontSize: 15 }} />}{runAllChecking ? "새 데이터 확인 중" : "전체 파싱"}</button>}
         </div>
         {actionError && <div role="alert" style={{ margin: "0 0 8px", padding: "8px 12px", border: "1px solid color-mix(in srgb, var(--danger) 45%, var(--border))", borderRadius: "var(--radius)", background: "color-mix(in srgb, var(--danger) 7%, var(--bg-panel))", color: "var(--danger)", fontSize: 12 }}>{actionError}</div>}
@@ -697,6 +734,7 @@ export default function RunPipeline({ activeCase, onChanged, onOpenHost, run }: 
       </section>
       {renameHost && <RenameHostDialog value={renameName} saving={renaming} error={renameError} onChange={setRenameName} onClose={() => { if (!renaming) setRenameHost(null); }} onSave={() => void handleRenameHost()} />}
       {deleteTarget && <DeleteHostDialog host={deleteTarget} deleting={deleting} error={actionError} onClose={() => { if (!deleting) { setDeleteTarget(null); setActionError(null); } }} onConfirm={() => void handleDelete(deleteTarget.id)} />}
+      {resetOpen && <ResetHostsDialog count={hosts.length} resetting={resetting} error={resetError} onClose={() => { if (!resetting) setResetOpen(false); }} onConfirm={() => void handleReset()} />}
     </div>
   );
 }
@@ -745,16 +783,7 @@ function HostLedgerRow({
   const showLogAction = Boolean(report) && !activeRun && !reportSyncPending;
   const terminalStatus = terminalRun?.status === "complete" ? "ok" : terminalRun?.status;
   const displayStatus = activeRun?.status ?? terminalStatus ?? host.lastRunStatus;
-  const progressLabel = isQueued
-    ? "대기 중"
-    : activeRun?.currentArtifact === "_OVERVIEW"
-      ? "종합 분석 생성 중…"
-      : activeRun?.currentArtifact === "파일 확인"
-        ? "원본 파일 확인 중…"
-        : activeRun?.currentArtifact ? `${activeRun.currentArtifact} 파싱 중…` : "준비 중…";
-  const percent = !activeRun || isQueued || activeRun.totalSteps <= 0
-    ? 0
-    : Math.min(99, Math.round((activeRun.completedSteps / activeRun.totalSteps) * 100));
+  const progress = activeRun && !isQueued ? hostProgress(activeRun) : null;
   // 카드 타일 색 = 실행 상태 신호.
   const tileColor = activeRun ? "var(--accent)" : displayStatus === "ok" ? "var(--success)" : displayStatus === "error" ? "var(--danger)" : displayStatus ? "var(--warning)" : "var(--text-dim)";
   // 카드 = 세로 구성: [헤더 행 + 우측 액션] 위, 펼친 실행 로그 패널이 아래
@@ -779,7 +808,9 @@ function HostLedgerRow({
         ) : terminalStatus ? <span style={{ color: "var(--text-faint)" }}>방금 {terminalStatusLabel(terminalStatus)} · 저장 정보 갱신 중</span> : <span style={{ color: "var(--text-faint)" }}>실행 기록 없음</span>}
       </div>
     </div>
-    {activeRun && !isQueued && <div style={{ gridColumn: "1 / -1" }}><InlineParseProgress stepLabel={progressLabel} percent={percent} completedSteps={activeRun.completedSteps} totalSteps={activeRun.totalSteps} /></div>}
+    {progress && <div style={{ gridColumn: "1 / -1" }}>
+      {progress.overview ? <InlineParseProgress bar={progress.overview} /> : <InlineParseProgress bar={progress.parse} />}
+    </div>}
     {activeRun?.failedArtifacts.length ? <div role="alert" style={{ gridColumn: "1 / -1", padding: "0 0 6px", color: "var(--danger)", fontSize: 12 }}>파싱 실패: {activeRun.failedArtifacts.join(", ")}</div> : null}
     </div>
     <div className="host-ledger-actions">

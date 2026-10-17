@@ -25,6 +25,10 @@ serde_json = "1"
 base64 = "0.22"
 url = "2"
 
+# Dev app runs real parses; optimize wina-core and other deps (user decision 2026-10-17).
+[profile.dev.package."*"]
+opt-level = 3
+
 [profile.release]
 opt-level = "s"
 lto = true

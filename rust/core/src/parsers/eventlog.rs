@@ -28,7 +28,6 @@ pub const ALLOWLIST: &[&str] = &[
     "Microsoft-Windows-Windows Defender%4Operational.evtx",
     "Microsoft-Windows-Windows Defender%4WHC.evtx",
     "Microsoft-Windows-TaskScheduler%4Operational.evtx",
-    "Microsoft-Windows-TaskScheduler%4Maintenance.evtx",
     "Microsoft-Windows-SMBServer%4Security.evtx",
     "Microsoft-Windows-SMBServer%4Audit.evtx",
     "Microsoft-Windows-SmbClient%4Security.evtx",

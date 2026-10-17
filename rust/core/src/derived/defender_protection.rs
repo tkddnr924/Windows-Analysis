@@ -4,6 +4,7 @@
 //! (뷰어13 R02·R13·A04).
 use super::{Cell, Ctx, DerivedDb};
 use anyhow::Result;
+use std::collections::HashSet;
 
 pub(super) const FEATURE_REALTIME: &str = "realtime_protection";
 pub(super) const FEATURE_ON_ACCESS: &str = "on_access";
@@ -58,7 +59,16 @@ fn opt(value: Option<&str>) -> Cell {
     value.map(text).unwrap_or(Cell::Null)
 }
 
-pub(super) fn populate(ctx: &Ctx, db: &mut DerivedDb, observations: &[Observation]) -> Result<()> {
+/// Record reference only when that record is stored in `Defender`.
+fn reference(kept: &HashSet<String>, record_id: &str) -> Cell {
+    if kept.contains(record_id) {
+        text(record_id)
+    } else {
+        Cell::Null
+    }
+}
+
+fn features(observations: &[Observation]) -> Vec<&'static str> {
     let mut features: Vec<&'static str> = Vec::new();
     for observation in observations {
         if !features.contains(&observation.feature) {
@@ -66,23 +76,80 @@ pub(super) fn populate(ctx: &Ctx, db: &mut DerivedDb, observations: &[Observatio
         }
     }
     features.sort_unstable();
+    features
+}
 
-    for feature in features {
-        let mut timed: Vec<&Observation> = observations
-            .iter()
-            .filter(|o| o.feature == feature && o.timestamp.is_some())
-            .collect();
-        let untimed: Vec<&Observation> = observations
-            .iter()
-            .filter(|o| o.feature == feature && o.timestamp.is_none())
-            .collect();
-        // Confirmed log order: recorded time, then the event record id.
-        timed.sort_by(|a, b| {
-            a.timestamp
-                .cmp(&b.timestamp)
-                .then(a.event_record_id.cmp(&b.event_record_id))
-                .then(a.order.cmp(&b.order))
-        });
+/// One feature's timed observations in confirmed log order (recorded time,
+/// then the event record id), and its untimed ones.
+fn ordered<'a>(observations: &'a [Observation], feature: &str) -> (Vec<&'a Observation>, Vec<&'a Observation>) {
+    let mut timed: Vec<&Observation> = observations
+        .iter()
+        .filter(|o| o.feature == feature && o.timestamp.is_some())
+        .collect();
+    let untimed: Vec<&Observation> = observations
+        .iter()
+        .filter(|o| o.feature == feature && o.timestamp.is_none())
+        .collect();
+    timed.sort_by(|a, b| {
+        a.timestamp
+            .cmp(&b.timestamp)
+            .then(a.event_record_id.cmp(&b.event_record_id))
+            .then(a.order.cmp(&b.order))
+    });
+    (timed, untimed)
+}
+
+fn is_decided(state: &str) -> bool {
+    state == STATE_ON || state == STATE_OFF
+}
+
+/// change_kind per timed observation, against the previous decided state.
+fn change_kinds(timed: &[&Observation]) -> Vec<&'static str> {
+    let mut previous: Option<&str> = None;
+    timed
+        .iter()
+        .map(|observation| {
+            if !is_decided(observation.state) {
+                return "undetermined";
+            }
+            let kind = match previous {
+                None => "initial_observation",
+                Some(state) if state == observation.state => "unchanged",
+                Some(_) => "transition",
+            };
+            previous = Some(observation.state);
+            kind
+        })
+        .collect()
+}
+
+/// Records that carry a protection change: a transition, a first observation
+/// that is off, or a state that is not on/off. Routine "on" and unchanged
+/// reports are not among them (user decision 2026-10-14).
+pub(super) fn changed_records(observations: &[Observation]) -> HashSet<String> {
+    let mut changed = HashSet::new();
+    for feature in features(observations) {
+        let (timed, untimed) = ordered(observations, feature);
+        for (observation, kind) in timed.iter().zip(change_kinds(&timed)) {
+            if kind == "transition" || kind == "undetermined" || (kind == "initial_observation" && observation.state == STATE_OFF) {
+                changed.insert(observation.record_id.clone());
+            }
+        }
+        for observation in untimed {
+            if observation.state != STATE_ON {
+                changed.insert(observation.record_id.clone());
+            }
+        }
+    }
+    changed
+}
+
+/// States, runs and latest state are computed from every observation; rows
+/// and record references are written only for records in `kept`.
+pub(super) fn populate(ctx: &Ctx, db: &mut DerivedDb, observations: &[Observation], kept: &HashSet<String>) -> Result<()> {
+    for feature in features(observations) {
+        let (timed, untimed) = ordered(observations, feature);
+        let kinds = change_kinds(&timed);
 
         let same_time = |time: &str| -> i64 {
             timed
@@ -94,8 +161,8 @@ pub(super) fn populate(ctx: &Ctx, db: &mut DerivedDb, observations: &[Observatio
             timed.iter().any(|o| {
                 o.timestamp.as_deref() == Some(time)
                     && o.state != state
-                    && (o.state == STATE_ON || o.state == STATE_OFF)
-                    && (state == STATE_ON || state == STATE_OFF)
+                    && is_decided(o.state)
+                    && is_decided(state)
             })
         };
 
@@ -104,16 +171,8 @@ pub(super) fn populate(ctx: &Ctx, db: &mut DerivedDb, observations: &[Observatio
         for (ordinal, observation) in timed.iter().enumerate() {
             let time = observation.timestamp.as_deref().unwrap_or_default();
             let ambiguous = conflicting(time, observation.state);
-            let decided = observation.state == STATE_ON || observation.state == STATE_OFF;
-            let change_kind = if !decided {
-                "undetermined"
-            } else if previous_decided.is_none() {
-                "initial_observation"
-            } else if previous_decided == Some(observation.state) {
-                "unchanged"
-            } else {
-                "transition"
-            };
+            let decided = is_decided(observation.state);
+            let change_kind = kinds[ordinal];
             let certainty = if !decided {
                 "unknown"
             } else if ambiguous {
@@ -121,6 +180,7 @@ pub(super) fn populate(ctx: &Ctx, db: &mut DerivedDb, observations: &[Observatio
             } else {
                 "confirmed"
             };
+            if kept.contains(&observation.record_id) {
             db.insert_child(
                 "DefenderProtectionStates",
                 &[
@@ -148,12 +208,16 @@ pub(super) fn populate(ctx: &Ctx, db: &mut DerivedDb, observations: &[Observatio
                     text(certainty),
                 ],
             )?;
+            }
             previous_time = observation.timestamp.as_deref();
             if decided {
                 previous_decided = Some(observation.state);
             }
         }
         for (ordinal, observation) in untimed.iter().enumerate() {
+            if !kept.contains(&observation.record_id) {
+                continue;
+            }
             db.insert_child(
                 "DefenderProtectionStates",
                 &[
@@ -227,14 +291,14 @@ pub(super) fn populate(ctx: &Ctx, db: &mut DerivedDb, observations: &[Observatio
                         "transition"
                     }),
                     text(start_time),
-                    text(&first.record_id),
+                    reference(kept, &first.record_id),
                     text(end_time),
-                    text(&last.record_id),
+                    reference(kept, &last.record_id),
                     Cell::Int((end - start + 1) as i64),
                     next.map(|next| text(next.state)).unwrap_or(Cell::Null),
                     next.map(|next| opt(next.timestamp.as_deref()))
                         .unwrap_or(Cell::Null),
-                    next.map(|next| text(&next.record_id)).unwrap_or(Cell::Null),
+                    next.map(|next| reference(kept, &next.record_id)).unwrap_or(Cell::Null),
                     next.map(|next| {
                         gap(end_time, next.timestamp.as_deref().unwrap_or_default())
                     })
@@ -276,7 +340,7 @@ pub(super) fn populate(ctx: &Ctx, db: &mut DerivedDb, observations: &[Observatio
                         text(last.state),
                         "confirmed",
                         at_time.len() as i64,
-                        text(&last.record_id),
+                        reference(kept, &last.record_id),
                         text(last.basis),
                     )
                 }

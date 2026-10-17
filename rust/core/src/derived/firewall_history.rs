@@ -2061,7 +2061,8 @@ pub(super) fn build(ctx: &Ctx, cache: &EventLogOverviewCache) -> Result<usize> {
         );
         let security_keep = audit.is_some();
         let keep = firewall_provider_event || (tracked && !security_log(&table)) || security_keep;
-        if !keep {
+        // Diagnostics 164 (MPSSVC started) is routine: not stored (user decision 2026-10-15).
+        if !keep || (family == "firewall_diagnostics_channel" && event_id == Some(164)) {
             continue;
         }
         if tracked && !corrupted {

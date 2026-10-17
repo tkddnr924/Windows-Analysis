@@ -1,7 +1,7 @@
 //! Typed Microsoft Defender storage: one row per attributed evidence record.
 //! Events are never merged into a synthetic detection, results come from the
 //! event's own evidence, and unknown values stay NULL (뷰어13 R01~R20·A01~A08).
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
 use anyhow::Result;
@@ -198,7 +198,6 @@ fn section_label(section: &str) -> &'static str {
         SECTION_THREAT => "탐지",
         SECTION_THREAT_ACTION => "조치",
         SECTION_SCAN => "검사",
-        SECTION_SIGNATURE => "정의 버전",
         SECTION_TAMPERING => "보호 설정",
         SECTION_HEALTH => "상태 보고",
         SECTION_FAILURE => "오류",
@@ -545,20 +544,7 @@ fn result_of(event_type: &str, error_code: &str) -> (Option<&'static str>, Optio
         | "threat_action_critically_failed"
         | "quarantine_restore_failed"
         | "quarantine_delete_failed" => (Some("failure"), Some("event:action_failed")),
-        "signature_updated" | "engine_updated" | "cloud_intelligence_received" => {
-            if failed {
-                (Some("failure"), Some("payload:error_code"))
-            } else {
-                (Some("success"), Some("event:update_succeeded"))
-            }
-        }
-        "signature_update_failed"
-        | "engine_update_failed"
-        | "platform_update_failed"
-        | "signature_load_failed"
-        | "dynamic_signature_failed"
-        | "clean_file_download_failed"
-        | "offline_scan_install_failed"
+        "offline_scan_install_failed"
         | "history_clear_failed"
         | "engine_failure"
         | "scan_error"
@@ -715,6 +701,8 @@ pub(super) fn build(ctx: &Ctx, cache: &EventLogOverviewCache) -> Result<usize> {
     let mut stats: BTreeMap<String, LogStats> = BTreeMap::new();
     let mut stored: Vec<Stored> = Vec::new();
     let mut observations: Vec<Observation> = Vec::new();
+    // Health reports wait until the protection changes are known.
+    let mut pending: Vec<(Record, Stored)> = Vec::new();
 
     for row in cache.rows() {
         let table = g(row, "_record_key").split("::").next().unwrap_or("").to_string();
@@ -764,19 +752,61 @@ pub(super) fn build(ctx: &Ctx, cache: &EventLogOverviewCache) -> Result<usize> {
         if found.is_none() {
             entry.unmapped += 1;
         }
-        let (record, facts) = event_record(ctx, row, event_id, found, known_channel, &mut observations)?;
-        stored.push(facts);
-        db.write(record)?;
+        let (record, facts, keep) = event_record(ctx, row, event_id, found, known_channel, &mut observations)?;
+        match keep {
+            Keep::Store => {
+                stored.push(facts);
+                db.write(record)?;
+            }
+            Keep::IfChanged => pending.push((record, facts)),
+            Keep::Drop => {}
+        }
+    }
+    let changed = protection::changed_records(&observations);
+    for (record, facts) in pending {
+        if changed.contains(&facts.record_id) {
+            stored.push(facts);
+            db.write(record)?;
+        }
     }
 
     let mpdetection = mpdetection_rows(ctx, &mut db, &mut stored)?;
     detections(ctx, &mut db, &stored)?;
     scans(ctx, &mut db, &stored)?;
-    protection::populate(ctx, &mut db, &observations)?;
+    let kept: HashSet<String> = stored.iter().map(|row| row.record_id.clone()).collect();
+    protection::populate(ctx, &mut db, &observations, &kept)?;
     summaries(ctx, &mut db, &stored)?;
     candidates(ctx, &mut db, &stored)?;
     input_observations(ctx, &mut db, stats, &mpdetection)?;
     db.finish()
+}
+
+/// Whether a source event becomes an `_OVERVIEW` row (user decision 2026-10-14).
+enum Keep {
+    Store,
+    /// Health report: stored only when it carries a protection change.
+    IfChanged,
+    /// Definition-version section, routine heartbeat or periodic history purge.
+    Drop,
+}
+
+/// Periodic history purge: SYSTEM deletes history older than a whole number
+/// of days (`ScanPurgeItemsAfterDelay`, default 15) before the event time.
+fn periodic_purge(account_sid: &str, user_raw: &str, event_time: &str, cleared_raw: &str) -> bool {
+    let system = if super::is_sid(account_sid) {
+        account_sid == "S-1-5-18"
+    } else {
+        user_raw.eq_ignore_ascii_case("NT AUTHORITY\\SYSTEM")
+    };
+    let Some(cleared) = support::parse_log_time(cleared_raw) else {
+        return false;
+    };
+    const DAY: i64 = 86_400;
+    const TOLERANCE: i64 = 2;
+    match protection::gap(&cleared.display, event_time) {
+        Cell::Int(seconds) => system && seconds >= DAY - TOLERANCE && (seconds + TOLERANCE) % DAY <= 2 * TOLERANCE,
+        _ => false,
+    }
 }
 
 /// One stored row per source event; no field is borrowed from another event.
@@ -787,7 +817,7 @@ fn event_record(
     found: Option<&'static Kind>,
     known_channel: bool,
     observations: &mut Vec<Observation>,
-) -> Result<(Record, Stored)> {
+) -> Result<(Record, Stored, Keep)> {
     let payload = payload_of(row.get("EventData").map(String::as_str));
     let mut record = ctx.record(&SPEC);
     let record_id = record.record_id.clone();
@@ -851,7 +881,7 @@ fn event_record(
     let generic_id = payload.get("ID");
     let antimalware = matches!(
         section,
-        SECTION_THREAT | SECTION_THREAT_ACTION | SECTION_SCAN | SECTION_SIGNATURE | SECTION_HISTORY
+        SECTION_THREAT | SECTION_THREAT_ACTION | SECTION_SCAN | SECTION_HISTORY
     );
     let threat_id = match payload.get("Threat ID") {
         stored if !stored.is_empty() => stored,
@@ -1310,6 +1340,40 @@ fn event_record(
         });
     }
 
+    let keep = match event_type.as_str() {
+        _ if section == SECTION_SIGNATURE => Keep::Drop,
+        // Routine quick scans and events without a supported meaning (user decision 2026-10-14).
+        _ if found.is_none() => Keep::Drop,
+        _ if section == SECTION_SCAN
+            && ["Quick Scan", "빠른 검사"].iter().any(|quick| scan_parameters.trim().eq_ignore_ascii_case(quick)) =>
+        {
+            Keep::Drop
+        }
+        // Only scan exclusions and protection settings carry meaning.
+        "configuration_changed"
+            if !target.is_empty() && exclusion_of(&target).is_none() && protection_setting(&target).is_none() =>
+        {
+            Keep::Drop
+        }
+        "service_healthy" => Keep::Drop,
+        "health_report" => Keep::IfChanged,
+        "history_cleared" => {
+            // Payload account first; the security context only when it is absent.
+            let account_sid = if super::is_sid(&sid) {
+                sid.as_str()
+            } else if user_raw.is_empty() {
+                system_sid
+            } else {
+                ""
+            };
+            if periodic_purge(account_sid, &user_raw, timestamp, &payload.first(&["Timestamp", "Time"])) {
+                Keep::Drop
+            } else {
+                Keep::Store
+            }
+        }
+        _ => Keep::Store,
+    };
     let facts = Stored {
         record_id,
         section: section.to_string(),
@@ -1334,7 +1398,7 @@ fn event_record(
             user_sid: if super::is_sid(&sid) { sid } else { String::new() },
         }),
     };
-    Ok((record, facts))
+    Ok((record, facts, keep))
 }
 
 fn split_account(raw: &str) -> (String, String) {
@@ -2944,22 +3008,22 @@ mod tests {
         let case = Case::new(4);
         let db = case.build(vec![
             event(
-                "2000",
+                "1013",
                 1,
                 "2026-03-02 10:00:00.000",
-                r#"{"Current security intelligence Version":"1.443.860.0","Previous security intelligence Version":"1.403.7.0","Domain":"WIN-HOST","User":"Administrator","SID":"S-1-5-21-1-2-3-500","Update Type":"전체"}"#,
+                r#"{"Timestamp":"2026-03-02T00:30:00Z","Domain":"WIN-HOST","User":"Administrator","SID":"S-1-5-21-1-2-3-500"}"#,
             ),
             event(
                 "1000",
                 2,
                 "2026-03-02 11:00:00.000",
-                r#"{"Scan ID":"{AAA}","Scan Type":"맬웨어 방지","Scan Parameters":"빠른 검사","Domain":"NT AUTHORITY","User":"SYSTEM","SID":"S-1-5-18"}"#,
+                r#"{"Scan ID":"{AAA}","Scan Type":"맬웨어 방지","Scan Parameters":"전체 검사","Domain":"NT AUTHORITY","User":"SYSTEM","SID":"S-1-5-18"}"#,
             ),
             event(
                 "1001",
                 3,
                 "2026-03-02 11:00:10.000",
-                r#"{"Scan ID":"{AAA}","Scan Type":"맬웨어 방지","Scan Parameters":"빠른 검사","Scan Time Hours":"0","Scan Time Minutes":"00","Scan Time Seconds":"10","Domain":"NT AUTHORITY","User":"SYSTEM","SID":"S-1-5-18"}"#,
+                r#"{"Scan ID":"{AAA}","Scan Type":"맬웨어 방지","Scan Parameters":"전체 검사","Scan Time Hours":"0","Scan Time Minutes":"00","Scan Time Seconds":"10","Domain":"NT AUTHORITY","User":"SYSTEM","SID":"S-1-5-18"}"#,
             ),
             event(
                 "1013",
@@ -2971,17 +3035,13 @@ mod tests {
 
         assert_eq!(one::<i64>(&db, "SELECT COUNT(*) FROM Defender"), 4);
         assert_eq!(
-            one::<String>(&db, "SELECT section FROM Defender WHERE event_id=2000"),
-            "signature"
-        );
-        assert_eq!(
-            one::<String>(&db, "SELECT event_type FROM Defender WHERE event_id=1013"),
-            "history_cleared"
+            one::<String>(&db, "SELECT group_concat(event_type) FROM (SELECT event_type FROM Defender WHERE event_id=1013 ORDER BY event_record_id)"),
+            "history_cleared,history_cleared"
         );
         // Payload SID is the account; the security context stays separate.
         let (sid, system, role): (String, String, String) = db
             .query_row(
-                "SELECT account_sid,system_user_sid,account_role FROM Defender WHERE event_id=2000",
+                "SELECT account_sid,system_user_sid,account_role FROM Defender WHERE event_record_id='1'",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
@@ -2999,10 +3059,10 @@ mod tests {
         // R06: per-kind totals with first/last stay queryable per period.
         let (count, first, last): (i64, String, String) = db
             .query_row(
-                "SELECT event_count,first_time,last_time FROM DefenderActivitySummaries WHERE summary_kind='signature_updated'",
+                "SELECT event_count,first_time,last_time FROM DefenderActivitySummaries WHERE summary_kind='scan_started'",
                 [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
             .unwrap();
-        assert_eq!((count, first.as_str(), last.as_str()), (1, "2026-03-02 10:00:00.000", "2026-03-02 10:00:00.000"));
+        assert_eq!((count, first.as_str(), last.as_str()), (1, "2026-03-02 11:00:00.000", "2026-03-02 11:00:00.000"));
         // A02: Scan ID pairs the start and completion, duration from payload.
         let (state, secs, elapsed): (String, i64, i64) = db
             .query_row(
@@ -3027,13 +3087,13 @@ mod tests {
                 "1013",
                 1,
                 "2026-08-23 07:34:59.772",
-                r#"{"Timestamp":"2026-08-21T22:34:59Z"}"#,
+                r#"{"Timestamp":"2026-08-21T22:34:59Z","Domain":"WIN-HOST","User":"analyst"}"#,
             ),
             event(
                 "1151",
                 2,
                 "2026-08-23 00:45:13.838",
-                r#"{"AV security intelligence creation time":"2026-08-22T07:31:42Z","AS security intelligence creation time":"2026-08-22T07:31:42Z","Last quick scan start time":"2026-08-21T22:35:00Z","Last quick scan end time":"2026-08-21T22:36:46Z","Last full scan start time":"1601-01-01T00:00:00Z","Last full scan end time":"1601-01-01T00:00:00Z"}"#,
+                r#"{"RTP state":"사용 안 함","AV security intelligence creation time":"2026-08-22T07:31:42Z","AS security intelligence creation time":"2026-08-22T07:31:42Z","Last quick scan start time":"2026-08-21T22:35:00Z","Last quick scan end time":"2026-08-21T22:36:46Z","Last full scan start time":"1601-01-01T00:00:00Z","Last full scan end time":"1601-01-01T00:00:00Z"}"#,
             ),
         ]);
         let (cleared, cleared_raw): (String, String) = db
@@ -3166,11 +3226,11 @@ mod tests {
             event("5004", 5, "2026-09-29 00:00:00.000", "{}"),
         ]);
 
-        // Two health reports, the two explicit state events and the
-        // configuration change, which stays an undecided observation.
+        // The routine first report (all on) is not stored; the off report, the
+        // two explicit state events and the configuration change remain.
         assert_eq!(
             one::<i64>(&db, "SELECT COUNT(*) FROM DefenderProtectionStates WHERE feature='realtime_protection'"),
-            5
+            4
         );
         // A configuration change is not an on/off state.
         assert_eq!(
@@ -3192,10 +3252,123 @@ mod tests {
         assert_eq!(end, "2026-08-20 00:00:00.000");
         assert_eq!(kind, "state_change");
         assert!(gap > 0);
+        let (run_kind, start_record): (String, Option<String>) = db
+            .query_row(
+                "SELECT run_kind,run_start_record_id FROM DefenderProtectionIntervals WHERE feature='on_access' AND state='on' AND run_start_time='2026-08-01 00:00:00.000'",
+                [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!(run_kind, "initial_observation");
+        // Its record was not stored, so no reference points at it.
+        assert_eq!(start_record, None);
+        assert_eq!(one::<i64>(&db, "SELECT COUNT(*) FROM pragma_foreign_key_check"), 0);
+    }
+
+    // 2026-10-14 user decision: routine heartbeats, unchanged health reports
+    // and periodic history purges are not brought into _OVERVIEW.
+    #[test]
+    fn routine_reports_and_periodic_purges_are_not_stored() {
+        let case = Case::new(10);
+        let on = r#"{"RTP state":"사용","OA state":"사용"}"#;
+        let db = case.build(vec![
+            event("1150", 1, "2026-08-01 00:00:00.000", "{}"),
+            event("1151", 2, "2026-08-01 00:00:00.100", on),
+            event("1151", 3, "2026-08-01 01:00:00.000", on),
+            event("1151", 4, "2026-08-01 02:00:00.000", r#"{"RTP state":"사용 안 함","OA state":"사용"}"#),
+            event("1151", 5, "2026-08-01 03:00:00.000", r#"{"RTP state":"사용 안 함","OA state":"사용"}"#),
+            event("1151", 6, "2026-08-01 04:00:00.000", on),
+            event("1151", 7, "2026-08-01 05:00:00.000", on),
+            // SYSTEM purge of history older than 15 days: periodic.
+            event("1013", 8, "2026-08-16 09:00:00.500", r#"{"Timestamp":"2026-08-01T00:00:00Z","Domain":"NT AUTHORITY","User":"SYSTEM"}"#),
+            // Not a whole-day cutoff, or not SYSTEM: kept.
+            event("1013", 9, "2026-08-16 09:00:00.000", r#"{"Timestamp":"2026-08-16T00:00:00Z","Domain":"NT AUTHORITY","User":"SYSTEM"}"#),
+            event("1013", 10, "2026-08-16 09:00:00.000", r#"{"Timestamp":"2026-08-01T00:00:00Z","Domain":"WIN-HOST","User":"analyst"}"#),
+        ]);
+
+        assert_eq!(one::<i64>(&db, "SELECT COUNT(*) FROM Defender WHERE event_id=1150"), 0);
+        // Only the off and back-on reports remain.
         assert_eq!(
-            one::<String>(&db, "SELECT run_kind FROM DefenderProtectionIntervals WHERE feature='on_access' AND state='on' AND run_start_time='2026-08-01 00:00:00.000'"),
-            "initial_observation"
+            one::<String>(&db, "SELECT group_concat(event_record_id) FROM (SELECT event_record_id FROM Defender WHERE event_id=1151 ORDER BY timestamp)"),
+            "4,6"
         );
+        assert_eq!(
+            one::<String>(&db, "SELECT group_concat(event_record_id) FROM (SELECT event_record_id FROM Defender WHERE event_id=1013 ORDER BY CAST(event_record_id AS INTEGER))"),
+            "9,10"
+        );
+        // The latest state still uses every observation; its record is gone.
+        let latest: (String, Option<String>, i64, String) = db
+            .query_row(
+                "SELECT state,record_id,observation_count,last_observed_time FROM DefenderProtectionLatest WHERE feature='realtime_protection'",
+                [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap();
+        assert_eq!(latest, ("on".to_string(), None, 6, "2026-08-01 05:00:00.000".to_string()));
+        assert_eq!(
+            one::<String>(&db, "SELECT group_concat(change_kind) FROM (SELECT change_kind FROM DefenderProtectionStates WHERE feature='realtime_protection' ORDER BY timestamp)"),
+            "transition,transition"
+        );
+        // on_access never changed: only its observations on stored records
+        // remain (unchanged), and the latest state still exists.
+        assert_eq!(
+            one::<String>(&db, "SELECT group_concat(change_kind) FROM DefenderProtectionStates WHERE feature='on_access'"),
+            "unchanged,unchanged"
+        );
+        assert_eq!(one::<String>(&db, "SELECT state FROM DefenderProtectionLatest WHERE feature='on_access'"), "on");
+        assert_eq!(one::<i64>(&db, "SELECT COUNT(*) FROM pragma_foreign_key_check"), 0);
+    }
+
+    // 2026-10-14 user decision: quick scans are not brought into _OVERVIEW.
+    #[test]
+    fn quick_scans_are_not_stored() {
+        let case = Case::new(4);
+        let db = case.build(vec![
+            event("1000", 1, "2026-08-01 00:00:00.000", r#"{"Scan ID":"{Q}","Scan Parameters":"빠른 검사"}"#),
+            event("1001", 2, "2026-08-01 00:00:19.000", r#"{"Scan ID":"{Q}","Scan Parameters":"빠른 검사"}"#),
+            event("1000", 3, "2026-08-01 01:00:00.000", r#"{"Scan ID":"{E}","Scan Parameters":"Quick Scan"}"#),
+            event("1000", 4, "2026-08-01 02:00:00.000", r#"{"Scan ID":"{F}","Scan Parameters":"전체 검사"}"#),
+        ]);
+        assert_eq!(one::<String>(&db, "SELECT group_concat(event_record_id) FROM Defender"), "4");
+        assert_eq!(one::<String>(&db, "SELECT group_concat(scan_id) FROM DefenderScans"), "{F}");
+    }
+
+    // 2026-10-14 user decision: the definition-version section (updates,
+    // failures, cloud intelligence) is not brought into _OVERVIEW.
+    #[test]
+    fn definition_version_section_is_not_stored() {
+        let case = Case::new(5);
+        let db = case.build(vec![
+            event("2000", 1, "2026-08-01 00:00:00.000", r#"{"Current security intelligence Version":"1.2","Previous security intelligence Version":"1.1"}"#),
+            event("2001", 2, "2026-08-01 01:00:00.000", r#"{"Error Code":"0x80240022"}"#),
+            event("2002", 3, "2026-08-01 02:00:00.000", r#"{"Current Engine Version":"1.1.2","Previous Engine Version":"1.1.1"}"#),
+            event("2010", 4, "2026-08-01 03:00:00.000", "{}"),
+            event("1000", 5, "2026-08-01 04:00:00.000", r#"{"Scan ID":"{B}"}"#),
+        ]);
+        assert_eq!(one::<String>(&db, "SELECT group_concat(event_id) FROM Defender"), "1000");
+        assert_eq!(one::<i64>(&db, "SELECT COUNT(*) FROM DefenderActivitySummaries WHERE section='signature'"), 0);
+        // Still recognised Defender events, not counted as unmapped.
+        assert_eq!(
+            one::<i64>(&db, "SELECT unmapped_event_count FROM DefenderInputObservations WHERE input_kind='eventlog' AND event_count IS NOT NULL"),
+            0
+        );
+        assert_eq!(one::<i64>(&db, "SELECT COUNT(*) FROM pragma_foreign_key_check"), 0);
+    }
+
+    // 2026-10-14 user decision: only scan exclusions and protection settings
+    // stay among configuration changes; unreadable targets are kept.
+    #[test]
+    fn unrelated_configuration_changes_are_not_stored() {
+        let case = Case::new(5);
+        let db = case.build(vec![
+            event("5007", 1, "2026-05-01 00:00:00.000", r#"{"Old Value":"HKLM\\SOFTWARE\\Microsoft\\Windows Defender\\CoreService\\WdConfigHash = 0x7A257414","New Value":"HKLM\\SOFTWARE\\Microsoft\\Windows Defender\\CoreService\\WdConfigHash = 0x57C0580F"}"#),
+            event("5007", 2, "2026-05-01 00:01:00.000", r#"{"Old Value":"","New Value":"HKLM\\SOFTWARE\\Microsoft\\Windows Defender\\Features\\Controls\\104 = 0x1"}"#),
+            event("5007", 3, "2026-05-01 00:02:00.000", r#"{"Old Value":"","New Value":"HKLM\\SOFTWARE\\Microsoft\\Windows Defender\\Exclusions\\Paths\\C:\\tmp = 0x0"}"#),
+            event("5007", 4, "2026-05-01 00:03:00.000", r#"{"Old Value":"HKLM\\SOFTWARE\\Microsoft\\Windows Defender\\Real-Time Protection\\DisableRealtimeMonitoring = 0x0","New Value":"HKLM\\SOFTWARE\\Microsoft\\Windows Defender\\Real-Time Protection\\DisableRealtimeMonitoring = 0x1"}"#),
+            event("5007", 5, "2026-05-01 00:04:00.000", r#"{"Old Value":"HKLM\\SOFTWARE\\Microsoft\\Windows Defender\\Features\\TamperProtection = 0x5","New Value":"HKLM\\SOFTWARE\\Microsoft\\Windows Defender\\Features\\TamperProtection = 0x4"}"#),
+        ]);
+        assert_eq!(
+            one::<String>(&db, "SELECT group_concat(event_record_id) FROM (SELECT event_record_id FROM Defender ORDER BY event_record_id)"),
+            "3,4,5"
+        );
+        assert_eq!(one::<String>(&db, "SELECT state FROM DefenderProtectionLatest WHERE feature='realtime_protection'"), "off");
+        assert_eq!(one::<i64>(&db, "SELECT COUNT(*) FROM pragma_foreign_key_check"), 0);
     }
 
     // R02/R17: same-time conflicts never become a decided latest state.
@@ -3228,7 +3401,7 @@ mod tests {
             event("5007", 1, "2026-05-01 00:00:00.000", r#"{"Old Value":"","New Value":"HKLM\\SOFTWARE\\Microsoft\\Windows Defender\\Exclusions\\Paths\\C:\\tmp = 0x0"}"#),
             event("5007", 2, "2026-05-01 00:01:00.000", r#"{"Old Value":"HKLM\\SOFTWARE\\Microsoft\\Windows Defender\\Exclusions\\Paths\\C:\\tmp = 0x0","New Value":""}"#),
             event("5007", 3, "2026-05-01 00:02:00.000", r#"{"Old Value":"Default\\DisableRealtimeMonitoring = 0x0","New Value":"HKLM\\SOFTWARE\\Microsoft\\Windows Defender\\DisableRealtimeMonitoring = 0x1"}"#),
-            event("5007", 4, "2026-05-01 00:03:00.000", r#"{"Old Value":"N/A\\ProductType =","New Value":"HKLM\\SOFTWARE\\Microsoft\\Windows Defender\\CoreService\\WdConfigHash"}"#),
+            event("5007", 4, "2026-05-01 00:03:00.000", r#"{"Old Value":"N/A\\Exclusions\\Paths\\C:\\x =","New Value":"HKLM\\SOFTWARE\\Microsoft\\Windows Defender\\Exclusions\\Paths\\C:\\x"}"#),
         ]);
 
         let kind = |n: i64| -> String {
@@ -3274,14 +3447,14 @@ mod tests {
         let mut nested = event("1151", 2, "2026-06-01 01:00:00.000", "");
         nested.insert(
             "EventData".to_string(),
-            r#"{"EventXML":{"RTP state":"사용","OA state":"사용"}}"#.to_string(),
+            r#"{"EventXML":{"RTP state":"사용 안 함","OA state":"사용"}}"#.to_string(),
         );
         // A stored empty payload and a missing EventData column differ.
         let stored_empty = event("5000", 5, "2026-06-01 04:00:00.000", "");
         let mut absent = event("5001", 6, "2026-06-01 05:00:00.000", "");
         absent.remove("EventData");
         // Another Defender channel: the id's Operational meaning is not proven,
-        // so it stays raw evidence and contributes no state or scan.
+        // so it is not stored and contributes no state or scan.
         let mut other_channel = event("1000", 7, "2026-06-01 06:00:00.000", r#"{"RTP state":"사용","Scan ID":"{W}"}"#);
         other_channel.insert(
             "Channel".to_string(),
@@ -3291,7 +3464,7 @@ mod tests {
             foreign,
             nested,
             event("2014", 3, "2026-06-01 02:00:00.000", r#"{"Product Name":"Microsoft Defender"}"#),
-            event("1150", 4, "2026-06-01 03:00:00.000", "not json"),
+            event("5007", 4, "2026-06-01 03:00:00.000", "not json"),
             stored_empty,
             absent,
             other_channel,
@@ -3308,17 +3481,9 @@ mod tests {
         assert_eq!(payload(5000), ("empty".to_string(), Some(String::new())));
         assert_eq!(payload(5001), ("absent".to_string(), None));
 
-        assert_eq!(one::<i64>(&db, "SELECT COUNT(*) FROM Defender"), 6);
-        let (support, section, kind): (String, String, String) = db
-            .query_row(
-                "SELECT support_state,section,event_type FROM Defender WHERE event_id=1000",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .unwrap();
-        assert_eq!(support, "unmapped_channel");
-        assert_eq!(section, "other");
-        assert_eq!(kind, "defender_event_1000");
+        // Unmapped events (2014, the WHC-channel 1000) are not stored.
+        assert_eq!(one::<i64>(&db, "SELECT COUNT(*) FROM Defender"), 4);
+        assert_eq!(one::<i64>(&db, "SELECT COUNT(*) FROM Defender WHERE event_id IN (1000,2014)"), 0);
         assert_eq!(one::<i64>(&db,
             "SELECT COUNT(*) FROM DefenderProtectionStates s JOIN Defender d USING(record_id)
              WHERE d.channel='Microsoft-Windows-Windows Defender/WHC'"), 0);
@@ -3340,15 +3505,11 @@ mod tests {
         );
         assert_eq!(
             one::<String>(&db, "SELECT rtp_state_raw FROM Defender WHERE event_id=1151"),
-            "사용"
+            "사용 안 함"
         );
-        // Unsupported mapping and invalid payloads stay visible, never blank rows.
-        assert_eq!(
-            one::<String>(&db, "SELECT support_state FROM Defender WHERE event_id=2014"),
-            "unmapped"
-        );
+        // Invalid payloads stay visible, never blank rows.
         let (shape, raw): (String, String) = db
-            .query_row("SELECT payload_shape,event_data_raw FROM Defender WHERE event_id=1150", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .query_row("SELECT payload_shape,event_data_raw FROM Defender WHERE event_id=5007", [], |r| Ok((r.get(0)?, r.get(1)?)))
             .unwrap();
         assert_eq!(shape, "invalid");
         assert_eq!(raw, "not json");
@@ -3614,14 +3775,8 @@ mod tests {
             one::<i64>(&db, "SELECT whc_state_id FROM Defender WHERE event_record_id='1'"),
             4
         );
-        assert_eq!(row(2, "support_state").as_deref(), Some("unmapped_channel"));
-        assert_eq!(row(2, "event_type").as_deref(), Some("defender_event_1121"));
-        assert_eq!(row(2, "protection_feature"), None);
-        assert_eq!(row(2, "asr_rule_id"), None);
-        assert_eq!(row(3, "support_state").as_deref(), Some("unmapped"));
-        assert_eq!(row(3, "whc_state_raw"), None);
-        assert_eq!(row(4, "channel_state").as_deref(), Some("unknown_channel"));
-        assert_eq!(row(4, "support_state").as_deref(), Some("unmapped_channel"));
+        // Unmapped ids on either channel are not stored.
+        assert_eq!(one::<String>(&db, "SELECT group_concat(event_record_id) FROM Defender"), "1");
         // No protection state, scan or detection is created from any of them.
         assert_eq!(one::<i64>(&db, "SELECT COUNT(*) FROM DefenderProtectionStates"), 0);
         assert_eq!(one::<i64>(&db, "SELECT COUNT(*) FROM DefenderScans"), 0);
@@ -3822,16 +3977,16 @@ mod tests {
     #[test]
     fn provider_guid_and_schema_version_are_stored_or_null() {
         let case = Case::new(3);
-        let mut matched = event("1150", 1, "2026-08-04 00:00:00.000", "{}");
+        let mut matched = event("5000", 1, "2026-08-04 00:00:00.000", "{}");
         matched.insert("ProviderGuid".to_string(), format!("{{{PROVIDER_GUID}}}"));
         matched.insert("Version".to_string(), "0".to_string());
-        let mut other = event("1150", 2, "2026-08-04 00:01:00.000", "{}");
+        let mut other = event("5000", 2, "2026-08-04 00:01:00.000", "{}");
         other.insert(
             "ProviderGuid".to_string(),
             "{00000000-0000-0000-0000-000000000000}".to_string(),
         );
         other.insert("Version".to_string(), "2".to_string());
-        let legacy = event("1150", 3, "2026-08-04 00:02:00.000", "{}");
+        let legacy = event("5000", 3, "2026-08-04 00:02:00.000", "{}");
         let db = case.build(vec![matched, other, legacy]);
 
         let state = |record: i64| -> (String, Option<i64>, Option<String>) {

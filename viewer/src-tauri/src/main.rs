@@ -701,6 +701,44 @@ fn delete_host_dir_and_bookmarks(case_dir: &Path, host_id: &str) -> bool {
     true
 }
 
+/// Every registered host back to its pre-parse state: outputs, logs and its
+/// bookmarks removed, registration kept. Refused while any run is active.
+#[tauri::command]
+async fn reset_hosts(state: tauri::State<'_, PipelineState>, case_id: String) -> Result<(), String> {
+    if !valid_id(&case_id) {
+        return Err("invalid case identifier".into());
+    }
+    {
+        let scheduler = state.0.lock().map_err(|_| "pipeline scheduler unavailable")?;
+        if !scheduler.running.is_empty() || !scheduler.reserving.is_empty() || !scheduler.queued.is_empty() {
+            return Err("실행 중이거나 대기 중인 파싱이 있어 초기화할 수 없습니다.".into());
+        }
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let cd = cases_dir();
+        let case_dir = case_store::case_dir(&cd, &case_id);
+        let hosts = case_store::list_cases(&cd).map_err(|error| error.to_string())?
+            .into_iter()
+            .flat_map(|case| case.hosts)
+            .collect::<Vec<_>>();
+        let mut failed = Vec::new();
+        for host in hosts {
+            if case_store::reset_host(&host.id, &cd).is_ok() {
+                remove_host_bookmarks(&case_dir, &host.id);
+            } else {
+                failed.push(host.name);
+            }
+        }
+        if failed.is_empty() {
+            Ok(())
+        } else {
+            Err(format!("초기화하지 못한 호스트: {}", failed.join(", ")))
+        }
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
 #[tauri::command]
 fn list_artifacts() -> Vec<String> {
     pipeline::ARTIFACT_NAMES
@@ -750,13 +788,21 @@ struct PipelineResult {
 struct RunningPipeline {
     child: std::process::Child,
     log_path: PathBuf,
+    /// Overview gate: one line written here lets the child build _OVERVIEW.
+    stdin: Option<std::process::ChildStdin>,
 }
 
 const MAX_HOST_PIPELINES: usize = 2;
+/// _OVERVIEW builds are memory heavy (MFT millions of rows), so they keep
+/// their own bound once a host has left its parse slot. 3 measured fastest for
+/// six hosts (release, overview only): 2 → 221s, 3 → 195s, 4 → 204s, 6 → 264s.
+const MAX_OVERVIEW_BUILDS: usize = 3;
 
-/// A bounded, keyed child supervisor. A run reserves a slot before spawning
-/// so concurrent commands can never exceed `MAX_HOST_PIPELINES`; cancellation
-/// can target an already-running child or a run that is still waiting.
+/// A bounded, keyed child supervisor. A run reserves a parse slot before
+/// spawning so concurrent parsing never exceeds `MAX_HOST_PIPELINES`. When
+/// the child reaches _OVERVIEW it gives the parse slot back and waits for an
+/// overview slot, so a queued host starts parsing meanwhile. Cancellation can
+/// target an already-running child or a run that is still waiting.
 #[derive(Default)]
 struct PipelineScheduler {
     running: HashMap<String, RunningPipeline>,
@@ -765,13 +811,18 @@ struct PipelineScheduler {
     cancelled: HashSet<String>,
     host_ids: HashMap<String, String>,
     case_ids: HashMap<String, String>,
+    /// Runs holding a parse slot (reserving, or running before _OVERVIEW).
+    parsing: HashSet<String>,
+    /// Runs at the overview gate, in arrival order.
+    overview_waiting: VecDeque<String>,
+    overview_building: HashSet<String>,
 }
 
 #[derive(Default)]
 struct PipelineState(std::sync::Mutex<PipelineScheduler>);
 
 fn reserve_pipeline_slot(scheduler: &mut PipelineScheduler, run_id: &str, host_id: &str) -> bool {
-    if scheduler.running.len() + scheduler.reserving.len() >= MAX_HOST_PIPELINES {
+    if scheduler.parsing.len() >= MAX_HOST_PIPELINES {
         return false;
     }
     // A host directory is the publish/report/status unit. Two children for the
@@ -793,7 +844,36 @@ fn reserve_pipeline_slot(scheduler: &mut PipelineScheduler, run_id: &str, host_i
     }
     scheduler.queued.remove(run_id);
     scheduler.reserving.insert(run_id.to_string());
+    scheduler.parsing.insert(run_id.to_string());
     true
+}
+
+/// The child reached _OVERVIEW: its parse slot goes to the next queued host.
+fn enter_overview_queue(scheduler: &mut PipelineScheduler, run_id: &str) {
+    if scheduler.parsing.remove(run_id) {
+        scheduler.overview_waiting.push_back(run_id.to_string());
+    }
+}
+
+/// Grant an overview slot to `run_id` only when it heads the gate queue.
+fn grant_overview(scheduler: &mut PipelineScheduler, run_id: &str) -> bool {
+    if scheduler.overview_building.len() >= MAX_OVERVIEW_BUILDS
+        || scheduler.overview_waiting.front().map(String::as_str) != Some(run_id)
+    {
+        return false;
+    }
+    scheduler.overview_waiting.pop_front();
+    scheduler.overview_building.insert(run_id.to_string());
+    true
+}
+
+/// Drop every slot and bookkeeping entry of a finished or cancelled run.
+fn release_run(scheduler: &mut PipelineScheduler, run_id: &str) {
+    scheduler.parsing.remove(run_id);
+    scheduler.overview_waiting.retain(|id| id != run_id);
+    scheduler.overview_building.remove(run_id);
+    scheduler.host_ids.remove(run_id);
+    scheduler.case_ids.remove(run_id);
 }
 
 fn append_supervisor_log(log_path: &Path, event: &str) {
@@ -1067,6 +1147,8 @@ async fn run_host(
 
     let mut child = match Command::new(exe)
         .args(&args)
+        .env(pipeline::OVERVIEW_GATE_ENV, "1")
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -1075,8 +1157,7 @@ async fn run_host(
         Err(error) => {
             if let Ok(mut scheduler) = state.0.lock() {
                 scheduler.reserving.remove(&run_id);
-                scheduler.host_ids.remove(&run_id);
-                scheduler.case_ids.remove(&run_id);
+                release_run(&mut scheduler, &run_id);
             }
             emit_pipeline_event(
                 &app,
@@ -1093,16 +1174,22 @@ async fn run_host(
     // Stream the child's stdout/stderr as `pipeline-log` events.
     let event_run_id = run_id.clone();
     let event_host_id = options.host_id.clone();
+    let gate_ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let pump =
         |app: &AppHandle, reader: Option<Box<dyn std::io::Read + Send>>, stream: &'static str| {
             if let Some(r) = reader {
                 let app = app.clone();
                 let run_id = event_run_id.clone();
                 let host_id = event_host_id.clone();
+                let gate_ready = gate_ready.clone();
                 Some(std::thread::spawn(move || {
                     use std::io::BufRead;
                     for line in std::io::BufReader::new(r).lines().map_while(Result::ok) {
                         if line.is_empty() {
+                            continue;
+                        }
+                        if line == pipeline::OVERVIEW_READY_LINE {
+                            gate_ready.store(true, std::sync::atomic::Ordering::Release);
                             continue;
                         }
                         emit_pipeline_event(&app, &run_id, &host_id, "running", stream, line);
@@ -1146,8 +1233,7 @@ async fn run_host(
         scheduler.reserving.remove(&run_id);
         let cancelled = scheduler.cancelled.remove(&run_id);
         if cancelled {
-            scheduler.host_ids.remove(&run_id);
-            scheduler.case_ids.remove(&run_id);
+            release_run(&mut scheduler, &run_id);
         }
         cancelled
     };
@@ -1176,9 +1262,10 @@ async fn run_host(
             .0
             .lock()
             .map_err(|_| "pipeline scheduler unavailable")?;
+        let stdin = child.stdin.take();
         scheduler
             .running
-            .insert(run_id.clone(), RunningPipeline { child, log_path });
+            .insert(run_id.clone(), RunningPipeline { child, log_path, stdin });
     }
     emit_pipeline_event(
         &app,
@@ -1190,6 +1277,7 @@ async fn run_host(
     );
 
     // Poll for exit so cancel_pipeline can still reach the child while it runs.
+    let mut gate_entered = false;
     loop {
         // Outer None: cancel took the entry out of the map after killing it.
         let exit = {
@@ -1197,6 +1285,17 @@ async fn run_host(
                 .0
                 .lock()
                 .map_err(|_| "pipeline scheduler unavailable")?;
+            if !gate_entered && gate_ready.load(std::sync::atomic::Ordering::Acquire) {
+                gate_entered = true;
+                enter_overview_queue(&mut scheduler, &run_id);
+            }
+            if gate_entered && grant_overview(&mut scheduler, &run_id) {
+                if let Some(mut stdin) = scheduler.running.get_mut(&run_id).and_then(|r| r.stdin.take()) {
+                    use std::io::Write;
+                    // Dropping stdin afterwards also ends the child's wait.
+                    let _ = stdin.write_all(b"go\n");
+                }
+            }
             scheduler.running.get_mut(&run_id).map(|running| {
                 running.child.try_wait().ok().flatten().map(|status| {
                     let exit_code = status.code();
@@ -1225,8 +1324,7 @@ async fn run_host(
         if let Some((exit_code, log_path)) = exit {
             if let Ok(mut scheduler) = state.0.lock() {
                 scheduler.running.remove(&run_id);
-                scheduler.host_ids.remove(&run_id);
-                scheduler.case_ids.remove(&run_id);
+                release_run(&mut scheduler, &run_id);
             }
             record_child_exit(&log_path, exit_code);
             join_output_pumps(pumps).await;
@@ -1336,6 +1434,7 @@ fn cancel_pipeline(
             record_forced_gui_cancel(&running.log_path, killed);
             let host_id = scheduler.host_ids.remove(&id).unwrap_or_default();
             let case_id = scheduler.case_ids.remove(&id).unwrap_or_default();
+            release_run(&mut scheduler, &id);
             // run_host emits the terminal event after draining output pumps.
             if !case_id.is_empty() && !host_id.is_empty() {
                 cancelled_contexts.push((id.clone(), case_id, host_id, true));
@@ -7817,6 +7916,67 @@ mod pipeline_log_supervision_tests {
         assert_eq!(scheduler.reserving.len(), MAX_HOST_PIPELINES);
     }
 
+    fn queue(scheduler: &mut PipelineScheduler, runs: &[(&str, &str)]) {
+        for (run_id, host_id) in runs {
+            scheduler.queued.insert(run_id.to_string());
+            scheduler.host_ids.insert(run_id.to_string(), host_id.to_string());
+        }
+    }
+
+    #[test]
+    fn overview_stage_frees_the_parse_slot_for_the_next_host() {
+        let mut scheduler = PipelineScheduler::default();
+        queue(&mut scheduler, &[("run-a", "host-a"), ("run-b", "host-b"), ("run-c", "host-c")]);
+        assert!(reserve_pipeline_slot(&mut scheduler, "run-a", "host-a"));
+        assert!(reserve_pipeline_slot(&mut scheduler, "run-b", "host-b"));
+        assert!(!reserve_pipeline_slot(&mut scheduler, "run-c", "host-c"));
+        enter_overview_queue(&mut scheduler, "run-a");
+        assert!(reserve_pipeline_slot(&mut scheduler, "run-c", "host-c"));
+        // A host in its overview stage still blocks a second run of itself.
+        queue(&mut scheduler, &[("run-a2", "host-a")]);
+        release_run(&mut scheduler, "run-b");
+        scheduler.reserving.remove("run-b");
+        assert!(!reserve_pipeline_slot(&mut scheduler, "run-a2", "host-a"));
+    }
+
+    #[test]
+    fn overview_builds_are_bounded_and_granted_in_arrival_order() {
+        let mut scheduler = PipelineScheduler::default();
+        let runs = [("run-a", "host-a"), ("run-b", "host-b"), ("run-c", "host-c"), ("run-d", "host-d")];
+        queue(&mut scheduler, &runs);
+        // Two parse slots: entering the overview queue frees one for the next host.
+        assert!(reserve_pipeline_slot(&mut scheduler, "run-a", "host-a"));
+        assert!(reserve_pipeline_slot(&mut scheduler, "run-b", "host-b"));
+        enter_overview_queue(&mut scheduler, "run-a");
+        assert!(reserve_pipeline_slot(&mut scheduler, "run-c", "host-c"));
+        enter_overview_queue(&mut scheduler, "run-c");
+        assert!(reserve_pipeline_slot(&mut scheduler, "run-d", "host-d"));
+        enter_overview_queue(&mut scheduler, "run-b");
+        enter_overview_queue(&mut scheduler, "run-d");
+        // run-c arrived before run-b: run-b may not jump ahead.
+        assert!(!grant_overview(&mut scheduler, "run-b"));
+        assert!(grant_overview(&mut scheduler, "run-a"));
+        assert!(grant_overview(&mut scheduler, "run-c"));
+        assert!(grant_overview(&mut scheduler, "run-b"));
+        assert_eq!(MAX_OVERVIEW_BUILDS, 3);
+        assert!(!grant_overview(&mut scheduler, "run-d"), "all overview slots busy");
+        release_run(&mut scheduler, "run-a");
+        assert!(grant_overview(&mut scheduler, "run-d"));
+        assert!(scheduler.overview_waiting.is_empty());
+    }
+
+    #[test]
+    fn a_run_that_ends_while_waiting_leaves_the_overview_queue() {
+        let mut scheduler = PipelineScheduler::default();
+        queue(&mut scheduler, &[("run-a", "host-a"), ("run-b", "host-b")]);
+        assert!(reserve_pipeline_slot(&mut scheduler, "run-a", "host-a"));
+        assert!(reserve_pipeline_slot(&mut scheduler, "run-b", "host-b"));
+        enter_overview_queue(&mut scheduler, "run-a");
+        enter_overview_queue(&mut scheduler, "run-b");
+        release_run(&mut scheduler, "run-a");
+        assert!(grant_overview(&mut scheduler, "run-b"), "a gone run never blocks the queue head");
+    }
+
     #[test]
     fn internal_pipeline_directories_are_never_exposed_as_categories() {
         assert!(is_internal_pipeline_directory(".parse-staging"));
@@ -9107,6 +9267,7 @@ fn main() {
             create_host,
             rename_host,
             delete_host,
+            reset_hosts,
             list_artifacts,
             run_host,
             cancel_pipeline,

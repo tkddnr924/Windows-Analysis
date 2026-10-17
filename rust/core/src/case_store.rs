@@ -644,6 +644,32 @@ pub fn update_host_status(
     write_host(&host, cases_dir, ROOT_COLLECTION_ID)
 }
 
+/// Back to the just-registered state: every parsed output, log and staging
+/// folder under the host directory is removed; `host.json` keeps the name,
+/// evidence path and creation time, and the run fields are cleared.
+pub fn reset_host(host_id: &str, cases_dir: &Path) -> Result<Host> {
+    let mut host = load_host(ROOT_COLLECTION_ID, host_id, cases_dir)?;
+    let dir = host_dir(cases_dir, ROOT_COLLECTION_ID, host_id);
+    for entry in std::fs::read_dir(&dir)? {
+        let path = entry?.path();
+        if path.file_name().is_some_and(|name| name == "host.json") {
+            continue;
+        }
+        if path.is_dir() && !path.is_symlink() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        }
+        .with_context(|| format!("remove {}", path.display()))?;
+    }
+    host.last_run_at = None;
+    host.last_run_status = None;
+    host.artifacts_run = vec![];
+    host.last_run_duration_secs = None;
+    write_host(&host, cases_dir, ROOT_COLLECTION_ID)?;
+    Ok(host)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -677,6 +703,29 @@ mod tests {
         assert_eq!(cases.len(), 1);
         assert_eq!(cases[0].id, ROOT_COLLECTION_ID);
         assert_eq!(cases[0].hosts.len(), 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reset_host_removes_outputs_and_run_state_but_keeps_registration() {
+        let root = temporary_directory("reset");
+        let host = create_host("ignored", "FIRST", "/evidence/first", "2026-08-23 12:00:01", &root).unwrap();
+        update_host_status("ignored", &host.id, &root, "2026-08-23 13:00:00", "ok", vec!["EventLog".into()], Some(12.5)).unwrap();
+        let dir = root.join(&host.id);
+        std::fs::create_dir_all(dir.join("_OVERVIEW")).unwrap();
+        std::fs::write(dir.join("_OVERVIEW/Defender.sqlite"), b"x").unwrap();
+        std::fs::create_dir_all(dir.join(".parse-staging/run")).unwrap();
+        std::fs::write(dir.join("run_report.json"), b"{}").unwrap();
+
+        let reset = reset_host(&host.id, &root).unwrap();
+
+        let entries: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("host.json")]);
+        let stored = load_host("ignored", &host.id, &root).unwrap();
+        for loaded in [&reset, &stored] {
+            assert_eq!((loaded.name.as_str(), loaded.target_dir.as_str(), loaded.created_at.as_str()), ("FIRST", "/evidence/first", "2026-08-23 12:00:01"));
+            assert_eq!((loaded.last_run_at.clone(), loaded.last_run_status.clone(), loaded.artifacts_run.len(), loaded.last_run_duration_secs), (None, None, 0, None));
+        }
         let _ = std::fs::remove_dir_all(root);
     }
 

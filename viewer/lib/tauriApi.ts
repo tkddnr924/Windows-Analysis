@@ -42,6 +42,7 @@ function makeApi(): ElectronApi {
     createHost: (caseId, name, targetDir) => invoke<Host>("create_host", { caseId, name, targetDir }),
     renameHost: (caseId, hostId, name) => invoke<Host>("rename_host", { caseId, hostId, name }),
     deleteHost: (caseId, hostId) => invoke<boolean>("delete_host", { caseId, hostId }),
+    resetHosts: (caseId) => invoke<void>("reset_hosts", { caseId }),
     listArtifacts: () => invoke<string[]>("list_artifacts"),
     runHost: (options: RunHostOptions) => invoke<PipelineResult>("run_host", { options }),
     cancelPipeline: (runId, cancelAll) => invoke<boolean>("cancel_pipeline", { runId: runId ?? null, cancelAll: cancelAll ?? false }),

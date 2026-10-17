@@ -47,7 +47,17 @@ struct State<'s> {
 /// Runs each task once its `after` tasks succeeded, on up to `workers`
 /// threads. Results keep task order; the first failure (in task order) is
 /// returned and no further tasks start after a failure.
+#[cfg(test)]
 pub(super) fn run_graph(tasks: Vec<Task<'_>>, workers: usize) -> Result<Vec<(String, usize)>> {
+    run_graph_reporting(tasks, workers, &|| {})
+}
+
+/// `run_graph` that calls `on_done` after every successful task.
+pub(super) fn run_graph_reporting(
+    tasks: Vec<Task<'_>>,
+    workers: usize,
+    on_done: &(dyn Fn() + Sync),
+) -> Result<Vec<(String, usize)>> {
     let names: Vec<&'static str> = tasks.iter().map(|task| task.name).collect();
     let known: HashSet<&'static str> = names.iter().copied().collect();
     for task in &tasks {
@@ -68,7 +78,7 @@ pub(super) fn run_graph(tasks: Vec<Task<'_>>, workers: usize) -> Result<Vec<(Str
     let wake = Condvar::new();
     std::thread::scope(|scope| {
         for _ in 0..workers.clamp(1, count.max(1)) {
-            scope.spawn(|| worker(&state, &wake));
+            scope.spawn(|| worker(&state, &wake, on_done));
         }
     });
     let mut state = state.into_inner();
@@ -85,7 +95,7 @@ pub(super) fn run_graph(tasks: Vec<Task<'_>>, workers: usize) -> Result<Vec<(Str
     Ok(out)
 }
 
-fn worker(state: &Mutex<State<'_>>, wake: &Condvar) {
+fn worker(state: &Mutex<State<'_>>, wake: &Condvar, on_done: &(dyn Fn() + Sync)) {
     let mut guard = state.lock();
     loop {
         if guard.failed {
@@ -120,6 +130,7 @@ fn worker(state: &Mutex<State<'_>>, wake: &Condvar) {
                     match &result {
                         Ok(_) => {
                             guard.done.insert(name);
+                            on_done();
                         }
                         Err(_) => guard.failed = true,
                     }

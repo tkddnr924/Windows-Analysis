@@ -25,8 +25,6 @@
   --text-faint: #8fa0b6;
   /* Timestamps must stay readable — brighter than the faint/dim greys. */
   --text-time: #c8d2dc;
-  /* A registered analysis host is an identity, not an evidence severity. */
-  --host-registered-text: #d8e3ef;
 
   --accent: #8ab4f8;
   --accent-emphasis: #6d9eeb;
@@ -721,6 +719,16 @@ input:focus, select:focus {
 ::-webkit-scrollbar-thumb:hover {
   background: #484f58;
   background-clip: padding-box;
+}
+
+/* Vertical scroll containers keep their scrollbar lane even before content
+   overflows, so content never shifts sideways when a scrollbar appears.
+   WKWebView ignores scrollbar-gutter with custom ::-webkit-scrollbar styles,
+   so the lane is reserved with overflow-y: scroll (empty track is
+   transparent). Inline styles serialize with or without the space. */
+[style*="overflow: auto"], [style*="overflow:auto"],
+[style*="overflow-y: auto"], [style*="overflow-y:auto"] {
+  overflow-y: scroll !important;
 }
 
 /* Small inline loading spinner (used by pinned nav rows while a background

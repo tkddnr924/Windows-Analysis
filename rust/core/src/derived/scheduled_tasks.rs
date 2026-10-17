@@ -1310,7 +1310,11 @@ fn write_operational_events(
 ) -> Result<usize> {
     let mut written = 0usize;
     for row in events.rows() {
-        if g(row, "Provider") != TASK_PROVIDER {
+        // Maintenance channel (automatic maintenance state, e.g. 800) names no
+        // task run; excluded by user decision 2026-10-14.
+        if g(row, "Provider") != TASK_PROVIDER
+            || g(row, "Channel").to_ascii_lowercase().contains("maintenance")
+        {
             continue;
         }
         let event_id = g(row, "EventID");
@@ -1333,7 +1337,6 @@ fn write_operational_events(
                 }
             }
         };
-        let maintenance = g(row, "Channel").to_ascii_lowercase().contains("maintenance");
         let mut rec = ctx.record(&SPEC);
         let meaning = operational_meaning(event_id);
         let (event_type, category, launch_reason, result, result_basis) = match &meaning {
@@ -1345,7 +1348,6 @@ fn write_operational_events(
                 meaning.result_basis,
             ),
             // Undocumented IDs keep the payload and say nothing about success.
-            None if maintenance => ("작업 유지 관리 이벤트", "maintenance", "", "", ""),
             None => ("작업 스케줄러 이벤트", "other", "", "", ""),
         };
         rec.timestamp(g(row, "timestamp"), "작업 이벤트 기록 시각");
@@ -2900,8 +2902,7 @@ mod tests {
                 row.remove("EventData");
                 row
             },
-            // Maintenance channel: the task is recorded in `Task` as an
-            // `NT TASK\…` name that must not be rewritten or merged.
+            // Maintenance channel (automatic maintenance state) is not stored.
             {
                 let mut row = event(
                     "808",
@@ -2922,7 +2923,7 @@ mod tests {
             },
         ]);
         let ctx = ctx_of(&case);
-        assert_eq!(build(&ctx, &events).unwrap(), 9);
+        assert_eq!(build(&ctx, &events).unwrap(), 8);
         let db = open(&case);
 
         // R10: scheduler completion and action completion are different facts.
@@ -3020,41 +3021,15 @@ mod tests {
             .unwrap(),
             1
         );
-        // Maintenance events keep their recorded name and claim no result.
-        let maintenance: (String, String, Option<String>, String, String) = db
-            .query_row(
-                "SELECT event_type,event_category,result,task_path,task_name_basis
-                 FROM ScheduledTasks WHERE event_id=808",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
-            )
-            .unwrap();
-        assert_eq!(maintenance.0, "작업 유지 관리 이벤트");
-        assert_eq!(maintenance.1, "maintenance");
-        assert_eq!(maintenance.2, None);
-        assert_eq!(maintenance.3, "NT TASK\\Custom\\Updater");
-        assert_eq!(maintenance.4, "Task");
-        // The recorded NT TASK name never collapses into the definition path.
+        // Maintenance channel records are excluded.
         assert_eq!(
             db.query_row(
-                "SELECT COUNT(*) FROM ScheduledTasks a JOIN ScheduledTasks b
-                 ON a.task_path_normalized=b.task_path_normalized
-                 WHERE a.event_id=808 AND b.evidence_kind='task_definition'",
+                "SELECT COUNT(*) FROM ScheduledTasks WHERE event_id=808",
                 [],
                 |row| row.get::<_, i64>(0)
             )
             .unwrap(),
             0
-        );
-        assert_eq!(
-            db.query_row(
-                "SELECT field_value FROM TaskEventFields f JOIN ScheduledTasks t USING(record_id)
-                 WHERE t.event_id=808 AND f.field_name LIKE '%Task'",
-                [],
-                |row| row.get::<_, String>(0)
-            )
-            .unwrap(),
-            "NT TASK\\Custom\\Updater"
         );
         // A present-but-empty payload stays TEXT '', a missing one stays NULL.
         let states: Vec<(String, Option<String>)> = db

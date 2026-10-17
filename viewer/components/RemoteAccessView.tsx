@@ -122,7 +122,7 @@ export default function RemoteAccessView({ fileName, dbPath, data, hostDir, ipHo
                   {address
                     ? <span style={{ fontFamily: "var(--mono)", fontSize: 13.5, fontWeight: 700 }}>{address}</span>
                     : accountText && <span style={{ fontSize: 13.5, fontWeight: 700 }}>{accountText}</span>}
-                  {candidates.map((host) => <span key={host.id} title="등록 호스트 후보" style={{ fontSize: 12, fontWeight: 700, color: "var(--host-registered-text)" }}>{host.name}</span>)}
+                  {candidates.map((host) => <Pill key={host.id} color="var(--accent)" title="등록 호스트">{host.name}</Pill>)}
                 </>}
                 sub={<>
                   {address && accountText && <>

@@ -1247,6 +1247,32 @@ pub(super) fn build(ctx: &Ctx, events: &EventLogOverviewCache) -> Result<usize> 
         };
         let event_id = g(row, "EventID").to_string();
         let time = g(row, "timestamp");
+
+        // Input accounting covers every BITS row, stored or not.
+        let stats = logs.entry(log.clone()).or_default();
+        stats.rows += 1;
+        if g(row, "_status") == "corrupted_chunk" {
+            stats.corrupted += 1;
+        }
+        if time.trim().is_empty() {
+            stats.untimed += 1;
+        }
+        observe(&mut stats.first, &mut stats.last, time);
+        if stats.source_file.is_none() {
+            let file = g(row, "_source_file");
+            if !file.is_empty() {
+                stats.source_file = Some(file.to_string());
+            }
+        }
+        let seen = coverage.entry((log.clone(), event_id.clone())).or_default();
+        seen.count += 1;
+        observe(&mut seen.first, &mut seen.last, time);
+
+        // 306 (no payload), 310 (warning without job id) and unclassified
+        // events are counted only (user decision 2026-10-15).
+        if matches!(kind_of(&event_id).status, "detail_unrecorded" | "channel_warning" | "unclassified") {
+            continue;
+        }
         // A ProcessingErrorData payload is the event decoder's failure, not
         // job data: its values are never read as BITS fields and its error
         // code is never a transfer result. The raw wrapper stays recorded.
@@ -1609,25 +1635,6 @@ pub(super) fn build(ctx: &Ctx, events: &EventLogOverviewCache) -> Result<usize> 
             job.processes.insert(value);
         }
 
-        let stats = logs.entry(log.clone()).or_default();
-        stats.rows += 1;
-        if g(row, "_status") == "corrupted_chunk" {
-            stats.corrupted += 1;
-        }
-        if time.trim().is_empty() {
-            stats.untimed += 1;
-        }
-        observe(&mut stats.first, &mut stats.last, time);
-        if stats.source_file.is_none() {
-            let file = g(row, "_source_file");
-            if !file.is_empty() {
-                stats.source_file = Some(file.to_string());
-            }
-        }
-
-        let seen = coverage.entry((log, event_id)).or_default();
-        seen.count += 1;
-        observe(&mut seen.first, &mut seen.last, time);
     }
 
     write_jobs(ctx, &mut db, jobs)?;
@@ -2051,7 +2058,8 @@ mod tests {
             event(9, "306", "2026-09-20 06:55:29.828", Some("")),
         ];
         let (written, db) = fx.run(rows);
-        assert_eq!(written, 9, "every Bits-Client record is incorporated");
+        // 306 and 310 are counted in coverage but not stored.
+        assert_eq!(written, 7, "every Bits-Client record except 306/310 is incorporated");
 
         // 16403: own event, verbatim local path, literal paths resolve to NULL.
         let file: (String, String, String, Option<String>, String, String, String) = db
@@ -2123,31 +2131,7 @@ mod tests {
         assert_eq!(command.1, "C:\\WINDOWS\\system32\\directxdatabaseupdater.exe");
         assert_eq!(command.2, "정보");
 
-        // 310 has no job attribution; 306 has no payload at all.
-        let warn: (Option<String>, String, String, i64, String) = db
-            .query_row(
-                "SELECT job_id,job_id_state,job_group_key,error_code_value,result FROM BitsHistory WHERE event_id=310",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-            )
-            .unwrap();
-        assert_eq!(warn.0, None);
-        assert_eq!(warn.1, "unrecorded");
-        assert!(warn.2.starts_with("record:"));
-        assert_eq!(warn.3, 2_147_942_450);
-        assert_eq!(warn.4, "미확인");
-        let verbose: (String, Option<String>, String) = db
-            .query_row(
-                "SELECT payload_state,event_data_raw,result_state FROM BitsHistory WHERE event_id=306",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .unwrap();
-        assert_eq!(
-            verbose,
-            ("unrecorded".into(), Some(String::new()), "unrecorded".into()),
-            "an empty payload string is stored verbatim, not as NULL"
-        );
+        assert_eq!(one::<i64>(&db, "SELECT COUNT(*) FROM BitsHistory WHERE event_id IN (306,310)"), 0);
 
         // Children exist only for evidenced file/transfer rows.
         assert_eq!(one::<i64>(&db, "SELECT COUNT(*) FROM BitsFiles"), 3);
@@ -2184,7 +2168,7 @@ mod tests {
         assert_eq!(grouped.4, "creation_and_termination_observed");
         assert_eq!(
             one::<i64>(&db, "SELECT COUNT(*) FROM BitsJobs WHERE job_id_state='unrecorded'"),
-            2
+            0
         );
         // The cancelled job has no creation event in this window.
         assert_eq!(
@@ -2196,18 +2180,18 @@ mod tests {
         );
 
         // Provenance: one real facts row per event, original file carried through.
-        assert_eq!(one::<i64>(&db, "SELECT COUNT(*) FROM source_records"), 9);
+        assert_eq!(one::<i64>(&db, "SELECT COUNT(*) FROM source_records"), 7);
         assert_eq!(
             one::<i64>(&db, "SELECT COUNT(*) FROM source_records WHERE source_dataset_id<>'facts-old'"),
             0
         );
         assert_eq!(
             one::<i64>(&db, &format!("SELECT COUNT(*) FROM BitsHistory WHERE source_file='{EVTX}'")),
-            9
+            7
         );
         assert_eq!(
             one::<i64>(&db, "SELECT COUNT(*) FROM source_records WHERE source_field='EventData'"),
-            8
+            7
         );
         assert_eq!(one::<i64>(&db, "SELECT COUNT(*) FROM pragma_foreign_key_check"), 0);
     }
@@ -2218,8 +2202,8 @@ mod tests {
     fn present_empty_and_absent_payload_stay_distinct() {
         let fx = Fixture::new(2);
         let (written, db) = fx.run(vec![
-            event(1, "306", "2026-01-01 00:00:00.000", Some("")),
-            event(2, "306", "2026-01-01 00:01:00.000", None),
+            event(1, "3", "2026-01-01 00:00:00.000", Some("")),
+            event(2, "3", "2026-01-01 00:01:00.000", None),
         ]);
         assert_eq!(written, 2);
         let empty: (Option<String>, String) = db
@@ -2467,6 +2451,33 @@ mod tests {
         assert_eq!(
             one::<i64>(&db, "SELECT COUNT(*) FROM BitsEventCoverage WHERE observation_state='observed'"),
             2
+        );
+    }
+
+    /// 306/310/unclassified rows are not stored but stay in the input counts
+    /// (user decision 2026-10-15).
+    #[test]
+    fn counted_only_events_keep_truthful_observations() {
+        let fx = Fixture::new(3);
+        fx.inputs(3);
+        let (written, db) = fx.run(vec![
+            event(1, "306", "2026-01-01 00:00:00.000", Some("")),
+            event(2, "310", "", Some(r#"{"ErrorCode":2147942450}"#)),
+            event(3, "9999", "2026-01-01 00:02:00.000", Some("{}")),
+        ]);
+        assert_eq!(written, 0);
+        assert_eq!(one::<i64>(&db, "SELECT COUNT(*) FROM BitsJobs"), 0);
+        let observation: (String, i64, i64) = db
+            .query_row(
+                "SELECT collection_state,event_count,untimed_count FROM BitsObservations",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(observation, ("collected".into(), 3, 1));
+        assert_eq!(
+            one::<i64>(&db, "SELECT COUNT(*) FROM BitsEventCoverage WHERE observation_state='observed'"),
+            3
         );
     }
 

@@ -4,7 +4,7 @@
 //! write_table. Overview builders are a separate (later) stage.
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -844,6 +844,29 @@ fn emit(msg: &str) {
     append_current_log_output(msg);
 }
 
+/// GUI progress protocol for the overview phase ("[종합 분석 진행] done/total").
+pub(crate) fn overview_progress(done: usize, total: usize) {
+    emit(&format!("[종합 분석 진행] {done}/{total}"));
+}
+
+/// Set by the GUI supervisor: before _OVERVIEW the child announces
+/// `OVERVIEW_READY_LINE` (freeing its parse slot) and waits for one stdin line
+/// granting an overview slot. Without it (CLI) the build starts directly.
+pub const OVERVIEW_GATE_ENV: &str = "WINA_OVERVIEW_GATE";
+pub const OVERVIEW_READY_LINE: &str = "[GATE] overview_ready";
+
+fn wait_for_overview_turn() {
+    if std::env::var_os(OVERVIEW_GATE_ENV).is_none() {
+        return;
+    }
+    emit("=== _OVERVIEW 대기 ===");
+    append_current_log_lifecycle("overview_gate_waiting");
+    println!("{OVERVIEW_READY_LINE}");
+    // A closed pipe (supervisor gone) also ends the wait.
+    let _ = std::io::stdin().read_line(&mut String::new());
+    append_current_log_lifecycle("overview_gate_granted");
+}
+
 /// Cooperative cancel flag: `run_host` clears it at start and checks it before
 /// each artifact; `cancel` (from the GUI) sets it to stop the remaining work.
 /// Parsers poll `cancelled()` inside their row loops so a long single artifact
@@ -1105,39 +1128,32 @@ pub fn discover_host_inputs(target: &Path) -> finder::Found {
     found
 }
 
+/// Only SYSTEM, SOFTWARE, SAM, SECURITY, Amcache.hve and user
+/// NTUSER.DAT/UsrClass.dat are parsed; RegBack copies and every other hive are
+/// skipped (user decision 2026-10-15).
 fn discover_registry_hives(target: &Path) -> finder::Found {
     let (files, errors) = finder::walk_files(target);
     let mut found = finder::Found { paths: Vec::new(), errors };
     for path in files {
         let name = path.file_name().unwrap_or_default().to_string_lossy();
-        let known = registry::REG_FILENAMES.iter().any(|n| name.eq_ignore_ascii_case(n))
+        let regback = path.strip_prefix(target).unwrap_or(&path).components().any(|part| {
+            part.as_os_str().to_string_lossy().eq_ignore_ascii_case("RegBack")
+        });
+        let known = registry::REG_FILENAMES.iter().chain(&["Amcache.hve"]).any(|n| name.eq_ignore_ascii_case(n))
             || registry::REG_SUFFIXES.iter().any(|suffix| {
                 name.get(name.len().saturating_sub(suffix.len())..)
                     .is_some_and(|end| end.eq_ignore_ascii_case(suffix))
             });
-        if known {
+        if known && !regback {
             found.paths.push(path);
-            continue;
-        }
-        // REGF file_type at offset 28: primary=0; transaction logs=1/6.
-        let mut header = [0u8; 32];
-        match File::open(&path).and_then(|mut file| file.read_exact(&mut header)) {
-            Ok(()) if &header[..4] == b"regf" && header[28..32] == [0; 4] => {
-                found.paths.push(path);
-            }
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {}
-            Err(error) => found.errors.push(format!("{}: {}", path.display(), error)),
         }
     }
     found
 }
 
-/// Locate one artifact's evidence files under the target. Registry includes
-/// primary REGF headers regardless of name. 탐색 중 만난 접근·순회 실패도
+/// Locate one artifact's evidence files under the target. 탐색 중 만난 접근·순회 실패도
 /// 함께 반환된다 — 파이프라인이 아티팩트 보고서에 기록해 "발견 0건"과
-/// 구분한다. RegBack 하이브도 별도 증거로 계획에 포함한다(출력명·파생 입력
-/// 구분은 파싱/파생 단계 몫 — 2026-08-31 사용자 확정).
+/// 구분한다.
 fn discover_artifact_files(name: &str, target: &Path) -> finder::Found {
     match name {
         "Amcache" => finder::by_name(target, &["Amcache.hve"]),
@@ -1530,7 +1546,7 @@ fn parse_registry_artifact(
     // Every worker writes its own SQLite output, so normal allocated-record
     // parsing remains isolated in live-only mode.
     //
-    // RegBack remains separate. Findings exclude it; full exploration keeps it.
+    // RegBack and COMPONENTS are never discovered (2026-10-15).
     //
     // 하이브별 트랜잭션 로그 목록은 여기서 한 번만 확정한다(파싱 계획 고정) —
     // 입력 기록·logsDiscovered·실제 파서 입력이 같은 스냅샷을 쓴다 (Amcache와
@@ -1541,15 +1557,7 @@ fn parse_registry_artifact(
         // 사용자 하이브는 `<계정>_NTUSER.DAT` 꼴로 발행한다 — 계정마다 같은
         // 파일명이 오므로, 접두가 없으면 하이브끼리 이름이 겹치고 파생 계층도
         // 어느 계정의 값인지 복원하지 못한다.
-        let mut base = registry::output_base_name(p);
-        let is_regback = p.components().any(|c| {
-            c.as_os_str()
-                .to_string_lossy()
-                .eq_ignore_ascii_case("regback")
-        });
-        if is_regback {
-            base = format!("{base}_RegBack");
-        }
+        let base = registry::output_base_name(p);
         let name = uniq_name(&base, &mut taken);
         let relative = format!("REGISTRY/{}.sqlite", name);
         let logs = registry::sibling_logs(p);
@@ -2754,6 +2762,7 @@ pub fn run_host_with_log_id(
     // stopped mid-artifact and left the staging tree incomplete.
     let mut overview_reset_failed = false;
     if !cancelled() {
+        wait_for_overview_turn();
         emit("=== _OVERVIEW ===");
         append_current_log_lifecycle("overview_started");
         let ov = out_dir.join("_OVERVIEW");
@@ -2786,10 +2795,11 @@ pub fn run_host_with_log_id(
             }
             Err(error) => {
                 had_error = true;
-                report.errors.push(format!("_OVERVIEW: {error}"));
-                emit(&format!("[!] _OVERVIEW failed: {error}"));
+                // `{:#}` keeps the cause chain; the outer context alone names only the task.
+                report.errors.push(format!("_OVERVIEW: {error:#}"));
+                emit(&format!("[!] _OVERVIEW failed: {error:#}"));
                 append_current_log_lifecycle(&format!(
-                    "overview_finished status=failed error={error}"
+                    "overview_finished status=failed error={error:#}"
                 ));
             }
         }
@@ -3179,22 +3189,23 @@ mod persistent_log_tests {
     }
 
     #[test]
-    fn registry_discovery_keeps_all_primary_hives_and_known_corrupt_inputs() {
+    fn registry_discovery_keeps_only_the_selected_hives() {
         let root = temporary_directory("registry-discovery");
         std::fs::create_dir_all(root.join("RegBack")).unwrap();
+        std::fs::create_dir_all(root.join("Users/admin")).unwrap();
         let mut header = [0u8; 32];
         header[..4].copy_from_slice(b"regf");
-        for name in ["COMPONENTS", "renamed-evidence.bin", "RegBack/SYSTEM"] {
+        // Only SYSTEM/SOFTWARE/SAM/SECURITY and user hives (user decision 2026-10-15).
+        for name in ["COMPONENTS", "DEFAULT", "DRIVERS", "BCD-Template", "ELAM", "BBI", "renamed-evidence.bin", "Amcache.hve",
+                     "RegBack/SYSTEM", "SAM", "SECURITY", "SYSTEM", "Users/admin/NTUSER.DAT", "Users/admin/UsrClass.dat"] {
             std::fs::write(root.join(name), header).unwrap();
         }
-        header[28..32].copy_from_slice(&1u32.to_le_bytes());
-        std::fs::write(root.join("other.LOG1"), header).unwrap();
         std::fs::write(root.join("SOFTWARE"), b"corrupt").unwrap();
         std::fs::write(root.join("unrelated.txt"), b"not a hive").unwrap();
         let found = discover_artifact_files("Registry", &root);
         let mut relative: Vec<_> = found.paths.iter().map(|p| p.strip_prefix(&root).unwrap().to_path_buf()).collect();
         relative.sort();
-        let mut expected: Vec<_> = ["COMPONENTS", "renamed-evidence.bin", "RegBack/SYSTEM", "SOFTWARE"]
+        let mut expected: Vec<_> = ["Amcache.hve", "SAM", "SECURITY", "SOFTWARE", "SYSTEM", "Users/admin/NTUSER.DAT", "Users/admin/UsrClass.dat"]
             .iter().map(PathBuf::from).collect();
         expected.sort();
         assert_eq!(relative, expected);
@@ -4142,9 +4153,6 @@ mod persistent_log_tests {
         std::fs::write(target_dir.join("SOFTWARE"), b"not a registry hive").unwrap();
         std::fs::write(target_dir.join("SRUDB.dat"), b"not an ESE database").unwrap();
         std::fs::write(target_dir.join("Amcache.hve"), b"not an amcache hive").unwrap();
-        let mut reserved_name = [0u8; 32];
-        reserved_name[..4].copy_from_slice(b"regf");
-        std::fs::write(target_dir.join("RegistryInputs"), reserved_name).unwrap();
         let case = case_store::create_case("case", "2026-08-23 01:02:03", &cases_dir).unwrap();
         let host = case_store::create_host(
             &case.id,
@@ -4228,17 +4236,13 @@ mod persistent_log_tests {
         assert_eq!(failed_hive.1, "skipped_corrupted");
         assert_eq!(failed_hive.2, "0");
         assert!(!failed_hive.3.is_empty(), "Unreadable input must retain its error");
-        let reserved_facts: String = inputs.query_row(
-            "SELECT facts_db FROM RegistryInputs WHERE hive_name='RegistryInputs'",
-            [], |row| row.get(0),
-        ).unwrap();
-        assert_eq!(reserved_facts, "REGISTRY/RegistryInputs_2.sqlite");
         drop(inputs);
         let explorer = rusqlite::Connection::open(host_dir.join("_OVERVIEW/RegistryExplorer.sqlite")).unwrap();
         let inventory: (i64, i64) = explorer.query_row(
             "SELECT COUNT(*),SUM(key_count) FROM RegistryHives", [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         ).unwrap();
+        // SOFTWARE and Amcache.hve are both registry inputs, each unreadable.
         assert_eq!(inventory, (2, 0));
         drop(explorer);
         // 손상 Amcache 건너뜀도 경로·오류와 함께 영구 보고서에 남아야

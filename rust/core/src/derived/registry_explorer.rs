@@ -89,11 +89,14 @@ struct HiveRef {
 
 pub(super) fn build(ctx: &Ctx) -> Result<usize> {
     let inputs = collect_inputs(ctx.out_dir)?;
-    let mut db = DerivedDb::create(&ctx.overview_dir(), DB_NAME)?;
+    // Entries resolve links in memory, so secondary indexes wait until every
+    // hive is written; quick targets below are the first reader.
+    let mut db = DerivedDb::create_bulk(&ctx.overview_dir(), DB_NAME)?;
     let mut hives: Vec<HiveRef> = Vec::with_capacity(inputs.len());
     for input in &inputs {
         hives.push(write_hive(ctx, &mut db, input)?);
     }
+    db.build_deferred_indexes()?;
     write_quick_targets(ctx, &mut db, &hives)?;
     db.finish()
 }
@@ -322,7 +325,6 @@ fn write_hive(ctx: &Ctx, db: &mut DerivedDb, input: &HiveInput) -> Result<HiveRe
         }
     }
 
-    let generation = opened.as_ref().map(|(_, generation)| generation.clone());
     let output_name = input
         .facts_db
         .as_deref()
@@ -333,6 +335,7 @@ fn write_hive(ctx: &Ctx, db: &mut DerivedDb, input: &HiveInput) -> Result<HiveRe
             path.split(['\\', '/'])
                 .any(|part| part.eq_ignore_ascii_case("RegBack"))
         });
+    let generation = opened.as_ref().map(|(_, generation)| generation.clone());
     db.insert_child(
         REGISTRY_HIVES_TABLE,
         &[
@@ -362,8 +365,11 @@ fn write_hive(ctx: &Ctx, db: &mut DerivedDb, input: &HiveInput) -> Result<HiveRe
 
     if let Some((conn, generation)) = opened {
         let relative = input.facts_db.clone().unwrap_or_default();
-        write_entries(ctx, db, input, &relative, &generation, &conn)?;
-        resolve_links(db, &input.hive_id)?;
+        let counts = write_entries(ctx, db, input, &relative, &generation, &conn)?;
+        db.conn().execute(
+            "UPDATE RegistryHives SET key_count = ?2, value_count = ?3, root_count = ?4 WHERE hive_id = ?1",
+            rusqlite::params![input.hive_id, counts.keys, counts.values, counts.roots],
+        )?;
     }
 
     Ok(HiveRef {
@@ -374,6 +380,85 @@ fn write_hive(ctx: &Ctx, db: &mut DerivedDb, input: &HiveInput) -> Result<HiveRe
     })
 }
 
+/// Per-hive totals stored on the RegistryHives row.
+struct HiveCounts {
+    keys: i64,
+    values: i64,
+    roots: i64,
+}
+
+/// Key identity inside one hive: offset when present, else the key path.
+/// Both passes walk rows in the same order, so `kp` numbering matches.
+#[derive(Default)]
+struct KeyIdentity {
+    seen_offsets: HashSet<String>,
+    path_keys: HashMap<String, String>,
+}
+
+impl KeyIdentity {
+    /// (record id, first time this key is seen).
+    fn resolve(&mut self, hive_id: &str, key_offset: &str, key_path: &str) -> (String, bool) {
+        if key_offset.is_empty() {
+            match self.path_keys.get(key_path) {
+                Some(found) => (found.clone(), false),
+                None => {
+                    let record_id = format!("{hive_id}:kp:{}", self.path_keys.len());
+                    self.path_keys.insert(key_path.to_string(), record_id.clone());
+                    (record_id, true)
+                }
+            }
+        } else {
+            let new_key = self.seen_offsets.insert(key_offset.to_string());
+            (format!("{hive_id}:k:{key_offset}"), new_key)
+        }
+    }
+}
+
+/// First pass: every key's parent link and stored child/value counts, so
+/// key rows are written complete instead of updated per hive afterwards.
+struct HiveLinks {
+    /// Keys whose parent offset names a key of this hive.
+    linked: HashSet<String>,
+    subkeys: HashMap<String, i64>,
+    values: HashMap<String, i64>,
+    offsets: HashSet<String>,
+}
+
+fn scan_links(hive_id: &str, conn: &Connection) -> Result<HiveLinks> {
+    let sql = format!(
+        "SELECT entry_kind, key_offset, parent_key_offset, key_path FROM {} ORDER BY rowid",
+        quote_ident(FACTS_TABLE)
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query([])?;
+    let mut identity = KeyIdentity::default();
+    let mut values: HashMap<String, i64> = HashMap::new();
+    let mut parents: Vec<(String, String)> = Vec::new();
+    while let Some(row) = rows.next()? {
+        let key_offset = text_at(row, 1)?;
+        let (key_record_id, new_key) = identity.resolve(hive_id, key_offset, text_at(row, 3)?);
+        if new_key {
+            let parent_offset = text_at(row, 2)?;
+            if !parent_offset.is_empty() {
+                parents.push((key_record_id.clone(), parent_offset.to_string()));
+            }
+        }
+        if text_at(row, 0)? == "value" {
+            *values.entry(key_record_id).or_default() += 1;
+        }
+    }
+    let offsets = identity.seen_offsets;
+    let mut linked = HashSet::new();
+    let mut subkeys: HashMap<String, i64> = HashMap::new();
+    for (record_id, parent_offset) in parents {
+        if offsets.contains(&parent_offset) {
+            *subkeys.entry(format!("{hive_id}:k:{parent_offset}")).or_default() += 1;
+            linked.insert(record_id);
+        }
+    }
+    Ok(HiveLinks { linked, subkeys, values, offsets })
+}
+
 fn write_entries(
     ctx: &Ctx,
     db: &mut DerivedDb,
@@ -381,9 +466,10 @@ fn write_entries(
     relative: &str,
     generation: &str,
     conn: &Connection,
-) -> Result<()> {
+) -> Result<HiveCounts> {
     let stem = stem_of_relative(relative);
     let hive_id = input.hive_id.as_str();
+    let links = scan_links(hive_id, conn)?;
     let width = db.spec().columns.len();
     let sql = format!(
         "SELECT rowid, entry_kind, key_offset, parent_key_offset, key_name, key_path, last_write, \
@@ -396,8 +482,11 @@ fn write_entries(
     let mut stmt = conn.prepare(&sql)?;
     let mut rows = stmt.query([])?;
     // Deduplicate within this hive only; missing offsets retain path identity.
-    let mut seen_offsets: HashSet<String> = HashSet::new();
-    let mut path_keys: HashMap<String, String> = HashMap::new();
+    let mut identity = KeyIdentity::default();
+    // A child stored before its parent row gets the link once the parent exists.
+    let mut written: HashSet<String> = HashSet::new();
+    let mut late_links: Vec<(String, String)> = Vec::new();
+    let mut counts = HiveCounts { keys: 0, values: 0, roots: 0 };
 
     while let Some(row) = rows.next()? {
         let rowid: i64 = row.get(C_ROWID)?;
@@ -411,41 +500,41 @@ fn write_entries(
             recovery
         };
 
-        let (key_record_id, new_key) = if key_offset.is_empty() {
-            match path_keys.get(key_path) {
-                Some(found) => (found.clone(), false),
-                None => {
-                    let record_id = format!("{hive_id}:kp:{}", path_keys.len());
-                    path_keys.insert(key_path.to_string(), record_id.clone());
-                    (record_id, true)
-                }
-            }
-        } else {
-            let record_id = format!("{hive_id}:k:{key_offset}");
-            let new_key = !seen_offsets.contains(key_offset);
-            if new_key {
-                seen_offsets.insert(key_offset.to_string());
-            }
-            (record_id, new_key)
-        };
+        let (key_record_id, new_key) = identity.resolve(hive_id, key_offset, key_path);
 
         if new_key {
             let parent_offset = text_at(row, C_PARENT_KEY_OFFSET)?;
             let depth = depth_of(key_path);
+            let parent_id = links
+                .linked
+                .contains(&key_record_id)
+                .then(|| format!("{hive_id}:k:{parent_offset}"));
+            debug_assert!(parent_id.is_none() || links.offsets.contains(parent_offset));
+            let parent_status = if parent_id.is_some() {
+                "linked"
+            } else if parent_offset.is_empty() && depth == 0 {
+                "root"
+            } else {
+                "unresolved"
+            };
+            counts.keys += 1;
+            counts.roots += i64::from(parent_status == "root");
             let mut values = vec![Cell::Null; width];
             values[0] = Cell::Text(key_record_id.clone());
             values[1] = Cell::Text(ctx.host_id.to_string());
             values[2] = Cell::Text(ctx.dataset_id.to_string());
             values[3] = Cell::Text(hive_id.to_string());
             values[4] = Cell::Text("key".to_string());
-            values[7] = Cell::Text(
-                if parent_offset.is_empty() && depth == 0 {
-                    "root"
+            values[7] = Cell::Text(parent_status.to_string());
+            if let Some(parent_id) = parent_id {
+                // Self-links are valid: the row satisfies its own reference.
+                if parent_id == key_record_id || written.contains(&parent_id) {
+                    values[6] = Cell::Text(parent_id);
                 } else {
-                    "unresolved"
+                    values[7] = Cell::Text("unresolved".to_string());
+                    late_links.push((key_record_id.clone(), parent_id));
                 }
-                .to_string(),
-            );
+            }
             values[8] = Cell::Text(key_offset.to_string());
             values[9] = opt_text(Some(parent_offset));
             values[10] = Cell::Text(text_at(row, C_KEY_NAME)?.to_string());
@@ -455,8 +544,8 @@ fn write_entries(
             values[14] = opt_text(Some(text_at(row, C_LAST_WRITE)?));
             values[15] = int_text(Some(text_at(row, C_KEY_SUBKEY_COUNT)?));
             values[16] = int_text(Some(text_at(row, C_KEY_VALUE_COUNT)?));
-            values[17] = Cell::Int(0);
-            values[18] = Cell::Int(0);
+            values[17] = Cell::Int(links.subkeys.get(&key_record_id).copied().unwrap_or(0));
+            values[18] = Cell::Int(links.values.get(&key_record_id).copied().unwrap_or(0));
             values[19] = Cell::Text(status_of(
                 text_at(row, C_KEY_READ_STATUS)?,
                 "ok",
@@ -472,12 +561,14 @@ fn write_entries(
                 &key_record_id,
                 &[source_ref(generation, relative, &stem, rowid, "key")],
             )?;
+            written.insert(key_record_id.clone());
         }
 
         if entry_kind != "value" {
             continue;
         }
         let record_id = format!("{hive_id}:v:{rowid}");
+        counts.values += 1;
         let name_raw = text_at(row, C_VALUE_NAME_RAW)?;
         let hex = text_at(row, C_VALUE_DATA_HEX)?;
         let decoded = decode_hex(hex);
@@ -523,7 +614,13 @@ fn write_entries(
             &[source_ref(generation, relative, &stem, rowid, "value")],
         )?;
     }
-    Ok(())
+    for (record_id, parent_id) in late_links {
+        db.conn().execute(
+            "UPDATE RegistryExplorer SET parent_record_id = ?2, parent_status = 'linked' WHERE record_id = ?1",
+            [record_id, parent_id],
+        )?;
+    }
+    Ok(counts)
 }
 
 // Per-hive path labels live in RegistryHives, not on every source reference.
@@ -539,47 +636,6 @@ fn source_ref(generation: &str, relative: &str, stem: &str, rowid: i64, field: &
         file: None,
         label: None,
     }
-}
-
-// Resolve only after all keys in this hive exist.
-fn resolve_links(db: &DerivedDb, hive_id: &str) -> Result<()> {
-    let conn = db.conn();
-    conn.execute(
-        "UPDATE RegistryExplorer SET parent_record_id = (
-             SELECT p.record_id FROM RegistryExplorer p
-             WHERE p.hive_id = RegistryExplorer.hive_id AND p.entry_kind = 'key'
-               AND p.key_offset = RegistryExplorer.parent_key_offset)
-         WHERE hive_id = ?1 AND entry_kind = 'key' AND parent_key_offset IS NOT NULL",
-        [hive_id],
-    )?;
-    conn.execute(
-        "UPDATE RegistryExplorer SET parent_status =
-             CASE WHEN parent_record_id IS NOT NULL THEN 'linked' ELSE 'unresolved' END
-         WHERE hive_id = ?1 AND entry_kind = 'key' AND parent_key_offset IS NOT NULL",
-        [hive_id],
-    )?;
-    conn.execute(
-        "UPDATE RegistryExplorer SET
-             stored_value_count = (SELECT COUNT(*) FROM RegistryExplorer v
-                                   WHERE v.key_record_id = RegistryExplorer.record_id AND v.entry_kind = 'value'),
-             stored_subkey_count = (SELECT COUNT(*) FROM RegistryExplorer c
-                                    WHERE c.parent_record_id = RegistryExplorer.record_id AND c.entry_kind = 'key')
-         WHERE hive_id = ?1 AND entry_kind = 'key'",
-        [hive_id],
-    )?;
-    conn.execute(
-        "UPDATE RegistryHives SET
-             key_count = (SELECT COUNT(*) FROM RegistryExplorer e
-                          WHERE e.hive_id = RegistryHives.hive_id AND e.entry_kind = 'key'),
-             value_count = (SELECT COUNT(*) FROM RegistryExplorer e
-                            WHERE e.hive_id = RegistryHives.hive_id AND e.entry_kind = 'value'),
-             root_count = (SELECT COUNT(*) FROM RegistryExplorer e
-                           WHERE e.hive_id = RegistryHives.hive_id AND e.entry_kind = 'key'
-                             AND e.parent_status = 'root')
-         WHERE hive_id = ?1",
-        [hive_id],
-    )?;
-    Ok(())
 }
 
 // Coordinates take precedence; path-only targets require a confirmed hive.
@@ -1556,6 +1612,60 @@ mod tests {
         ).unwrap();
         assert_eq!(status, "loaded");
         assert!(error.as_deref().is_some_and(|e| e.contains("_source_file")), "{error:?}");
+        drop(conn);
+        let _ = std::fs::remove_dir_all(out_dir.parent().unwrap());
+    }
+
+    // A child row stored before its parent row still links, and the parent
+    // counts it; the hive totals match the rows.
+    #[test]
+    fn child_before_parent_links_and_counts() {
+        let (out_dir, target) = fixture_dirs("forward-parent");
+        let root = key("4096", "", "", "\\ROOT");
+        let child = key("8192", "4096", "Child", "\\ROOT\\Child");
+        let child_hex = hex_of("v");
+        let rows = vec![
+            value(&child, "9001", "V", "V", "1", "REG_SZ", &child_hex, "v"),
+            root,
+        ];
+        fixture::write_hive(&out_dir, "SOFTWARE.sqlite", "C:\\config\\SOFTWARE", &rows);
+        crate::metadata::build_metadata(&out_dir, &target, "host", "ds").unwrap();
+        let ctx = Ctx {
+            out_dir: out_dir.as_path(),
+            target: target.as_path(),
+            host_id: "host",
+            dataset_id: "ds",
+            facts: FactsIndex::load(&out_dir).unwrap(),
+            meta: MetaLookup::load(&out_dir).unwrap(),
+        };
+        build(&ctx).unwrap();
+        let conn = open_explorer(&out_dir);
+        let keys: Vec<(String, Option<String>, String, i64, i64)> = conn
+            .prepare(
+                "SELECT key_path, parent_record_id, parent_status, stored_subkey_count, stored_value_count
+                 FROM RegistryExplorer WHERE entry_kind='key' ORDER BY key_path",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let root_id: String = conn
+            .query_row("SELECT record_id FROM RegistryExplorer WHERE key_path='\\ROOT'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            keys,
+            vec![
+                ("\\ROOT".to_string(), None, "root".to_string(), 1, 0),
+                ("\\ROOT\\Child".to_string(), Some(root_id), "linked".to_string(), 0, 1),
+            ]
+        );
+        let totals: (i64, i64, i64) = conn
+            .query_row("SELECT key_count, value_count, root_count FROM RegistryHives", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(totals, (2, 1, 1));
         drop(conn);
         let _ = std::fs::remove_dir_all(out_dir.parent().unwrap());
     }

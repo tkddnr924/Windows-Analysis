@@ -16,7 +16,7 @@ use crate::hex::hex_lower;
 use crate::sqlite::{Row, StreamWriter};
 
 pub const REG_TABLE: &str = "Registry";
-pub const REG_FILENAMES: &[&str] = &["SYSTEM", "SOFTWARE", "SAM", "SECURITY", "DEFAULT"];
+pub const REG_FILENAMES: &[&str] = &["SYSTEM", "SOFTWARE", "SAM", "SECURITY"];
 pub const REG_SUFFIXES: &[&str] = &["NTUSER.DAT", "USRCLASS.DAT"];
 pub const REG_FIELD_ORDER: &[&str] = &[
     // 기존 7열 — 이름·순서·의미 고정.

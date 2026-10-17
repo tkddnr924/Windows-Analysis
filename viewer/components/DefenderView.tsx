@@ -12,7 +12,6 @@ import MonitorHeartOutlinedIcon from "@mui/icons-material/MonitorHeartOutlined";
 import PriorityHighOutlinedIcon from "@mui/icons-material/PriorityHighOutlined";
 import ShieldOutlinedIcon from "@mui/icons-material/ShieldOutlined";
 import TuneOutlinedIcon from "@mui/icons-material/TuneOutlined";
-import UpdateOutlinedIcon from "@mui/icons-material/UpdateOutlined";
 import WidgetsOutlinedIcon from "@mui/icons-material/WidgetsOutlined";
 import { HeaderSearchInput, MultiSelectDropdown, SortDropdown, ViewHeader } from "@/components/FilterControls";
 import PaginationControls from "@/components/PaginationControls";
@@ -21,13 +20,13 @@ import type { CsvData, FetchLinkedRows } from "@/lib/types";
 import { EMPTY_TIME_RANGE, inRange, rangeActive, type TimeRange } from "@/lib/timeRange";
 import { resolveAccountDisplay, type AccountDirectory } from "@/lib/accountIdentity";
 import { RecordScopeContext } from "@/lib/recordScope";
-import { CHANGE_LABELS, DEFAULT_DEFENDER_FILTER, EXCLUSION_LABELS, FEATURE_LABELS, RESULT_LABELS, buildDefenderItems, groupIndex, latestProtection, selectedSections, summarizeActivity, type DefenderFilter, type DefenderItem } from "@/lib/defenderActivity";
+import { CHANGE_LABELS, DEFAULT_DEFENDER_FILTER, EXCLUSION_LABELS, FEATURE_LABELS, RESULT_LABELS, buildDefenderItems, groupIndex, latestProtection, protectionChanges, selectedSections, storedLatest, summarizeActivity, type DefenderFilter, type DefenderItem, type ProtectionChange } from "@/lib/defenderActivity";
 import { chronological } from "@/lib/eventOrder";
 import { optionsOf, pageWindow, rowidOf, timeSpan } from "@/lib/eventCards";
 import RowDetailPanel from "./RowDetailPanel";
 
 const TABLE = "Defender";
-const COMPANIONS = ["DefenderDetectionMembers", "DefenderScans", "DefenderResources", "DefenderProtectionStates"];
+const COMPANIONS = ["DefenderDetectionMembers", "DefenderScans", "DefenderResources", "DefenderProtectionStates", "DefenderProtectionLatest"];
 // Defender stores English result codes (success/failure/unknown).
 const RESULT_COLOR: Record<string, string> = { success: "var(--success)", failure: "var(--danger)" };
 const SEVERITY_COLOR: Record<string, string> = { 심각: "var(--danger)", 높음: "var(--danger)" };
@@ -76,11 +75,6 @@ function summaryOf(row: Row, targets: string[] = []): string {
     const next = row.config_new_state === "value" ? row.config_new_value : "";
     return [configTarget(row), old || next ? `${old}${old && next ? " → " : ""}${next}` : ""].filter(Boolean).join(" · ");
   }
-  if (row.section === "signature") {
-    const signature = row.signature_version_previous && row.signature_version_current ? `${row.signature_version_previous} → ${row.signature_version_current}` : row.signature_version_current;
-    const engine = row.engine_version_previous && row.engine_version_current && row.engine_version_previous !== row.engine_version_current ? `엔진 ${row.engine_version_previous} → ${row.engine_version_current}` : "";
-    return [row.signature_type, row.update_type, signature || (row.event_type === "engine_updated" ? `${row.engine_version_previous} → ${row.engine_version_current}` : ""), engine, row.error_description].filter(Boolean).join(" · ");
-  }
   if (row.section === "health") return [row.platform_version && `플랫폼 ${row.platform_version}`, row.av_signature_version && `정의 ${row.av_signature_version}`].filter(Boolean).join(" · ");
   if (row.section === "scan") return [row.scan_parameters, row.scan_type, duration(row.scan_duration_seconds)].filter(Boolean).join(" · ");
   if (row.section === "threat" || row.section === "threat_action") return [row.action && row.action !== "해당 없음" ? row.action : "", targetText(row.target_path ? [row.target_path] : targets)].filter(Boolean).join(" · ");
@@ -88,18 +82,29 @@ function summaryOf(row: Row, targets: string[] = []): string {
   return row.detail || row.description || "";
 }
 
-const ICONS: Record<string, React.ElementType> = { threat: BugReportOutlinedIcon, threat_action: BugReportOutlinedIcon, scan: ManageSearchOutlinedIcon, signature: UpdateOutlinedIcon, tampering: TuneOutlinedIcon, history: DeleteSweepOutlinedIcon, health: MonitorHeartOutlinedIcon, failure: PriorityHighOutlinedIcon };
+const ICONS: Record<string, React.ElementType> = { threat: BugReportOutlinedIcon, threat_action: BugReportOutlinedIcon, scan: ManageSearchOutlinedIcon, tampering: TuneOutlinedIcon, history: DeleteSweepOutlinedIcon, health: MonitorHeartOutlinedIcon, failure: PriorityHighOutlinedIcon };
 
-function SummaryTile({ icon: Icon, label, value, title, wide, children }: { icon: React.ElementType; label: string; value?: React.ReactNode; title?: string; wide?: boolean; children?: React.ReactNode }) {
-  return (
-    <div title={title} style={{ gridColumn: wide ? "span 2" : undefined, display: "grid", alignContent: "start", gap: 6, minWidth: 0, padding: "10px 12px", border: "1px solid var(--border)", borderRadius: "var(--radius)", background: "var(--bg)" }}>
-      <span style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11.5, color: "var(--text-faint)" }}>
-        <Icon sx={{ fontSize: 14 }} />{label}
-      </span>
-      {value !== undefined && <span style={{ fontSize: 18, fontWeight: 700, lineHeight: 1.1, color: "var(--text)", fontVariantNumeric: "tabular-nums" }}>{value}</span>}
-      {children && <span style={{ display: "flex", alignItems: "baseline", gap: 8, flexWrap: "wrap", fontSize: 11.5, color: "var(--text-dim)", minWidth: 0 }}>{children}</span>}
-    </div>
-  );
+function SummaryTile({ icon: Icon, label, value, title, wide, pressed, onPress, children }: { icon: React.ElementType; label: string; value?: React.ReactNode; title?: string; wide?: boolean; pressed?: boolean; onPress?: () => void; children?: React.ReactNode }) {
+  const style: React.CSSProperties = { gridColumn: wide ? "span 2" : undefined, display: "grid", alignContent: "start", gap: 6, minWidth: 0, padding: "10px 12px", border: `1px solid ${pressed ? "var(--accent)" : "var(--border)"}`, borderRadius: "var(--radius)", background: pressed ? "var(--accent-subtle)" : "var(--bg)", textAlign: "left", font: "inherit", color: "inherit" };
+  const content = <>
+    <span style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11.5, color: pressed ? "var(--accent)" : "var(--text-faint)" }}>
+      <Icon sx={{ fontSize: 14 }} />{label}
+    </span>
+    {value !== undefined && <span style={{ fontSize: 18, fontWeight: 700, lineHeight: 1.1, color: "var(--text)", fontVariantNumeric: "tabular-nums" }}>{value}</span>}
+    {children && <span style={{ display: "flex", alignItems: "baseline", gap: 8, flexWrap: "wrap", fontSize: 11.5, color: "var(--text-dim)", minWidth: 0 }}>{children}</span>}
+  </>;
+  if (!onPress) return <div title={title} style={style}>{content}</div>;
+  return <button type="button" title={title} aria-pressed={pressed} onClick={onPress} style={{ ...style, cursor: "pointer" }}>{content}</button>;
+}
+
+/** "기능·기능 꺼짐" pills for one record's stored state changes. */
+function ChangePills({ changes }: { changes: ProtectionChange[] }) {
+  return <>
+    {(["off", "on"] as const).map((state) => {
+      const features = changes.filter((change) => change.state === state).map((change) => FEATURE_LABELS[change.feature] ?? change.feature);
+      return features.length ? <Pill key={state} color={state === "off" ? "var(--danger)" : "var(--success)"} title={features.join("\n")}>{features.join("·")} {state === "off" ? "꺼짐" : "켜짐"}</Pill> : null;
+    })}
+  </>;
 }
 
 const unit = (count: number) => <>{count.toLocaleString()}<span style={{ fontSize: 12, fontWeight: 500, color: "var(--text-faint)", marginLeft: 2 }}>회</span></>;
@@ -107,16 +112,18 @@ const unit = (count: number) => <>{count.toLocaleString()}<span style={{ fontSiz
 export default function DefenderView({ data, onNavigate, onFetchLinkedRows, bookmarkedRowids, onToggleBookmark, timeRange = EMPTY_TIME_RANGE, accountDirectory }: Props) {
   const scope = useContext(RecordScopeContext);
   const [filter, setFilter] = useState<DefenderFilter>(DEFAULT_DEFENDER_FILTER);
+  // Show only records with stored protection on/off changes.
+  const [changesOnly, setChangesOnly] = useState(false);
   const [sortDir, setSortDir] = useState<"asc" | "desc">("asc");
   const [selected, setSelected] = useState<Row | null>(null);
-  const cardState = useCardState([filter, timeRange, sortDir]);
+  const cardState = useCardState([filter, timeRange, sortDir, changesOnly]);
   const bookmarks: Bookmarks = { bookmarkedRowids, onToggleBookmark };
   const update = (patch: Partial<DefenderFilter>) => setFilter((previous) => ({ ...previous, ...patch }));
 
   // Stored groups and protection observations from the same _OVERVIEW file;
   // each table loads and fails on its own.
   const companion = useCompanionTables(scope?.fullPath, COMPANIONS);
-  const { DefenderDetectionMembers: members, DefenderScans: scanTable, DefenderResources: resourceTable, DefenderProtectionStates: stateTable } = companion.tables;
+  const { DefenderDetectionMembers: members, DefenderScans: scanTable, DefenderResources: resourceTable, DefenderProtectionStates: stateTable, DefenderProtectionLatest: latestTable } = companion.tables;
   const index = useMemo(() => groupIndex(members?.rows ?? [], scanTable?.rows ?? []), [members, scanTable]);
   const scans = useMemo(() => new Map((scanTable?.rows ?? []).map((row) => [row.scan_entry_id, row])), [scanTable]);
   const resources = useMemo(() => {
@@ -128,8 +135,12 @@ export default function DefenderView({ data, onNavigate, onFetchLinkedRows, book
 
   const rangeOn = rangeActive(timeRange);
   const inPeriod = useMemo(() => (timestamp: string) => inRange(timestamp, timeRange), [timeRange]);
-  const items = useMemo(() => buildDefenderItems(data.rows, index, filter, inPeriod, rangeOn, sortDir), [data.rows, index, filter, inPeriod, rangeOn, sortDir]);
-  const protection = useMemo(() => latestProtection(states, inPeriod), [states, inPeriod]);
+  const changes = useMemo(() => protectionChanges(states, inPeriod), [states, inPeriod]);
+  const focus = useMemo(() => (changesOnly ? new Set(changes.keys()) : null), [changesOnly, changes]);
+  const items = useMemo(() => buildDefenderItems(data.rows, index, filter, inPeriod, rangeOn, sortDir, focus), [data.rows, index, filter, inPeriod, rangeOn, sortDir, focus]);
+  // Routine reports are not stored as rows: the whole range uses the stored
+  // latest state; a period can only use the stored change records.
+  const protection = useMemo(() => (rangeOn ? latestProtection(states, inPeriod) : storedLatest(latestTable?.rows ?? [])), [rangeOn, states, inPeriod, latestTable]);
   const summary = useMemo(() => summarizeActivity(data.rows, inPeriod, rangeOn), [data.rows, inPeriod, rangeOn]);
   const matchedEvents = items.reduce((sum, item) => sum + item.matched.size, 0);
 
@@ -141,7 +152,7 @@ export default function DefenderView({ data, onNavigate, onFetchLinkedRows, book
   const sectionSelection = selectedSections(filter, sectionOptions.map((option) => option.value));
 
   const list = pageWindow(items.length, cardState.page);
-  const periodNote = rangeOn ? "기간 내 " : "";
+  const protectionLabel = rangeOn ? "기간 내 마지막 변경 상태" : "마지막 보호 상태";
 
   const resultPill = (row: Row) => {
     const label = row.result && row.result !== "unknown" ? RESULT_LABELS[row.result] ?? row.result : "";
@@ -184,14 +195,18 @@ export default function DefenderView({ data, onNavigate, onFetchLinkedRows, book
       };
     }
     const exclusion = first.config_exclusion_kind;
+    // Realtime protection turned off (stored change) is the key alert.
+    const realtimeOff = (changes.get(first.record_id) ?? []).some((change) => change.feature === "realtime_protection" && change.state === "off");
     return {
-      icon: ICONS[first.section] ?? WidgetsOutlinedIcon, tone: RESULT_COLOR[first.result] === "var(--danger)" ? "var(--danger)" : "var(--text-dim)",
+      alert: realtimeOff,
+      icon: ICONS[first.section] ?? WidgetsOutlinedIcon, tone: realtimeOff || RESULT_COLOR[first.result] === "var(--danger)" ? "var(--danger)" : "var(--text-dim)",
       name: exclusion ? exclusionTitle(first) : first.title || first.description || first.event_type,
       tag: first.section_label,
       line: [exclusion ? first.config_exclusion_value : summaryOf(first, resources.get(first.record_id)), accountOf(first)].filter(Boolean).join(" · "),
       lineTitle: [first.config_target_raw, first.config_target && !exclusion ? first.config_target : "", first.history_cleared_time && `삭제 기준 ${first.history_cleared_time}`, first.description].filter(Boolean).join("\n"),
       pills: <>
         {first.config_change_kind && !exclusion && <Pill color="var(--text-dim)">{CHANGE_LABELS[first.config_change_kind] ?? first.config_change_kind}</Pill>}
+        {changes.has(first.record_id) && <ChangePills changes={changes.get(first.record_id) ?? []} />}
         {resultPill(first)}
       </>,
     };
@@ -201,7 +216,7 @@ export default function DefenderView({ data, onNavigate, onFetchLinkedRows, book
     <div className="dfir-view" style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", background: "var(--bg)", overflow: "hidden" }}>
       <ViewHeader icon={ShieldOutlinedIcon} title="Microsoft Defender 활동" meta={`항목 ${items.length.toLocaleString()} · 일치 기록 ${matchedEvents.toLocaleString()} / ${data.rows.length.toLocaleString()}`} right={loadErrorNote(companion.failed)}>
         <HeaderSearchInput value={filter.search} onChange={(search) => update({ search })} placeholder="위협 · 경로 · 프로세스 · 설정 · 계정 · SID" ariaLabel="Microsoft Defender 활동 검색" width={300} />
-        <MultiSelectDropdown icon={<CategoryOutlinedIcon sx={{ fontSize: 15 }} />} label="구분" ariaLabel="구분" options={sectionOptions} selected={sectionSelection.length === sectionOptions.length ? [] : sectionSelection} onChange={(sections) => update({ sections })} />
+        {!changesOnly && <MultiSelectDropdown icon={<CategoryOutlinedIcon sx={{ fontSize: 15 }} />} label="구분" ariaLabel="구분" options={sectionOptions} selected={sectionSelection.length === sectionOptions.length ? [] : sectionSelection} onChange={(sections) => update({ sections })} />}
         {severityOptions.length > 0 && <MultiSelectDropdown icon={<PriorityHighOutlinedIcon sx={{ fontSize: 15 }} />} label="심각도" ariaLabel="심각도" options={severityOptions} selected={filter.severities} onChange={(severities) => update({ severities })} />}
         {categoryOptions.length > 0 && <MultiSelectDropdown icon={<BugReportOutlinedIcon sx={{ fontSize: 15 }} />} label="분류" ariaLabel="분류" options={categoryOptions} selected={filter.categories} onChange={(categories) => update({ categories })} />}
         {resultOptions.length > 0 && <MultiSelectDropdown icon={<FactCheckOutlinedIcon sx={{ fontSize: 15 }} />} label="결과" ariaLabel="결과" options={resultOptions} selected={filter.results} onChange={(results) => update({ results })} />}
@@ -210,12 +225,12 @@ export default function DefenderView({ data, onNavigate, onFetchLinkedRows, book
 
       <div role="region" aria-label="활동 요약" style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(170px, 1fr))", gap: 8, padding: "10px 14px", borderBottom: "1px solid var(--border)", background: "var(--bg-panel)" }}>
         {protection.length > 0 && (
-          <SummaryTile icon={ShieldOutlinedIcon} label={`${periodNote}마지막 보호 상태`} wide>
+          <SummaryTile icon={ShieldOutlinedIcon} label={changesOnly ? `보호 상태 변경 기록 ${changes.size.toLocaleString()}건만 표시 중 · 눌러서 해제` : `${protectionLabel}${changes.size ? ` · 변경 기록 ${changes.size.toLocaleString()}건 보기` : ""}`} wide pressed={changesOnly} onPress={changesOnly || changes.size ? () => setChangesOnly((value) => !value) : undefined}>
             <span style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: "4px 14px", width: "100%" }}>
               {protection.map((entry) => {
                 const color = entry.state === "off" ? "var(--danger)" : entry.state === "on" ? "var(--success)" : "var(--text-faint)";
                 return (
-                  <span key={entry.feature} title={entry.state ? `${periodNote}마지막 관측 ${entry.time}\n관측 ${entry.count.toLocaleString()}회 (${entry.first} → ${entry.time})` : `${entry.time} 같은 시각 관측 ${entry.tie}건의 상태가 서로 다름`} style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0, fontSize: 12.5 }}>
+                  <span key={entry.feature} title={entry.state ? (rangeOn ? `기간 내 마지막 변경 기록 ${entry.time}` : `마지막 관측 ${entry.time}\n관측 ${entry.count.toLocaleString()}회 (${entry.first} → ${entry.time})`) : `${entry.time} 같은 시각 관측 ${entry.tie}건의 상태가 서로 다름`} style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0, fontSize: 12.5, fontWeight: 400 }}>
                     <span aria-hidden="true" style={{ width: 7, height: 7, borderRadius: "50%", flexShrink: 0, background: color }} />
                     <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text-dim)" }}>{FEATURE_LABELS[entry.feature] ?? entry.feature}</span>
                     <span style={{ flexShrink: 0, fontWeight: 700, color: entry.state === "off" ? "var(--danger)" : "var(--text)" }}>{entry.state === "on" ? "켜짐" : entry.state === "off" ? "꺼짐" : "확정 불가"}</span>
@@ -230,12 +245,6 @@ export default function DefenderView({ data, onNavigate, onFetchLinkedRows, book
             <span>완료 {summary.scan.completed}</span>
             {summary.scan.cancelled > 0 && <span>중지 {summary.scan.cancelled}</span>}
             {summary.scan.failed > 0 && <span style={{ color: "var(--danger)", fontWeight: 700 }}>오류 {summary.scan.failed}</span>}
-          </SummaryTile>
-        )}
-        {summary.signature.updated + summary.signature.failed > 0 && (
-          <SummaryTile icon={UpdateOutlinedIcon} label="정의 업데이트" value={unit(summary.signature.updated)} title={summary.signature.last && `최근 ${summary.signature.last}`}>
-            {summary.signature.version && <span style={{ fontFamily: "var(--mono)" }}>{summary.signature.version}</span>}
-            {summary.signature.failed > 0 && <span style={{ color: "var(--danger)", fontWeight: 700 }}>실패 {summary.signature.failed}</span>}
           </SummaryTile>
         )}
         {summary.config.count > 0 && (
@@ -261,7 +270,7 @@ export default function DefenderView({ data, onNavigate, onFetchLinkedRows, book
           return (
             <CardShell key={item.key} label={head.name} tone={head.tone} mark={<IconTile icon={head.icon} tone={head.tone} />}
               expandable={grouped} open={grouped && cardState.isOpen(item.key)} onActivate={() => (grouped ? cardState.toggle(item.key) : setSelected(single))} buttonLabel={grouped ? undefined : `${head.name} 상세 보기`}
-              bookmarked={!grouped && isBookmarked(single, bookmarks)} side={!grouped && <BookmarkButton row={single} bookmarks={bookmarks} />} regionLabel="기록"
+              bookmarked={!grouped && isBookmarked(single, bookmarks)} alert={"alert" in head && head.alert} side={!grouped && <BookmarkButton row={single} bookmarks={bookmarks} />} regionLabel="기록"
               body={<PagedEvents events={item.events} page={cardState.eventPage(item.key)} onPage={(next) => cardState.setEventPage(item.key, next)} label={`${head.name} 기록 페이지`}
                 render={(row, index) => {
                   const targets = resources.get(row.record_id) ?? [];
@@ -278,7 +287,7 @@ export default function DefenderView({ data, onNavigate, onFetchLinkedRows, book
                 }} />}>
               <CardMain
                 title={<>
-                  <CardName>{head.name}</CardName>
+                  <CardName>{"alert" in head && head.alert ? <span style={{ color: "var(--danger)" }}>{head.name}</span> : head.name}</CardName>
                   {head.tag && <span style={{ flexShrink: 0, color: "var(--text-faint)", fontSize: 11.5 }}>{head.tag}</span>}
                 </>}
                 sub={(head.line || grouped) && <>

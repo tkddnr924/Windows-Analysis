@@ -21,7 +21,11 @@ export const DEFAULT_SECTIONS = ["threat", "threat_action"];
 export const DEFAULT_DEFENDER_FILTER: DefenderFilter = { search: "", sections: null, severities: [], categories: [], results: [] };
 
 export function selectedSections(filter: DefenderFilter, present: string[]): string[] {
-  if (!filter.sections) return present.filter((section) => DEFAULT_SECTIONS.includes(section));
+  if (!filter.sections) {
+    // Detections first; a host without any shows every section, never nothing.
+    const defaults = present.filter((section) => DEFAULT_SECTIONS.includes(section));
+    return defaults.length ? defaults : present;
+  }
   return filter.sections.length ? filter.sections : present;
 }
 
@@ -43,8 +47,10 @@ export function groupIndex(members: Cells[], scans: Cells[]): Map<string, ItemRe
   return index;
 }
 
-function matches(row: Cells, filter: DefenderFilter, sections: Set<string>): boolean {
-  if (!sections.has(row.section ?? "") || !facetAllows(filter.severities, row.severity) || !facetAllows(filter.categories, row.category) || !facetAllows(filter.results, row.result)) return false;
+function matches(row: Cells, filter: DefenderFilter, sections: Set<string>, focus: ReadonlySet<string> | null): boolean {
+  // Focus replaces the section choice; the other facets still apply.
+  if (focus ? !focus.has(row.record_id ?? "") : !sections.has(row.section ?? "")) return false;
+  if (!facetAllows(filter.severities, row.severity) || !facetAllows(filter.categories, row.category) || !facetAllows(filter.results, row.result)) return false;
   const needle = filter.search.trim().toLowerCase();
   return !needle || [row.search_text, row.threat_name, row.target_path, row.title, row.detail, row.process, row.account, row.account_sid].some((value) => (value ?? "").toLowerCase().includes(needle));
 }
@@ -53,8 +59,8 @@ export interface DefenderItem<R extends Cells> extends EventGroup<R> {
   kind: ItemKind;
 }
 
-/** Time order (direction), untimed last, ties by record_id (R17). */
-export function buildDefenderItems<R extends Cells>(rows: R[], index: Map<string, ItemRef>, filter: DefenderFilter, inPeriod: (timestamp: string) => boolean, periodSet: boolean, direction: "asc" | "desc"): DefenderItem<R>[] {
+/** Time order (direction), untimed last, ties by record_id (R17). `focus` limits rows to those record_ids. */
+export function buildDefenderItems<R extends Cells>(rows: R[], index: Map<string, ItemRef>, filter: DefenderFilter, inPeriod: (timestamp: string) => boolean, periodSet: boolean, direction: "asc" | "desc", focus: ReadonlySet<string> | null = null): DefenderItem<R>[] {
   const present = [...new Set(rows.map((row) => row.section ?? ""))];
   const sections = new Set(selectedSections(filter, present));
   const refOf = (row: R): ItemRef => index.get(row.record_id ?? "") ?? { key: `record::${row.record_id}`, kind: "record" };
@@ -64,7 +70,7 @@ export function buildDefenderItems<R extends Cells>(rows: R[], index: Map<string
     direction,
     keyOf: (row) => refOf(row).key,
     create: (key, row) => ({ key, kind: refOf(row).kind, events: [], matched: new Set() }),
-    matches: (row) => matches(row, filter, sections),
+    matches: (row) => matches(row, filter, sections, focus),
   });
 }
 
@@ -101,9 +107,38 @@ export function latestProtection(states: Cells[], inPeriod: (timestamp: string) 
   return result;
 }
 
+/** Whole-range latest state per feature from DefenderProtectionLatest; it is
+ * computed from every observation, including reports not stored as rows. */
+export function storedLatest(rows: Cells[]): ProtectionLatest[] {
+  return rows
+    .filter((row) => row.certainty !== "undetermined")
+    .map((row) => ({
+      feature: row.feature ?? "",
+      state: row.certainty === "confirmed" ? row.state ?? null : null,
+      time: row.last_observed_time ?? "",
+      tie: Number(row.tie_count ?? 0),
+      count: Number(row.observation_count ?? 0),
+      first: row.first_observed_time ?? "",
+      recordId: row.record_id ?? "",
+    }));
+}
+
+export interface ProtectionChange { feature: string; state: string }
+
+/** record_id → stored on/off changes (transition, or a first observation that is off) within the period. */
+export function protectionChanges(states: Cells[], inPeriod: (timestamp: string) => boolean): Map<string, ProtectionChange[]> {
+  const byRecord = new Map<string, ProtectionChange[]>();
+  for (const row of states) {
+    if (row.state !== "on" && row.state !== "off") continue;
+    if (row.change_kind !== "transition" && !(row.change_kind === "initial_observation" && row.state === "off")) continue;
+    if (!row.timestamp || !inPeriod(row.timestamp) || !row.record_id) continue;
+    byRecord.set(row.record_id, [...(byRecord.get(row.record_id) ?? []), { feature: row.feature ?? "", state: row.state }]);
+  }
+  return byRecord;
+}
+
 export interface ActivitySummary {
   scan: { started: number; completed: number; cancelled: number; failed: number; last: string };
-  signature: { updated: number; failed: number; version: string; last: string };
   history: { count: number; last: string };
   config: { count: number; exclusionsAdded: number; exclusionsRemoved: number; last: string };
 }
@@ -112,11 +147,9 @@ export interface ActivitySummary {
 export function summarizeActivity(rows: Cells[], inPeriod: (timestamp: string) => boolean, periodSet: boolean): ActivitySummary {
   const summary: ActivitySummary = {
     scan: { started: 0, completed: 0, cancelled: 0, failed: 0, last: "" },
-    signature: { updated: 0, failed: 0, version: "", last: "" },
     history: { count: 0, last: "" },
     config: { count: 0, exclusionsAdded: 0, exclusionsRemoved: 0, last: "" },
   };
-  let versionTime = "";
   const later = (current: string, time: string) => (time > current ? time : current);
   for (const row of rows) {
     const time = row.timestamp ?? "";
@@ -127,11 +160,6 @@ export function summarizeActivity(rows: Cells[], inPeriod: (timestamp: string) =
       else if (row.event_type === "scan_cancelled") summary.scan.cancelled += 1;
       else if (row.event_type === "scan_error") summary.scan.failed += 1;
       summary.scan.last = later(summary.scan.last, time);
-    } else if (row.section === "signature") {
-      if (row.result === "failure") summary.signature.failed += 1;
-      else summary.signature.updated += 1;
-      if (row.signature_version_current && time >= versionTime) { versionTime = time; summary.signature.version = row.signature_version_current; }
-      summary.signature.last = later(summary.signature.last, time);
     } else if (row.section === "history") {
       summary.history.count += 1;
       summary.history.last = later(summary.history.last, time);
