@@ -558,8 +558,7 @@ fn group_records(db_path: &Path) -> Result<()> {
     drop(writer);
     conn.close().map_err(|(_, error)| error)?;
     // synchronous=OFF: sync the finished file once, like DerivedDb::finish.
-    std::fs::File::open(db_path)
-        .and_then(|file| file.sync_all())
+    super::sync_finished_file(db_path)
         .with_context(|| format!("UsnJournal 디스크 기록: {}", db_path.display()))?;
     Ok(())
 }

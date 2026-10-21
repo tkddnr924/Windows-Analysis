@@ -637,11 +637,17 @@ impl DerivedDb {
             .close()
             .map_err(|(_, error)| error)
             .with_context(|| format!("{} 닫기", self.spec.name))?;
-        std::fs::File::open(&self.path)
-            .and_then(|file| file.sync_all())
+        sync_finished_file(&self.path)
             .with_context(|| format!("{} 디스크 기록", self.path.display()))?;
         Ok(self.rows)
     }
+}
+
+/// Flush a closed SQLite file once (connections use synchronous=OFF).
+/// Windows FlushFileBuffers needs GENERIC_WRITE, so a read-only handle fails
+/// with os error 5; open for write without create/truncate.
+pub(crate) fn sync_finished_file(path: &Path) -> std::io::Result<()> {
+    std::fs::OpenOptions::new().write(true).open(path)?.sync_all()
 }
 
 // ---------------------------------------------------------------------------
@@ -1074,6 +1080,22 @@ pub fn build_all(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sync_finished_file_keeps_contents_and_fails_for_missing_file() {
+        let dir = std::env::temp_dir().join(format!("wina-sync-finished-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("done.sqlite");
+        std::fs::write(&path, b"finished bytes").unwrap();
+        sync_finished_file(&path).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"finished bytes");
+        // Must not create a file that the builder never wrote.
+        let missing = dir.join("missing.sqlite");
+        assert!(sync_finished_file(&missing).is_err());
+        assert!(!missing.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn every_documented_database_has_a_spec() {
